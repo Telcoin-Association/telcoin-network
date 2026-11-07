@@ -2979,10 +2979,14 @@ async fn test_sync_partial_epoch_pack_over_stream() {
         assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
 
         let mut reassembled = Vec::new();
-        crate::network::sync_codec::sync_pack_reader(cursor)
-            .read_to_end(&mut reassembled)
-            .await
-            .expect("reassemble partial pack data frames");
+        crate::network::sync_codec::sync_pack_reader(
+            cursor,
+            crate::network::sync_codec::SyncRateBound::Floor,
+            crate::network::sync_codec::SyncServeMeter::default(),
+        )
+        .read_to_end(&mut reassembled)
+        .await
+        .expect("reassemble partial pack data frames");
         reassembled
     }
 

@@ -48,9 +48,11 @@ The chain id in the protocol name means a node on one chain fails negotiation ag
 
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
+On the worker, the whole batch stream is also bounded (95 seconds), so one peer can use at most 120 seconds of a 480-second `request_batches` call: the batches validated before the bound are kept, and the peer is recorded as stalled for the epoch and asked after the unmarked peers of its tier on later calls; a complete exchange slower than its allowance (15 seconds plus 1 second per batch) is marked too, and an empty answer is marked only when it took 5 seconds or more.
+Each tier of the connected-peer list is shuffled per request so no peer keeps a fixed early place.
 On the responding side, a peer that opens a stream and never sends its request frame is dropped after 1 second if it is a public-tier peer and after 5 seconds if it is a committee peer.
 While it waits it holds only an opening-read slot, never a serve slot.
-A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit.
+A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit, and, for a worker batch serve, for a serve cut at the 60-second hold limit and for a request above the 500-digest cap.
 A late request is charged whether it is then admitted or refused; a prompt `AtCapacity` refusal is not charged (see [Admission](#admission)).
 
 ## Frame tags
@@ -150,11 +152,11 @@ The per-peer cap of two lets a committee key open its second stream from the slo
 
 Each serve is also bounded in time:
 
-- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes. That floor-derived deadline is the only time bound for a committee-tier serve. A public-tier epoch-pack serve is also cut by its own fixed, size-independent bound, `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` (200 seconds), and a serve that outlives it is charged as a stall.
+- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes. That floor-derived deadline is the only time bound for a committee-tier serve. A public-tier epoch-pack serve is also cut by its own fixed, size-independent bound, `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` (200 seconds), and a serve that outlives it is charged as a stall. The requester reads a fresh peer at a target of 8 MiB per 30-second window (`SYNC_TARGET_MIN_BYTES`) and a peer already de-prioritised this epoch at the 1 MiB floor, both prorated over the real window length and checked on the `End` frame too. Only a serve that completes at the target rate (plus a 1-second latency allowance) makes a peer the preferred sync server; a slower completed serve de-prioritises the peer for the epoch instead.
 - A missing-certificates or consensus-output serve is bounded at 200 seconds in total.
-- A worker batch serve has 5 seconds to write its `Ack` and 30 seconds for each data frame, inside the 200-second total.
+- A worker batch serve has 5 seconds to write its `Ack` and 30 seconds for each data frame, inside the 200-second total. A public-tier worker batch serve is also cut at a fixed 60-second hold limit (`PUBLIC_BATCH_SERVE_TIMEOUT`) and charged as a stall; a public key serves on one worker stream at a time and may hold worker serve permits for 60 seconds per 300-second window (`PUBLIC_BATCH_SERVE_HOLD_BUDGET`, `PUBLIC_BATCH_SERVE_HOLD_WINDOW`), and is refused `AtCapacity` outside that budget. A public key may hold worker opening-read permits for 10 seconds per 300-second window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`) and is shed `AtCapacity`, uncharged, outside it; a key is leased only with a full 60-second hold limit of serve budget left.
 
-A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window (whether the request is then admitted or refused), for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit.
+A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window (whether the request is then admitted or refused), for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit, and, for a worker batch serve, for a serve cut at the 60-second hold limit and for a request above the 500-digest cap.
 A serve stalls when it hits a write timeout or a missed deadline.
 On the primary, the whole-serve timeout of a missing-certificates or consensus-output serve is a stall.
 On the primary, a requester that resets or closes the stream during the serve is also a stall: a `TimedOut`, `ConnectionReset` or `NotConnected` stream error counts as a stall, the same set the worker uses.
@@ -181,6 +183,10 @@ These admission penalties are enforced, unlike the stream-failure penalties unde
 | Worker batch serves | 5 + 1 per committee key | Concurrent worker batch sync serves |
 | Epoch-pack serve deadline | 30s per started MiB, plus 30s | Total time one epoch-pack serve can take |
 | Public epoch-pack serve hold limit | 200s | Fixed, size-independent bound on one public-tier epoch-pack serve (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`); a serve that outlives it is dropped and charged as a stall; committee-tier serves keep the throughput-floor deadline |
+| Public worker batch serve hold limit | 60s | Fixed, size-independent bound on one public-tier worker batch serve (`PUBLIC_BATCH_SERVE_TIMEOUT`); a serve that outlives it is dropped and charged as a stall; committee-tier serves keep the 200s stream bound |
+| Public worker batch serves per key | 1 | Worker batch serves one public key may hold at a time (`PUBLIC_BATCH_SERVES_PER_PEER`); a second request is refused `AtCapacity` without a charge |
+| Public worker batch-serve hold budget | 60s per 300s | Serve-permit hold time one public key may use per window (`PUBLIC_BATCH_SERVE_HOLD_BUDGET`, `PUBLIC_BATCH_SERVE_HOLD_WINDOW`); a key is leased only with a full 60s hold limit left; outside that it is refused `AtCapacity` without a charge |
+| Public worker opening hold budget | 10s per 300s | Opening-read hold time one public key may use per window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`); a key with less than one read bound left is shed `AtCapacity` without a charge |
 
 The 15-second and 10-second budgets nest: the total open budget covers a dial that may itself have to establish a connection, while the negotiation timeout applies only once a connection exists.
 An open that is dispatch-ready when its peer disconnects is re-queued for dialing rather than handed to a handler that no longer exists.

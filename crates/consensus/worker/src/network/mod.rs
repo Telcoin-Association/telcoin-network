@@ -12,16 +12,19 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     read_frame,
     types::{GossipValidation, NetworkEvent},
-    write_frame, DenyReason, GossipMessage, PeerSlot, PeerSlots, PeerTier, Penalty, ReservedPeers,
-    ReservedPool, ResponseChannel, ServiceClass, Stream, SyncFrame, SyncFrameError,
-    WorkerSyncRequest,
+    write_frame, DenyReason, GossipMessage, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,
+    Penalty, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream, SyncFrame,
+    SyncFrameError, WorkerSyncRequest,
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
     TnReceiver, WorkerId, B256,
 };
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 use tracing::{debug, warn};
 
 pub(crate) mod error;
@@ -44,6 +47,8 @@ pub(crate) type Res = WorkerResponse;
 /// Each committee key (the current and the next committee) draws first on its own
 /// reserve of `COMMITTEE_RESERVED_BATCH_STREAMS` permits that no other key can
 /// take, so public peers that fill this share cannot block a committee request.
+/// A public serve is also bounded by `PUBLIC_BATCH_SERVE_TIMEOUT` and budgeted per
+/// key by `PUBLIC_BATCH_SERVE_HOLD_BUDGET`.
 pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
 /// Batch-serve permits reserved for each committee key.
@@ -62,7 +67,11 @@ pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 1;
 /// A permit is taken when the stream opens and held while the opening request
 /// frame is read, which [`opening_read_bound`] bounds for the peer's tier. The
 /// permit is released as soon as the opening read ends, whatever its result, so no
-/// serve, control write or close holds it.
+/// serve, control write or close holds it. A public peer takes a lease from its
+/// opening hold budget ([`PUBLIC_OPENING_HOLD_BUDGET`] per
+/// [`PUBLIC_OPENING_HOLD_WINDOW`]) before the permit, and the time its opening read
+/// took is charged to that budget when the read ends, so a few public keys cannot
+/// hold this share by re-opening below the late charge (GHSA-pg7j-w22m-3qj5).
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
 /// Opening-read permits reserved for each committee key.
@@ -87,8 +96,10 @@ pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 ///
 /// A peer holds one slot per sync stream through both admission phases (the
 /// opening read and the batch serve), so no single peer can fill either pool
-/// and starve its peers. The same cap bounds the batch reports that one peer
-/// has in validation at a time (see `WorkerNetwork::process_report_batch`).
+/// and starve its peers. A public key may serve on only
+/// `PUBLIC_BATCH_SERVES_PER_PEER` of its streams at a time. The same cap bounds
+/// the batch reports that one peer has in validation at a time (see
+/// `WorkerNetwork::process_report_batch`).
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
 /// Maximum number of concurrent gossip-triggered batch prefetches.
@@ -138,6 +149,69 @@ const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// permit for most of the window at no cost (GHSA-vr4r-x9mm-6x9g).
 /// Committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
 const PUBLIC_SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upper bound on one public-tier batch serve.
+///
+/// A fixed, size-independent cap of two frame bounds (`SEND_STREAM_FRAME_TIMEOUT`,
+/// 30 s). At the 20 MB/s design rate that `SEND_STREAM_TIMEOUT` assumes, a full
+/// request of [`MAX_BATCH_DIGESTS_PER_REQUEST`] 1 MiB batches completes in about
+/// 25 s, so an honest public reader keeps more than 2x headroom; a reader that
+/// drains at the frame floor gets about 2 MiB per serve. A serve that runs past
+/// this bound is dropped, classed [`SyncServeOutcome::Stalled`] and charged
+/// [`Penalty::Mild`], so a slow public reader cannot hold a batch-serve permit
+/// for the whole 200 s stream bound at no cost (GHSA-pg7j-w22m-3qj5). Committee
+/// serves keep `SEND_STREAM_TIMEOUT` only.
+pub(crate) const PUBLIC_BATCH_SERVE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The batch-serve hold time one public key may use per [`PUBLIC_BATCH_SERVE_HOLD_WINDOW`].
+///
+/// One full serve at [`PUBLIC_BATCH_SERVE_TIMEOUT`], or several short ones. A key
+/// is leased serve time only while it has a full [`PUBLIC_BATCH_SERVE_TIMEOUT`] of
+/// this budget left, so an admitted serve can always run to its limit inside the
+/// budget and a fresh key gets one full hold per refill, not two. A key with less
+/// than that left is refused with `Deny(AtCapacity)` and not charged, like any
+/// other at-capacity answer, until its charge has leaked: a key that completes a
+/// serve waits 5 s for every second it was served before its next serve, and a key
+/// that drains a serve just inside the hold limit is refused for the whole window
+/// (GHSA-pg7j-w22m-3qj5).
+pub(crate) const PUBLIC_BATCH_SERVE_HOLD_BUDGET: Duration = PUBLIC_BATCH_SERVE_TIMEOUT;
+
+/// The window [`PUBLIC_BATCH_SERVE_HOLD_BUDGET`] refills over.
+///
+/// The same 300 s the peer score decays over (`ScoreConfig::score_halflife`), so a
+/// key that just spent its budget is refused for about as long as a penalty would
+/// take to fade. One key can hold the public share for at most 1/5 of the time, so
+/// filling the 5 public permits needs 25 keys that are each refused for 4/5 of the
+/// time, in the first window and in every window after it, instead of 3 keys with
+/// no limit (GHSA-pg7j-w22m-3qj5).
+pub(crate) const PUBLIC_BATCH_SERVE_HOLD_WINDOW: Duration = Duration::from_secs(300);
+
+/// The number of batch serves one public key may hold on a worker at a time.
+///
+/// The per-peer stream cap ([`MAX_PENDING_REQUESTS_PER_PEER`], 2) still lets a
+/// public key hold a second stream in its opening phase; a second serve is
+/// refused with `Deny(AtCapacity)`, uncharged. Committee keys keep the stream cap
+/// (GHSA-pg7j-w22m-3qj5).
+pub(crate) const PUBLIC_BATCH_SERVES_PER_PEER: usize = 1;
+
+/// The opening-read hold time one public key may use per [`PUBLIC_OPENING_HOLD_WINDOW`].
+///
+/// An honest opening takes about one round trip, so ten seconds covers hundreds of
+/// openings in a window. A public key is leased opening time only while it has a full
+/// [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`] of this budget left, and the time its opening
+/// read took is charged when that read ends. A key outside the budget takes the shed
+/// path, uncharged, like any other at-capacity opening. So a key that sits on an opening
+/// permit for just under half the read bound, below the late charge, gets about twenty
+/// such openings per window instead of an unbounded number, and filling the
+/// [`MAX_CONCURRENT_OPENING_READS`] public share needs about 240 keys instead of 4
+/// (GHSA-pg7j-w22m-3qj5; the opening-phase residual of GHSA-vr4r-x9mm-6x9g).
+pub(crate) const PUBLIC_OPENING_HOLD_BUDGET: Duration = Duration::from_secs(10);
+
+/// The window [`PUBLIC_OPENING_HOLD_BUDGET`] refills over.
+///
+/// The same 300 s as [`PUBLIC_BATCH_SERVE_HOLD_WINDOW`], on a budget of its own, so
+/// openings never draw down the serve time of an honest key.
+pub(crate) const PUBLIC_OPENING_HOLD_WINDOW: Duration = Duration::from_secs(300);
 
 /// How a served sync batch exchange ended.
 ///
@@ -208,11 +282,90 @@ impl SyncServeOutcome {
     }
 }
 
+/// The budgets that admit the opening phase of one inbound sync stream.
+#[derive(Clone, Debug)]
+struct OpeningAdmission {
+    /// The per-peer in-flight stream cap, held through both phases.
+    slots: PeerSlots,
+    /// The opening-read pool: a public share and a reserve for each committee key.
+    pool: ReservedPool,
+    /// The opening-read hold time each public key has used, capped at
+    /// [`PUBLIC_OPENING_HOLD_BUDGET`] per [`PUBLIC_OPENING_HOLD_WINDOW`].
+    public_hold: HoldBudget,
+}
+
+impl OpeningAdmission {
+    /// The budgets at the sizes the live network uses.
+    fn new() -> Self {
+        Self {
+            slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            pool: ReservedPool::new(MAX_CONCURRENT_OPENING_READS, COMMITTEE_RESERVED_OPENING_READS),
+            public_hold: HoldBudget::new(
+                PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
+                PUBLIC_OPENING_HOLD_BUDGET,
+                PUBLIC_OPENING_HOLD_WINDOW,
+            ),
+        }
+    }
+
+    /// Try to take the opening-read grants for `peer` of `tier`, without waiting.
+    ///
+    /// A committee opening takes its pool permit only. A public opening takes its hold lease,
+    /// then its pool permit, so a key outside its budget never holds a permit.
+    fn try_grant(&self, peer: &BlsPublicKey, tier: PeerTier, now: Instant) -> Option<OpeningGrant> {
+        match tier {
+            PeerTier::Committee => self.pool.try_acquire(peer, tier).map(OpeningGrant::Committee),
+            PeerTier::Public => self.public_hold.try_lease(*peer, now).and_then(|lease| {
+                self.pool.try_acquire(peer, tier).map(|permit| {
+                    OpeningGrant::Public(Box::new(PublicOpeningGrant { lease, permit }))
+                })
+            }),
+        }
+    }
+}
+
+/// The opening-read grants one admitted stream holds while it reads its request frame.
+#[derive(Debug)]
+enum OpeningGrant {
+    /// A committee opening holds its pool permit only.
+    Committee(OwnedSemaphorePermit),
+    /// A public opening also holds its hold-budget lease, which charges the read time when it
+    /// drops. Boxed: the lease alone is about 340 bytes next to a 16-byte permit.
+    Public(Box<PublicOpeningGrant>),
+}
+
+/// The grants one admitted public opening holds, declared in release order so an aborted task
+/// drops them the same way `OpeningGrant::release` does: the lease books its charge before the
+/// permit frees.
+#[derive(Debug)]
+struct PublicOpeningGrant {
+    /// The hold-budget lease, which charges the read time when it drops.
+    lease: HoldLease,
+    /// The pool permit.
+    permit: OwnedSemaphorePermit,
+}
+
+impl OpeningGrant {
+    /// Release every grant: the lease first, so its charge is on the books before the permit
+    /// frees, then the permit.
+    fn release(self) {
+        match self {
+            Self::Committee(permit) => drop(permit),
+            Self::Public(grant) => {
+                let PublicOpeningGrant { lease, permit } = *grant;
+                drop(lease);
+                drop(permit);
+            }
+        }
+    }
+}
+
 /// An inbound sync stream admitted to the opening phase.
 ///
-/// Holds the peer's [`PeerSlot`] for the whole exchange and an opening-read
-/// permit. The permit is released as soon as the opening read ends, whatever its
-/// result, so no serve, control write or close holds opening-read capacity.
+/// Holds the peer's [`PeerSlot`] for the whole exchange and its opening-read
+/// grants: a pool permit, and for a public peer the hold lease the permit was
+/// taken under. The grants are released as soon as the opening read ends, whatever
+/// its result, so no serve, control write or close holds opening-read capacity.
 #[derive(Debug)]
 struct SyncAdmission {
     /// The peer that opened the stream.
@@ -221,31 +374,183 @@ struct SyncAdmission {
     tier: PeerTier,
     /// The per-peer in-flight slot, held through both phases.
     slot: PeerSlot,
-    /// The opening-read permit, released as soon as the opening read ends, whatever its result.
-    opening: OwnedSemaphorePermit,
+    /// The opening-read grants, released as soon as the opening read ends, whatever its result.
+    opening: OpeningGrant,
 }
 
 /// Try to admit the opening phase of one inbound sync stream for `peer`.
 ///
 /// Takes a per-peer slot first, so a peer at [`MAX_PENDING_REQUESTS_PER_PEER`]
-/// never holds a pool permit, then an opening-read permit for `tier`. A committee
-/// peer draws on its own reserve before the public share; a public peer draws
-/// only on the public share. Returns `None` when either budget is full, and a slot taken
-/// before a refusal is released on drop.
+/// never holds a pool permit, then for a public peer a lease from its opening hold
+/// budget, then an opening-read permit for `tier`. A committee peer draws on its
+/// own reserve before the public share; a public peer draws only on the public
+/// share. Returns `None` when any budget is full, and a grant taken before a
+/// refusal is released on drop; the refused stream takes the shed path, uncharged.
 fn try_admit_opening(
-    slots: &PeerSlots,
-    opening: &ReservedPool,
+    opening: &OpeningAdmission,
     peer: BlsPublicKey,
     tier: PeerTier,
 ) -> Option<SyncAdmission> {
-    slots.try_take(peer).and_then(|slot| {
-        opening.try_acquire(&peer, tier).map(|permit| SyncAdmission {
+    let now = Instant::now();
+    opening.slots.try_take(peer).and_then(|slot| {
+        opening.try_grant(&peer, tier, now).map(|opening| SyncAdmission {
             peer,
             tier,
             slot,
-            opening: permit,
+            opening,
         })
     })
+}
+
+/// The budgets that admit one batch serve, taken together when the opening `Req` is read.
+#[derive(Clone, Debug)]
+struct BatchServeAdmission {
+    /// The batch-serve pool: a public share and a reserve for each committee key.
+    pool: ReservedPool,
+    /// The number of batch serves each public key has in flight, capped at
+    /// [`PUBLIC_BATCH_SERVES_PER_PEER`].
+    public_serves: PeerSlots,
+    /// The hold time each public key has used, capped at [`PUBLIC_BATCH_SERVE_HOLD_BUDGET`] per
+    /// [`PUBLIC_BATCH_SERVE_HOLD_WINDOW`].
+    public_hold: HoldBudget,
+}
+
+impl BatchServeAdmission {
+    /// The budgets at the sizes the live network uses.
+    fn new() -> Self {
+        Self {
+            pool: ReservedPool::new(MAX_CONCURRENT_BATCH_STREAMS, COMMITTEE_RESERVED_BATCH_STREAMS),
+            public_serves: PeerSlots::new(PUBLIC_BATCH_SERVES_PER_PEER),
+            public_hold: HoldBudget::new(
+                PUBLIC_BATCH_SERVE_TIMEOUT,
+                PUBLIC_BATCH_SERVE_HOLD_BUDGET,
+                PUBLIC_BATCH_SERVE_HOLD_WINDOW,
+            ),
+        }
+    }
+
+    /// Try to take every grant a batch serve for `peer` of `tier` needs, without waiting.
+    ///
+    /// A committee serve needs its pool permit only. A public serve takes, in this order, its
+    /// per-key serve slot, its hold lease and its pool permit; a grant taken before a refusal is
+    /// released on drop.
+    fn try_grant(
+        &self,
+        peer: &BlsPublicKey,
+        tier: PeerTier,
+        now: Instant,
+    ) -> Result<ServeGrant, ServeRefusal> {
+        match tier {
+            PeerTier::Committee => self
+                .pool
+                .try_acquire(peer, tier)
+                .map(ServeGrant::Committee)
+                .ok_or(ServeRefusal::PoolFull),
+            PeerTier::Public => self
+                .public_serves
+                .try_take(*peer)
+                .ok_or(ServeRefusal::PeerCap)
+                .and_then(|slot| {
+                    self.public_hold
+                        .try_lease(*peer, now)
+                        .ok_or(ServeRefusal::HoldBudget)
+                        .map(|lease| (slot, lease))
+                })
+                .and_then(|(slot, lease)| {
+                    self.pool.try_acquire(peer, tier).ok_or(ServeRefusal::PoolFull).map(|permit| {
+                        ServeGrant::Public(Box::new(PublicServeGrant { permit, lease, slot }))
+                    })
+                }),
+        }
+    }
+}
+
+/// The grants one admitted public batch serve holds, declared in release order so an aborted
+/// task drops them the same way `ServeGrant::release` does.
+#[derive(Debug)]
+struct PublicServeGrant {
+    /// The pool permit.
+    permit: OwnedSemaphorePermit,
+    /// The hold-budget lease, which charges the held time when it drops.
+    lease: HoldLease,
+    /// The per-key serve slot.
+    slot: PeerSlot,
+}
+
+/// The grants one admitted batch serve holds until it ends.
+#[derive(Debug)]
+enum ServeGrant {
+    /// A committee serve holds its pool permit only.
+    Committee(OwnedSemaphorePermit),
+    /// A public serve also holds its per-key serve slot and its hold-budget lease. Boxed: the
+    /// public grants are about 650 bytes next to a 16-byte permit.
+    Public(Box<PublicServeGrant>),
+}
+
+impl ServeGrant {
+    /// Release every grant: the pool permit, then the lease, so its charge is on the books before
+    /// the per-key serve slot frees and a second stream of the key cannot pass `try_lease`
+    /// against books that miss the hold just ended, then the slot.
+    fn release(self) {
+        match self {
+            Self::Committee(permit) => drop(permit),
+            Self::Public(grant) => {
+                let PublicServeGrant { permit, lease, slot } = *grant;
+                drop(permit);
+                drop(lease);
+                drop(slot);
+            }
+        }
+    }
+}
+
+/// Why a batch serve was refused. Every refusal answers `Deny(AtCapacity)` on the wire; the
+/// reason is for the log only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeRefusal {
+    /// No pool permit the peer may take is free.
+    PoolFull,
+    /// The public key already serves on [`PUBLIC_BATCH_SERVES_PER_PEER`] streams.
+    PeerCap,
+    /// The public key has used its [`PUBLIC_BATCH_SERVE_HOLD_BUDGET`] for the window.
+    HoldBudget,
+}
+
+/// The wall-clock bound the admission layer puts on one batch serve, by tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeHoldLimit {
+    /// The serve runs under its own bounds only (`SEND_STREAM_TIMEOUT` and the per-write bounds).
+    Unbounded,
+    /// The serve is dropped after this long and reported as [`SyncServeOutcome::Stalled`].
+    Bounded(Duration),
+}
+
+impl ServeHoldLimit {
+    /// The limit for a serve to a peer of `tier`: a public-tier serve is bounded by
+    /// [`PUBLIC_BATCH_SERVE_TIMEOUT`]; a committee serve keeps `SEND_STREAM_TIMEOUT` only.
+    fn of(tier: PeerTier) -> Self {
+        match tier {
+            PeerTier::Committee => Self::Unbounded,
+            PeerTier::Public => Self::Bounded(PUBLIC_BATCH_SERVE_TIMEOUT),
+        }
+    }
+
+    /// Run `serve` under this limit. A serve cut at the limit is dropped, which resets the stream
+    /// for the requester, and is reported as [`SyncServeOutcome::Stalled`].
+    async fn run<Fut: Future<Output = SyncServeOutcome>>(self, serve: Fut) -> SyncServeOutcome {
+        match self {
+            Self::Unbounded => serve.await,
+            Self::Bounded(limit) => {
+                tokio::time::timeout(limit, serve).await.unwrap_or(SyncServeOutcome::Stalled)
+            }
+        }
+    }
+}
+
+/// The number of digests `request` names, before the responder caps it.
+fn requested_digests(request: &WorkerSyncRequest) -> usize {
+    let WorkerSyncRequest::Batches { batch_digests, .. } = request;
+    batch_digests.len()
 }
 
 /// The result of the bounded read of an opening sync request frame.
@@ -255,10 +560,10 @@ enum OpeningRead {
     Silent,
     /// The frame could not be read or decoded.
     Unreadable(std::io::Error),
-    /// A request frame, with the batch-serve permit that admits it.
-    Admitted(WorkerSyncRequest, OwnedSemaphorePermit),
-    /// A request frame, refused because the batch-serve pool is full for the tier.
-    AtCapacity,
+    /// A request frame, with the grants that admit its serve.
+    Admitted(WorkerSyncRequest, ServeGrant),
+    /// A request frame, refused by one of the batch-serve budgets.
+    AtCapacity(ServeRefusal),
     /// A readable frame that is not a request.
     Unexpected,
 }
@@ -266,20 +571,21 @@ enum OpeningRead {
 impl OpeningRead {
     /// Classify a decoded opening frame.
     ///
-    /// A request takes a permit from `batch_serve` for `peer`, a peer of `tier`,
-    /// here, before the caller releases the opening-read permit, so an admitted
-    /// stream always holds one of the two. A committee-tier `peer` takes the permit
-    /// from its own reserve first and then from the public share.
+    /// A request takes every grant its serve needs from `admission` here, before
+    /// the caller releases the opening-read permit, so an admitted stream always
+    /// holds one of the two. A committee-tier `peer` takes its pool permit from its
+    /// own reserve first and then from the public share.
     fn from_frame(
         frame: SyncFrame<WorkerSyncRequest>,
-        batch_serve: &ReservedPool,
+        admission: &BatchServeAdmission,
         peer: &BlsPublicKey,
         tier: PeerTier,
+        now: Instant,
     ) -> Self {
         match frame {
-            SyncFrame::Req(request) => batch_serve
-                .try_acquire(peer, tier)
-                .map_or(Self::AtCapacity, |permit| Self::Admitted(request, permit)),
+            SyncFrame::Req(request) => admission
+                .try_grant(peer, tier, now)
+                .map_or_else(Self::AtCapacity, |grant| Self::Admitted(request, grant)),
             SyncFrame::Ack
             | SyncFrame::Deny(_)
             | SyncFrame::Data(_)
@@ -300,26 +606,34 @@ fn opening_read_bound(tier: PeerTier) -> Duration {
 
 /// Run one inbound sync exchange through both admission phases.
 ///
-/// The opening phase reads the request frame under the opening-read permit in
-/// `admission`, bounded by [`opening_read_bound`] for the peer's tier. The
-/// opening-read permit is released as soon as that read ends, whatever its
-/// result, before any serve, penalty, control write or close.
+/// The opening phase reads the request frame under the opening-read grants in
+/// `admission`, bounded by [`opening_read_bound`] for the peer's tier. Those
+/// grants are released as soon as that read ends, whatever its result, before any
+/// serve, penalty, control write or close; for a public peer the lease then
+/// charges the time the read took to the key's opening budget
+/// ([`PUBLIC_OPENING_HOLD_BUDGET`] per [`PUBLIC_OPENING_HOLD_WINDOW`]).
 ///
-/// The serve phase needs a permit from `batch_serve` for the peer's tier. A
+/// The serve phase needs every grant in `batch_serve` for the peer's tier: a pool
+/// permit for any peer, and for a public peer also a per-key serve slot (at most
+/// [`PUBLIC_BATCH_SERVES_PER_PEER`] in flight) and a hold lease within
+/// [`PUBLIC_BATCH_SERVE_HOLD_BUDGET`] per [`PUBLIC_BATCH_SERVE_HOLD_WINDOW`]. A
 /// committee peer draws on the reserve before the public share, so public peers
-/// cannot use up the capacity that a committee request needs. With a permit,
-/// `serve` runs, and the permit is held only while it serves. Without one, the
-/// stream gets a bounded [`DenyReason::AtCapacity`] write.
+/// cannot use up the capacity that a committee request needs. With every grant,
+/// `serve` runs, cut for a public peer at [`PUBLIC_BATCH_SERVE_TIMEOUT`], and the
+/// grants are held only while it serves. Without one, the stream gets a bounded
+/// [`DenyReason::AtCapacity`] write.
 ///
 /// A public-tier peer is charged [`Penalty::Mild`] for a silent, unreadable or
-/// non-request opening and for a [`SyncServeOutcome::Stalled`] serve. It is also
-/// charged for a request that arrives in the second half of its opening-read
-/// bound, whether the request is then admitted or refused. That charge is sent
-/// once the stream holds no serve permit: after the serve for an admitted
-/// request, before the deny for a refused one. A prompt
-/// [`DenyReason::AtCapacity`] answer is not charged: an honest peer gets it when
-/// the public share is full, and the refused stream holds no permit. A committee
-/// peer is never charged.
+/// non-request opening, for a [`SyncServeOutcome::Stalled`] serve, which includes
+/// a serve cut at [`PUBLIC_BATCH_SERVE_TIMEOUT`], and for a request that names
+/// more than [`MAX_BATCH_DIGESTS_PER_REQUEST`] digests, which is served truncated.
+/// It is also charged for a request that arrives in the second half of its
+/// opening-read bound, whether the request is then admitted or refused. That
+/// charge is sent once the stream holds no serve grant: after the serve for an
+/// admitted request, before the deny for a refused one. A prompt
+/// [`DenyReason::AtCapacity`] answer is not charged, whichever budget refused it:
+/// an honest peer gets it when the public share is full, and the refused stream
+/// holds no grant. A committee peer is never charged.
 ///
 /// The per-peer slot is held until this returns. Generic over the stream and the
 /// serve step, so unit tests drive both phases with in-memory streams and a paused
@@ -327,7 +641,7 @@ fn opening_read_bound(tier: PeerTier) -> Duration {
 async fn admit_and_serve_sync_stream<S, F, Fut>(
     mut stream: S,
     admission: SyncAdmission,
-    batch_serve: ReservedPool,
+    batch_serve: BatchServeAdmission,
     network_handle: WorkerNetworkHandle,
     max_frame: usize,
     serve: F,
@@ -352,14 +666,15 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
     .await
     .map_or(OpeningRead::Silent, |frame| {
         frame.map_or_else(OpeningRead::Unreadable, |frame| {
-            OpeningRead::from_frame(frame, &batch_serve, &peer, tier)
+            OpeningRead::from_frame(frame, &batch_serve, &peer, tier, Instant::now())
         })
     });
     let elapsed = opened.elapsed();
     let late = elapsed > read_bound / 2;
 
-    // the opening read has ended: release its permit before any serve, penalty, write or close
-    drop(opening);
+    // the opening read has ended: release its grants before any serve, penalty, write or close,
+    // lease first so its charge is on the books before the permit frees
+    opening.release();
     match read {
         OpeningRead::Silent => {
             warn!(
@@ -376,13 +691,37 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
             charge_public_peer(&network_handle, peer, tier).await;
             close_stream_bounded(&mut stream).await;
         }
-        OpeningRead::Admitted(request, serve_permit) => {
-            let outcome = serve(stream, request).await;
-            // free the serve permit before the penalty send so a stall cannot hold it
-            drop(serve_permit);
+        OpeningRead::Admitted(request, grant) => {
+            let requested = requested_digests(&request);
+            let outcome = ServeHoldLimit::of(tier).run(serve(stream, request)).await;
+            // free every grant before the penalty send so a stall cannot hold one; a public
+            // lease charges its hold time to the key here
+            grant.release();
             match outcome {
-                SyncServeOutcome::Stalled => charge_public_peer(&network_handle, peer, tier).await,
+                SyncServeOutcome::Stalled => {
+                    warn!(
+                        target: "worker::network",
+                        %peer,
+                        ?tier,
+                        hold_limit = ?ServeHoldLimit::of(tier),
+                        "sync batch serve stalled or was cut at the hold limit"
+                    );
+                    charge_public_peer(&network_handle, peer, tier).await
+                }
                 SyncServeOutcome::Completed | SyncServeOutcome::Failed => {}
+            }
+            // a request above the digest cap is served truncated and charged, so an oversized
+            // request never costs less than a late one
+            if requested > MAX_BATCH_DIGESTS_PER_REQUEST {
+                warn!(
+                    target: "worker::network",
+                    %peer,
+                    ?tier,
+                    requested,
+                    max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                    "oversized sync batch request"
+                );
+                charge_public_peer(&network_handle, peer, tier).await;
             }
             // a request that used more than half of the opening bound is charged on top of
             // the serve outcome, so a late opening never pays less than a silent one
@@ -393,12 +732,13 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
                 charge_public_peer(&network_handle, peer, tier).await;
             }
         }
-        OpeningRead::AtCapacity => {
+        OpeningRead::AtCapacity(refusal) => {
             debug!(
                 target: "worker::network",
                 %peer,
                 ?tier,
-                "batch-serve pool is full, denying inbound sync stream"
+                ?refusal,
+                "batch-serve admission refused, denying inbound sync stream"
             );
             // a refusal is free only when the request was prompt; the refused stream holds
             // no serve permit, so the charge goes out before the deny
@@ -439,10 +779,11 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
 ///
 /// Called for a silent, unreadable or non-request opening frame, for a request
 /// that arrives in the second half of its opening-read bound (admitted or
-/// refused), and for a stalled serve (the peer stopped reading, or stopped or
-/// closed the stream after the serve began). A prompt [`DenyReason::AtCapacity`]
-/// refusal is not charged. A committee peer is never charged, because load on
-/// either side can slow an honest committee peer.
+/// refused), for a stalled serve (the peer stopped reading, or stopped or
+/// closed the stream after the serve began), for a public serve cut at the hold
+/// limit, and for a request above the digest cap. A prompt
+/// [`DenyReason::AtCapacity`] refusal is not charged. A committee peer is never charged, because
+/// load on either side can slow an honest committee peer.
 async fn charge_public_peer(
     network_handle: &WorkerNetworkHandle,
     peer: BlsPublicKey,
@@ -512,7 +853,7 @@ async fn serve_sync_request<DB: Database>(
     if serves_sync_epoch(epoch, req_epoch) {
         // cap to the node's max
         let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-            warn!(
+            debug!(
                 target: "worker::network",
                 %peer,
                 requested = batch_digests.len(),
@@ -710,23 +1051,24 @@ pub struct WorkerNetwork<DB, Events> {
     request_handler: RequestHandler<DB>,
     /// Opening-read pool for inbound sync streams.
     ///
-    /// A stream holds a permit while its opening request frame is read, which
+    /// A stream holds its per-peer slot (capped at [`MAX_PENDING_REQUESTS_PER_PEER`])
+    /// through both admission phases, so one peer cannot fill either pool, and an
+    /// opening-read permit while its opening request frame is read, which
     /// [`SYNC_REQUEST_READ_TIMEOUT`] bounds: [`MAX_CONCURRENT_OPENING_READS`] public
     /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] for each committee key,
-    /// which only that key may take.
-    sync_opening: ReservedPool,
-    /// Batch-serve pool for inbound sync streams.
+    /// which only that key may take. A public key holds opening permits within
+    /// [`PUBLIC_OPENING_HOLD_BUDGET`] per [`PUBLIC_OPENING_HOLD_WINDOW`].
+    sync_opening: OpeningAdmission,
+    /// The batch-serve budgets for inbound sync streams: the pool, the per-key
+    /// public serve cap and the public hold budget.
     ///
-    /// A stream takes a permit after its request frame is read and holds it until
-    /// the serve ends: [`MAX_CONCURRENT_BATCH_STREAMS`] public permits plus
-    /// [`COMMITTEE_RESERVED_BATCH_STREAMS`] for each committee key, which only that
-    /// key may take.
-    batch_serve: ReservedPool,
-    /// Per-peer in-flight sync streams, capped at [`MAX_PENDING_REQUESTS_PER_PEER`].
-    ///
-    /// A stream holds its slot through both admission phases, so one peer cannot
-    /// fill either pool.
-    sync_peer_slots: PeerSlots,
+    /// A stream takes its grants after its request frame is read and holds them
+    /// until the serve ends. The pool has [`MAX_CONCURRENT_BATCH_STREAMS`] public
+    /// permits plus [`COMMITTEE_RESERVED_BATCH_STREAMS`] for each committee key,
+    /// which only that key may take; a public key serves on at most
+    /// [`PUBLIC_BATCH_SERVES_PER_PEER`] streams at a time and within
+    /// [`PUBLIC_BATCH_SERVE_HOLD_BUDGET`] per [`PUBLIC_BATCH_SERVE_HOLD_WINDOW`].
+    batch_serve: BatchServeAdmission,
     /// Per-peer in-flight batch report validations, capped at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`].
     ///
@@ -783,15 +1125,8 @@ where
             network_events,
             network_handle,
             request_handler,
-            sync_opening: ReservedPool::new(
-                MAX_CONCURRENT_OPENING_READS,
-                COMMITTEE_RESERVED_OPENING_READS,
-            ),
-            batch_serve: ReservedPool::new(
-                MAX_CONCURRENT_BATCH_STREAMS,
-                COMMITTEE_RESERVED_BATCH_STREAMS,
-            ),
-            sync_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            sync_opening: OpeningAdmission::new(),
+            batch_serve: BatchServeAdmission::new(),
             report_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
             report_shed: report_shed_counter(id),
             reserved_peers,
@@ -1009,9 +1344,7 @@ where
         // shed path instead of spawning here, so over-cap substream bursts cannot
         // fan out past the shed budget (#1254).
         let tier = self.reserved_peers.tier(&peer);
-        let Some(admission) =
-            try_admit_opening(&self.sync_peer_slots, &self.sync_opening, peer, tier)
-        else {
+        let Some(admission) = try_admit_opening(&self.sync_opening, peer, tier) else {
             self.shed_inbound_sync_stream(peer, stream);
             return;
         };
@@ -1097,27 +1430,27 @@ mod tests {
     #[test]
     fn sync_admit_enforces_per_peer_cap_and_frees_on_drop() {
         let p = peer();
-        let (slots, opening, _batch_serve) = admission_budgets();
+        let (opening, _batch_serve) = admission_budgets();
         let held = MAX_CONCURRENT_OPENING_READS.saturating_sub(MAX_PENDING_REQUESTS_PER_PEER);
 
         // admit up to the per-peer cap
         let admissions: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
             .map(|_| {
-                try_admit_opening(&slots, &opening, p, PeerTier::Public)
+                try_admit_opening(&opening, p, PeerTier::Public)
                     .expect("admit below the per-peer cap")
             })
             .collect();
-        assert_eq!(slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER);
-        assert_eq!(opening.available_public(), held);
+        assert_eq!(opening.slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER);
+        assert_eq!(opening.pool.available_public(), held);
 
         // at the cap: the next admit is refused and keeps no opening-read permit
-        assert!(try_admit_opening(&slots, &opening, p, PeerTier::Public).is_none());
-        assert_eq!(opening.available_public(), held);
+        assert!(try_admit_opening(&opening, p, PeerTier::Public).is_none());
+        assert_eq!(opening.pool.available_public(), held);
 
         // dropping the admissions frees the opening-read permits and the peer's slots
         drop(admissions);
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(slots.in_flight(&p), 0);
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(opening.slots.in_flight(&p), 0);
     }
 
     /// Report admission up to the per-peer cap succeeds; the next report from the same peer
@@ -1409,9 +1742,9 @@ mod tests {
     // and the permit returns (#1718).
     #[tokio::test(start_paused = true)]
     async fn deny_unserved_sync_epoch_is_bounded_and_frees_permit() {
-        let (_slots, _opening, batch_serve) = admission_budgets();
+        let (_opening, batch_serve) = admission_budgets();
         let permit =
-            batch_serve.try_acquire(&key(1), PeerTier::Public).expect("admit below the caps");
+            batch_serve.pool.try_acquire(&key(1), PeerTier::Public).expect("admit below the caps");
 
         // hold the permit on a task blocked on the pending deny write
         let task = tokio::spawn(async move {
@@ -1421,7 +1754,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert_eq!(
-            batch_serve.available_public(),
+            batch_serve.pool.available_public(),
             MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(1),
             "the blocked deny task holds its permit"
         );
@@ -1429,7 +1762,7 @@ mod tests {
         // the bounded write trips SYNC_REQUEST_READ_TIMEOUT and the permit returns
         tokio::time::advance(SYNC_REQUEST_READ_TIMEOUT + Duration::from_secs(1)).await;
         task.await.expect("deny task completes");
-        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
     }
 
     /// A deterministic BLS public key for `seed`, for tests that need several
@@ -1438,14 +1771,9 @@ mod tests {
         *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public()
     }
 
-    /// The per-peer slots, opening-read pool, and batch-serve pool, at the sizes
-    /// the live network uses.
-    fn admission_budgets() -> (PeerSlots, ReservedPool, ReservedPool) {
-        (
-            PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
-            ReservedPool::new(MAX_CONCURRENT_OPENING_READS, COMMITTEE_RESERVED_OPENING_READS),
-            ReservedPool::new(MAX_CONCURRENT_BATCH_STREAMS, COMMITTEE_RESERVED_BATCH_STREAMS),
-        )
+    /// The opening and batch-serve budgets, at the sizes the live network uses.
+    fn admission_budgets() -> (OpeningAdmission, BatchServeAdmission) {
+        (OpeningAdmission::new(), BatchServeAdmission::new())
     }
 
     /// A network handle whose commands (such as reported penalties) arrive on the
@@ -1526,14 +1854,17 @@ mod tests {
     /// ends, while the task is still stuck on its bounded control write or close;
     /// that the per-peer slot lasts for the task; and that no serve runs. Returns
     /// the peer of every `Mild` penalty charged.
-    async fn stuck_opening(wire: Vec<u8>, batch_serve: ReservedPool) -> Vec<Option<BlsPublicKey>> {
+    async fn stuck_opening(
+        wire: Vec<u8>,
+        batch_serve: BatchServeAdmission,
+    ) -> Vec<Option<BlsPublicKey>> {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
-        let (slots, opening, _batch_serve) = admission_budgets();
+        let (opening, _batch_serve) = admission_budgets();
         let served = Arc::new(AtomicUsize::new(0));
         let peer = key(1);
-        let admission = try_admit_opening(&slots, &opening, peer, PeerTier::Public)
-            .expect("opening read admitted");
+        let admission =
+            try_admit_opening(&opening, peer, PeerTier::Public).expect("opening read admitted");
         let task = tokio::spawn(admit_and_serve_sync_stream(
             RequestStream::new(wire, WriteCredit::Withheld),
             admission,
@@ -1546,12 +1877,12 @@ mod tests {
         // the opening read has ended; the bounded control write or close is pending
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(
-            opening.available_public(),
+            opening.pool.available_public(),
             MAX_CONCURRENT_OPENING_READS,
             "the opening-read permit is free once the read ends"
         );
         assert!(!task.is_finished(), "the bounded control write or close is still pending");
-        assert_eq!(slots.in_flight(&peer), 1, "the per-peer slot lasts for the task");
+        assert_eq!(opening.slots.in_flight(&peer), 1, "the per-peer slot lasts for the task");
 
         // past the write and close bounds: the task ends and frees the slot
         tokio::time::advance(
@@ -1559,7 +1890,7 @@ mod tests {
         )
         .await;
         task.await.expect("stuck opening task");
-        assert_eq!(slots.in_flight(&peer), 0);
+        assert_eq!(opening.slots.in_flight(&peer), 0);
         assert_eq!(served.load(Ordering::SeqCst), 0, "no stuck opening reaches the serve phase");
         drain_mild_penalties(&mut commands)
     }
@@ -1711,112 +2042,119 @@ mod tests {
     /// committee key keeps its whole reserve and is still admitted (issue #1750).
     #[test]
     fn public_opening_reads_cannot_exhaust_the_committee_reserve() {
-        let (slots, opening, _batch_serve) = admission_budgets();
+        let (opening, _batch_serve) = admission_budgets();
         let (committee, other) = (key(200), key(201));
 
         // one opening read each from as many public peers as the public share holds
         let public: Vec<_> = (0_u64..)
             .take(MAX_CONCURRENT_OPENING_READS)
             .map(|seed| {
-                try_admit_opening(&slots, &opening, key(seed), PeerTier::Public)
+                try_admit_opening(&opening, key(seed), PeerTier::Public)
                     .expect("public opening read within the public share")
             })
             .collect();
-        assert_eq!(opening.available_public(), 0);
+        assert_eq!(opening.pool.available_public(), 0);
         assert!(
-            try_admit_opening(&slots, &opening, key(100), PeerTier::Public).is_none(),
+            try_admit_opening(&opening, key(100), PeerTier::Public).is_none(),
             "a new public peer is refused once the public share is full"
         );
-        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.pool.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
 
         // one committee key opens streams from its own reserve until it is empty
         let drained: Vec<_> = std::iter::repeat_with(|| {
-            try_admit_opening(&slots, &opening, committee, PeerTier::Committee)
+            try_admit_opening(&opening, committee, PeerTier::Committee)
                 .expect("committee opening read from its own reserve")
         })
         .take(COMMITTEE_RESERVED_OPENING_READS)
         .collect();
-        assert_eq!(opening.available_reserved(&committee), 0);
+        assert_eq!(opening.pool.available_reserved(&committee), 0);
         assert!(
-            try_admit_opening(&slots, &opening, committee, PeerTier::Committee).is_none(),
+            try_admit_opening(&opening, committee, PeerTier::Committee).is_none(),
             "a committee key is refused once its own reserve and the public share are full"
         );
 
         // a second committee key keeps its whole reserve and is still admitted
-        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
-        let admitted = try_admit_opening(&slots, &opening, other, PeerTier::Committee)
+        assert_eq!(opening.pool.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+        let admitted = try_admit_opening(&opening, other, PeerTier::Committee)
             .expect("a second committee key opens from its own reserve");
         assert_eq!(
-            opening.available_reserved(&other),
+            opening.pool.available_reserved(&other),
             COMMITTEE_RESERVED_OPENING_READS.saturating_sub(1)
         );
 
         drop((public, drained, admitted));
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
-        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(opening.pool.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.pool.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
-    /// Three public identities, each at the per-peer cap, open six streams with
-    /// readable requests while every serve stays pending. Five streams fill the
-    /// public share of the batch-serve pool and the sixth is refused, but none of
+    /// Five public identities, each at the per-peer cap, open ten streams with
+    /// readable requests while every serve stays pending. One stream of each
+    /// identity is served and the five fill the public share of the batch-serve
+    /// pool; the other stream of each is refused at the per-key serve cap. None of
     /// them can take a committee reserve, so a committee request is still
     /// admitted and served from the reserve of its key. A second committee key
     /// keeps its whole reserve, and its request is served too (issue #1750).
     #[tokio::test(start_paused = true)]
-    async fn three_public_identities_cannot_block_a_committee_batches_request() {
+    async fn five_public_identities_cannot_block_a_committee_batches_request() {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
-        let (slots, opening, batch_serve) = admission_budgets();
-        let (committee, other) = (key(0), key(4));
+        let (opening, batch_serve) = admission_budgets();
+        let (committee, other) = (key(0), key(6));
         let reserved = ReservedPeers::new([committee, other]);
         let served = Arc::new(AtomicUsize::new(0));
         let max_frame = max_sync_frame_size(0);
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
 
-        // six streams: two from each of three public identities
-        let tasks: Vec<_> = (1_u64..=3)
-            .flat_map(|seed| std::iter::repeat_n(key(seed), MAX_PENDING_REQUESTS_PER_PEER))
-            .map(|public| {
-                let admission = try_admit_opening(&slots, &opening, public, reserved.tier(&public))
-                    .expect("public opening read admitted");
-                tokio::spawn(admit_and_serve_sync_stream(
-                    RequestStream::new(request.clone(), WriteCredit::Granted),
-                    admission,
-                    batch_serve.clone(),
-                    handle.clone(),
-                    max_frame,
-                    pending_serve(served.clone()),
-                ))
-            })
-            .collect();
+        // ten streams: two from each of five public identities; the public opening-read share
+        // admits eight reads at once, so the fifth identity opens once the first four have read
+        // their requests and released their opening-read permits
+        let open_pair = |seed: u64| -> Vec<tokio::task::JoinHandle<()>> {
+            std::iter::repeat_n(key(seed), MAX_PENDING_REQUESTS_PER_PEER)
+                .map(|public| {
+                    let admission = try_admit_opening(&opening, public, reserved.tier(&public))
+                        .expect("public opening read admitted");
+                    tokio::spawn(admit_and_serve_sync_stream(
+                        RequestStream::new(request.clone(), WriteCredit::Granted),
+                        admission,
+                        batch_serve.clone(),
+                        handle.clone(),
+                        max_frame,
+                        pending_serve(served.clone()),
+                    ))
+                })
+                .collect()
+        };
+        let first_wave: Vec<_> = (1_u64..=4).flat_map(&open_pair).collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let tasks: Vec<_> = first_wave.into_iter().chain(open_pair(5)).collect();
         // let every task read its request and reach its serve or its refusal
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert_eq!(
             served.load(Ordering::SeqCst),
             MAX_CONCURRENT_BATCH_STREAMS,
-            "the public share admits five public serves"
+            "the public share admits one serve per public key"
         );
-        assert_eq!(batch_serve.available_public(), 0, "the public share is full");
+        assert_eq!(batch_serve.pool.available_public(), 0, "the public share is full");
         assert_eq!(
-            batch_serve.available_reserved(&committee),
+            batch_serve.pool.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS,
             "public peers never take a committee reserve"
         );
         assert_eq!(
             tasks.iter().filter(|task| task.is_finished()).count(),
-            1,
-            "the sixth public stream is refused at the serve phase"
+            MAX_CONCURRENT_BATCH_STREAMS,
+            "the second stream of each public key is refused at the serve phase"
         );
         assert_eq!(
-            opening.available_public(),
+            opening.pool.available_public(),
             MAX_CONCURRENT_OPENING_READS,
             "served and refused streams hold no opening-read permit"
         );
 
         // the committee request is admitted and served from the reserve
-        let admission = try_admit_opening(&slots, &opening, committee, reserved.tier(&committee))
+        let admission = try_admit_opening(&opening, committee, reserved.tier(&committee))
             .expect("committee opening read admitted");
         let committee_task = tokio::spawn(admit_and_serve_sync_stream(
             RequestStream::new(request.clone(), WriteCredit::Granted),
@@ -1834,7 +2172,7 @@ mod tests {
             "the committee request is served"
         );
         assert_eq!(
-            batch_serve.available_reserved(&committee),
+            batch_serve.pool.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
             "the committee serve holds a permit from the reserve of its key"
         );
@@ -1842,11 +2180,11 @@ mod tests {
 
         // a second committee key keeps its whole reserve, so its request is served too
         assert_eq!(
-            batch_serve.available_reserved(&other),
+            batch_serve.pool.available_reserved(&other),
             COMMITTEE_RESERVED_BATCH_STREAMS,
             "one committee key never takes the reserve of another"
         );
-        let admission = try_admit_opening(&slots, &opening, other, reserved.tier(&other))
+        let admission = try_admit_opening(&opening, other, reserved.tier(&other))
             .expect("second committee opening read admitted");
         let other_task = tokio::spawn(admit_and_serve_sync_stream(
             RequestStream::new(request, WriteCredit::Granted),
@@ -1864,7 +2202,7 @@ mod tests {
             "the second committee request is served"
         );
         assert_eq!(
-            batch_serve.available_reserved(&other),
+            batch_serve.pool.available_reserved(&other),
             COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
             "the second committee serve holds a permit from the reserve of its key"
         );
@@ -1882,11 +2220,11 @@ mod tests {
         let step = opening_read_bound(PeerTier::Public) / 4;
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
-        let (slots, opening, batch_serve) = admission_budgets();
+        let (opening, batch_serve) = admission_budgets();
         let served = Arc::new(AtomicUsize::new(0));
         let (first_peer, second_peer, third_peer) = (key(1), key(2), key(3));
         let open = |peer: BlsPublicKey| {
-            let admission = try_admit_opening(&slots, &opening, peer, PeerTier::Public)
+            let admission = try_admit_opening(&opening, peer, PeerTier::Public)
                 .expect("silent peer's opening read admitted");
             tokio::spawn(admit_and_serve_sync_stream(
                 SilentStream,
@@ -1907,13 +2245,13 @@ mod tests {
         tokio::time::advance(step).await;
         let third = open(third_peer);
         tokio::task::yield_now().await;
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(3));
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(3));
 
         // t = 4.5 steps (1125 ms): only the first stream's read window has closed
         tokio::time::advance(step * 2 + step / 2).await;
         first.await.expect("first silent stream task");
         assert_eq!(drain_mild_penalties(&mut commands), vec![Some(first_peer)]);
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(2));
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(2));
 
         // t = 6.5 steps (1625 ms): the other two read windows have closed
         tokio::time::advance(step * 2).await;
@@ -1924,9 +2262,11 @@ mod tests {
         assert!(charged.contains(&Some(second_peer)) && charged.contains(&Some(third_peer)));
 
         assert_eq!(served.load(Ordering::SeqCst), 0, "no silent stream reaches the serve phase");
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
-        assert!([first_peer, second_peer, third_peer].iter().all(|p| slots.in_flight(p) == 0));
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert!([first_peer, second_peer, third_peer]
+            .iter()
+            .all(|p| opening.slots.in_flight(p) == 0));
     }
 
     /// A peer that gives the stream no write credit cannot pin the `Ack` write: it
@@ -1959,7 +2299,7 @@ mod tests {
     async fn stalled_ack_write_returns_serve_permit_at_bound() {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
-        let (slots, opening, batch_serve) = admission_budgets();
+        let (opening, batch_serve) = admission_budgets();
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
             ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
@@ -1968,8 +2308,8 @@ mod tests {
         let peer = key(1);
         let max_frame = max_sync_frame_size(0);
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
-        let admission = try_admit_opening(&slots, &opening, peer, PeerTier::Public)
-            .expect("opening read admitted");
+        let admission =
+            try_admit_opening(&opening, peer, PeerTier::Public).expect("opening read admitted");
         let one_held = MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(1);
 
         let task = tokio::spawn(admit_and_serve_sync_stream(
@@ -1994,19 +2334,19 @@ mod tests {
             },
         ));
         tokio::task::yield_now().await;
-        assert_eq!(batch_serve.available_public(), one_held, "the serve holds a permit");
+        assert_eq!(batch_serve.pool.available_public(), one_held, "the serve holds a permit");
 
         // just inside the ack bound: the permit is still held
         tokio::time::advance(SYNC_REQUEST_READ_TIMEOUT.saturating_sub(Duration::from_millis(1)))
             .await;
         tokio::task::yield_now().await;
-        assert_eq!(batch_serve.available_public(), one_held, "held inside the ack bound");
+        assert_eq!(batch_serve.pool.available_public(), one_held, "held inside the ack bound");
 
         // just past the ack bound: the write fails and the permit returns
         tokio::time::advance(Duration::from_millis(2)).await;
         task.await.expect("serve task");
-        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
-        assert_eq!(slots.in_flight(&peer), 0);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(opening.slots.in_flight(&peer), 0);
         assert_eq!(drain_mild_penalties(&mut commands), vec![Some(peer)]);
     }
 
@@ -2041,7 +2381,7 @@ mod tests {
     /// while the bounded close is still pending, and is charged one `Mild` penalty.
     #[tokio::test(start_paused = true)]
     async fn unreadable_openings_free_the_budget_and_are_charged() {
-        let (_slots, _opening, batch_serve) = admission_budgets();
+        let (_opening, batch_serve) = admission_budgets();
         assert_eq!(stuck_opening(Vec::new(), batch_serve).await, vec![Some(key(1))]);
     }
 
@@ -2051,7 +2391,7 @@ mod tests {
     /// one `Mild` penalty.
     #[tokio::test(start_paused = true)]
     async fn unexpected_openings_free_the_budget_and_are_charged() {
-        let (_slots, _opening, batch_serve) = admission_budgets();
+        let (_opening, batch_serve) = admission_budgets();
         assert_eq!(stuck_opening(encoded_ack().await, batch_serve).await, vec![Some(key(1))]);
     }
 
@@ -2061,15 +2401,16 @@ mod tests {
     /// share is full.
     #[tokio::test(start_paused = true)]
     async fn at_capacity_openings_free_the_budget_without_a_charge() {
-        let (_slots, _opening, batch_serve) = admission_budgets();
+        let (_opening, batch_serve) = admission_budgets();
         let held: Vec<_> = (0..MAX_CONCURRENT_BATCH_STREAMS)
             .map(|_| {
                 batch_serve
+                    .pool
                     .try_acquire(&key(1), PeerTier::Public)
                     .expect("public batch-serve permit")
             })
             .collect();
-        assert_eq!(batch_serve.available_public(), 0, "the public share is full");
+        assert_eq!(batch_serve.pool.available_public(), 0, "the public share is full");
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
         assert!(
             stuck_opening(request, batch_serve.clone()).await.is_empty(),
@@ -2077,7 +2418,7 @@ mod tests {
         );
         // the held permits keep the public share full for the whole exchange
         drop(held);
-        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
     }
 
     /// A valid request that arrives in the second half of the public window is
@@ -2087,7 +2428,7 @@ mod tests {
     async fn late_valid_public_openings_are_charged() {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
-        let (slots, opening, batch_serve) = admission_budgets();
+        let (opening, batch_serve) = admission_budgets();
         let served = Arc::new(AtomicUsize::new(0));
         let max_frame = max_sync_frame_size(0);
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
@@ -2100,7 +2441,7 @@ mod tests {
             .iter()
             .flat_map(|peer| std::iter::repeat_n(*peer, MAX_PENDING_REQUESTS_PER_PEER))
             .map(|public| {
-                let admission = try_admit_opening(&slots, &opening, public, PeerTier::Public)
+                let admission = try_admit_opening(&opening, public, PeerTier::Public)
                     .expect("public opening read admitted");
                 let served = served.clone();
                 tokio::spawn(admit_and_serve_sync_stream(
@@ -2116,7 +2457,7 @@ mod tests {
                 ))
             })
             .collect();
-        assert_eq!(opening.available_public(), 0, "the late openings fill the public share");
+        assert_eq!(opening.pool.available_public(), 0, "the late openings fill the public share");
 
         // every request arrives just inside the public read bound
         tokio::task::yield_now().await;
@@ -2137,10 +2478,544 @@ mod tests {
                 "each late stream of a peer is charged"
             );
         });
-        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
-        assert_eq!(batch_serve.available_reserved(&committee), COMMITTEE_RESERVED_BATCH_STREAMS);
-        assert!(peers.iter().all(|peer| slots.in_flight(peer) == 0));
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(
+            batch_serve.pool.available_reserved(&committee),
+            COMMITTEE_RESERVED_BATCH_STREAMS
+        );
+        assert!(peers.iter().all(|peer| opening.slots.in_flight(peer) == 0));
+    }
+
+    /// A public serve that is still running at `PUBLIC_BATCH_SERVE_TIMEOUT` is cut
+    /// there: its pool permit, serve slot and peer slot return, and the peer is
+    /// charged one `Mild` penalty. A committee serve started at the same time keeps
+    /// running on its reserve.
+    #[tokio::test(start_paused = true)]
+    async fn public_batch_serve_is_cut_at_the_hold_limit_and_charged() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let (public, committee) = (key(1), key(0));
+        let reserved = ReservedPeers::new([committee]);
+        let open = |peer: BlsPublicKey| {
+            let admission = try_admit_opening(&opening, peer, reserved.tier(&peer))
+                .expect("opening read admitted");
+            tokio::spawn(admit_and_serve_sync_stream(
+                RequestStream::new(request.clone(), WriteCredit::Granted),
+                admission,
+                batch_serve.clone(),
+                handle.clone(),
+                max_frame,
+                pending_serve(served.clone()),
+            ))
+        };
+
+        let public_task = open(public);
+        let committee_task = open(committee);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 2, "both serves are running");
+        assert_eq!(
+            batch_serve.pool.available_public(),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(1),
+            "the public serve holds a public permit"
+        );
+        assert_eq!(batch_serve.public_serves.in_flight(&public), 1);
+
+        // just inside the hold limit: the public serve still runs
+        tokio::time::advance(PUBLIC_BATCH_SERVE_TIMEOUT.saturating_sub(Duration::from_millis(2)))
+            .await;
+        tokio::task::yield_now().await;
+        assert!(!public_task.is_finished(), "the public serve runs inside the hold limit");
+
+        // at the limit: the public serve is cut, every grant returns, and the key is charged
+        tokio::time::advance(Duration::from_millis(2)).await;
+        public_task.await.expect("public serve task");
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(batch_serve.public_serves.in_flight(&public), 0);
+        assert_eq!(opening.slots.in_flight(&public), 0);
+        assert_eq!(drain_mild_penalties(&mut commands), vec![Some(public)]);
+
+        // the committee serve keeps running on its reserve
+        assert!(!committee_task.is_finished(), "a committee serve has no hold limit");
+        assert_eq!(
+            batch_serve.pool.available_reserved(&committee),
+            COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
+            "the committee serve still holds its reserve permit"
+        );
+    }
+
+    /// A public key at the per-peer stream cap opens two streams with readable
+    /// requests: one is served and the other is refused at the serve phase without
+    /// a charge, so one public key holds one batch-serve permit at a time. A
+    /// committee key serves on both of its streams.
+    #[tokio::test(start_paused = true)]
+    async fn a_public_key_holds_one_batch_serve_permit_at_a_time() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let (public, committee) = (key(1), key(0));
+        let reserved = ReservedPeers::new([committee]);
+        let open_pair = |peer: BlsPublicKey| -> Vec<tokio::task::JoinHandle<()>> {
+            (0..MAX_PENDING_REQUESTS_PER_PEER)
+                .map(|_| {
+                    let admission = try_admit_opening(&opening, peer, reserved.tier(&peer))
+                        .expect("opening read admitted");
+                    tokio::spawn(admit_and_serve_sync_stream(
+                        RequestStream::new(request.clone(), WriteCredit::Granted),
+                        admission,
+                        batch_serve.clone(),
+                        handle.clone(),
+                        max_frame,
+                        pending_serve(served.clone()),
+                    ))
+                })
+                .collect()
+        };
+
+        let public_tasks = open_pair(public);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 1, "one stream of the public key is served");
+        assert_eq!(
+            public_tasks.iter().filter(|task| task.is_finished()).count(),
+            1,
+            "the other stream of the public key is refused at the serve phase"
+        );
+        assert_eq!(
+            batch_serve.pool.available_public(),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(1),
+            "the refused stream holds no pool permit"
+        );
+        assert_eq!(batch_serve.public_serves.in_flight(&public), PUBLIC_BATCH_SERVES_PER_PEER);
+        assert!(drain_mild_penalties(&mut commands).is_empty(), "a per-key refusal is not charged");
+
+        let committee_tasks = open_pair(committee);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 3, "a committee key serves on both streams");
+        assert!(committee_tasks.iter().all(|task| !task.is_finished()));
+        assert!(drain_mild_penalties(&mut commands).is_empty(), "no committee stream is charged");
+    }
+
+    /// A public key whose serve was cut at the hold limit has used its whole hold
+    /// budget: its next request is refused `AtCapacity` without a charge while a
+    /// fresh key is served, and it is served again once the window has refilled
+    /// its budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_public_key_that_used_its_hold_budget_is_refused_until_it_refills() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let (spent, fresh) = (key(1), key(2));
+        let open = |peer: BlsPublicKey| {
+            let admission =
+                try_admit_opening(&opening, peer, PeerTier::Public).expect("opening read admitted");
+            tokio::spawn(admit_and_serve_sync_stream(
+                RequestStream::new(request.clone(), WriteCredit::Granted),
+                admission,
+                batch_serve.clone(),
+                handle.clone(),
+                max_frame,
+                pending_serve(served.clone()),
+            ))
+        };
+
+        // the first serve runs to the hold limit and is cut there
+        let first = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 1, "the first request is served");
+        tokio::time::advance(PUBLIC_BATCH_SERVE_TIMEOUT).await;
+        first.await.expect("first serve task");
+        assert_eq!(drain_mild_penalties(&mut commands), vec![Some(spent)]);
+
+        // the key has no hold budget left: refused at once, uncharged, and the pool is whole
+        let refused = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(refused.is_finished(), "the spent key is refused at the serve phase");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "the refused request is not served");
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "a hold-budget refusal is not charged"
+        );
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(opening.slots.in_flight(&spent), 0);
+
+        // a fresh key is served
+        let other = open(fresh);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 2, "a fresh key is served");
+        assert!(!other.is_finished());
+
+        // the window refills the budget and the spent key is served again
+        tokio::time::advance(PUBLIC_BATCH_SERVE_HOLD_WINDOW.saturating_add(Duration::from_secs(1)))
+            .await;
+        let again = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 3, "the spent key is served after the window");
+        assert!(!again.is_finished());
+    }
+
+    /// A public key whose serve completed just inside the hold limit is charged the time it was
+    /// served, and with less than a full hold of budget left it is refused, uncharged, until that
+    /// charge has leaked: 58 s served means 290 s refused. A fresh key is served meanwhile. So a
+    /// key never gets two full holds back to back (GHSA-pg7j-w22m-3qj5, review round 2).
+    #[tokio::test(start_paused = true)]
+    async fn a_public_key_that_completed_a_serve_near_the_limit_waits_for_the_refill() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let (spent, fresh) = (key(1), key(2));
+        let near_limit = PUBLIC_BATCH_SERVE_TIMEOUT.saturating_sub(Duration::from_secs(2));
+        let open = |peer: BlsPublicKey| {
+            let admission =
+                try_admit_opening(&opening, peer, PeerTier::Public).expect("opening read admitted");
+            let served = served.clone();
+            tokio::spawn(admit_and_serve_sync_stream(
+                RequestStream::new(request.clone(), WriteCredit::Granted),
+                admission,
+                batch_serve.clone(),
+                handle.clone(),
+                max_frame,
+                move |_stream: RequestStream, _request: WorkerSyncRequest| async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(near_limit).await;
+                    SyncServeOutcome::Completed
+                },
+            ))
+        };
+
+        // the first serve completes 2 s inside the hold limit and is not charged a penalty
+        let first = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 1, "the first request is served");
+        tokio::time::advance(near_limit).await;
+        first.await.expect("first serve task");
+        assert!(drain_mild_penalties(&mut commands).is_empty(), "a completed serve is free");
+
+        // 2 s of budget is short of a full hold: refused at once, uncharged, and the pool is whole
+        let refused = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(refused.is_finished(), "the spent key is refused at the serve phase");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "the refused request is not served");
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "a hold-budget refusal is not charged"
+        );
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(opening.slots.in_flight(&spent), 0);
+
+        // a fresh key is served
+        let other = open(fresh);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 2, "a fresh key is served");
+        assert!(!other.is_finished());
+
+        // 289 s later the 58 s charge has not fully leaked: still refused
+        tokio::time::advance(Duration::from_secs(289)).await;
+        let early = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(early.is_finished(), "the spent key is refused before its charge has leaked");
+        assert_eq!(served.load(Ordering::SeqCst), 2, "the early request is not served");
+
+        // one more second (plus the milliseconds the checks took) and the key is served again
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        let again = open(spent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 3, "the spent key is served after the refill");
+        assert!(!again.is_finished());
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "nothing in this exchange is charged"
+        );
+    }
+
+    /// Filling the public batch-serve share for a whole window needs 25 keys: five rounds of five
+    /// fresh keys, each held to the hold limit, over 300 s. A sixth key in any round finds the
+    /// share full, every key used so far is refused by its hold budget, and a key is granted
+    /// again only 300 s after its own round (GHSA-pg7j-w22m-3qj5, review round 2).
+    #[tokio::test(start_paused = true)]
+    async fn filling_the_public_share_for_a_window_needs_twenty_five_keys() {
+        /// Grant one round of fresh keys, hold them to the limit, release them, and check that
+        /// every key used so far is refused. Returns every key used so far.
+        async fn round(
+            batch_serve: &BatchServeAdmission,
+            used: Vec<BlsPublicKey>,
+            seeds: std::ops::Range<u64>,
+        ) -> Vec<BlsPublicKey> {
+            let fresh: Vec<BlsPublicKey> = seeds.map(key).collect();
+            let grants: Vec<ServeGrant> = fresh
+                .iter()
+                .map(|peer| {
+                    batch_serve
+                        .try_grant(peer, PeerTier::Public, Instant::now())
+                        .expect("a fresh key is granted while the share has room")
+                })
+                .collect();
+            assert_eq!(grants.len(), MAX_CONCURRENT_BATCH_STREAMS);
+            assert!(
+                matches!(
+                    batch_serve.try_grant(&key(1_000), PeerTier::Public, Instant::now()),
+                    Err(ServeRefusal::PoolFull)
+                ),
+                "a sixth fresh key finds the public share full"
+            );
+            tokio::time::advance(PUBLIC_BATCH_SERVE_TIMEOUT).await;
+            grants.into_iter().for_each(ServeGrant::release);
+            let used: Vec<BlsPublicKey> = used.into_iter().chain(fresh).collect();
+            assert!(
+                used.iter().all(|peer| matches!(
+                    batch_serve.try_grant(peer, PeerTier::Public, Instant::now()),
+                    Err(ServeRefusal::HoldBudget)
+                )),
+                "every key used so far is refused by its hold budget"
+            );
+            used
+        }
+
+        let batch_serve = BatchServeAdmission::new();
+        let used = round(&batch_serve, Vec::new(), 1..6).await;
+        let used = round(&batch_serve, used, 6..11).await;
+        let used = round(&batch_serve, used, 11..16).await;
+        let used = round(&batch_serve, used, 16..21).await;
+        let used = round(&batch_serve, used, 21..26).await;
+        assert_eq!(used.len(), 25, "five rounds of five keys fill the share for 300 s");
+
+        // 300 s after their round the first five keys are back; the second five are not
+        tokio::time::advance(PUBLIC_BATCH_SERVE_TIMEOUT).await;
+        let regranted: Vec<ServeGrant> = used
+            .iter()
+            .take(5)
+            .map(|peer| {
+                batch_serve
+                    .try_grant(peer, PeerTier::Public, Instant::now())
+                    .expect("a key is granted again once its window has passed")
+            })
+            .collect();
+        assert_eq!(regranted.len(), 5);
+        assert!(used.iter().skip(5).take(5).all(|peer| matches!(
+            batch_serve.try_grant(peer, PeerTier::Public, Instant::now()),
+            Err(ServeRefusal::HoldBudget)
+        )));
+    }
+
+    /// A public key that re-opens streams one after another, holding each opening permit for
+    /// just under half the read bound (below the late charge), is admitted only while it has a
+    /// full read bound of its opening budget left, and is then shed, uncharged. Its admitted
+    /// opening time lands between the budget less one hold and the budget. A fresh public key
+    /// and a committee key are still admitted, and the key is admitted again after the window
+    /// (GHSA-pg7j-w22m-3qj5, review round 2; the opening-phase residual of GHSA-vr4r-x9mm-6x9g).
+    #[tokio::test(start_paused = true)]
+    async fn public_opening_holds_are_budgeted_per_key() {
+        use futures::StreamExt as _;
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let spender = key(1);
+        let hold = (PUBLIC_SYNC_REQUEST_READ_TIMEOUT / 2).saturating_sub(Duration::from_millis(10));
+        let (opening_ref, batch_serve_ref, handle_ref, request_ref) =
+            (&opening, &batch_serve, &handle, &request);
+        // one opening: admitted or not, the task (if any) reads after `hold` and completes
+        let open_once = move || async move {
+            let task = try_admit_opening(opening_ref, spender, PeerTier::Public).map(|admission| {
+                tokio::spawn(admit_and_serve_sync_stream(
+                    DelayedStream::new(hold, request_ref.clone()),
+                    admission,
+                    batch_serve_ref.clone(),
+                    handle_ref.clone(),
+                    max_frame,
+                    |_stream: DelayedStream, _request: WorkerSyncRequest| {
+                        std::future::ready(SyncServeOutcome::Completed)
+                    },
+                ))
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(hold).await;
+            futures::future::OptionFuture::from(task)
+                .await
+                .map(|done| done.expect("opening task"))
+                .is_some()
+        };
+
+        // open until the opening budget sheds the key, at most 40 times
+        let admitted = futures::stream::iter(0..40u32)
+            .then(|_| open_once())
+            .take_while(|admitted| std::future::ready(*admitted))
+            .fold(0usize, |count, _| std::future::ready(count + 1))
+            .await;
+        assert!(admitted < 40, "the opening budget sheds the key");
+        assert!(admitted >= 10, "the budget admits many honest-sized openings");
+        let opening_time = hold.saturating_mul(u32::try_from(admitted).expect("count fits"));
+        assert!(
+            opening_time
+                >= PUBLIC_OPENING_HOLD_BUDGET.saturating_sub(PUBLIC_SYNC_REQUEST_READ_TIMEOUT),
+            "the key gets its budget less one reserved hold of opening time"
+        );
+        assert!(opening_time <= PUBLIC_OPENING_HOLD_BUDGET, "never more than the budget");
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "openings under half the bound are not late, and a shed opening is not charged"
+        );
+        assert_eq!(opening.pool.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(opening.slots.in_flight(&spender), 0);
+
+        // other keys are admitted at that instant
+        let fresh = try_admit_opening(&opening, key(2), PeerTier::Public);
+        let committee = try_admit_opening(&opening, key(3), PeerTier::Committee);
+        assert!(fresh.is_some(), "a fresh public key is admitted");
+        assert!(committee.is_some(), "a committee key is admitted");
+        drop((fresh, committee));
+
+        // the window refills the opening budget and the key is admitted again
+        tokio::time::advance(PUBLIC_OPENING_HOLD_WINDOW).await;
+        assert_eq!(
+            opening.public_hold.remaining(&spender, Instant::now()),
+            PUBLIC_OPENING_HOLD_BUDGET
+        );
+        assert!(try_admit_opening(&opening, spender, PeerTier::Public).is_some());
+    }
+
+    /// Three public keys, the GHSA-pg7j-w22m-3qj5 pattern, open five streams
+    /// with readable requests while every serve stays pending: one serve per key
+    /// runs and the other streams are refused, so the public share is never full.
+    /// The three serves are cut at the hold limit and charged, and the keys cannot
+    /// re-open at once: each is refused for the window while a fourth key is
+    /// served.
+    #[tokio::test(start_paused = true)]
+    async fn slow_public_readers_cannot_hold_the_public_share_for_the_window() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let keys: Vec<_> = (1_u64..=3).map(key).collect();
+        let open = |peer: BlsPublicKey| {
+            let admission =
+                try_admit_opening(&opening, peer, PeerTier::Public).expect("opening read admitted");
+            tokio::spawn(admit_and_serve_sync_stream(
+                RequestStream::new(request.clone(), WriteCredit::Granted),
+                admission,
+                batch_serve.clone(),
+                handle.clone(),
+                max_frame,
+                pending_serve(served.clone()),
+            ))
+        };
+
+        // five streams: two from each of the first two keys and one from the third
+        let tasks: Vec<_> = [1_u64, 1, 2, 2, 3].into_iter().map(key).map(&open).collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 3, "one serve per key runs");
+        assert_eq!(
+            tasks.iter().filter(|task| task.is_finished()).count(),
+            2,
+            "the second stream of a key is refused at the serve phase"
+        );
+        assert_eq!(
+            batch_serve.pool.available_public(),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(3),
+            "the public share is never full"
+        );
+        assert!(drain_mild_penalties(&mut commands).is_empty(), "no stream is charged yet");
+
+        // the three serves are cut at the hold limit and each key is charged once
+        tokio::time::advance(PUBLIC_BATCH_SERVE_TIMEOUT).await;
+        futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("serve tasks");
+        let charged = drain_mild_penalties(&mut commands);
+        assert_eq!(charged.len(), 3, "each cut serve is charged once");
+        assert!(keys.iter().all(|peer| charged.contains(&Some(*peer))));
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+
+        // the keys have used their hold budgets: re-opening at once is refused, uncharged
+        let reopened: Vec<_> = keys.iter().map(|peer| open(*peer)).collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(reopened.iter().all(|task| task.is_finished()), "every spent key is refused");
+        assert_eq!(served.load(Ordering::SeqCst), 3, "no spent key is served");
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "a hold-budget refusal is not charged"
+        );
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+
+        // a fourth key is served
+        let fourth = open(key(4));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(served.load(Ordering::SeqCst), 4, "a fresh key is served");
+        assert!(!fourth.is_finished());
+    }
+
+    /// A request that names more digests than `MAX_BATCH_DIGESTS_PER_REQUEST` is
+    /// handed to the serve whole, which truncates it, and a public requester is
+    /// charged one `Mild` penalty for it; a committee requester is not.
+    #[tokio::test(start_paused = true)]
+    async fn oversized_public_requests_are_served_truncated_and_charged() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (opening, batch_serve) = admission_budgets();
+        let max_frame = max_sync_frame_size(0);
+        let digest = |seed: usize| {
+            let mut bytes = [0_u8; 32];
+            bytes.iter_mut().zip(seed.to_be_bytes()).for_each(|(byte, seed)| *byte = seed);
+            B256::from(bytes)
+        };
+        let oversized = MAX_BATCH_DIGESTS_PER_REQUEST.saturating_add(1);
+        let digests: BTreeSet<B256> = (0..oversized).map(digest).collect();
+        assert_eq!(digests.len(), oversized, "every digest is distinct");
+        let request = encoded_request(digests).await;
+        let (public, committee) = (key(1), key(0));
+        let reserved = ReservedPeers::new([committee]);
+        let requested = Arc::new(AtomicUsize::new(0));
+        let open = |peer: BlsPublicKey| {
+            let admission = try_admit_opening(&opening, peer, reserved.tier(&peer))
+                .expect("opening read admitted");
+            let requested = requested.clone();
+            tokio::spawn(admit_and_serve_sync_stream(
+                RequestStream::new(request.clone(), WriteCredit::Granted),
+                admission,
+                batch_serve.clone(),
+                handle.clone(),
+                max_frame,
+                move |_stream: RequestStream, sync_request: WorkerSyncRequest| {
+                    requested.store(requested_digests(&sync_request), Ordering::SeqCst);
+                    std::future::ready(SyncServeOutcome::Completed)
+                },
+            ))
+        };
+
+        // a public requester is served the whole request and charged once
+        open(public).await.expect("public serve task");
+        assert_eq!(
+            requested.load(Ordering::SeqCst),
+            oversized,
+            "the serve sees every digest and truncates the request itself"
+        );
+        assert_eq!(drain_mild_penalties(&mut commands), vec![Some(public)]);
+        assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+
+        // a committee requester is served and not charged
+        open(committee).await.expect("committee serve task");
+        assert_eq!(requested.load(Ordering::SeqCst), oversized);
+        assert!(
+            drain_mild_penalties(&mut commands).is_empty(),
+            "a committee peer is never charged"
+        );
     }
 
     /// The write errors quinn reports when the requester stops the stream

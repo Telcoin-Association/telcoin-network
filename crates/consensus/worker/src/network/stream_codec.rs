@@ -247,8 +247,11 @@ mod tests {
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let result =
-            handle.read_sync_batches(&mut cursor, &digests).await.expect("read sync batches");
+        let result = handle
+            .read_sync_batches(&mut cursor, &digests)
+            .await
+            .expect("read sync batches")
+            .into_batches();
 
         assert_eq!(result.len(), batches.len());
         let received: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
@@ -291,8 +294,11 @@ mod tests {
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let result =
-            handle.read_sync_batches(&mut cursor, &digests).await.expect("read sync batches");
+        let result = handle
+            .read_sync_batches(&mut cursor, &digests)
+            .await
+            .expect("read sync batches")
+            .into_batches();
 
         // only the two batches present in the DB are served
         let expected: BTreeSet<B256> = batches[..2].iter().map(|b| b.digest()).collect();
@@ -382,8 +388,11 @@ mod tests {
         read_sync_ack(&mut cursor, max_frame).await;
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let received =
-            handle.read_sync_batches(&mut cursor, &digest_set).await.expect("read sync batches");
+        let received = handle
+            .read_sync_batches(&mut cursor, &digest_set)
+            .await
+            .expect("read sync batches")
+            .into_batches();
         let received: BTreeSet<B256> = received.iter().map(|(d, _)| *d).collect();
         assert_eq!(received, digest_set, "the sync responder must serve evicted batches");
 
@@ -444,8 +453,11 @@ mod tests {
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let result =
-            handle.read_sync_batches(&mut cursor, &digests).await.expect("read sync batches");
+        let result = handle
+            .read_sync_batches(&mut cursor, &digests)
+            .await
+            .expect("read sync batches")
+            .into_batches();
 
         assert_eq!(result.len(), batch_count);
         let received: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
@@ -553,8 +565,11 @@ mod tests {
         read_sync_ack(&mut cursor, max_frame).await;
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let result =
-            handle.read_sync_batches(&mut cursor, &digests).await.expect("read sync batches");
+        let result = handle
+            .read_sync_batches(&mut cursor, &digests)
+            .await
+            .expect("read sync batches")
+            .into_batches();
 
         // the first batch was read before its Data write triggered the eviction, and
         // every later batch was read after it; a whole-chunk read up front would
@@ -652,10 +667,9 @@ mod tests {
     /// test for the worker batch-sync slow-drip DoS (GHSA-h59j-q8p3-hw5v).
     #[tokio::test(start_paused = true)]
     async fn read_sync_batches_is_bounded_by_total_timeout() {
-        use crate::network::handle::{max_sync_frame_size, BATCH_STREAM_TOTAL_TIMEOUT};
+        use crate::network::handle::{max_sync_frame_size, StreamEnd, BATCH_STREAM_TOTAL_TIMEOUT};
         use futures::stream::{self, StreamExt};
         use std::time::Duration;
-        use tn_network_libp2p::error::NetworkError;
 
         // 4s < BATCH_STREAM_TIMEOUT (5s), so no single frame trips the inner bound
         let gap = Duration::from_secs(4);
@@ -695,15 +709,19 @@ mod tests {
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
 
         let start = tokio::time::Instant::now();
-        let outcome = handle.read_sync_batches(&mut reader, &digests).await.map(|b| b.len());
+        let outcome = handle.read_sync_batches(&mut reader, &digests).await.expect("stalled read");
         let elapsed = start.elapsed();
 
-        // the exchange is cut off, not run to completion
+        // the exchange is cut off, not run to completion: the stream stalled, and the
+        // batches validated before the bound are kept instead of dropped (#1773)
+        assert_eq!(outcome.end(), StreamEnd::Stalled, "expected a stalled stream");
+        let kept = outcome.into_batches().len();
         assert!(
-            matches!(outcome, Err(NetworkError::Timeout)),
-            "expected aggregate timeout, got {outcome:?}"
+            kept > 0 && kept < batches.len(),
+            "expected a partial read, got {kept} of {}",
+            batches.len()
         );
-        // and it is the aggregate bound (~210s) that fired, not a per-frame 5s stall
+        // and it is the aggregate bound (~95s) that fired, not a per-frame 5s stall
         assert!(
             elapsed >= BATCH_STREAM_TOTAL_TIMEOUT && elapsed < BATCH_STREAM_TOTAL_TIMEOUT + gap * 2,
             "total timeout should fire at ~{BATCH_STREAM_TOTAL_TIMEOUT:?}, fired at {elapsed:?}"
