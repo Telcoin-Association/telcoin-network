@@ -22,9 +22,11 @@ runs once.
   run of a revision: any change is real. The smoke test checks that two runs agree.
 
 Each row runs under the sync modes its result depends on (`--sync`). A row of one transaction's
-put loop or of reads does the same work under either mode, so it runs under `nosync` only
-(`n` below); a row with commits, or measured on a state built by several commits, runs under every
-selected mode (`*`); `reth.block.pages_synced` runs under `durable` only (`d`).
+put or delete loop, of the file one commit leaves, or of reads (on any state: under `nosync` the
+settles below make it the durable state) does the same work under either mode, so it runs under
+`nosync` only (`n` below); a time row that includes commits or is timed between them (the rewrite
+rows), and a size row of a state built by several commits, runs under every selected mode (`*`);
+`reth.block.pages_synced` runs under `durable` only (`d`).
 
 Under `nosync` no timed region calls `Env::sync`, so a commit row times the in-memory commit. A
 `nosync` environment reuses a freed page only once a sync has made the freeing commit durable, so
@@ -40,9 +42,9 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | row | op | sync | what it models |
 |---|---|---|---|
 | `put.seq` | put | n | `n` 8-byte big-endian sequential keys, 100-byte values, one transaction: the put loop |
-| `put.seq.commit` | commit | * | that transaction's commit (not gated at the quick tier, see below) |
+| `put.seq.commit` | commit | * | that transaction's commit (not gated in a run under 1M entries, see below) |
 | `put.rand` | put | n | `n` random 32-byte keys, one transaction: the put loop |
-| `put.rand.commit` | commit | * | its commit (not gated at the quick tier) |
+| `put.rand.commit` | commit | * | its commit (not gated in a run under 1M entries) |
 | `put.rand.file_bytes` | bytes | n | the file's used span (pages times page size) after it |
 | `put.append` | append | n | `put.seq` through `RwTxn::append` |
 | `put.cursor` | put | n | `put.seq` through `RwCursor::put` |
@@ -52,7 +54,7 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | `seek.range` | seek | n | a seek to a random absent key, then 9 `next` (100k seeks) |
 | `seek.range.sorted` | seek | n | the same targets sorted ascending, as a walker seeks |
 | `ro.txn` | transaction | n | short read transactions on one thread, each `begin_ro`, 2 point gets of random hits and its drop (20k), over a table of random entries small enough to stay in the caches (10k), so the gets do not bury the transaction's own cost under memory misses |
-| `ro.txn.mt` | transaction a thread | n | the same on 4 threads at once over one environment, each its own gets, started together: the span from the first thread's start to the last one's end over a thread's transactions. Equal to `ro.txn` when the threads share nothing they write; the ratio is what readers on several threads (an RPC node) pay for the state they share. The thread count is fixed so runs compare across machines; 4 stay on performance cores (an M1 Max has 8) |
+| `ro.txn.mt` | transaction a thread | n | the same on 4 threads at once over one environment, each its own gets, started together: the span from the first thread's start to the last one's end over a thread's transactions. Equal to `ro.txn` when the threads share nothing they write, but for the threads' start skew (the last thread to reach the barrier starts at once, the others once woken) and any wait for a core: it wants 4 idle cores, and on a shared runner it is noisy; the ratio is what readers on several threads (an RPC node) pay for the state they share. The thread count is fixed so runs compare across machines; 4 stay on performance cores (an M1 Max has 8) |
 | `commit.small` | transaction | * | transactions of 3 puts committed one by one into a fresh environment (2000) |
 | `mixed` | operation | * | 50/50 deletes and re-inserts over a full random table, 1000 a transaction (100k) |
 | `delete.rand90` | delete | n | 90% of a random table deleted in random order, one transaction |
@@ -68,7 +70,7 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | `reth.changesets.walk` | row | n | 10 `walk_range`s of 100 blocks: a seek, then steps across keys |
 | `reth.changesets.file_bytes` | bytes | * | the file's used span after the load |
 | `reth.history.rewrite` | key | * | reth's `append_history_index`: `TxnCursor::seek_exact` then `put` of the value grown 8 bytes, 20 sorted transactions over a table of `n` 28-byte keys (10k keys each) |
-| `reth.dup.rewrite` | pair | * | reth's `write_hashed_state` storage loop as engine calls: `DupTxnCursor::seek_dup_with_key_tail`, `delete_current`, `insert`, over a HashedStorages-shaped dup table (32/32) of `n` rows under 3 nested keys |
+| `reth.dup.rewrite` | pair | * | reth's `write_hashed_state` storage loop as engine calls, the ones the adapter issued before it made reth's dup rewrite one put: `DupTxnCursor::seek_dup_with_key_tail`, `delete_current`, `insert`, over a HashedStorages-shaped dup table (32/32) of `n` rows under 3 nested keys. The adapter's dup rewrite is now one `DupTxnCursor::put`, which `reth.block`'s slot upserts time |
 | `reth.block` | block | * | an execution output's writes, one transaction a block, commit included: a header (600 B), 50 transactions (200 B) and receipts (150 B) appended, 100 account upserts (32-byte keys, 80 B) over an `n / 10` account base (1k to 100k), about 300 storage slot upserts through a dup cursor, both changesets appended, 200 history index extensions (`n / 1000` blocks, 4 to 1000) |
 | `reth.block.file_bytes` | bytes | * | the file's used span after the blocks |
 | `reth.block.pages_synced` | pages | d | pages synced per block commit (`Env::io_stats`) |
@@ -95,8 +97,12 @@ tn-lmdb-bench [--tier quick|default|full] [--rows <pat,..>] [--groups generic,re
   error.
 - `--list` prints the (row, group, sync) triples the other arguments would run, tab-separated.
 - Progress goes to stderr, the summary table to stdout, the JSON to `--out`.
-- Exit 0 on success, 2 on a usage or environment error. On Linux a `$TMPDIR` on tmpfs or ramfs is
-  refused (syncs there cost nothing).
+- Exit 0 on success; 2 on a usage or environment error, refused before any work (a `$TMPDIR` on
+  tmpfs or ramfs on Linux, where syncs cost nothing, or one a temp dir cannot be made in; an
+  `--out` that cannot be written); 101 when the run itself fails (an engine error such as a full
+  disk, or a failed check of a workload's own results: a panic, its message on stderr).
+- An interrupted run (a signal) leaves its rep's `tn-lmdb-bench-*` dir under `$TMPDIR`; the
+  compare script removes its own.
 
 ```text
 cargo build --release -p tn-lmdb-bench
@@ -115,11 +121,12 @@ cargo build --release -p tn-lmdb-bench
 
 `metric` is `ns_per_op` (unit `ns`), `bytes` (`B`) or `pages_per_op` (`pages`); the last two are
 exact. A row is keyed by `name` and `sync`. `median` of an even count is the mean of the middle
-two. `gate` is false for a row the comparison reports but does not gate at the run's tier: the two
-single-commit rows (`put.seq.commit`, `put.rand.commit`) at the quick tier, where a commit of 100k
-entries takes a fraction of a millisecond, mostly writing fresh file pages, and its cost moves by
-10% and more from one run to the next with the machine's memory state, however many passes it
-takes. From the default tier on (1M entries, a commit of milliseconds) they are gated.
+two. `gate` is false for a row the comparison reports but does not gate at the run's size: the two
+single-commit rows (`put.seq.commit`, `put.rand.commit`) in a run of fewer than 1M entries a bulk
+table (`n`; the quick tier's 100k), where a commit of 100k entries takes a fraction of a
+millisecond, mostly writing fresh file pages, and its cost moves by 10% and more from one run to
+the next with the machine's memory state, however many passes it takes. From 1M entries on (the
+default and full tiers, or any `--n` of 1M or more; a commit of milliseconds) they are gated.
 
 ## Comparing two revisions
 
@@ -127,26 +134,28 @@ takes. From the default tier on (1M entries, a commit of milliseconds) they are 
 regression:
 
 ```sh
-etc/tn-lmdb-bench-compare.sh --tier quick a451515f4 HEAD               # two commits
-etc/tn-lmdb-bench-compare.sh --tier quick --worktree a451515f4         # the working tree as head
+etc/tn-lmdb-bench-compare.sh --tier quick HEAD~1 HEAD                  # two commits
+etc/tn-lmdb-bench-compare.sh --tier quick --worktree HEAD              # the working tree as head
 etc/tn-lmdb-bench-compare.sh --report-only <bench dir> --threshold 5   # the same runs, judged again
 ```
 
 Both sides run head's bench source, each built as a standalone package against its own side's
 `crates/tn-lmdb` (a `git worktree` of the side's commit), so the engine is the only difference
-between the two binaries. The bench uses only public API that exists from a451515f4, the first
-commit with tn-lmdb, on. An unchanged tn-lmdb, or a change that does not reach the binary, exits 0
-with "nothing to compare" (`--allow-same` runs it anyway: an A/A run that shows the noise). The
-runs alternate, base head then head base (`--rounds`, default 4 at the quick tier and 2
+between the two binaries. The bench uses only public API that every revision with `crates/tn-lmdb`
+has. An unchanged tn-lmdb, or a change that does not reach the binary, exits 0 with "nothing to
+compare", and a one-line report says why (`--allow-same` runs it anyway: an A/A run that shows the
+noise). The runs alternate, base head then head base (`--rounds`, default 4 at the quick tier and 2
 otherwise), and each row's samples are pooled per side. A time row regresses when head's median
 over base's is above 1 + `--threshold` (default 10%) and head's min over base's is above 1 + half
 of it. An exact row regresses when it grows past `--size-threshold` (default 1%). Durable time rows
-are reported, and gated only with `--gate-durable`; a row whose JSON says `gate: false` is
-reported only. Exit codes: 0 no gated regression, 1 a gated regression, 2 a usage, build or
-environment error. A base without tn-lmdb (`main` until tn-lmdb merges) is refused. The report is
-`<bench dir>/report.md` (default bench dir `$TMPDIR/tn-lmdb-bench-compare`). The script's header
-comment is the full reference. CI runs it on pull requests labeled `bench`, and by hand
-(`.github/ACTIONS.md`, "tn-lmdb regression bench").
+are reported, and gated only with `--gate-durable`; a row whose JSON says `gate: false`, time or
+exact, is reported only. Exit codes: 0 no gated regression (or nothing to compare), 1 a gated
+regression, 2 a usage, environment, build or run error, or any failure the script does not expect
+(never 1). A base or head without tn-lmdb (no `crates/tn-lmdb/Cargo.toml`) is refused, and so is a
+second run on a bench dir another run holds (its `.lock`, removed at exit; a run killed by SIGKILL
+leaves it). The report is `<bench dir>/report.md` (default bench dir
+`$TMPDIR/tn-lmdb-bench-compare`). The script's header comment is the full reference. CI runs it on
+pull requests labeled `bench`, and by hand (`.github/ACTIONS.md`, "tn-lmdb regression bench").
 
 Within one run a quick-tier time row holds to a few percent. On a busy machine whole runs still
 move: when other work starts, every sample of the next run can sit 10 to 20% above the run before.

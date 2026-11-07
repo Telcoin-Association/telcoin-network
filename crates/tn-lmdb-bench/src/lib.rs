@@ -115,9 +115,12 @@ impl Metric {
 /// The sync modes a row runs under, of those selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modes {
-    /// Every selected mode: the mode changes the work (commits, or a state built by several).
+    /// Every selected mode: the mode changes the work: a time row that includes commits or is
+    /// timed between them, or a size row of a state built by several commits.
     Every,
-    /// `nosync` only: one transaction's put loop or reads, the same work under either mode.
+    /// `nosync` only: one transaction's put or delete loop, the file one commit leaves, or reads
+    /// (on any state: under `nosync` the settles make it the durable state), the same work under
+    /// either mode.
     NoSyncOnly,
     /// `durable` only: a sync counter, zero under `nosync`.
     DurableOnly,

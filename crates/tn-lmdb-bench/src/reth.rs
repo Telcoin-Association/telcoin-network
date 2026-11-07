@@ -519,7 +519,8 @@ pub(crate) fn history_rewrite(
 /// HashedStorages-shaped dup table whose `n` rows sit under `RW_DUP_KEYS` nested keys:
 /// `DupTxnCursor::seek_dup_with_key_tail`, then at the row `delete_current`,
 /// `follower_shares_prefix` (and `prev_in_prefix` when that is false) and `insert` of the pair
-/// with a new value.
+/// with a new value. These are the calls the adapter issued before it made reth's dup rewrite
+/// one `DupTxnCursor::put`; that put is timed by `reth.block`'s slot upserts.
 pub(crate) fn dup_rewrite(dir: &Path, options: EnvOptions, data: &RewriteData, out: &mut Out<'_>) {
     let key_len = u16::try_from(RW_DUP_WIDTH).expect("a narrow key");
     let time = rewrite_pass(

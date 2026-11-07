@@ -92,7 +92,8 @@ The form is part of the file's format: the open refuses a table held in the othe
 table with another key width or `packed_max` (`MDBX_INCOMPATIBLE`, naming the table and both
 forms). A read returns the value (subkey, then the rest) as one slice of the page, with no copy,
 read by the move itself on a nested table (the engine's tail moves, `next_with_key_tail` and the
-others) and by `current_with_key_tail` after the move on a composite one.
+others) and by `current_with_key_tail` after the move on a composite one; only a value in an
+overflow run is joined in a buffer of the cursor's.
 `seek_by_key_subkey` reads its row in the seek itself, from the leaf the seek fetched (the engine's
 `seek_with_key_tail`, with `key ‖ subkey` built on the stack; `seek_dup_with_key_tail` on a nested
 table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
@@ -166,17 +167,20 @@ The point gets are level within their spread in both shapes. `t4n`'s used span i
 
 ## Tests
 
-Every test of a dup-sort table runs on three forms: the production one (packed), a small packing
-bound (`TnLmdbArgs::packed_dup_max(128)`: a key promotes at its second or third row), and every
-table composite (`TnLmdbArgs::composite_dup_tables`), the changesets' path.
+Most dup cursor tests (`src/tests/dup.rs`, through `on_every_form`) and the differential test
+run on three forms: the production one (packed), a small packing bound
+(`TnLmdbArgs::packed_dup_max(128)`: a key promotes at its second or third row), and every table
+composite (`TnLmdbArgs::composite_dup_tables`), the changesets' path. The ported reth tests and
+the adapter's other tests run on the production form, the form tests excepted; the crash cycles
+run on the packed form and the composite one.
 
-- **reth's MDBX tests,** ported with only the constructor swapped (`tests/mdbx_port.rs`); three
-  dup-sort tests assert the one-value-per-subkey refusal instead.
-- **The adapter's own** (`tests/adapter.rs`, `tests/dup.rs`): MDBX's error codes, reth's error
-  variants, the metrics, every dup cursor call and the cursor steps after a delete or `last`, each
-  run on MDBX too and on every form, the layouts and forms against reth's encodings, the form
-  check at open, and the differences pinned beside MDBX's results.
-- **A differential test** (`tests/differential.rs`): random scripts of transaction and cursor
+- **reth's MDBX tests,** ported with only the constructor swapped (`src/tests/mdbx_port.rs`);
+  three dup-sort tests assert the one-value-per-subkey refusal instead.
+- **The adapter's own** (`src/tests/adapter.rs`, `src/tests/dup.rs`): MDBX's error codes, reth's
+  error variants, the metrics, every dup cursor call and the cursor steps after a delete or
+  `last`, each run on MDBX too, the layouts and forms against reth's encodings, the form check at
+  open, and the differences pinned beside MDBX's results.
+- **A differential test** (`src/tests/differential.rs`): random scripts of transaction and cursor
   calls (two write cursors and a read cursor, commits, aborts, a held read transaction) run on
   MDBX and on tn-lmdb in every form, each form's outcome list equal to MDBX's; it skips the
   documented differences, about 4% of ops, each form's skips equal to MDBX's run's, and fails if a
@@ -186,10 +190,11 @@ table composite (`TnLmdbArgs::composite_dup_tables`), the changesets' path.
   each run (printed; `PROPTEST_RNG_SEED=<seed>` reruns a failure).
   `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs seed 1's scripts and pins
   the skip counts by class, so a class whose share moved fails.
-- **Crash cycles** (`tests/crash.rs`, Unix only): a child process writing reth-style rounds (one
-  storage key of them over several nested leaves, wiped now and then) is killed with `SIGKILL` in
-  its open, its writes or its commit, and the reopened environment must hold its last committed
-  round exactly and pass the engine's `check` (5 cycles, on each form; 200 in the heavy variant).
+- **Crash cycles** (`src/tests/crash.rs`, Unix only): a child process writing reth-style rounds
+  (one storage key of them over several nested leaves, wiped now and then) is killed with
+  `SIGKILL` in its open, its writes or its commit, and the reopened environment must hold its last
+  committed round exactly and pass the engine's `check` (5 cycles on the packed form, 5 on the
+  composite one in `_composite`; 200 in the heavy variant, packed).
 
 ```text
 cargo nextest run -p tn-lmdb-reth                                              # default suite
@@ -217,13 +222,15 @@ MDBX `UtterlyNoSync`), so the write rows time the CPU alone: the table's own hea
 `bench (nosync: CPU only, not the gate)`, so the mark survives the gate loop's `grep '^|'`. The
 module docs give each workload, the data, the timing and where they differ from reth's.
 
-**The Linux gate**, the rule for a change on a hot path: each bench at most 1.10× MDBX, with at
-most one explained row up to 1.25×. Run it three times at reth's sizes, on performance cores with
-the temp dir on a real disk (see the [run tip](engine-bench.md#run-tip-linux); the run stops if the
-temp dir is on a tmpfs), and take each cell's median. Pin the power settings first: the drive's autonomous power states off,
-and the CPU governor and energy preference at `performance` (all three reset on a reboot or a
-sleep). From the repository root, with the performance cores in `taskset` (`lscpu -e` shows which
-CPUs they are):
+**The Linux gate**, the rule for a change on the adapter's hot path (this crate's cursors and
+transactions, or reth's cursor or transaction code; an engine change runs the engine's regression
+check, `crates/tn-lmdb/CLAUDE.md`): each bench at most 1.10× MDBX, with at most one explained row up
+to 1.25×. Run it three times at reth's sizes, on performance cores with the temp dir on a real disk
+(see the [run tip](engine-bench.md#run-tip-linux); the run stops if the temp dir is on a tmpfs), and
+take each cell's median. Pin the power settings first: the drive's autonomous power states off, and
+the CPU governor and energy preference at `performance` (all three reset on a reboot or a sleep).
+From the repository root, with the performance cores in `taskset` (`lscpu -e` shows which CPUs they
+are):
 
 ```text
 sudo nvme set-feature /dev/nvme0 -f 0x0c -v 0
@@ -233,13 +240,14 @@ mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TN_LMDB_RETH_BENCH_N=10000,1000
 ```
 
 **Durable write rows on a consumer drive.** A laptop NVMe drive syncs a commit at one of two speeds
-(on the gate laptop about 0.7 ms or about 5 ms), and it switches between them during a run, for
-both engines at once: MDBX's own time for a write row can move 5× from one run to the next, with
-the power settings pinned. tn-lmdb and MDBX issue the same syncs per commit (a data `msync`, a size
-sync when the file grew, a meta `msync`), so the drive's state, not the engine, decides which speed
-a row lands on. A durable write row over 1.10× is the engine's only if it stays over with the
-drive at its fast speed (the runs where MDBX's time for that row is lowest) or with
-`TN_LMDB_RETH_BENCH_SYNC=nosync`.
+(on the gate laptop about 0.7 ms or about 5 ms), and it switches between them during a run, for both
+engines at once: MDBX's own time for a write row can move 5× from one run to the next, with the
+power settings pinned. tn-lmdb and MDBX sync a commit alike: one data sync (tn-lmdb an `msync` of
+the dirty pages when they form one range, else an `fdatasync` of the file; MDBX an `msync` of the
+used span), a size sync when the file grew (tn-lmdb's only if the data sync did not cover it), and a
+meta `msync`. So the drive's state, not the engine, decides which speed a row lands on. A durable
+write row over 1.10× is the engine's only if it stays over with the drive at its fast speed (the
+runs where MDBX's time for that row is lowest) or with `TN_LMDB_RETH_BENCH_SYNC=nosync`.
 
 **The two runs below measured an earlier engine and dup layout:** engine format 2, with all five
 dup-sort tables composite (`key ‖ subkey` in one plain tree). They predate the state tables' engine
@@ -318,7 +326,7 @@ write rows over 1.10× are the drive's (see "Over 1.10× on Linux").
 | Put.put | 1000000 | 48.0 ns | 131.0 ns | 0.37 | 0.42 |
 | Put.append | 1000000 | 48.0 ns | 76.0 ns | 0.63 | 0.71 |
 
-**The tuning round** took every plain `RandomRead` from 1.10 to 1.38 down to 0.93 to 1.05, and the
+**The tuning round** took every plain `RandomRead` from 1.05 to 1.38 down to 0.93 to 1.05, and the
 dup `RandomRead` from 1.63 to 1.12. It made five changes:
 
 - a snapshot resolves each table handle once, for all its read transactions (the engine's
@@ -333,7 +341,7 @@ dup `RandomRead` from 1.63 to 1.12. It made five changes:
 the rightmost leaf of an append without a second descent. It took `hash append_input` at 1M from
 1.11 to 1.05 (CPU only, from 1.10 to 1.02).
 
-`Get.get` went from 17 to 23 ns (0.59 to 0.77 of MDBX) on this machine but not on the Mac, where the
+`Get.get` went from 17 to 23 ns (0.59 to 0.74 of MDBX) on this machine but not on the Mac, where the
 same path does less work than before; it is not explained.
 
 **Over 1.10× on Linux:**

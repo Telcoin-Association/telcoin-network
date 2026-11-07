@@ -439,19 +439,20 @@ The script's header comment is the reference for what it builds, runs and report
 
 It runs only when asked:
 
-- on a pull request labeled `bench`, against the pull request's base and head commits: when the label is added, and again on every push or reopen while it stays. Adding some other label does not run it. The label has to exist in the repository (Issues -> Labels) before it can be applied;
-- by hand (*tn-lmdb bench* -> *Run workflow*), with a `base` (required), a `head` (empty: the commit the run is on) and a `tier` (`quick`, `default` or `full`).
+- on a pull request labeled `bench`, against what merging it changes: its merge commit (`github.sha`) against that commit's first parent, the base branch's tip it merges onto, so changes made on the base after the branch point do not show as the pull request's. It runs when the label is added, and again on every push or reopen while it stays. Adding some other label does not run it, nor cancel a running one: a run that skips takes a concurrency group of its own. The label has to exist in the repository (Issues -> Labels) before it can be applied;
+- by hand (*tn-lmdb bench* -> *Run workflow*), with a `base` (required), a `head` (empty: the commit the run is on) and a `tier` (`quick`, `default` or `full`). A `base` or `head` that does not resolve as given is read as `origin/<branch>` when that resolves, since the checkout has a local branch for the run's own ref only.
 
 It is optional by construction, and must stay so.
 It is not in `pr.yaml`, never runs on `merge_group`, and is not a required check; `CI Success` stays the only one (item 1 of "Repository settings this requires"), and the job's name is not `CI Success`.
 A red run blocks nothing: it is information for the reviewer.
-It is still not `continue-on-error`, so the pull request shows a red check when the script exits non-zero: 1 for a gated regression, 2 for a refusal or a build or run error.
-Until tn-lmdb is on `main`, a pull request into `main` gets exit 2 from the base check ("main does not have tn-lmdb"); dispatch it by hand with a base that has tn-lmdb instead.
+It is still not `continue-on-error`, so the pull request shows a red check when the script exits non-zero: 1 for a gated regression, 2 for a refusal, a build or run error, or any failure the script does not expect (never 1).
+A run with nothing to compare (tn-lmdb and the root `Cargo.toml` unchanged, or a change that does not reach the bench binary) is green, and its job summary gives the one-line reason.
+A pull request whose base has no tn-lmdb (no `crates/tn-lmdb/Cargo.toml`) gets exit 2 from the base check; dispatch it by hand with a base that has tn-lmdb instead.
 
 The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
 Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
 
-Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable rows, and the quick tier's two single-commit rows, reported, not gated) catches large regressions only.
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable time rows, and the quick tier's two single-commit rows, reported, not gated) catches large regressions only.
 For anything finer, run the script locally, with more rounds, on an idle machine.
 
 The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.

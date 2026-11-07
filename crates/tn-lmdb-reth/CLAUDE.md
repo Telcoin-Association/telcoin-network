@@ -98,8 +98,10 @@ implementation and tests are in `crates/storage/db/src/implementation/mdbx/` the
 - **Tests open through `open_env` and spawn through `spawn`** (`tests/mod.rs`). `SPAWN_LOCK` is an
   `RwLock`: opens share it, a spawn takes it alone. A child forked while another thread's open is
   between its create and its lock holds that open's file description until it execs, and the
-  open then fails with `MDBX_BUSY`. Never call `TnLmdbEnv::open` or `Command::spawn` directly in a
-  test.
+  open then fails with `MDBX_BUSY` (the engine's `Locked`). Never call `TnLmdbEnv::open` or
+  `Command::spawn` directly in a test. The hazard is any open of a database in the test binary,
+  the engine's own `Env::open` included: a test that calls it holds `SPAWN_LOCK.read()` across
+  its opens (as `changesets_forms_hold_the_same_rows` does).
 - **Default tests stay small** (CI runs nextest in debug); heavy variants are
   `#[ignore = "heavy: run with --release"]` with a `_heavy` suffix. **Mutation-check every new
   test.** Durable anchors only in comments and docs: function, test and type names, real issue
@@ -146,12 +148,14 @@ and MDBX `UtterlyNoSync`, so the write rows time the CPU alone; never the gate, 
 header row says so), and on Apple Silicon `TN_LMDB_RETH_BENCH_MDBX_PAGE=4096` for MDBX pages the size
 of tn-lmdb's.
 
-**The Linux gate**, the rule for a change on a hot path: each bench at most 1.10× MDBX, with at
-most one explained row up to 1.25×. Run it three times at reth's sizes, pinned to performance
-cores with the temp dir on a real disk (as the run tip in `engine-bench.md` says; the run stops if
-the temp dir is on a tmpfs), with the drive's autonomous power states off and the CPU governor
-and energy preference at `performance` (the README gives the commands; all three reset on a
-reboot or a sleep). From the repository root:
+**The Linux gate**, the rule for a change on the adapter's hot path (this crate's cursors and
+transactions, or reth's cursor or transaction code; an engine change runs the engine's regression
+check, `crates/tn-lmdb/CLAUDE.md`): each bench at most 1.10× MDBX, with at most one explained row up
+to 1.25×. Run it three times at reth's sizes, pinned to performance cores with the temp dir on a
+real disk (as the run tip in `engine-bench.md` says; the run stops if the temp dir is on a tmpfs),
+with the drive's autonomous power states off and the CPU governor and energy preference at
+`performance` (the README gives the commands; all three reset on a reboot or a sleep). From the
+repository root:
 
 ```text
 mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TN_LMDB_RETH_BENCH_N=10000,100000,1000000 taskset -c 0-7 cargo test --release -p tn-lmdb-reth tn_lmdb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
@@ -161,8 +165,10 @@ Report each cell as the median of the three. A consumer NVMe drive syncs a commi
 speeds and switches during a run, for both engines at once (the README's "Durable write rows on a
 consumer drive"), so a durable write row over 1.10× is the engine's only if it stays over at the
 drive's fast speed (the runs where MDBX's time for that row is lowest) or under
-`TN_LMDB_RETH_BENCH_SYNC=nosync`. Both engines issue the same syncs per commit; a change to tn-lmdb's
-commit path that adds one is the engine's cost, whatever the drive does.
+`TN_LMDB_RETH_BENCH_SYNC=nosync`. Both engines sync a commit alike: one data sync (tn-lmdb an
+`msync` of one dirty range, else an `fdatasync`; MDBX an `msync` of the used span), a size sync when
+the file grew, and a meta `msync`; a change to tn-lmdb's commit path that adds one is the engine's
+cost, whatever the drive does.
 
 ## On a reth upgrade (including storage v2)
 
