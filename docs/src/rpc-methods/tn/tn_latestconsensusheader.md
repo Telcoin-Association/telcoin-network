@@ -23,7 +23,7 @@ The result is served from memory and does not read consensus storage. [tn\_lates
     * `parents`: `Array` - Digests of the header's parent certificates from the previous round, base58-encoded.
     * `latest_execution_block`: `Object` - The latest execution block the author had when it built the header: `number` (`Number`) and `hash` (`DATA`, 32 Bytes).
     * `seed_signature`: `String` - The author's BLS signature over the epoch seed message for this round, base58-encoded; it feeds the epoch seed chain that shuffles the next committee. Present for epochs where the seed-signature fork is active: every epoch on mainnet builds, epoch 383 onward on adiri.
-    * `created_at_millis`: `Number` - The millisecond part of `created_at`, `0` to `999`. Present only for epochs where the sub-second timestamp fork is active: every epoch on mainnet builds, epoch 735 onward on adiri.
+    * `created_at_millis`: `Number` - The millisecond part of `created_at`, `0` to `999`. Present only for epochs where the sub-second timestamp fork is active: every epoch on mainnet builds, epoch 739 onward on adiri.
   * `reputation_scores`: `Object` - Leader reputation scores: `scores_per_authority` maps each authority id (base58) to its score (`Number`), and `final_of_schedule` (`Boolean`) is `true` when these are the last scores of the current leader schedule before they reset.
   * `commit_timestamp`: `Number` - The commit time, in whole seconds since the Unix epoch.
   * `randomness`: `DATA`, 32 Bytes - The epoch seed chain value as of this commit. For epochs before the seed-signature fork, a hash of the leader certificate's aggregate signature instead.

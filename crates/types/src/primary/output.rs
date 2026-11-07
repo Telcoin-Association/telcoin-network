@@ -1120,7 +1120,7 @@ mod tests {
     }
 
     /// An epoch whose leaders carry millisecond commit timestamps under the running cfg:
-    /// `u32::MAX` under `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 735, compared with
+    /// `u32::MAX` under `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 739, compared with
     /// `>=`), epoch zero elsewhere (non-adiri is active from genesis).
     fn v2_epoch() -> Epoch {
         let epoch = if cfg!(feature = "adiri") { u32::MAX } else { 0 };
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     /// Epoch of the frozen V2 consensus header vector: `u32::MAX` is sub-second-active under
-    /// BOTH cfgs (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (735), far below
+    /// BOTH cfgs (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (739), far below
     /// `u32::MAX`, compared with `>=`; non-adiri everywhere), so one hex constant pins the bytes
     /// for every build.
     const GOLDEN_V2_EPOCH: Epoch = u32::MAX;
