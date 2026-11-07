@@ -107,6 +107,43 @@ const BATCH_REQUEST_PEER_SHARES: u64 = 4;
 /// `OPEN_DEADLINE` in `tn-network-libp2p` so the per-peer budget accounts for it.
 const STREAM_OPEN_DEADLINE: Duration = Duration::from_secs(15);
 
+/// The least time an exchange that ends with no batch must take before it marks
+/// the peer (#1773).
+///
+/// An exchange ends with no batch when the peer answers `Deny`, or `Ack` then
+/// `End` with none of the requested batches. An honest peer that lacks the data
+/// or sheds load answers with the same frames inside one round trip, so the
+/// frames alone cannot mark a peer. A slow empty answer wastes the caller's time,
+/// so it marks the peer.
+const SLOW_EMPTY_EXCHANGE: Duration = Duration::from_secs(5);
+
+/// The fixed part of the time a complete exchange may take before it marks the
+/// peer. See [`slow_exchange_allowance`].
+const SLOW_EXCHANGE_BASE: Duration = Duration::from_secs(15);
+
+/// The part of the time a complete exchange may take for each batch it
+/// delivers. See [`slow_exchange_allowance`].
+const SLOW_EXCHANGE_PER_BATCH: Duration = Duration::from_secs(1);
+
+/// The most time a complete exchange that delivered `batches` batches may take
+/// before it marks the peer (#1773).
+///
+/// A complete exchange slower than this delivered its batches but held the
+/// caller for most of the exchange. A peer that drips requested batches just
+/// inside each 5s frame deadline and ends with `End` inside the 95s cap takes
+/// about 90s for 18 batches, and without this bound it would never be marked.
+/// [`SLOW_EXCHANGE_BASE`] covers the open, the request write, the `Ack` and the
+/// first store read. [`SLOW_EXCHANGE_PER_BATCH`] is a floor of about 8 Mbit/s on
+/// 1 MB batches. A marked peer is still asked, so an honest peer on a slow link
+/// only loses its place in the order. The allowance is generous because a
+/// delivered batch proves the peer holds data; an exchange that delivers nothing
+/// gets only [`SLOW_EMPTY_EXCHANGE`].
+fn slow_exchange_allowance(batches: usize) -> Duration {
+    SLOW_EXCHANGE_BASE.saturating_add(
+        SLOW_EXCHANGE_PER_BATCH.saturating_mul(u32::try_from(batches).unwrap_or(u32::MAX)),
+    )
+}
+
 /// The largest sync frame accepted for `epoch`: a `Data` frame carrying one
 /// encoded batch, plus envelope headroom.
 pub(crate) fn max_sync_frame_size(epoch: Epoch) -> usize {
@@ -163,12 +200,15 @@ pub(crate) enum SyncAttempt {
 #[derive(Debug)]
 enum PeerFetchError {
     /// The peer is sync-capable but answered `Deny`. It stays eligible for later
-    /// retry passes, because the retry delay lets its semaphores release.
+    /// retry passes, because the retry delay lets its semaphores release. A
+    /// `Deny` that took [`SLOW_EMPTY_EXCHANGE`] or longer marks the peer for later
+    /// calls this epoch.
     Denied(NetworkError),
     /// Any other failure (open error, unsupported protocol, write or read
     /// timeout, protocol error, or an empty answer). The peer is skipped for the
-    /// rest of the call and, once it has answered the protocol, tried last on
-    /// later calls this epoch.
+    /// rest of the call. A deadline or an error after negotiation also marks it
+    /// for later calls this epoch; an empty answer marks it only when it took
+    /// [`SLOW_EMPTY_EXCHANGE`] or longer.
     Failed(NetworkError),
 }
 
@@ -176,23 +216,37 @@ enum PeerFetchError {
 /// [`WorkerNetworkHandle::request_batches`].
 ///
 /// Drops the peers in `skipped` (failed earlier in this call), then yields the
-/// preferred peer first, the peers not in `stalled` in the order received (the
-/// network layer puts the current committee first and shuffles each tier per
-/// request), and the peers in `stalled` last. A marked peer is still asked, so a
-/// transient stall costs an honest peer only its place in the order (#1773).
+/// preferred peer first, then the members of `committee`, then the other peers.
+/// Inside each tier the peers not in `stalled` come first, in the order received
+/// (the network layer shuffles each tier per request), and the peers in
+/// `stalled` after them. The mark never moves a peer out of its tier, so a
+/// marked committee peer is still asked before any non-committee peer. A marked
+/// peer is still asked, so a transient stall costs an honest peer only its place
+/// in its tier (#1773).
 fn order_peers(
     peers: Vec<BlsPublicKey>,
     preferred: Option<&AuthorityIdentifier>,
     skipped: &HashSet<BlsPublicKey>,
     stalled: &HashSet<BlsPublicKey>,
+    committee: &HashSet<BlsPublicKey>,
 ) -> Vec<BlsPublicKey> {
     let (preferred_peers, rest): (Vec<_>, Vec<_>) =
         peers.into_iter().filter(|peer| !skipped.contains(peer)).partition(|peer| {
             preferred.is_some_and(|target| AuthorityIdentifier::from(*peer) == *target)
         });
-    let (fresh, marked): (Vec<_>, Vec<_>) =
-        rest.into_iter().partition(|peer| !stalled.contains(peer));
-    preferred_peers.into_iter().chain(fresh).chain(marked).collect()
+    let (members, others): (Vec<_>, Vec<_>) =
+        rest.into_iter().partition(|peer| committee.contains(peer));
+    // the unmarked peers of a tier before its marked peers, each in the order received
+    let unmarked_first = |tier: Vec<BlsPublicKey>| {
+        let (fresh, marked): (Vec<_>, Vec<_>) =
+            tier.into_iter().partition(|peer| !stalled.contains(peer));
+        fresh.into_iter().chain(marked)
+    };
+    preferred_peers
+        .into_iter()
+        .chain(unmarked_first(members))
+        .chain(unmarked_first(others))
+        .collect()
 }
 
 /// The wrapper around worker-specific network calls.
@@ -214,15 +268,25 @@ pub struct WorkerNetworkHandle {
     /// ([`Self::update_epoch`]) so a peer upgraded over the rotation boundary is
     /// re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
-    /// Peers whose last sync exchange this epoch stalled, failed after
-    /// negotiation, or served none of the requested batches.
+    /// Peers whose last sync exchange this epoch hit a deadline, failed after
+    /// negotiation, or wasted the caller's time: an empty answer or `Deny` that
+    /// took [`SLOW_EMPTY_EXCHANGE`] or longer, or a complete exchange slower than
+    /// [`slow_exchange_allowance`].
     ///
-    /// [`Self::request_batches`] still asks a marked peer, but after every
-    /// unmarked peer, so a committee peer that runs each exchange to its deadline
-    /// cannot keep an early place in every call (#1773). A complete exchange that
-    /// serves a requested batch clears the mark; [`Self::update_epoch`] resets the
-    /// set at the rotation boundary, like the capability cache.
+    /// [`Self::request_batches`] still asks a marked peer, but after the unmarked
+    /// peers of its tier (see [`order_peers`]), so a peer that runs each exchange
+    /// to its deadline cannot keep an early place in every call (#1773). A fast
+    /// empty answer leaves the record as it is, because an honest peer that lacks
+    /// the data sends the same frames. A complete exchange inside its allowance
+    /// clears the mark; [`Self::update_epoch`] resets the set at the rotation
+    /// boundary, like the capability cache.
     stalled_peers: Arc<Mutex<HashSet<BlsPublicKey>>>,
+    /// The current committee's BLS keys, set by [`Self::update_epoch`].
+    ///
+    /// The network layer answers `ConnectedPeers` with these peers first, and
+    /// [`order_peers`] applies the stall mark inside each tier, so a marked
+    /// committee peer is still asked before any non-committee peer (#1773).
+    committee: Arc<Mutex<HashSet<BlsPublicKey>>>,
     /// The genesis chain id, used to namespace gossip topics this handle publishes.
     chain_id: u64,
     /// The id of the worker this handle belongs to, used to select its gossip topics.
@@ -246,6 +310,7 @@ impl WorkerNetworkHandle {
             worker_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             stalled_peers: Arc::new(Mutex::new(HashSet::new())),
+            committee: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -320,9 +385,13 @@ impl WorkerNetworkHandle {
     /// A peer that answers `Deny` stays eligible for later passes; a peer that
     /// fails in any other way (a deadline, an error after negotiation, or `Ack`
     /// then `End` with none of the requested batches) is skipped for the rest of
-    /// the call and tried last on later calls this epoch (see [`order_peers`]).
-    /// The network layer shuffles each tier of the peer list per request, so no
-    /// peer keeps a fixed early place. Retries up to
+    /// the call. A deadline, an error after negotiation, an empty answer or `Deny`
+    /// that took [`SLOW_EMPTY_EXCHANGE`] or longer, and a complete exchange
+    /// slower than [`slow_exchange_allowance`] mark the peer. On later calls this
+    /// epoch a marked peer is tried after the unmarked peers of its tier, so a
+    /// marked committee peer still comes before every non-committee peer (see
+    /// [`order_peers`]). The network layer shuffles each tier of the peer list
+    /// per request, so no peer keeps a fixed early place. Retries up to
     /// [MAX_BATCH_REQUEST_RETRIES] times through the peer list with
     /// [BATCH_REQUEST_RETRY_DELAY] between attempts, giving semaphores time to
     /// release.
@@ -384,10 +453,11 @@ impl WorkerNetworkHandle {
                 return Ok(());
             }
 
-            // the preferred peer first, then the unmarked peers in the order
-            // received, then the peers whose last exchange stalled (#1773)
+            // the preferred peer first, then the committee tier and the other
+            // tier, each with its unmarked peers before its marked peers (#1773)
             let stalled = self.stalled_peers.lock().clone();
-            let ordered = order_peers(peers, preferred, &skipped, &stalled);
+            let committee = self.committee.lock().clone();
+            let ordered = order_peers(peers, preferred, &skipped, &stalled, &committee);
 
             // try peers one at a time with fallback
             for peer in ordered {
@@ -497,6 +567,9 @@ impl WorkerNetworkHandle {
     /// Returns [`PeerFetchError::Denied`] when the peer answered `Deny`, so the
     /// caller may try it again on a later pass, and [`PeerFetchError::Failed`] for
     /// every other failure, so the caller skips the peer for the rest of the call.
+    /// The exchange is timed from the open, and the time and the outcome decide
+    /// the peer's stall mark (see [`Self::record_sync_read`] and
+    /// [`Self::record_empty_exchange`]).
     async fn request_batches_from_peer(
         &self,
         peer: BlsPublicKey,
@@ -516,10 +589,13 @@ impl WorkerNetworkHandle {
             ))));
         }
 
-        match self.request_batches_from_peer_sync(peer, batch_digests).await {
+        let started = tokio::time::Instant::now();
+        let attempt = self.request_batches_from_peer_sync(peer, batch_digests).await;
+        let elapsed = started.elapsed();
+        match attempt {
             SyncAttempt::Fetched(read) => {
                 self.sync_capability.lock().insert(peer, true);
-                self.record_sync_read(peer, read)
+                self.record_sync_read(peer, read, elapsed)
             }
             SyncAttempt::Unsupported => {
                 // no legacy fallback: cache the peer unsyncable this epoch and let
@@ -536,13 +612,15 @@ impl WorkerNetworkHandle {
             }
             SyncAttempt::Denied(e) => {
                 // the peer speaks sync but is shedding load or lacks the data; it
-                // stays eligible for a later pass
+                // stays eligible for a later pass, and a slow `Deny` marks it for
+                // later calls (#1773)
                 self.sync_capability.lock().insert(peer, true);
+                self.record_empty_exchange(peer, elapsed);
                 Err(PeerFetchError::Denied(e))
             }
             SyncAttempt::Failed(e) => {
                 // the peer speaks sync but this exchange failed; try the next peer,
-                // and this peer last on later calls (#1773)
+                // and mark this peer for later calls (#1773)
                 self.sync_capability.lock().insert(peer, true);
                 self.mark_stalled(peer);
                 Err(PeerFetchError::Failed(e))
@@ -550,36 +628,60 @@ impl WorkerNetworkHandle {
         }
     }
 
-    /// Mark `peer` as stalled for the rest of the epoch, so later calls try it last.
+    /// Mark `peer` as stalled for the rest of the epoch, so later calls try it
+    /// after the unmarked peers of its tier (see [`order_peers`]).
     fn mark_stalled(&self, peer: BlsPublicKey) {
         self.stalled_peers.lock().insert(peer);
     }
 
-    /// Record the outcome of an `Ack`ed exchange with `peer` and yield its batches.
+    /// Record an exchange with `peer` that took `elapsed` and ended with no batch:
+    /// `Deny`, or `Ack` then `End` with none of the requested batches.
     ///
-    /// A complete stream that served at least one requested batch clears the
-    /// peer's stall mark. A stream cut by a deadline keeps the batches read before
-    /// it but marks the peer; with no batches at all it is a failed exchange, as
-    /// before, so the caller skips the peer for the rest of the call. A complete
+    /// Marks the peer only when the exchange took [`SLOW_EMPTY_EXCHANGE`] or
+    /// longer. An honest peer that lacks the data or sheds load sends the same
+    /// frames inside one round trip, so a fast empty exchange leaves the record
+    /// as it is (#1773).
+    fn record_empty_exchange(&self, peer: BlsPublicKey, elapsed: Duration) {
+        if elapsed >= SLOW_EMPTY_EXCHANGE {
+            self.mark_stalled(peer);
+        }
+    }
+
+    /// Record the outcome of an `Ack`ed exchange with `peer` that took `elapsed`,
+    /// and yield its batches.
+    ///
+    /// A complete stream with at least one requested batch keeps its batches. It
+    /// clears the peer's stall mark when it took no longer than
+    /// [`slow_exchange_allowance`] for its batch count, and marks the peer when
+    /// it was slower, so a peer that drips requested batches just inside each
+    /// frame deadline and then sends `End` still loses its place. A complete
     /// stream with none of the requested batches (`Ack` then `End`) is a failed
-    /// exchange too: the peer is marked and skipped, instead of counting as a
-    /// success and keeping its place on every later pass (#1773).
+    /// exchange, so the caller skips the peer for the rest of the call; it marks
+    /// the peer only when it was slow (see [`Self::record_empty_exchange`]),
+    /// because an honest peer that lacks the batches sends the same frames. A
+    /// stream cut by a deadline keeps the batches read before it but marks the
+    /// peer; with no batches at all it is a failed exchange (#1773).
     fn record_sync_read(
         &self,
         peer: BlsPublicKey,
         read: SyncRead,
+        elapsed: Duration,
     ) -> Result<Vec<(BlockHash, Batch)>, PeerFetchError> {
         let end = read.end();
         let batches = read.into_batches();
         match end {
             StreamEnd::Complete if batches.is_empty() => {
-                self.mark_stalled(peer);
+                self.record_empty_exchange(peer, elapsed);
                 Err(PeerFetchError::Failed(NetworkError::RPCRetryable(format!(
                     "peer {peer} answered the batch sync request with none of the requested batches"
                 ))))
             }
             StreamEnd::Complete => {
-                self.stalled_peers.lock().remove(&peer);
+                if elapsed > slow_exchange_allowance(batches.len()) {
+                    self.mark_stalled(peer);
+                } else {
+                    self.stalled_peers.lock().remove(&peer);
+                }
                 Ok(batches)
             }
             StreamEnd::Stalled => {
@@ -858,17 +960,20 @@ impl WorkerNetworkHandle {
         self.epoch
     }
 
-    /// Update the current epoch.
+    /// Update the current epoch and the current committee's BLS keys.
     ///
     /// Also clears the per-peer sync capability cache: committees rotate at the
     /// boundary and binaries are upgraded there, so a peer that could only speak
     /// legacy last epoch is re-probed for the sync protocol this epoch. The stall
     /// record is reset too: the committee rotates, so last epoch's marks no longer
-    /// describe the peers that serve this epoch.
-    pub fn update_epoch(&mut self, epoch: Epoch) {
+    /// describe the peers that serve this epoch. `committee` replaces the
+    /// committee set that `request_batches` uses to keep the stall mark inside
+    /// each tier of the peer order (#1773).
+    pub fn update_epoch(&mut self, epoch: Epoch, committee: HashSet<BlsPublicKey>) {
         self.epoch = epoch;
         self.sync_capability.lock().clear();
         self.stalled_peers.lock().clear();
+        *self.committee.lock() = committee;
     }
 }
 
@@ -898,6 +1003,7 @@ impl WorkerNetworkHandle {
             worker_id: tn_types::DEFAULT_WORKER_ID,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             stalled_peers: Arc::new(Mutex::new(HashSet::new())),
+            committee: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -924,19 +1030,204 @@ impl WorkerNetworkHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamEnd, SyncRead, WorkerNetworkHandle};
-    use tn_types::{BlsPublicKey, TaskManager};
+    use super::{
+        max_sync_frame_size, order_peers, slow_exchange_allowance, StreamEnd, SyncRead,
+        WorkerNetworkHandle, SLOW_EMPTY_EXCHANGE,
+    };
+    use crate::test_utils::create_test_batches;
+    use futures::{stream, StreamExt as _, TryStreamExt as _};
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        time::Duration,
+    };
+    use tn_network_libp2p::{write_frame, SyncFrame, WorkerSyncRequest};
+    use tn_types::{encode, AuthorityIdentifier, BlockHash, BlsKeypair, BlsPublicKey, TaskManager};
 
-    /// `Ack` then `End` with none of the requested batches is a failed exchange and marks
-    /// the peer, instead of counting as a success (#1773).
+    /// A distinct BLS public key for each `seed`.
+    fn peer_key(seed: u64) -> BlsPublicKey {
+        *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public()
+    }
+
+    /// The read of an `Ack` then `End` exchange with none of the requested batches.
+    fn empty_complete_read() -> SyncRead {
+        SyncRead { batches: Vec::new(), end: StreamEnd::Complete }
+    }
+
+    /// A fast `Ack` then `End` with none of the requested batches fails the exchange, so the
+    /// caller skips the peer for the call, but it does not mark the peer: an honest peer that
+    /// lacks the batches sends the same frames (#1773).
     #[test]
-    fn empty_complete_answer_fails_and_marks_the_peer() {
+    fn fast_empty_answer_fails_without_marking_the_peer() {
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
         let peer = BlsPublicKey::default();
-        let read = SyncRead { batches: Vec::new(), end: StreamEnd::Complete };
-        assert!(handle.record_sync_read(peer, read).is_err(), "an empty answer is a failure");
-        assert!(handle.stalled_peers_for_test().contains(&peer), "the peer is marked");
+        let elapsed = Duration::from_secs(1);
+        assert!(
+            handle.record_sync_read(peer, empty_complete_read(), elapsed).is_err(),
+            "an empty answer is a failure"
+        );
+        assert!(
+            !handle.stalled_peers_for_test().contains(&peer),
+            "a fast empty answer does not mark the peer"
+        );
+    }
+
+    /// An empty answer that took `SLOW_EMPTY_EXCHANGE` fails and marks the peer (#1773).
+    #[test]
+    fn slow_empty_answer_marks_the_peer() {
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let peer = BlsPublicKey::default();
+        assert!(
+            handle.record_sync_read(peer, empty_complete_read(), SLOW_EMPTY_EXCHANGE).is_err(),
+            "an empty answer is a failure"
+        );
+        assert!(
+            handle.stalled_peers_for_test().contains(&peer),
+            "a slow empty answer marks the peer"
+        );
+    }
+
+    /// A slow `Deny` marks the peer while fast empty answers from other peers do not, and the
+    /// next order asks the marked peer last, whatever order the peers arrive in (#1773).
+    #[test]
+    fn slow_deny_marks_the_peer_and_orders_it_last() {
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let (a, b, d) = (peer_key(1), peer_key(2), peer_key(3));
+        [a, b].into_iter().for_each(|peer| {
+            assert!(
+                handle
+                    .record_sync_read(peer, empty_complete_read(), Duration::from_secs(1))
+                    .is_err(),
+                "an empty answer is a failure"
+            );
+        });
+        // the `Deny` arm of `request_batches_from_peer` records the exchange this way
+        handle.record_empty_exchange(d, Duration::from_secs(20));
+
+        let record = handle.stalled_peers_for_test();
+        assert_eq!(record, HashSet::from([d]), "only the slow deny is marked");
+
+        let committee = HashSet::from([a, b, d]);
+        let skipped = HashSet::new();
+        assert_eq!(order_peers(vec![a, b, d], None, &skipped, &record, &committee), vec![a, b, d]);
+        let reordered = order_peers(vec![d, a, b], None, &skipped, &record, &committee);
+        assert_eq!(reordered.last(), Some(&d), "the marked peer is asked last");
+    }
+
+    /// A complete exchange inside its allowance keeps its batches and clears the mark (#1773).
+    #[test]
+    fn fast_complete_exchange_clears_the_mark() {
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let peer = BlsPublicKey::default();
+        handle.mark_stalled_for_test(peer);
+        let batches: Vec<(BlockHash, _)> =
+            create_test_batches(1).into_iter().map(|batch| (batch.digest(), batch)).collect();
+        let expected: Vec<BlockHash> = batches.iter().map(|(digest, _)| *digest).collect();
+        let read = SyncRead { batches, end: StreamEnd::Complete };
+
+        let fetched = handle
+            .record_sync_read(peer, read, Duration::from_secs(2))
+            .expect("a complete exchange succeeds");
+        let fetched: Vec<BlockHash> = fetched.iter().map(|(digest, _)| *digest).collect();
+        assert_eq!(fetched, expected, "the batch is kept");
+        assert!(!handle.stalled_peers_for_test().contains(&peer), "the mark is cleared");
+    }
+
+    /// A peer that drips 18 requested batches 4.9s apart and then sends `End` stays inside
+    /// every frame deadline and the 95s stream cap. The exchange keeps all its batches, but it
+    /// is slower than its allowance, so it marks the peer (#1773).
+    #[tokio::test(start_paused = true)]
+    async fn slow_complete_exchange_keeps_batches_and_marks_the_peer() {
+        // 4.9s < BATCH_STREAM_TIMEOUT (5s), so no single frame trips the inner bound
+        let gap = Duration::from_millis(4900);
+        let batches = create_test_batches(18);
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|batch| batch.digest()).collect();
+        assert_eq!(digests.len(), batches.len(), "test batches must be distinct");
+        let max_frame = max_sync_frame_size(0);
+
+        // each `Data` frame waits `gap` before it is readable, and `End` follows the last one
+        // at once; there is no `Ack`, because the read starts after it
+        let frames: Vec<(Duration, Vec<u8>)> = stream::iter(
+            batches
+                .iter()
+                .map(|batch| (gap, SyncFrame::<WorkerSyncRequest>::Data(encode(batch))))
+                .chain(std::iter::once((Duration::ZERO, SyncFrame::End))),
+        )
+        .then(|(delay, frame)| async move {
+            let mut bytes = Vec::new();
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+            write_frame(&mut bytes, &frame, &mut encode_buffer, &mut compressed_buffer, max_frame)
+                .await
+                .expect("frame encodes");
+            (delay, bytes)
+        })
+        .collect()
+        .await;
+        let mut reader = stream::iter(frames)
+            .then(|(delay, bytes)| async move {
+                tokio::time::sleep(delay).await;
+                Ok::<_, std::io::Error>(bytes)
+            })
+            .boxed()
+            .into_async_read();
+
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let peer = BlsPublicKey::default();
+        let started = tokio::time::Instant::now();
+        let read = handle.read_sync_batches(&mut reader, &digests).await.expect("complete read");
+        let elapsed = started.elapsed();
+
+        assert_eq!(read.end(), StreamEnd::Complete, "the drip ends with `End` inside the cap");
+        assert!(elapsed >= Duration::from_secs(88), "the drip took {elapsed:?}");
+        assert!(
+            elapsed > slow_exchange_allowance(digests.len()),
+            "the drip is slower than its allowance"
+        );
+
+        let fetched = handle
+            .record_sync_read(peer, read, elapsed)
+            .expect("a complete exchange keeps its batches");
+        let fetched: BTreeSet<BlockHash> = fetched.iter().map(|(digest, _)| *digest).collect();
+        assert_eq!(fetched, digests, "every requested batch is kept");
+        assert!(
+            handle.stalled_peers_for_test().contains(&peer),
+            "the slow exchange marks the peer"
+        );
+    }
+
+    /// The stall mark orders peers inside their tier: a marked committee peer is still asked
+    /// before an unmarked non-committee peer, the preferred peer comes first even when marked,
+    /// and a skipped peer is dropped (#1773).
+    #[test]
+    fn stall_mark_orders_within_each_tier() {
+        let (c1, c2, n1, n2) = (peer_key(1), peer_key(2), peer_key(3), peer_key(4));
+        let peers = vec![c1, c2, n1, n2];
+        let stalled = HashSet::from([c1, n1]);
+        let committee = HashSet::from([c1, c2]);
+        let none = HashSet::new();
+
+        assert_eq!(
+            order_peers(peers.clone(), None, &none, &stalled, &committee),
+            vec![c2, c1, n2, n1],
+            "each tier puts its unmarked peers first, and the committee tier stays first"
+        );
+        let preferred = AuthorityIdentifier::from(n1);
+        assert_eq!(
+            order_peers(peers.clone(), Some(&preferred), &none, &stalled, &committee),
+            vec![n1, c2, c1, n2],
+            "the preferred peer comes first even when marked"
+        );
+        let skipped = HashSet::from([c2]);
+        assert_eq!(
+            order_peers(peers, None, &skipped, &stalled, &committee),
+            vec![c1, n2, n1],
+            "a skipped peer is dropped"
+        );
     }
 
     /// A stream cut by a deadline before any batch arrived is a failed exchange and marks
@@ -947,7 +1238,10 @@ mod tests {
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
         let peer = BlsPublicKey::default();
         let read = SyncRead { batches: Vec::new(), end: StreamEnd::Stalled };
-        assert!(handle.record_sync_read(peer, read).is_err(), "a stalled empty stream fails");
+        assert!(
+            handle.record_sync_read(peer, read, Duration::from_secs(5)).is_err(),
+            "a stalled empty stream fails"
+        );
         assert!(handle.stalled_peers_for_test().contains(&peer), "the peer is marked");
     }
 
@@ -959,7 +1253,7 @@ mod tests {
         let peer = BlsPublicKey::default();
         handle.mark_stalled_for_test(peer);
         assert!(handle.stalled_peers_for_test().contains(&peer));
-        handle.update_epoch(1);
+        handle.update_epoch(1, HashSet::new());
         assert!(handle.stalled_peers_for_test().is_empty(), "the record is reset per epoch");
     }
 }

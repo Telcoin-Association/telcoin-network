@@ -3,7 +3,7 @@
 use assert_matches::assert_matches;
 use futures::{future, StreamExt as _};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -817,9 +817,10 @@ async fn test_semaphore_exhaustion_denies_admission() {
     );
 }
 
-/// `request_batches` tries the peers whose last exchange stalled after every unmarked peer,
-/// whatever order the swarm reports them in, and a failed exchange marks the peer for later
-/// calls. Regression test for issue #1773.
+/// `request_batches` applies the stall mark inside each tier: a marked committee peer is tried
+/// after the unmarked committee peers but still before every non-committee peer, and a failed
+/// exchange marks the peer for later calls. The swarm reports the peers as the network layer
+/// does, current committee first. Regression test for issue #1773.
 #[tokio::test]
 async fn test_request_batches_tries_stalled_peers_last() {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -828,19 +829,21 @@ async fn test_request_batches_tries_stalled_peers_last() {
     let author = committee.last_authority().primary_public_key();
     let (tx, rx) = mpsc::channel(10);
     let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
-    tokio::spawn(failing_open_swarm(rx, vec![unknown, other, author], opened_tx));
+    tokio::spawn(failing_open_swarm(rx, vec![other, author, unknown], opened_tx));
     let task_manager = TaskManager::default();
-    let handle =
+    let mut handle =
         WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+    handle.update_epoch(0, HashSet::from([other, author]));
 
-    // the first reported peer stalled on an earlier call: it moves behind the others
-    handle.mark_stalled_for_test(unknown);
+    // the first reported committee peer stalled on an earlier call: it moves behind the other
+    // committee peer, but stays ahead of the non-committee peer
+    handle.mark_stalled_for_test(other);
     let mut digests = BTreeSet::from([B256::random()]);
     let result = handle.pub_request_batches(&mut digests, None).await;
     assert!(result.is_err(), "every open fails, so nothing is fetched");
 
     let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
-    assert_eq!(opened, vec![other, author, unknown]);
+    assert_eq!(opened, vec![author, other, unknown]);
 
     // every open failed after the swarm answered, so every peer is now marked
     let stalled = handle.stalled_peers_for_test();

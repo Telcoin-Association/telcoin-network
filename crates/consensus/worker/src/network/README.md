@@ -130,10 +130,14 @@ the next peer is tried.
 Peer order: `connected_peers()` returns current-committee members first, with each tier shuffled
 per request so no peer keeps a fixed early place. When the caller names a preferred authority
 (the vote-path `synchronize` passes the header author), that peer is tried first, because it is
-the peer most likely to hold the batches. Peers whose last exchange this epoch stalled, failed
-after negotiation, or served none of the requested batches (`stalled_peers`) are tried last; a
-complete exchange that serves a requested batch clears the mark, and the epoch boundary resets
-the record (#1773).
+the peer most likely to hold the batches. The stall record (`stalled_peers`) marks a peer whose
+last exchange this epoch hit a deadline, failed after negotiation, or was slow: an empty answer
+or `Deny` that took 5s or more (`SLOW_EMPTY_EXCHANGE`), or a complete exchange slower than 15s
+plus 1s per batch (`SLOW_EXCHANGE_BASE`, `SLOW_EXCHANGE_PER_BATCH`). A fast empty answer is
+skipped for the call but not marked, because an honest peer that lacks the batch sends the same
+frames. The mark orders peers within their tier, so a marked committee peer is still asked
+before any non-committee peer. A complete exchange inside its allowance clears the mark, and the
+epoch boundary resets the record (#1773).
 
 If **all** peers fail a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
 times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
@@ -149,8 +153,9 @@ Key behaviors:
 - **Re-fetches peers** each attempt to pick up newly connected nodes.
 - **Skips failed peers**: a peer that answers `Deny` stays eligible for later passes. A peer that
   fails in any other way (open error, unsupported protocol, write or read timeout, protocol error,
-  or `Ack` then `End` with none of the requested batches) is not tried again in the same call, and
-  is tried last on later calls this epoch.
+  or `Ack` then `End` with none of the requested batches) is not tried again in the same call.
+  On later calls only marked peers (see the peer order above) move behind the unmarked peers of
+  their tier.
 - **Keeps a partial stream**: the batches validated before a stream deadline are kept, so a
   stalling peer does not waste the frames it did deliver.
 - **Returns immediately** on any partial success (at least one batch received).
