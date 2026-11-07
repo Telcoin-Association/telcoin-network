@@ -486,6 +486,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `cloned_workers_validate_while_another_job_is_blocked`; transaction-pool
   228/228. *Upstream*: n/a (upstream commit).
 
+- **TN-0042** — Backport 8861e2724: `set_block_info` notifies listeners of the transactions it
+  promotes. *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/pool/{mod.rs,txpool.rs,update.rs}` (`TxPool::set_block_info`
+  returns the promotions; `UpdateOutcome` is public), plus a TN test in `pool/mod.rs`.
+  *Why*: TN calls `set_block_info` when an epoch's base fee changes (`WorkerTxPool`). Transactions
+  a lower base fee promoted to pending never reached pending-transaction listeners, so
+  `eth_subscribe("newPendingTransactions")` missed them. TN's batch builder reads
+  `best_transactions()` on its own tick, so batching was never affected. Pool notifications only.
+  *Tests*: `set_block_info_notifies_pending_listeners_of_promotions` (TN; upstream has none) parks
+  a transaction below the base fee, lowers the fee, and expects its hash on a pending listener;
+  it fails without the change. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

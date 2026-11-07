@@ -53,6 +53,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 6e4009eed | TN-0039 | a lagging `eth_subscribe("logs")` subscriber skips the missed blocks instead of panicking its subscription task | nested build; no upstream test |
 | 6d718d0c2 | TN-0040 | `trace_filter`'s range error names the configured limit, not 100 | tn-reth namespace test |
 | bf1db83ae | TN-0041 | pool validation workers no longer hold the job queue's lock while validating, so `--txpool.additional-validation-tasks` runs in parallel | upstream test; txpool 228/228 |
+| 8861e2724 | TN-0042 | transactions a lower base fee promotes in `set_block_info` reach pending listeners (`newPendingTransactions`) | TN test fails without the fix; txpool 229/229 |
 
 ## Open
 
@@ -83,7 +84,6 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
 | 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
 | 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
-| 8861e2724 | notify subscribers when set_block_info promotes | transaction-pool | TN calls `set_block_info`; transactions promoted by a basefee drop never reach pending listeners. | clean |
 | 5b0120dbb | lower default block/receipt cache limits | rpc-eth-types | High default memory use unless TN sets its own limits. | clean |
 | 329fcfc73 | bound `eth_callBundle` work | rpc | TN serves `eth_callBundle` (`rpc_bundle.rs`). Each transaction's gas is capped, the bundle's total is not, so one request runs N × the gas cap under one blocking-IO permit. Port the cumulative check (not the EIP-8037 branch); the cancellation check needs 13a59de4b | hand port |
 | 0973a1387, 34f77be92 | stop `eth_simulateV1` and the pending-block build once the request is dropped | rpc-eth-api | Build on 13a59de4b. TN defaults `--rpc.pending-block none` | after 13a59de4b |

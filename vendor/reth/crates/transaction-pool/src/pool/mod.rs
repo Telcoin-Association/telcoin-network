@@ -204,9 +204,15 @@ where
     pub fn block_info(&self) -> BlockInfo {
         self.get_pool_data().block_info()
     }
-    /// Sets the currently tracked block
+    /// Sets the currently tracked block.
+    ///
+    /// This will also notify subscribers about any transactions that were promoted to the pending
+    /// pool due to fee changes.
     pub fn set_block_info(&self, info: BlockInfo) {
-        self.pool.write().set_block_info(info)
+        let outcome = self.pool.write().set_block_info(info);
+
+        // Notify subscribers about promoted transactions due to fee changes
+        self.notify_on_transaction_updates(outcome.promoted, outcome.discarded);
     }
 
     /// Returns the internal [`SenderId`] for this address, allocating a new mapping when the
@@ -1753,6 +1759,36 @@ mod tests {
 
         let identifiers = test_pool.identifiers.read();
         assert_eq!(identifiers.sender_id(&auth), Some(SenderId::from(1)));
+    }
+
+    /// TN(TN-0042): a transaction that a lower base fee promotes reaches pending listeners.
+    #[test]
+    fn set_block_info_notifies_pending_listeners_of_promotions() {
+        use crate::TransactionListenerKind;
+
+        let test_pool = &TestPoolBuilder::default().with_config(Default::default()).pool;
+        test_pool.set_block_info(BlockInfo { pending_basefee: 1_000, ..Default::default() });
+        let mut pending = test_pool.add_pending_listener(TransactionListenerKind::All);
+
+        let tx = MockTransaction::eip1559().with_max_fee(500).with_priority_fee(1);
+        let hash = *tx.get_hash();
+        test_pool.add_transactions(
+            TransactionOrigin::External,
+            [TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: 0,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(tx),
+                propagate: true,
+                authorities: None,
+            }],
+        );
+        assert_eq!(test_pool.size().basefee, 1, "parked below the base fee");
+        assert!(pending.try_recv().is_err(), "a parked transaction is not pending");
+
+        test_pool.set_block_info(BlockInfo { pending_basefee: 100, ..Default::default() });
+        assert_eq!(test_pool.size().pending, 1, "promoted by the lower base fee");
+        assert_eq!(pending.try_recv().ok(), Some(hash));
     }
 
     #[test]
