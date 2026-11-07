@@ -109,6 +109,13 @@ pub struct PrimaryMetrics {
     /// This is the lag the activity window demotes on, measured against the node's own round
     /// instead of an incoming certificate's.
     pub(crate) commit_lag_rounds: Gauge,
+    // bench5 f1-commit-lag
+    /// Times the execution check asked the canonical database again because it could not answer
+    /// for a block at or below the executed tip (a read error), one per retry.
+    ///
+    /// Zero in a healthy node; a rising value means the execution database keeps failing reads
+    /// and the waits behind it (votes, the subscriber, catch-up) are held.
+    pub(crate) execution_check_retries_total: Counter,
 }
 
 impl PrimaryMetrics {
@@ -511,6 +518,7 @@ mod tests {
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
             metrics.commit_run_ahead_blocked_total.increment(1);
+            metrics.execution_check_retries_total.increment(4);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -543,6 +551,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
+        assert!(matches!(value, DebugValue::Counter(4)));
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four

@@ -6,7 +6,7 @@ use crate::{
     metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBusApp, NodeMode,
+    ConsensusBusApp, ExecutionCheckError, NodeMode,
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
@@ -1096,14 +1096,37 @@ where
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
         timing.enter(VoteStage::ExecWait);
-        if self.consensus_bus.wait_for_execution(header.latest_execution_block()).await.is_err() {
-            error!(
-                target: "primary",
-                peer_hash = ?header.latest_execution_block(),
-                expected = ?self.consensus_bus.latest_execution_block_num_hash(),
-                "unexpected execution result received"
-            );
-            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block()).into());
+        let header_block = header.latest_execution_block();
+        match self.consensus_bus.wait_for_execution(header_block).await {
+            Ok(()) => {}
+            Err(ExecutionCheckError::Fork) => {
+                error!(
+                    target: "primary",
+                    peer_hash = ?header_block,
+                    expected = ?self.consensus_bus.latest_execution_block_num_hash(),
+                    "unexpected execution result received"
+                );
+                return Err(HeaderError::UnknownExecutionResult(header_block).into());
+            }
+            Err(ExecutionCheckError::BelowFloor { floor }) => {
+                // a snapshot-restored voter holds no block below its floor, so it can neither
+                // confirm nor refute the header's and never will: a final refusal without a
+                // penalty, not a fork
+                warn!(
+                    target: "primary",
+                    header_block = header_block.number,
+                    floor,
+                    "header's execution block is below the restored-state floor; not voting"
+                );
+                return Err(HeaderError::BelowRestoreFloor {
+                    header_block: header_block.number,
+                    floor,
+                }
+                .into());
+            }
+            Err(ExecutionCheckError::Closed) => {
+                return Err(HeaderError::ClosedWatchChannel.into());
+            }
         }
         timing.enter(VoteStage::Parents);
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
@@ -1928,6 +1951,7 @@ impl VoteOutcome {
                 HeaderError::Storage(_)
                 | HeaderError::ClosedWatchChannel
                 | HeaderError::NotCommitteeMember
+                | HeaderError::BelowRestoreFloor { .. }
                 | HeaderError::SyncBatches(_)
                 | HeaderError::TNSend(_)
                 | HeaderError::PendingCertificateOneshot,

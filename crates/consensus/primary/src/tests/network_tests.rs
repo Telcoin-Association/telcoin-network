@@ -4169,3 +4169,82 @@ async fn behind_line_reports_execution_and_commit_lag() {
         behind[0]
     );
 }
+
+// ---- bench5 f1-commit-lag ----
+
+/// SEC-6 / N1: a snapshot-restored voter can never check a header's execution block below its
+/// floor. It refuses at once with the final, unpenalized `BelowRestoreFloor`, neither the fork
+/// error `UnknownExecutionResult` nor the retryable `ExecutionBehind`, counts no execution-behind
+/// refusal and stores no vote.
+#[tokio::test]
+async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<()> {
+    /// A datadir restored at block 100 that attests no block.
+    struct RestoredAt100;
+    impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+        fn canonical_execution_hash(&self, _: u64) -> Option<BlockHash> {
+            None
+        }
+        fn restored_state_floor(&self) -> Option<u64> {
+            Some(100)
+        }
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    // executed through block 120 after a restore at block 100
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::seal_slow(ExecHeader { number: 120, ..Default::default() })),
+        )
+    });
+    consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+
+    let author = committee.last_authority();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(50, BlockHash::ZERO))
+        .build();
+    let err = handler
+        .vote(*author.authority().protocol_key(), header, vec![])
+        .await
+        .expect_err("a block below the floor cannot be checked");
+
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+            header_block: 50,
+            floor: 100
+        })
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "the refusal is final, so the requester stops asking this voter"
+    );
+    let behind =
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.votes_refused_execution_behind_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        });
+    assert_eq!(behind.unwrap_or_default(), 0, "not an execution-behind refusal");
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a refused header stores no vote");
+    Ok(())
+}

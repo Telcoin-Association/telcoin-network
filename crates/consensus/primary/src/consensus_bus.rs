@@ -4,7 +4,8 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, metrics::PrimaryMetrics,
-    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
+    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, ExecutionCheck,
+    RecentBlocks,
 };
 use parking_lot::Mutex;
 use std::{
@@ -14,14 +15,15 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
-    deconstruct_nonce, BlockNumHash, CanonicalExecutionReader, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header,
-    Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockNumHash, BlockNumber, CanonicalExecutionReader, Certificate,
+    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord,
+    EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -31,6 +33,16 @@ use tokio::{
     time::error::Elapsed,
 };
 use tracing::{error, info, warn};
+
+/// How long [`ConsensusBusApp::wait_for_execution`] waits before asking the canonical database
+/// again after it could not answer ([`ExecutionCheck::Unconfirmed`]).
+///
+/// Persistence is not signalled on the `recent_blocks` watch, so the wait polls. Short enough
+/// that a voter retries several times inside its execution wait.
+const EXECUTION_CHECK_RETRY_DELAY: Duration = Duration::from_millis(200);
+/// [`ConsensusBusApp::wait_for_execution`] logs its first retry of an unanswered database read and
+/// then every this many retries (about every 5 s at [`EXECUTION_CHECK_RETRY_DELAY`]).
+const EXECUTION_CHECK_RETRY_WARN_EVERY: u64 = 25;
 
 /// Depth of the bounded `sync_output` queue.
 ///
@@ -747,16 +759,12 @@ impl CanonicalReaderSlot {
         *self.0.lock() = Some(reader);
     }
 
-    /// Confirm that `block` is the canonical execution block persisted at its height.
+    /// The installed reader, if any.
     ///
-    /// Returns `false` when no reader is installed, the height is above the persisted tip, or the
-    /// DB hash differs (a genuine fork).
-    fn confirms(&self, block: &BlockNumHash) -> bool {
-        // Clone the handle out and drop the lock before the DB read: never hold a lock across I/O.
-        let reader = self.0.lock().clone();
-        reader
-            .and_then(|reader| reader.canonical_execution_hash(block.number))
-            .is_some_and(|hash| hash == block.hash)
+    /// The handle is cloned out so the caller reads the database without this lock: never hold a
+    /// lock across I/O.
+    fn reader(&self) -> Option<Arc<dyn CanonicalExecutionReader>> {
+        self.0.lock().clone()
     }
 }
 
@@ -1194,39 +1202,64 @@ impl ConsensusBusApp {
         self.inner.canonical_reader.install(reader);
     }
 
-    /// Will resolve once we have executed block.
+    /// Check `block`, an execution block a header names, against this node's execution without
+    /// waiting (see [`ExecutionCheck`]).
     ///
-    /// Return an error if we do not execute the requested block by block number.
-    /// Note if the chain is not advancing this may never return.
-    pub async fn wait_for_execution(
-        &self,
-        block: BlockNumHash,
-    ) -> Result<(), WaitForExecutionElapsed> {
+    /// The `recent_blocks` ring answers first, comparing the number and the hash. A miss at or
+    /// below the executed tip goes to the canonical database, with the restored-state floor as the
+    /// lower bound: the ring keeps only the final block of each recent output, and its window is
+    /// `gc_depth` deep. The watch borrow is released before the database read.
+    pub fn check_execution_block(&self, block: BlockNumHash) -> ExecutionCheck {
+        let ring = self.recent_blocks().borrow().check_execution_block(block);
+        ring.unwrap_or_else(|| {
+            ExecutionCheck::from_canonical(block, self.inner.canonical_reader.reader().as_deref())
+        })
+    }
+
+    /// Will resolve once execution has reached `block` and the check matched it.
+    ///
+    /// This is the one execution check the voter, the subscriber and state-sync make (see
+    /// [`Self::check_execution_block`]). It waits while the check is [`ExecutionCheck::NotYet`],
+    /// for the next executed output, and while it is [`ExecutionCheck::Unconfirmed`], asking the
+    /// database again every [`EXECUTION_CHECK_RETRY_DELAY`]; each retry counts in
+    /// `tn_primary.execution_check_retries_total`, and the first and every
+    /// [`EXECUTION_CHECK_RETRY_WARN_EVERY`]th log a warning. Note if the chain is not advancing
+    /// this may never return.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutionCheckError::Fork`] when this node holds a different block at the number,
+    /// [`ExecutionCheckError::BelowFloor`] when the number is below this node's restored-state
+    /// floor (it cannot check the block; not a fork) and [`ExecutionCheckError::Closed`] when the
+    /// `recent_blocks` watch closes.
+    pub async fn wait_for_execution(&self, block: BlockNumHash) -> Result<(), ExecutionCheckError> {
         let mut watch_execution_result = self.recent_blocks().subscribe();
-        let target_number = block.number;
-        // Make sure that our recent blocks is not empty.  If it is we can have a race around block
-        // 0.
-        while self.recent_blocks().borrow().is_empty() {
-            watch_execution_result.changed().await?;
-        }
-        let mut current_number = self.latest_execution_block_num_hash().number;
-        while current_number < target_number {
-            watch_execution_result.changed().await?;
-            current_number = self.latest_execution_block_num_hash().number;
-        }
-        if self.recent_blocks().borrow().contains_execution_hash(block.hash) {
-            // Once we see our hash, should happen when current_number == target_number- trust
-            // digesting for this, we are done.
-            Ok(())
-        } else if self.inner.canonical_reader.confirms(&block) {
-            // Not in the in-memory ring, but the local execution DB holds exactly this block as
-            // canonical at its height: the ring merely evicted it (its window is `gc_depth` deep),
-            // so this is a stale ring, not a fork.
-            Ok(())
-        } else {
-            // Not in the ring and not confirmed canonical in the DB: a genuine execution fork, or
-            // the block is simply not persisted yet. Fail hard.
-            Err(WaitForExecutionElapsed())
+        let mut retries: u64 = 0;
+        loop {
+            match self.check_execution_block(block) {
+                ExecutionCheck::Match => return Ok(()),
+                ExecutionCheck::Fork => return Err(ExecutionCheckError::Fork),
+                ExecutionCheck::BelowFloor { floor } => {
+                    return Err(ExecutionCheckError::BelowFloor { floor })
+                }
+                ExecutionCheck::NotYet => watch_execution_result.changed().await?,
+                ExecutionCheck::Unconfirmed => {
+                    // the ring is pushed only after a block is persisted, so a database that
+                    // cannot answer at or below the tip is failing reads: keep asking, visibly
+                    retries = retries.saturating_add(1);
+                    self.metrics().execution_check_retries_total.increment(1);
+                    if retries == 1 || retries.is_multiple_of(EXECUTION_CHECK_RETRY_WARN_EVERY) {
+                        warn!(
+                            target: "primary",
+                            block_number = block.number,
+                            block_hash = %block.hash,
+                            retries,
+                            "execution block not readable from the canonical db; retrying"
+                        );
+                    }
+                    tokio::time::sleep(EXECUTION_CHECK_RETRY_DELAY).await
+                }
+            }
         }
     }
 
@@ -1680,7 +1713,31 @@ impl ConsensusBus {
     }
 }
 
-/// Error for wait_for_execution().
+/// Why [`ConsensusBusApp::wait_for_execution`] did not confirm an execution block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutionCheckError {
+    /// This node holds a different block at the number: execution has forked.
+    #[error("execution fork: the local chain holds a different block at this number")]
+    Fork,
+    /// The number is below this node's restored-state floor, so this node cannot check the
+    /// block. Not a fork.
+    #[error("execution block is below the restored-state floor {floor}")]
+    BelowFloor {
+        /// The node's restored-state floor.
+        floor: BlockNumber,
+    },
+    /// The `recent_blocks` watch closed before the check finished.
+    #[error("the recent blocks watch closed")]
+    Closed,
+}
+
+impl From<RecvError> for ExecutionCheckError {
+    fn from(_: RecvError) -> Self {
+        Self::Closed
+    }
+}
+
+/// Error for wait_for_consensus_execution().
 #[derive(Copy, Clone, Debug)]
 pub struct WaitForExecutionElapsed();
 

@@ -11,7 +11,9 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::PrimaryToWorkerClient;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
+use tn_primary::{
+    network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, ExecutionCheckError, NodeMode,
+};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
@@ -553,12 +555,20 @@ impl<DB: Database> Subscriber<DB> {
                 Some(output) = waiting.next() => {
                     match output {
                         Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
-                        Err(SubscriberError::ExecutionFork { number, base_block, base_hash }) => {
+                        Err(SubscriberError::ExecutionFork {
+                            number,
+                            base_block,
+                            base_hash,
+                            leader,
+                            leader_round,
+                        }) => {
                             error!(
                                 target: "subscriber",
                                 number,
                                 base_block,
                                 %base_hash,
+                                %leader,
+                                leader_round,
                                 "leader's execution block is not on the local chain; execution has forked, going inactive"
                             );
                             let previous =
@@ -762,7 +772,10 @@ impl<DB: Database> Subscriber<DB> {
     /// floor. The check itself is [`ConsensusBusApp::wait_for_execution`], the one each vote
     /// makes.
     ///
-    /// Returns [`SubscriberError::ExecutionFork`] when the check fails.
+    /// Returns [`SubscriberError::ExecutionFork`] only when this node holds a different block at
+    /// the leader's number. A block below this node's restored-state floor cannot be checked here:
+    /// it is logged at warn and the output goes on, because the voters that certified the leader
+    /// checked it against their own chains.
     async fn wait_for_leader_execution(
         &self,
         sub_dag: &CommittedSubDag,
@@ -791,11 +804,30 @@ impl<DB: Database> Subscriber<DB> {
                 "waited for execution before assembling the output"
             );
         }
-        checked.map_err(|_| SubscriberError::ExecutionFork {
-            number,
-            base_block: base.number,
-            base_hash: base.hash,
-        })
+        match checked {
+            Ok(()) => Ok(()),
+            Err(ExecutionCheckError::BelowFloor { floor }) => {
+                warn!(
+                    target: "subscriber",
+                    number,
+                    leader_round = sub_dag.leader_round(),
+                    base_block = base.number,
+                    floor,
+                    "leader's execution block is below the restored-state floor; not checked"
+                );
+                Ok(())
+            }
+            Err(ExecutionCheckError::Fork) => Err(SubscriberError::ExecutionFork {
+                number,
+                base_block: base.number,
+                base_hash: base.hash,
+                leader: sub_dag.leader().author().clone(),
+                leader_round: sub_dag.leader_round(),
+            }),
+            Err(ExecutionCheckError::Closed) => {
+                Err(SubscriberError::ClosedChannel("recent_blocks".to_string()))
+            }
+        }
     }
 
     /// Warn every [`FETCH_BATCHES_STALL_WARN_INTERVAL`] while a worker's fetch leg is
@@ -877,9 +909,13 @@ impl<DB: Database> Subscriber<DB> {
 /// The execution block number the next received sub-dag's output waits for: the running maximum
 /// of the leaders' execution blocks, `wait_floor` so far raised to `sub_dag`'s leader's block.
 ///
-/// Keeping the floor monotone makes the outputs pass their execution wait in consensus order, so
-/// the assembled outputs held in memory stay about the channel depth even while commits run far
-/// ahead of execution.
+/// Keeping the floor monotone makes the outputs pass their execution wait in consensus order: an
+/// output led from an older block does not pass early and sit fully assembled behind a slower
+/// predecessor. It does not bound how many outputs are assembled at once. Every output whose floor
+/// local execution has passed is assembled concurrently, so under a uniform backlog the outputs
+/// held in memory approach the outputs between the executed and the committed leader: up to about
+/// 500 at the 1,000-round run-ahead bound ([`tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS`]), about
+/// 0.5-0.6 GB at the 1.0-1.25 MB average output and 2.75 GB at the 5.5 MB maximum.
 fn next_wait_floor(wait_floor: u64, sub_dag: &CommittedSubDag) -> u64 {
     wait_floor.max(sub_dag.leader().latest_execution_block().number)
 }
@@ -1689,6 +1725,8 @@ mod tests {
             let subscriber = sync_subscriber(&fixture, chain, &bus);
             let sub_dag = led_at(&fixture, BlockNumHash::new(1, forked_hash()), true);
             assert_ne!(sub_dag.num_primary_batches(), 0);
+            let (expected_leader, expected_round) =
+                (sub_dag.leader().author().clone(), sub_dag.leader_round());
 
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -1697,11 +1735,50 @@ mod tests {
             .await
             .expect("the fork check runs before the batch fetch");
 
+            // the error names the leader that referenced the block (SEC-11)
             assert!(matches!(
                 result,
-                Err(SubscriberError::ExecutionFork { number: 1, base_block: 1, base_hash })
-                    if base_hash == forked_hash()
+                Err(SubscriberError::ExecutionFork {
+                    number: 1,
+                    base_block: 1,
+                    base_hash,
+                    leader,
+                    leader_round,
+                }) if base_hash == forked_hash()
+                    && leader == expected_leader
+                    && leader_round == expected_round
             ));
+        }
+
+        /// A leader block below a snapshot-restored node's floor cannot be checked there, so it
+        /// is not a fork: the output is assembled, while the same mismatch at the floor still
+        /// fails the check (SEC-6).
+        #[tokio::test]
+        async fn fetch_batches_assembles_below_the_restore_floor() {
+            /// A restored execution database whose floor is block 3, attesting this node's
+            /// blocks from there on.
+            struct RestoredAt3;
+            impl tn_types::CanonicalExecutionReader for RestoredAt3 {
+                fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
+                    (number >= 3).then(|| local_hash(number))
+                }
+                fn restored_state_floor(&self) -> Option<u64> {
+                    Some(3)
+                }
+            }
+
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            (2..=5).for_each(|number| execute(&bus, number));
+            bus.set_canonical_reader(Arc::new(RestoredAt3));
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let below = led_at(&fixture, BlockNumHash::new(2, forked_hash()), false);
+            let output = subscriber.fetch_batches(below, B256::ZERO.into(), 1, 2).await.unwrap();
+            assert_eq!(output.number(), 1);
+
+            let at_floor = led_at(&fixture, BlockNumHash::new(3, forked_hash()), false);
+            let result = subscriber.fetch_batches(at_floor, B256::ZERO.into(), 2, 3).await;
+            assert!(matches!(result, Err(SubscriberError::ExecutionFork { base_block: 3, .. })));
         }
 
         /// A sub-dag with no batches gets the same fork check: its output is not returned before
