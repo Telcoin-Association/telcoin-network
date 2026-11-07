@@ -302,8 +302,8 @@ impl From<GossipVerdict> for MessageAcceptance {
 /// Deferred validation ticket for one gossip message that gossipsub holds (#1772).
 ///
 /// Gossipsub runs with `validate_messages()`, so it forwards a message only after this node
-/// reports a verdict. The message stays reportable for about 5 s (history length 5 at a 1 s
-/// heartbeat). The rule for the consumer:
+/// reports a verdict. The message stays reportable for about 12 s (history length 12 at a 1 s
+/// heartbeat, `GOSSIP_HISTORY_LENGTH`). The rule for the consumer:
 ///
 /// - call [`accept`](Self::accept) right after the signature check and before any downstream work;
 /// - call [`reject`](Self::reject) on an author content fault;

@@ -965,7 +965,7 @@ where
             relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
         let task_name = format!("process-gossip-{relayer_label}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            // The batch fetch can take longer than the about 5 s gossipsub validation window,
+            // The batch fetch can take longer than the about 12 s gossipsub validation window,
             // so the worker accepts at delivery (#1772). Batch gossip forwards as before.
             validation.accept().await;
             if let Err(e) = request_handler.process_gossip(&msg).await {

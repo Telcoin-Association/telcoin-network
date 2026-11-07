@@ -4085,6 +4085,39 @@ async fn invalid_certificate_signature_rejects_and_charges_author() {
     );
 }
 
+/// The signed author of a certificate whose aggregate fails takes a fatal penalty, which the peer
+/// manager waives for committee keys. The strike in the verification slots is the cost: the
+/// author gets no slot during its cooldown, and another author still gets one (#1772).
+#[tokio::test]
+async fn invalid_certificate_author_is_cooled_down() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("bad-aggregate-cooldown");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+
+    // process_gossip strikes the author on this fault.
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    let author = other.last_authority().primary_public_key();
+    let honest = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, honest, "the fixture committee has more than one authority");
+    slots.strike(author);
+    assert!(slots.take(Some(author), None).is_none(), "a struck author must be cooled down");
+    assert!(slots.take(Some(honest), None).is_some(), "another author must still get a slot");
+}
+
 /// A certificate that verifies reports Accept and frees its verification slot before the
 /// downstream certificate work (#1772).
 #[tokio::test]
@@ -4109,6 +4142,48 @@ async fn valid_certificate_accepts_before_downstream() {
     assert!(
         slots.take(None, None).is_some(),
         "the verdict must free the slot while the message is still held"
+    );
+}
+
+/// A replay of a certificate this node already verified is ignored before the aggregate check:
+/// the handler returns `Ok(())` with no verdict, and the dropped ticket reports Ignore, so the
+/// replay is not forwarded (#1772).
+#[tokio::test]
+async fn replayed_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+
+    // First delivery: the aggregate verifies and the ticket reports Accept. The digest is recorded
+    // before the accept, so the downstream result does not matter here.
+    let (validation, mut verdicts) = gossip_ticket("first-delivery");
+    let mut first = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let _ = handler.process_gossip_with(&msg, &mut first).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "the first delivery of a valid certificate must report Accept"
+    );
+    drop(first);
+
+    // Second delivery of the same frame: the known-certificate check returns before the verify.
+    let (validation, mut verdicts2) = gossip_ticket("replay");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "a replay of a known certificate is not a fault"
+    );
+    assert!(pending.is_pending(), "a replay must not get a verdict from the handler");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts2, GossipVerdict::Ignore).await,
+        "a replay must report Ignore, so it is not forwarded"
     );
 }
 

@@ -3,7 +3,12 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
@@ -148,6 +153,24 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// epoch vote. Four leaves headroom for a burst after a reconnect.
 pub const MAX_PENDING_GOSSIP_PER_PEER: usize = 4;
 
+/// How long this node ignores gossip from an author after its first strike in an epoch (#1772).
+///
+/// A strike is a provable author content fault with a fatal penalty, for example a certificate
+/// from a resolved author whose aggregate signature fails. The gossipsub envelope is signed, so
+/// the author is accountable. Each further strike in the epoch doubles the hold, up to
+/// [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+///
+/// The peer manager exempts committee keys from every penalty (`docs/src/network/peers.md`, test
+/// `committee_members_are_exempt_from_all_penalties`). The `Fatal` is then recorded with
+/// `outcome=exempt`, and this local cooldown is the cost that the author pays. The slots are
+/// rebuilt with the primary network each epoch, which clears the strikes.
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_BASE: Duration = Duration::from_secs(10);
+
+/// Upper bound on the gossip cooldown of an author after repeated strikes in one epoch (#1772).
+///
+/// See [`GOSSIP_AUTHOR_COOLDOWN_BASE`].
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_MAX: Duration = Duration::from_secs(160);
+
 /// Guard for one gossip message in signature verification (#1772).
 ///
 /// It holds a per-peer slot, or a permit from the shared bucket for gossip whose author and
@@ -171,28 +194,63 @@ pub(crate) enum GossipSlot {
 ///
 /// A message takes a slot keyed by its author when the author is resolved, else by its relayer.
 /// Gossip with neither identity resolved shares one bucket with the same cap.
+///
+/// An author struck for a fatal author content fault gets no slot for a cooldown that starts at
+/// [`GOSSIP_AUTHOR_COOLDOWN_BASE`] and doubles per strike up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
 #[derive(Clone, Debug)]
 pub(crate) struct GossipSlots {
     /// Slots keyed by the author or relayer BLS key.
     peers: PeerSlots,
     /// Shared bucket for gossip whose author and relayer are both unresolved.
     unresolved: Arc<Semaphore>,
+    /// Cooldowns of struck authors. The slots are rebuilt each epoch, which clears them.
+    cooldowns: Arc<Mutex<HashMap<BlsPublicKey, AuthorCooldown>>>,
+}
+
+/// The gossip cooldown of one struck author in this epoch (#1772).
+#[derive(Clone, Copy, Debug)]
+struct AuthorCooldown {
+    /// Strikes against the author in this epoch.
+    strikes: u32,
+    /// The author's gossip gets no slot until this instant.
+    until: Instant,
 }
 
 impl GossipSlots {
     /// Create the slots with `cap` messages per peer and `cap` messages in the shared bucket.
     pub(crate) fn new(cap: usize) -> Self {
-        Self { peers: PeerSlots::new(cap), unresolved: Arc::new(Semaphore::new(cap)) }
+        Self {
+            peers: PeerSlots::new(cap),
+            unresolved: Arc::new(Semaphore::new(cap)),
+            cooldowns: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Take a slot for gossip from `author`, else `relayer`, else the shared bucket.
     ///
-    /// Returns `None` when that peer or the shared bucket is at the cap.
+    /// Returns `None` when that peer or the shared bucket is at the cap, or when `author` is in a
+    /// cooldown.
     pub(crate) fn take(
         &self,
         author: Option<BlsPublicKey>,
         relayer: Option<BlsPublicKey>,
     ) -> Option<GossipSlot> {
+        self.take_at(author, relayer, Instant::now())
+    }
+
+    /// [`Self::take`] at the instant `now`.
+    fn take_at(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+        now: Instant,
+    ) -> Option<GossipSlot> {
+        let cooling = author
+            .and_then(|a| self.cooldowns.lock().get(&a).copied())
+            .is_some_and(|c| c.until > now);
+        if cooling {
+            return None;
+        }
         author.or(relayer).map_or_else(
             || {
                 Arc::clone(&self.unresolved)
@@ -202,6 +260,30 @@ impl GossipSlots {
             },
             |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: Box::new(slot) }),
         )
+    }
+
+    /// Strike `author` for a fatal author content fault (#1772).
+    ///
+    /// Its gossip gets no slot for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubled for each earlier
+    /// strike in this epoch, up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+    pub(crate) fn strike(&self, author: BlsPublicKey) {
+        self.strike_at(author, Instant::now())
+    }
+
+    /// [`Self::strike`] at the instant `now`.
+    fn strike_at(&self, author: BlsPublicKey, now: Instant) {
+        let mut guard = self.cooldowns.lock();
+        let strikes = guard.get(&author).map_or(1, |c| c.strikes.saturating_add(1));
+        let hold = GOSSIP_AUTHOR_COOLDOWN_BASE
+            .saturating_mul(1u32 << strikes.saturating_sub(1).min(4))
+            .min(GOSSIP_AUTHOR_COOLDOWN_MAX);
+        guard.insert(author, AuthorCooldown { strikes, until: now + hold });
+    }
+
+    /// The end of the cooldown of `author`, if it was struck in this epoch.
+    #[cfg(test)]
+    pub(crate) fn cooldown_until(&self, author: &BlsPublicKey) -> Option<Instant> {
+        self.cooldowns.lock().get(author).map(|c| c.until)
     }
 
     /// Admit one gossip message for signature verification.
@@ -2320,6 +2402,11 @@ where
     /// at the verdict. Downstream work on verified gossip is not bounded here. That is safe because
     /// only signed messages from committee members, and certificates signed by a quorum of the
     /// committee, reach it.
+    ///
+    /// A fatal author content fault also strikes the author in [`GossipSlots`]: that author's
+    /// gossip is ignored for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubling per strike up to
+    /// [`GOSSIP_AUTHOR_COOLDOWN_MAX`], because the peer manager exempts committee keys from
+    /// penalties and the cooldown is the cost the author pays.
     fn process_gossip(&self, gossip: GossipPayload<Req, Res>) {
         let GossipPayload { message: msg, relayer, author, validation } = gossip;
         self.gossip_slots.admit(validation, author, relayer).map_or_else(
@@ -2335,6 +2422,7 @@ where
                 // clone for spawned tasks
                 let request_handler = self.request_handler.clone();
                 let network_handle = self.network_handle.clone();
+                let gossip_slots = self.gossip_slots.clone();
                 let relayer_label = relayer
                     .as_ref()
                     .map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
@@ -2357,6 +2445,16 @@ where
                         // or the error carries no penalty.
                         let charged = if e.is_author_content_fault() { author } else { relayer };
                         if let Some((peer, penalty)) = charged.zip((&e).into()) {
+                            // The peer manager exempts committee keys from every penalty, so a
+                            // fatal author fault also cools down the author's gossip here.
+                            if e.is_author_content_fault() && matches!(penalty, Penalty::Fatal) {
+                                gossip_slots.strike(peer);
+                                debug!(
+                                    target: "primary::network",
+                                    author = %peer,
+                                    "fatal author fault, cooling down the author's gossip"
+                                );
+                            }
                             network_handle.report_penalty(peer, penalty).await;
                         }
                         Err(e.into())
@@ -2565,13 +2663,13 @@ mod clip_peer_error_tests {
 #[cfg(test)]
 mod sync_admission_tests {
     use super::{
-        admit_and_serve_sync_stream, opening_read_bound, write_frame, PrimaryNetworkError,
-        PrimaryNetworkHandle, Req, Res, ServeHoldLimit, SyncAdmission, SyncClass, SyncFrame,
-        SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
+        admit_and_serve_sync_stream, opening_read_bound, write_frame, GossipSlots,
+        PrimaryNetworkError, PrimaryNetworkHandle, Req, Res, ServeHoldLimit, SyncAdmission,
+        SyncClass, SyncFrame, SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
         COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
-        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
-        PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
-        SYNC_REQUEST_READ_TIMEOUT,
+        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_GOSSIP_PER_PEER, MAX_PENDING_REQUESTS_PER_PEER,
+        MAX_SYNC_REQUEST_FRAME_SIZE, PUBLIC_EPOCH_PACK_SERVE_TIMEOUT,
+        PUBLIC_SYNC_REQUEST_READ_TIMEOUT, SYNC_REQUEST_READ_TIMEOUT,
     };
     use futures::{io::Cursor, AsyncRead, AsyncWrite, StreamExt as _};
     use rand::{rngs::StdRng, SeedableRng as _};
@@ -2584,7 +2682,7 @@ mod sync_admission_tests {
             Arc,
         },
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tn_network_libp2p::{
         types::NetworkCommand, PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers,
@@ -3015,6 +3113,30 @@ mod sync_admission_tests {
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
         assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
         assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+    }
+
+    /// A struck author gets no gossip slot during its cooldown, the hold doubles per strike, and
+    /// it stops at the cap. Other authors are not affected (#1772).
+    #[test]
+    fn gossip_author_cooldown_ignores_struck_author() {
+        let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        slots.strike_at(key(1), t0);
+        assert!(slots.take_at(Some(key(1)), None, t0).is_none());
+        // a resolved relayer does not give a struck author a slot
+        assert!(slots.take_at(Some(key(1)), Some(key(2)), t0).is_none());
+        assert!(slots.take_at(Some(key(2)), None, t0).is_some());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(9)).is_none());
+        // the first hold is over
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(10)).is_some());
+        // the second strike holds for 20 s
+        slots.strike_at(key(1), t0 + s(10));
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(29)).is_none());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(30)).is_some());
+        // more strikes stop at the cap
+        (0..5).for_each(|_| slots.strike_at(key(1), t0 + s(30)));
+        assert_eq!(slots.cooldown_until(&key(1)), Some(t0 + s(30) + s(160)));
     }
 
     /// Silent streams hold only the opening-read budget, and only until the opening read for
