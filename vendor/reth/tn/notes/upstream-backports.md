@@ -69,6 +69,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 44a74f9ea | TN-0051 | `eth_fillTransaction`, `eth_sendTransaction` and `eth_signTransaction` refuse a request that mixes legacy and EIP-1559 fee fields | nested and tn-reth tests |
 | 078c22d5f | TN-0052 | `BlockState` drops its parent chain iteratively (no stack overflow on a long unpersisted chain); Drop only | upstream test |
 | 1a6ba945a | TN-0052 | `AlloyHeader::from_compact` returns the buffer past the header; headers TN stores decode as before | codecs tests |
+| e7ebeb869 | TN-0052 | `receipts_by_block` returns `None` instead of a partial list for a block missing receipts | upstream tests |
 
 ## Open
 
@@ -100,7 +101,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### Low
 
-e7ebeb869 (partial receipts).
+None left.
 
 ### Not applicable
 

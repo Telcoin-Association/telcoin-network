@@ -630,7 +630,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 
 - **TN-0052** — Backport upstream's Low fixes on the chain-state and storage paths. *Kind*:
   backport.
-  *Files*: `crates/chain-state/src/in_memory.rs`, `crates/storage/codecs/src/alloy/header.rs`.
+  *Files*: `crates/chain-state/src/in_memory.rs`, `crates/storage/codecs/src/alloy/header.rs`,
+  `crates/storage/provider/src/providers/database/provider.rs`.
   *Why*: none changes what a block executes to or what a datadir stores.
   - 078c22d5f: `BlockState` drops its parent chain in a loop. The derived drop recursed once per
     in-memory ancestor it released, so dropping the head of a long unpersisted chain could
@@ -640,7 +641,14 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     was given, so a type that decodes a header followed by more fields reads them from the right
     offset. TN stores headers as whole values (static files, MDBX), which ignore the returned
     buffer, so decoded headers and stored bytes are unchanged.
-  *Tests*: upstream's `deep_chain_drop_preserves_shared_tail`; codecs' compact round-trip tests.
+  - e7ebeb869: `receipts_by_block` returns `None` for a non-empty block whose receipt range holds
+    fewer receipts than transactions, instead of the partial list. TN's replay for extensions
+    (`tn-reth/src/env/helpers.rs`) then reports `ReplayReceiptsMissing` rather than handing an
+    indexer a block that looks emptier than it is. TN never prunes, so a consistent datadir answers
+    as before. A read path: block execution does not read receipts this way.
+  *Tests*: upstream's `deep_chain_drop_preserves_shared_tail`; codecs' compact round-trip tests;
+  upstream's `test_receipts_by_block_returns_none_for_missing_unpruned_receipts` and its two
+  adjusted pruning tests.
   *Upstream*: n/a (upstream commits).
 
 ## TN fixes (not from an upstream commit)
