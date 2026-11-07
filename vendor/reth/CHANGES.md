@@ -628,6 +628,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   TN node. RPC input validation only. *Tests*: nested reth-rpc-eth-api tests; tn-reth's
   fill-transaction tests. *Upstream*: n/a (upstream commit).
 
+- **TN-0052** — Backport upstream's Low fixes on the chain-state and storage paths. *Kind*:
+  backport.
+  *Files*: `crates/chain-state/src/in_memory.rs`.
+  *Why*: none changes what a block executes to or what a datadir stores.
+  - 078c22d5f: `BlockState` drops its parent chain in a loop. The derived drop recursed once per
+    in-memory ancestor it released, so dropping the head of a long unpersisted chain could
+    overflow a thread's stack. Drop only; the conflict was a later upstream test in the same
+    module, not taken.
+  *Tests*: upstream's `deep_chain_drop_preserves_shared_tail`. *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
