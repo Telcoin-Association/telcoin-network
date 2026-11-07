@@ -77,6 +77,13 @@ pub(crate) const BIG: [(usize, usize); 3] =
     [(2 << 10, 20_000), (8 << 10, 10_000), (32 << 10, 4_000)];
 /// The large values are windows of one buffer at this many offsets.
 const BIG_SHIFTS: usize = 64;
+/// Point gets in each read transaction of `ro.txn` and `ro.txn.mt`.
+pub(crate) const TXN_GETS: usize = 2;
+/// Threads of `ro.txn.mt`. Fixed, not the machine's core count, so runs on two machines measure
+/// the same workload; four stay on performance cores with room to spare on any machine the
+/// bench targets (an M1 Max has 8, in two clusters of 4), so no thread lands on an efficiency
+/// core or waits for the main thread or the system.
+pub(crate) const TXN_THREADS: usize = 4;
 
 /// How many of each workload's operations a run of `n` takes: the bulk tables hold `n` entries,
 /// and the other counts follow `n` up to the comparison bench's fixed counts.
@@ -94,6 +101,10 @@ pub(crate) struct Sizes {
     pub(crate) churn: usize,
     /// Entries of each large-value row, in [`BIG`]'s order.
     pub(crate) big: [usize; 3],
+    /// Entries of the table of `ro.txn` and `ro.txn.mt`.
+    pub(crate) txn_keys: usize,
+    /// Read transactions of `ro.txn`, and of each thread of `ro.txn.mt`.
+    pub(crate) txns: usize,
 }
 
 impl Sizes {
@@ -107,6 +118,9 @@ impl Sizes {
             churn: n / 4,
             // A quarter of the full counts at the quick tier's 100k, the full counts from 400k.
             big: BIG.map(|(_, full)| (full * n / 400_000).clamp(16, full)),
+            // The full counts from the quick tier's 100k on.
+            txn_keys: (n / 10).clamp(16, 10_000),
+            txns: (n / 5).clamp(16, 20_000),
         }
     }
 }
@@ -136,6 +150,10 @@ pub(crate) struct Data {
     /// `churn`'s rounds' delete orders: `CHURN_ROUNDS` permutations of `0..churn`, one after the
     /// other (see [`Data::churn_order`]).
     churn_orders: Vec<u32>,
+    /// The gets of `ro.txn` and `ro.txn.mt`: indexes into the first `txn_keys` of `rand_keys`,
+    /// `TXN_GETS` a transaction, `txns` transactions for each of `TXN_THREADS` threads, one
+    /// after the other (see [`Data::txn_gets`]).
+    txn_gets: Vec<u32>,
 }
 
 /// `mixed`'s `ops` operations over the random table's `n` keys: (index into `rand_keys`,
@@ -195,6 +213,10 @@ impl Data {
         let mixed = mixed_half(&mut rng, n, sizes.mixed_ops);
         let churn_orders =
             (0..CHURN_ROUNDS).flat_map(|_| shuffled(&mut rng, sizes.churn)).collect();
+        let mut rng = Rng(0x5eed_0000_0000_0004);
+        let txn_gets = (0..TXN_THREADS * sizes.txns * TXN_GETS)
+            .map(|_| rng.below(sizes.txn_keys as u64) as u32)
+            .collect();
         Self {
             sizes,
             rand_keys,
@@ -206,6 +228,7 @@ impl Data {
             del_order,
             mixed,
             churn_orders,
+            txn_gets,
         }
     }
 
@@ -218,6 +241,13 @@ impl Data {
     /// first `deleted(churn)` the round deletes.
     pub(crate) fn churn_order(&self, r: usize) -> &[u32] {
         &self.churn_orders[r * self.sizes.churn..][..self.sizes.churn]
+    }
+
+    /// Thread `thread`'s gets in `ro.txn.mt` (thread 0's are `ro.txn`'s): `txns` transactions'
+    /// `TXN_GETS` indexes into `rand_keys`, each below `txn_keys`.
+    pub(crate) fn txn_gets(&self, thread: usize) -> &[u32] {
+        let len = self.sizes.txns * TXN_GETS;
+        &self.txn_gets[thread * len..][..len]
     }
 
     /// Entry `i`'s value in a large-value row of `len`-byte values.

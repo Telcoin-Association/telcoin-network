@@ -139,6 +139,7 @@ impl Modes {
 pub(crate) enum Job {
     Seq,
     Rand,
+    Txn,
     Small,
     Api,
     Mixed,
@@ -154,9 +155,10 @@ pub(crate) enum Job {
 
 impl Job {
     /// Every job, in run order.
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Seq,
         Self::Rand,
+        Self::Txn,
         Self::Small,
         Self::Api,
         Self::Mixed,
@@ -174,6 +176,7 @@ impl Job {
         match self {
             Self::Seq => "seq",
             Self::Rand => "rand",
+            Self::Txn => "txn",
             Self::Small => "small",
             Self::Api => "api",
             Self::Mixed => "mixed",
@@ -251,6 +254,8 @@ pub const ROWS: &[RowSpec] = &[
     row("scan.rev", Generic, NsPerOp, NoSyncOnly, Job::Rand, "entry"),
     row("seek.range", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
     row("seek.range.sorted", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
+    row("ro.txn", Generic, NsPerOp, NoSyncOnly, Job::Txn, "transaction"),
+    row("ro.txn.mt", Generic, NsPerOp, NoSyncOnly, Job::Txn, "transaction a thread"),
     row("commit.small", Generic, NsPerOp, Every, Job::Small, "transaction"),
     row("mixed", Generic, NsPerOp, Every, Job::Mixed, "put or delete"),
     row("delete.rand90", Generic, NsPerOp, NoSyncOnly, Job::Delete, "delete"),
@@ -666,6 +671,7 @@ pub fn run(config: &Config, progress: &mut dyn FnMut(&str)) -> Report {
                 let each: fn(&Path, EnvOptions, &data::Data, &mut Out<'_>) = match generic_job {
                     Job::Seq => generic::seq,
                     Job::Rand => generic::rand,
+                    Job::Txn => generic::txn,
                     Job::Small => generic::small,
                     Job::Api => generic::api,
                     Job::Mixed => generic::mixed,

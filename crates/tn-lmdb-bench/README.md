@@ -51,6 +51,8 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | `scan.fwd`, `scan.rev` | entry | n | full cursor scans of the random table |
 | `seek.range` | seek | n | a seek to a random absent key, then 9 `next` (100k seeks) |
 | `seek.range.sorted` | seek | n | the same targets sorted ascending, as a walker seeks |
+| `ro.txn` | transaction | n | short read transactions on one thread, each `begin_ro`, 2 point gets of random hits and its drop (20k), over a table of random entries small enough to stay in the caches (10k), so the gets do not bury the transaction's own cost under memory misses |
+| `ro.txn.mt` | transaction a thread | n | the same on 4 threads at once over one environment, each its own gets, started together: the span from the first thread's start to the last one's end over a thread's transactions. Equal to `ro.txn` when the threads share nothing they write; the ratio is what readers on several threads (an RPC node) pay for the state they share. The thread count is fixed so runs compare across machines; 4 stay on performance cores (an M1 Max has 8) |
 | `commit.small` | transaction | * | transactions of 3 puts committed one by one into a fresh environment (2000) |
 | `mixed` | operation | * | 50/50 deletes and re-inserts over a full random table, 1000 a transaction (100k) |
 | `delete.rand90` | delete | n | 90% of a random table deleted in random order, one transaction |
