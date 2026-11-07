@@ -4,10 +4,11 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
-        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
-        PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
+        try_admit_epoch_record, try_admit_shed, GossipSlots, MissingCertificatesRequest,
+        PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
         MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
-        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        MAX_PENDING_GOSSIP_PER_PEER, MAX_PENDING_REQUESTS_PER_PEER,
+        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -30,10 +31,10 @@ use tn_config::{ConsensusConfig, KeyConfig, Parameters};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
-        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, GossipVerdict, IntoResponse as _, MessageId,
+        NetworkCommand, NetworkEvent, NetworkResponseMessage, NetworkResult,
     },
-    GossipMessage, Penalty, StreamError, TopicHash,
+    GossipMessage, PeerId, Penalty, StreamError, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -1488,6 +1489,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_a, chain_id),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject epoch-A event");
@@ -1514,6 +1516,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_gap, chain_id),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject gap event");
@@ -4022,4 +4025,241 @@ fn test_import_fault_is_peer_caused_whitelist() {
         PackError::LocalEpochMismatch { local: 1, found: 2 }
     ))
     .is_none());
+}
+
+/// Encode `cert` as primary gossip on the primary topic, as the network layer delivers it.
+fn encode_certificate_gossip(cert: tn_types::Certificate) -> GossipMessage {
+    let data = tn_types::encode(&PrimaryGossip::Certificate(Box::new(cert)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A validation ticket that reports to a fresh channel, and the receiver for its verdict.
+fn gossip_ticket(
+    id: &str,
+) -> (
+    GossipValidation<PrimaryRequest, PrimaryResponse>,
+    tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    (GossipValidation::new(MessageId::from(id.as_bytes().to_vec()), PeerId::random(), tx), rx)
+}
+
+/// Whether the next command on `verdicts` reports `expected` for a held gossip message.
+async fn next_verdict_is(
+    verdicts: &mut tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    expected: GossipVerdict,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), verdicts.recv()).await.ok().flatten().is_some_and(
+        |command| {
+            matches!(
+                command,
+                NetworkCommand::ReportGossipValidation { verdict, .. } if verdict == expected
+            )
+        },
+    )
+}
+
+/// A certificate whose aggregate signature does not verify against the committee is an author
+/// content fault with a fatal penalty, and its ticket reports Reject (#1772).
+#[tokio::test]
+async fn invalid_certificate_signature_rejects_and_charges_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, mut verdicts) = gossip_ticket("bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a bad aggregate must report Reject"
+    );
+}
+
+/// The signed author of a certificate whose aggregate fails takes a fatal penalty, which the peer
+/// manager waives for committee keys. The strike in the verification slots is the cost: the
+/// author gets no slot during its cooldown, and another author still gets one (#1772).
+#[tokio::test]
+async fn invalid_certificate_author_is_cooled_down() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("bad-aggregate-cooldown");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+
+    // process_gossip strikes the author on this fault.
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    let author = other.last_authority().primary_public_key();
+    let honest = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, honest, "the fixture committee has more than one authority");
+    slots.strike(author);
+    assert!(slots.take(Some(author), None).is_none(), "a struck author must be cooled down");
+    assert!(slots.take(Some(honest), None).is_some(), "another author must still get a slot");
+}
+
+/// A certificate that verifies reports Accept and frees its verification slot before the
+/// downstream certificate work (#1772).
+#[tokio::test]
+async fn valid_certificate_accepts_before_downstream() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+    let slots = GossipSlots::new(1);
+    let (validation, mut verdicts) = gossip_ticket("valid");
+    let mut pending =
+        PendingGossip::new(validation, slots.take(None, None).expect("free shared slot"));
+    assert!(slots.take(None, None).is_none(), "the shared bucket holds one message");
+
+    // Only the verdict and the slot are checked; the downstream result is not part of the fix.
+    let _ = handler.process_gossip_with(&msg, &mut pending).await;
+    assert!(!pending.is_pending(), "a verified certificate must get a verdict");
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "a verified certificate must report Accept"
+    );
+    assert!(
+        slots.take(None, None).is_some(),
+        "the verdict must free the slot while the message is still held"
+    );
+}
+
+/// A replay of a certificate this node already verified is ignored before the aggregate check:
+/// the handler returns `Ok(())` with no verdict, and the dropped ticket reports Ignore, so the
+/// replay is not forwarded (#1772).
+#[tokio::test]
+async fn replayed_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+
+    // First delivery: the aggregate verifies and the ticket reports Accept. The digest is recorded
+    // before the accept, so the downstream result does not matter here.
+    let (validation, mut verdicts) = gossip_ticket("first-delivery");
+    let mut first = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let _ = handler.process_gossip_with(&msg, &mut first).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "the first delivery of a valid certificate must report Accept"
+    );
+    drop(first);
+
+    // Second delivery of the same frame: the known-certificate check returns before the verify.
+    let (validation, mut verdicts2) = gossip_ticket("replay");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "a replay of a known certificate is not a fault"
+    );
+    assert!(pending.is_pending(), "a replay must not get a verdict from the handler");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts2, GossipVerdict::Ignore).await,
+        "a replay must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A certificate for an epoch with no known committee cannot be verified: the handler returns
+/// `Ok(())`, so no peer is charged, and the dropped ticket reports Ignore (#1772).
+#[tokio::test]
+async fn unknown_committee_certificate_ignores_without_penalty() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    let future =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(5).build();
+    let cert = future.certificate(&future.header_from_last_authority());
+    assert_eq!(cert.epoch(), 5, "the certificate must be for an epoch the handler does not know");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("unknown-committee");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an unknown committee is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "unverifiable gossip must not get Accept");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "a ticket dropped without a verdict must report Ignore"
+    );
+}
+
+/// With MAX_PENDING_GOSSIP_PER_PEER messages from one author in verification, the next message
+/// from that author is not admitted and its ticket reports Ignore. Another author still gets a
+/// slot, and the author's slots free when its messages settle (#1772).
+#[tokio::test]
+async fn gossip_slots_cap_per_author() {
+    let author_a = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([1; 32])).public();
+    let author_b = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([2; 32])).public();
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+
+    // Hold every slot for author A.
+    let held: Vec<PendingGossip> = (0..MAX_PENDING_GOSSIP_PER_PEER)
+        .map(|i| {
+            let (validation, _verdicts) = gossip_ticket(&format!("held-{i}"));
+            slots.admit(validation, Some(author_a), None).expect("author A is under the cap")
+        })
+        .collect();
+
+    // The next message from author A is over the cap: no slot, and its ticket reports Ignore.
+    let (validation, mut verdicts) = gossip_ticket("over-cap");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_none(),
+        "author A must not get a slot past the cap"
+    );
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "over-cap gossip must report Ignore"
+    );
+
+    // Another author has its own slots.
+    let (validation, _verdicts) = gossip_ticket("author-b");
+    assert!(
+        slots.admit(validation, Some(author_b), None).is_some(),
+        "author B must still get a slot"
+    );
+
+    // Settled messages free their slots for author A.
+    drop(held);
+    let (validation, _verdicts) = gossip_ticket("after-release");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_some(),
+        "author A must get a slot once its held messages settle"
+    );
 }

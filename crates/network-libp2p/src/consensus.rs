@@ -20,9 +20,9 @@ use crate::{
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
-        EpochPosition, GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
-        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
-        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        EpochPosition, GossipPayload, GossipValidation, KadQuery, NetworkCommand, NetworkEvent,
+        NetworkHandle, NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult,
+        NetworkType, NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -1697,6 +1697,18 @@ where
                     bounded_warn!(Command, target: "peer-manager", ?peer, "unable to assess penalty for peer");
                 }
             }
+            NetworkCommand::ReportGossipValidation { message_id, propagation_source, verdict } => {
+                // the consumer's deferred verdict for a held gossip message (#1772)
+                let reported =
+                    self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        verdict.into(),
+                    );
+                if !reported {
+                    bounded_error!(Gossip, target: "network", ?propagation_source, ?message_id, ?verdict, "gossip validation verdict for an expired message");
+                }
+            }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
                 // this is called after timeout for disconnected peer exchanges
                 let res = self.swarm.disconnect_peer_id(peer_id);
@@ -1917,12 +1929,16 @@ where
                 let msg_acceptance = self.verify_gossip(&message);
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
-                // report message validation results to propagate valid messages
-                if !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                    &message_id,
-                    &propagation_source,
-                    msg_acceptance.into(),
-                ) {
+                // Report a reject now. An accepted message stays held in gossipsub until the
+                // consumer reports its verdict through the `GossipValidation` ticket (#1772), so
+                // nothing is forwarded before the application verifies it.
+                let reject_unreported = matches!(msg_acceptance, GossipAcceptance::Reject(_))
+                    && !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        msg_acceptance.into(),
+                    );
+                if reject_unreported {
                     bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, "error reporting message validation result");
                 }
 
@@ -1960,11 +1976,20 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
+                        // Gossipsub holds the message until the consumer reports a verdict
+                        // through this ticket (#1772). The primary accepts only after the
+                        // signature check, so this node never forwards a forged message.
+                        let validation = GossipValidation::new(
+                            message_id.clone(),
+                            propagation_source,
+                            self.handle.clone(),
+                        );
                         // forward gossip to handler; a full queue or a queue with no
-                        // subscriber counts as shed
-                        let forwarded = self
-                            .event_stream
-                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        // subscriber counts as shed. A failed forward drops the event, and
+                        // its dropped ticket reports `Ignore`.
+                        let forwarded = self.event_stream.try_send_outcome(accepted_gossip_event(
+                            message, relayer, author, validation,
+                        ));
                         self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
                         if forwarded.inspect_err(|e| {
                             bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
@@ -3701,12 +3726,20 @@ fn resolve_response<Res: TNMessage>(
 /// and dropping an unresolved-relayer message would lose it permanently because
 /// gossipsub has already cached its `message_id`. The relayer is carried so the
 /// consumer can attribute a penalty only when the identity is known.
+///
+/// `validation` is the deferred verdict ticket for the held message (#1772): the consumer
+/// accepts or rejects it, and an event that is dropped reports `Ignore`.
 fn accepted_gossip_event<Req, Res>(
     message: GossipMessage,
     relayer: Option<BlsPublicKey>,
     author: Option<BlsPublicKey>,
-) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
+    validation: GossipValidation<Req, Res>,
+) -> NetworkEvent<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author, validation }))
 }
 
 /// Order the connected peers for a `ConnectedPeers` answer: the current committee
