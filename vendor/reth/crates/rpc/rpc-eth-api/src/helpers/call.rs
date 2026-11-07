@@ -25,7 +25,6 @@ use reth_evm::{
 };
 use reth_primitives_traits::{BlockBody, Recovered};
 use reth_revm::{
-    cancelled::CancelOnDrop,
     database::StateProviderDatabase,
     db::{bal::EvmDatabaseError, State},
 };
@@ -37,6 +36,7 @@ use reth_rpc_eth_types::{
     EthApiError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox};
+use reth_tasks::{cancel::is_cancelled, CancelOnDrop};
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Transaction},
@@ -392,6 +392,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                     // transact all transactions in the bundle
                     for (tx_index, tx) in transactions.into_iter().enumerate() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
+
                         // Apply overrides, state overrides are only applied for the first tx in the
                         // request
                         let overrides =
@@ -817,6 +821,9 @@ pub trait Call:
             if *tx.tx_hash() == target_tx_hash {
                 // reached the target transaction
                 break
+            }
+            if is_cancelled() {
+                return Err(EthApiError::InternalEthError.into())
             }
 
             let tx_env = self.evm_config().tx_env(tx);

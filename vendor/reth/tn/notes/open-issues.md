@@ -68,9 +68,8 @@ pool (512 threads by default). Semaphores bound most RPC work: upstream's for `e
 `eth_callMany`, `eth_simulateV1`, `eth_getLogs` and `eth_getProof` (TN-0019, TN-0035), and TN's for
 `eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`, `eth_callBundle` (TN-0037,
 `crates/tn-reth/src/rpc_call.rs`), `debug_trace*` (TN-0036), and `trace_*` and
-`debug_executionWitness*` (TN-0038). One gap remains: long synchronous jobs (a large `eth_call`)
-run to completion after the client leaves. Upstream 13a59de4b and 621f663ed stop them; they need
-`CancelOnDrop` moved into reth-tasks first (`upstream-backports.md`, Medium).
+`debug_executionWitness*` (TN-0038), and a request that loses its client stops its long loops
+(TN-0049).
 
 The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_manager.rs`) its own
 runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method

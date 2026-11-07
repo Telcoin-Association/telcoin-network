@@ -582,6 +582,30 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`debug_traceCallMany` among them), 29/29. *Upstream*: n/a
   (upstream commits).
 
+- **TN-0049** — Backport upstream's cooperative cancellation of RPC blocking work. *Kind*:
+  backport (security).
+  *Files*: added `crates/tasks/src/cancel.rs` (upstream's at 13a59de4b: `CancelOnDrop` with its
+  finalization state, `ManualCancel`, `scope` and `is_cancelled`), `crates/tasks/src/lib.rs`;
+  `crates/rpc/rpc-eth-api/src/helpers/{blocking_task.rs, call.rs, estimate.rs, trace.rs,
+  pending_block.rs}`, `crates/rpc/rpc-eth-types/src/simulate.rs`,
+  `crates/rpc/rpc/src/{debug.rs, trace.rs}`, `crates/rpc/rpc/src/eth/{bundle.rs, core.rs}`.
+  *Why*: a client that disconnects drops its request, but the blocking task it started ran to
+  the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
+  replay or trace kept its thread (and, since TN-0019 and TN-0036 to TN-0038, its permit) for
+  work nobody would read. 13a59de4b runs each `spawn_blocking_io` task inside a `CancelOnDrop`
+  scope that the request's drop cancels, and the long loops check `is_cancelled()` between
+  transactions or binary-search steps and stop. TN's `spawn_with_state_at_block` runs on
+  `spawn_blocking_io_fut` instead, so TN wraps that future in `InCancelScope`, which enters the
+  scope around each poll; every replay and trace runs there. Also applied: 621f663ed's move of
+  `CancelOnDrop` into reth-tasks (`call.rs` imports it from there), except that reth-revm's copy
+  stays, so this change leaves `crates/revm` untouched; 0973a1387 (`eth_simulateV1`), 34f77be92
+  (the pending-block build) and 329fcfc73's check in `eth_callBundle`. A stopped request returns
+  an internal error to a client that has already left. RPC only: block execution does not run in
+  these scopes.
+  *Tests*: upstream's `cancel.rs` tests and `blocking_task_observes_dropped_request`; TN's
+  `blocking_future_observes_dropped_request`, which fails without `InCancelScope`. *Upstream*:
+  n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

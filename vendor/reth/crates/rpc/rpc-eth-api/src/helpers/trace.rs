@@ -16,8 +16,9 @@ use reth_revm::{
     database::StateProviderDatabase,
     db::{bal::EvmDatabaseError, State},
 };
-use reth_rpc_eth_types::cache::db::StateCacheDb;
+use reth_rpc_eth_types::{cache::db::StateCacheDb, EthApiError};
 use reth_storage_api::{ProviderBlock, ProviderTx};
+use reth_tasks::cancel::is_cancelled;
 use revm::{context::Block, context_interface::result::ResultAndState};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -309,6 +310,9 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     .evm_factory()
                     .create_tracer(&mut db, evm_env, inspector_setup())
                     .try_trace_many(block.transactions_recovered().take(max_transactions), |ctx| {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         #[allow(clippy::needless_update)]
                         let tx_info = TransactionInfo {
                             hash: Some(*ctx.tx.tx_hash()),

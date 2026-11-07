@@ -13,7 +13,7 @@ use reth_rpc_eth_api::{
     EthCallBundleApiServer, FromEthApiError, FromEvmError,
 };
 use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError, RpcInvalidTransactionError};
-use reth_tasks::pool::BlockingTaskGuard;
+use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard};
 use reth_transaction_pool::{
     EthBlobTransactionSidecar, EthPoolTransaction, PoolPooledTx, PoolTransaction, TransactionPool,
 };
@@ -173,6 +173,10 @@ where
                 let mut transactions = transactions.into_iter().peekable();
 
                 while let Some(tx) = transactions.next() {
+                    if is_cancelled() {
+                        return Err(Eth::Error::from_eth_err(EthApiError::InternalEthError))
+                    }
+
                     // TN(TN-0046): the bundle's transactions share the block gas limit, as a
                     // block's do (upstream 329fcfc73, without its EIP-8037 branch).
                     if tx.gas_limit() > block_gas_limit.saturating_sub(total_gas_used) {

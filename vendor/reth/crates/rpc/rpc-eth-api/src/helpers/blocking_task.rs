@@ -5,9 +5,13 @@ use futures::Future;
 use reth_rpc_eth_types::EthApiError;
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
-    TaskSpawner,
+    CancelOnDrop, TaskSpawner,
 };
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::sync::{oneshot, AcquireError, OwnedSemaphorePermit, Semaphore};
 
 use crate::EthApiTypes;
@@ -156,6 +160,9 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
     ///
     /// Note: This is expected for futures that are dominated by blocking IO operations, for tracing
     /// or CPU bound operations in general use [`spawn_tracing`](Self::spawn_tracing).
+    ///
+    /// The task keeps running when the returned future is dropped, long running work in `f`
+    /// should check [`is_cancelled`](reth_tasks::cancel::is_cancelled) to stop early.
     fn spawn_blocking_io<F, R>(&self, f: F) -> impl Future<Output = Result<R, Self::Error>> + Send
     where
         F: FnOnce(Self) -> Result<R, Self::Error> + Send + 'static,
@@ -163,15 +170,21 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
     {
         let (tx, rx) = oneshot::channel();
         let this = self.clone();
+        let cancel = CancelOnDrop::default();
+        let request = cancel.clone();
         self.io_task_spawner().spawn_blocking_task(Box::pin(async move {
             if tx.is_closed() {
                 return
             }
-            let res = f(this);
+            let res = cancel.scope(|| f(this));
             let _ = tx.send(res);
         }));
 
-        async move { rx.await.map_err(|_| EthApiError::InternalEthError)? }
+        async move {
+            // cancels the blocking task once the request is dropped
+            let _request = request;
+            rx.await.map_err(|_| EthApiError::InternalEthError)?
+        }
     }
 
     /// Executes the future on a new blocking task.
@@ -189,8 +202,11 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
     {
         let (mut tx, rx) = oneshot::channel();
         let this = self.clone();
+        // TN(TN-0049): `spawn_with_state_at_block` runs here, so its work sees `is_cancelled` too.
+        let cancel = CancelOnDrop::default();
+        let request = cancel.clone();
         self.io_task_spawner().spawn_blocking_task(Box::pin(async move {
-            let fut = f(this);
+            let fut = InCancelScope { cancel, fut: Box::pin(f(this)) };
             tokio::pin!(fut);
             let res = tokio::select! {
                 // Futures executed here may perform blocking work before their first yield.
@@ -203,7 +219,11 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
             }
         }));
 
-        async move { rx.await.map_err(|_| EthApiError::InternalEthError)? }
+        async move {
+            // cancels the blocking task once the request is dropped
+            let _request = request;
+            rx.await.map_err(|_| EthApiError::InternalEthError)?
+        }
     }
 
     /// Executes a blocking task on the tracing pool.
@@ -219,5 +239,22 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
         let this = self.clone();
         let fut = self.tracing_task_pool().spawn(move || f(this));
         async move { fut.await.map_err(|_| EthApiError::InternalBlockingTaskError)? }
+    }
+}
+
+/// TN(TN-0049): polls `fut` inside `cancel`'s scope, so the blocking work done in each poll sees
+/// [`is_cancelled`](reth_tasks::cancel::is_cancelled), as upstream's `spawn_blocking_io` gives its
+/// closure.
+struct InCancelScope<Fut> {
+    cancel: CancelOnDrop,
+    fut: Pin<Box<Fut>>,
+}
+
+impl<Fut: Future> Future for InCancelScope<Fut> {
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.cancel.scope(|| this.fut.as_mut().poll(cx))
     }
 }

@@ -26,6 +26,7 @@ use reth_storage_api::{
     noop::NoopProvider, BlockReader, BlockReaderIdExt, ProviderHeader, ProviderTx, ReceiptProvider,
     StateProviderBox, StateProviderFactory,
 };
+use reth_tasks::cancel::is_cancelled;
 use reth_transaction_pool::{
     error::InvalidPoolTransactionError, BestTransactions, BestTransactionsAttributes,
     PoolTransaction, TransactionPool,
@@ -270,6 +271,11 @@ pub trait LoadPendingBlock:
                 .without_updates();
 
             while let Some(pool_tx) = best_txs.next() {
+                // nobody waits for the block once the request is dropped
+                if is_cancelled() {
+                    return Err(Self::Error::from_eth_err(EthApiError::InternalEthError))
+                }
+
                 // ensure we still have capacity for this transaction
                 if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
                     // we can't fit this transaction into the block, so we need to mark it as

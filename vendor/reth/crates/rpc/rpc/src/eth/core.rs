@@ -899,4 +899,61 @@ mod tests {
             "all: no percentiles were requested, so there should be no rewards result"
         );
     }
+    /// Upstream 13a59de4b's test (TN-0049): a blocking task sees its dropped request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_task_observes_dropped_request() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use reth_tasks::cancel::is_cancelled;
+        use std::time::{Duration, Instant};
+
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io(move |_| {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        // drop the request while its blocking task is running
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
+    }
+
+    /// TN(TN-0049): the same for `spawn_blocking_io_fut`, which `spawn_with_state_at_block` (and
+    /// so every replay and trace) runs on: the future's blocking work sees the dropped request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_future_observes_dropped_request() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use reth_tasks::cancel::is_cancelled;
+        use std::time::{Duration, Instant};
+
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io_fut(move |_| async move {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
+    }
 }

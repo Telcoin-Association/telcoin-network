@@ -35,7 +35,7 @@ use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, HeaderProvider, ProviderBlock, ReceiptProviderIdExt,
     StateProofProvider, StateProviderFactory, StateRootProvider, TransactionVariant,
 };
-use reth_tasks::{pool::BlockingTaskGuard, TaskSpawner};
+use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard, TaskSpawner};
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 use revm::DatabaseCommit;
 use revm_inspectors::tracing::{DebugInspector, TransactionContext};
@@ -144,6 +144,9 @@ where
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
                 let mut inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
                 while let Some((index, tx)) = transactions.next() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     let tx_hash = *tx.tx_hash();
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
@@ -412,6 +415,9 @@ where
 
             // 2. replay the required number of transactions
             for tx in block.transactions_recovered().take(tx_index) {
+                if is_cancelled() {
+                    return Err(EthApiError::InternalEthError.into())
+                }
                 let tx_env = eth_api.evm_config().tx_env(tx);
                 let res = eth_api.transact(&mut db, evm_env.clone(), tx_env)?;
                 db.commit(res.state);
@@ -490,6 +496,9 @@ where
 
                     // Execute all transactions until index
                     for tx in transactions {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         let tx_env = eth_api.evm_config().tx_env(tx);
                         let res = eth_api.transact(&mut db, evm_env.clone(), tx_env)?;
                         db.commit(res.state);
@@ -508,6 +517,9 @@ where
 
                     let mut transactions = transactions.into_iter().peekable();
                     while let Some(tx) = transactions.next() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         // apply state overrides only once, before the first transaction
                         let state_overrides = state_overrides.take();
                         let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
