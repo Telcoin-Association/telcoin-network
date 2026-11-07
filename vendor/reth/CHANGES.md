@@ -606,6 +606,28 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `blocking_future_observes_dropped_request`, which fails without `InCancelScope`. *Upstream*:
   n/a (upstream commits).
 
+- **TN-0050** — Backport 33b785d97: an empty revert returns `0x` as its error data. *Kind*:
+  backport.
+  *Files*: `crates/rpc/rpc-eth-types/src/error/mod.rs` (`RevertError` keeps its output as
+  `Bytes`, with upstream's test). The conflict was TN's older doc line on `RevertError::new`.
+  *Why*: a call that reverts with no output returned an error with no `data`, where geth returns
+  `"0x"`; clients that decode revert data treat the missing field as a different error. RPC
+  output only. *Tests*: upstream's `empty_revert_err_has_empty_data`. *Upstream*: n/a (upstream
+  commit).
+
+- **TN-0051** — Backport 44a74f9ea: refuse requests that mix legacy and EIP-1559 fee fields.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/transaction.rs` (`send_transaction_request`,
+  `fill_transaction`, `sign_transaction`, and `ensure_no_conflicting_fee_fields`). A hand port:
+  upstream's imports and doc context differ.
+  *Why*: a request with `gasPrice` and `maxFeePerGas` or `maxPriorityFeePerGas` was built into
+  whichever transaction type the conversion picked. It now fails with the error `eth_call`
+  already returns for the same input. TN serves `eth_fillTransaction` (its wrapper,
+  `tn-reth/src/rpc_fill_transaction.rs`, leaves a request with `gasPrice` untouched, so the check
+  sees the client's fields); `eth_sendTransaction` and `eth_signTransaction` have no signers on a
+  TN node. RPC input validation only. *Tests*: nested reth-rpc-eth-api tests; tn-reth's
+  fill-transaction tests. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

@@ -65,6 +65,8 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | c4cd5c9b7 | TN-0048 | `debug_traceCallMany` at a transaction index applies the block's pre-execution changes before replaying its earlier transactions | nested reth-rpc tests |
 | 080a9cfc1 | TN-0048 | `spawn_replay_transaction` applies the block's pre-execution changes (unused by TN today) | nested tests |
 | 13a59de4b, 621f663ed (partial), 0973a1387, 34f77be92, 329fcfc73 (its check) | TN-0049 | **security**: a dropped RPC request cancels its blocking task, and long loops (call, callMany, estimate, simulate, bundle, replays, traces, pending block) stop between steps. TN scopes `spawn_blocking_io_fut` too, where its replays and traces run; reth-revm's `CancelOnDrop` copy stays | upstream tests + a TN test that fails without the TN scope |
+| 33b785d97 | TN-0050 | an empty revert returns `0x` as its error data, as geth does | upstream test |
+| 44a74f9ea | TN-0051 | `eth_fillTransaction`, `eth_sendTransaction` and `eth_signTransaction` refuse a request that mixes legacy and EIP-1559 fee fields | nested and tn-reth tests |
 
 ## Open
 
@@ -97,8 +99,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 ### Low
 
 e7ebeb869 (partial receipts), 1a6ba945a (codecs decode), 078c22d5f (iterative BlockState
-drop), 44a74f9ea (reject conflicting transaction fees in call requests), 33b785d97 (`0x` data for
-empty reverts). 1a6ba945a and 078c22d5f are on the execution path (`codecs`, `chain-state`) for a
+drop). 1a6ba945a and 078c22d5f are on the execution path (`codecs`, `chain-state`) for a
 change that does not alter state; they wait for the next fork-checked change rather than carry
 that cost alone.
 
