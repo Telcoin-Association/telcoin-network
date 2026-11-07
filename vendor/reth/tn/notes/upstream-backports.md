@@ -58,6 +58,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 0e14f1a8a | TN-0044 | an IPC connection's service loop ends when its response channel closes instead of spinning | reth-ipc 17/17 |
 | a68f9e19f | TN-0044 | `--rpc.max-subscriptions-per-connection` limits IPC connections (each request had built a fresh counter) | upstream test; reth-ipc 18/18 |
 | 9580b7fc1 | TN-0045 | test only: zstd 0.13 compatibility fixtures for nippy-jar, so a zstd bump cannot silently stop reading static files | the test itself |
+| 329fcfc73 (partial) | TN-0046 | **security**: an `eth_callBundle` request's transactions share its block gas limit, so one request cannot run N × the call gas cap. Without the EIP-8037 branch and the cancellation check | TN tests; the refusal test fails without the check |
 
 ## Open
 
@@ -89,7 +90,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
 | 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
 | 5b0120dbb | lower default block/receipt cache limits | rpc-eth-types | High default memory use unless TN sets its own limits. | clean |
-| 329fcfc73 | bound `eth_callBundle` work | rpc | TN serves `eth_callBundle` (`rpc_bundle.rs`). Each transaction's gas is capped, the bundle's total is not, so one request runs N × the gas cap under one blocking-IO permit. Port the cumulative check (not the EIP-8037 branch); the cancellation check needs 13a59de4b | hand port |
+| 329fcfc73 (cancellation check) | stop `eth_callBundle` between transactions once the request is dropped | rpc | The cumulative gas check is applied (TN-0046); this part builds on 13a59de4b | after 13a59de4b |
 | 0973a1387, 34f77be92 | stop `eth_simulateV1` and the pending-block build once the request is dropped | rpc-eth-api | Build on 13a59de4b. TN defaults `--rpc.pending-block none` | after 13a59de4b |
 
 ### Low

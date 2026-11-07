@@ -530,6 +530,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   wrote, before any datadir meets it. No shipped code changes. *Tests*: reth-nippy-jar and reth-db
   51/51. *Upstream*: n/a (upstream commit).
 
+- **TN-0046** — Port the cumulative gas check from 329fcfc73: an `eth_callBundle` request's
+  transactions share its block gas limit. *Kind*: backport (security).
+  *Files*: `crates/rpc/rpc/src/eth/bundle.rs` (`EthBundle::call_bundle`, the
+  `BundleGasLimitExceeded` error, and the TN test module `gas_limit_tests`).
+  *Why*: TN serves `eth_callBundle` publicly (`tn-reth/src/rpc_bundle.rs`). The block gas limit
+  (`gasLimit`, by default the call gas cap) bounded each transaction but not their sum, so one
+  request could execute any number of cap-sized transactions under one blocking-IO permit. Each
+  transaction must now fit the gas the earlier ones left, as in a block. Upstream's EIP-8037 branch
+  (separate state gas) and its cancellation check (which needs 13a59de4b) are not ported; the
+  permit part of 329fcfc73 is TN-0037's. RPC only.
+  *Tests*: `bundle_over_the_gas_limit_is_refused` (two 30,000-gas transfers under a 50,000 limit;
+  fails without the check) and `bundle_within_the_gas_limit_runs`. *Upstream*: n/a (upstream
+  commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

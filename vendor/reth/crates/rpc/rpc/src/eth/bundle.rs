@@ -148,6 +148,7 @@ where
         let state_block_number = evm_env.block_env.number();
         // use the block number of the request
         evm_env.block_env.inner_mut().number = U256::from(block_number);
+        let block_gas_limit = evm_env.block_env.gas_limit();
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, db| {
@@ -172,6 +173,14 @@ where
                 let mut transactions = transactions.into_iter().peekable();
 
                 while let Some(tx) = transactions.next() {
+                    // TN(TN-0046): the bundle's transactions share the block gas limit, as a
+                    // block's do (upstream 329fcfc73, without its EIP-8037 branch).
+                    if tx.gas_limit() > block_gas_limit.saturating_sub(total_gas_used) {
+                        return Err(Eth::Error::from_eth_err(EthApiError::InvalidParams(
+                            EthBundleError::BundleGasLimitExceeded(block_gas_limit).to_string(),
+                        )))
+                    }
+
                     let signer = tx.signer();
                     let tx = {
                         let mut tx = <Eth::Pool as TransactionPool>::Transaction::from_pooled(tx);
@@ -312,6 +321,89 @@ pub enum EthBundleError {
     /// Thrown when the blob gas usage of the blob transactions in a bundle exceed the maximum.
     #[error("blob gas usage exceeds the limit of {0} gas per block.")]
     Eip4844BlobGasExceeded(u64),
+    /// Thrown when the gas limits of the bundle's transactions exceed the block gas limit.
+    #[error("bundle gas exceeds the block gas limit of {0}")]
+    BundleGasLimitExceeded(u64),
+}
+
+/// TN(TN-0046): the transactions of an `eth_callBundle` request share its block gas limit.
+#[cfg(test)]
+mod gas_limit_tests {
+    use super::*;
+    use crate::EthApiBuilder;
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
+    use alloy_primitives::{Address, TxKind};
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::Block as _;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_testing_utils::generators::{self, generate_key, sign_tx_with_key_pair};
+    use reth_transaction_pool::test_utils::testing_pool;
+
+    /// Two transfers from one sender, each with a 30,000 gas limit, run as a bundle whose block
+    /// gas limit is `gas_limit`. The first uses 21,000 gas.
+    async fn call_two_transfers(gas_limit: u64) -> Result<EthCallBundleResponse, EthApiError> {
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+        let block = Block {
+            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        }
+        .seal_slow();
+        provider.add_block(block.hash(), block.into_block());
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let bundle = EthBundle::new(api, BlockingTaskGuard::new(1));
+        let key = generate_key(&mut generators::rng());
+        let transfer = |nonce| {
+            sign_tx_with_key_pair(
+                key,
+                Transaction::Legacy(TxLegacy {
+                    nonce,
+                    gas_limit: 30_000,
+                    to: TxKind::Call(Address::repeat_byte(0xff)),
+                    ..Default::default()
+                }),
+            )
+            .encoded_2718()
+            .into()
+        };
+        bundle
+            .call_bundle(EthCallBundle {
+                txs: vec![transfer(0), transfer(1)],
+                block_number: 2,
+                state_block_number: BlockNumberOrTag::Number(1),
+                gas_limit: Some(gas_limit),
+                ..Default::default()
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn bundle_within_the_gas_limit_runs() {
+        let response = call_two_transfers(60_000).await.expect("30,000 + 30,000 fits 60,000");
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.total_gas_used, 42_000);
+    }
+
+    /// The second transfer's 30,000 gas limit exceeds the 29,000 the first one leaves.
+    #[tokio::test]
+    async fn bundle_over_the_gas_limit_is_refused() {
+        let err = call_two_transfers(50_000).await.expect_err("only 29,000 gas is left");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "bundle gas exceeds the block gas limit of 50000"),
+            "{err:?}"
+        );
+    }
 }
 
 /// TN(TN-0037): `eth_callBundle` and `eth_createAccessList` keep their blocking-IO permit until

@@ -13,7 +13,7 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | Method | Notes |
 | --- | --- |
 | `eth_blobBaseFee` | |
-| `eth_callBundle` | Waits for the same concurrency permit as `eth_call` |
+| `eth_callBundle` | Waits for the same concurrency permit as `eth_call`. The bundle's transactions share one block gas limit (`gasLimit`, or the node's call gas cap): a transaction whose gas limit exceeds what the earlier ones left fails the whole request |
 | `eth_callMany` | |
 | `eth_fillTransaction` | Missing fee fields are filled from the worker's epoch base fee |
 | `eth_getAccount` | |
