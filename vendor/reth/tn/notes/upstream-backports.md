@@ -51,6 +51,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 055fafc72 (partial) | TN-0035 | **security**: parallel `eth_getLogs` receipt chunks take their own blocking-IO permit, else run inline; one scan no longer occupies up to six blocking threads. The window-by-window scan rewrite in the same commit is not ported. Found by the review | 2 TN tests; the permit test fails without the fix |
 | revm-inspectors a5638ca (#548) | `patches/revm-inspectors` | **security**: Boa's recursion limit 10,000 → 128, so a recursive getter or setter in a JS tracer cannot overflow a blocking thread's stack and abort the node (`js-tracer` builds only). Carried as a patched crate, not a vendored file; see its PATCH.md. Found by the review | 3 tests; getter and setter abort the process without the fix |
 | 6e4009eed | TN-0039 | a lagging `eth_subscribe("logs")` subscriber skips the missed blocks instead of panicking its subscription task | nested build; no upstream test |
+| 6d718d0c2 | TN-0040 | `trace_filter`'s range error names the configured limit, not 100 | tn-reth namespace test |
 
 ## Open
 
@@ -78,7 +79,6 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | sha | subject | crate | why | pick |
 |---|---|---|---|---|
 | 13a59de4b (+ 621f663ed) | stop long blocking jobs once the request is dropped | rpc-eth-api, tasks | Extends TN-0019 to synchronous jobs that never yield (e.g. long `eth_call`s). Needs the `CancelOnDrop` move into reth-tasks first. | not tried |
-| 6d718d0c2 | use the configured limit in `trace_filter` | rpc | `trace` is opt-in. | not tried |
 | 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
 | 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
 | bf1db83ae | release receiver lock before validating | transaction-pool | `additional_validation_tasks` validates one transaction at a time. | clean |

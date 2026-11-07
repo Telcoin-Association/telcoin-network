@@ -5,7 +5,7 @@
 
 Returns the Parity-style traces in a block range whose sender or receiver matches the filter, much as `eth_getLogs` does for logs. The node keeps no index of trace addresses: it re-executes every transaction in every block of the range and applies the address filter to the traces afterwards, so a narrow address filter does not make a request cheaper. A request holds two permits from the tracing permit pool and traces up to `--rpc.max-tracing-requests` blocks at a time.
 
-`toBlock` minus `fromBlock` may be at most `--rpc.max-trace-filter-blocks` (default 100). A wider range fails with `-32602` and the message `Block range too large; currently limited to 100 blocks`; the message says 100 whatever the configured limit is. Because `fromBlock` defaults to `0x0` and `toBlock` to the latest block, a request that sets neither field fails this check once the latest block number is above 100.
+`toBlock` minus `fromBlock` may be at most `--rpc.max-trace-filter-blocks` (default 100). A wider range fails with `-32602` and the message `Block range too large; currently limited to <limit> blocks`, with the configured limit. Because `fromBlock` defaults to `0x0` and `toBlock` to the latest block, a request that sets neither field fails this check once the latest block number is above 100.
 
 A `fromBlock` or `toBlock` past the node's latest block fails with `-32001` and a `block not found` message, and a `fromBlock` greater than `toBlock` fails with `-32602` and the message `invalid parameters: fromBlock cannot be greater than toBlock`.
 

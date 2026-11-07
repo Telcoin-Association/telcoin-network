@@ -313,9 +313,9 @@ async fn trace_filter_honours_max_trace_filter_blocks() -> eyre::Result<()> {
         )
         .await,
     )?;
-    // reth's message names its own default of 100 whatever the configured limit is
+    // the message names the configured limit (upstream 6d718d0c2, TN-0040)
     assert_eq!(code, -32602, "{message}");
-    assert!(message.starts_with("Block range too large"), "unexpected error: {message}");
+    assert_eq!(message, "Block range too large; currently limited to 0 blocks");
     let single: Value = http
         .call("trace_filter", rpc_params![json!({"fromBlock": "0x1", "toBlock": "0x1"})])
         .await?;

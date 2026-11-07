@@ -469,6 +469,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   notifications, as reth's other canonical-state consumers do. RPC only. *Tests*: none upstream;
   the change swaps one stream constructor for another. *Upstream*: n/a (upstream commit).
 
+- **TN-0040** — Backport 6d718d0c2: `trace_filter`'s range error names the configured limit.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/trace.rs` (`TraceApi::trace_filter`).
+  *Why*: the error said "limited to 100 blocks" whatever `--rpc.max-trace-filter-blocks` was.
+  Message only. *Tests*: tn-reth's `trace_filter_honours_max_trace_filter_blocks` now checks the
+  whole message. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
