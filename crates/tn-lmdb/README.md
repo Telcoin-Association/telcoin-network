@@ -556,8 +556,10 @@ changes, and do not latch.
 - An allocation takes a page from `pool`, else the next page number at the end of the file,
   growing the file.
 - An overflow run of `n` pages (`Writer::alloc_run`, `allocate_run`) tries, in order:
-  1. the first fit in `pool`: the lowest `n` consecutive page numbers it holds (`first_fit`, which
-     sorts the pool; `n = 1` takes a page as an allocation does);
+  1. the first fit in `pool`: the lowest `n` consecutive page numbers it holds
+     (`Allocator::first_fit`: the pool is sorted unless the search knows it is ascending, and
+     scanned from where the last search stopped, `alloc::Fit`; `n = 1` takes a page as an
+     allocation does);
   2. more free records that pass the gate, loaded until the pool fits or 8 records
      (`RUN_LOAD_RECORDS`) are loaded, then the first fit again;
   3. tail reuse: pool pages that end the file start the run, and the file grows by the rest;
@@ -567,6 +569,13 @@ changes, and do not latch.
   which lists far more, and left runs growing the file without bound under churn while later
   records held fits (`run_churn_keeps_the_file_bounded_heavy`). Its pages are private, and the
   allocator also records the run (`private_runs`) for the commit's one CRC.
+
+  The budget is per allocation and the pages loaded stay in the pool, so on a free list of
+  scattered pages the pool grows with every run that finds no fit. A record loaded into an
+  ascending pool is merged in, and a fit search resumes where the last one stopped, so a
+  transaction's runs cost the pages they load, not the whole pool each
+  (`a_run_on_a_scattered_free_list_costs_what_it_loads`); neither changes an allocation
+  (`the_fit_knowledge_keeps_every_allocation`).
 - A run that leaves a tree goes back as `n` single pages (`free_run`): to `freed` if published,
   to `pool` if this transaction created it. Free records list single pages, so a freed run's
   pages come back one by one, as tree pages or as parts of a later run.

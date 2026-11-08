@@ -1515,6 +1515,84 @@ fn an_abort_returns_the_records_a_run_loaded() {
     check(&f.env);
 }
 
+/// A file whose free list, past the gate, holds `free` scattered pages in records of
+/// `record_pages` pages (`Writer::record_pages`): table `t` held keys `0..2 * free`, each in a
+/// one-page run, and one commit deleted the even keys (every other run page, and the leaves it
+/// copied).
+fn scattered_pages(path: &Path, free: u32, record_pages: usize) -> Env {
+    let env = open(path, SyncMode::Durable);
+    env.with_writer(|w| w.record_pages = Some(record_pages));
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..free * 2 {
+        txn.put(&t, &key(i), &value(i, 0, 3000)).expect("put");
+    }
+    txn.commit().expect("commit");
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.open_table("t").expect("open").expect("t");
+    for i in (0..free * 2).step_by(2) {
+        assert!(txn.delete(&t, &key(i)).expect("delete"));
+    }
+    txn.commit().expect("commit");
+    // Two more commits: the gate passes the delete's.
+    churn(&env, "s", 1, 0, 8);
+    churn(&env, "s", 1, 1, 8);
+    env
+}
+
+/// On a free list of scattered pages, a transaction's runs that find no fit cost the pool work
+/// of what they load, not of the pool they load into: each record is merged into the pool and
+/// only the stretches its pages touch are scanned, and once the loading stops (the list is
+/// exhausted) a run longer than every stretch is answered without a look (`alloc::Fit`). Sorting
+/// and scanning the whole pool for each record loaded and each run cost the square of the runs
+/// while loading and the whole pool per run after.
+#[test]
+fn a_run_on_a_scattered_free_list_costs_what_it_loads() {
+    const RECORD_PAGES: usize = 16;
+    let (_dir, path) = temp();
+    let env = scattered_pages(&path, 4000, RECORD_PAGES);
+    let big = value(0, 1, 10_000);
+    // Per transaction of `runs` 3-page values: the work, the records loaded, whether loading
+    // stopped, the work when it stopped, and the pool's size at the end.
+    let txn_of = |runs: u32| {
+        let before = env.with_writer(|w| w.alloc.run_stats);
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        let mut work_at_stop = None;
+        for j in 0..runs {
+            txn.put(&t, &key(0x8000_0000 + j), &big).expect("put");
+            let alloc = &txn.writer_mut().alloc;
+            if work_at_stop.is_none() && !alloc.loading() {
+                work_at_stop = Some(alloc.run_stats.pool_work - before.pool_work);
+            }
+        }
+        let pool = txn.writer_mut().alloc.pool().len() as u64;
+        txn.abort();
+        let after = env.with_writer(|w| w.alloc.run_stats);
+        let grown = after.steps[3] - before.steps[3];
+        assert!(grown + 2 >= u64::from(runs), "{runs} runs: nearly all grow the file: {after:?}");
+        (after.pool_work - before.pool_work, after.records - before.records, work_at_stop, pool)
+    };
+    // Still loading at the end: about eight records loaded per run.
+    let (work, records, stopped, _) = txn_of(25);
+    assert!(
+        stopped.is_none() && records > 8 * 20,
+        "{records} records, loading stopped {stopped:?}"
+    );
+    let loaded = records * RECORD_PAGES as u64;
+    // Each page loaded is placed by its merge and scanned once.
+    assert!(work <= 3 * loaded, "work {work} for {loaded} pages loaded");
+    // Past the end of the list: the runs after the loading stopped look at no stretch.
+    let (work, records, stopped, pool) = txn_of(200);
+    let stopped = stopped.expect("the list is exhausted");
+    assert!(stopped <= 3 * records * RECORD_PAGES as u64, "work {stopped} for {records} records");
+    assert!(
+        work - stopped <= pool,
+        "work {} after the loading stopped, pool {pool}",
+        work - stopped
+    );
+}
+
 /// The bytes [`run_churn`] values are cut from: one random buffer, so a value costs a copy.
 fn churn_bytes() -> Vec<u8> {
     let mut rng = Rng(0x0C4E_17B5);

@@ -34,6 +34,15 @@
 //! (`freelist::save`). The budget counts records, not pages: a record often lists more
 //! pages than a run needs, and a budget that stopped at the first such record left runs growing
 //! the file while later records held fits (`run_churn_keeps_the_file_bounded_heavy`).
+//!
+//! The budget is per allocation and the pages loaded stay in the pool, so on a free list of
+//! scattered pages the pool grows with every run that finds no fit. The fit search keeps what it
+//! learnt of the pool ([`Fit`]): that it is ascending, and how far it scanned it and the longest
+//! stretch of consecutive pages it passed there. Taking pages keeps both; a record loaded into an
+//! ascending pool is merged in, which cuts the scanned part at the lowest page that moved. A
+//! search resumes where the scanned part ends, so a run longer than every stretch there looks
+//! only at the pages added since (`a_run_on_a_scattered_free_list_costs_what_it_loads`). Neither
+//! changes which pages any allocation takes (`the_fit_knowledge_keeps_every_allocation`).
 
 use std::collections::BTreeMap;
 
@@ -62,6 +71,9 @@ pub(crate) struct Allocator {
     stamped: PageSet,
     /// Pages free for this transaction to reuse.
     pool: Vec<u32>,
+    /// What the fit search knows of `pool` without looking ([`Self::find_fit`]). A page pushed
+    /// resets it to [`Fit::Unsorted`]; a record loaded merges into it ([`Self::load_record`]).
+    fit: Fit,
     /// Published pages this transaction took out of its trees.
     freed: Vec<u32>,
     /// The first page number past the end of the file (the transaction's page count).
@@ -115,6 +127,10 @@ pub(crate) struct RunStats {
     pub(crate) steps: [u64; 4],
     /// Free records loaded, by any allocation.
     pub(crate) records: u64,
+    /// Pool pages the fit searches scanned (one that sorts scans them all), and the pool slots a
+    /// record's merge wrote (its pages and the pool pages above them): the run policy's work on
+    /// the pool.
+    pub(crate) pool_work: u64,
 }
 
 impl Allocator {
@@ -127,6 +143,7 @@ impl Allocator {
             private_runs: BTreeMap::new(),
             stamped: PageSet::default(),
             pool: Vec::new(),
+            fit: Fit::Unsorted,
             freed: Vec::new(),
             next_pgno: page_count,
             base: (Vec::new(), page_count),
@@ -231,7 +248,7 @@ impl Allocator {
 
     /// True if the pool holds `n` consecutive pages (run allocation's step 1 would take them).
     pub(crate) fn pool_fits(&mut self, n: u32) -> bool {
-        find_fit(&mut self.pool, n).is_some()
+        self.find_fit(n).is_some()
     }
 
     /// The last free record the transaction took: the next one is past it.
@@ -239,9 +256,12 @@ impl Allocator {
         self.consumed.last().copied()
     }
 
-    /// Take free record `key`'s `pages` (checked by `freelist::decode_pages`) into the pool. A
-    /// page taken from the list already in this transaction is [`Error::Corrupt`], and then
-    /// nothing is taken.
+    /// Take free record `key`'s `pages` (checked by `freelist::decode_pages`: ascending) into the
+    /// pool. A page taken from the list already in this transaction is [`Error::Corrupt`], and
+    /// then nothing is taken. An empty or ascending pool stays ascending, the pages merged in
+    /// ([`Self::merge_into_pool`]); the writer loads only into such a pool (an empty one, or one
+    /// [`Self::pool_fits`] sorted), and sorts it before a run takes from it, as it did when this
+    /// appended. Any other pool gets them appended.
     pub(crate) fn load_record(&mut self, key: RecordKey, pages: Vec<u32>) -> Result<()> {
         if let Some(&p) = pages.iter().find(|&&p| self.loaded.contains(p)) {
             return Err(Error::Corrupt(format!(
@@ -258,9 +278,47 @@ impl Allocator {
             }
             self.run_stats.records += 1;
         }
-        self.pool.extend(pages);
+        self.merge_into_pool(&pages);
         self.consumed.push(key);
         Ok(())
+    }
+
+    /// Add `pages` (ascending) to the pool for [`Self::load_record`]. Into an empty or ascending
+    /// pool they are merged from the back, so only the pool pages above the lowest of them move
+    /// (none if they all lie above the pool: an append), and the pages [`Self::fit`] knows end
+    /// where the first moved (the pages below did not change). A free list's records list
+    /// ascending chunks of what each commit freed, so loading them in key order mostly appends.
+    fn merge_into_pool(&mut self, pages: &[u32]) {
+        let (known, longest) = match self.fit {
+            Fit::Ascending { known, longest } => (known, longest),
+            Fit::Unsorted if self.pool.is_empty() => (0, 0),
+            Fit::Unsorted => {
+                self.pool.extend_from_slice(pages);
+                return;
+            }
+        };
+        let old = self.pool.len();
+        self.pool.extend_from_slice(pages);
+        let mut i = old;
+        if pages.first().is_some_and(|&first| old > 0 && self.pool[old - 1] > first) {
+            // `i` old pages and `j` new ones are left to place, the highest first, into slot
+            // `i + j - 1`.
+            let mut j = pages.len();
+            while j > 0 {
+                if i > 0 && self.pool[i - 1] > pages[j - 1] {
+                    self.pool[i + j - 1] = self.pool[i - 1];
+                    i -= 1;
+                } else {
+                    self.pool[i + j - 1] = pages[j - 1];
+                    j -= 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.run_stats.pool_work += (self.pool.len() - i) as u64;
+        }
+        self.fit = Fit::Ascending { known: known.min(i), longest };
     }
 
     /// Stop refilling from the free list for the rest of the transaction.
@@ -385,11 +443,11 @@ impl Allocator {
     }
 
     /// Take an overflow run of `n` contiguous pages (`n >= 1`) for the transaction, by steps 1, 3
-    /// and 4 of the policy (see the module docs): the first fit in `pool` ([`first_fit`]), else
-    /// the pool's pages that end the file plus new ones ([`tail_pages`]), else the next `n` page
-    /// numbers. `grow(new_page_count)` must first make room for new pages (one growth). The pages
-    /// are private, and the run is recorded until it is freed or the commit stamps it. The caller
-    /// writes every byte of the run. A failure changes nothing.
+    /// and 4 of the policy (see the module docs): the first fit in `pool` ([`Self::first_fit`]),
+    /// else the pool's pages that end the file plus new ones ([`tail_pages`]), else the next
+    /// `n` page numbers. `grow(new_page_count)` must first make room for new pages (one
+    /// growth). The pages are private, and the run is recorded until it is freed or the commit
+    /// stamps it. The caller writes every byte of the run. A failure changes nothing.
     pub(crate) fn allocate_run(
         &mut self,
         n: u32,
@@ -404,7 +462,7 @@ impl Allocator {
             }
             *left -= 1;
         }
-        let p = match first_fit(&mut self.pool, n) {
+        let p = match self.first_fit(n) {
             Some(p) => p,
             None => {
                 // `first_fit` left the pool sorted, holding fewer than `n` pages that end the file.
@@ -439,6 +497,7 @@ impl Allocator {
         if self.private.contains(p) {
             self.private.remove(p);
             self.pool.push(p);
+            self.fit = Fit::Unsorted;
         } else {
             self.freed.push(p);
         }
@@ -506,6 +565,7 @@ impl Allocator {
         self.private_runs.clear();
         self.freed.clear();
         self.pool.clone_from(&self.base.0);
+        self.fit = Fit::Unsorted;
         self.next_pgno = self.base.1;
         self.reset_loading();
     }
@@ -514,41 +574,95 @@ impl Allocator {
     #[cfg(test)]
     pub(crate) fn add_to_pool(&mut self, pages: impl IntoIterator<Item = u32>) {
         self.pool.extend(pages);
+        self.fit = Fit::Unsorted;
+    }
+
+    /// The lowest `n` consecutive page numbers in the pool, taken out of it; `None` (the pool
+    /// unchanged as a set) if it holds no such run. One page is simply the last in the pool, as
+    /// [`Self::allocate`] takes it; see [`Self::find_fit`] for more.
+    fn first_fit(&mut self, n: u32) -> Option<u32> {
+        if n == 1 {
+            return self.pool.pop();
+        }
+        let start = self.find_fit(n)?;
+        let p = self.pool[start];
+        self.pool.drain(start..start + n as usize);
+        Some(p)
+    }
+
+    /// Where the lowest `n` consecutive page numbers in the pool start, if it holds them. One page
+    /// is the last in the pool. For more, the pool is a set: this sorts it (ascending, so the next
+    /// single-page allocation takes its highest page) unless [`Self::fit`] says it is ascending,
+    /// and scans it for the first stretch of `n`, from where the pages the search knows end (and
+    /// the stretch that crosses there) unless one of their stretches may be that long. It then
+    /// knows the pages up to the fit, or the whole pool: a run longer than every stretch the pool
+    /// holds is answered without a look until pages are added.
+    fn find_fit(&mut self, n: u32) -> Option<usize> {
+        if n == 1 {
+            return self.pool.len().checked_sub(1);
+        }
+        let (known, longest) = match self.fit {
+            Fit::Ascending { known, longest } => (known.min(self.pool.len()), longest),
+            Fit::Unsorted => {
+                self.pool.sort_unstable();
+                (0, 0)
+            }
+        };
+        let (from, longest) = if n <= longest {
+            (0, 0)
+        } else {
+            let mut from = known;
+            while from > 0 && from < self.pool.len() && self.pool[from - 1] + 1 == self.pool[from] {
+                from -= 1;
+            }
+            (from, longest)
+        };
+        #[cfg(test)]
+        {
+            self.run_stats.pool_work += (self.pool.len() - from) as u64;
+        }
+        let (fit, passed) = scan_for_fit(&self.pool[from..], n as usize);
+        // Every stretch passed is shorter than `n`, so a `u32`.
+        let longest = longest.max(passed as u32);
+        let known = fit.map_or(self.pool.len(), |at| from + at);
+        self.fit = Fit::Ascending { known, longest };
+        fit.map(|at| from + at)
     }
 }
 
-/// The lowest `n` consecutive page numbers in `pool`, taken out of it; `None` (the pool
-/// unchanged as a set) if it holds no such run. One page is simply the last in the pool, as
-/// [`Allocator::allocate`] takes it; see [`find_fit`] for more.
-fn first_fit(pool: &mut Vec<u32>, n: u32) -> Option<u32> {
-    if n == 1 {
-        return pool.pop();
-    }
-    let start = find_fit(pool, n)?;
-    let p = pool[start];
-    pool.drain(start..start + n as usize);
-    Some(p)
+/// What the fit search ([`Allocator::find_fit`]) knows of the pool without looking. Taking pages
+/// out keeps it: the pool's pages left in the same order, and every prefix of the pool, as a list,
+/// holds no longer stretch than before (a pop or a tail cut shortens the pool, and a fit is taken
+/// where the pages it knows end). The premise is that the pool is a set: a page in it twice is a
+/// broken invariant ([`Allocator::reusable`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fit {
+    /// Nothing: the pool may be in any order.
+    Unsorted,
+    /// The pool is ascending, and no more than `longest` consecutive page numbers are among its
+    /// first `known` pages (all of them if the pool is shorter now): the pages the search knows.
+    Ascending {
+        /// How many of the pool's first pages the search knows.
+        known: usize,
+        /// The longest stretch of consecutive page numbers among them.
+        longest: u32,
+    },
 }
 
-/// Where the lowest `n` consecutive page numbers in `pool` start, if it holds them. One page is
-/// the last in the pool. For more, the pool is a set: this sorts it (ascending, so the next
-/// single-page allocation takes its highest page), which an already sorted pool makes a linear
-/// pass.
-fn find_fit(pool: &mut [u32], n: u32) -> Option<usize> {
-    let n = n as usize;
-    if n == 1 {
-        return pool.len().checked_sub(1);
-    }
-    pool.sort_unstable();
-    let mut start = 0;
+/// In the ascending `pool`, where the first `n` consecutive page numbers start (`n >= 2`), and
+/// the longest stretch of consecutive page numbers before them (less than `n`), or in the whole
+/// pool if it holds no such run.
+fn scan_for_fit(pool: &[u32], n: usize) -> (Option<usize>, usize) {
+    let (mut start, mut longest) = (0, 0);
     for i in 1..pool.len() {
         if pool[i] != pool[i - 1] + 1 {
+            longest = longest.max(i - start);
             start = i;
         } else if i + 1 - start == n {
-            return Some(start);
+            return (Some(start), longest);
         }
     }
-    None
+    (None, longest.max(pool.len() - start))
 }
 
 /// How many of the sorted `pool`'s last pages are the pages just below `next_pgno` (the end of
@@ -1162,5 +1276,286 @@ mod tests {
             want.sort_unstable();
             assert_eq!(merge_sorted(&a, &b), want, "case {case}");
         }
+    }
+
+    /// The pool as run allocation kept it before [`Allocator::fit`], the reference
+    /// [`the_fit_knowledge_keeps_every_allocation`] holds the allocator to: every fit search sorts
+    /// the pool and scans it from the start, a record loaded is appended, a private page freed is
+    /// pushed, an abort returns to the pool and page count the transaction began with.
+    #[derive(Debug)]
+    struct ReferencePool {
+        pool: Vec<u32>,
+        next_pgno: u32,
+        private: std::collections::BTreeSet<u32>,
+        base: (Vec<u32>, u32),
+    }
+
+    impl ReferencePool {
+        fn find_fit(&mut self, n: u32) -> Option<usize> {
+            let n = n as usize;
+            if n == 1 {
+                return self.pool.len().checked_sub(1);
+            }
+            self.pool.sort_unstable();
+            let mut start = 0;
+            for i in 1..self.pool.len() {
+                if self.pool[i] != self.pool[i - 1] + 1 {
+                    start = i;
+                } else if i + 1 - start == n {
+                    return Some(start);
+                }
+            }
+            None
+        }
+    }
+
+    /// What the writer's run policy calls on its allocator (`Writer::alloc`, `alloc_run` and
+    /// `load` in `env.rs`), for the allocator and the reference alike.
+    trait Pool {
+        fn fits(&mut self, n: u32) -> bool;
+        fn is_empty(&self) -> bool;
+        fn take_record(&mut self, seq: u32, pages: &[u32]);
+        fn take_page(&mut self) -> u32;
+        fn take_run(&mut self, n: u32) -> u32;
+        fn give_back(&mut self, p: u32, n: u32, run: bool);
+        fn back_to_base(&mut self);
+        fn pages(&self) -> (&[u32], u32);
+    }
+
+    impl Pool for Allocator {
+        fn fits(&mut self, n: u32) -> bool {
+            self.pool_fits(n)
+        }
+        fn is_empty(&self) -> bool {
+            self.pool.is_empty()
+        }
+        fn take_record(&mut self, seq: u32, pages: &[u32]) {
+            self.load_record(RecordKey { txn: 1, seq }, pages.to_vec()).expect("load");
+        }
+        fn take_page(&mut self) -> u32 {
+            self.allocate(|_| Ok(())).expect("page")
+        }
+        fn take_run(&mut self, n: u32) -> u32 {
+            self.allocate_run(n, |_| Ok(())).expect("run")
+        }
+        fn give_back(&mut self, p: u32, n: u32, run: bool) {
+            if run {
+                self.free_run(p, n);
+            } else {
+                self.free(p);
+            }
+        }
+        fn back_to_base(&mut self) {
+            self.abort();
+        }
+        fn pages(&self) -> (&[u32], u32) {
+            (&self.pool, self.next_pgno)
+        }
+    }
+
+    impl Pool for ReferencePool {
+        fn fits(&mut self, n: u32) -> bool {
+            self.find_fit(n).is_some()
+        }
+        fn is_empty(&self) -> bool {
+            self.pool.is_empty()
+        }
+        fn take_record(&mut self, _: u32, pages: &[u32]) {
+            self.pool.extend_from_slice(pages);
+        }
+        fn take_page(&mut self) -> u32 {
+            let p = self.pool.pop().unwrap_or_else(|| {
+                self.next_pgno += 1;
+                self.next_pgno - 1
+            });
+            self.private.insert(p);
+            p
+        }
+        fn take_run(&mut self, n: u32) -> u32 {
+            let fit = match n {
+                1 => self.pool.pop(),
+                _ => self.find_fit(n).map(|start| {
+                    let p = self.pool[start];
+                    self.pool.drain(start..start + n as usize);
+                    p
+                }),
+            };
+            let p = fit.unwrap_or_else(|| {
+                let tail = tail_pages(&self.pool, self.next_pgno);
+                self.pool.truncate(self.pool.len() - tail as usize);
+                let p = self.next_pgno - tail;
+                self.next_pgno = p + n;
+                p
+            });
+            self.private.extend(p..p + n);
+            p
+        }
+        fn give_back(&mut self, p: u32, n: u32, _: bool) {
+            for q in p..p + n {
+                if self.private.remove(&q) {
+                    self.pool.push(q);
+                }
+            }
+        }
+        fn back_to_base(&mut self) {
+            self.pool.clone_from(&self.base.0);
+            self.next_pgno = self.base.1;
+            self.private.clear();
+        }
+        fn pages(&self) -> (&[u32], u32) {
+            (&self.pool, self.next_pgno)
+        }
+    }
+
+    /// One side of the oracle: its pool, and how far through the free records its loading got.
+    struct Side<P> {
+        pool: P,
+        at: usize,
+        loading: bool,
+    }
+
+    impl<P: Pool> Side<P> {
+        /// `Writer::load`: the next records until `enough`; the end of the list stops loading.
+        fn load(&mut self, records: &[Vec<u32>], mut enough: impl FnMut(&mut P, u32) -> bool) {
+            let mut loaded = 0;
+            while self.loading && !enough(&mut self.pool, loaded) {
+                match records.get(self.at) {
+                    Some(pages) => {
+                        self.pool.take_record(self.at as u32, pages);
+                        self.at += 1;
+                        loaded += 1;
+                    }
+                    None => self.loading = false,
+                }
+            }
+        }
+
+        /// `Writer::refill`, when the pool is empty.
+        fn refill(&mut self, records: &[Vec<u32>]) {
+            if self.loading && self.pool.is_empty() {
+                self.load(records, |pool, _| !pool.is_empty());
+            }
+        }
+
+        /// `Writer::alloc`.
+        fn alloc(&mut self, records: &[Vec<u32>]) -> u32 {
+            self.refill(records);
+            self.pool.take_page()
+        }
+
+        /// `Writer::alloc_run`: steps 1 to 4.
+        fn alloc_run(&mut self, records: &[Vec<u32>], n: u32) -> u32 {
+            self.refill(records);
+            if self.loading && !self.pool.fits(n) {
+                self.load(records, |pool, loaded| loaded >= RUN_LOAD_RECORDS || pool.fits(n));
+            }
+            self.pool.take_run(n)
+        }
+
+        fn abort(&mut self) {
+            self.pool.back_to_base();
+            self.at = 0;
+            self.loading = true;
+        }
+    }
+
+    /// [`Allocator::fit`] holds: [`Fit::Unsorted`], or an ascending pool none of whose first
+    /// `known` pages hold a longer stretch than `longest`.
+    fn assert_fit(a: &Allocator, what: &str) {
+        let Fit::Ascending { known, longest } = a.fit else {
+            return;
+        };
+        assert!(a.pool.windows(2).all(|w| w[0] < w[1]), "{what}: not ascending: {:?}", a.pool);
+        let known = &a.pool[..known.min(a.pool.len())];
+        let (mut most, mut stretch) = (0, 0);
+        for (i, &p) in known.iter().enumerate() {
+            stretch = if i > 0 && known[i - 1] + 1 == p { stretch + 1 } else { 1 };
+            most = most.max(stretch);
+        }
+        assert!(most <= longest, "{what}: a stretch of {most} among the known pages: {:?}", a.fit);
+    }
+
+    /// The writer's allocations over fragmented pools, through [`Side`], on the allocator and on
+    /// [`ReferencePool`]: single pages, runs of 1 to 8 pages, frees of private pages and runs,
+    /// and aborts back to a non-empty base pool, with free records that each scatter over the
+    /// whole file or list one ascending chunk of it. After every step both returned the same
+    /// pages and hold the same pool, in the same order, and the same page count.
+    fn fit_oracle(seed: u64, cases: u32, steps: u32) {
+        let mut rng = crate::tree::test_harness::Rng(seed);
+        for case in 0..cases {
+            let top = 64 + rng.below(2_000) as u32;
+            let density = 2 + rng.below(6);
+            let free: Vec<u32> = (2..top).filter(|_| rng.below(10) < density).collect();
+            let base: Vec<u32> = free.iter().copied().filter(|_| rng.below(8) == 0).collect();
+            let rest: Vec<u32> = free.iter().copied().filter(|p| !base.contains(p)).collect();
+            let per = 1 + rng.below(24) as usize;
+            let records: Vec<Vec<u32>> = if case % 2 == 0 {
+                rest.chunks(per).map(<[u32]>::to_vec).collect()
+            } else {
+                let mut records = vec![Vec::new(); rest.len().div_ceil(per)];
+                for &p in &rest {
+                    let r = rng.below(records.len() as u64) as usize;
+                    records[r].push(p);
+                }
+                records
+            };
+            let mut base = base;
+            for i in (1..base.len()).rev() {
+                base.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let mut a = Allocator::new(1, top);
+            a.add_to_pool(base.iter().copied());
+            a.begin_txn(2);
+            let reference = ReferencePool {
+                pool: base.clone(),
+                next_pgno: top,
+                private: Default::default(),
+                base: (base, top),
+            };
+            let mut ours = Side { pool: a, at: 0, loading: true };
+            let mut theirs = Side { pool: reference, at: 0, loading: true };
+            // The private units both sides hold: (first page, pages, run).
+            let mut units: Vec<(u32, u32, bool)> = Vec::new();
+            for step in 0..steps {
+                let what = format!("case {case} step {step}");
+                match rng.below(20) {
+                    0..=5 => {
+                        let p = ours.alloc(&records);
+                        assert_eq!(p, theirs.alloc(&records), "{what}: page");
+                        units.push((p, 1, false));
+                    }
+                    6..=13 => {
+                        let n = match rng.below(8) {
+                            0 => 1,
+                            1 => 6 + rng.below(3) as u32,
+                            _ => 2 + rng.below(4) as u32,
+                        };
+                        let p = ours.alloc_run(&records, n);
+                        assert_eq!(p, theirs.alloc_run(&records, n), "{what}: run of {n}");
+                        units.push((p, n, true));
+                    }
+                    14..=18 if !units.is_empty() => {
+                        let (p, n, run) = units.swap_remove(rng.below(units.len() as u64) as usize);
+                        ours.pool.give_back(p, n, run);
+                        theirs.pool.give_back(p, n, run);
+                    }
+                    19 => {
+                        ours.abort();
+                        theirs.abort();
+                        units.clear();
+                    }
+                    _ => {}
+                }
+                assert_eq!(ours.pool.pages(), theirs.pool.pages(), "{what}: the pools");
+                assert_eq!(ours.at, theirs.at, "{what}: records loaded");
+                assert_fit(&ours.pool, &what);
+            }
+        }
+    }
+
+    /// [`fit_oracle`]: what the fit search knows, and the merged loads, change no allocation.
+    #[test]
+    fn the_fit_knowledge_keeps_every_allocation() {
+        fit_oracle(0xf17b_0000_0000_0001, 200, 300);
     }
 }
