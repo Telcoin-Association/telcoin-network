@@ -34,11 +34,21 @@
 //! [`DupRoCursor::seek_dup_with_key_tail`]) stay inside one outer key: a miss leaves the cursor
 //! unset and reads no other key's rows. The key a call returns is the cursor's copy of
 //! `k ‖ s`, so the results borrow the cursor.
+//!
+//! tn-lmdb builds on Linux and macOS only, the two kernels its syncs are verified on; another unix
+//! needs the checks in the README's Platform notes ("Other Unixes") first.
 
 // The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with
 // `fallocate`/`F_PREALLOCATE` and locked with `flock`: this crate builds for unix targets only.
 #[cfg(not(unix))]
 compile_error!("tn-lmdb requires a unix target (mmap-backed page file, msync, flock)");
+// What `msync` and `fsync` make durable for a mapped file differs between unix kernels, and the
+// syncs are verified on Linux and macOS only.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+compile_error!(
+    "tn-lmdb's syncs are verified on Linux and macOS only: see README.md, Platform notes, \
+     \"Other Unixes\", for what a port to another unix must check"
+);
 
 mod alloc;
 #[cfg(test)]

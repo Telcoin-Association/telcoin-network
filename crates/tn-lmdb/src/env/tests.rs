@@ -933,7 +933,7 @@ fn commits_survive_a_power_loss_once_durable() {
 
 /// A commit whose pages are scattered over the file (copies taking pages that earlier commits
 /// freed all over it), so they form more than one range, syncs its data with one `fdatasync` of
-/// the file, and survives a power loss.
+/// the file (on macOS by the `msync`s of each merged range), and survives a power loss.
 #[test]
 fn a_scattered_commit_is_durable_through_one_fdatasync() {
     let (_dir, path) = temp();
@@ -971,10 +971,10 @@ fn a_scattered_commit_is_durable_through_one_fdatasync() {
 }
 
 /// A commit of a few pages that form two ranges (pages reused from the free list, and new ones
-/// further on) in a file that did not grow syncs them all by its one `fdatasync`, and survives a
-/// power loss: an `msync` of one of the ranges would lose the other, and no size sync covers it.
-/// Every commit up to the first such one is followed by a power loss and a reopen, so the check
-/// does not depend on which sync step 4 took.
+/// further on) in a file that did not grow syncs them all by its one `fdatasync` (on macOS by an
+/// `msync` of each range), and survives a power loss: an `msync` of one of the ranges would lose
+/// the other, and no size sync covers it. Every commit up to the first such one is followed by a
+/// power loss and a reopen, so the check does not depend on which sync step 4 took.
 #[test]
 fn a_commit_of_two_ranges_survives_a_power_loss() {
     let (_dir, path) = temp();
@@ -1420,23 +1420,104 @@ fn handles_are_send_and_sync() {
 }
 
 /// Dirty pages merge across gaps of up to 64 clean pages: one merged range of at most 16 runs of
-/// adjacent pages is synced by one `msync`, and anything else by one `fdatasync` of the file.
+/// adjacent pages is synced by one `msync`, and anything else by one `fdatasync` of the file (on
+/// macOS by the `msync`s of each merged range).
 #[test]
 fn dirty_pages_form_one_range_or_take_one_fdatasync() {
+    #[cfg(target_os = "macos")]
+    let many = DataSync::Ranges;
+    #[cfg(not(target_os = "macos"))]
+    let many = DataSync::File;
     let p = 4096;
     assert_eq!(data_sync(&[], p), DataSync::Nothing);
     assert_eq!(data_sync(&[7], p), DataSync::Range(7 * p..8 * p));
     assert_eq!(data_sync(&[2, 3, 4], p), DataSync::Range(2 * p..5 * p));
     assert_eq!(data_sync(&[2, 67], p), DataSync::Range(2 * p..68 * p), "a gap of 64 merges");
-    assert_eq!(data_sync(&[2, 68], p), DataSync::File, "65 does not: two ranges");
+    assert_eq!(data_sync(&[2, 68], p), many, "65 does not: two ranges");
     let apart: Vec<u32> = (0..3).map(|i| 2 + i * 100).collect();
-    assert_eq!(data_sync(&apart, p), DataSync::File, "three ranges");
+    assert_eq!(data_sync(&apart, p), many, "three ranges");
     // Runs that merge into one range still count one by one.
     let combed: Vec<u32> = (0..16).flat_map(|i| [2 + i * 3, 3 + i * 3]).collect();
     let one = DataSync::Range(2 * p..49 * p);
     assert_eq!(data_sync(&combed, p), one, "16 runs one page apart");
     let combed: Vec<u32> = (0..17).map(|i| 2 + i * 2).collect();
-    assert_eq!(data_sync(&combed, p), DataSync::File, "17 runs one page apart");
+    assert_eq!(data_sync(&combed, p), many, "17 runs one page apart");
+}
+
+/// macOS: once a durable commit returns, no page of the file is dirty in memory only, the
+/// scattered commits of a mature file included (step 4's [`DataSync::Ranges`]): an `fsync` there
+/// leaves some pages dirtied through the mapping unwritten, while the meta naming them is on disk.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_scattered_durable_commit_leaves_no_page_dirty() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let n = 40_000u32;
+    let key = |i: u32| i.wrapping_mul(2_654_435_761).to_be_bytes();
+    let value = |round: u32, i: u32| [(round ^ i) as u8; 200];
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..n {
+        txn.put(&t, &key(i), &value(0, i)).expect("put");
+    }
+    txn.commit().expect("commit");
+    let mut scattered = 0;
+    for round in 1..8u32 {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = table(&txn, "t");
+        for j in 0..3000u32 {
+            let i = j.wrapping_mul(7919).wrapping_add(round * 104_729) % n;
+            txn.put(&t, &key(i), &value(round, i)).expect("put");
+        }
+        let before = env.io_stats();
+        txn.commit().expect("commit");
+        scattered += env.io_stats().since(&before).fdatasync_syncs;
+        let dirty = env.with_writer(|w| w.file.dirty_os_pages());
+        assert_eq!(dirty, 0, "round {round}: OS pages left dirty after the commit returned");
+    }
+    assert!(scattered >= 4, "most commits took the scattered path ({scattered})");
+}
+
+/// macOS: a writer open writes the pages another mapping of the file left dirty before it builds
+/// on them: those of a crashed writer, or here of a mapping still held. An `fsync` (open step 7)
+/// writes none of them there.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_writer_open_writes_the_pages_another_mapping_left_dirty() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..3000u32 {
+        txn.put(&t, &i.to_be_bytes(), &[i as u8; 4000]).expect("put");
+    }
+    txn.commit().expect("commit");
+    drop(env);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    // SAFETY: nothing else changes the file while the test maps it, and every store writes back
+    // the byte it read, so the file holds what was committed.
+    let mut map = unsafe { memmap2::MmapMut::map_mut(&file) }.expect("map");
+    for at in (0..map.len()).step_by(sys::os_page_size() as usize) {
+        map[at] = std::hint::black_box(map[at]);
+    }
+    drop(file);
+    let env = open(&path);
+    assert_eq!(env.with_writer(|w| w.file.dirty_os_pages()), 0, "pages left dirty after the open");
+    env.check().expect("check");
+    drop(map);
+}
+
+/// macOS: the ranges [`DataSync::Ranges`] msyncs are the merged ranges [`data_sync`] counts.
+#[test]
+#[cfg(target_os = "macos")]
+fn scattered_pages_msync_their_merged_ranges() {
+    let p = 4096;
+    let ranges = |pages: &[u32]| {
+        merged_ranges(pages, p).map(|r| (r.start / p, r.end / p)).collect::<Vec<_>>()
+    };
+    assert_eq!(ranges(&[7]), [(7, 8)]);
+    assert_eq!(ranges(&[2, 3, 68]), [(2, 69)], "a gap of 64 merges");
+    assert_eq!(ranges(&[2, 68, 69, 300]), [(2, 3), (68, 70), (300, 301)], "65 does not");
 }
 
 /// A table record a transaction remembers serves only the handle it was resolved for: not a

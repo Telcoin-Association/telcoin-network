@@ -21,14 +21,15 @@
 //! ## Commits
 //!
 //! A commit (see `RwTxn::commit`) stamps the CRC of every page the transaction wrote, makes
-//! them durable (one `msync` when they form one range, else one `fdatasync` of the file; see
-//! [`data_sync`]), then the file's size if it grew and that sync did not already cover it, and
-//! only then writes the new meta over the slot holding the lower txn and syncs that one page. A
-//! crash before the meta is copied recovers the previous state; after its sync, the new one; in
-//! between, the new one if its record survived intact (a process crash keeps it in the page
-//! cache, which a reopen reads; a power loss, only if it reached the disk), else the previous one
-//! (README, Commit protocol). In [`SyncMode::NoSync`] a commit only stamps and publishes in
-//! memory; [`Env::sync`] (or the environment's drop) runs the durable steps for the newest state.
+//! them durable (one `msync` when they form one range, else one `fdatasync` of the file, or on
+//! macOS an `msync` of each range; see [`data_sync`]), then the file's size if it grew and that
+//! sync did not already cover it, and only then writes the new meta over the slot holding the
+//! lower txn and syncs that one page. A crash before the meta is copied recovers the previous
+//! state; after its sync, the new one; in between, the new one if its record survived intact (a
+//! process crash keeps it in the page cache, which a reopen reads; a power loss, only if it
+//! reached the disk), else the previous one (README, Commit protocol). In [`SyncMode::NoSync`] a
+//! commit only stamps and publishes in memory; [`Env::sync`] (or the environment's drop) runs the
+//! durable steps for the newest state.
 //!
 //! ## Readers
 //!
@@ -110,7 +111,15 @@ enum DataSync {
     Nothing,
     /// One `msync(MS_SYNC)` of this byte range.
     Range(Range<u64>),
-    /// One `fdatasync` of the whole file.
+    /// macOS, where Linux takes [`DataSync::File`]: one `msync(MS_ASYNC)` of each range the pages
+    /// merge into, then one `msync(MS_SYNC)` of each ([`merged_ranges`],
+    /// `PageFile::msync_ranges`). An `fsync` there leaves some pages dirtied through the mapping
+    /// unwritten, and only `msync` writes them (README, Platform notes).
+    #[cfg(target_os = "macos")]
+    Ranges,
+    /// One `fdatasync` of the whole file (on macOS only the test-only `Writer::data_by_fdatasync`
+    /// picks it, and `PageFile::fdatasync_all` msyncs the whole mapping first there).
+    #[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
     File,
 }
 
@@ -510,7 +519,8 @@ pub(crate) struct Writer {
     /// [`Self::crash_point`]).
     #[cfg(test)]
     pub(crate) crash_at: Option<CrashAt>,
-    /// Test-only: the latest durable steps synced the data with one `fdatasync` of the file.
+    /// Test-only: the latest durable steps synced the data with one `fdatasync` of the file (on
+    /// macOS also by the `msync`s of `DataSync::Ranges`, which take its place there).
     #[cfg(test)]
     pub(crate) data_by_file: bool,
     /// Test-only (a benchmark comparison): step 4 makes the data pages durable with one
@@ -642,9 +652,10 @@ impl Writer {
     }
 
     /// The durable steps of a commit (4–6): sync `pages` (ascending) by the one `msync` or the
-    /// one `fdatasync` [`data_sync`] picks, then the file's size if it grew (a no-op after the
-    /// `fdatasync`, which syncs the size too), then write `meta` over the slot holding the lower
-    /// txn and sync that page.
+    /// one `fdatasync` [`data_sync`] picks (on macOS the `msync`s of `DataSync::Ranges` instead
+    /// of the `fdatasync`), then the file's size if it grew (a no-op after the `fdatasync`, which
+    /// syncs the size too), then write `meta` over the slot holding the lower txn and sync that
+    /// page.
     pub(crate) fn make_durable(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         let size = self.geometry.page_size();
         let plan = data_sync(pages, size as u64);
@@ -659,6 +670,10 @@ impl Writer {
         #[cfg(test)]
         {
             self.data_by_file = plan == DataSync::File;
+            #[cfg(target_os = "macos")]
+            {
+                self.data_by_file |= plan == DataSync::Ranges;
+            }
         }
         let grown = self.file.size_unsynced();
         let mut clock = Instant::now();
@@ -669,6 +684,11 @@ impl Writer {
                 self.file.msync_range(range)?;
                 self.stats.msync_syncs += 1;
                 self.stats.msync_span_pages += span;
+            }
+            #[cfg(target_os = "macos")]
+            DataSync::Ranges => {
+                self.file.msync_ranges(merged_ranges(pages, size as u64))?;
+                self.stats.fdatasync_syncs += 1;
             }
             DataSync::File => {
                 self.file.fdatasync_all()?;
@@ -1144,24 +1164,31 @@ where
 
 /// How step 4 syncs dirty `pages` (ascending). Runs of adjacent pages separated by at most
 /// [`MERGE_GAP`] clean pages merge into one range. Pages that form exactly one range, in at most
-/// [`MAX_RUNS`] runs, get one `msync` of it; any other set gets one `fdatasync` of the file.
+/// [`MAX_RUNS`] runs, get one `msync` of it; any other set gets one `fdatasync` of the file (on
+/// macOS the `msync`s of `DataSync::Ranges`: see below).
 ///
 /// - **Two or more ranges:** on Linux every `msync(MS_SYNC)` runs the file system's fsync path,
-///   drive-cache flush included, so k ranges cost k flushes where one `fdatasync` costs one (small
-///   commits on macOS sync faster by one `fdatasync` too).
+///   drive-cache flush included, so k ranges cost k flushes where one `fdatasync` costs one.
 /// - **One range:** one `msync` is one flush on Linux too, and on macOS it beats an `fdatasync` of
 ///   the file for a large commit (a bulk load's one range), which `fdatasync` writes slower.
 /// - **More than [`MAX_RUNS`] runs** (a commit whose copies took pages freed all over the file) get
-///   the `fdatasync` even when they merge into one range: an `msync` writes its range's dirty pages
-///   one cluster at a time on macOS, about three times the cost of `fdatasync`'s single pass for a
-///   commit of a thousand scattered pages.
+///   the `fdatasync` (on macOS the two passes) even when they merge into one range: one
+///   `msync(MS_SYNC)` writes its range's dirty pages one cluster at a time on macOS, three to four
+///   times the cost of starting every write first, as the `MS_ASYNC` pass does.
 ///
 /// Either way the data is durable before the meta is written. `fdatasync` also writes any other
 /// dirty page of the file, which at a commit can only be a page of an aborted transaction: a free
-/// page, so writing it is harmless. On macOS the `fdatasync` is a plain `fsync`, which leaves some
-/// pages dirtied through the mapping unwritten, so there a scattered commit is not durable against
-/// a kernel crash, and the macOS costs above measured that lesser work (README, Platform notes;
-/// do-not-flag item 30).
+/// page, so writing it is harmless.
+///
+/// **macOS** takes `DataSync::Ranges` where Linux takes the `fdatasync`: a plain `fsync` there
+/// (`sys::fdatasync_file`) does not write every page dirtied through a shared mapping, and only
+/// `msync` does (README, Platform notes; do-not-flag item 30). The `MS_ASYNC` pass starts the
+/// writes of every range at once, and the `MS_SYNC` pass after it waits for them (as it waits for
+/// any write in flight) and writes whatever is still dirty: one `MS_SYNC` per range alone writes
+/// one range at a time, about three times slower on a commit of a few thousand scattered pages,
+/// and one `MS_SYNC` of the span from the first page to the last walks every resident page in it,
+/// a cost that grows with the file. A scattered commit of a mature file of 1–4 GiB syncs this way
+/// three to five times faster than by the `fsync`, which also skipped pages.
 fn data_sync(pages: &[u32], page_size: u64) -> DataSync {
     let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else {
         return DataSync::Nothing;
@@ -1173,9 +1200,22 @@ fn data_sync(pages: &[u32], page_size: u64) -> DataSync {
         ranges += usize::from(clean > MERGE_GAP);
     }
     if runs > MAX_RUNS || ranges > 1 {
+        #[cfg(target_os = "macos")]
+        return DataSync::Ranges;
+        #[cfg(not(target_os = "macos"))]
         return DataSync::File;
     }
     DataSync::Range(u64::from(first) * page_size..(u64::from(last) + 1) * page_size)
+}
+
+/// The byte ranges dirty `pages` (ascending) merge into, as [`data_sync`] counts them: runs of
+/// adjacent pages separated by at most [`MERGE_GAP`] clean pages form one range.
+#[cfg(target_os = "macos")]
+fn merged_ranges(pages: &[u32], page_size: u64) -> impl Iterator<Item = Range<u64>> + Clone + '_ {
+    pages.chunk_by(|a, b| b - a - 1 <= MERGE_GAP).map(move |range| {
+        let (first, last) = (range[0], range[range.len() - 1]);
+        u64::from(first) * page_size..(u64::from(last) + 1) * page_size
+    })
 }
 
 impl Env {
@@ -1211,6 +1251,11 @@ impl Env {
         sys::fsync_directory(parent_dir(path))?;
         let file =
             PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
+        // macOS: that fsync leaves pages a crashed writer dirtied through its mapping unwritten,
+        // and only an msync writes them (README, Platform notes). Every mapping of the file
+        // shares its pages, so an msync of this one does, once, before anything is built on them.
+        #[cfg(target_os = "macos")]
+        file.msync_range(0..file.file_len())?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
         let mut writer = Writer {
             view: file.view(),

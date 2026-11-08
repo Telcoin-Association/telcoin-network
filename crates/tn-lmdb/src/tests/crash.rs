@@ -247,7 +247,8 @@ pub(super) struct Case {
     pub(super) latest: State,
     /// The meta slot `M`'s record goes to.
     pub(super) slot: usize,
-    /// The last durable steps synced the data by one `fdatasync` of the file.
+    /// The last durable steps synced the data by one `fdatasync` of the file (on macOS also by
+    /// the `msync`s of `DataSync::Ranges`, which take its place there).
     pub(super) by_file: bool,
     /// The pages the writer took from the free list.
     pub(super) reused: usize,
@@ -308,10 +309,10 @@ fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Lo
 
 /// Run the crash commit (or the sync after it) to the end, checked to exercise what the matrix
 /// needs: the data synced by the `fdatasync` `data_sync` picks for pages that form several
-/// ranges (or, `by_msync`, by one `msync`), pages reused from the free list, a growth of the
-/// file exactly when the base says so (a growth's size sync is an `fsync`, which writes every
-/// page: only a commit that does not grow shows what one `msync` alone covers), and the base's
-/// `layout`.
+/// ranges (on macOS the `msync`s of `DataSync::Ranges`; or, `by_msync`, by one `msync`), pages
+/// reused from the free list, a growth of the file exactly when the base says so (a growth's size
+/// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
+/// `msync` alone covers), and the base's `layout`.
 fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
     let Case { path, latest, by_file, reused, .. } = run_case(base, sync, by_msync, None);
     assert_eq!(by_file, !by_msync, "{sync:?}: by_msync={by_msync}: synced by fdatasync");

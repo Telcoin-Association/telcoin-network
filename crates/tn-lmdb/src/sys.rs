@@ -6,11 +6,13 @@
 //! `F_FULLFSYNC`, a flush of the whole drive's write cache). Commits are `msync`, so every other
 //! sync here is a plain `fsync` too ([`fsync_file`], [`fdatasync_file`]): std's
 //! `File::sync_all`/`sync_data` would issue `F_FULLFSYNC`, costing 10–20 ms each and stalling
-//! every other write on the drive, for a guarantee the commits never give. A crash of the process
-//! loses nothing committed durably. A kernel crash or a forced power-off can: a plain `fsync`
-//! there leaves some pages dirtied through a shared mapping unwritten (only `msync` writes them),
-//! and step 4 syncs a scattered commit's pages by one (README, Platform notes; do-not-flag item
-//! 30). A power loss can also lose what the drive's write cache held. On Linux these are exactly
+//! every other write on the drive, for a guarantee the commits never give. A plain `fsync` there
+//! also leaves some pages dirtied through a shared mapping unwritten (only `msync` writes them),
+//! so on macOS the page file never relies on an `fsync` for such pages: it syncs them by `msync`
+//! (a commit's data, `fdatasync_all`, the writer open: `file.rs`, Durability), and the syncs here
+//! keep what an `fsync` does write: the file's size, bytes written by `write` (a create's metas)
+//! and the directory. With that, a crash of the process or the kernel loses nothing committed
+//! durably; a power loss can lose what the drive's write cache held. On Linux these are exactly
 //! `File::sync_all`/`sync_data` (`fsync`/`fdatasync`, which do flush the drive's cache and write
 //! every dirty page of the file).
 //!
@@ -158,8 +160,8 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
 /// reflink copy or a snapshot, needs new space at each rewrite (README, Platform notes).
 ///
 /// `from` must be the file's current length (macOS reserves from the physical end of file). Where
-/// the platform or filesystem cannot preallocate, this falls back to a plain (sparse) resize so the
-/// file still works.
+/// the filesystem cannot preallocate, this falls back to a plain (sparse) resize so the file
+/// still works.
 #[cfg(target_os = "linux")]
 pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> {
     let len = to.saturating_sub(from);
@@ -233,15 +235,8 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
     file.set_len(to)
 }
 
-/// See the Linux variant: no portable preallocation on this target, so a plain (sparse) resize.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn allocate_range(file: &File, _from: u64, to: u64) -> io::Result<()> {
-    file.set_len(to)
-}
-
 /// Run `call` again while a signal interrupts it (`EINTR`), as std does inside `File::sync_all`
 /// and `set_len`: every caller fail-stops on the error, and an interrupted call is not one.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn retry_interrupted(mut call: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     loop {
         match call() {
@@ -252,7 +247,6 @@ fn retry_interrupted(mut call: impl FnMut() -> io::Result<()>) -> io::Result<()>
 }
 
 /// A libc call's return code as a result: `-1` is the error in `errno`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn os_result(rc: libc::c_int) -> io::Result<()> {
     if rc == -1 {
         Err(io::Error::last_os_error())
@@ -368,7 +362,6 @@ mod tests {
 
     /// An interrupted call is issued again until it completes; any other error ends it at once.
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn retry_interrupted_reissues_only_an_interrupted_call() {
         let mut calls = 0;
         let done = retry_interrupted(|| {

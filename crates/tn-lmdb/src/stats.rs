@@ -42,7 +42,7 @@ pub struct IoStats {
     /// Step 4s done by one `msync` of the one range the dirty pages form.
     pub msync_syncs: u64,
     /// Step 4s done by one `fdatasync` of the file (dirty pages in more than one range, or in too
-    /// many runs).
+    /// many runs; on macOS these take an `msync` of each range instead, counted here too).
     pub fdatasync_syncs: u64,
     /// The pages the `msync`s of [`Self::msync_syncs`] spanned, from each range's first dirty page
     /// to its last, the clean pages between included.
@@ -59,7 +59,8 @@ pub struct IoStats {
     pub save_ns: u64,
     /// Time in step 3: the CRCs of every page written, one per tree page and one per run.
     pub stamp_ns: u64,
-    /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages.
+    /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages (on macOS the
+    /// `msync`s that take the `fdatasync`'s place).
     pub data_sync_ns: u64,
     /// Time in step 5: the file's size sync (`fdatasync`) when it grew and step 4 did not already
     /// sync it; a check of a flag otherwise.

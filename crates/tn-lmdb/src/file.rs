@@ -54,11 +54,13 @@
 //! persist a size extension, so a growth marks the size unsynced and
 //! [`PageFile::sync_size_if_grown`] fdatasyncs it once. [`PageFile::fdatasync_all`] writes every
 //! dirty page of the mapping and the size in one call, so after it the size sync has nothing left
-//! to do (on Linux; on macOS its plain `fsync` leaves some mapped pages unwritten: README,
-//! Platform notes). Any failed sync or growth poisons the file:
-//! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
-//! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
-//! continue.
+//! to do. On macOS an `fsync` leaves some pages dirtied through the mapping unwritten and only
+//! `msync` writes them, so there every such page is synced by an `msync`: `fdatasync_all` msyncs
+//! the whole mapping before its `fsync`, a commit's scattered pages take `PageFile::msync_ranges`,
+//! and a writer open (`Env::open`) msyncs the mapping once, for the pages a crashed writer left
+//! dirty (README, Platform notes). Any failed sync or growth poisons the file: every later write or
+//! sync returns [`Error::Failed`] and is never retried (a retried `msync` after a writeback error
+//! can spuriously succeed on Linux errseq, laundering lost data). Reads continue.
 //!
 //! ## Read-only
 //!
@@ -500,8 +502,40 @@ impl PageFile {
         self.msync(start, start + page_size as u64).inspect_err(|_| self.poison())
     }
 
+    /// macOS: make `ranges` durable by one `msync(MS_ASYNC)` of each, which starts the writes
+    /// of their dirty pages, then one `msync(MS_SYNC)` of each, which waits for those writes (as
+    /// for any write in flight) and writes any page still dirty. Only the `MS_SYNC` pass is relied
+    /// on; the `MS_ASYNC` pass is for speed (one `MS_SYNC` per range alone writes one range at a
+    /// time). A failure poisons the file, and the ranges are never retried.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn msync_ranges(
+        &self,
+        mut ranges: impl Iterator<Item = Range<u64>> + Clone,
+    ) -> Result<()> {
+        self.check_poison()?;
+        ranges
+            .clone()
+            .try_for_each(|range| self.msync_flags(range.start, range.end, libc::MS_ASYNC))
+            .and_then(|()| ranges.try_for_each(|range| self.msync(range.start, range.end)))
+            .inspect_err(|_| self.poison())
+    }
+
     /// One `msync(MS_SYNC)` of `[start, end)`.
     fn msync(&self, start: u64, end: u64) -> Result<()> {
+        #[cfg(test)]
+        if start < end && end <= self.len && self.fail_next_msync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected msync failure").into());
+        }
+        self.msync_flags(start, end, libc::MS_SYNC)
+    }
+
+    /// One `msync` of `[start, end)` with `flags`: `MS_SYNC` ([`Self::msync`], and on macOS
+    /// [`Self::fdatasync_all`]'s msync of the mapping), or on macOS `MS_ASYNC`
+    /// (`Self::msync_ranges`' first pass). Only [`Self::msync`] is failed by
+    /// `Self::fail_next_msync`, so `fdatasync_all`'s injected failure stays
+    /// `Self::fail_next_fsync`'s. An `MS_ASYNC` makes nothing durable, so only an `MS_SYNC`
+    /// reports to the disk model.
+    fn msync_flags(&self, start: u64, end: u64, flags: libc::c_int) -> Result<()> {
         if start >= end {
             return Ok(());
         }
@@ -510,10 +544,6 @@ impl PageFile {
                 "page file: msync of {start}..{end} past the end of the file ({})",
                 self.len
             )));
-        }
-        #[cfg(test)]
-        if self.fail_next_msync.swap(false, Ordering::Relaxed) {
-            return Err(io::Error::other("injected msync failure").into());
         }
         let aligned = start - start % os_page_size();
         let base = self.map.as_ptr();
@@ -524,14 +554,16 @@ impl PageFile {
             libc::msync(
                 base.add(aligned as usize).cast_mut().cast(),
                 (end - aligned) as usize,
-                libc::MS_SYNC,
+                flags,
             )
         };
         if rc != 0 {
             return Err(io::Error::last_os_error().into());
         }
         #[cfg(test)]
-        crate::disk_model::flushed_range(self.ino, base, self.len, start, end);
+        if flags == libc::MS_SYNC {
+            crate::disk_model::flushed_range(self.ino, base, self.len, start, end);
+        }
         Ok(())
     }
 
@@ -547,10 +579,12 @@ impl PageFile {
     }
 
     /// `fdatasync` the whole file, which makes every page written through the mapping durable and
-    /// its size too (on Linux; on macOS not every page: README, Platform notes). A failure poisons
-    /// the file.
+    /// its size too (on macOS after an `msync` of the whole mapping: see the module docs). A
+    /// failure poisons the file.
     pub(crate) fn fdatasync_all(&self) -> Result<()> {
         self.check_poison()?;
+        #[cfg(target_os = "macos")]
+        self.msync_flags(0, self.len, libc::MS_SYNC).inspect_err(|_| self.poison())?;
         self.fdatasync().inspect_err(|_| self.poison())?;
         self.size_unsynced.store(false, Ordering::Relaxed);
         Ok(())
@@ -576,6 +610,21 @@ impl PageFile {
     #[cfg(test)]
     pub(crate) fn fail_next_fsync(&self) {
         self.fail_next_fsync.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only (macOS): how many OS pages of the file the kernel holds modified and not yet
+    /// written to it (`mincore`'s `MINCORE_MODIFIED` or `MINCORE_MODIFIED_OTHER`), whichever
+    /// mapping modified them.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn dirty_os_pages(&self) -> usize {
+        let len = self.len as usize;
+        let mut flags = vec![0 as libc::c_char; len.div_ceil(os_page_size() as usize)];
+        // SAFETY: `[0, len)` lies within the live mapping, and `mincore` writes one byte per OS
+        // page of it into `flags`, which holds that many.
+        let rc = unsafe { libc::mincore(self.map.as_ptr().cast(), len, flags.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore: {}", io::Error::last_os_error());
+        let modified = libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER;
+        flags.iter().filter(|&&f| i32::from(f) & modified != 0).count()
     }
 }
 
@@ -833,6 +882,23 @@ mod tests {
                 bytes[pgno * page..(pgno + 1) * page].iter().all(|&b| b == want),
                 "page {pgno} (synced: {synced})"
             );
+        }
+    }
+
+    /// macOS: `fdatasync_all` leaves no page dirtied through the mapping unwritten, rewrites of
+    /// pages already on disk included, which an `fsync` alone leaves dirty there.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fdatasync_all_writes_every_page_dirtied_through_the_mapping() {
+        let tmp = TempDir::with_prefix("tn_lmdb_file_fdatasync").expect("temp dir");
+        let mut pf = PageFile::open(&tmp.path().join("db"), 64 << 20).expect("open");
+        pf.ensure_len(16 << 20).expect("grow");
+        for fill in [1, 2] {
+            for pgno in 0..(16 << 20) / 4096 {
+                pf.page_mut(pgno, 4096).expect("page").fill(fill);
+            }
+            pf.fdatasync_all().expect("fdatasync");
+            assert_eq!(pf.dirty_os_pages(), 0, "fill {fill}: pages left dirty");
         }
     }
 

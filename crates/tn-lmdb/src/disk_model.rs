@@ -12,6 +12,9 @@
 //! [`power_loss_random`] models a harsher crash in which some unflushed pages (and perhaps the
 //! size change) had already been written back, some pages only in part. Untracked files cost one
 //! atomic load per flush.
+//!
+//! An fsync here is Linux's, which writes every page dirtied through a mapping. On macOS the page
+//! file never relies on an fsync for those pages (it leaves some unwritten there): it msyncs them.
 
 use std::{
     collections::HashMap,

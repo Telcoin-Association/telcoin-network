@@ -505,8 +505,8 @@ committed tree, only one this transaction freed, and only damage names it: the c
 | 1 | Flush each dup table's working map into its outer tree (`Work::flush_nested`: each changed nested root into its outer cell, which can allocate, copy and free pages), write each changed table's root into the catalog (in name order), then save the free list (see below). |
 | 2 | Build meta M in memory: txn L+1, both roots, the page count. |
 | 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
-| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). |
-| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too. |
+| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
+| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too (on macOS, step 4's msyncs of a scattered commit leave the size to this step). |
 | 6 | Copy meta M into the slot holding the lower txn (an invalid slot first; on a tie, slot 1), msync that one page, then record M's txn as the slot's. |
 | 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
 
@@ -514,7 +514,8 @@ committed tree, only one this transaction freed, and only damage names it: the c
 [Step 4](#step-4-one-msync-or-one-fdatasync) (do-not-flag item 10). The `fdatasync` also writes any
 other dirty page of the file. At a commit that can only be a page of an aborted transaction, which
 is a free page, so writing it is harmless. A crash test cannot stop a commit between data ranges,
-because there is one sync; partial writeback of the dirty pages is still modelled by
+because there is one sync (on macOS two passes of msyncs, with no crash point between them: the
+meta follows the last); partial writeback of the dirty pages is still modelled by
 `power_loss_random`, and the crash matrix runs every point on both paths (`Writer::data_by_msync`,
 `Writer::data_by_fdatasync`).
 
@@ -990,7 +991,10 @@ checks as `Cursor`'s.
    `readahead` is set ([Platform notes](#platform-notes); do-not-flag item 16); a remap past the
    reservation is advised the same way. The writer takes the bytes past the pages any meta slot
    names as not preallocated: its first growth past them cuts the file to those pages and grows
-   from there ([Platform notes](#platform-notes)). Open itself writes nothing.
+   from there ([Platform notes](#platform-notes)). On macOS step 8 then msyncs the whole mapping
+   once: step 7's `fsync` does not write the pages a crashed writer dirtied through its mapping
+   there, and every mapping of the file shares them
+   (`a_writer_open_writes_the_pages_another_mapping_left_dirty`). Open itself changes no byte.
 9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
    its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
    txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
@@ -1720,7 +1724,7 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 | group | counters |
 |---|---|
 | commits | `commits` (each run of steps 4–6: a `Durable` commit, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits`, `grown_commits` (the file grew since the last durable state) |
-| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took), `msync_span_pages` (the one range's pages, clean ones included) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
 | step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
@@ -1895,31 +1899,44 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 
 ## Platform notes
 
-- **Unix only** (`compile_error!` elsewhere): the engine uses mmap, msync, flock, and
-  fallocate or `F_PREALLOCATE`.
+- **Linux and macOS only** (`compile_error!` elsewhere): the engine uses mmap, msync, flock, and
+  fallocate or `F_PREALLOCATE`, and its syncs are verified on those two only (Other Unixes,
+  below).
 - **macOS: msync and fsync are not power-loss barriers.** Neither flushes the drive's write cache.
   Only `F_FULLFSYNC` does, at 10–20 ms each, and the crate deliberately never issues it. Never call
-  `File::sync_all`; use `sys::fsync_file` and `fdatasync_file`. A process crash loses nothing
-  committed durably; a kernel crash can (next note), and a power loss can, as with any engine that
-  syncs without `F_FULLFSYNC` on macOS. Production durability is a Linux property, where
-  `msync(MS_SYNC)` and `fdatasync` each take the file system's fsync path, drive-cache flush
-  included.
-- **macOS: a plain `fsync` does not write every page dirtied through a shared mapping.** On APFS
-  (Darwin 24) it leaves some in memory only, and only `msync` writes them (by `mincore`'s
-  `MINCORE_MODIFIED`: up to 1304 OS pages of a 25 MiB file and 7493 of a 4 GiB one after
-  scattered durable commits; with another mapping of the file held, all of them). Step 4 takes the
-  `fdatasync` for a commit whose pages form more than one range, nearly every commit of a mature
-  file, so on macOS a durable commit can return with its meta on disk and some of its pages in
-  memory only; open step 7's `fsync` does not write a crashed writer's pages either. A process
-  crash loses nothing (the page cache keeps the pages). A kernel panic or a forced power-off can
-  leave a meta naming pages that never reached the disk, which open, the first read or
-  `Env::check` refuses as `Corrupt` (a parent's `child_txn`, a page's header and CRC): damage,
-  not a rollback to the previous commit. The engine accepts this on macOS (do-not-flag item 30):
-  syncing those pages by `msync` (an `MS_ASYNC`, then an `MS_SYNC`, of each merged range) left
-  none dirty but cost 2.2x on the durable `reth.block` row (3.7 → 8.0 ms a block) and 2.0x on its
-  no-sync twin, whose untimed `Env::sync` between blocks took the same path (Apple M1 Max,
-  2026-11-08). That is the price of the writes the `fsync` skips and of the write faults on pages
-  a writeback cleans, which Linux pays at every commit.
+  `File::sync_all`; use `sys::fsync_file` and `fdatasync_file`. A process or kernel crash loses
+  nothing committed durably, but a power loss can, as with any engine that syncs without
+  `F_FULLFSYNC` on macOS. Production durability is a Linux property, where `msync(MS_SYNC)` and
+  `fdatasync` each take the file system's fsync path, drive-cache flush included.
+- **macOS: pages written through the mapping are synced by `msync`.** A plain `fsync` there does
+  not write every page dirtied through a shared mapping, and only `msync` writes them. Tested on
+  APFS (Darwin 24) by snapshots of what the device held, as a power cut would leave it: `fsync`,
+  `F_FULLFSYNC` and `F_BARRIERFSYNC` alike left in memory only the dirtied pages of the first 16 MiB
+  of any dirty extent wider than that, every time (about a quarter of 1500 scattered rewrites of a
+  64 MiB file), and those pages stayed unwritten for minutes, after `munmap` and `close` too. Every
+  form of `msync` wrote them all, and `mincore`'s `MINCORE_MODIFIED` counted exactly the pages left. So on macOS the engine never relies on an `fsync` for a mapped page
+  (do-not-flag item 30): step 4 syncs a scattered commit's pages by an `msync(MS_ASYNC)`, then an
+  `msync(MS_SYNC)`, of each merged range (`data_sync`'s `DataSync::Ranges`,
+  `PageFile::msync_ranges`), `PageFile::fdatasync_all` msyncs the whole mapping before its fsync,
+  and a writer open msyncs its mapping once, before it builds on the file, for the pages a crashed
+  writer left dirty ([Open and recovery](#open-and-recovery) step 8). The fsyncs left sync the
+  file's size, a create's `pwrite`s and the directory. This costs about 2x on the durable
+  `reth.block` row and nothing on most others ([Step 4](#step-4-one-msync-or-one-fdatasync)).
+  Linux's `fsync` writes every page dirtied through the mapping, so Linux keeps one `fdatasync`
+  for a scattered commit.
+- **Other Unixes are refused at build time** (`compile_error!` in `lib.rs`): their kernels differ
+  in what `msync` and `fsync` make durable for a mapped file, and none is tested. A port checks,
+  for each kernel and file system: whether `fsync` writes the pages dirtied through a mapping;
+  whether `msync(MS_SYNC)` waits for the disk and also makes durable the block a page first
+  stored into a hole was given (growth there would be a sparse `set_len`, with no preallocation);
+  and whether `pread`, which open reads the metas with, sees the mapping's pages. From their
+  sources (untested): on FreeBSD (UFS, ZFS) and illumos with ZFS `fsync` writes mapped pages and
+  `msync` is a complete data sync, so Linux's rule would apply. On NetBSD (FFS) and illumos with
+  UFS `fsync` writes mapped pages, but an `msync` leaves a hole's new block allocation unwritten
+  until an `fsync`, so every `msync` of data would need an `fsync` after it. OpenBSD has no
+  unified cache: its `fsync` ignores mapped pages and its `msync(MS_SYNC)` returns before the disk
+  has them, so each durable step would need an `msync` then an `fsync`, and open would read the
+  metas through the mapping, not by `pread`.
 - **A page size below the OS page puts both metas in one OS page** (4 KiB pages on Apple
   Silicon's 16 KiB OS pages, or on a 64 KiB-page arm64 or ppc64 Linux kernel). A mapped write
   dirties the whole OS page and an msync rounds down to it, so every meta msync also writes back
@@ -1932,24 +1949,23 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   that matters, create the file with `page_size` at least the OS page size, which puts each meta
   in its own OS page.
 - **Linux: growth uses `fallocate`** (mode 0, which allocates real blocks and extends the size).
-  macOS uses `F_PREALLOCATE` plus `set_len`, and other unix targets use a plain `set_len`.
-  Preallocation makes a full disk an `io::Error` at growth, not a `SIGBUS` on a mapped write. That
-  holds only where preallocation works. On other unix targets, and on a file system without it
-  (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on NFS before version 4.2 and FUSE file
-  systems that do not implement it, or `F_PREALLOCATE` with `ENOTSUP`), growth is a sparse
-  `set_len`, and a full disk can then be a `SIGBUS` on a mapped write. Growth is geometric: at
-  least `clamp(len, 1 MiB, max_growth)` more (`EnvOptions::max_growth`, default 1 GiB, at least
-  `MIN_GROWTH`, 1 MiB), rounded to the OS page, so a running file holds a preallocated tail of up
-  to one step past its pages. A clean close truncates the file to its pages, rounded up to the OS
-  page (`PageFile::trim_to`, see [Close](#close)), so the resting file holds no preallocated tail;
-  a failed or skipped trim (a crash, a latched close) leaves the slack. A reopened writer does not
+  macOS uses `F_PREALLOCATE` plus `set_len`. Preallocation makes a full disk an `io::Error` at
+  growth, not a `SIGBUS` on a mapped write. That holds only where preallocation works. On a file
+  system without it (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on NFS before version 4.2
+  and FUSE file systems that do not implement it, or `F_PREALLOCATE` with `ENOTSUP`), growth is a
+  sparse `set_len`, and a full disk can then be a `SIGBUS` on a mapped write. Growth is geometric:
+  at least `clamp(len, 1 MiB, max_growth)` more (`EnvOptions::max_growth`, default 1 GiB, at least
+  `MIN_GROWTH`, 1 MiB), rounded to the OS page, so a running file holds a preallocated tail of up to
+  one step past its pages. A clean close truncates the file to its pages, rounded up to the OS page
+  (`PageFile::trim_to`, see [Close](#close)), so the resting file holds no preallocated tail; a
+  failed or skipped trim (a crash, a latched close) leaves the slack. A reopened writer does not
   trust that slack: a sparse copy or restore (`cp --sparse=always`, `rsync -S`, `tar -S`, a backup
   tool that punches runs of zeros) can have made it holes, where a first write on a full disk is a
-  `SIGBUS`. Its first growth past the pages any meta slot names truncates the file to them and
-  grows from there, preallocated, so the guarantee holds for the tail. The cut covers the tail
-  only: holes a sparse copy made inside the pages in use stay (next item). Past the reservation the
-  mapping moves to a new reservation of at least twice the size. Retired mappings are kept until
-  close while a reader may hold a view of them.
+  `SIGBUS`. Its first growth past the pages any meta slot names truncates the file to them and grows
+  from there, preallocated, so the guarantee holds for the tail. The cut covers the tail only: holes
+  a sparse copy made inside the pages in use stay (next item). Past the reservation the mapping
+  moves to a new reservation of at least twice the size. Retired mappings are kept until close while
+  a reader may hold a view of them.
 - **A mapped access can still be a `SIGBUS`.** Preallocation covers a page's first write only.
   Every commit rewrites a meta page and reused pages in place, and where a rewrite needs new space
   a full disk can fail it with a `SIGBUS`: on a copy-on-write file system (btrfs, ZFS), and for a
@@ -2107,8 +2123,8 @@ These limits and non-goals are known:
 Each item is a deliberate choice: the decision, the reason in brief, and the section that holds the
 argument and the measurements. Code and other docs cite the items by number, so the numbers stay.
 
-1. **No `F_FULLFSYNC` on macOS.** The commit path is msync or a plain fsync, neither stronger, and a
-   full drive flush per sync would cost 10–20 ms and buy nothing the commits keep (item 30). See
+1. **No `F_FULLFSYNC` on macOS.** The commit path is msync, which is no stronger, and a full drive
+   flush per sync would cost 10–20 ms and buy nothing the commits keep. See
    [Platform notes](#platform-notes).
 2. **`unsafe` in five places**, each block with a `SAFETY:` comment:
    - `file.rs`: a read-only open's mapping (`map`), `msync`, and the `from_raw_parts` page slices.
@@ -2160,8 +2176,9 @@ argument and the measurements. Code and other docs cite the items by number, so 
    gap below a split's half-full pages. See [Deletes and merging](#deletes-and-merging).
 10. **Step 4 is one sync:** one `msync` when the dirty pages merge into one range of at most 16
     runs, else one `fdatasync` of the file. On Linux every msync takes the fsync path, drive-cache
-    flush included, so syncing k ranges one by one paid k flushes. See
-    [Commit protocol](#commit-protocol) and [Step 4](#step-4-one-msync-or-one-fdatasync).
+    flush included, so syncing k ranges one by one paid k flushes. (On macOS an `msync(MS_ASYNC)`
+    then an `msync(MS_SYNC)` of each merged range, since an `fsync` there skips mapped pages: item
+    30.) See [Commit protocol](#commit-protocol) and [Step 4](#step-4-one-msync-or-one-fdatasync).
 11. **The writer trusts its own pages by provenance** (`write::descend_write`): a trusted page skips
     the per-fetch checks, `verify_published` and the separator-range check. `is_private` alone is
     not enough; the rules that close the gap (an untrusted parent naming a private page is
@@ -2248,11 +2265,14 @@ argument and the measurements. Code and other docs cite the items by number, so 
     every entry returned past the landing comes from a leaf checked in full; most seeks never read
     past their landing, and the full check on every seek was a measurable share of the read path.
     See [Readers and snapshots](#readers-and-snapshots).
-30. **On macOS a scattered durable commit's pages are synced by a plain `fsync`,** which on APFS
-    leaves some pages dirtied through the mapping unwritten, so a kernel panic or a forced
-    power-off can leave such a commit `Corrupt`. Writing them by `msync` measured 2.2x on the
-    durable `reth.block` row; production durability is a Linux property. See
-    [Platform notes](#platform-notes).
+30. **On macOS mapped pages are synced by `msync`.** There a scattered commit's pages take an
+    `msync(MS_ASYNC)` then an `msync(MS_SYNC)` of each merged range (`DataSync::Ranges`),
+    `PageFile::fdatasync_all` msyncs the whole mapping before its fsync, and a writer open msyncs
+    its mapping once: an APFS `fsync` leaves some pages dirtied through the mapping unwritten, and
+    only `msync` writes them. Do not flag the msync passes as redundant with an fsync, nor the
+    `MS_ASYNC` pass as redundant with the `MS_SYNC` one (it starts every range's writes at once).
+    Linux keeps the `fdatasync`, which writes them. See [Platform notes](#platform-notes) and
+    [Step 4](#step-4-one-msync-or-one-fdatasync).
 
 ---
 
@@ -2263,7 +2283,7 @@ invariants a change must keep.
 
 | file | contents |
 |---|---|
-| `lib.rs` | crate docs, `compile_error!` off unix, re-exports |
+| `lib.rs` | crate docs, `compile_error!` off Linux and macOS, re-exports |
 | `error.rs` | `Error`, `Result` |
 | `stats.rs` | `IoStats`, the writer's I/O and allocation counters (`Env::io_stats`) |
 | `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
@@ -2375,30 +2395,42 @@ same runs stayed within a few percent of merging off, and the other rows were un
 #### Step 4: one msync or one fdatasync
 
 Step 4 syncs a commit's dirty pages with one call: one `msync` when they merge into one range of
-at most 16 runs, and one `fdatasync` of the file otherwise (do-not-flag item 10). The numbers
-behind the rule:
+at most 16 runs, and one `fdatasync` of the file otherwise (do-not-flag item 10; on macOS the two
+`msync` passes over the merged ranges instead, item 30). The numbers behind the rule:
 
 - **Linux, small commits.** Each `msync(MS_SYNC)` runs the file system's fsync path, drive-cache
   flush included, so syncing range by range paid one flush per range. In the A/B rows of three
   runs, one `fdatasync` beat the per-range msyncs in all 18 cells: median 904–920 → 515–516 us
   at 4K, 703–931 → 532–568 us at 16K, with lower p99s and totals.
-- **macOS, small commits.** One `fdatasync` was about 35% cheaper than the per-range msyncs
-  (75–84 us vs 114–130 us median). Neither is a drive-cache flush on macOS, so this measures only
-  the kernel paths.
-- **macOS, bulk commits.** A 1M-entry load dirties one range. One `fdatasync` of it cost 15–26%
-  more than one `msync` of the range plus the growth sync: sequential commit 34.9 → 43.9 ms,
-  random 87.9 → 106.1 ms at 4K, confirmed by a repeat. So one range keeps the `msync`, which is
-  also a single flush on Linux.
-- **macOS, scattered commits.** An msync writes its range's dirty pages one cluster at a time, so
-  its cost follows the dirty pages, not the span. In the mixed row at 200k entries, a 1000-update
-  commit dirtied about 835 pages at 16K, in about 620 runs, which the 64-page merge gap folded
-  into 2 ranges spanning the file. Their msyncs took about 14.6 ms, and one `fdatasync` 5.3 ms
-  (16.5 vs 3.7 ms at 4K). Syncing the runs one by one, or a smaller merge gap, cost the same as
-  the merged span. So past 16 runs even one range takes the `fdatasync`.
-
-The macOS rows compared `msync` with an `fsync` that on APFS does not write every page dirtied
-through the mapping, so the `fdatasync` side did less work there
-([Platform notes](#platform-notes)).
+- **macOS, small commits** (measured against a skipping `fsync`: last bullet). One `fdatasync`
+  was about 35% cheaper than the per-range msyncs (75–84 us vs 114–130 us median). Neither is a
+  drive-cache flush on macOS, so this measures only the kernel paths.
+- **macOS, bulk commits** (measured against a skipping `fsync`: last bullet). A 1M-entry load
+  dirties one range. One `fdatasync` of it cost 15–26% more than one `msync` of the range plus the
+  growth sync: sequential commit 34.9 → 43.9 ms, random 87.9 → 106.1 ms at 4K, confirmed by a
+  repeat. So one range keeps the `msync`, which is also a single flush on Linux.
+- **macOS, scattered commits** (measured against a skipping `fsync`: last bullet). An msync writes
+  its range's dirty pages one cluster at a time, so its cost follows the dirty pages, not the
+  span. In the mixed row at 200k entries, a 1000-update commit dirtied about 835 pages at 16K, in
+  about 620 runs, which the 64-page merge gap folded into 2 ranges spanning the file. Their msyncs
+  took about 14.6 ms, and one `fdatasync` 5.3 ms (16.5 vs 3.7 ms at 4K). Syncing the runs one by
+  one, or a smaller merge gap, cost the same as the merged span. So past 16 runs even one range
+  takes the `fdatasync` (on macOS, the two `msync` passes).
+- **macOS, scattered commits by `msync` (Apple M1 Max, APFS, 16 KiB OS pages, 2026-11-08).** On
+  APFS an `fsync` leaves some pages dirtied through the mapping unwritten
+  ([Platform notes](#platform-notes)), so the three macOS rows above, and the macOS numbers under
+  "After the change" and "Open" below, priced an `fdatasync` that did less work than a sync. Step
+  4 now takes an `MS_ASYNC`, then an `MS_SYNC`, of each merged range there. On a mature file
+  (random 400-byte rewrites, 4 KiB pages; step 4 median, the skipping `fsync` → the two passes):
+  37 MiB 0.54 → 2.18 ms (300 rewrites) and 16.2 → 4.6 ms (3000); 1 GiB 11.6 → 2.4 and
+  78.7 → 26.2; 4 GiB 13.8 → 3.4 and 122 → 41 ms. One `MS_SYNC` per range alone is about 3x
+  slower (it writes one range at a time), and one `MS_SYNC` of the span grows with the file (a
+  clean 1 GiB mapping's walk alone takes 4–24 ms). The durable `reth.block` row went 3.7 → 8.0 ms
+  a block, and its no-sync twin, whose untimed `Env::sync` between blocks takes the same path,
+  1.7 → 3.3 ms; the other durable rows were level (0.89–1.03). A block's ~793 pages, over 9 tables
+  in ~68 merged ranges of a ~140 MB file, each dirty a whole 16 KiB OS page (~12.5 MiB a block,
+  which the `fsync` mostly skipped), and the write faults on pages a writeback cleaned add
+  ~0.5 ms, a cost Linux pays at every commit.
 
 The Linux numbers are the A/B rows of three runs on a Linux x86_64 laptop (i7-1360P, NVMe, ext4),
 2026-10-20; the macOS ones come from an Apple M1 Max (internal SSD, APFS), 2026-10-20, in targeted

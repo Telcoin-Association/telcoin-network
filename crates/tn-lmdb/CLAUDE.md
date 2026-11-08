@@ -26,7 +26,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 
 | file | role |
 |---|---|
-| `lib.rs` | Crate docs, `compile_error!` off unix, the re-exports (the whole public API). |
+| `lib.rs` | Crate docs, `compile_error!` off unix and on every unix but Linux and macOS (the syncs are verified on those two only: README, Platform notes, "Other Unixes"), the re-exports (the whole public API). |
 | `error.rs` | `Error` (`thiserror`) and `Result`; `Error::latches`, the one list of the errors that latch (the latch, the write cursors' unset arms and the adapter read it). |
 | `env.rs` | `Env`: open and recovery, steps 1–9 (`choose_state` 4–6, `checked_snapshot` 9; README "Open and recovery"), `open_read_only` (README "Read-only open"), the writer hand-off, snapshots (`Snapshot::page_again`, do-not-flag 14; `Snapshot` aligned to 128 bytes, its `Arc` counts on a line of their own), the reader queue (`Published`, `reuse_gate`, `Env::oldest_reader_age`), commit steps 3–6 (`stamp_private`, `make_durable`, `data_sync`), `alloc`, `copy_published_with` (a private source refused; `copy_unpublished`), `io_stats`, the test-only `CrashAt`, the close (`EnvInner::drop`, `Writer::trim_tail`; README "Close"). |
 | `stats.rs` | `IoStats` (public, each counter documented; `since`), `elapsed_ns` and `lap`, the commit steps' clock reads. |
@@ -46,7 +46,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 | `catalog.rs` | `DupOptions` (public; `PACKED_DEFAULT`, `resolved`, `resolve`: `InvalidDupOptions`), `TableRecord` (`RECORD_LEN`; `decode` refuses unknown flags, non-zero reserved bytes, `DupRecord::broken_rule`), `usable` (a record held to this build's limits at every use: `catalog::get`, `Env::check`), the catalog ops. |
 | `check.rs` | `Env::check`: structure plus exact page accounting; `claim_run` (a run read's checks, full CRC included, plus its zero pad); `Checker::walk` (`Leaves::{Plain, DupOuter}`); `Checker::walk_dup` (width, nested trees walked `Plain`, packed sets validated whole, an inline cell in a table that never packs refused (`NOT_NESTED`), totals against the record); `TableCheck`. |
 | `latch.rs` | `Latch` (first cause wins; `fail` vs `fail_damaged`), `UnwindLatch` (a guarded step that ends without a panic of its own calls `disarm`, so an unrelated unwind never latches). |
-| `file.rs` | `PageFile`: the reserved mapping (each page slice made from the raw pointer over its own bytes, never a reference to the whole mapping), `grow` (capped by `EnvOptions::max_growth`, at least `MIN_GROWTH`), `trim_to`, `distrust_tail` (open's inherited tail: cut and regrown at the first growth), the syncs (`msync_range`, `msync_page`, `fdatasync_all`, the size sync), poison; `ReadOnlyFile`; `advise_access` (do-not-flag 16); `MapView` (the readers' and the writer's, updated in place by a remap). |
+| `file.rs` | `PageFile`: the reserved mapping (each page slice made from the raw pointer over its own bytes, never a reference to the whole mapping), `grow` (capped by `EnvOptions::max_growth`, at least `MIN_GROWTH`), `trim_to`, `distrust_tail` (open's inherited tail: cut and regrown at the first growth), the syncs (`msync_range`, `msync_page`, `fdatasync_all`, the size sync; every `msync` goes through `msync_flags`; on macOS `msync_ranges`, and `fdatasync_all`'s msync of the mapping: do-not-flag 30), poison; the test-only `dirty_os_pages` (macOS, `mincore`'s modified pages); `ReadOnlyFile`; `advise_access` (do-not-flag 16); `MapView` (the readers' and the writer's, updated in place by a remap). |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `flock_exclusive` (a writer's open), `flock_shared` (a read-only open's). |
 | `crc.rs` | A copy of `crates/storage/src/archive/crc.rs`; keep the code a copy (its module doc, two `dead_code` allows and `#[inline]` on `crc_is_zero` differ, as the module doc says; a sync keeps all three). |
 | `page_set.rs` | A copy of `crates/storage/src/archive/page_set.rs` plus a touched-word list (`clear` and `drain` cost the words inserts touched); keep the rest a copy. |
@@ -67,10 +67,11 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   (`PageFile::distrust_tail`): never let the writer allocate into it without the cut and regrowth
   at the first growth (which covers the tail only).
 - **Every sync wrapper reports to `disk_model` in tests.** `msync` (`msync_range`, `msync_page`)
-  calls `flushed_range`; `fsync`/`fdatasync` (`fdatasync_all`, the size sync) call `flushed_all`;
-  a truncation (`grow`'s cut, `trim_to`) calls `truncated`, which keeps a later msync past the cut
-  off the model's disk until the next fsync. A sync path that skips the model makes the crash
-  tests lie.
+  calls `flushed_range`; on macOS `msync_ranges` reports through `msync` in its `MS_SYNC` pass,
+  and `msync_flags` for `MS_SYNC` only (an `MS_ASYNC` promises nothing); `fsync`/`fdatasync`
+  (`fdatasync_all`, the size sync) call `flushed_all`; a truncation (`grow`'s cut, `trim_to`)
+  calls `truncated`, which keeps a later msync past the cut off the model's disk until the next
+  fsync. A sync path that skips the model makes the crash tests lie.
 - **Never panic on bytes from disk.** Page accessors bounds-check and return `Corrupt`. A page
   read from the file passes `page::validate` before its first change, which copy-on-write does.
 - **Never rely on zeros from `alloc` or `alloc_run`.** A new page or run keeps its old bytes, so
@@ -164,10 +165,11 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
     `PageFile::trust_tail` (the whole file as this process's growth, undoing `distrust_tail`),
     `PageFile::open_with_max_growth`; `Env::crash` (`EnvInner::crash_on_drop`: drop as a crash
     would).
-  - Reports: `max_save_rounds`, `data_by_file`, `stamped_on`, the allocator's `load_log`, `free_log`
-    and `run_stats`, `PageSet::visited`, `file::take_advice_log` (the advice each mapping got),
-    `sys::take_dir_sync_log` (the directories `fsync_directory` synced); plus test accessors (the
-    `Allocator`'s `freed`, `pool`, `take_freed`, `add_to_pool`).
+  - Reports: `max_save_rounds`, `data_by_file` (on macOS also set by step 4's
+    `DataSync::Ranges`), `stamped_on`, the allocator's `load_log`, `free_log` and `run_stats`,
+    `PageSet::visited`, `PageFile::dirty_os_pages` (macOS), `file::take_advice_log` (the advice
+    each mapping got), `sys::take_dir_sync_log` (the directories `fsync_directory` synced); plus
+    test accessors (the `Allocator`'s `freed`, `pool`, `take_freed`, `add_to_pool`).
   - Hooks: `RwTxn::forget_nested`, `RwTxn::plant_nested` (a working entry no nested cell
     names), `PageWrite::merges_applied` (the `MergeReport` of a delete that merged or refused a
     sibling; `MemStore.merge_report` keeps the last, reset by a test before the delete it reads;
@@ -223,7 +225,7 @@ its `mod tests` or `<module>/tests.rs`. "Neighbours": the tests next to the one 
 | cursor moves, seeks, prefix steps | `tree/cursor/tests.rs` | `run_moves` (`Op`, `Moves::apply`, `apply_owned`, `RwModel`); `a_reset_cursor_moves_as_a_fresh_one`; `seeks_of_every_key_and_gap_match_a_model` and `seeks_from_random_positions_match_a_fresh_seek` (both `_heavy`); by `ROOT_DESCENTS`: `a_seek_near_the_cursor_starts_from_its_leaf` and neighbours; damage: `the_descent_names_the_first_check_a_page_fails`, `a_seek_from_the_leaf_meets_damage_as_a_descent_does`; the narrowed seek check (fixture `a_partly_misrouted_leaf`): `a_seek_lands_in_a_leaf_partly_outside_its_range_and_reading_on_refuses_it` and neighbours; `tree_cursor_stays_small`, `txn_cursor_stays_small` |
 | step 3's parallel stamp | `stamp.rs`, `env/tests.rs` | `crcs_stamp_the_bytes_of_the_serial_loop`, `a_zero_crc_payload_gets_the_serial_loops_sentinel`, `threads_grow_with_the_bytes_to_the_cap`; `a_parallel_stamp_writes_the_serial_stamps_bytes`, `a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes` |
 | free list, reuse timing, accounting, runs | `freelist/tests.rs` | `the_save_writes_the_records_the_reference_writes` (`Allocator::reference_save`), `a_spill_below_the_freed_pages_is_merged_into_them`, `the_page_logs_stay_empty_until_a_test_turns_them_on`, `a_run_on_a_scattered_free_list_costs_what_it_loads` |
-| open, commit, NoSync, latch, growth, close | `env/tests.rs` (helpers `pub(crate)`), `file.rs` | `max_growth_under_the_minimum_is_refused_at_open`, `a_growth_cap_bounds_the_tail_past_the_pages`, `growth_steps_stop_doubling_at_the_cap`; the trim: `a_clean_close_trims_the_file_to_its_pages` and neighbours, `a_failed_final_sync_skips_the_trim`; the inherited tail: `an_inherited_tail_is_cut_and_regrown_with_real_blocks`, and its crash matrix in `tests/crash_runs.rs`; `a_flip_the_page_crc_covers_fails_open_and_check`; `a_version_4_file_is_refused_at_open`; `oldest_reader_age_follows_the_oldest_superseded_reader`; table roots: `a_snapshot_resolves_each_handle_once` and neighbours; `every_mapping_follows_the_readahead_option`, `every_mapping_carries_the_random_read_flag_on_linux` |
+| open, commit, NoSync, latch, growth, close | `env/tests.rs` (helpers `pub(crate)`), `file.rs` | `max_growth_under_the_minimum_is_refused_at_open`, `a_growth_cap_bounds_the_tail_past_the_pages`, `growth_steps_stop_doubling_at_the_cap`; the trim: `a_clean_close_trims_the_file_to_its_pages` and neighbours, `a_failed_final_sync_skips_the_trim`; the inherited tail: `an_inherited_tail_is_cut_and_regrown_with_real_blocks`, and its crash matrix in `tests/crash_runs.rs`; `a_flip_the_page_crc_covers_fails_open_and_check`; `a_version_4_file_is_refused_at_open`; `oldest_reader_age_follows_the_oldest_superseded_reader`; table roots: `a_snapshot_resolves_each_handle_once` and neighbours; `every_mapping_follows_the_readahead_option`, `every_mapping_carries_the_random_read_flag_on_linux`; macOS's msyncs: `scattered_pages_msync_their_merged_ranges`, and on macOS by `dirty_os_pages`: `a_scattered_durable_commit_leaves_no_page_dirty`, `a_writer_open_writes_the_pages_another_mapping_left_dirty`, `fdatasync_all_writes_every_page_dirtied_through_the_mapping` |
 | the I/O counters (`Env::io_stats`) | `env/io_stats_tests.rs`, `stats.rs` | commits, copies and checks, NoSync and `Env::sync`, the gate's lag, runs by policy step (`RunStats`), a read-only open; `IoStats::since` |
 | whole engine: crashes, damage, the multi-table model, concurrency, path cache, append | `tests/{crash,damage,multi_model,concurrency,path_cache,append}.rs` | `every_crash_point_recovers_the_state_the_protocol_allows` (the template, below); `damage.rs`'s `sweep`; `slot_rewrites_over_sorted_keys_delete_in_the_cached_leaf`; `hinted_writes_leave_the_bytes_of_unhinted_ones` (`_heavy`) |
 | overflow runs in the whole engine | `tests/crash_runs.rs`, `tests/damage_runs.rs` | `crash.rs`'s `matrix` on another `Base` (`runs_base`), and on the same commit cutting the inherited tail (`cutting_base`: `every_crash_point_of_a_commit_that_cuts_the_inherited_tail_recovers`, `_heavy`); `damage.rs`'s `sweep` on runs; `a_cursor_delete_reads_the_key_alone` |
@@ -252,9 +254,10 @@ its `mod tests` or `<module>/tests.rs`. "Neighbours": the tests next to the one 
    `CrashAt` names a point of the commit protocol: `BeforeSave`, `AfterSave`, `AfterStamp`,
    `AfterDataSync`, `AfterSizeSync`, `AfterMetaCopy`, `AfterMetaMsync`. The commit stops there with
    an error, as a process death would: no further I/O, and the environment latches. Step 4 takes
-   one `msync` or one `fdatasync` (`data_sync`); to run a crash point on the path a commit would
-   not take, set `data_by_msync` on the writer (as `tests/crash.rs`'s `run_case` does; it gets
-   the `fdatasync` path from a crash commit whose pages form several ranges) or
+   one `msync` or one `fdatasync` (`data_sync`; on macOS the `msync`s of `DataSync::Ranges` in
+   place of the `fdatasync`); to run a crash point on the path a commit would not take, set
+   `data_by_msync` on the writer (as `tests/crash.rs`'s `run_case` does; it gets the `fdatasync`
+   path, on macOS the `Ranges` one, from a crash commit whose pages form several ranges) or
    `data_by_fdatasync`.
 3. **Drop the environment as a crash would.** Call `env.crash()`, which skips the close: the
    NoSync final sync and the trim of the preallocated tail (hold no other handle or transaction).
