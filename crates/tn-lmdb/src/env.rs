@@ -1158,7 +1158,10 @@ where
 ///
 /// Either way the data is durable before the meta is written. `fdatasync` also writes any other
 /// dirty page of the file, which at a commit can only be a page of an aborted transaction: a free
-/// page, so writing it is harmless.
+/// page, so writing it is harmless. On macOS the `fdatasync` is a plain `fsync`, which leaves some
+/// pages dirtied through the mapping unwritten, so there a scattered commit is not durable against
+/// a kernel crash, and the macOS costs above measured that lesser work (README, Platform notes;
+/// do-not-flag item 30).
 fn data_sync(pages: &[u32], page_size: u64) -> DataSync {
     let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else {
         return DataSync::Nothing;

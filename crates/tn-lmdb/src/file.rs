@@ -54,7 +54,8 @@
 //! persist a size extension, so a growth marks the size unsynced and
 //! [`PageFile::sync_size_if_grown`] fdatasyncs it once. [`PageFile::fdatasync_all`] writes every
 //! dirty page of the mapping and the size in one call, so after it the size sync has nothing left
-//! to do. Any failed sync or growth poisons the file:
+//! to do (on Linux; on macOS its plain `fsync` leaves some mapped pages unwritten: README,
+//! Platform notes). Any failed sync or growth poisons the file:
 //! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
 //! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
 //! continue.
@@ -546,7 +547,8 @@ impl PageFile {
     }
 
     /// `fdatasync` the whole file, which makes every page written through the mapping durable and
-    /// its size too. A failure poisons the file.
+    /// its size too (on Linux; on macOS not every page: README, Platform notes). A failure poisons
+    /// the file.
     pub(crate) fn fdatasync_all(&self) -> Result<()> {
         self.check_poison()?;
         self.fdatasync().inspect_err(|_| self.poison())?;

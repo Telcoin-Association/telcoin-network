@@ -7,9 +7,12 @@
 //! sync here is a plain `fsync` too ([`fsync_file`], [`fdatasync_file`]): std's
 //! `File::sync_all`/`sync_data` would issue `F_FULLFSYNC`, costing 10–20 ms each and stalling
 //! every other write on the drive, for a guarantee the commits never give. A crash of the process
-//! or the kernel loses nothing committed durably; a power loss can lose what the drive's write
-//! cache held. On Linux these are exactly `File::sync_all`/`sync_data` (`fsync`/`fdatasync`,
-//! which do flush the drive's cache).
+//! loses nothing committed durably. A kernel crash or a forced power-off can: a plain `fsync`
+//! there leaves some pages dirtied through a shared mapping unwritten (only `msync` writes them),
+//! and step 4 syncs a scattered commit's pages by one (README, Platform notes; do-not-flag item
+//! 30). A power loss can also lose what the drive's write cache held. On Linux these are exactly
+//! `File::sync_all`/`sync_data` (`fsync`/`fdatasync`, which do flush the drive's cache and write
+//! every dirty page of the file).
 //!
 //! In tests every successful sync reports to the disk model (`disk_model`).
 
