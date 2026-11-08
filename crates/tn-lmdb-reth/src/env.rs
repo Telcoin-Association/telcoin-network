@@ -130,6 +130,17 @@ pub struct TnLmdbArgs {
     pub max_growth: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
+    /// [`SyncMode::NoSync`]: a commit commits durably once at least this long has passed since the
+    /// last durable state (default `None`: never by time): the engine's `EnvOptions::sync_period`,
+    /// checked at each commit. A crash then loses only commits made less than this after the last
+    /// durable state. Ignored in [`SyncMode::Durable`] and by a read-only open.
+    pub sync_period: Option<Duration>,
+    /// [`SyncMode::NoSync`]: a commit commits durably once the pages stamped since the last
+    /// durable state, its own included, hold at least this many bytes (default `None`: never by
+    /// size): the engine's `EnvOptions::sync_bytes`. It bounds what a crash loses and how long
+    /// freed pages wait, so how far the file grows past its live pages. Ignored in
+    /// [`SyncMode::Durable`] and by a read-only open.
+    pub sync_bytes: Option<u64>,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
@@ -157,6 +168,8 @@ impl Default for TnLmdbArgs {
             map_reserve: engine.map_reserve,
             max_growth: engine.max_growth,
             sync: SyncMode::Durable,
+            sync_period: engine.sync_period,
+            sync_bytes: engine.sync_bytes,
             #[cfg(test)]
             nested_dup: true,
             #[cfg(test)]
@@ -175,6 +188,20 @@ impl TnLmdbArgs {
     /// Set when commits become durable.
     pub const fn with_sync_mode(mut self, sync: SyncMode) -> Self {
         self.sync = sync;
+        self
+    }
+
+    /// Set [`Self::sync_period`], the time after the last durable state past which a
+    /// [`SyncMode::NoSync`] commit commits durably (`None`: never by time).
+    pub const fn with_sync_period(mut self, sync_period: Option<Duration>) -> Self {
+        self.sync_period = sync_period;
+        self
+    }
+
+    /// Set [`Self::sync_bytes`], the bytes of pages stamped since the last durable state past
+    /// which a [`SyncMode::NoSync`] commit commits durably (`None`: never by size).
+    pub const fn with_sync_bytes(mut self, sync_bytes: Option<u64>) -> Self {
+        self.sync_bytes = sync_bytes;
         self
     }
 
@@ -234,6 +261,8 @@ impl TnLmdbArgs {
             map_reserve: self.map_reserve,
             sync: self.sync,
             max_growth: self.max_growth,
+            sync_period: self.sync_period,
+            sync_bytes: self.sync_bytes,
             ..EnvOptions::default()
         }
     }
@@ -507,12 +536,12 @@ impl TnLmdbEnv {
     }
 
     /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
-    /// durable only at the next sync (or when the environment drops, which syncs unless it
-    /// latched). A no-op when nothing is pending, in [`SyncMode::Durable`] and in a read-only
-    /// environment, unless the environment is latched: then it fails in every mode. Waits while
-    /// a write transaction is open. A failure is
-    /// [`DatabaseError::Commit`] and latches the environment: later writes and commits fail
-    /// until it is reopened.
+    /// durable only at the next sync (this, the environment's drop, which syncs unless it latched,
+    /// or a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`]). A no-op when
+    /// nothing is pending, in [`SyncMode::Durable`] and in a read-only environment, unless the
+    /// environment is latched: then it fails in every mode. Waits while a write transaction is
+    /// open. A failure is [`DatabaseError::Commit`] and latches the environment: later writes
+    /// and commits fail until it is reopened.
     pub fn sync(&self) -> Result<(), DatabaseError> {
         self.env.sync().map_err(|e| DatabaseError::Commit(error::info(&e)))
     }

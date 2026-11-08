@@ -317,10 +317,6 @@ mod tn_lmdb {
                 },
             ),
             (
-                "--db.sync-mode safe-no-sync",
-                DatabaseArgs { sync_mode: Some(MdbxSyncMode::SafeNoSync), ..Default::default() },
-            ),
-            (
                 "the UtterlyNoSync sync mode",
                 DatabaseArgs { sync_mode: Some(MdbxSyncMode::UtterlyNoSync), ..Default::default() },
             ),
@@ -346,16 +342,15 @@ mod tn_lmdb {
             .collect();
         assert!(accepted.is_empty(), "unsupported flags accepted: {accepted:?}");
 
-        // The no-sync refusals also say why, and what to use instead.
-        for mode in [MdbxSyncMode::SafeNoSync, MdbxSyncMode::UtterlyNoSync] {
-            let msg = tn_lmdb_args(&DatabaseArgs { sync_mode: Some(mode), ..Default::default() })
-                .expect_err("a no-sync mode is refused")
-                .to_string();
-            assert!(
-                msg.contains("only after a sync") && msg.contains("use --db.sync-mode durable"),
-                "the {mode:?} refusal says why: {msg}"
-            );
-        }
+        // The UtterlyNoSync refusal also says why, and what to use instead.
+        let utterly =
+            DatabaseArgs { sync_mode: Some(MdbxSyncMode::UtterlyNoSync), ..Default::default() };
+        let msg = tn_lmdb_args(&utterly).expect_err("UtterlyNoSync is refused").to_string();
+        assert!(
+            msg.contains("no mode that never syncs")
+                && msg.contains("use --db.sync-mode safe-no-sync or durable"),
+            "the UtterlyNoSync refusal says why: {msg}"
+        );
     }
 
     /// The flags tn-lmdb honours map onto the adapter's settings; unset flags keep its defaults.
@@ -378,6 +373,14 @@ mod tn_lmdb {
                 "--db.sync-mode durable",
                 DatabaseArgs { sync_mode: Some(MdbxSyncMode::Durable), ..Default::default() },
                 default.with_sync_mode(SyncMode::Durable),
+            ),
+            (
+                "--db.sync-mode safe-no-sync",
+                DatabaseArgs { sync_mode: Some(MdbxSyncMode::SafeNoSync), ..Default::default() },
+                default
+                    .with_sync_mode(SyncMode::NoSync)
+                    .with_sync_period(Some(SAFE_NO_SYNC_PERIOD))
+                    .with_sync_bytes(Some(SAFE_NO_SYNC_BYTES)),
             ),
             (
                 "--db.growth-step",
@@ -412,6 +415,35 @@ mod tn_lmdb {
             err.to_string().contains("--db.growth-step") && err.to_string().contains("minimum"),
             "names the flag and the minimum: {err}"
         );
+    }
+
+    /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
+    #[test]
+    fn safe_no_sync_syncs_every_second_or_64_mib() {
+        assert_eq!(SAFE_NO_SYNC_PERIOD, Duration::from_secs(1));
+        assert_eq!(SAFE_NO_SYNC_BYTES, 64 << 20);
+    }
+
+    /// `--db.sync-mode safe-no-sync` opens the database in the engine's `NoSync`: its commits
+    /// make no state durable but by an automatic sync (`auto_syncs`), and the clean close makes
+    /// the rest durable, so a reopen reads every row.
+    #[test]
+    fn open_rw_with_safe_no_sync_defers_commits_to_the_automatic_syncs_and_the_close() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let config =
+            config(DatabaseArgs { sync_mode: Some(MdbxSyncMode::SafeNoSync), ..test_db_args() });
+        let db = open_rw(&config, &path).expect("safe-no-sync opens");
+        db.update(|tx| tx.put::<tables::CanonicalHeaders>(7, B256::with_last_byte(7)))
+            .expect("tx")
+            .expect("put");
+        let s = db.io_stats();
+        assert!(s.nosync_commits + s.auto_syncs > 0, "{s:?}");
+        assert_eq!(s.commits, s.auto_syncs, "only automatic syncs made a state durable: {s:?}");
+        drop(db);
+        let db = open_rw(&config, &path).expect("reopen");
+        let row = db.tx().expect("tx").get::<tables::CanonicalHeaders>(7).expect("get");
+        assert_eq!(row, Some(B256::with_last_byte(7)), "the close made the commit durable");
     }
 
     /// A refused flag fails the open before anything is created.

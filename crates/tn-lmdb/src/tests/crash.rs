@@ -1,11 +1,12 @@
-//! The crash matrix: a commit (or, in `SyncMode::NoSync`, a sync) stopped at each point of the
-//! commit protocol, then a process crash, a strict power loss or a random-writeback power loss,
+//! The crash matrix: a commit (or, in `SyncMode::NoSync`, a sync; or a `NoSync` commit past
+//! `EnvOptions::sync_period`, which syncs itself) stopped at each point of the commit protocol,
+//! then a process crash, a strict power loss or a random-writeback power loss,
 //! must reopen to exactly the state the protocol allows — the last durable state `L` until the
 //! new meta is written, the new state `M` once its msync completed, and in between `M` exactly
 //! when the slot holds `M`'s intact record — pass `Env::check`, and reopen to the same state again
 //! after a crash right after that reopen.
 
-use std::{fs, os::unix::fs::FileExt as _};
+use std::{fs, os::unix::fs::FileExt as _, time::Duration};
 
 use super::{
     damage::tree,
@@ -166,6 +167,40 @@ fn crash_changes(txn: &mut RwTxn, state: &mut State) {
     }
 }
 
+/// How a case's environment commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// `SyncMode::Durable`: the crash commit is durable when it returns.
+    Durable,
+    /// `SyncMode::NoSync`: two unsynced commits and the crash commit defer, and the `Env::sync`
+    /// after them runs the durable steps.
+    NoSync,
+    /// `SyncMode::NoSync` with [`AUTO_PERIOD`] as `EnvOptions::sync_period`: the two unsynced
+    /// commits defer, and the crash commit, made with the writer's clock (`Writer::clock_at`) at
+    /// the period, runs the durable steps itself, over its own pages and theirs.
+    AutoSync,
+}
+
+impl Mode {
+    /// The engine's sync mode.
+    fn sync(self) -> SyncMode {
+        match self {
+            Mode::Durable => SyncMode::Durable,
+            Mode::NoSync | Mode::AutoSync => SyncMode::NoSync,
+        }
+    }
+}
+
+/// [`Mode::AutoSync`]'s `EnvOptions::sync_period`: long enough that only the crash commit, made
+/// with the writer's clock moved to it, reaches it.
+const AUTO_PERIOD: Duration = Duration::from_secs(3600);
+
+/// Open the file at `path` as `mode` commits.
+fn open_in(path: &Path, mode: Mode) -> Env {
+    let sync_period = (mode == Mode::AutoSync).then_some(AUTO_PERIOD);
+    Env::open(path, EnvOptions { sync_period, ..options(mode.sync()) }).expect("open")
+}
+
 /// The crash points of a commit, in protocol order.
 const POINTS: [CrashAt; 7] = [
     CrashAt::BeforeSave,
@@ -177,23 +212,23 @@ const POINTS: [CrashAt; 7] = [
     CrashAt::AfterMetaMsync,
 ];
 
-/// True if `at` stops a commit in `sync` mode (else it stops the following sync).
-fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
-    sync == SyncMode::Durable
+/// True if `at` stops a commit in `mode` (else it stops the following sync).
+fn stops_the_commit(mode: Mode, at: CrashAt) -> bool {
+    mode != Mode::NoSync
         || matches!(at, CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp)
 }
 
-/// Copy the base to a tracked case file, open it in `sync` mode, make the commits (unsynced
+/// Copy the base to a tracked case file, open it as `mode` commits, make the commits (unsynced
 /// ones first in `SyncMode::NoSync`) and stop at `at` (`None`: run to the end, with a sync).
 /// With `by_msync`, step 4 syncs the data by one `msync` (`Writer::data_by_msync`), else by the
 /// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made, the slot
 /// `M`'s meta goes to, how the durable steps synced the data, and what the writer reused and
 /// how it placed its runs. The environment is crashed.
-pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) -> Case {
+pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<CrashAt>) -> Case {
     let path = base.dir.path().join("case");
     fs::copy(&base.path, &path).expect("copy");
     disk_model::track(&path);
-    let env = open(&path, sync);
+    let env = open_in(&path, mode);
     env.with_writer(|w| {
         w.data_by_msync = by_msync;
         w.alloc.log_pages = true;
@@ -204,23 +239,29 @@ pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<C
         }
     });
     let mut latest = base.state.clone();
-    if sync == SyncMode::NoSync {
+    if mode != Mode::Durable {
         for round in 0..2 {
             let mut txn = env.begin_rw().expect("begin");
             (base.unsynced)(&mut txn, &mut latest, round);
             txn.commit().expect("an unsynced commit");
         }
+        assert_eq!(env.io_stats().nosync_commits, 2, "{mode:?}: the unsynced commits deferred");
+    }
+    if mode == Mode::AutoSync {
+        env.with_writer(|w| w.clock_at = Some(w.durable_at + AUTO_PERIOD));
     }
     let slot = env.with_writer(|w| slot_to_write(&w.slots()));
     let mut txn = env.begin_rw().expect("begin");
     (base.crash)(&mut txn, &mut latest);
     let stopped = match at {
-        Some(at) if stops_the_commit(sync, at) => {
+        Some(at) if stops_the_commit(mode, at) => {
             txn.writer_mut().crash_at = Some(at);
             Some(txn.commit().expect_err("the commit stops at the crash point"))
         }
         _ => {
             txn.commit().expect("commit");
+            let auto_syncs = u64::from(mode == Mode::AutoSync);
+            assert_eq!(env.io_stats().auto_syncs, auto_syncs, "{mode:?}: the crash commit");
             env.with_writer(|w| w.crash_at = at);
             env.sync().err()
         }
@@ -271,15 +312,15 @@ pub(super) fn assert_gets(env: &Env, want: &State, case: &str) {
 
 /// One cell of the matrix: stop at `at`, go down by `loss`, and reopen (twice, with a crash and
 /// a strict power loss right after the first reopen) to exactly the state allowed.
-fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Loss) {
-    let case = format!("{sync:?} by_msync={by_msync} {at:?} {loss:?}");
-    let Case { path, latest, slot, .. } = run_case(base, sync, by_msync, Some(at));
+fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) {
+    let case = format!("{mode:?} by_msync={by_msync} {at:?} {loss:?}");
+    let Case { path, latest, slot, .. } = run_case(base, mode, by_msync, Some(at));
     match loss {
         Loss::Process => {}
         Loss::Strict => disk_model::power_loss(&path),
         Loss::Random(seed) => disk_model::power_loss_random(&path, seed),
     }
-    let m_txn = base.txn + if sync == SyncMode::NoSync { 3 } else { 1 };
+    let m_txn = base.txn + if mode == Mode::Durable { 1 } else { 3 };
     // `M` survives exactly when its slot holds its intact record, which must be after step 6
     // completed, may be during it, and must not be before it (a `NoSync` commit never writes it).
     let reaches_m = slot_holds(&path, base.page_size, slot, m_txn);
@@ -296,7 +337,7 @@ fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Lo
     }
     let (want_txn, want) = if reaches_m { (m_txn, &latest) } else { (base.txn, &base.state) };
     for reopen in 0..2 {
-        let env = open(&path, sync);
+        let env = open_in(&path, mode);
         assert_eq!(env.stat().txn_id, want_txn, "{case}: reopen {reopen}");
         assert!(newest_state(&env) == *want, "{case}: reopen {reopen}: the state differs");
         assert_gets(&env, want, &format!("{case}: reopen {reopen}"));
@@ -313,14 +354,14 @@ fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Lo
 /// reused from the free list, a growth of the file exactly when the base says so (a growth's size
 /// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
 /// `msync` alone covers), and the base's `layout`.
-fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
-    let Case { path, latest, by_file, reused, .. } = run_case(base, sync, by_msync, None);
-    assert_eq!(by_file, !by_msync, "{sync:?}: by_msync={by_msync}: synced by fdatasync");
-    assert!(reused > 0, "{sync:?}: pages were reused");
+fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
+    let Case { path, latest, by_file, reused, .. } = run_case(base, mode, by_msync, None);
+    assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
+    assert!(reused > 0, "{mode:?}: pages were reused");
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;
-    assert_eq!(grew, base.grows, "{sync:?}: the file grew");
-    let env = open(&path, sync);
+    assert_eq!(grew, base.grows, "{mode:?}: the file grew");
+    let env = open_in(&path, mode);
     assert_eq!(newest_state(&env), latest);
     (base.layout)(&env);
     drop(env);
@@ -331,15 +372,20 @@ fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
 /// Every crash point of `base`'s crash commit x {process crash, strict power loss, `seeds`
 /// random power losses} x {`Durable`, `NoSync`} x {the `fdatasync` step 4 picks, one `msync`}.
 pub(super) fn matrix(base: &Base, seeds: u64) {
-    for sync in [SyncMode::Durable, SyncMode::NoSync] {
+    matrix_of(base, seeds, &[Mode::Durable, Mode::NoSync]);
+}
+
+/// [`matrix`] in each of `modes`.
+pub(super) fn matrix_of(base: &Base, seeds: u64, modes: &[Mode]) {
+    for &mode in modes {
         for by_msync in [false, true] {
-            dry_run(base, sync, by_msync);
+            dry_run(base, mode, by_msync);
             for (n, at) in POINTS.into_iter().enumerate() {
                 for loss in [Loss::Process, Loss::Strict] {
-                    crash_case(base, sync, by_msync, at, loss);
+                    crash_case(base, mode, by_msync, at, loss);
                 }
                 for seed in 0..seeds {
-                    crash_case(base, sync, by_msync, at, Loss::Random(seed * 64 + n as u64));
+                    crash_case(base, mode, by_msync, at, Loss::Random(seed * 64 + n as u64));
                 }
             }
         }
@@ -363,6 +409,25 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
     }
 }
 
+/// The matrix of a `NoSync` commit past `EnvOptions::sync_period` ([`Mode::AutoSync`]), which
+/// runs the durable steps over its own pages and those of the two commits before it, which
+/// deferred theirs: every crash point recovers by the `Durable` rules, `L` being the last synced
+/// state (the base's) and `M` the crash commit's, under a process crash, a strict power loss and
+/// random power losses.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows() {
+    matrix_of(&base(4096), 3, &[Mode::AutoSync]);
+}
+
+/// The automatic sync's matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_heavy() {
+    for page_size in [4096, 16384] {
+        matrix_of(&base(page_size), 40, &[Mode::AutoSync]);
+    }
+}
+
 /// A commit that grew the file survives a power loss once it returned, by either data sync: the
 /// `fdatasync` makes the new length durable with the data, and after one `msync` the size sync
 /// does, before the meta naming it.
@@ -374,7 +439,7 @@ fn a_commit_that_grew_the_file_survives_a_power_loss() {
 /// [`a_commit_that_grew_the_file_survives_a_power_loss`] on `base`.
 fn grown_commit_survives_a_power_loss(base: &Base) {
     for by_msync in [false, true] {
-        let Case { path, latest, .. } = run_case(base, SyncMode::Durable, by_msync, None);
+        let Case { path, latest, .. } = run_case(base, Mode::Durable, by_msync, None);
         disk_model::power_loss(&path);
         disk_model::untrack(&path);
         let env = open(&path, SyncMode::Durable);
@@ -397,7 +462,7 @@ fn the_older_state_stays_recoverable_until_its_meta_is_overwritten() {
 /// [`the_older_state_stays_recoverable_until_its_meta_is_overwritten`] on `base`.
 fn older_state_stays_recoverable(base: &Base) {
     let Case { path, slot, reused, .. } =
-        run_case(base, SyncMode::Durable, false, Some(CrashAt::AfterSizeSync));
+        run_case(base, Mode::Durable, false, Some(CrashAt::AfterSizeSync));
     assert!(reused > 0, "the commit reused pages");
     disk_model::power_loss(&path);
     disk_model::untrack(&path);

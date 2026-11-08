@@ -22,22 +22,31 @@ use std::time::Instant;
 /// The commit protocol's steps: 1 writes the changed tables' roots into the catalog and saves the
 /// free list, 3 stamps the CRCs, 4 syncs the data pages, 5 syncs the file's size if it grew, 6
 /// writes and syncs the meta. A [`crate::SyncMode::NoSync`] commit runs steps 1 and 3 (and
-/// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`); the [`crate::Env::sync`] that
-/// makes its state durable runs steps 4 to 6.
+/// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`); the sync that makes its state
+/// durable runs steps 4 to 6: an [`crate::Env::sync`], or a later `NoSync` commit past
+/// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`], which runs all seven
+/// steps itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
-    /// States made durable: each run of steps 4 to 6, by a [`crate::SyncMode::Durable`] commit
-    /// or by an [`crate::Env::sync`] that found a [`crate::SyncMode::NoSync`] state to make
-    /// durable (a sync with nothing pending counts nothing).
+    /// States made durable: each run of steps 4 to 6, by a [`crate::SyncMode::Durable`] commit,
+    /// by a [`crate::SyncMode::NoSync`] commit that commits durably ([`Self::auto_syncs`]), or by
+    /// an [`crate::Env::sync`] that found a `NoSync` state to make durable (a sync with nothing
+    /// pending counts nothing).
     pub commits: u64,
-    /// [`crate::SyncMode::NoSync`] commits: steps 1, 3 and 7 only.
+    /// [`crate::SyncMode::NoSync`] commits that deferred their sync: steps 1, 3 and 7 only.
     pub nosync_commits: u64,
+    /// [`crate::SyncMode::NoSync`] commits that committed durably, past
+    /// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`]: steps 1 to 7, over
+    /// their own pages and those of the `NoSync` commits since the last sync. Each also counts in
+    /// [`Self::commits`], never in [`Self::nosync_commits`].
+    pub auto_syncs: u64,
     /// Of [`Self::commits`], those for which the file had grown since the last durable state,
     /// so its size needed a sync too (by step 5, or by step 4's `fdatasync`).
     pub grown_commits: u64,
-    /// Pages step 4 made durable: every page the commits (or, for a sync, the
-    /// [`crate::SyncMode::NoSync`] commits since the last sync) wrote, each overflow run's pages
-    /// included. Pages, not bytes: an OS page larger than the page size makes the writes larger.
+    /// Pages step 4 made durable: every page the commits wrote (for a sync, the
+    /// [`crate::SyncMode::NoSync`] commits since the last sync; for one of [`Self::auto_syncs`],
+    /// those and its own), each overflow run's pages included. Pages, not bytes: an OS page larger
+    /// than the page size makes the writes larger.
     pub pages_synced: u64,
     /// Step 4s done by one `msync` of the one range the dirty pages form.
     pub msync_syncs: u64,
@@ -115,6 +124,7 @@ impl IoStats {
         let IoStats {
             commits,
             nosync_commits,
+            auto_syncs,
             grown_commits,
             pages_synced,
             msync_syncs,
@@ -142,6 +152,7 @@ impl IoStats {
         IoStats {
             commits: d(commits, earlier.commits),
             nosync_commits: d(nosync_commits, earlier.nosync_commits),
+            auto_syncs: d(auto_syncs, earlier.auto_syncs),
             grown_commits: d(grown_commits, earlier.grown_commits),
             pages_synced: d(pages_synced, earlier.pages_synced),
             msync_syncs: d(msync_syncs, earlier.msync_syncs),
@@ -194,6 +205,7 @@ mod tests {
     fn since_subtracts_every_counter_but_the_maximum() {
         let earlier = IoStats {
             commits: 1,
+            auto_syncs: 1,
             pages_synced: 10,
             runs_by_step: [1, 2, 3, 4],
             max_gate_lag: 7,
@@ -201,6 +213,7 @@ mod tests {
         };
         let later = IoStats {
             commits: 3,
+            auto_syncs: 2,
             pages_synced: 25,
             runs_by_step: [2, 2, 5, 9],
             max_gate_lag: 9,
@@ -212,6 +225,7 @@ mod tests {
             d,
             IoStats {
                 commits: 2,
+                auto_syncs: 1,
                 pages_synced: 15,
                 runs_by_step: [1, 0, 2, 5],
                 max_gate_lag: 9,

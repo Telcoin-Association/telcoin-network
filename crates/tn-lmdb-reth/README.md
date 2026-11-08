@@ -40,8 +40,9 @@ tx.commit()?;
 - **`TnLmdbArgs`:** 4 KiB pages by default (any power of two from 4 to 64 KiB, fixed when the file
   is created), the engine's map reserve, the engine's largest growth step (1 GiB;
   `with_max_growth`, at least `MIN_GROWTH`, 1 MiB, the engine's constant re-exported, else the
-  open is `MDBX_EINVAL`), and `SyncMode::Durable` (or `NoSync`, made durable by `TnLmdbEnv::sync`
-  or the drop). A clean drop gives back the file's preallocated tail (the engine's close).
+  open is `MDBX_EINVAL`), and `SyncMode::Durable` (or `NoSync`, made durable by `TnLmdbEnv::sync`,
+  the drop, or a commit past `with_sync_period` or `with_sync_bytes`, the engine's automatic syncs,
+  which bound what a crash loses and how far the file grows; both off by default). A clean drop gives back the file's preallocated tail (the engine's close).
 - **Read cursors are pooled per transaction:** a `TnLmdbTx` keeps the engine cursors its dropped
   cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
   table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new

@@ -931,6 +931,213 @@ fn commits_survive_a_power_loss_once_durable() {
     }
 }
 
+/// Commit `round` of the automatic-sync tests, in table `a`: 300 rows of 150 bytes (about a dozen
+/// leaves), then a rewrite of the first leaf's rows, then of a few rows of another leaf.
+fn auto_sync_round(env: &Env, round: u8) {
+    let rows = match round {
+        0 => 0..300_u32,
+        1 => 0..10,
+        _ => 100..105,
+    };
+    let rows: Vec<([u8; 4], Vec<u8>)> =
+        rows.map(|i| (i.to_be_bytes(), vec![round + 1; 150])).collect();
+    let rows: Vec<(&[u8], &[u8])> = rows.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+    put_all(env, "a", &rows);
+}
+
+/// The value [`auto_sync_round`] leaves under row `i` after `rounds` rounds.
+fn auto_sync_value(i: u32, rounds: u8) -> Vec<u8> {
+    let round = match i {
+        0..10 if rounds > 1 => 1,
+        100..105 if rounds > 2 => 2,
+        _ => 0,
+    };
+    vec![round + 1; 150]
+}
+
+/// Open `path` in `SyncMode::NoSync` with the automatic syncs `sync_period` and `sync_bytes`.
+fn open_auto(path: &Path, sync_period: Option<Duration>, sync_bytes: Option<u64>) -> Env {
+    let options = EnvOptions { sync_period, sync_bytes, ..options(4096, SyncMode::NoSync) };
+    Env::open(path, options).expect("open")
+}
+
+/// The newest txn a meta slot holds: the last durable state.
+fn durable_txn(env: &Env) -> u64 {
+    env.with_writer(|w| durable_txn_of(w))
+}
+
+/// [`durable_txn`] of the writer's state.
+fn durable_txn_of(w: &Writer) -> u64 {
+    w.slots.iter().flatten().copied().max().expect("a valid slot")
+}
+
+/// `NoSync` with `sync_bytes`: the commit whose stamped pages bring the unsynced pages to the bound
+/// commits durably, over its own pages and the deferred commit's (a strict power loss keeps it),
+/// and the count starts again from it, so the next, smaller commit defers; with a bound one byte
+/// higher, the same commit defers.
+#[test]
+fn a_nosync_commit_reaching_sync_bytes_commits_durably() {
+    // The unsynced pages after each round, on a file that never syncs (the rounds allocate the
+    // same pages whatever the bound: nothing freed is reusable before the second sync).
+    let unsynced: Vec<u64> = {
+        let (_dir, path) = temp();
+        let env = open_auto(&path, None, None);
+        (0..3)
+            .map(|round| {
+                auto_sync_round(&env, round);
+                env.with_writer(|w| w.unsynced_pages)
+            })
+            .collect()
+    };
+    assert!(unsynced[2] - unsynced[1] < unsynced[1], "the third round stamps fewer: {unsynced:?}");
+    let reach = unsynced[1] * 4096;
+
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, Some(reach));
+    disk_model::track(&path);
+    auto_sync_round(&env, 0);
+    let deferred = env.io_stats();
+    assert_eq!((deferred.nosync_commits, deferred.auto_syncs, deferred.commits), (1, 0, 0));
+    auto_sync_round(&env, 1);
+    let d = env.io_stats().since(&deferred);
+    assert_eq!((d.nosync_commits, d.auto_syncs, d.commits), (0, 1, 1), "{d:?}");
+    assert_eq!(d.pages_synced, unsynced[1], "both commits' pages: {d:?}");
+    assert_eq!(env.with_writer(|w| (durable_txn_of(w), w.unsynced_pages)), (2, 0));
+    auto_sync_round(&env, 2);
+    let s = env.io_stats();
+    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (2, 1, 1), "{s:?}");
+    env.crash();
+    disk_model::power_loss(&path);
+    disk_model::untrack(&path);
+    let env = open(&path);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(ro.txn_id(), 2, "the commit that reached the bound survives, the next does not");
+    let a = table(&ro, "a");
+    for i in 0..300_u32 {
+        assert_eq!(val(&ro, &a, &i.to_be_bytes()), Some(auto_sync_value(i, 2)), "row {i}");
+    }
+    drop(ro);
+    env.check().expect("check");
+    drop(env);
+
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, Some(reach + 1));
+    disk_model::track(&path);
+    auto_sync_round(&env, 0);
+    auto_sync_round(&env, 1);
+    let s = env.io_stats();
+    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (2, 0, 0), "{s:?}");
+    env.crash();
+    disk_model::power_loss(&path);
+    disk_model::untrack(&path);
+    assert_eq!(open(&path).stat().txn_id, 0, "a byte short of the bound, nothing was synced");
+}
+
+/// `NoSync` with `sync_period`: `Duration::ZERO` makes every commit that changes something
+/// durable. With a period, a commit made one nanosecond short of it after the last durable state
+/// defers and one made at it commits durably (the writer's clock moved by `Writer::clock_at`, so
+/// nothing waits); the period then counts from that commit's durable steps, and from an
+/// `Env::sync`'s, not from the open.
+#[test]
+fn a_nosync_commit_past_sync_period_commits_durably() {
+    let (_dir, path) = temp();
+    let env = open_auto(&path, Some(Duration::ZERO), None);
+    for i in 1..=3_u8 {
+        put_all(&env, "a", &[(b"k", &[i])]);
+        assert_eq!(durable_txn(&env), u64::from(i));
+    }
+    env.begin_rw().expect("begin").commit().expect("a commit of no change");
+    let s = env.io_stats();
+    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (0, 3, 3), "{s:?}");
+    drop(env);
+
+    let period = Duration::from_secs(3600);
+    let (_dir, path) = temp();
+    let env = open_auto(&path, Some(period), None);
+    let due = |env: &Env| env.with_writer(|w| w.durable_at + period);
+    let set_clock = |env: &Env, at: Instant| env.with_writer(|w| w.clock_at = Some(at));
+    let opened = due(&env);
+    set_clock(&env, opened - Duration::from_nanos(1));
+    put_all(&env, "a", &[(b"k", b"1")]);
+    assert_eq!(durable_txn(&env), 0, "short of the period since the open");
+    set_clock(&env, opened);
+    put_all(&env, "a", &[(b"k", b"2")]);
+    assert_eq!(durable_txn(&env), 2, "the period since the open");
+    put_all(&env, "a", &[(b"k", b"3")]);
+    assert_eq!(durable_txn(&env), 2, "short of the period since commit 2");
+    set_clock(&env, due(&env));
+    put_all(&env, "a", &[(b"k", b"4")]);
+    assert_eq!(durable_txn(&env), 4, "the period since commit 2");
+    let after_4 = due(&env);
+    set_clock(&env, after_4 - Duration::from_nanos(1));
+    put_all(&env, "a", &[(b"k", b"5")]);
+    env.sync().expect("sync");
+    set_clock(&env, after_4);
+    put_all(&env, "a", &[(b"k", b"6")]);
+    assert_eq!(durable_txn(&env), 5, "short of the period since the sync");
+    let s = env.io_stats();
+    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (4, 2, 3), "{s:?}");
+}
+
+/// A `NoSync` churn of rewrites, each freeing the pages it copies: with `sync_bytes` the file's
+/// pages stay within the live pages plus what two sync intervals and the commit that frees a
+/// page can hold (a page freed by txn N is reused once two syncs at txns from N on have moved
+/// both slots; each interval stamps less than the bound plus its syncing commit), while with no
+/// automatic sync nothing is reused and every commit grows them. The file's length follows its
+/// pages by the growth policy.
+#[test]
+fn nosync_churn_with_sync_bytes_keeps_the_file_bounded() {
+    const ROWS: u32 = 2000;
+    const ROUNDS: u32 = 200;
+    let bound_pages = 100_u64;
+    let churn = |env: &Env, round: u32| {
+        let rows: Vec<([u8; 4], Vec<u8>)> = (0..20)
+            .map(|j| ((round * 20 + j) * 97 % ROWS).to_be_bytes())
+            .map(|k| (k, vec![round as u8; 100]))
+            .collect();
+        let rows: Vec<(&[u8], &[u8])> = rows.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+        put_all(env, "a", &rows);
+    };
+    let load = |env: &Env| {
+        let rows: Vec<([u8; 4], Vec<u8>)> =
+            (0..ROWS).map(|i| (i.to_be_bytes(), vec![0; 100])).collect();
+        let rows: Vec<(&[u8], &[u8])> = rows.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+        put_all(env, "a", &rows);
+    };
+
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, Some(bound_pages * 4096));
+    load(&env);
+    let (mut live, mut most_allocated) = (0, 0);
+    for round in 0..ROUNDS {
+        let before = env.io_stats();
+        churn(&env, round);
+        let d = env.io_stats().since(&before);
+        most_allocated = most_allocated.max(d.pages_from_pool + d.pages_from_end);
+        let r = env.check().expect("check");
+        live = live.max(u64::from(r.page_count) - r.free_pages);
+    }
+    let s = env.io_stats();
+    let bound = live + 2 * bound_pages + 3 * most_allocated;
+    let bounded = u64::from(env.stat().page_count);
+    assert!(bounded <= bound, "{bounded} pages, past {bound}: {s:?}");
+    assert!(s.auto_syncs > 1 && s.pages_from_pool > 0, "freed pages came back: {s:?}");
+    drop(env);
+
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, None);
+    load(&env);
+    let loaded = env.stat().page_count;
+    for round in 0..ROUNDS {
+        churn(&env, round);
+    }
+    let unbounded = u64::from(env.stat().page_count);
+    let s = env.io_stats();
+    assert_eq!((s.auto_syncs, s.pages_from_pool), (0, 0), "{s:?}");
+    assert!(unbounded >= u64::from(loaded) + u64::from(ROUNDS), "every commit grew the file");
+    assert!(unbounded > bound, "{unbounded} pages, within the bounded run's {bound}");
+}
+
 /// A commit whose pages are scattered over the file (copies taking pages that earlier commits
 /// freed all over it), so they form more than one range, syncs its data with one `fdatasync` of
 /// the file (on macOS by the `msync`s of each merged range), and survives a power loss.

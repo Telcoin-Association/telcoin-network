@@ -2589,7 +2589,8 @@ impl Work {
     /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog
     /// (a dup table's record refused as [`Error::Corrupt`] if its totals break a record rule:
     /// [`Self::set_dup_record`]), the free list's save, the new meta, the pages' CRCs, the durable
-    /// steps (or their deferral), and publication. The writer then begins the next txn, so a
+    /// steps (or, in `SyncMode::NoSync`, their deferral, unless the commit is past a bound of
+    /// `Writer::sync_due`), and publication. The writer then begins the next txn, so a
     /// txn of `u64::MAX` (its base meta's id is one only a crafted meta has) is
     /// [`Error::Corrupt`] before anything is written.
     fn commit(&mut self, inner: &EnvInner) -> Result<u64> {
@@ -2645,6 +2646,7 @@ impl Work {
         writer.crash_point(CrashAt::AfterStamp)?;
         match inner.sync_mode {
             SyncMode::Durable => writer.make_durable(&pages, &meta)?,
+            SyncMode::NoSync if writer.sync_due(pages.len()) => writer.sync_with(&pages, &meta)?,
             SyncMode::NoSync => writer.defer_sync(&pages),
         }
         writer.publish(inner, meta);
@@ -3053,7 +3055,8 @@ impl RwTxn {
     }
 
     /// Commit: make this transaction's state the newest (durable when this returns in
-    /// `SyncMode::Durable`; at the next sync in `SyncMode::NoSync`) and return its txn id. A
+    /// `SyncMode::Durable`; in `SyncMode::NoSync` at the next sync, which is this commit when it
+    /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes`) and return its txn id. A
     /// transaction that changed nothing returns the id of the state it began from, with no
     /// I/O. An error latches the environment, and whether the commit survives is unknown until
     /// the file is reopened.

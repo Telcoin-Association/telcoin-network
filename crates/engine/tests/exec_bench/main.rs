@@ -92,7 +92,8 @@
 //!   `t0 + i * PACE_MS`, and the report counts the outputs that started late.
 //! - `TN_EXEC_BENCH_METRICS` (`off`): `off`, or `prom` for a `--metrics` node's recorder.
 //! - `TN_EXEC_BENCH_SYNC` (`durable`): `durable` (`--db.sync-mode durable`) or `nosync`
-//!   (`--db.sync-mode safe-no-sync`, MDBX only: the tn-lmdb build refuses that flag).
+//!   (`--db.sync-mode safe-no-sync`: on tn-lmdb the engine's `NoSync` with automatic syncs, each
+//!   second or 64 MiB, `tn_reth`'s `tn_lmdb_args`).
 //! - `TN_EXEC_BENCH_PAGE_SIZE` (the backend's default, [`default_page_size`]: MDBX the OS page
 //!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tn-lmdb 4096): the database page size in
 //!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
@@ -259,7 +260,7 @@ use tn_reth::{
     snapshot::PinnedStateView,
     test_utils::load::{
         announce_temp_dir,
-        base::{base_dir_name, BACKEND, META_FILE, TN_LMDB_BACKEND},
+        base::{base_dir_name, BACKEND, META_FILE},
         build_base, clone_datadir, db_counters, db_file_bytes, db_page_size, dir_bytes,
         open_production_env_with_db, poll_addresses,
         readers::{KindSamples, PollSamples, POLL_INTERVAL},
@@ -625,7 +626,7 @@ const AGING_CHUNK: usize = 50;
 enum SyncMode {
     /// `--db.sync-mode durable`.
     Durable,
-    /// `--db.sync-mode safe-no-sync` (MDBX only).
+    /// `--db.sync-mode safe-no-sync`.
     NoSync,
 }
 
@@ -704,8 +705,8 @@ struct Knobs {
 }
 
 impl Knobs {
-    /// The knobs from this process's environment, for the database backend `backend`.
-    fn from_env(backend: &str) -> eyre::Result<Self> {
+    /// The knobs from this process's environment.
+    fn from_env() -> eyre::Result<Self> {
         let mut vars = Vec::new();
         for (name, value) in std::env::vars_os() {
             let Some(name) = name.to_str().filter(|name| name.starts_with(KNOB_PREFIX)) else {
@@ -716,17 +717,13 @@ impl Knobs {
                 .map_err(|value| eyre::eyre!("{name} is not valid UTF-8: {value:?}"))?;
             vars.push((name.to_owned(), value));
         }
-        Self::parse(vars, backend)
+        Self::parse(vars)
     }
 
     /// The knobs from the `TN_EXEC_BENCH_*` variables in `vars` (others are ignored), the
-    /// defaults for those absent, for the database backend `backend`. Refuses an unknown knob, a
-    /// malformed value, a `PAGE_SIZE` that is not a power of two from 4096 to 65536,
-    /// `SYNC=nosync` on tn-lmdb, and `EPOCH_EVERY` without `REGISTRY=1`.
-    fn parse(
-        vars: impl IntoIterator<Item = (String, String)>,
-        backend: &str,
-    ) -> eyre::Result<Self> {
+    /// defaults for those absent. Refuses an unknown knob, a malformed value, a `PAGE_SIZE` that
+    /// is not a power of two from 4096 to 65536, and `EPOCH_EVERY` without `REGISTRY=1`.
+    fn parse(vars: impl IntoIterator<Item = (String, String)>) -> eyre::Result<Self> {
         let mut set = BTreeMap::new();
         for (name, value) in vars {
             let Some(knob) = name.strip_prefix(KNOB_PREFIX) else { continue };
@@ -767,11 +764,6 @@ impl Knobs {
         } else {
             SyncMode::NoSync
         };
-        eyre::ensure!(
-            !(sync == SyncMode::NoSync && backend == TN_LMDB_BACKEND),
-            "{KNOB_PREFIX}SYNC=nosync is --db.sync-mode safe-no-sync, which the tn-lmdb build \
-             refuses: run tn-lmdb with SYNC=durable"
-        );
         let page_size = match get("PAGE_SIZE") {
             None => None,
             Some(value) => {
@@ -3291,7 +3283,7 @@ fn host() -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a long bench: run it alone, in release (see the module docs)"]
 async fn exec_bench() -> eyre::Result<()> {
-    let knobs = Knobs::from_env(BACKEND)?;
+    let knobs = Knobs::from_env()?;
     // refuse a report path that cannot be written before the run, not after it
     let report_target = knobs.report.as_deref().map(report_target).transpose()?;
 
@@ -3512,14 +3504,14 @@ mod tests {
 
     /// The defaults.
     fn defaults() -> Knobs {
-        Knobs::parse(Vec::new(), "mdbx").expect("the defaults parse")
+        Knobs::parse(Vec::new()).expect("the defaults parse")
     }
 
     /// With no knob set, every knob takes its documented default; variables without the prefix
     /// are ignored.
     #[test]
     fn test_knobs_default() {
-        let knobs = Knobs::parse(vec![("PATH".to_owned(), "/bin".to_owned())], "mdbx").unwrap();
+        let knobs = Knobs::parse(vec![("PATH".to_owned(), "/bin".to_owned())]).unwrap();
         let expected = Knobs {
             outputs: 300,
             batches: 8,
@@ -3558,13 +3550,12 @@ mod tests {
     #[test]
     fn test_knobs_page_size() {
         for bytes in [4096, 16_384, 65_536] {
-            let knobs = Knobs::parse(vars(&[("PAGE_SIZE", &bytes.to_string())]), "mdbx").unwrap();
+            let knobs = Knobs::parse(vars(&[("PAGE_SIZE", &bytes.to_string())])).unwrap();
             assert_eq!((knobs.page_size, knobs.page_size()), (Some(bytes), bytes));
             assert!(knobs.line().contains(&format!(" page_size={bytes} ")), "{}", knobs.line());
         }
         for value in ["2048", "131072", "12288", "16k", "", "-4096", "0"] {
-            let err =
-                Knobs::parse(vars(&[("PAGE_SIZE", value)]), "tn-lmdb").unwrap_err().to_string();
+            let err = Knobs::parse(vars(&[("PAGE_SIZE", value)])).unwrap_err().to_string();
             let needle = format!(
                 "TN_EXEC_BENCH_PAGE_SIZE={value:?} is not a page size: a power of two from 4096 \
                  to 65536 bytes"
@@ -3584,29 +3575,26 @@ mod tests {
     /// Every knob is read from its variable and shapes the spec, the outputs and the workloads.
     #[test]
     fn test_knobs_set() {
-        let knobs = Knobs::parse(
-            vars(&[
-                ("OUTPUTS", "5"),
-                ("BATCHES", "2"),
-                ("GAS", "3000000"),
-                ("WARMUP", "0"),
-                ("AGING", "0"),
-                ("PREFILL", "10000"),
-                ("SENDERS", "100"),
-                ("POOLS", "4"),
-                ("SEED", "9"),
-                ("REGISTRY", "0"),
-                ("PACE_MS", "250"),
-                ("METRICS", "prom"),
-                ("SYNC", "nosync"),
-                ("READERS", "3"),
-                ("SUBMIT_FRACTION", "0.5"),
-                ("WINDOW", "7"),
-                ("CACHE_DIR", "/some/cache"),
-                ("REPORT", "/some/report.json"),
-            ]),
-            "mdbx",
-        )
+        let knobs = Knobs::parse(vars(&[
+            ("OUTPUTS", "5"),
+            ("BATCHES", "2"),
+            ("GAS", "3000000"),
+            ("WARMUP", "0"),
+            ("AGING", "0"),
+            ("PREFILL", "10000"),
+            ("SENDERS", "100"),
+            ("POOLS", "4"),
+            ("SEED", "9"),
+            ("REGISTRY", "0"),
+            ("PACE_MS", "250"),
+            ("METRICS", "prom"),
+            ("SYNC", "nosync"),
+            ("READERS", "3"),
+            ("SUBMIT_FRACTION", "0.5"),
+            ("WINDOW", "7"),
+            ("CACHE_DIR", "/some/cache"),
+            ("REPORT", "/some/report.json"),
+        ]))
         .unwrap();
         assert_eq!((knobs.outputs, knobs.warmup, knobs.aging), (5, 0, 0));
         assert_eq!(
@@ -3631,68 +3619,61 @@ mod tests {
             knobs.line()
         );
         assert!(knobs.line().ends_with(" report=/some/report.json"), "{}", knobs.line());
-        let edges =
-            Knobs::parse(vars(&[("SUBMIT_FRACTION", "0"), ("WINDOW", "1")]), "mdbx").unwrap();
+        let edges = Knobs::parse(vars(&[("SUBMIT_FRACTION", "0"), ("WINDOW", "1")])).unwrap();
         assert_eq!((edges.submit_fraction, edges.window), (0.0, 1));
-        assert_eq!(
-            Knobs::parse(vars(&[("SUBMIT_FRACTION", "1")]), "mdbx").unwrap().submit_fraction,
-            1.0
-        );
+        assert_eq!(Knobs::parse(vars(&[("SUBMIT_FRACTION", "1")])).unwrap().submit_fraction, 1.0);
     }
 
-    /// A malformed value, an unknown knob and `SYNC=nosync` on tn-lmdb are refused, each by name.
+    /// A malformed value and an unknown knob are refused, each by name.
     #[test]
     fn test_knobs_refused() {
-        let cases: [(&str, &str, &str, &str); 20] = [
-            ("OUTPUTS", "many", "mdbx", "OUTPUTS=\"many\" is not a whole number"),
-            ("OUTPUTS", "0", "mdbx", "OUTPUTS=0 is below 1"),
-            ("BATCHES", "0", "mdbx", "BATCHES=0 is below 1"),
-            ("GAS", "-1", "mdbx", "GAS=\"-1\" is not a whole number"),
-            ("PREFILL", "1e6", "mdbx", "PREFILL=\"1e6\""),
-            ("REGISTRY", "true", "mdbx", "REGISTRY=\"true\" is not one of 1, 0"),
-            ("METRICS", "on", "mdbx", "METRICS=\"on\" is not one of off, prom"),
-            ("SYNC", "fast", "mdbx", "SYNC=\"fast\" is not one of durable, nosync"),
-            ("SYNC", "nosync", "tn-lmdb", "the tn-lmdb build refuses"),
-            ("CACHE_DIR", "", "mdbx", "CACHE_DIR is empty"),
-            ("REPORT", "", "mdbx", "REPORT is empty"),
-            ("READERS", "-1", "mdbx", "READERS=\"-1\" is not a whole number"),
-            ("SUBMIT_FRACTION", "a lot", "mdbx", "SUBMIT_FRACTION=\"a lot\" is not a number"),
-            ("SUBMIT_FRACTION", "1.5", "mdbx", "SUBMIT_FRACTION=\"1.5\" is not between 0 and 1"),
-            ("SUBMIT_FRACTION", "-0.1", "mdbx", "SUBMIT_FRACTION=\"-0.1\" is not between 0 and 1"),
-            ("SUBMIT_FRACTION", "NaN", "mdbx", "SUBMIT_FRACTION=\"NaN\" is not between 0 and 1"),
-            ("WINDOW", "0", "mdbx", "WINDOW=0 is below 1"),
-            ("EPOCH_EVERY", "often", "mdbx", "EPOCH_EVERY=\"often\" is not a whole number"),
-            ("EXPORT", "2", "mdbx", "EXPORT=\"2\" is not one of 0, 1"),
-            ("READER", "1", "mdbx", "unknown knob TN_EXEC_BENCH_READER"),
+        let cases: [(&str, &str, &str); 19] = [
+            ("OUTPUTS", "many", "OUTPUTS=\"many\" is not a whole number"),
+            ("OUTPUTS", "0", "OUTPUTS=0 is below 1"),
+            ("BATCHES", "0", "BATCHES=0 is below 1"),
+            ("GAS", "-1", "GAS=\"-1\" is not a whole number"),
+            ("PREFILL", "1e6", "PREFILL=\"1e6\""),
+            ("REGISTRY", "true", "REGISTRY=\"true\" is not one of 1, 0"),
+            ("METRICS", "on", "METRICS=\"on\" is not one of off, prom"),
+            ("SYNC", "fast", "SYNC=\"fast\" is not one of durable, nosync"),
+            ("CACHE_DIR", "", "CACHE_DIR is empty"),
+            ("REPORT", "", "REPORT is empty"),
+            ("READERS", "-1", "READERS=\"-1\" is not a whole number"),
+            ("SUBMIT_FRACTION", "a lot", "SUBMIT_FRACTION=\"a lot\" is not a number"),
+            ("SUBMIT_FRACTION", "1.5", "SUBMIT_FRACTION=\"1.5\" is not between 0 and 1"),
+            ("SUBMIT_FRACTION", "-0.1", "SUBMIT_FRACTION=\"-0.1\" is not between 0 and 1"),
+            ("SUBMIT_FRACTION", "NaN", "SUBMIT_FRACTION=\"NaN\" is not between 0 and 1"),
+            ("WINDOW", "0", "WINDOW=0 is below 1"),
+            ("EPOCH_EVERY", "often", "EPOCH_EVERY=\"often\" is not a whole number"),
+            ("EXPORT", "2", "EXPORT=\"2\" is not one of 0, 1"),
+            ("READER", "1", "unknown knob TN_EXEC_BENCH_READER"),
         ];
-        for (knob, value, backend, needle) in cases {
-            let err = Knobs::parse(vars(&[(knob, value)]), backend).unwrap_err().to_string();
-            assert!(err.contains(needle), "{knob}={value:?} on {backend}: {err}");
+        for (knob, value, needle) in cases {
+            let err = Knobs::parse(vars(&[(knob, value)])).unwrap_err().to_string();
+            assert!(err.contains(needle), "{knob}={value:?}: {err}");
         }
-        assert_eq!(Knobs::parse(vars(&[("SYNC", "durable")]), "tn-lmdb").unwrap(), defaults());
+        assert_eq!(Knobs::parse(vars(&[("SYNC", "durable")])).unwrap(), defaults());
     }
 
     /// `EPOCH_EVERY` and `EXPORT` are read and shown in the knob line; `EPOCH_EVERY` above 0 needs
     /// the registry.
     #[test]
     fn test_knobs_epoch_every_and_export() {
-        let knobs =
-            Knobs::parse(vars(&[("EPOCH_EVERY", "3"), ("EXPORT", "1")]), "tn-lmdb").unwrap();
+        let knobs = Knobs::parse(vars(&[("EPOCH_EVERY", "3"), ("EXPORT", "1")])).unwrap();
         assert_eq!((knobs.epoch_every, knobs.export), (3, true));
         assert!(
             knobs.line().contains(" window=20 epoch_every=3 export=1 cache_dir="),
             "{}",
             knobs.line()
         );
-        let err = Knobs::parse(vars(&[("EPOCH_EVERY", "2"), ("REGISTRY", "0")]), "mdbx")
-            .unwrap_err()
-            .to_string();
+        let err =
+            Knobs::parse(vars(&[("EPOCH_EVERY", "2"), ("REGISTRY", "0")])).unwrap_err().to_string();
         let needle = "EPOCH_EVERY=2 closes epochs through the ConsensusRegistry: it needs \
                       TN_EXEC_BENCH_REGISTRY=1";
         assert!(err.contains(needle), "{err}");
-        let plain = Knobs::parse(vars(&[("EPOCH_EVERY", "0"), ("REGISTRY", "0")]), "mdbx").unwrap();
+        let plain = Knobs::parse(vars(&[("EPOCH_EVERY", "0"), ("REGISTRY", "0")])).unwrap();
         assert_eq!((plain.epoch_every, plain.registry), (0, false));
-        assert_eq!(Knobs::parse(vars(&[("EXPORT", "0")]), "mdbx").unwrap(), defaults());
+        assert_eq!(Knobs::parse(vars(&[("EXPORT", "0")])).unwrap(), defaults());
     }
 
     /// The segments hold every timed output once, and each closes on its `EPOCH_EVERY`-th output

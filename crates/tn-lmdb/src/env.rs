@@ -29,7 +29,8 @@
 //! process crash keeps it in the page cache, which a reopen reads; a power loss, only if it
 //! reached the disk), else the previous one (README, Commit protocol). In [`SyncMode::NoSync`] a
 //! commit only stamps and publishes in memory; [`Env::sync`] (or the environment's drop) runs the
-//! durable steps for the newest state.
+//! durable steps for the newest state, and so does a commit past [`EnvOptions::sync_period`] or
+//! [`EnvOptions::sync_bytes`] for its own ([`Writer::sync_due`]), as a durable commit does.
 //!
 //! ## Readers
 //!
@@ -129,11 +130,15 @@ pub enum SyncMode {
     /// A commit is durable when it returns: its pages, then its meta page, are synced.
     #[default]
     Durable,
-    /// A commit is visible in this process at once, and durable at the next [`Env::sync`] (or
-    /// at the close, which runs in the drop of the environment's last handle, on that thread: a
-    /// reader's or cursor's drop can be the one that syncs, and a handle alive when the process
-    /// exits skips it). A crash, even of the process alone, rolls back to the last sync; the file
-    /// stays consistent, since the durable state's pages are never overwritten.
+    /// A commit is visible in this process at once, and durable at the next sync: an
+    /// [`Env::sync`], the close (which runs in the drop of the environment's last handle, on that
+    /// thread: a reader's or cursor's drop can be the one that syncs, and a handle alive when the
+    /// process exits skips it), or a commit past [`EnvOptions::sync_period`] or
+    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does. A
+    /// crash, even of the process alone, rolls back to the last sync: an [`Env::sync`], the
+    /// close, or a commit past `sync_period` or `sync_bytes`. The file stays consistent, since
+    /// the durable state's pages are never overwritten. Pages freed meanwhile wait for the syncs
+    /// (README, Free list and page reuse), so without either bound the file grows until a sync.
     NoSync,
 }
 
@@ -170,6 +175,20 @@ pub struct EnvOptions {
     /// preallocated tail past the pages in use while the environment runs; a clean close gives
     /// that tail back.
     pub max_growth: u64,
+    /// [`SyncMode::NoSync`]: a commit that changes something commits durably once at least this
+    /// long has passed since the last durable state (the open, or the last run of the durable
+    /// steps: a durable commit, an [`Env::sync`]) (default `None`: never by time). Checked at each
+    /// commit, so no thread or timer syncs: commits that then stop wait for the next commit, an
+    /// [`Env::sync`] or the close. A crash then loses only commits made less than this after the
+    /// last durable state, and freed pages come back within about two periods. Ignored in
+    /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
+    pub sync_period: Option<Duration>,
+    /// [`SyncMode::NoSync`]: a commit that changes something commits durably once the pages
+    /// stamped since the last durable state, its own included, hold at least this many bytes
+    /// (pages times the page size) (default `None`: never by size). A crash then loses less than
+    /// this many bytes of pages, and freed pages come back within about twice this. Ignored in
+    /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
+    pub sync_bytes: Option<u64>,
 }
 
 impl Default for EnvOptions {
@@ -180,6 +199,8 @@ impl Default for EnvOptions {
             sync: SyncMode::Durable,
             readahead: !cfg!(target_os = "linux"),
             max_growth: MAX_GROWTH,
+            sync_period: None,
+            sync_bytes: None,
         }
     }
 }
@@ -494,6 +515,16 @@ pub(crate) struct Writer {
     slots: [Option<u64>; 2],
     /// [`SyncMode::NoSync`]: the pages commits stamped since the last sync.
     unsynced: PageSet,
+    /// The pages [`Self::unsynced`] holds: each commit's stamped pages counted as it defers them,
+    /// distinct from those already there, because a page a `NoSync` commit stamped is reused only
+    /// once a sync has moved the slots past the txn that frees it.
+    unsynced_pages: u64,
+    /// [`SyncMode::NoSync`]'s automatic syncs ([`Self::sync_due`]): `None` in
+    /// [`SyncMode::Durable`] and when neither bound is set, so a commit then tests one field.
+    auto_sync: Option<AutoSync>,
+    /// When the last durable state became durable: the open, then the end of each run of the
+    /// durable steps ([`Self::make_durable`], which takes it from its last clock read).
+    pub(crate) durable_at: Instant,
     /// The snapshots published, oldest first (see [`Self::oldest_reader_txn`]).
     readers: VecDeque<Published>,
     /// The queue's length after its last full pass (see [`Self::prune_readers`]).
@@ -563,6 +594,30 @@ pub(crate) struct Writer {
     /// loop).
     #[cfg(test)]
     pub(crate) stamped_on: usize,
+    /// Test-only: the time [`Self::sync_due`]'s period check reads in place of the clock, so a
+    /// test reaches `EnvOptions::sync_period` without waiting for it.
+    #[cfg(test)]
+    pub(crate) clock_at: Option<Instant>,
+}
+
+/// [`SyncMode::NoSync`]'s bounds on the commits a sync waits for: [`EnvOptions::sync_period`] and
+/// [`EnvOptions::sync_bytes`], at least one of them set.
+#[derive(Clone, Copy, Debug)]
+struct AutoSync {
+    /// [`EnvOptions::sync_period`].
+    period: Option<Duration>,
+    /// [`EnvOptions::sync_bytes`].
+    bytes: Option<u64>,
+}
+
+impl AutoSync {
+    /// The automatic syncs `options` ask for: `None` in [`SyncMode::Durable`], whose commits are
+    /// all durable, and when neither bound is set.
+    fn new(options: &EnvOptions) -> Option<Self> {
+        let (period, bytes) = (options.sync_period, options.sync_bytes);
+        (options.sync == SyncMode::NoSync && (period.is_some() || bytes.is_some()))
+            .then_some(Self { period, bytes })
+    }
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -575,7 +630,8 @@ pub(crate) enum CrashAt {
     BeforeSave,
     /// After the free list's save.
     AfterSave,
-    /// After step 3 (the pages' CRCs stamped): the last point of a `SyncMode::NoSync` commit.
+    /// After step 3 (the pages' CRCs stamped): the last point of a `SyncMode::NoSync` commit that
+    /// defers its sync.
     AfterStamp,
     /// After step 4 (the data sync: the one `msync`, the one `fdatasync`, or nothing).
     AfterDataSync,
@@ -643,12 +699,71 @@ impl Writer {
         Some(stamp::crcs(&units, threads))
     }
 
+    /// Whether a [`SyncMode::NoSync`] commit that stamped `pages` pages commits durably
+    /// ([`Self::sync_with`]) rather than deferring them ([`Self::defer_sync`]): when the pages
+    /// stamped since the last durable state, these included, hold at least
+    /// [`EnvOptions::sync_bytes`] (pages times the page size), or at least
+    /// [`EnvOptions::sync_period`] has passed since that state ([`Self::durable_at`]). With
+    /// neither bound set, a test of one field; the clock is read only with a period set.
+    #[inline]
+    pub(crate) fn sync_due(&self, pages: usize) -> bool {
+        let Some(auto) = &self.auto_sync else {
+            return false;
+        };
+        let page_size = self.geometry.page_size() as u64;
+        auto.bytes.is_some_and(|bytes| {
+            (self.unsynced_pages + pages as u64).saturating_mul(page_size) >= bytes
+        }) || auto.period.is_some_and(|period| self.since_durable() >= period)
+    }
+
+    /// The time since the last durable state ([`Self::durable_at`]); in tests from
+    /// [`Self::clock_at`] when it is set.
+    fn since_durable(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(now) = self.clock_at {
+            return now.saturating_duration_since(self.durable_at);
+        }
+        self.durable_at.elapsed()
+    }
+
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
     pub(crate) fn defer_sync(&mut self, pages: &[u32]) {
         self.stats.nosync_commits += 1;
+        self.add_unsynced(pages);
+    }
+
+    /// Add `pages`, stamped by a [`SyncMode::NoSync`] commit, to [`Self::unsynced`].
+    fn add_unsynced(&mut self, pages: &[u32]) {
+        self.unsynced_pages += pages.len() as u64;
         for &p in pages {
             self.unsynced.insert(p);
         }
+    }
+
+    /// Empty [`Self::unsynced`]: its pages, ascending.
+    fn take_unsynced(&mut self) -> Vec<u32> {
+        let pages: Vec<u32> = self.unsynced.drain().map(|p| p as u32).collect();
+        debug_assert_eq!(
+            pages.len() as u64,
+            self.unsynced_pages,
+            "a page a NoSync commit stamped was stamped again before a sync"
+        );
+        self.unsynced_pages = 0;
+        pages
+    }
+
+    /// A [`SyncMode::NoSync`] commit past a bound of [`Self::sync_due`], committing durably: the
+    /// durable steps (4–6, [`Self::make_durable`]) over every page stamped since the last sync and
+    /// `pages`, the commit's own, with its `meta`, exactly as a [`SyncMode::Durable`] commit runs
+    /// them. The pages stay ascending for [`data_sync`], and distinct: a page a `NoSync` commit
+    /// stamped is not reused before a sync. An error leaves the commit unpublished, and the
+    /// caller latches, as for a durable commit.
+    pub(crate) fn sync_with(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
+        self.add_unsynced(pages);
+        let pages = self.take_unsynced();
+        self.make_durable(&pages, meta)?;
+        self.stats.auto_syncs += 1;
+        Ok(())
     }
 
     /// The durable steps of a commit (4–6): sync `pages` (ascending) by the one `msync` or the
@@ -710,6 +825,7 @@ impl Writer {
         self.file.msync_page(slot as u32, size)?;
         self.slots[slot] = Some(meta.txn);
         self.stats.meta_sync_ns += lap(&mut clock);
+        self.durable_at = clock;
         self.stats.commits += 1;
         self.stats.grown_commits += u64::from(grown);
         #[cfg(test)]
@@ -747,7 +863,7 @@ impl Writer {
             return Ok(());
         }
         let guard = UnwindLatch(latch, "a sync panicked");
-        let pages: Vec<u32> = self.unsynced.drain().map(|p| p as u32).collect();
+        let pages = self.take_unsynced();
         let last = self.last;
         let synced =
             self.make_durable(&pages, &last).inspect_err(|e| latch.fail(format!("sync: {e}")));
@@ -1265,6 +1381,9 @@ impl Env {
             last: meta,
             slots: chosen.slots,
             unsynced: PageSet::default(),
+            unsynced_pages: 0,
+            auto_sync: AutoSync::new(&options),
+            durable_at: Instant::now(),
             readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
             scratch: None,
@@ -1297,6 +1416,8 @@ impl Env {
             stamp_threads: None,
             #[cfg(test)]
             stamped_on: 0,
+            #[cfg(test)]
+            clock_at: None,
         };
         // A tail past the pages in use is an earlier process's, maybe sparse: the first growth
         // past those pages cuts it and grows again, preallocated. Nothing is written here.

@@ -1154,17 +1154,7 @@ fn table_stats_skip_a_table_the_file_lacks() {
 /// up to it; a commit after it only once the next sync runs.
 #[test]
 fn sync_makes_no_sync_commits_durable() {
-    use std::path::Path;
     use tn_lmdb::SyncMode;
-
-    /// The `CanonicalHeaders` rows of a copy of the file in `dir`, or `None` if it lacks the table.
-    fn durable_rows(dir: &Path) -> Option<usize> {
-        let copy = tempfile::TempDir::new().unwrap();
-        std::fs::copy(dir.join(crate::DATA_FILE), copy.path().join(crate::DATA_FILE)).unwrap();
-        let db = super::open_env(copy.path(), TnLmdbEnvKind::RO, TnLmdbArgs::default()).unwrap();
-        let tx = db.tx().unwrap();
-        tx.entries::<CanonicalHeaders>().ok()
-    }
 
     let dir = tempfile::TempDir::new().unwrap();
     let args = TnLmdbArgs::default().with_sync_mode(SyncMode::NoSync);
@@ -1185,6 +1175,48 @@ fn sync_makes_no_sync_commits_durable() {
     assert_eq!(durable_rows(dir.path()), Some(2), "until the next sync");
     db.sync().unwrap();
     assert_eq!(db.failure(), None, "a sync with nothing pending changes nothing");
+}
+
+/// The `CanonicalHeaders` rows of a copy of the file in `dir` (what a process crash leaves), or
+/// `None` if it lacks the table.
+fn durable_rows(dir: &std::path::Path) -> Option<usize> {
+    let copy = tempfile::TempDir::new().unwrap();
+    std::fs::copy(dir.join(crate::DATA_FILE), copy.path().join(crate::DATA_FILE)).unwrap();
+    let db = super::open_env(copy.path(), TnLmdbEnvKind::RO, TnLmdbArgs::default()).unwrap();
+    let tx = db.tx().unwrap();
+    tx.entries::<CanonicalHeaders>().ok()
+}
+
+/// `with_sync_period` and `with_sync_bytes` reach the engine's automatic syncs: a `NoSync` commit
+/// past either commits durably with no `sync` (a copy of the file holds it, and `io_stats` counts
+/// it in `auto_syncs`), while bounds it does not reach leave it to the next sync.
+#[test]
+fn automatic_syncs_reach_the_engine() {
+    use std::time::Duration;
+    use tn_lmdb::SyncMode;
+
+    let no_sync = TnLmdbArgs::default().with_sync_mode(SyncMode::NoSync);
+    let cases = [
+        ("sync_period zero", no_sync.with_sync_period(Some(Duration::ZERO)), true),
+        ("sync_bytes zero", no_sync.with_sync_bytes(Some(0)), true),
+        (
+            "bounds not reached",
+            no_sync
+                .with_sync_period(Some(Duration::from_secs(3600)))
+                .with_sync_bytes(Some(1 << 40)),
+            false,
+        ),
+    ];
+    for (case, args, synced) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
+        db.create_tables().unwrap();
+        db.update(|tx| tx.put::<CanonicalHeaders>(1, B256::with_last_byte(1))).unwrap().unwrap();
+        let s = db.io_stats();
+        let want = if synced { Some(1) } else { None };
+        assert_eq!(durable_rows(dir.path()), want, "{case}: {s:?}");
+        assert_eq!((s.auto_syncs > 0, s.nosync_commits > 0), (synced, !synced), "{case}: {s:?}");
+    }
 }
 
 /// `io_stats` is the engine's counters: a reth write through the adapter counts one durable

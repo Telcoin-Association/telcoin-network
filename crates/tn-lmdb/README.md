@@ -524,16 +524,33 @@ Crash outcomes (L = the last durable state, M = this commit):
 | crash during or after | Durable recovers | NoSync recovers |
 |---|---|---|
 | steps 1–3 (memory only) | L | the last synced state |
-| step 4 or 5 | L. M's meta was never written, and L's pages are untouched, because pages reachable from either slot are never reused. | not applicable |
-| step 6, before the meta's msync completes | M if its record reached the disk with a valid CRC, else L | not applicable |
-| after step 6 | M | not applicable |
-| any time after a NoSync commit, before `Env::sync` | not applicable | the last synced state. A process crash also rolls back. |
+| step 4 or 5 | L. M's meta was never written, and L's pages are untouched, because pages reachable from either slot are never reused. | a commit that syncs (past `sync_period` or `sync_bytes`): L, the last synced state, as in `Durable` |
+| step 6, before the meta's msync completes | M if its record reached the disk with a valid CRC, else L | a commit that syncs: as in `Durable` |
+| after step 6 | M | a commit that syncs: M |
+| any time after a NoSync commit that deferred its sync, before the next sync | not applicable | the last synced state. A process crash also rolls back. |
 
 **NoSync** runs steps 1–3 and 7 only. The stamped pages accumulate in an `unsynced` page set, and
 no meta is written, so the slots stay put. `Env::sync()` runs steps 4–6 for the newest state.
 Dropping the environment calls it unless the environment is latched. Because the reuse gate uses
 the slots' txns, the durable state's pages are never overwritten, and the file stays consistent
 whatever is lost.
+
+**Automatic syncs** (`EnvOptions::sync_period`, `EnvOptions::sync_bytes`, both off by default)
+bound what NoSync defers. A NoSync commit that changes something commits durably when its stamped
+pages bring the unsynced pages to at least `sync_bytes` (pages times the page size), or when at
+least `sync_period` has passed since the last durable state (the open, or the end of the last
+run of steps 4–6) (`Writer::sync_due`). It then runs steps 4–6 over every unsynced page plus its
+own, then step 7, exactly as a `Durable` commit does (`Writer::sync_with`): its crash outcomes
+are `Durable`'s, with L the last synced state, and an error leaves it unpublished and latches.
+The pages stay ascending for step 4 and distinct, because a page a NoSync commit stamped is not
+reused before a sync. The bounds are checked at commit only, with no thread or timer: commits
+that then stop stay in memory until the next commit, an `Env::sync` or the close. The clock is
+read only with `sync_period` set; with neither set, a commit tests one field. So a crash, even of
+the process alone, loses only the commits since the last durable state: with `sync_period` set,
+each came less than it after that state; with `sync_bytes` set, their pages hold less than it.
+The bounds also bound the file's growth:
+pages freed meanwhile come back within about two sync intervals (below). In `Durable` mode both
+options do nothing: every commit already syncs.
 
 **Abort** means dropping the `RwTxn` (or calling `abort`). The free tree was never touched, the
 pool and `next_pgno` return to the transaction's base, and its private pages and runs are simply
@@ -641,7 +658,11 @@ no durable meta and no live reader reaches them. A page freed by txn N is listed
 N's base state still holds it. In `Durable` mode, after commit N the slots hold N−1 and N. So a
 page freed by txn N becomes reusable at txn **N+2**, once N+1 has committed and the slots hold N
 and N+1. In `NoSync` mode the slots move only at a sync, so a freed page comes back once two syncs
-have made states from N on durable in both slots.
+have made states from N on durable in both slots. Without a sync the gate stays put and every
+commit's pages come from the end of the file, so it grows until the next sync; with automatic
+syncs (`sync_period`, `sync_bytes`) a freed page comes back within about two sync intervals:
+those two syncs are at most two intervals, plus the commit that freed it, away
+(`nosync_churn_with_sync_bytes_keeps_the_file_bounded`).
 
 **The save at commit** (`freelist::save`) runs with loading stopped, so pages come only from the
 pool or the end of the file:
@@ -1063,7 +1084,8 @@ An environment closes when its last `Env` clone and transaction drop (`EnvInner:
 close runs inside that last drop, on its thread: a reader's `RoTxn` or cursor dropped on a worker
 thread can be the one that syncs and trims, and a handle still alive when the process exits (a
 detached thread's, a static's) skips the close. A `NoSync` caller that needs its commits durable
-calls `Env::sync` before it lets go of the environment, and before the process exits. The steps,
+calls `Env::sync` before it lets go of the environment, and before the process exits (automatic
+syncs, [Commit protocol](#commit-protocol), bound what it can lose meanwhile). The steps,
 in order:
 
 1. **A crash stops here** (the test-only `Env::crash`): no sync, no trim.
@@ -1651,9 +1673,9 @@ so does a write's `Io` or `Failed` (an environment latched already included), as
 |---|---|
 | `Env::open(path, EnvOptions) -> Result<Env>` | open or create, then recover (see above) |
 | `Env::open_read_only(path, EnvOptions) -> Result<Env>` | open an existing file no writer holds, read-only (see [Read-only open](#read-only-open)): a shared lock, the same meta choice and root checks, a read-only mapping; never creates, writes or syncs; `begin_rw`/`try_begin_rw` return `ReadOnly` |
-| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is `OutOfMemory` after a missing file was created. |
+| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth, sync_period, sync_bytes }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB, `None`, `None`. `sync_period` and `sync_bytes` are `NoSync`'s automatic syncs: a commit past either commits durably ([Commit protocol](#commit-protocol)); `Durable` and `open_read_only` ignore them. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is `OutOfMemory` after a missing file was created. |
 | `MIN_GROWTH` | the smallest growth step, 1 MiB, and the least `EnvOptions::max_growth` an open accepts, for a caller that checks its own setting first (the reth adapter re-exports it) |
-| `SyncMode::{Durable, NoSync}` | durable at commit, or at the next `Env::sync` or drop |
+| `SyncMode::{Durable, NoSync}` | durable at commit, or at the next sync: an `Env::sync`, the drop, or a commit past `sync_period` or `sync_bytes`. A crash, even of the process alone, rolls back to that sync |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
 | `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
 | `Env::sync()` | make NoSync commits durable (a no-op when nothing is pending, and in a read-only environment); waits for an open writer in every mode, and returns `Failed` once the environment is latched |
@@ -1723,7 +1745,7 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 
 | group | counters |
 |---|---|
-| commits | `commits` (each run of steps 4–6: a `Durable` commit, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits`, `grown_commits` (the file grew since the last durable state) |
+| commits | `commits` (each run of steps 4–6: a `Durable` commit, a `NoSync` commit that synced, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits` (`NoSync` commits that deferred their sync), `auto_syncs` (`NoSync` commits past `sync_period` or `sync_bytes`, which synced their own pages and the deferred ones; each also counts in `commits`), `grown_commits` (the file grew since the last durable state) |
 | step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
 | step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
@@ -2466,10 +2488,10 @@ commits are not yet measured under the new rule (see
   migrating an MDBX one at its first open (`crates/tn-reth`'s README); dup tables as nested
   trees with packed small sets ([Dup tables](#dup-tables)); leaf values inline up to half a page;
   a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
-  tail ([Close](#close)). On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
+  tail ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
+  which bound its growth and what a crash loses, so it serves as an opt-in fast mode. On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
   A B B A, commits judged where both engines' drive syncs ran fast) put tn-lmdb within 2% of MDBX
   at peak and busy load and within 5% on the other four profiles, with its tables within 1–3% of
   MDBX's size. Of the remaining peak cost, most is step 3's page CRCs, which MDBX does not have.
-- **Next:** a faster page checksum for step 3 (the checks stay); the reth storage changes that
-  move the changesets out of the database; and a bound on `NoSync`'s growth, which the reth
-  integration needs before it accepts `--db.sync-mode safe-no-sync`.
+- **Next:** a faster page checksum for step 3 (the checks stay); and the reth storage changes that
+  move the changesets out of the database.

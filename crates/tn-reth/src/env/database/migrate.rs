@@ -38,8 +38,9 @@
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
-//! 4. Open tn-lmdb in the temp directory with `NoSync` and the page size, reservation and growth
-//!    step of the node's `--db.*` flags, and create reth's tables.
+//! 4. Open tn-lmdb in the temp directory with `NoSync` (no automatic syncs, whatever
+//!    `--db.sync-mode`) and the page size, reservation and growth step of the node's `--db.*`
+//!    flags, and create reth's tables.
 //! 5. Copy each of reth's tables (`Tables::ALL`), read from MDBX in one transaction with the
 //!    long-read safety off, by appends, in write transactions of at most [`COMMIT_ROWS`] rows or
 //!    [`COMMIT_BYTES`] bytes, hashing each row's key and value as it goes (std's `DefaultHasher`,
@@ -455,12 +456,11 @@ fn copy_and_verify(
     temp: &Path,
     args: TnLmdbArgs,
 ) -> eyre::Result<Vec<TableCopy>> {
-    // `NoSync` is fine here: an append-only copy frees few pages and syncs before the move.
-    let mut tn_lmdb =
-        TnLmdbEnv::open(temp, TnLmdbEnvKind::RW, args.with_sync_mode(SyncMode::NoSync))
-            .wrap_err_with(|| {
-                format!("failed to create the tn-lmdb database in {}", temp.display())
-            })?;
+    // `NoSync` with no automatic syncs is fine here: an append-only copy frees few pages and
+    // syncs before the move.
+    let args = args.with_sync_mode(SyncMode::NoSync).with_sync_period(None).with_sync_bytes(None);
+    let mut tn_lmdb = TnLmdbEnv::open(temp, TnLmdbEnvKind::RW, args)
+        .wrap_err_with(|| format!("failed to create the tn-lmdb database in {}", temp.display()))?;
     tn_lmdb.create_tables()?;
 
     let copies = copy_tables(&src, &tn_lmdb)?;

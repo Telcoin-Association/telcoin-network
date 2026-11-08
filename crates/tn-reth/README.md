@@ -438,13 +438,18 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   two in 4 KiB..=64 KiB). `--db.growth-step` is the largest growth step (unset, the engine's 1
   GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
   gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
-  `--db.sync-mode durable` is durable commits. Refused at startup, naming the flag:
-  `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`,
-  `--db.sync-mode safe-no-sync`, and reth's `UtterlyNoSync`
-  and `NoMetaSync` sync modes (neither has a CLI value). The `safe-no-sync` and `UtterlyNoSync`
-  refusals say why and point at `durable`: the engine's `NoSync` reuses the pages a commit frees
-  only after a sync, and nothing syncs a `NoSync` environment on its own, so the file would grow
-  until one (see "Persist benchmark"). They stay refused until the engine bounds that growth.
+  `--db.sync-mode durable` (the default) is durable commits. `--db.sync-mode safe-no-sync` is the
+  engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
+  MiB): a commit returns before it is durable, and the first commit a second after the last
+  durable state, or whose pages bring those written since to 64 MiB, commits durably with every
+  commit before it. A crash, of the system or of the process alone, rolls back to the last durable
+  state and never corrupts the file, and the pages commits free wait at most about two of those
+  intervals, so the file stays bounded (an engine `NoSync` with no syncs would grow until one: see
+  "Persist benchmark"). Refused at startup, naming the flag: `--db.exclusive`,
+  `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`, and reth's
+  `UtterlyNoSync` and `NoMetaSync` sync modes (neither has a CLI value). The `UtterlyNoSync`
+  refusal says why and points at `safe-no-sync` and `durable`: the engine has no mode that never
+  syncs.
 - **Default page size** (`default_page_size`): the page size of a new database without
   `--db.page-size`. The MDBX build's is reth's own default, the OS page size clamped to 4 KiB..=64
   KiB (16 KiB on Apple Silicon, 4 KiB on x86 Linux), which its `open_rw` passes to MDBX explicitly;
@@ -584,9 +589,10 @@ durable runs: p99 ratio 0.93 and 0.91). The backends' Linux comparison is the ex
 Under no-sync, `tn-lmdb.dat` grew to 2 GiB in every run, against 65 MiB durable: the pages a commit
 frees are reused only after a sync, and a no-sync run never syncs. The engine then remapped past
 its 1 GiB reservation, and those commits are the run's slowest (up to 436 ms, below p99). The
-tn-lmdb build therefore refuses `--db.sync-mode safe-no-sync` (`tn_lmdb_args`) until the engine bounds
-that growth, and the bench's no-sync runs reach the engine's `NoSync` through a test-only path
-instead (`database::TEST_NO_SYNC`, which the bench sets before it opens the database).
+tn-lmdb build's `--db.sync-mode safe-no-sync` therefore adds automatic syncs (each second or 64
+MiB, `tn_lmdb_args`), which bound that growth; the bench's no-sync runs still reach the engine's
+`NoSync` with no syncs at all through a test-only path (`database::TEST_NO_SYNC`, which the bench
+sets before it opens the database), so its rows time no sync.
 
 ### Execution benchmark
 

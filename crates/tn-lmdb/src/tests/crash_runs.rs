@@ -12,7 +12,7 @@
 use std::fs;
 
 use super::{
-    crash::{assert_gets, matrix, run_case, slack, Base, Case},
+    crash::{assert_gets, matrix, matrix_of, run_case, slack, Base, Case, Mode},
     damage::tree,
     *,
 };
@@ -214,6 +214,25 @@ fn every_crash_point_recovers_a_workload_of_overflow_runs_heavy() {
     }
 }
 
+/// The run workload's matrix in `Mode::AutoSync`: a crash commit that does not grow the file, so
+/// no size sync writes every page, runs the durable steps over its own pages and those of the two
+/// `NoSync` commits before it; every crash point recovers the base's state or the crash commit's
+/// by the `Durable` rules.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_a_workload_of_overflow_runs() {
+    matrix_of(&runs_base(4096), 2, &[Mode::AutoSync]);
+}
+
+/// [`every_crash_point_of_an_automatic_sync_recovers_a_workload_of_overflow_runs`] at two page
+/// sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_an_automatic_sync_recovers_a_workload_of_overflow_runs_heavy() {
+    for page_size in [4096, 16384] {
+        matrix_of(&runs_base(page_size), 40, &[Mode::AutoSync]);
+    }
+}
+
 /// [`runs_base`] with its slack left to the reopened writer as open leaves it: distrusted (no
 /// `PageFile::trust_tail`). The crash commit fits that slack (the run workload's matrix does not
 /// grow the file), so here it grows only because its first page past the pages in use is the
@@ -253,7 +272,7 @@ fn a_commit_that_grew_the_file_through_a_run_survives_a_power_loss() {
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     for by_msync in [false, true] {
         let Case { path, latest, runs, reused, .. } =
-            run_case(&base, SyncMode::Durable, by_msync, None);
+            run_case(&base, Mode::Durable, by_msync, None);
         let what = format!("by_msync={by_msync}: {runs:?}");
         assert!(reused > 0, "{what}: pages were reused");
         assert!(runs.steps[0] + runs.steps[1] > 0, "{what}: runs in reused pages");

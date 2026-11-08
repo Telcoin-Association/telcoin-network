@@ -82,6 +82,7 @@ impl DbCounters {
         let tn_lmdb_reth::IoStats {
             commits,
             nosync_commits,
+            auto_syncs,
             grown_commits,
             pages_synced,
             msync_syncs,
@@ -109,6 +110,7 @@ impl DbCounters {
         vec![
             ("tn_lmdb_commits", commits),
             ("tn_lmdb_nosync_commits", nosync_commits),
+            ("tn_lmdb_auto_syncs", auto_syncs),
             ("tn_lmdb_grown_commits", grown_commits),
             ("tn_lmdb_pages_synced", pages_synced),
             ("tn_lmdb_msync_syncs", msync_syncs),

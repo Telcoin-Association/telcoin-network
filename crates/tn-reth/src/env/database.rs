@@ -140,8 +140,9 @@ pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<Ret
 #[cfg(all(test, feature = "tn-lmdb"))]
 thread_local! {
     /// Test-only: the tn-lmdb databases this thread opens through [`open_tn_lmdb`] commit with the
-    /// engine's `NoSync`, which [`tn_lmdb_args`] refuses on the CLI. The persist bench's `nosync` mode
-    /// sets it (`env::persist_bench`).
+    /// engine's `NoSync` and no automatic syncs, which no CLI flag gives (`--db.sync-mode
+    /// safe-no-sync` adds them: [`tn_lmdb_args`]). The persist bench's `nosync` mode sets it
+    /// (`env::persist_bench`), so its no-sync rows time no sync at all.
     pub(crate) static TEST_NO_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -156,8 +157,13 @@ fn open_tn_lmdb(
 
     let args = tn_lmdb_args(db_args)?;
     #[cfg(test)]
-    let args =
-        if TEST_NO_SYNC.get() { args.with_sync_mode(tn_lmdb_reth::SyncMode::NoSync) } else { args };
+    let args = if TEST_NO_SYNC.get() {
+        args.with_sync_mode(tn_lmdb_reth::SyncMode::NoSync)
+            .with_sync_period(None)
+            .with_sync_bytes(None)
+    } else {
+        args
+    };
     check_backend(path, args)?;
     init_db_version_file(path)?;
     let mut env = TnLmdbEnv::open(path, TnLmdbEnvKind::RW, args).wrap_err_with(|| {
@@ -450,10 +456,15 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 ///   not a cap on the database's size.
 /// - `--db.page-size` is the page size of a new file; the engine validates it (a power of two in 4
 ///   KiB..=64 KiB). A size that does not fit a `u32` is refused here.
-/// - `--db.sync-mode`: `durable` is durable commits. `safe-no-sync` and reth's `UtterlyNoSync` (no
-///   CLI value) are refused: the engine's `NoSync` reuses the pages a commit frees only after a
-///   sync, and nothing syncs a `NoSync` environment on its own, so the file would grow until one.
-///   reth's `NoMetaSync` (no CLI value either) is refused.
+/// - `--db.sync-mode`: `durable` is durable commits (the default). `safe-no-sync` is the engine's
+///   `NoSync` with automatic syncs: a commit returns before it is durable, and the first commit
+///   made at least [`SAFE_NO_SYNC_PERIOD`] after the last durable state, or whose pages bring those
+///   written since then to [`SAFE_NO_SYNC_BYTES`], commits durably, with every commit before it
+///   (the engine's `sync_period` and `sync_bytes`). A crash, of the system or of the process alone,
+///   rolls back to the last durable state and never corrupts the file; the automatic syncs bound
+///   what it loses and how long the pages commits free wait before they are reused, so the file
+///   stays bounded. reth's `UtterlyNoSync` (no CLI value) is refused: the engine has no mode that
+///   never syncs. reth's `NoMetaSync` (no CLI value either) is refused.
 /// - `--db.growth-step` is the largest growth step (`max_growth`; unset, the engine's 1 GiB): the
 ///   file grows by doubling up to it, then by it, each step preallocated. A step under the engine's
 ///   minimum (`MIN_GROWTH`, 1 MiB) is refused here.
@@ -513,25 +524,40 @@ fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
         tn_lmdb = tn_lmdb.with_max_growth(step);
     }
     if let Some(sync_mode) = sync_mode {
-        let refuse_no_sync = |mode: &str| {
-            eyre::eyre!(
-                "{mode} is not supported by the tn-lmdb backend: its no-sync mode reuses the pages \
-                 a commit frees only after a sync, so the file would grow until one; use \
-                 --db.sync-mode durable"
-            )
-        };
-        let sync = match sync_mode {
-            MdbxSyncMode::Durable => SyncMode::Durable,
-            MdbxSyncMode::SafeNoSync => return Err(refuse_no_sync("--db.sync-mode safe-no-sync")),
+        tn_lmdb = match sync_mode {
+            MdbxSyncMode::Durable => tn_lmdb.with_sync_mode(SyncMode::Durable),
+            MdbxSyncMode::SafeNoSync => tn_lmdb
+                .with_sync_mode(SyncMode::NoSync)
+                .with_sync_period(Some(SAFE_NO_SYNC_PERIOD))
+                .with_sync_bytes(Some(SAFE_NO_SYNC_BYTES)),
             MdbxSyncMode::UtterlyNoSync => {
-                return Err(refuse_no_sync("the UtterlyNoSync sync mode"))
+                return Err(eyre::eyre!(
+                    "the UtterlyNoSync sync mode is not supported by the tn-lmdb backend: it has \
+                     no mode that never syncs; use --db.sync-mode safe-no-sync or durable"
+                ))
             }
             MdbxSyncMode::NoMetaSync => return Err(refuse("the NoMetaSync sync mode")),
         };
-        tn_lmdb = tn_lmdb.with_sync_mode(sync);
     }
     Ok(tn_lmdb)
 }
+
+/// `--db.sync-mode safe-no-sync`'s automatic sync by time on tn-lmdb (the engine's
+/// `sync_period`): a commit made at least this long after the last durable state commits durably,
+/// with every commit since. A crash, of the system or of the process alone, loses at most about
+/// this long's commits (those made within it of the last durable state), and the pages commits
+/// free wait at most about two of these before they are reused. Checked at commit: commits that
+/// then stop wait for the next commit or the close.
+#[cfg(feature = "tn-lmdb")]
+const SAFE_NO_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `--db.sync-mode safe-no-sync`'s automatic sync by size on tn-lmdb (the engine's `sync_bytes`):
+/// a commit whose pages bring those stamped since the last durable state to this many bytes
+/// commits durably, with every commit since. A crash, of the system or of the process alone, loses
+/// at most about this many bytes of commits, and the pages commits free wait at most about two of
+/// these before they are reused, so they hold at most about twice this beyond the live pages.
+#[cfg(feature = "tn-lmdb")]
+const SAFE_NO_SYNC_BYTES: u64 = 64 << 20;
 
 /// Create or check reth's database version file in `path`, as reth's `create_db` does: an absent
 /// or empty directory is created and gets the file; otherwise the file must hold reth's version,

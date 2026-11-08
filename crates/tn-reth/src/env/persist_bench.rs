@@ -55,10 +55,11 @@
 //! - `TN_PERSIST_BENCH_ACCOUNTS` (10000): prefilled accounts, and as many prefilled slots in the
 //!   writer contract.
 //! - `TN_PERSIST_BENCH_SYNC` (`nosync`): `nosync` or `durable` (`--db.sync-mode durable`). On MDBX
-//!   `nosync` is `--db.sync-mode safe-no-sync`. tn-lmdb refuses that flag (`tn_lmdb_args`: its
-//!   `NoSync` reuses freed pages only after a sync, so the file grows until one), so the tn-lmdb
-//!   build opens its database with the engine's `SyncMode::NoSync` through the test-only
-//!   `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings.
+//!   `nosync` is `--db.sync-mode safe-no-sync`. On tn-lmdb that flag adds automatic syncs (each
+//!   second or 64 MiB: `tn_lmdb_args`), so the no-sync rows would time some syncs; the tn-lmdb
+//!   build instead opens its database with the engine's `SyncMode::NoSync` and no automatic syncs
+//!   through the test-only `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings, so its
+//!   no-sync rows time no sync at all.
 //!
 //! **Caveats.**
 //!
@@ -393,8 +394,9 @@ fn run_mode(
     let chain = chain(knobs.accounts);
     #[cfg(not(feature = "tn-lmdb"))]
     let sync_mode = Some(if knobs.durable { SyncMode::Durable } else { SyncMode::SafeNoSync });
-    // The tn-lmdb build refuses `--db.sync-mode safe-no-sync`, so `nosync` reaches the engine's
-    // `NoSync` through the test-only `TEST_NO_SYNC`, read by the open on this thread.
+    // On tn-lmdb `--db.sync-mode safe-no-sync` syncs each second or 64 MiB, so `nosync` reaches
+    // the engine's `NoSync` with no automatic syncs through the test-only `TEST_NO_SYNC`, read by
+    // the open on this thread.
     #[cfg(feature = "tn-lmdb")]
     let sync_mode = {
         super::database::TEST_NO_SYNC.set(!knobs.durable);
