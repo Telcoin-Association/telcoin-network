@@ -173,7 +173,8 @@ pub trait ReadTxn {
     fn cursor<'t>(&'t self, table: &Table) -> Result<Cursor<'t>>;
 
     /// The id of the state this transaction reads: a read-only transaction's snapshot, or the
-    /// id the write transaction commits as.
+    /// id the write transaction commits as if it changes something (a commit that changes
+    /// nothing returns its base state's id).
     fn txn_id(&self) -> u64;
 
     /// Figures about `table` in this state, O(1) for either kind (see [`TableStat`]); a write
@@ -3379,10 +3380,17 @@ impl RwCursor<'_> {
         let removed = match self.txn.delete(&self.table, &key) {
             Ok(true) => Ok(()),
             Ok(false) => {
-                let cause =
-                    format!("the entry under a cursor of table {:?} is missing", self.table.name());
-                self.txn.inner.latch.fail(cause.clone());
-                Err(Error::Failed(cause))
+                // The cursor reached the entry by range-checked descents and steps; the delete
+                // descends from the root by search, which a branch whose keys do not ascend
+                // (damage that reads do not check) routes elsewhere: damage, as the dup path's
+                // miss is.
+                let cause = format!(
+                    "table {:?}: the entry under a cursor is not where a descent from the root \
+                     finds its key",
+                    self.table.name()
+                );
+                self.txn.inner.latch.fail_damaged(cause.clone());
+                Err(Error::Corrupt(cause))
             }
             Err(e) => Err(e),
         };
@@ -3612,8 +3620,10 @@ impl Tracker {
 /// A write to another table, and the cursor's own writes, cause no reseek. Each landing on an
 /// entry keeps a copy of its key, so the cursor can find it again.
 ///
-/// Errors are the transaction's (a failure latches the environment); [`Error::WrongTxn`] and
-/// [`Error::StaleTable`] change nothing and do not latch.
+/// Errors are the transaction's (a failure latches the environment, and a write or delete that
+/// fails so, [`Error::Failed`] from an environment latched already included, leaves the cursor
+/// unset, as a [`DupTxnCursor`]'s does); [`Error::WrongTxn`] and [`Error::StaleTable`] change
+/// nothing and do not latch.
 pub struct TxnCursor {
     /// The table, and what tells whether it changed since the cursor's last call.
     track: Tracker,
@@ -3995,7 +4005,21 @@ impl TxnCursor {
         // Up to date, the path is the table's: the put's descent routes by it.
         let fresh = self.track.up_to_date(&txn.work);
         let Self { track, root, tree, .. } = self;
-        let placed = txn.put_entry(&track.table, key, value, kind, Some((tree, root)), fresh)?;
+        let placed = match txn.put_entry(&track.table, key, value, kind, Some((tree, root)), fresh)
+        {
+            Ok(placed) => placed,
+            Err(e) => {
+                // A refusal changes nothing, the cursor included; a failure the environment
+                // latches (damage, I/O, a broken invariant, an environment latched already)
+                // leaves it unset, as a failed `delete_current` does and as a `DupTxnCursor`'s
+                // write leaves it.
+                if matches!(e, Error::Corrupt(_) | Error::Io(_) | Error::Failed(_)) {
+                    self.tree.unset();
+                    self.deleted = false;
+                }
+                return Err(e);
+            }
+        };
         self.deleted = false;
         save_key(&mut self.key, key);
         self.track.writes = self.track.table_writes(&txn.work);

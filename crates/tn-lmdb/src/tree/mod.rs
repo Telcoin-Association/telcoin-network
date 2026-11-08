@@ -312,6 +312,11 @@ pub(crate) trait PageWrite: PageRead {
     /// were built (and checked) here: copy-on-write does not re-verify it.
     fn is_stamped(&self, pgno: u32) -> bool;
 
+    /// The page count of the state this transaction began from. Every page from it up to
+    /// [`PageRead::page_count`] is one this transaction allocated, so no published page names
+    /// one, and one that is not private is loose: allocated and freed again, no tree's page.
+    fn base_page_count(&self) -> u32;
+
     /// Private page `pgno`'s bytes for a trusted descent (see [`write`]): the caller checked
     /// [`Self::is_private`], so the page is one this transaction allocated, inside the file; only
     /// the mapping is checked ([`Error::Corrupt`] if it fails), none of [`read::checked_page`]'s

@@ -210,7 +210,8 @@ fn view_entry<'s, R: CellRead, S: PageRead + ?Sized>(
 pub enum KeyTail<'a> {
     /// An inline value: the key's last `t` bytes followed by the value, one slice.
     Joined(&'a [u8]),
-    /// A value in an overflow run: the value alone, for the caller to join to the key's tail.
+    /// The value alone, for the caller to join to the key's tail: a value in an overflow run, or,
+    /// on a dup cursor's tail call, an inline value when `t` is longer than the row's subkey.
     Apart(&'a [u8]),
 }
 

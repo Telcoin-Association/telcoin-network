@@ -509,7 +509,8 @@ impl TnLmdbEnv {
     /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
     /// durable only at the next sync (or when the environment drops, which syncs unless it
     /// latched). A no-op when nothing is pending, in [`SyncMode::Durable`] and in a read-only
-    /// environment. Waits while a write transaction is open. A failure is
+    /// environment, unless the environment is latched: then it fails in every mode. Waits while
+    /// a write transaction is open. A failure is
     /// [`DatabaseError::Commit`] and latches the environment: later writes and commits fail
     /// until it is reopened.
     pub fn sync(&self) -> Result<(), DatabaseError> {

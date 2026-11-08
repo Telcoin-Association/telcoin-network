@@ -3128,7 +3128,11 @@ pub(crate) struct NestedSums {
 /// [`Error::Corrupt`], and a private child must be the copy its parent names (the identity check).
 /// Freed, a private page goes back to the pool at once, so without these rules a forged pointer
 /// naming a page this transaction allocated for another tree (a tree page, or a page of one of
-/// its runs) would hand that page out again while the other tree holds it.
+/// its runs) would hand that page out again while the other tree holds it. A root or child at or
+/// past the page count the transaction began with ([`PageWrite::base_page_count`]) that is not
+/// private is [`Error::Corrupt`] whatever its parent (a branch this transaction copied carries
+/// the published cells): no published page names a page past its state's count, so it is one
+/// this transaction allocated and freed, in the pool, which freeing would also list free.
 ///
 /// A plain tree ([`Leaves::Plain`]) counting no overflow page has its leaves taken from their
 /// parents' pointers: only the first is read (it must be a leaf: the tree is balanced, so that
@@ -3159,6 +3163,7 @@ pub(crate) fn tree_pages<S: PageWrite + ?Sized>(
         store,
         geometry: store.geometry(),
         page_count: store.page_count(),
+        base_count: store.base_page_count(),
         seen: PageSet::default(),
         out: TreePages::default(),
     };
@@ -3172,6 +3177,8 @@ struct PageWalk<'s, S: ?Sized> {
     store: &'s S,
     geometry: Geometry,
     page_count: u32,
+    /// [`PageWrite::base_page_count`]: a page from it on that is not private is loose.
+    base_count: u32,
     seen: PageSet,
     out: TreePages,
 }
@@ -3180,7 +3187,7 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
     /// Collect the non-empty tree `root` (provenance `root_trusted`), its leaves read as
     /// `leaves` says ([`tree_pages`]).
     fn tree(&mut self, root: &TreeRoot, root_trusted: bool, mut leaves: Leaves<'_>) -> Result<()> {
-        let (store, page_count) = (self.store, self.page_count);
+        let (store, page_count, base_count) = (self.store, self.page_count, self.base_count);
         let corrupt = |what: String| Error::Corrupt(format!("tree walk: {what}"));
         let check_header = |pgno: u32, txn: u32| -> Result<&'s [u8]> {
             let page = store.page(pgno)?;
@@ -3204,8 +3211,18 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
                 "page {p} is private to this transaction but named by a page it did not write"
             ))
         };
-        if store.is_private(root.root) && !root_trusted {
-            return Err(untrusted(root.root));
+        let loose = |p: u32| {
+            corrupt(format!(
+                "page {p} is past the {base_count} pages this transaction began with but not \
+                 private to it: a page it allocated and freed, no tree's"
+            ))
+        };
+        if store.is_private(root.root) {
+            if !root_trusted {
+                return Err(untrusted(root.root));
+            }
+        } else if root.root >= base_count {
+            return Err(loose(root.root));
         }
         self.seen.insert(root.root);
         self.out.pages.push(root.root);
@@ -3233,6 +3250,8 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
                             return Err(untrusted(child));
                         }
                         check_header(child, child_txn)?;
+                    } else if child >= base_count {
+                        return Err(loose(child));
                     }
                     self.seen.insert(child);
                     next.push((child, child_txn));

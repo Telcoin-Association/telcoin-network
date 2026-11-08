@@ -257,6 +257,68 @@ fn a_symlinked_path_opens_only_the_database_it_names() {
     assert_eq!(val(&txn, &table(&txn, "t"), b"k2").as_deref(), Some(&b"v2"[..]));
 }
 
+/// A file of another type than a regular file at the path (a FIFO, a socket, a directory), or at
+/// a symbolic link's end (a FIFO, a device), is refused by both opens, `Io(InvalidInput)` naming
+/// the path, and left as it is: a writer open never replaces it with a new database (a FIFO's
+/// length is 0, as an empty file's), and a read-only open never blocks on it (a FIFO's open waits
+/// for a writer). Each open runs on a thread under a watchdog, so a regression fails, not hangs.
+#[test]
+fn a_path_that_is_not_a_regular_file_is_refused() {
+    use std::os::unix::{fs::FileTypeExt as _, net::UnixListener};
+    let (dir, path) = temp();
+    let creating = path.with_file_name("db.creating");
+    let link = dir.path().join("link");
+    let refused = |at: &Path, what: &str| {
+        for read_only in [false, true] {
+            let what = format!("{what}, read-only {read_only}");
+            let (tx, rx) = mpsc::channel();
+            let p = at.to_path_buf();
+            std::thread::spawn(move || {
+                let options = EnvOptions::default();
+                let opened = if read_only {
+                    Env::open_read_only(&p, options)
+                } else {
+                    Env::open(&p, options)
+                };
+                let _ = tx.send(opened.map(drop));
+            });
+            let Ok(got) = rx.recv_timeout(Duration::from_secs(10)) else {
+                // Unblock a FIFO's open (a writer end) so the thread ends, then fail.
+                let _w = fs::OpenOptions::new().write(true).open(at);
+                panic!("{what}: the open blocked");
+            };
+            let e = got.expect_err("the open must fail");
+            let Error::Io(io) = &e else { panic!("{what}: {e}") };
+            assert_eq!(io.kind(), io::ErrorKind::InvalidInput, "{what}: {e}");
+            assert!(io.to_string().contains(&at.display().to_string()), "{what}: {e}");
+            assert!(!creating.exists(), "{what}: nothing is built aside");
+        }
+    };
+    let made = std::process::Command::new("mkfifo").arg(&path).status().expect("mkfifo");
+    assert!(made.success());
+    refused(&path, "a FIFO");
+    std::os::unix::fs::symlink(&path, &link).expect("link");
+    refused(&link, "a link to a FIFO");
+    assert!(fs::symlink_metadata(&path).expect("stat").file_type().is_fifo(), "still a FIFO");
+    fs::remove_file(&link).expect("remove");
+    std::os::unix::fs::symlink("/dev/null", &link).expect("link");
+    refused(&link, "a link to a device");
+    fs::remove_file(&path).expect("remove");
+    let socket = UnixListener::bind(&path).expect("socket");
+    refused(&path, "a socket");
+    assert!(fs::symlink_metadata(&path).expect("stat").file_type().is_socket(), "still a socket");
+    drop(socket);
+    fs::remove_file(&path).expect("remove");
+    fs::create_dir(&path).expect("a directory");
+    refused(&path, "a directory");
+    assert!(fs::symlink_metadata(&path).expect("stat").is_dir(), "still a directory");
+    fs::remove_dir(&path).expect("remove");
+    put_all(&open(&path), "t", &[(b"k", b"v")]);
+    let ro = Env::open_read_only(&path, EnvOptions::default()).expect("a regular file");
+    let txn = ro.begin_ro().expect("ro");
+    assert_eq!(val(&txn, &table(&txn, "t"), b"k").as_deref(), Some(&b"v"[..]));
+}
+
 /// The file is locked while any handle or transaction of an environment lives, against
 /// another open in this process too.
 #[test]
@@ -989,6 +1051,48 @@ fn a_writer_open_syncs_the_directory_naming_the_file() {
     assert_eq!(crate::sys::take_dir_sync_log(), [dir], "an open of an existing file");
     drop(Env::open_read_only(&path, EnvOptions::default()).expect("read-only"));
     assert_eq!(crate::sys::take_dir_sync_log(), Vec::<PathBuf>::new(), "a read-only open");
+}
+
+/// A directory the process may enter and write but not read (mode 0300) cannot be opened to be
+/// synced: the create and the open of an existing file in it skip its sync (it never could make
+/// the name durable) and open, syncing no directory. Any other failure of a directory sync fails,
+/// naming the directory.
+#[test]
+fn a_directory_that_cannot_be_read_is_not_synced_and_the_open_goes_on() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::with_prefix("tn_lmdb_env").expect("temp dir");
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).expect("dir");
+    let path = dir.join("db");
+    /// Gives the directory its read permission back however the test ends, before the
+    /// temporary directory's removal, which must list it.
+    struct Readable<'d>(&'d Path);
+    impl Drop for Readable<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let readable = Readable(&dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).expect("chmod");
+    // A process that reads the directory anyway (root) syncs it: only the open is checked then.
+    let unreadable = fs::read_dir(&dir).is_err();
+    crate::sys::take_dir_sync_log();
+    let created =
+        Env::open(&path, EnvOptions::default()).map(|env| put_all(&env, "t", &[(b"k", b"v")]));
+    let reopened = Env::open(&path, EnvOptions::default()).map(drop);
+    let synced = crate::sys::take_dir_sync_log();
+    drop(readable);
+    assert!(created.is_ok() && reopened.is_ok(), "{created:?}, {reopened:?}");
+    if unreadable {
+        assert_eq!(synced, Vec::<PathBuf>::new(), "a directory it cannot open is not synced");
+    }
+    let env = open(&path);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(val(&ro, &table(&ro, "t"), b"k").as_deref(), Some(&b"v"[..]));
+    let missing = tmp.path().join("missing");
+    let e = crate::sys::fsync_directory(&missing).expect_err("a missing directory");
+    assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    assert!(e.to_string().contains(&missing.display().to_string()), "{e}");
 }
 
 /// Damage a read finds latches the environment: writes fail, other reads continue.
@@ -1805,6 +1909,37 @@ fn max_growth_under_the_minimum_is_refused_at_open() {
     assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"v"[..]));
 }
 
+/// An `EnvOptions::map_reserve` past `isize::MAX` can never be mapped: it is refused at open as
+/// `InvalidMapReserve`, before the file is touched (a missing file is not created, an existing
+/// one keeps every byte), and a read-only open, which maps the file at its length, ignores it.
+/// `isize::MAX` itself is no refusal but the mapping's (`Io`, after the create). A tiny
+/// reservation opens and grows (each growth moves the mapping).
+#[test]
+fn a_map_reserve_past_isize_max_is_refused_at_open() {
+    let (dir, path) = temp();
+    for reserve in [u64::MAX, isize::MAX as u64 + 1] {
+        let huge = EnvOptions { map_reserve: reserve, ..EnvOptions::default() };
+        assert!(matches!(Env::open(&path, huge), Err(Error::InvalidMapReserve(r)) if r == reserve));
+        let created = fs::read_dir(dir.path()).expect("dir").count();
+        assert_eq!(created, 0, "the refused open of {reserve} created a file");
+    }
+    let huge = EnvOptions { map_reserve: u64::MAX, ..EnvOptions::default() };
+    put_all(&open(&path), "a", &[(b"k", b"v")]);
+    let before = fs::read(&path).expect("read");
+    assert!(matches!(Env::open(&path, huge), Err(Error::InvalidMapReserve(_))));
+    assert!(fs::read(&path).expect("read") == before, "the refused open changed the file");
+    let ro = Env::open_read_only(&path, huge).expect("a read-only open ignores map_reserve");
+    drop(ro);
+    let most = EnvOptions { map_reserve: isize::MAX as u64, ..EnvOptions::default() };
+    assert!(matches!(Env::open(&path, most), Err(Error::Io(_))), "the mapping's refusal");
+    let tiny = EnvOptions { map_reserve: 1, ..EnvOptions::default() };
+    let env = Env::open(&path, tiny).expect("a tiny reservation opens");
+    put_all(&env, "b", &[(b"k", &[7; 3 << 20][..])]);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"v"[..]));
+    assert_eq!(val(&ro, &table(&ro, "b"), b"k").map(|v| v.len()), Some(3 << 20));
+}
+
 /// A growth cap of `MIN_GROWTH` bounds the file's tail past its pages while the environment
 /// runs: after every commit of a load that grows the file to several MiB, the length past
 /// `page_count` pages is at most the cap plus the OS-page rounding (doubling would leave up to
@@ -1991,6 +2126,83 @@ fn a_failed_final_sync_skips_the_trim() {
     assert_eq!(env.stat().txn_id, synced, "the last synced state");
     env.check().expect("check");
     assert_rows(&env, "a", 300, 150);
+}
+
+/// The variable that makes [`a_forked_childs_drop_changes_nothing_in_the_child`] run: set only
+/// in the process [`a_forked_childs_drop_leaves_the_parents_file_alone`] starts.
+const FORK_CHILD: &str = "TN_LMDB_FORK_CHILD";
+
+/// A process forks (without exec) while an environment is open, and the child drops its copy, as
+/// a normal return would: the drop closes nothing, since the file, its lock and the writer's
+/// state are the parent's. Without that the child's close would trim the shared file under the
+/// parent (whose next writes into its slack would then fault, `SIGBUS`) and, in `NoSync`, sync
+/// a stale meta. The forking test runs in a process of its own, this test binary run again, so
+/// a fault or a hang fails this test rather than the suite.
+#[test]
+fn a_forked_childs_drop_leaves_the_parents_file_alone() {
+    let name = "env::tests::a_forked_childs_drop_changes_nothing_in_the_child";
+    let mut run = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", name, "--include-ignored", "--nocapture", "--test-threads", "1"])
+        .env(FORK_CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while run.try_wait().expect("wait").is_none() {
+        if Instant::now() > deadline {
+            let _ = run.kill();
+            panic!("the forking process hung");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = run.wait_with_output().expect("output");
+    let (stdout, stderr) =
+        (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    use std::os::unix::process::ExitStatusExt as _;
+    assert!(out.status.success(), "signal {:?}\n{stdout}\n{stderr}", out.status.signal());
+    assert!(stdout.contains("1 passed"), "the forking test ran\n{stdout}");
+}
+
+/// The forking half of [`a_forked_childs_drop_leaves_the_parents_file_alone`], in `Durable` and
+/// `NoSync` (an unsynced commit pending): the child drops the environment and leaves at once
+/// (`_exit`: nothing else of the process runs in it); the file is then byte for byte as it was,
+/// and the parent's next commit, which writes into its slack, and the reopen are sound.
+#[test]
+#[ignore = "run by a_forked_childs_drop_leaves_the_parents_file_alone, in a process of its own"]
+fn a_forked_childs_drop_changes_nothing_in_the_child() {
+    if std::env::var_os(FORK_CHILD).is_none() {
+        return;
+    }
+    for sync in [SyncMode::Durable, SyncMode::NoSync] {
+        let (_dir, path) = temp();
+        let env = Env::open(&path, options(4096, sync)).expect("open");
+        commit_rows(&env, "a", 0, 50, 100);
+        let before = fs::read(&path).expect("read");
+        // SAFETY: the child only drops the environment and calls `_exit`. The harness's other
+        // thread waits on a channel, holding no lock the drop takes (both libcs make `malloc`
+        // usable in a forked child).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            drop(env);
+            // SAFETY: ends the child at once, running no exit handler of the parent's.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child forked above, into a local.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{sync:?}: {status}");
+        assert!(fs::read(&path).expect("read") == before, "{sync:?}: the child changed the file");
+        commit_rows(&env, "a", 50, 350, 1000);
+        drop(env);
+        let env = open(&path);
+        env.check().expect("check");
+        let ro = env.begin_ro().expect("ro");
+        let a = table(&ro, "a");
+        assert_eq!(ro.table_stat(&a).expect("stat").entries, 400, "{sync:?}");
+        assert_eq!(val(&ro, &a, &399_u32.to_be_bytes()), Some(vec![399_u32 as u8; 1000]));
+    }
 }
 
 /// After a trim the reopened file grows from its pages in use (the trimmed length less the

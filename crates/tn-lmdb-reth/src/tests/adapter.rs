@@ -170,6 +170,7 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         (E::InvalidTableName, Error::DecodeError),
         (E::InvalidPageSize(3), Error::DecodeError),
         (E::InvalidMaxGrowth(4096), Error::DecodeError),
+        (E::InvalidMapReserve(u64::MAX), Error::DecodeError),
         (E::KeyTooShort { len: 4, min: 5 }, Error::BadValSize),
         (E::TableKind("t".into()), Error::Incompatible),
         (E::InvalidDupOptions("packed_max must be 0".into()), Error::DecodeError),

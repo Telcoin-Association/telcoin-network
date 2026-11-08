@@ -19,8 +19,9 @@ pub enum Error {
     /// file is reopened.
     #[error("tn-lmdb: environment failed: {0}")]
     Failed(String),
-    /// A key longer than the page size allows, or an outer key passed to
-    /// [`crate::RwTxn::delete_prefix`] longer than its dup table's `key_len`.
+    /// A key longer than the page size allows, or an outer key longer than its dup table's
+    /// `key_len` passed to [`crate::RwTxn::delete_prefix`] or to a dup cursor's bounded seek
+    /// (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`), `max` then the `key_len`.
     #[error("tn-lmdb: key of {len} bytes exceeds the maximum of {max}")]
     KeyTooLarge {
         /// The key's length.
@@ -29,8 +30,9 @@ pub enum Error {
         max: usize,
     },
     /// A key too short for its dup table: a point operation's key with no subkey (at most
-    /// `key_len` bytes), or an outer key passed to [`crate::RwTxn::delete_prefix`] shorter than
-    /// `key_len`. It is refused before anything changes and does not latch.
+    /// `key_len` bytes), or an outer key shorter than `key_len` passed to
+    /// [`crate::RwTxn::delete_prefix`] or to a dup cursor's bounded seek (`seek_key`, `seek_dup`,
+    /// `seek_dup_with_key_tail`). It is refused before anything changes and does not latch.
     #[error("tn-lmdb: key of {len} bytes is shorter than the minimum of {min}")]
     KeyTooShort {
         /// The key's length.
@@ -48,8 +50,8 @@ pub enum Error {
         max: usize,
     },
     /// An append ([`crate::RwTxn::append`], [`crate::RwCursor::append`],
-    /// [`crate::TxnCursor::append`]) of a key that does not sort strictly after the table's last
-    /// key. It is refused before anything changes.
+    /// [`crate::TxnCursor::append`], [`crate::DupTxnCursor::append`]) of a key that does not sort
+    /// strictly after the table's last key. It is refused before anything changes.
     #[error("tn-lmdb: append of a key that does not sort after the table's last key")]
     AppendOutOfOrder,
     /// An insert ([`crate::RwTxn::insert`], [`crate::RwCursor::insert`],
@@ -90,6 +92,10 @@ pub enum Error {
     /// [`crate::Env::open`] before it touches the file.
     #[error("tn-lmdb: invalid max growth {0} (at least {} bytes)", crate::MIN_GROWTH)]
     InvalidMaxGrowth(u64),
+    /// An `EnvOptions::map_reserve` past `isize::MAX` bytes, which no mapping can reserve,
+    /// refused by [`crate::Env::open`] before it touches the file.
+    #[error("tn-lmdb: invalid map reserve {0} (at most {} bytes)", isize::MAX)]
+    InvalidMapReserve(u64),
     /// Another handle (in this process or another) holds the database open: any handle, for
     /// [`crate::Env::open`]; one with a writer, for [`crate::Env::open_read_only`].
     #[error("tn-lmdb: database is locked by another handle")]

@@ -127,7 +127,7 @@
 //! | `TableNotFound`, `StaleTable`, a table never created | `MDBX_NOTFOUND` |
 //! | an unpositioned `delete_current` | `MDBX_ENODATA` |
 //! | `TableKind` | `MDBX_INCOMPATIBLE` |
-//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidDupOptions` | `MDBX_EINVAL` |
+//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidMapReserve`, `InvalidDupOptions` | `MDBX_EINVAL` |
 //!
 //! A refused second value for a dup-sort row's subkey (below) is `MDBX_KEYEXIST` with a message of
 //! this crate's saying it stores one value per subkey. Four engine errors keep their own message,

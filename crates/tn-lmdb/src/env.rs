@@ -121,8 +121,10 @@ pub enum SyncMode {
     #[default]
     Durable,
     /// A commit is visible in this process at once, and durable at the next [`Env::sync`] (or
-    /// when the environment drops). A crash, even of the process alone, rolls back to the last
-    /// sync; the file stays consistent, since the durable state's pages are never overwritten.
+    /// at the close, which runs in the drop of the environment's last handle, on that thread: a
+    /// reader's or cursor's drop can be the one that syncs, and a handle alive when the process
+    /// exits skips it). A crash, even of the process alone, rolls back to the last sync; the file
+    /// stays consistent, since the durable state's pages are never overwritten.
     NoSync,
 }
 
@@ -132,10 +134,15 @@ pub enum SyncMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvOptions {
     /// The page size of a new file: a power of two in 4 KiB..=64 KiB (default 4096). An
-    /// existing file keeps the page size it was created with.
+    /// existing file keeps the page size it was created with. It also caps the file: `u32` page
+    /// numbers hold at most 2^32 - 1 pages (16 TiB at 4 KiB, 256 TiB at 64 KiB).
     pub page_size: u32,
     /// Address space the mapping reserves, in bytes (default 1 GiB). The file grows inside it
-    /// without remapping; past it the mapping moves to a larger reservation.
+    /// without remapping; past it the mapping moves to a larger reservation. More than
+    /// `isize::MAX` bytes can never be mapped: [`Env::open`] refuses it
+    /// ([`Error::InvalidMapReserve`]) before it touches the file. A reservation the host refuses
+    /// (past the address space, or past `ulimit -v` on Linux: `ENOMEM`) fails the open with
+    /// [`Error::Io`] after a missing file was created.
     pub map_reserve: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
@@ -183,7 +190,8 @@ pub struct EnvStat {
 }
 
 /// An open database file (see the module docs). Cheap to clone: clones share one environment,
-/// which closes when the last clone and the last transaction drop.
+/// which closes when the last clone and the last transaction drop, inside that last drop and on
+/// its thread (README, Close).
 #[derive(Clone)]
 pub struct Env {
     inner: Arc<EnvInner>,
@@ -296,6 +304,10 @@ pub(crate) struct EnvInner {
     /// The writer's counters as of the last time its state came back ([`Self::return_writer`]),
     /// which [`Env::io_stats`] copies: all zero in a read-only environment.
     io_stats: Mutex<IoStats>,
+    /// The id of the process that opened the environment. A child it forks (without exec) holds a
+    /// copy of this state, of the file's descriptor and lock, and of the mapping, all the
+    /// parent's: the child's drop closes nothing ([`Drop`]).
+    pid: u32,
     /// Test-only: drop as a crash would, without the final sync.
     #[cfg(test)]
     pub(crate) crash_on_drop: std::sync::atomic::AtomicBool,
@@ -322,6 +334,7 @@ impl EnvInner {
             clock_base: Instant::now(),
             oldest_superseded: AtomicU64::new(NOT_SUPERSEDED),
             io_stats: Mutex::new(IoStats::default()),
+            pid: std::process::id(),
             #[cfg(test)]
             crash_on_drop: std::sync::atomic::AtomicBool::new(false),
         }
@@ -390,10 +403,15 @@ impl EnvInner {
 /// The close: in [`SyncMode::NoSync`] the final sync, then the trim of the file's preallocated
 /// tail ([`Writer::trim_tail`]). A latched environment does neither (its newest state may not be
 /// durable, and the slots' bookkeeping may not match the disk), nor does a read-only one, which
-/// has no writer. A failed sync skips the trim; a failed trim is logged and changes nothing that
-/// matters: the file keeps its tail, which is slack.
+/// has no writer, nor a copy in a process the opener forked, whose file it is not (its state is
+/// the parent's as of the fork: its sync could write a stale meta, its trim cut the parent's
+/// slack under the parent's next writes). A failed sync skips the trim; a failed trim is logged
+/// and changes nothing that matters: the file keeps its tail, which is slack.
 impl Drop for EnvInner {
     fn drop(&mut self) {
+        if std::process::id() != self.pid {
+            return;
+        }
         #[cfg(test)]
         if self.crash_on_drop.load(Ordering::Relaxed) {
             return;
@@ -931,6 +949,10 @@ impl PageWrite for Writer {
         self.alloc.is_stamped(pgno)
     }
 
+    fn base_page_count(&self) -> u32 {
+        self.alloc.base_page_count()
+    }
+
     fn private_page(&self, pgno: u32) -> Result<&[u8]> {
         self.file
             .page(pgno, self.geometry.page_size())
@@ -1159,8 +1181,10 @@ impl Env {
     /// holds it open; [`Error::NotTnLmdb`], [`Error::UnsupportedVersion`] or [`Error::Corrupt`]
     /// for a file that cannot be opened safely (left unchanged); [`Error::InvalidPageSize`] for
     /// an invalid `options.page_size`; [`Error::InvalidMaxGrowth`] for an `options.max_growth`
-    /// under [`MIN_GROWTH`](crate::MIN_GROWTH) (both refused before the file is touched);
-    /// [`Error::Io`], `NotFound` for a symbolic link at `path` to a missing or empty file, and
+    /// under [`MIN_GROWTH`](crate::MIN_GROWTH); [`Error::InvalidMapReserve`] for an
+    /// `options.map_reserve` past `isize::MAX` (all three refused before the file is touched);
+    /// [`Error::Io`] for a reservation the host refuses (a missing file is created first),
+    /// `NotFound` for a symbolic link at `path` to a missing or empty file, and
     /// `InvalidInput` naming it for a `<path>.creating` that is a symbolic link or not a regular
     /// file when the open would create the file (each left as it is).
     pub fn open(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
@@ -1169,13 +1193,17 @@ impl Env {
         if options.max_growth < MIN_GROWTH {
             return Err(Error::InvalidMaxGrowth(options.max_growth));
         }
+        if options.map_reserve > isize::MAX as u64 {
+            return Err(Error::InvalidMapReserve(options.map_reserve));
+        }
         let file = open_locked(path, options.page_size)?;
         let (chosen, geometry) = choose_state(&file)?;
         let meta = chosen.meta;
         // A crash may have left a meta in the page cache whose msync never finished, or a
         // created file whose name never reached the disk (a `create` that died, or failed, before
         // its directory sync): make what this open reads, and the name it found it by, durable
-        // before anything is built on them.
+        // before anything is built on them (a directory that cannot be synced is skipped, with
+        // a warning: `sys::fsync_directory`).
         sys::fsync_file(&file)?;
         sys::fsync_directory(parent_dir(path))?;
         let file =
@@ -1308,7 +1336,8 @@ impl Env {
     /// Make every commit durable: in [`SyncMode::NoSync`], sync the pages committed since the
     /// last sync and write the newest state's meta (a no-op when nothing is pending, and always
     /// in [`SyncMode::Durable`] and in an environment opened read-only). Waits while a write
-    /// transaction is open, as [`Self::begin_rw`] does. A failure latches the environment.
+    /// transaction is open, as [`Self::begin_rw`] does, in every mode. A failure latches the
+    /// environment, and once it is latched this is [`Error::Failed`] in every mode.
     pub fn sync(&self) -> Result<()> {
         if self.inner.writable().is_err() {
             return Ok(());
@@ -1431,6 +1460,10 @@ fn open_locked(path: &Path, page_size: u32) -> Result<File> {
             return Err(Error::Locked);
         }
         let locked = file.metadata()?;
+        if !locked.is_file() {
+            // Another type put at the path after `needs_create` refused none.
+            return Err(not_regular(path));
+        }
         match fs::metadata(path) {
             Ok(named) if named.ino() == locked.ino() && named.dev() == locked.dev() => {
                 if locked.len() > 0 {
@@ -1450,14 +1483,24 @@ fn open_locked(path: &Path, page_size: u32) -> Result<File> {
 /// As in [`open_locked`], the lock must end up on the file the path names: a creator may rename a
 /// new file over a missing or empty path between this open and its lock, so the open is retried
 /// (a few times; then [`Error::Locked`]). A missing file is [`Error::Io`] (`NotFound`), and an
-/// empty one is left to [`choose_meta`], which finds no meta in it: [`Error::NotTnLmdb`].
+/// empty one is left to [`choose_meta`], which finds no meta in it: [`Error::NotTnLmdb`]. A path
+/// naming a file of another type than a regular file (followed through symbolic links) is
+/// refused before it is opened ([`not_regular`]): a FIFO's open would block until a writer
+/// opened it. The open is non-blocking too, so a FIFO put there after the check is refused as
+/// well, without waiting.
 fn open_shared(path: &Path) -> Result<File> {
     for _ in 0..3 {
-        let file = OpenOptions::new().read(true).open(path)?;
+        if fs::metadata(path).is_ok_and(|named| !named.is_file()) {
+            return Err(not_regular(path));
+        }
+        let file = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+        let locked = file.metadata()?;
+        if !locked.is_file() {
+            return Err(not_regular(path));
+        }
         if !sys::flock_shared(&file)? {
             return Err(Error::Locked);
         }
-        let locked = file.metadata()?;
         match fs::metadata(path) {
             Ok(named) if named.ino() == locked.ino() && named.dev() == locked.dev() => {
                 return Ok(file);
@@ -1474,11 +1517,14 @@ fn open_shared(path: &Path) -> Result<File> {
 /// followed only to a file holding bytes: one whose target is missing or empty is refused,
 /// [`Error::Io`] (`NotFound`) naming the link, and left as it is. [`create`]'s rename would
 /// replace the link itself with a new, empty database, leaving the one the link names (on a disk
-/// not mounted, say) behind.
+/// not mounted, say) behind. A file of another type than a regular file at `path`, or at the
+/// link's end (a FIFO, a socket or a device, whose length is 0, or a directory), is refused
+/// ([`not_regular`]) and left as it is, never replaced by a new database.
 fn needs_create(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {}
-        Ok(meta) => return Ok(meta.len() == 0),
+        Ok(meta) if meta.is_file() => return Ok(meta.len() == 0),
+        Ok(_) => return Err(not_regular(path)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(e) => return Err(e.into()),
     }
@@ -1493,11 +1539,23 @@ fn needs_create(path: &Path) -> Result<bool> {
         ))
     };
     match fs::metadata(path) {
+        Ok(target) if !target.is_file() => Err(not_regular(path)),
         Ok(target) if target.len() > 0 => Ok(false),
         Ok(_) => Err(refused("an empty file")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(refused("a missing file")),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The refusal of a database path naming a file of another type than a regular file (a FIFO, a
+/// socket, a device, a directory), [`Error::Io`] (`InvalidInput`) naming it, as [`create`]
+/// refuses such a temporary file: an open neither replaces it nor reads it.
+#[cold]
+fn not_regular(path: &Path) -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("the database path {} is not a regular file: refused", path.display()),
+    ))
 }
 
 /// Create the file at `path` atomically (open step 2): both metas of a new file (txn 0, no

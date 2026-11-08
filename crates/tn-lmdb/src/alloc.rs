@@ -159,6 +159,12 @@ impl Allocator {
         self.next_pgno
     }
 
+    /// The page count the writing transaction began with: pages from it up to
+    /// [`Self::page_count`] are ones the transaction allocated.
+    pub(crate) fn base_page_count(&self) -> u32 {
+        self.base.1
+    }
+
     /// The writer-wide epoch: it changes at every allocation and free, whenever the private set
     /// empties (commit, abort) and when a transaction begins, and never otherwise; it is never 0.
     /// Every change to a tree's shape or separators allocates or frees a page, so a write-path

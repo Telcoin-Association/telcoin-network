@@ -22,8 +22,41 @@ use std::{fs::File, io, os::fd::AsRawFd, path::Path};
 /// file's own data is durable. Calling this on the parent directory closes that gap.
 ///
 /// `path` must refer to a directory (a regular file would just have its contents synced).
+///
+/// PostgreSQL's rule for a directory that cannot be synced: an `EACCES` from opening it (a
+/// directory the process may enter and write but not read) and an `EINVAL`, `ENOTSUP` or
+/// `EOPNOTSUPP` from its fsync (a file system with no directory fsync) are skipped with a
+/// warning naming the directory, since such a directory never could make the name durable and
+/// the file's own sync still runs. Every other error fails, naming the directory (its kind kept).
 pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
-    fsync_file(&File::open(path)?)?;
+    let skipped = |what: &str, e: &io::Error| {
+        tracing::warn!(
+            target: "tn_lmdb",
+            "the directory {} cannot be synced ({what}: {e}); a crash may lose a name made in it",
+            path.display()
+        );
+    };
+    let failed = |what: &str, e: io::Error| {
+        io::Error::new(e.kind(), format!("syncing the directory {}: {what}: {e}", path.display()))
+    };
+    let dir = match File::open(path) {
+        Ok(dir) => dir,
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+            skipped("it cannot be opened", &e);
+            return Ok(());
+        }
+        Err(e) => return Err(failed("open", e)),
+    };
+    if let Err(e) = fsync_file(&dir) {
+        let unsupported = e.raw_os_error().is_some_and(|code| {
+            code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+        });
+        if !unsupported {
+            return Err(failed("fsync", e));
+        }
+        skipped("its file system has no directory fsync", &e);
+        return Ok(());
+    }
     #[cfg(test)]
     DIR_SYNC_LOG.with(|log| log.borrow_mut().push(path.to_path_buf()));
     Ok(())
@@ -31,8 +64,8 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only: the directories [`fsync_directory`] synced on this thread, in order. Read with
-    /// [`take_dir_sync_log`].
+    /// Test-only: the directories [`fsync_directory`] synced on this thread, in order (a
+    /// directory it skipped is not one). Read with [`take_dir_sync_log`].
     static DIR_SYNC_LOG: std::cell::RefCell<Vec<std::path::PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

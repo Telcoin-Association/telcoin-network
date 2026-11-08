@@ -66,6 +66,7 @@ impl Latch {
             | Error::UnsupportedVersion(_)
             | Error::InvalidPageSize(_)
             | Error::InvalidMaxGrowth(_)
+            | Error::InvalidMapReserve(_)
             | Error::Locked
             | Error::ReadOnly
             | Error::WrongTxn => {}

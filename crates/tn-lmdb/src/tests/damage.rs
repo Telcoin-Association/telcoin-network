@@ -449,14 +449,74 @@ fn a_crossing_into_a_redirected_leaf_is_corrupt() {
     }
 }
 
+/// A table of 2000 keys (height 2) whose root's separators from the middle to the one before the
+/// last are overwritten with `0xFF` bytes, the root's CRC stamped again: the last child's range is
+/// unchanged, so an edge descent to the last leaf passes its range check, but a search of the
+/// root for the last key routes into another child.
+fn a_root_out_of_key_order(path: &Path) {
+    let env = open(path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..2000_u32 {
+        txn.put(&t, &i.to_be_bytes(), &[7; 100]).expect("put");
+    }
+    txn.commit().expect("commit");
+    let root = tree(&env, "t");
+    assert_eq!(root.height, 2, "{root:?}");
+    drop(env);
+    restamped(path, root.root, |page| {
+        let n = page::nkeys(page);
+        assert!(n >= 8, "{n} children");
+        for i in 1 + (n - 1) / 2..n - 1 {
+            let k = page::branch_key(page, i).expect("key");
+            let (off, len) = (k.as_ptr() as usize - page.as_ptr() as usize, k.len());
+            page[off..off + len].fill(0xFF);
+        }
+    });
+}
+
+/// A write cursor at the last entry of a table whose root's keys do not ascend deletes it. An
+/// `RwCursor`'s delete searches from the root and misses the key; a `TxnCursor`'s routes by its
+/// path and meets the root's order in the copy's verify. Either is `Corrupt` (damage, not a
+/// writer bug's `Failed`) and latches as damage.
+#[test]
+fn a_cursor_delete_on_a_root_out_of_key_order_is_corrupt() {
+    for detached in [false, true] {
+        let (_dir, path) = temp("tn_lmdb_damage_order");
+        a_root_out_of_key_order(&path);
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        let last = 1999_u32.to_be_bytes();
+        let got = if detached {
+            let mut cursor = txn.cursor_detached(&t).expect("cursor");
+            let at = cursor.last(&txn).expect("last").map(|(k, _)| k.to_vec());
+            assert_eq!(at.as_deref(), Some(&last[..]));
+            cursor.delete_current(&mut txn)
+        } else {
+            let mut cursor = txn.cursor_mut(&t).expect("cursor");
+            let at = cursor.last().expect("last").map(|(k, _)| k.to_vec());
+            assert_eq!(at.as_deref(), Some(&last[..]));
+            cursor.delete_current()
+        };
+        let what = format!("detached {detached}");
+        let Err(Error::Corrupt(cause)) = got else { panic!("{what}: {got:?}") };
+        drop(txn);
+        assert_eq!(env.failure().as_ref(), Some(&cause), "{what}: the damage latched");
+        assert!(matches!(env.begin_rw(), Err(Error::Failed(_))), "{what}: writes fail");
+    }
+}
+
 /// A table root number past the end of the file, in a catalog record whose leaf's CRC is intact
 /// (reads do not check catalog leaves' CRCs, and open checks only the catalog and free-tree
 /// roots): `drop_table` and `clear_table` walk the tree to free it, and `tree_pages` must refuse
-/// the root by its range check, before the number sizes the walk's dense page set. The error is
+/// the root by its range check, before the number sizes the walk's dense page set. A root past
+/// the state's page count that this transaction allocated and freed (a page of a run it wrote,
+/// loose in the pool) is refused too, though inside the transaction's pages. The error is
 /// `Corrupt` and latches.
 #[test]
 fn a_table_root_past_the_end_is_refused_by_the_tree_walk() {
-    for far in [true, false] {
+    for (far, loose) in [(true, false), (false, false), (false, true)] {
         for dropping in [false, true] {
             let (_dir, path) = temp("tn_lmdb_damage_root");
             let (catalog, page_count) = {
@@ -469,7 +529,7 @@ fn a_table_root_past_the_end_is_refused_by_the_tree_walk() {
                 assert_eq!(meta.catalog.height, 1, "the catalog is one leaf");
                 (meta.catalog.root, meta.page_count)
             };
-            let bad = if far { u32::MAX - 1 } else { page_count };
+            let bad = if far { u32::MAX - 1 } else { page_count + 2 * u32::from(loose) };
             restamped(&path, catalog, |page| {
                 let i = (0..page::nkeys(page))
                     .find(|&i| page::leaf_inline_entry(page, i).expect("entry").0 == b"t")
@@ -483,13 +543,23 @@ fn a_table_root_past_the_end_is_refused_by_the_tree_walk() {
             });
             let env = open(&path, SyncMode::Durable);
             let mut txn = env.begin_rw().expect("begin");
+            let what = format!("root {bad}, drop {dropping}");
+            if loose {
+                // A leaf and a run of three pages from the file's end, then the run freed.
+                let b = txn.create_table("b").expect("b");
+                txn.put(&b, b"k", &value(2, 0, 9000)).expect("put");
+                txn.put(&b, b"k", b"v").expect("put");
+                let pool = txn.writer_mut().alloc.pool().to_vec();
+                assert!(pool.contains(&bad), "{what}: the root is loose: {pool:?}");
+            }
             let t = txn.open_table("t").expect("open").expect("t");
             let err = if dropping { txn.drop_table(t) } else { txn.clear_table(&t) }.unwrap_err();
-            let what = format!("root {bad}, drop {dropping}");
-            assert!(
-                matches!(&err, Error::Corrupt(m) if m.starts_with("tree walk: root ")),
-                "{what}: {err}"
-            );
+            let want = if loose {
+                format!("tree walk: page {bad} is past the ")
+            } else {
+                "tree walk: root ".to_string()
+            };
+            assert!(matches!(&err, Error::Corrupt(m) if m.starts_with(&want)), "{what}: {err}");
             drop(txn);
             assert!(env.failure().is_some(), "{what}: latched");
             assert!(matches!(env.begin_rw(), Err(Error::Failed(_))), "{what}: writes fail");
@@ -699,6 +769,70 @@ fn a_free_of_a_tree_refuses_a_leaf_this_transaction_holds_for_another() {
             drop(ro);
             drop(env);
             fs::remove_file(&path).expect("remove");
+        }
+    }
+}
+
+/// A table `a` of 200 rows (a root branch over leaves, no runs) whose root's last child is forged
+/// to name page `page_count + past`, past the state's pages, the root's CRC stamped again. Returns
+/// the forged page.
+fn a_forged_past_the_page_count(path: &Path, past: u32) -> u32 {
+    let env = open(path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let a = txn.create_table("a").expect("a");
+    for i in 0..200_u32 {
+        txn.put(&a, &i.to_be_bytes(), &value(1, i, 100)).expect("put");
+    }
+    txn.commit().expect("commit");
+    let root = tree(&env, "a");
+    assert_eq!((root.height, root.overflow_pages), (2, 0), "{root:?}");
+    let forged = env.inner().current().meta.page_count + past;
+    drop(env);
+    restamped(path, root.root, |page| set_child(page, page::nkeys(page) - 1, forged));
+    forged
+}
+
+/// A branch of table `a` names a page past the state's page count that this transaction
+/// allocated (a page of a run it wrote) and freed again, so the page is loose, in the pool. A
+/// published branch, or a copy this transaction made of it (a put into `a`'s first leaf copies
+/// the root with the forged cell), hands it to `drop_table`'s and `clear_table`'s walk, which
+/// takes a run-less tree's leaves from their parents' pointers without reading them. The walk
+/// refuses it (`Corrupt`, naming the page) before anything is freed, and the damage latches.
+/// Freed, the page would be in the pool and listed free at once: a later allocation would commit
+/// it listed free and reachable from another table.
+#[test]
+fn a_free_of_a_tree_refuses_a_child_past_the_page_count_this_transaction_freed() {
+    for copied in [false, true] {
+        for dropping in [false, true] {
+            let what = format!("copied parent {copied}, drop {dropping}");
+            let (_dir, path) = temp("tn_lmdb_damage_loose");
+            let forged = a_forged_past_the_page_count(&path, 2);
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("begin");
+            // A leaf and a run of three pages from the file's end, then the run freed: loose.
+            let b = txn.create_table("b").expect("b");
+            txn.put(&b, b"k", &value(2, 0, 9000)).expect("put");
+            txn.put(&b, b"k", b"v").expect("put");
+            let a = txn.open_table("a").expect("open").expect("a");
+            if copied {
+                txn.put(&a, &0_u32.to_be_bytes(), b"x").expect("put");
+            }
+            let lists = |txn: &mut RwTxn| {
+                let alloc = &txn.writer_mut().alloc;
+                (alloc.pool().to_vec(), alloc.freed().to_vec())
+            };
+            let before = lists(&mut txn);
+            assert!(before.0.contains(&forged), "{what}: page {forged} is loose: {before:?}");
+            let got = if dropping { txn.drop_table(a) } else { txn.clear_table(&a) };
+            let want = format!("tree walk: page {forged} is past the ");
+            match got {
+                Err(Error::Corrupt(e)) => assert!(e.contains(&want), "{what}: {e}"),
+                other => panic!("{what}: {other:?}"),
+            }
+            assert!(lists(&mut txn) == before, "{what}: nothing freed");
+            drop(txn);
+            assert!(env.failure().is_some(), "{what}: the damage latched");
+            assert!(matches!(env.begin_rw(), Err(Error::Failed(_))), "{what}: writes fail");
         }
     }
 }

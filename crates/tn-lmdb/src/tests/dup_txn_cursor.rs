@@ -1458,6 +1458,44 @@ fn refused_writes_through_a_dup_cursor_change_nothing() {
     txn.abort();
 }
 
+/// A put, insert or append through a dup cursor and through its twin's cursor, on a row or in
+/// the deleted state, after the environment latched (another thread's check met damage, say):
+/// each is `Failed` and leaves its cursor unset, its deleted state cleared, as a failed
+/// `delete_current` leaves it, so the twins' next calls still agree (from unset, the first row).
+#[test]
+fn a_write_refused_by_the_latch_leaves_a_dup_cursor_and_its_twin_alike() {
+    for options in [OPTIONS, PACKING] {
+        for (kind, deleted) in [("put", false), ("insert", true), ("append", false), ("put", true)]
+        {
+            let what = format!("packed_max {}, {kind}, deleted {deleted}", options.packed_max);
+            let keys = [(1, 4), (2, 3)];
+            let (_dir, env, d, p, _) = setup_with("tn_lmdb_dup_txn_latched", &keys, options);
+            let mut txn = env.begin_rw().expect("rw");
+            let (mut c, mut t) = pair(&txn, &d, &p);
+            assert!(c.seek_exact(&txn, &row_key(1, 2)).expect("seek").is_some());
+            assert!(t.seek_exact(&txn, &row_key(1, 2)).expect("seek").is_some());
+            if deleted {
+                assert!(c.delete_current(&mut txn).expect("delete"));
+                assert!(t.delete_current(&mut txn).expect("delete"));
+                assert_eq!((c.state(), t.state()), ((State::At, true), (State::At, true)));
+            }
+            env.inner().latch.fail("latched by a test".into());
+            let key = if kind == "append" { row_key(3, 0) } else { row_key(1, 9) };
+            let (a, b) = match kind {
+                "put" => (c.put(&mut txn, &key, b"w"), t.put(&mut txn, &key, b"w")),
+                "insert" => (c.insert(&mut txn, &key, b"w"), t.insert(&mut txn, &key, b"w")),
+                _ => (c.append(&mut txn, &key, b"w"), t.append(&mut txn, &key, b"w")),
+            };
+            let failed = |r: &Result<()>| matches!(r, Err(Error::Failed(_)));
+            assert!(failed(&a) && failed(&b), "{what}: {a:?}, {b:?}");
+            assert_eq!(c.state(), (State::Unset, false), "{what}: the dup cursor");
+            assert_eq!(t.state(), (State::Unset, false), "{what}: the twin's cursor");
+            assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "{what}: next");
+            assert_eq!(key_of(c.current(&txn)), Some(row_key(1, 0)), "{what}: the first row");
+        }
+    }
+}
+
 /// A cursor's put into the key of the row it is at, after another writer created a key before it
 /// (moving the outer path's slots), finds its row by key rather than keep the stale outer path: a
 /// scan from it then crosses to the right keys. A put that creates a key is found by key too.

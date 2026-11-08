@@ -815,8 +815,9 @@ impl Rows {
     /// place it for (an insert of a present key: on the key, its first row on a dup-sort table;
     /// an append out of order: on the last row, for `append_dup` the key's last or first), leaves
     /// it at the engine cursor's place ([`Pos::Engine`]). A size the engine refuses changes
-    /// nothing, the engine cursor included, so the cursor keeps its state, as MDBX's does; so it
-    /// does after damage, which fails the environment.
+    /// nothing, the engine cursor included, so the cursor keeps its state, as MDBX's does. A
+    /// failure that latches the environment (damage, I/O, a broken invariant) leaves the engine
+    /// cursor unset and this one where it was: the transaction can no longer commit.
     fn wrote(&mut self, result: &tn_lmdb::Result<()>) {
         if matches!(
             result,
@@ -1600,6 +1601,16 @@ impl Deferred {
     }
 }
 
+/// Whether `result` is a failure the engine latches the environment on (damage, I/O, a broken
+/// invariant), after which its write cursors are unset; a refusal (a size, `KeyExists`, ...) is
+/// not.
+fn latches(result: &tn_lmdb::Result<()>) -> bool {
+    matches!(
+        result,
+        Err(tn_lmdb::Error::Corrupt(_) | tn_lmdb::Error::Io(_) | tn_lmdb::Error::Failed(_))
+    )
+}
+
 /// A held delete's row was not where its cursor found it: no accessor writes before running it,
 /// so the table is damaged or the adapter wrong.
 fn held_row_missing(table: &EngineTable) -> tn_lmdb::Error {
@@ -1786,9 +1797,12 @@ impl<T: Table> TnLmdbCursorMut<T> {
                 let put = cursor.put(txn, stored, rest);
                 if put.is_ok() {
                     state.deferred.count(FUSED);
-                } else {
+                } else if !latches(&put) {
                     // A refused put changes nothing, the cursor included: the delete runs as it
-                    // would have before the upsert (a failure of it is kept for the commit).
+                    // would have before the upsert (a failure of it is kept for the commit). A
+                    // put that latched the environment left the engine cursor unset, and no
+                    // commit can follow: the delete does not run, and the put's error is the
+                    // call's.
                     state.deferred.count(BY_OWNER);
                     if let Ok(pos) = state.deferred.run(cursor, txn, &table, dup) {
                         rows.pos = pos;

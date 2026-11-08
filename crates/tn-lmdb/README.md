@@ -930,8 +930,11 @@ checks as `Cursor`'s.
 `Env::open` (`env.rs`) runs these steps:
 
 1. **Validate the options.** `options.page_size` must be a valid page size, else
-   `InvalidPageSize`, and `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
-   `InvalidMaxGrowth`, even for an existing file. Nothing is created or opened before.
+   `InvalidPageSize`, `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
+   `InvalidMaxGrowth`, and `options.map_reserve` at most `isize::MAX`, else `InvalidMapReserve`,
+   even for an existing file. Nothing is created or opened before. A reservation the host refuses
+   below that (`ENOMEM` past `ulimit -v`) is an `Io` error at step 8, after a missing file was
+   created.
 2. **Create the file if it is missing or empty.** Both metas (txn 0, page count 2, empty trees)
    are written with `pwrite` to `<path>.creating`, which is opened with `O_NOFOLLOW` (a symbolic
    link there, or anything but a regular file, a directory included, fails the open with `Io` of
@@ -943,7 +946,9 @@ checks as `Cursor`'s.
    A symbolic link at the path is followed only to a file that holds bytes: a dangling link, or
    one to an empty file, is refused (`Io` of kind `NotFound`, naming the link) and nothing is
    created, because the rename would put a new, empty database in place of the link rather than
-   create its target.
+   create its target. A path that names anything but a regular file (a FIFO, a socket, a device,
+   a directory; through a symbolic link too) is refused, `Io` of kind `InvalidInput` naming it,
+   and never replaced.
 3. **Lock.** `flock(LOCK_EX | LOCK_NB)`, else `Locked`. A second open in the same process fails
    too. The locked file must be the one the path names, and non-empty. A creator may rename its
    new file over the path between this open and its lock, so the open is retried up to three
@@ -967,7 +972,11 @@ checks as `Cursor`'s.
    msync never finished, and a `create` that died or failed between its rename and its
    `fsync_directory` may have left the file's name not durable. What open reads, and the name it
    found it by, must be durable before anything is built on them
-   (`a_writer_open_syncs_the_directory_naming_the_file`).
+   (`a_writer_open_syncs_the_directory_naming_the_file`). As in PostgreSQL, an `EACCES` opening
+   the directory, or an `EINVAL`/`ENOTSUP` from its fsync, is skipped with a warning naming it
+   (such a directory never could make a name durable; the file's own fsync still runs); any other
+   error fails the open, naming the directory. Step 2's directory sync after the rename follows
+   the same rule.
 8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
    `readahead` is set ([Platform notes](#platform-notes); do-not-flag item 16); a remap past the
    reservation is advised the same way. The writer takes the bytes past the pages any meta slot
@@ -1004,7 +1013,9 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
 1. **Validate the page size**, as `Env::open` does. Of the other fields of `EnvOptions` only
    `readahead` applies (step 8).
 2. **Never create.** A missing file is `Io(NotFound)`. An empty file is `NotTnLmdb` (step 4 finds
-   no meta in it). No `<path>.creating` file is made.
+   no meta in it). No `<path>.creating` file is made. A path that names anything but a regular
+   file is refused before it is opened (`Io` of kind `InvalidInput`; the open is also
+   non-blocking), so a FIFO never blocks it.
 3. **Lock shared** (`open_shared`): `O_RDONLY`, then `flock(LOCK_SH | LOCK_NB)`
    (`sys::flock_shared`), else `Locked`. Read-only opens coexist; a writer's `LOCK_EX` excludes
    them, and they exclude it (its open is `Locked`). The locked file must be the one the path
@@ -1035,8 +1046,12 @@ by both the published page count and the mapped length (`MapView::slice`), so th
 
 ### Close
 
-An environment closes when its last `Env` clone and transaction drop (`EnvInner::drop`), in
-this order:
+An environment closes when its last `Env` clone and transaction drop (`EnvInner::drop`). The
+close runs inside that last drop, on its thread: a reader's `RoTxn` or cursor dropped on a worker
+thread can be the one that syncs and trims, and a handle still alive when the process exits (a
+detached thread's, a static's) skips the close. A `NoSync` caller that needs its commits durable
+calls `Env::sync` before it lets go of the environment, and before the process exits. The steps,
+in order:
 
 1. **A crash stops here** (the test-only `Env::crash`): no sync, no trim.
 2. **A latched environment stops here:** its newest state may not be durable and its view of the
@@ -1098,6 +1113,9 @@ A latched environment skips its close: no final sync (NoSync) and no trim ([Clos
   first.
 - Readers never block the writer and the writer never blocks readers. A long-lived reader only
   holds back page reuse, so the file grows instead.
+- **An environment belongs to the process that opened it.** A child forked without exec must not
+  use it; its drop of its copy does nothing (no final sync, no trim, nothing written). An exec'd
+  child is fine: the file descriptor is close-on-exec.
 - Multi-process access alongside a writer is out of scope. The `flock` makes a second process's
   open fail with `Locked`. Read-only opens (`Env::open_read_only`) take the lock shared, so any
   number of processes may read a file no writer holds. The lock is advisory and may hold only on
@@ -1607,7 +1625,9 @@ from a cell the map supersedes, and from the cell otherwise.
 **Errors.** Damage a move or a write through the cursor meets (an outer key of another width, an
 outer cell that is not a nested cell or, in a table that packs, a packed set, an empty or damaged
 nested root, a packed set that fails a check, a subkey of another length, any check of a descent) is
-`Corrupt`, latches, and leaves the cursor unset (a `DupTxnCursor` out of the deleted state too).
+`Corrupt`, latches, and leaves the cursor unset (a `DupTxnCursor` out of the deleted state too);
+so does a write's `Io` or `Failed` (an environment latched already included), as on the twin's
+`TxnCursor`.
 `WrongTxn`, `StaleTable`, the width refusals and refused writes change nothing and do not latch.
 
 ---
@@ -1618,12 +1638,12 @@ nested root, a packed set that fails a check, a subkey of another length, any ch
 |---|---|
 | `Env::open(path, EnvOptions) -> Result<Env>` | open or create, then recover (see above) |
 | `Env::open_read_only(path, EnvOptions) -> Result<Env>` | open an existing file no writer holds, read-only (see [Read-only open](#read-only-open)): a shared lock, the same meta choice and root checks, a read-only mapping; never creates, writes or syncs; `begin_rw`/`try_begin_rw` return `ReadOnly` |
-| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. |
+| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is an `Io` error after a missing file was created. |
 | `MIN_GROWTH` | the smallest growth step, 1 MiB, and the least `EnvOptions::max_growth` an open accepts, for a caller that checks its own setting first (the reth adapter re-exports it) |
 | `SyncMode::{Durable, NoSync}` | durable at commit, or at the next `Env::sync` or drop |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
 | `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
-| `Env::sync()` | make NoSync commits durable (a no-op when nothing is pending, and in a read-only environment) |
+| `Env::sync()` | make NoSync commits durable (a no-op when nothing is pending, and in a read-only environment); waits for an open writer in every mode, and returns `Failed` once the environment is latched |
 | `Env::check() -> CheckReport` | full structural check plus exact page accounting, each root's entry count and page counters compared with its tree. `CheckReport` gives the state's txn id and page count, the catalog, table, free-tree and free pages, the free records, and a `TableCheck { entries, pages, height }` per table. A failed accounting names the first 16 runs of leaked pages and the first 16 pages used twice, and counts the rest; the check holds 4 bytes per page of the page count, so a meta counting far more pages than the file holds data for (a crafted file) costs that much address space. |
 | `Env::stat() -> EnvStat` | `page_size`, `txn_id`, `page_count`, `tables` |
 | `Env::free_pages() -> u64` | the pages the newest committed state's free list holds (space the file can reuse before it grows; the reth adapter reports it as reth's `db.freelist` gauge): every free record read with the allocator's checks, so damage is `Corrupt` and latches |
@@ -1669,7 +1689,9 @@ shares the first `n` bytes of the current entry's key, and return it; otherwise 
 and the cursor stays where it was. For keys built as `key ‖ subkey` they walk one key's subkeys
 (the reth adapter's `next_dup` and `prev_dup`).
 
-- Not at an entry (Unset, AfterEnd, BeforeStart): `None`.
+- Not at an entry (Unset, AfterEnd, BeforeStart): `None`, except right after a delete: a write
+  cursor in the deleted state steps from the deleted entry's place, so after the table's last
+  entry is deleted `prev_in_prefix(n)` returns the new last entry when it shares the prefix.
 - `n` longer than the current key: `None` (no other key has that prefix).
 - `n = 0`: `next` (`prev`), except that at the last (first) entry it returns `None` and stays.
 - At a leaf's end the step peeks into the adjacent leaf with a copy of the cursor and keeps its
@@ -1769,7 +1791,9 @@ A write to another table (each table has its own stamp) and the cursor's own wri
 the stamp its write left) cause no reseek. A `put`, `insert` or `append` through the cursor checks
 the serial and the table, not the stamp: it places the cursor anew at the entry it wrote, from the
 path the table's path cache holds (or by key after a split), as `RwCursor` does; a refused one
-changes nothing, the cursor included, so a stale cursor is brought up to date at its next call.
+changes nothing, the cursor included, so a stale cursor is brought up to date at its next call,
+and one that fails with an error that latches (`Corrupt`, `Io`, `Failed`, the last also from an
+environment latched already) leaves the cursor unset, as a failed `delete_current` does.
 `delete_current` brings the cursor up to date first, then deletes the entry it is at, through the
 table's path cache ([Deletes and merging](#deletes-and-merging)), and lands on the follower in the
 deleted state. When the delete left the cache naming the entry's leaf (it took the entry out of
@@ -1837,9 +1861,9 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 | `Io(io::Error)` | an I/O failure (latches inside a write, commit or sync) |
 | `Corrupt(String)` | damage: a failed CRC, structure, pointer, range or accounting check, or an unopenable file (latches when found by a read, a write or `Env::check`; from an open there is no environment to latch) |
 | `Failed(String)` | the environment is latched (the first cause), or a broken internal invariant |
-| `KeyTooLarge { len, max }` / `ValueTooLarge { len, max }` | an entry over the page size's limits, or an outer key passed to `delete_prefix` longer than its dup table's `key_len` (no latch) |
-| `KeyTooShort { len, min }` | a dup table's point operation with no subkey (`len <= key_len`, `min = key_len + 1`), or a `delete_prefix` outer key shorter than `key_len` (no latch) |
-| `AppendOutOfOrder` | an append whose key does not sort strictly after the table's last key (no latch) |
+| `KeyTooLarge { len, max }` / `ValueTooLarge { len, max }` | an entry over the page size's limits, or an outer key passed to `delete_prefix` or to a dup cursor's bounded seek (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`) longer than its dup table's `key_len` (`max = key_len`) (no latch) |
+| `KeyTooShort { len, min }` | a dup table's point operation with no subkey (`len <= key_len`, `min = key_len + 1`), or an outer key passed to `delete_prefix` or to a dup cursor's bounded seek shorter than `key_len` (`min = key_len`) (no latch) |
+| `AppendOutOfOrder` | an append (`RwTxn::append`, `RwCursor::append`, `TxnCursor::append`, `DupTxnCursor::append`) whose key does not sort strictly after the table's last key (no latch) |
 | `KeyExists` | an insert (`RwTxn::insert`, `RwCursor::insert`, `TxnCursor::insert`, `DupTxnCursor::insert`) of a key the table holds (no latch) |
 | `TableNotFound(String)` / `StaleTable(String)` / `InvalidTableName` | table errors (no latch) |
 | `TableKind(String)` | a call that needs the other kind of table: `create_table` on a dup table, `create_dup_table` on a plain table or a dup table of other options, a plain cursor on a dup table, `delete_prefix` on a plain table (no latch) |
@@ -1848,6 +1872,7 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 | `UnsupportedVersion(u32)` | another format version in a meta slot |
 | `InvalidPageSize(u32)` | `EnvOptions::page_size` is not a power of two in 4K..=64K |
 | `InvalidMaxGrowth(u64)` | `EnvOptions::max_growth` is under `MIN_GROWTH` (1 MiB); refused by `Env::open` before it touches the file |
+| `InvalidMapReserve(u64)` | `EnvOptions::map_reserve` is past `isize::MAX`; refused by `Env::open` before it touches the file |
 | `Locked` | another handle (in this process or another) holds the file: any handle for `Env::open`, a writer's for `Env::open_read_only` |
 | `ReadOnly` | `begin_rw` or `try_begin_rw` in an environment opened read-only (no latch) |
 | `WrongTxn` | a `TxnCursor` or `DupTxnCursor` used with a write transaction other than the one that made it (no latch) |
@@ -1915,7 +1940,11 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   `local_lock=flock` or `local_lock=all`, FUSE file systems such as sshfs), so two hosts could
   both open the file for writing and corrupt it. A process that writes the file without the lock
   (an `rsync` into a live datadir) changes bytes readers hold: like a foreign truncation
-  ([Read-only open](#read-only-open)), it is outside the model.
+  ([Read-only open](#read-only-open)), it is outside the model. So is a file renamed over the path
+  or unlinked while an environment holds it: the environment keeps committing into an inode no
+  name holds (those commits are gone once it closes), and the lock is on that inode, so a second
+  writer opens whatever the path names now. Restore or replace a datadir only while the node is
+  stopped.
 - **Linux: every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`;
   do-not-flag item 16), unless `EnvOptions::readahead` is set: the writer's mapping at open and
   after each remap past the reservation, and a read-only environment's. Elsewhere `readahead`
@@ -1994,6 +2023,12 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 
 The entry limits are in [Limits](#limits): a table takes values up to 16 MiB, in overflow runs.
 These limits and non-goals are known:
+
+- **A file holds at most 2^32 − 1 pages** (`u32` page numbers, `u32::MAX` the null page): 16 TiB
+  at 4 KiB pages (the default), 32 TiB at 8 KiB, 64 TiB at 16 KiB, 128 TiB at 32 KiB, 256 TiB at
+  64 KiB. The page size, fixed at create, is the only lever. A write that needs a page past the
+  cap is `Failed` and latches (reads continue; a reopen can still reuse freed pages). Within a few
+  dozen pages of the cap a split's room check can report the shortfall as `Corrupt` instead.
 
 - **Dup tables have owned and detached cursors only, and pack only what fits a quarter-page
   entry.** A dup table's cursors are `DupRoCursor` and `DupTxnCursor`, and the borrowed
@@ -2134,9 +2169,11 @@ argument and the measurements. Code and other docs cite the items by number, so 
     most. See [Dup tables](#dup-tables).
 20. **A write transaction keeps one path cache per outer key it writes** (the boxed
     `write::PathCache` of each map entry, about 1 KiB), so keys written in turn do not evict each
-    other's path, and map entries are never evicted (item 18). The memory is bounded by the
-    transaction's own work: every such key already owns a private page, and the map drops at commit
-    or abort. A packed key has no entry and no path cache of its own (item 22).
+    other's path, and map entries are never evicted (item 18). The memory is bounded by the nested
+    keys the transaction's dup writes reach: each key it changed owns a private page, and a key a
+    dup delete missed or whose insert or append was refused keeps its entry too (about 1 KiB each)
+    though nothing changed. The map drops at commit or abort. A packed key has no entry and no path
+    cache of its own (item 22).
 21. **The dup cursors' shape:** a bounded seek's miss leaves the cursor unset; any change to the
     table's write stamp reseeks every dup cursor of it; a `DupTxnCursor`'s results borrow the cursor
     too; a key tail past the subkey is `Apart`; there are no borrowed dup cursors and no cursor

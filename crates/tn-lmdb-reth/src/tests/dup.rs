@@ -1915,6 +1915,54 @@ fn a_held_delete_that_meets_damage_fails_the_call_that_runs_it() {
     }
 }
 
+/// A dup rewrite's put that fails because the environment latched after its delete was held (an
+/// `Env::check` met damage in another leaf) is the call's error, and the held delete does not
+/// run: the failed put left the engine cursor unset, and no commit can follow.
+#[test]
+fn a_rewrite_put_on_a_latched_environment_skips_the_held_delete() {
+    const MARK: [u8; 32] = [0xA5; 32];
+    for form in Form::ALL {
+        let (dir, db) = create_test_db_with(TnLmdbEnvKind::RW, form);
+        db.update(|tx| {
+            for k in 0..200 {
+                tx.put::<PlainStorageState>(a(k), e(1, u64::from(k)))?;
+            }
+            let marked = StorageEntry { key: s(9), value: U256::from_be_bytes(MARK) };
+            tx.put::<PlainStorageState>(a(10), marked)
+        })
+        .unwrap()
+        .unwrap();
+        drop(db);
+        let path = dir.path().join(crate::DATA_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let marks: Vec<usize> = (0..bytes.len() - MARK.len())
+            .filter(|&at| bytes[at..at + MARK.len()] == MARK)
+            .collect();
+        assert!(!marks.is_empty(), "the row is on disk");
+        for at in marks {
+            bytes[at] ^= 0xFF;
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let db = super::open_env(dir.path(), TnLmdbEnvKind::RW, form.args()).unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert_eq!(val(c.seek_by_key_subkey(a(190), s(1))), "1", "{}", form.name());
+        assert_eq!(done(c.delete_current()), "ok", "{}: the delete is held", form.name());
+        assert!(db.check().is_err(), "{}: the check meets the damage", form.name());
+        assert!(db.failure().is_some(), "{}: latched", form.name());
+        let counts = tx.deferred_counts();
+        assert!(
+            matches!(c.upsert(a(190), &e(1, 7)), Err(DatabaseError::Write(_))),
+            "{}: the put's error is the call's",
+            form.name()
+        );
+        assert_eq!(tx.deferred_counts(), counts, "{}: the held delete did not run", form.name());
+        drop(c);
+        assert!(matches!(tx.commit(), Err(DatabaseError::Commit(_))), "{}", form.name());
+    }
+}
+
 /// A second held delete while one is held (a call that did not run the first: the test-only
 /// `TnLmdbTxMut::skip_next_held_delete_run`) is refused, `MDBX_PANIC` with the adapter's message,
 /// rather than dropping the first: the commit refuses the transaction, the environment does not

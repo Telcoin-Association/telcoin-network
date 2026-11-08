@@ -341,6 +341,10 @@ impl PageWrite for MemStore {
         self.alloc.is_stamped(pgno)
     }
 
+    fn base_page_count(&self) -> u32 {
+        self.alloc.base_page_count()
+    }
+
     fn private_page(&self, pgno: u32) -> Result<&[u8]> {
         self.span(pgno, self.geometry.page_size())
             .ok_or_else(|| Error::Corrupt(format!("private page {pgno} is not stored")))
