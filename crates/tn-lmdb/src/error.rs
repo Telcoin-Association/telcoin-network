@@ -19,6 +19,25 @@ pub enum Error {
     /// file is reopened.
     #[error("tn-lmdb: environment failed: {0}")]
     Failed(String),
+    /// The host refused to map the file: `mmap` failed with `ENOMEM` (the address space, `ulimit
+    /// -v`, or the process's count of mappings exhausted, as many environments open at once can
+    /// do). `bytes` is the length of the mapping asked for: the writer's reservation
+    /// (`EnvOptions::map_reserve` at open, a larger one at a growth past it) or the file, for
+    /// [`crate::Env::open_read_only`]. From a growth inside a write it latches the environment,
+    /// as an I/O error does.
+    #[error("tn-lmdb: out of memory: mapping {bytes} bytes of the file failed: {source}")]
+    OutOfMemory {
+        /// The length of the mapping refused.
+        bytes: u64,
+        /// The `mmap` error.
+        source: io::Error,
+    },
+    /// The file has no page number left for a write: a file holds at most 2^32 − 1 pages (16 TiB
+    /// at 4 KiB pages, 256 TiB at 64 KiB; [`crate::EnvOptions::page_size`]). It latches the
+    /// environment, as an I/O error does; reads continue, and a reopen can still reuse the pages
+    /// freed back to the free list.
+    #[error("tn-lmdb: the file is full: {0}")]
+    Full(String),
     /// A key longer than the page size allows, or an outer key longer than its dup table's
     /// `key_len` passed to [`crate::RwTxn::delete_prefix`] or to a dup cursor's bounded seek
     /// (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`), `max` then the `key_len`.
@@ -114,6 +133,41 @@ pub enum Error {
 
 /// A `Result` with [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// True for an error that latches the environment it happens in: damage, an I/O error, a
+    /// mapping refused for want of memory, a full file, a broken invariant or an environment
+    /// latched already (after it, writes and commits return [`Error::Failed`] until a reopen; a
+    /// write cursor it meets is left unset). Validation errors and an open's refusals change
+    /// nothing and do not latch.
+    pub fn latches(&self) -> bool {
+        match self {
+            Error::Corrupt(_)
+            | Error::Io(_)
+            | Error::Failed(_)
+            | Error::OutOfMemory { .. }
+            | Error::Full(_) => true,
+            Error::KeyTooLarge { .. }
+            | Error::KeyTooShort { .. }
+            | Error::ValueTooLarge { .. }
+            | Error::AppendOutOfOrder
+            | Error::KeyExists
+            | Error::TableNotFound(_)
+            | Error::StaleTable(_)
+            | Error::TableKind(_)
+            | Error::InvalidDupOptions(_)
+            | Error::InvalidTableName
+            | Error::NotTnLmdb
+            | Error::UnsupportedVersion(_)
+            | Error::InvalidPageSize(_)
+            | Error::InvalidMaxGrowth(_)
+            | Error::InvalidMapReserve(_)
+            | Error::Locked
+            | Error::ReadOnly
+            | Error::WrongTxn => false,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

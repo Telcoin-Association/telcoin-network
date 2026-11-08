@@ -1912,7 +1912,7 @@ fn max_growth_under_the_minimum_is_refused_at_open() {
 /// An `EnvOptions::map_reserve` past `isize::MAX` can never be mapped: it is refused at open as
 /// `InvalidMapReserve`, before the file is touched (a missing file is not created, an existing
 /// one keeps every byte), and a read-only open, which maps the file at its length, ignores it.
-/// `isize::MAX` itself is no refusal but the mapping's (`Io`, after the create). A tiny
+/// `isize::MAX` itself is no refusal but the mapping's (`OutOfMemory`, after the create). A tiny
 /// reservation opens and grows (each growth moves the mapping).
 #[test]
 fn a_map_reserve_past_isize_max_is_refused_at_open() {
@@ -1931,7 +1931,10 @@ fn a_map_reserve_past_isize_max_is_refused_at_open() {
     let ro = Env::open_read_only(&path, huge).expect("a read-only open ignores map_reserve");
     drop(ro);
     let most = EnvOptions { map_reserve: isize::MAX as u64, ..EnvOptions::default() };
-    assert!(matches!(Env::open(&path, most), Err(Error::Io(_))), "the mapping's refusal");
+    let refused = Env::open(&path, most).map(drop);
+    let Err(Error::OutOfMemory { bytes, source }) = &refused else { panic!("{refused:?}") };
+    assert_eq!((*bytes, source.raw_os_error()), (isize::MAX as u64, Some(libc::ENOMEM)));
+    assert!(refused.unwrap_err().to_string().contains("out of memory"), "the mapping's refusal");
     let tiny = EnvOptions { map_reserve: 1, ..EnvOptions::default() };
     let env = Env::open(&path, tiny).expect("a tiny reservation opens");
     put_all(&env, "b", &[(b"k", &[7; 3 << 20][..])]);

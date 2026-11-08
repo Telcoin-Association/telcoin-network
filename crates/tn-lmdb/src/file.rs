@@ -611,7 +611,7 @@ impl ReadOnlyFile {
         // SAFETY: the shared lock keeps every tn-lmdb writer out, so nothing changes the file while
         // it is mapped (a foreign process truncating it is outside the crate's contract, as for a
         // writer's mapping), and readers read only the published bytes, inside the file.
-        let map = unsafe { MmapOptions::new().len(len).map(&file) }?;
+        let map = mapped(unsafe { MmapOptions::new().len(len).map(&file) }, len)?;
         advise_access(readahead, |advice| map.advise(advice));
         let view = Arc::new(MapView::new());
         view.set_mapping(map.as_ptr(), map.len() as u64);
@@ -641,9 +641,18 @@ fn map_reservation(file: &File, len: u64, readahead: bool) -> Result<MmapRaw> {
     // single writer (the database holds an exclusive lock on it), and the pages past the end of
     // file are never touched: the writer's accessors stop at the file length, readers at the
     // published length.
-    let map = MmapOptions::new().len(len).map_raw(file)?;
+    let map = mapped(MmapOptions::new().len(len).map_raw(file), len)?;
     advise_access(readahead, |advice| map.advise(advice));
     Ok(map)
+}
+
+/// The mapping `map` of `len` bytes, its refusal for want of memory ([`libc::ENOMEM`]) as
+/// [`Error::OutOfMemory`], any other failure as [`Error::Io`].
+fn mapped<M>(map: io::Result<M>, len: usize) -> Result<M> {
+    map.map_err(|source| match source.raw_os_error() {
+        Some(libc::ENOMEM) => Error::OutOfMemory { bytes: len as u64, source },
+        _ => Error::Io(source),
+    })
 }
 
 /// Advise a new mapping of the page file through `advise` (its `advise` method): `MADV_RANDOM`,

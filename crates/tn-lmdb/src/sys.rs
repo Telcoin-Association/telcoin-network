@@ -30,7 +30,8 @@ use std::{fs::File, io, os::fd::AsRawFd, path::Path};
 /// directory the process may enter and write but not read) and an `EINVAL`, `ENOTSUP` or
 /// `EOPNOTSUPP` from its fsync (a file system with no directory fsync) are skipped with a
 /// warning naming the directory, since such a directory never could make the name durable and
-/// the file's own sync still runs. Every other error fails, naming the directory (its kind kept).
+/// the file's own sync still runs. Every other error fails, naming the directory, with the
+/// original error as its source (its kind and OS error code kept: [`Context`]).
 pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
     let skipped = |what: &str, e: &io::Error| {
         tracing::warn!(
@@ -40,7 +41,7 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
         );
     };
     let failed = |what: &str, e: io::Error| {
-        io::Error::new(e.kind(), format!("syncing the directory {}: {what}: {e}", path.display()))
+        Context::wrap(format!("syncing the directory {}: {what}", path.display()), e)
     };
     let dir = match File::open(path) {
         Ok(dir) => dir,
@@ -63,6 +64,38 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     DIR_SYNC_LOG.with(|log| log.borrow_mut().push(path.to_path_buf()));
     Ok(())
+}
+
+/// An I/O error with what was being done when it happened (`what: error`). Wrapped in an
+/// `io::Error` of the original's kind, it is that error's payload and keeps the original as its
+/// source, so a caller that walks the sources (as the reth adapter does for an error's code)
+/// still finds the OS error code, which the wrapping `io::Error` itself no longer carries.
+#[derive(Debug)]
+struct Context {
+    /// What was being done.
+    what: String,
+    /// The error it met.
+    source: io::Error,
+}
+
+impl Context {
+    /// `source`, as an `io::Error` of its kind that says it happened while doing `what`.
+    #[cold]
+    fn wrap(what: String, source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), Context { what, source })
+    }
+}
+
+impl std::fmt::Display for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.source)
+    }
+}
+
+impl std::error::Error for Context {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +300,19 @@ fn flock(file: &File, op: libc::c_int) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+
+    /// A directory sync that fails names the directory and keeps the original error as its
+    /// source, the OS error code with it, and the original kind.
+    #[test]
+    fn a_failed_directory_sync_keeps_the_original_error() {
+        let tmp = tempfile::TempDir::with_prefix("tn_lmdb_dir_sync").expect("temp dir");
+        let missing = tmp.path().join("missing");
+        let e = fsync_directory(&missing).expect_err("no such directory");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(e.to_string().contains(&missing.display().to_string()), "{e}");
+        let source = std::error::Error::source(&e).and_then(|s| s.downcast_ref::<io::Error>());
+        assert_eq!(source.and_then(io::Error::raw_os_error), Some(libc::ENOENT), "{e:?}");
+    }
 
     /// A second open of the same file, even in this process, cannot take the lock while the first
     /// holds it, and can once the first is closed.

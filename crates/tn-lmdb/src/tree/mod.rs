@@ -184,13 +184,13 @@ impl TreeRoot {
         Error::Corrupt(format!("tree root {self:?} {what}"))
     }
 
-    /// Count a new overflow run of `n` pages (a put's). Only a damaged handle can count past
-    /// [`MAX_TREE_PAGES`]: [`Error::Corrupt`], the handle unchanged.
-    pub(crate) fn add_run(&mut self, n: u32) -> Result<()> {
+    /// Count a new overflow run of `n` pages (a put's), the handle unchanged on an error. A count
+    /// past [`MAX_TREE_PAGES`] is [`Error::Full`] when the tree's pages lie within the
+    /// `file_pages` the file holds (a sound tree filling the file), else [`Error::Corrupt`] (only
+    /// a damaged handle counts more pages than the file).
+    pub(crate) fn add_run(&mut self, n: u32, file_pages: u32) -> Result<()> {
         if self.pages() + u64::from(n) > MAX_TREE_PAGES {
-            return Err(Error::Corrupt(format!(
-                "tree root {self:?} counts more pages than a tree holds with a run of {n} more"
-            )));
+            return Err(room_error(self, file_pages, format_args!("a run of {n} more")));
         }
         // Within the limit every counter is below `u32::MAX`.
         self.overflow_pages += n;
@@ -418,6 +418,20 @@ pub(crate) trait PageWrite: PageRead {
     fn merges_applied(&mut self, _report: write::MergeReport) {}
 }
 
+/// The error of a write whose tree `root` would count more than [`MAX_TREE_PAGES`] pages with
+/// `more`: [`Error::Full`] when its pages lie within the `file_pages` the file holds (a sound tree
+/// counts at most the file's pages, so it is filling the file's page numbers), else
+/// [`Error::Corrupt`] (a damaged count).
+#[cold]
+fn room_error(root: &TreeRoot, file_pages: u32, more: std::fmt::Arguments<'_>) -> Error {
+    if root.pages() < u64::from(file_pages) {
+        return Error::Full(format!(
+            "tree root {root:?} has no room in the file's page numbers for {more}"
+        ));
+    }
+    Error::Corrupt(format!("tree root {root:?} counts more pages than a tree holds with {more}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +530,36 @@ mod tests {
         ];
         for root in bad {
             assert!(matches!(TreeRoot::decode(&root.encode()), Err(Error::Corrupt(_))), "{root:?}");
+        }
+    }
+
+    /// A run past the page bound is `Full` for a tree within the file's pages (one filling the
+    /// file) and `Corrupt` for one counting more pages than the file holds, the handle unchanged
+    /// either way; a run up to the bound counts.
+    #[test]
+    fn a_run_past_the_page_bound_is_full_or_corrupt_by_the_file() {
+        let near = TreeRoot {
+            branch_pages: 2,
+            leaf_pages: 3,
+            overflow_pages: MAX_TREE_PAGES as u32 - 10,
+            ..THREE
+        };
+        let room = MAX_TREE_PAGES - near.pages();
+        let mut root = near;
+        root.add_run(room as u32, NULL_PGNO).expect("the last pages a tree can hold");
+        assert_eq!(root.pages(), MAX_TREE_PAGES);
+        let counted = near.pages() as u32;
+        for (file_pages, full) in
+            [(NULL_PGNO, true), (counted + 1, true), (counted, false), (1000, false)]
+        {
+            let mut root = near;
+            let done = root.add_run(room as u32 + 1, file_pages);
+            match done {
+                Err(Error::Full(_)) if full => {}
+                Err(Error::Corrupt(_)) if !full => {}
+                other => panic!("a file of {file_pages} pages: {other:?}"),
+            }
+            assert_eq!(root, near, "a refused run changes nothing");
         }
     }
 

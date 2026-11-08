@@ -27,7 +27,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 | file | role |
 |---|---|
 | `lib.rs` | Crate docs, `compile_error!` off unix, the re-exports (the whole public API). |
-| `error.rs` | `Error` (`thiserror`) and `Result`. |
+| `error.rs` | `Error` (`thiserror`) and `Result`; `Error::latches`, the one list of the errors that latch (the latch, the write cursors' unset arms and the adapter read it). |
 | `env.rs` | `Env`: open and recovery, steps 1–9 (`choose_state` 4–6, `checked_snapshot` 9; README "Open and recovery"), `open_read_only` (README "Read-only open"), the writer hand-off, snapshots (`Snapshot::page_again`, do-not-flag 14; `Snapshot` aligned to 128 bytes, its `Arc` counts on a line of their own), the reader queue (`Published`, `reuse_gate`, `Env::oldest_reader_age`), commit steps 3–6 (`stamp_private`, `make_durable`, `data_sync`), `alloc`, `copy_published_with` (a private source refused; `copy_unpublished`), `io_stats`, the test-only `CrashAt`, the close (`EnvInner::drop`, `Writer::trim_tail`; README "Close"). |
 | `stats.rs` | `IoStats` (public, each counter documented; `since`), `elapsed_ns` and `lap`, the commit steps' clock reads. |
 | `txn.rs` | Transactions and handles: `RoTxn`, `RwTxn`, `ReadTxn`; `Table` resolution through the snapshot's `TableRoots` (`RoTxn::root`, `resolve_root`; do-not-flag 15); commit steps 1–3 and 7 (`Work::commit`, `Work::flush_nested` first). Cursors: `RoCursor`, `RwCursor`, `TxnCursor` (detached; `Tracker` checks `Work::set_record`'s stamp, `Work::schema`, `Work::serial`), `DupRoCursor`, `DupTxnCursor` (`WorkRoots`). Dup tables: `dup_put`, `dup_delete` (the record's totals counted before the write changes anything the transaction reads, but for a sum past a counter's type: `OtherTrees`), `dup_delete_prefix`, `dup_get`, `packed_put`, `packed_delete`, `promote`, the working map (`Working::nested`, `dup_entry`, `held_cell`: do-not-flag 29), the free walks (`free_dup_table`; `WalkRoots`, their `write::NestedRoots`). See the dup rules in Rules of the crate. |
@@ -78,7 +78,8 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   `overflow::encode_run` the whole run). Debug builds fill each with `tree::POISON`, so a
   reliance on zeros fails the tests (README do-not-flag 17).
 - **Damage returns `Error::Corrupt` and latches** (`fail_damaged`). I/O, growth and commit errors
-  and panics latch through `fail` or `UnwindLatch`. Validation errors (`KeyTooLarge`,
+  (a refused mapping is `OutOfMemory`, a file out of page numbers `Full`) and panics latch through
+  `fail` or `UnwindLatch`; `Error::latches` is the one list, so a new variant is classed there. Validation errors (`KeyTooLarge`,
   `KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, table errors, `TableKind`,
   `InvalidDupOptions`, `ReadOnly`, `WrongTxn`) are checked before anything changes and do not latch.
   A broken writer invariant (a split or new root that cannot be laid out, an outer cell past its

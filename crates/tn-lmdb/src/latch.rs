@@ -43,33 +43,16 @@ impl Latch {
         self.failed.store(true, Ordering::Release);
     }
 
-    /// Latch the failure `error` stands for, if it is one: damage ([`Error::Corrupt`]) through
-    /// [`Self::fail_damaged`]; an I/O error or a broken invariant ([`Error::Io`],
-    /// [`Error::Failed`]) through [`Self::fail`]. Validation errors (an entry over the limits, an
-    /// append out of order, an insert of a present key, a table error, a write asked of a
-    /// read-only environment) change nothing and do not latch.
+    /// Latch the failure `error` stands for, if it is one ([`Error::latches`]): damage
+    /// ([`Error::Corrupt`]) through [`Self::fail_damaged`], any other through [`Self::fail`].
+    /// Validation errors (an entry over the limits, an append out of order, an insert of a present
+    /// key, a table error, a write asked of a read-only environment) change nothing and do not
+    /// latch.
     pub(crate) fn latch_error(&self, error: &Error) {
         match error {
             Error::Corrupt(cause) => self.fail_damaged(cause.clone()),
-            Error::Io(_) | Error::Failed(_) => self.fail(error.to_string()),
-            Error::KeyTooLarge { .. }
-            | Error::KeyTooShort { .. }
-            | Error::ValueTooLarge { .. }
-            | Error::AppendOutOfOrder
-            | Error::KeyExists
-            | Error::TableNotFound(_)
-            | Error::StaleTable(_)
-            | Error::TableKind(_)
-            | Error::InvalidDupOptions(_)
-            | Error::InvalidTableName
-            | Error::NotTnLmdb
-            | Error::UnsupportedVersion(_)
-            | Error::InvalidPageSize(_)
-            | Error::InvalidMaxGrowth(_)
-            | Error::InvalidMapReserve(_)
-            | Error::Locked
-            | Error::ReadOnly
-            | Error::WrongTxn => {}
+            e if e.latches() => self.fail(e.to_string()),
+            _ => {}
         }
     }
 

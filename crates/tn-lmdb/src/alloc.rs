@@ -434,7 +434,7 @@ impl Allocator {
         }
         let p = self.next_pgno;
         if p == NULL_PGNO {
-            return Err(Error::Failed("the file has used every page number".to_string()));
+            return Err(Error::Full("the file has used every page number".to_string()));
         }
         grow(p + 1)?;
         self.next_pgno = p + 1;
@@ -471,7 +471,7 @@ impl Allocator {
                 let p = self.next_pgno - tail;
                 // An end within `u32` keeps every page of the run below the null page.
                 let Some(end) = p.checked_add(n) else {
-                    return Err(Error::Failed(format!(
+                    return Err(Error::Full(format!(
                         "the file has no {n} page numbers left for an overflow run"
                     )));
                 };
@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(a.allocate_run(1, |_| panic!("the pool fits")).expect("run"), 12);
 
         let mut end = Allocator::new(1, NULL_PGNO - 2);
-        assert!(matches!(end.allocate_run(3, |_| Ok(())), Err(Error::Failed(_))));
+        assert!(matches!(end.allocate_run(3, |_| Ok(())), Err(Error::Full(_))));
         assert_eq!(end.allocate_run(2, |_| Ok(())).expect("the last two"), NULL_PGNO - 2);
         assert_eq!(end.page_count(), NULL_PGNO);
     }
@@ -1091,7 +1091,7 @@ mod tests {
     fn page_numbers_run_out_before_null() {
         let mut a = Allocator::new(1, NULL_PGNO - 1);
         assert_eq!(a.allocate(|_| Ok(())).expect("last"), NULL_PGNO - 1);
-        assert!(matches!(a.allocate(|_| Ok(())), Err(Error::Failed(_))));
+        assert!(matches!(a.allocate(|_| Ok(())), Err(Error::Full(_))));
         assert_eq!(a.page_count(), NULL_PGNO);
     }
 

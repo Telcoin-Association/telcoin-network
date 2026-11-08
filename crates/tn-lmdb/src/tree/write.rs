@@ -216,14 +216,12 @@ impl std::fmt::Debug for Removed {
     }
 }
 
-/// The [`Error::Corrupt`] of a split refused by [`put_from_root`] before anything changes: the
-/// handle the put leaves, `after`, has no room for the `needed` pages its worst case can take.
+/// The error of a split refused by [`put_from_root`] before anything changes: the handle the put
+/// leaves, `after`, has no room for the `needed` pages its worst case can take, in a file of
+/// `file_pages` pages ([`Error::Full`] for a tree filling the file, else [`Error::Corrupt`]).
 #[cold]
-fn split_room_error(after: &TreeRoot, needed: usize) -> Error {
-    Error::Corrupt(format!(
-        "tree root {after:?} counts more pages than a tree holds with the {needed} its split can \
-         take"
-    ))
+fn split_room_error(after: &TreeRoot, needed: usize, file_pages: u32) -> Error {
+    super::room_error(after, file_pages, format_args!("the {needed} pages its split can take"))
 }
 
 /// A broken invariant of this module (not damage on disk): the writer must stop.
@@ -575,7 +573,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
         after.remove_run(n)?;
     }
     if let Some(n) = run_pages {
-        after.add_run(n)?;
+        after.add_run(n, store.page_count())?;
     }
     match change {
         LeafChange::Replace(_) => {}
@@ -585,7 +583,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
                 after.add_entry()?;
             }
             if after.pages() + needed as u64 > MAX_TREE_PAGES {
-                return Err(split_room_error(&after, needed));
+                return Err(split_room_error(&after, needed, store.page_count()));
             }
         }
     }
@@ -6402,6 +6400,30 @@ mod tests {
     fn write_state(store: &MemStore, root: &TreeRoot) -> WriteState {
         let lists = (store.alloc.freed().to_vec(), store.alloc.pool().to_vec());
         (*root, store.reachable(root), lists.0, lists.1, store.alloc.page_count())
+    }
+
+    /// A split refused for room under a handle whose pages lie within the file's (a sound tree
+    /// filling the file's page numbers) is `Full`, not damage, and changes nothing; the same
+    /// count in a file of fewer pages is `Corrupt`
+    /// (`an_entry_count_past_a_trees_bounds_is_corrupt`).
+    #[test]
+    fn a_split_with_no_page_numbers_left_is_full() {
+        let max = MemStore::new(4096).geometry().max_value(200);
+        let (mut store, root, _) = two_leaf_tree(20);
+        // The file at the page-number cap: only the room check reads the count, and it refuses
+        // before any page is taken.
+        store.alloc = crate::alloc::Allocator::new(store.alloc.txn(), crate::tree::NULL_PGNO);
+        let mut handle = TreeRoot { leaf_pages: (MAX_TREE_PAGES - 2) as u32, ..root };
+        assert_eq!(
+            handle.pages(),
+            MAX_TREE_PAGES - 1,
+            "the most a sound tree beside the catalog counts"
+        );
+        let before = write_state(&store, &handle);
+        let done = put(&mut store, &mut handle, &id_key(100, 200), &vec![1; max]);
+        let Err(Error::Full(m)) = &done else { panic!("{done:?}") };
+        assert!(m.contains("no room in the file's page numbers"), "{m}");
+        assert!(write_state(&store, &handle) == before, "the refused split changed something");
     }
 
     /// A handle counting past what any tree holds is `Corrupt` naming the root, refused before

@@ -4010,10 +4010,10 @@ impl TxnCursor {
             Ok(placed) => placed,
             Err(e) => {
                 // A refusal changes nothing, the cursor included; a failure the environment
-                // latches (damage, I/O, a broken invariant, an environment latched already)
-                // leaves it unset, as a failed `delete_current` does and as a `DupTxnCursor`'s
-                // write leaves it.
-                if matches!(e, Error::Corrupt(_) | Error::Io(_) | Error::Failed(_)) {
+                // latches ([`Error::latches`]: damage, I/O, a full file, a broken invariant, an
+                // environment latched already) leaves it unset, as a failed `delete_current` does
+                // and as a `DupTxnCursor`'s write leaves it.
+                if e.latches() {
                     self.tree.unset();
                     self.deleted = false;
                 }
@@ -4819,9 +4819,8 @@ impl DupTxnCursor {
             Ok(placed) => placed,
             Err(e) => {
                 // A refusal changes nothing, the cursor included; a failure the environment
-                // latches (damage, I/O, a broken invariant) leaves it unset, as a failed
-                // `delete_current` does.
-                if matches!(e, Error::Corrupt(_) | Error::Io(_) | Error::Failed(_)) {
+                // latches ([`Error::latches`]) leaves it unset, as a failed `delete_current` does.
+                if e.latches() {
                     self.walk.unset();
                     self.deleted = false;
                 }

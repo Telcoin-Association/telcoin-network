@@ -1601,14 +1601,11 @@ impl Deferred {
     }
 }
 
-/// Whether `result` is a failure the engine latches the environment on (damage, I/O, a broken
-/// invariant), after which its write cursors are unset; a refusal (a size, `KeyExists`, ...) is
-/// not.
+/// Whether `result` is a failure the engine latches the environment on
+/// ([`tn_lmdb::Error::latches`]: damage, I/O, a full file, a broken invariant), after which its
+/// write cursors are unset; a refusal (a size, `KeyExists`, ...) is not.
 fn latches(result: &tn_lmdb::Result<()>) -> bool {
-    matches!(
-        result,
-        Err(tn_lmdb::Error::Corrupt(_) | tn_lmdb::Error::Io(_) | tn_lmdb::Error::Failed(_))
-    )
+    result.as_ref().is_err_and(tn_lmdb::Error::latches)
 }
 
 /// A held delete's row was not where its cursor found it: no accessor writes before running it,

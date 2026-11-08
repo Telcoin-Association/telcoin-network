@@ -142,7 +142,7 @@ pub struct EnvOptions {
     /// `isize::MAX` bytes can never be mapped: [`Env::open`] refuses it
     /// ([`Error::InvalidMapReserve`]) before it touches the file. A reservation the host refuses
     /// (past the address space, or past `ulimit -v` on Linux: `ENOMEM`) fails the open with
-    /// [`Error::Io`] after a missing file was created.
+    /// [`Error::OutOfMemory`] after a missing file was created.
     pub map_reserve: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
@@ -1186,10 +1186,10 @@ impl Env {
     /// an invalid `options.page_size`; [`Error::InvalidMaxGrowth`] for an `options.max_growth`
     /// under [`MIN_GROWTH`](crate::MIN_GROWTH); [`Error::InvalidMapReserve`] for an
     /// `options.map_reserve` past `isize::MAX` (all three refused before the file is touched);
-    /// [`Error::Io`] for a reservation the host refuses (a missing file is created first),
-    /// `NotFound` for a symbolic link at `path` to a missing or empty file, and
-    /// `InvalidInput` naming it for a `<path>.creating` that is a symbolic link or not a regular
-    /// file when the open would create the file (each left as it is).
+    /// [`Error::OutOfMemory`] for a reservation the host refuses (a missing file is created
+    /// first); [`Error::Io`] `NotFound` for a symbolic link at `path` to a missing or empty file,
+    /// and `InvalidInput` naming it for a `<path>.creating` that is a symbolic link or not a
+    /// regular file when the open would create the file (each left as it is).
     pub fn open(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         let path = path.as_ref();
         Geometry::new(options.page_size)?;

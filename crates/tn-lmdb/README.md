@@ -942,8 +942,8 @@ checks as `Cursor`'s.
    `InvalidPageSize`, `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
    `InvalidMaxGrowth`, and `options.map_reserve` at most `isize::MAX`, else `InvalidMapReserve`,
    even for an existing file. Nothing is created or opened before. A reservation the host refuses
-   below that (`ENOMEM` past `ulimit -v`) is an `Io` error at step 8, after a missing file was
-   created.
+   below that (`ENOMEM`: the address space or `ulimit -v`) is `OutOfMemory` at step 8, after a
+   missing file was created.
 2. **Create the file if it is missing or empty.** Both metas (txn 0, page count 2, empty trees)
    are written with `pwrite` to `<path>.creating`, which is opened with `O_NOFOLLOW` (a symbolic
    link there, or anything but a regular file, a directory included, fails the open with `Io` of
@@ -1090,7 +1090,7 @@ in order:
 | latches (later writes and commits return `Failed`) | does not latch |
 |---|---|
 | any error inside `commit` or `sync` (`fail`; `fail_damaged` for `Corrupt`) | `KeyTooLarge`, `KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, `ReadOnly` |
-| an I/O or growth error in a write (`fail`); a failed msync also poisons the file, which is never retried | `TableNotFound`, `StaleTable`, `TableKind`, `InvalidTableName`, `InvalidDupOptions`, `WrongTxn` |
+| an I/O or growth error in a write (`fail`), a refused mapping (`OutOfMemory`) or a full file (`Full`) included; a failed msync also poisons the file, which is never retried | `TableNotFound`, `StaleTable`, `TableKind`, `InvalidTableName`, `InvalidDupOptions`, `WrongTxn` |
 | a panic part way through a write, commit or sync (`UnwindLatch` guard; one a destructor runs while an unrelated panic unwinds latches only on a panic of its own) | a miss (`Ok(None)`) |
 | `Corrupt` from any read, get, cursor move or write (`fail_damaged`) | errors from `Env::open` (there is no environment yet) |
 | a failed `Env::check` | |
@@ -1647,7 +1647,7 @@ so does a write's `Io` or `Failed` (an environment latched already included), as
 |---|---|
 | `Env::open(path, EnvOptions) -> Result<Env>` | open or create, then recover (see above) |
 | `Env::open_read_only(path, EnvOptions) -> Result<Env>` | open an existing file no writer holds, read-only (see [Read-only open](#read-only-open)): a shared lock, the same meta choice and root checks, a read-only mapping; never creates, writes or syncs; `begin_rw`/`try_begin_rw` return `ReadOnly` |
-| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is an `Io` error after a missing file was created. |
+| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is `OutOfMemory` after a missing file was created. |
 | `MIN_GROWTH` | the smallest growth step, 1 MiB, and the least `EnvOptions::max_growth` an open accepts, for a caller that checks its own setting first (the reth adapter re-exports it) |
 | `SyncMode::{Durable, NoSync}` | durable at commit, or at the next `Env::sync` or drop |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
@@ -1870,6 +1870,8 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 | `Io(io::Error)` | an I/O failure (latches inside a write, commit or sync) |
 | `Corrupt(String)` | damage: a failed CRC, structure, pointer, range or accounting check, or an unopenable file (latches when found by a read, a write or `Env::check`; from an open there is no environment to latch) |
 | `Failed(String)` | the environment is latched (the first cause), or a broken internal invariant |
+| `OutOfMemory { bytes, source }` | the host refused to map the file (`mmap`'s `ENOMEM`: the address space, `ulimit -v` or the process's mapping count exhausted, as many environments open at once can do), at open or at a growth past the reservation (latches inside a write) |
+| `Full(String)` | the file has no page number left for a write (2^32 − 1 pages, see Limits and non-goals) (latches) |
 | `KeyTooLarge { len, max }` / `ValueTooLarge { len, max }` | an entry over the page size's limits, or an outer key passed to `delete_prefix` or to a dup cursor's bounded seek (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`) longer than its dup table's `key_len` (`max = key_len`) (no latch) |
 | `KeyTooShort { len, min }` | a dup table's point operation with no subkey (`len <= key_len`, `min = key_len + 1`), or an outer key passed to `delete_prefix` or to a dup cursor's bounded seek shorter than `key_len` (`min = key_len`) (no latch) |
 | `AppendOutOfOrder` | an append (`RwTxn::append`, `RwCursor::append`, `TxnCursor::append`, `DupTxnCursor::append`) whose key does not sort strictly after the table's last key (no latch) |
@@ -1885,6 +1887,9 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 | `Locked` | another handle (in this process or another) holds the file: any handle for `Env::open`, a writer's for `Env::open_read_only` |
 | `ReadOnly` | `begin_rw` or `try_begin_rw` in an environment opened read-only (no latch) |
 | `WrongTxn` | a `TxnCursor` or `DupTxnCursor` used with a write transaction other than the one that made it (no latch) |
+
+`Error::latches()` is the one list of the errors that latch: `Corrupt`, `Io`, `Failed`,
+`OutOfMemory` and `Full`. The reth adapter reads it to unset its write cursors after one.
 
 ---
 
@@ -2053,8 +2058,9 @@ These limits and non-goals are known:
 - **A file holds at most 2^32 − 1 pages** (`u32` page numbers, `u32::MAX` the null page): 16 TiB
   at 4 KiB pages (the default), 32 TiB at 8 KiB, 64 TiB at 16 KiB, 128 TiB at 32 KiB, 256 TiB at
   64 KiB. The page size, fixed at create, is the only lever. A write that needs a page past the
-  cap is `Failed` and latches (reads continue; a reopen can still reuse freed pages). Within a few
-  dozen pages of the cap a split's room check can report the shortfall as `Corrupt` instead.
+  cap is `Full` and latches (reads continue; a reopen can still reuse freed pages), whether the
+  allocator or a tree's page count meets the cap first (a count past the file's own pages is
+  damage, `Corrupt`).
 
 - **Dup tables have owned and detached cursors only, and pack only what fits a quarter-page
   entry.** A dup table's cursors are `DupRoCursor` and `DupTxnCursor`, and the borrowed

@@ -153,6 +153,31 @@ fn a_long_reader_warns_after_a_commit_at_most_once_per_interval() {
     });
 }
 
+/// An I/O error the engine wrapped with what it was doing (as its directory sync does): the
+/// original, with its OS error number, is the wrapper's source.
+#[derive(Debug)]
+struct Wrapped(std::io::Error);
+
+impl Wrapped {
+    /// An error of OS error number `code`, wrapped.
+    fn io(code: i32) -> std::io::Error {
+        let source = std::io::Error::from_raw_os_error(code);
+        std::io::Error::new(source.kind(), Self(source))
+    }
+}
+
+impl std::fmt::Display for Wrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "syncing the directory /x: open: {}", self.0)
+    }
+}
+
+impl std::error::Error for Wrapped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 #[test]
 fn engine_errors_carry_mdbx_codes_and_messages() {
     use tn_lmdb::Error as E;
@@ -187,6 +212,15 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         (E::UnsupportedVersion(9), Error::VersionMismatch.to_err_code()),
         (E::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)), libc::ENOSPC),
         (E::Io(std::io::Error::other("no errno")), libc::EIO),
+        (E::Io(Wrapped::io(libc::ENOTDIR)), libc::ENOTDIR),
+        (E::Full("the file has used every page number".into()), Error::MapFull.to_err_code()),
+        (
+            E::OutOfMemory {
+                bytes: 1 << 40,
+                source: std::io::Error::from_raw_os_error(libc::ENOMEM),
+            },
+            libc::ENOMEM,
+        ),
     ];
     for (engine, code) in own {
         let info = error::info(&engine);

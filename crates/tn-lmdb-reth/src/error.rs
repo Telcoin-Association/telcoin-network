@@ -30,6 +30,9 @@ impl Mdbx {
     pub(crate) const CORRUPTED: Self = Self { code: -30796, message: "database is corrupted" };
     /// `MDBX_PANIC`.
     pub(crate) const PANIC: Self = Self { code: -30795, message: "fatal environment error" };
+    /// `MDBX_MAP_FULL`.
+    pub(crate) const MAP_FULL: Self =
+        Self { code: -30792, message: "environment map size limit reached" };
     /// `MDBX_VERSION_MISMATCH`.
     pub(crate) const VERSION_MISMATCH: Self = Self { code: -30794, message: "DB version mismatch" };
     /// `MDBX_INVALID`.
@@ -97,13 +100,32 @@ pub(crate) fn info(error: &tn_lmdb::Error) -> DatabaseErrorInfo {
         | E::InvalidMapReserve(_)
         | E::InvalidDupOptions(_) => Mdbx::INVALID_PARAMETER.info(),
         E::Failed(_) => Mdbx::PANIC.with_message(error.to_string()),
+        E::Full(_) => Mdbx::MAP_FULL.with_message(error.to_string()),
+        E::OutOfMemory { .. } => {
+            DatabaseErrorInfo { message: error.to_string().into(), code: libc::ENOMEM }
+        }
         E::NotTnLmdb => Mdbx::INVALID.with_message(error.to_string()),
         E::UnsupportedVersion(_) => Mdbx::VERSION_MISMATCH.with_message(error.to_string()),
         E::Io(io) => DatabaseErrorInfo {
             message: error.to_string().into(),
-            code: io.raw_os_error().unwrap_or(libc::EIO),
+            code: os_error_code(io).unwrap_or(libc::EIO),
         },
     }
+}
+
+/// The OS error number behind `io`: its own, else the first its sources carry (the engine wraps
+/// some errors with what it was doing, the original kept as the source).
+fn os_error_code(io: &std::io::Error) -> Option<i32> {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(io);
+    while let Some(e) = next {
+        if let Some(code) =
+            e.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error)
+        {
+            return Some(code);
+        }
+        next = e.source();
+    }
+    None
 }
 
 /// A failed read, as [`DatabaseError::Read`].
