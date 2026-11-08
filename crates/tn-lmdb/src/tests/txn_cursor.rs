@@ -831,6 +831,33 @@ fn a_failed_delete_through_a_write_cursor_leaves_it_unset() {
     assert_eq!(key_of(c.next().expect("next")), 0);
 }
 
+/// A reseek that fails leaves a `TxnCursor` unset, from the deleted state too: after its delete of
+/// key 5 (the cursor on key 6, deleted), a direct put to the table makes its next call find its
+/// place again, and the leaf it reseeks into (private to the transaction) names another page in
+/// its header. The move is `Corrupt`; the cursor is unset and out of the deleted state, so its
+/// prefix steps never answer from the saved keys of a place it lost.
+#[test]
+fn a_failed_reseek_leaves_a_write_cursor_unset() {
+    use crate::tree::PageWrite as _;
+    let (_dir, path) = temp("tn_lmdb_txn_cursor_failed_reseek");
+    let env = open(&path, SyncMode::NoSync);
+    let [a] = filled(&env, &["a"], 300).try_into().expect("one table");
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&a).expect("cursor");
+    assert!(c.seek_exact(&rw, &key(5)).expect("seek").is_some());
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert_eq!(c.state(), (State::At, true));
+    let (_, path, ..) = c.position(&rw);
+    let &(leaf, _) = path.last().expect("a leaf");
+    rw.put(&a, &key(1_000), b"moves the table's writes").expect("put");
+    let page = rw.writer_mut().page_mut(leaf).expect("a private leaf");
+    page[..4].copy_from_slice(&(leaf + 1).to_le_bytes());
+    let got = c.next(&rw).map(|e| e.map(|(k, _)| k.to_vec()));
+    assert!(matches!(&got, Err(Error::Corrupt(_))), "{got:?}");
+    assert_eq!(c.state(), (State::Unset, false));
+    assert!(!c.follower_shares_prefix(&rw, 8).expect("shares"));
+}
+
 /// After `last`, or `prev` from an unset cursor, the cursor is on the table's last entry as after
 /// any move: `next` and `next_in_prefix` move to an entry another cursor or the transaction has put
 /// past it since, and with none return nothing, the cursor then after the end (`current` finds

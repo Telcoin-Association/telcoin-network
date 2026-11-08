@@ -901,6 +901,74 @@ fn check_refuses_a_root_branch_with_one_child() {
     assert!(err.contains(&format!("page {r} is a root branch with one child")), "{err}");
 }
 
+/// `Env::check` holds every page to the range its parents' separators give it: two leaves of
+/// one txn swapped under their branch (each still claimed once, its identity check passing, the
+/// branch's CRC stamped again) is `Corrupt`.
+#[test]
+fn check_refuses_children_outside_their_separators() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    churn(&env, "t", 300, 0, 100);
+    assert_eq!(check(&env).tables["t"].height, 2);
+    let r = {
+        let snapshot = env.inner().current();
+        catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t").root.root
+    };
+    drop(env);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let mut page = vec![0; 4096];
+    file.read_exact_at(&mut page, u64::from(r) * 4096).expect("read");
+    let (a, b) =
+        (page::branch_child(&page, 1).expect("1"), page::branch_child(&page, 2).expect("2"));
+    assert_eq!(a.1, b.1, "one txn wrote both");
+    page::branch_set_child(&mut page, 1, b.0, b.1).expect("set");
+    page::branch_set_child(&mut page, 2, a.0, a.1).expect("set");
+    page::stamp(&mut page);
+    file.write_all_at(&page, u64::from(r) * 4096).expect("write");
+    let env = open(&path, SyncMode::Durable);
+    let err = env.check().expect_err("swapped").to_string();
+    assert!(err.contains("outside its parents' separators"), "{err}");
+}
+
+/// A free record keyed by the txn after the state's (the last record of the free tree's leaf
+/// rekeyed, its CRC stamped again; it never passes the reuse gate) is refused where it is met:
+/// `Env::check` finds it later than the state, and the next commit's save, which writes a
+/// record of that key, finds it already there instead of overwriting it (and leaking its
+/// pages). Both are `Corrupt`.
+#[test]
+fn a_free_record_of_a_later_txn_is_refused_by_check_and_the_save() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    for generation in 0..4 {
+        churn(&env, "t", 300, generation, 100);
+    }
+    let meta = env.inner().current().meta;
+    assert_eq!(meta.free.height, 1, "{:?}", meta.free);
+    drop(env);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let mut page = vec![0; 4096];
+    file.read_exact_at(&mut page, u64::from(meta.free.root) * 4096).expect("read");
+    let off = {
+        let key = page::leaf_key(&page, page::nkeys(&page) - 1).expect("key");
+        key.as_ptr() as usize - page.as_ptr() as usize
+    };
+    let later = RecordKey { txn: meta.txn + 1, seq: 0 }.encode();
+    page[off..off + later.len()].copy_from_slice(&later);
+    page::stamp(&mut page);
+    file.write_all_at(&page, u64::from(meta.free.root) * 4096).expect("write");
+
+    let env = open(&path, SyncMode::Durable);
+    let err = env.check().expect_err("check").to_string();
+    assert!(err.contains("later than the state"), "{err}");
+    drop(env); // the failed check latched it
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.open_table("t").expect("open").expect("t");
+    txn.put(&t, &key(0), b"new").expect("put");
+    let err = txn.commit().expect_err("commit").to_string();
+    assert!(err.contains("already exists"), "{err}");
+}
+
 /// `Env::check` compares each root's page counters with the pages its walk finds, by kind, and
 /// `table_stat` reports them: a table record counting one leaf, one branch or one overflow page
 /// too many (its shape still possible, its leaf's CRC re-stamped) is `Corrupt`, naming the kind.

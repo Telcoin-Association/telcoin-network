@@ -560,6 +560,54 @@ fn a_table_root_miscounting_its_pages_is_refused_by_the_tree_walk() {
     }
 }
 
+/// A table root one level short of its tree (height 1 over a two-level tree, its counters those
+/// of the cut view: no branch, one leaf, a possible root), in a catalog record whose leaf's CRC
+/// is stamped again: `drop_table` and `clear_table` walk the tree to free it, and `tree_pages`
+/// finds a branch where the handle puts the leaves. The error is `Corrupt` and latches, with
+/// nothing freed: freeing the root alone would leak every leaf under it.
+#[test]
+fn a_table_root_short_of_its_leaves_is_refused_by_the_tree_walk() {
+    for dropping in [false, true] {
+        let (_dir, path) = temp("tn_lmdb_damage_short_root");
+        let (catalog, root) = {
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("begin");
+            let t = txn.create_table("t").expect("t");
+            for i in 0..300_u32 {
+                txn.put(&t, &i.to_be_bytes(), &value(3, i, 100)).expect("put");
+            }
+            txn.commit().expect("commit");
+            let meta = env.inner().current().meta;
+            assert_eq!(meta.catalog.height, 1, "the catalog is one leaf");
+            (meta.catalog.root, tree(&env, "t"))
+        };
+        assert_eq!(root.height, 2, "{root:?}");
+        let short = TreeRoot { height: 1, branch_pages: 0, leaf_pages: 1, ..root };
+        restamped(&path, catalog, |page| {
+            let i = (0..page::nkeys(page))
+                .find(|&i| page::leaf_inline_entry(page, i).expect("entry").0 == b"t")
+                .expect("t's record");
+            let (_, value) = page::leaf_inline_entry(page, i).expect("entry");
+            let off = value.as_ptr() as usize - page.as_ptr() as usize;
+            let mut record = catalog::TableRecord::decode(value).expect("record");
+            record.root = short;
+            let bytes = record.encode();
+            page[off..off + bytes.len()].copy_from_slice(&bytes);
+        });
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        let result = if dropping { txn.drop_table(t) } else { txn.clear_table(&t) };
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains("does not reach the leaves")),
+            "drop {dropping}: {result:?}"
+        );
+        assert!(txn.writer_mut().alloc.freed().is_empty(), "drop {dropping}: nothing freed");
+        drop(txn);
+        assert!(env.failure().is_some(), "drop {dropping}: latched");
+    }
+}
+
 /// Table `u`'s last leaf in the fixture (`u` has two levels and no runs, so a free of it reads its
 /// root and only its first leaf), and a copy of the fixture's file, named `what`, whose first free
 /// record (which passes the reuse gate) also lists that leaf, the record's leaf CRC stamped again.

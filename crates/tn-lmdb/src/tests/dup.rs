@@ -1476,6 +1476,39 @@ fn a_dup_write_its_totals_cannot_count_changes_nothing() {
     }
 }
 
+/// A put that takes a packed set past its limit moves the set's rows out of the record's packed
+/// rows: a record counting fewer packed rows than the set holds (its total lowered to its one
+/// packed set's count, every record rule kept) cannot, so the promotion is `Corrupt`, latches,
+/// and leaves the row unwritten, never totals clamped to zero.
+#[test]
+fn a_promotion_its_packed_row_total_cannot_count_is_corrupt() {
+    let (_dir, path) = temp("tn_lmdb_dup_promote_short");
+    {
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let options = DupOptions { key_len: 4, packed_max: PACKED_SMALL };
+        let d = txn.create_dup_table("d", options).expect("d");
+        for s in 0..5_u8 {
+            txn.put(&d, &dup_key(1, &[s]), &[s; 8]).expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+    restamp_record(&path, |record| {
+        let dup = record.dup.as_mut().expect("dup");
+        assert_eq!((dup.packed_rows, dup.nested_trees), (5, 0), "one packed set of five rows");
+        dup.packed_rows = 1;
+    });
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("rw");
+    let d = txn.open_table("d").expect("open").expect("d");
+    let key = dup_key(1, &[9]);
+    let result = txn.put(&d, &key, &[9; 40]);
+    let message = format!("totals do not count the nested tree of key {:02x?}", &key[..4]);
+    assert!(matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)), "{result:?}");
+    assert!(env.failure().is_some(), "latched");
+    assert_eq!(txn.get(&d, &key).expect("get"), None, "the row unwritten");
+}
+
 /// A record that decodes but miscounts its trees can leave a write's totals breaking a record
 /// rule (each write checks them against the counters' types only): the commit refuses that
 /// working record as `Corrupt`, naming the rule, before it goes into the catalog, and latches;

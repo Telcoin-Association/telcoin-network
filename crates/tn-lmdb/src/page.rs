@@ -3550,7 +3550,7 @@ mod tests {
     fn validate_rejects_each_kind_of_damage() {
         let g = geometry(4096);
         let end = g.page_size() - TRAILER;
-        let damages: [Damage; 13] = [
+        let damages: [Damage; 14] = [
             ("unknown kind", |p| p[KIND_OFF] = 3),
             ("page flags", |p| p[FLAGS_OFF] = 1),
             ("reserved header byte", |p| p[RESERVED_OFF + 5] = 1),
@@ -3560,6 +3560,10 @@ mod tests {
                 let (a, b) = (slot(p, 1), slot(p, 2));
                 put_u16(p, HEADER + SLOT, b);
                 put_u16(p, HEADER + 2 * SLOT, a);
+            }),
+            ("two cells of one key", |p| {
+                let (a, b) = (slot(p, 1) + LEAF_CELL_HEADER, slot(p, 2) + LEAF_CELL_HEADER);
+                p.copy_within(a..a + 8, b);
             }),
             ("gap before the first cell", |p| {
                 let u = upper(p);

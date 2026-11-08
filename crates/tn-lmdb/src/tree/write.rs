@@ -6267,6 +6267,29 @@ mod tests {
         }
     }
 
+    /// The same edge check at two more places: an empty page on the edge (the first leaf of the
+    /// branch a collapse promotes) is `Corrupt`, as a descent finds an empty non-root leaf; and a
+    /// neighbour that is its parent's last child, whose upper bound only an ancestor's separator
+    /// gives, is held to that bound too: a key past it is `Corrupt`. Each delete changes nothing.
+    #[test]
+    fn an_unlink_or_a_collapse_refuses_an_empty_edge_or_a_key_past_an_ancestors_separator() {
+        use Node::{Branch as B, Leaf as L};
+        let empty =
+            B(&[("", B(&[("", L(&["a"]))])), ("m", B(&[("", L(&[])), ("p", L(&["p", "q"]))]))]);
+        let past = B(&[
+            ("", B(&[("", L(&["a"])), ("c", L(&["c", "n"]))])),
+            ("m", B(&[("", L(&["m", "o"]))])),
+        ]);
+        for (tree, msg) in [(empty, "is empty"), (past, "outside its parents' separators")] {
+            let mut store = MemStore::new(4096);
+            store.no_merge = true;
+            let (r, entries) = build(&mut store, &tree, "");
+            let mut root = built_root(&store, r, 3, entries);
+            publish(&mut store, false);
+            assert_delete_refused(&mut store, &mut root, b"a", msg);
+        }
+    }
+
     /// A neighbour read for a merge and refused (too full to absorb) still gets `sibling_view`'s
     /// cheap checks, made before the fit test: a stale txn in the parent's cell, a leaf whose
     /// header counts no cell, or a parent cell naming a page private to this transaction is
@@ -6537,6 +6560,19 @@ mod tests {
         publish(&mut store, false);
         assert!(delete(&mut store, &mut root, b"a").expect("delete"));
         assert_eq!(root, TreeRoot::EMPTY);
+    }
+
+    /// The same last delete with a handle that also counts a run the tree does not hold (its
+    /// one key's value is inline) is `Corrupt`, not the empty tree: the miscount is refused,
+    /// not forgotten.
+    #[test]
+    fn emptying_a_tree_whose_handle_counts_a_run_is_corrupt() {
+        let mut store = MemStore::new(4096);
+        let p = leaf_of(&mut store, &[b"a"]);
+        let mut root = TreeRoot { overflow_pages: 1, ..built_root(&store, p, 1, 1) };
+        root.check().expect("the handle passes its own check");
+        publish(&mut store, false);
+        assert_delete_refused(&mut store, &mut root, b"a", "does not count");
     }
 
     /// A clear frees exactly the tree's pages: published ones to the freed list, private ones

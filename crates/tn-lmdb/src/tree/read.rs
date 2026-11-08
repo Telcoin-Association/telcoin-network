@@ -654,4 +654,29 @@ mod tests {
         let got = last_key(&store.reader(), &root).map(|k| k.map(<[u8]>::to_vec));
         assert!(matches!(&got, Err(Error::Corrupt(m)) if m.contains("page flags 0x1")), "{got:?}");
     }
+
+    /// An empty leaf below the root (its cells deleted, CRC restamped) is `Corrupt` at its first
+    /// use by each path with its own check: [`last_key`] (not the `None` of an empty tree) and a
+    /// put the write descent routes into it (refused, not filled in).
+    #[test]
+    fn an_empty_non_root_last_leaf_is_corrupt_for_last_key_and_a_put() {
+        let (mut store, root) = committed_tree(1_000);
+        let mut p = root.root;
+        for _ in 1..root.height {
+            let page = store.raw(p);
+            p = page::branch_child(page, page::nkeys(page) - 1).expect("child").0;
+        }
+        while page::nkeys(store.raw(p)) > 0 {
+            page::leaf_delete(store.raw_mut(p), 0).expect("delete");
+        }
+        store.restamp(p);
+        let got = last_key(&store.reader(), &root).map(|k| k.map(<[u8]>::to_vec));
+        assert!(
+            matches!(&got, Err(Error::Corrupt(m)) if m.contains("is empty")),
+            "last_key: {got:?}"
+        );
+        let mut writer_root = root;
+        let got = put(&mut store, &mut writer_root, &key_of(999), b"x");
+        assert!(matches!(&got, Err(Error::Corrupt(m)) if m.contains("is empty")), "put: {got:?}");
+    }
 }

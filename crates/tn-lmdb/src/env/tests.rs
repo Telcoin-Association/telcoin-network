@@ -440,7 +440,8 @@ fn a_value_holding_meta_bytes_never_refuses_the_open() {
     assert_eq!(val(&ro, &table(&ro, "a"), b"k"), Some(value));
 }
 
-/// Both metas damaged, or a damaged tree root: the open fails closed and changes nothing.
+/// Both metas damaged, or a damaged tree root (its CRC, its txn, a header byte only
+/// `page::validate` checks, its kind): the open fails closed and changes nothing.
 #[test]
 fn damaged_metas_and_roots_fail_closed() {
     let (_dir, path) = temp();
@@ -463,6 +464,13 @@ fn damaged_metas_and_roots_fail_closed() {
     file.read_exact_at(&mut page, u64::from(catalog_root.root) * 4096).expect("read");
     let original = page.clone();
     page[8] ^= 0x02; // header txn 2 -> 0: no later than the meta's, but not the root's
+    page::stamp(&mut page);
+    file.write_all_at(&page, u64::from(catalog_root.root) * 4096).expect("write");
+    assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
+    // The catalog root has a reserved header byte set, the CRC restamped: only `page::validate`
+    // refuses it.
+    let mut page = original.clone();
+    page[18] = 1;
     page::stamp(&mut page);
     file.write_all_at(&page, u64::from(catalog_root.root) * 4096).expect("write");
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
@@ -2016,6 +2024,23 @@ fn a_trimmed_file_grows_from_its_pages_in_use_and_trims_again() {
     let env = open(&path);
     env.check().expect("check");
     assert_rows(&env, "a", rows, 150);
+}
+
+/// A close of a file already at its trimmed length (reopened and never grown) trims nothing,
+/// and its trim is no error. `EnvInner::drop` only logs a failed trim, so the test calls the
+/// close's trim directly.
+#[test]
+fn a_close_of_a_file_at_its_trimmed_length_trims_nothing() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    put_all(&env, "a", &[(b"k", b"1")]);
+    drop(env);
+    let trimmed = file_len(&path);
+    let env = open(&path);
+    assert_eq!(trimmed_len(&env), trimmed, "the first close trimmed to the pages, rounded");
+    env.with_writer(|w| w.trim_tail()).expect("a trim to the file's own length");
+    drop(env);
+    assert_eq!(file_len(&path), trimmed);
 }
 
 /// A trim never cuts a page the newest meta names: after a commit followed by an aborted

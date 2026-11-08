@@ -234,9 +234,9 @@ mod tests {
     /// A txn whose high bits are set, so a 32-bit identity differs from the full id.
     const TXN: u64 = 0x1_0000_0007;
 
-    /// A value spanning three pages, every byte non-zero.
-    fn three_page_value() -> Vec<u8> {
-        (0..3 * P - RUN_HEADER - TRAILER - 100).map(|i| (i % 251) as u8 + 1).collect()
+    /// A value spanning `pages` pages, every byte non-zero.
+    fn value_of_pages(pages: usize) -> Vec<u8> {
+        (0..pages * P - RUN_HEADER - TRAILER - 100).map(|i| (i % 251) as u8 + 1).collect()
     }
 
     /// A file image of pages `0..2 + n` with `value`'s run, written by [`TXN`], at page 2 and
@@ -266,7 +266,7 @@ mod tests {
     /// is read before its CRC is stamped; the page count covers the header and the trailer.
     #[test]
     fn a_run_reads_back_its_value() {
-        let bytes = three_page_value();
+        let bytes = value_of_pages(3);
         let (mut file, ovf, count) = image(&bytes);
         assert_eq!(count, 5, "three pages");
         assert_eq!(Ovf::decode(&ovf.encode()), ovf);
@@ -293,7 +293,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "a store's slice is not the run's length")]
     fn a_slice_shorter_than_the_run_fails_the_debug_assert() {
-        let (file, ovf, count) = image(&three_page_value());
+        let (file, ovf, count) = image(&value_of_pages(3));
         let _ = checked_run(ovf, P, count, TXN, false, RunCrc::MultiPage, |p, len| {
             let start = p as usize * P;
             file.get(start..start + len - P)
@@ -308,7 +308,7 @@ mod tests {
     fn the_test_store_reads_runs_against_its_snapshot() {
         use crate::tree::{test_harness::MemStore, PageRead, PageWrite};
         let mut store = MemStore::new(P as u32);
-        let bytes = three_page_value();
+        let bytes = value_of_pages(3);
         let n = run_pages(bytes.len(), P) as u32;
         let r = store.alloc_run(n).expect("run");
         let txn = store.txn();
@@ -334,7 +334,7 @@ mod tests {
     /// the snapshot, and a cell whose txn, length or limit is not the run's.
     #[test]
     fn each_damaged_run_is_corrupt() {
-        let (file, ovf, count) = image(&three_page_value());
+        let (file, ovf, count) = image(&value_of_pages(3));
         let ok = (ovf, count, TXN, false, RunCrc::MultiPage);
         read(&file, ok).expect("the undamaged run");
 
@@ -408,6 +408,34 @@ mod tests {
             let private = (args.0, args.1, args.2, true, args.4);
             let got = read(&file, private).map(<[u8]>::len);
             assert!(matches!(got, Err(Error::Corrupt(_))), "{name}, private: {got:?}");
+        }
+    }
+
+    /// The smallest multi-page run is CRC-checked too: a flip in the second page of a two-page
+    /// run (a page with no header, so only the CRC sees it) is `Corrupt` under
+    /// [`RunCrc::MultiPage`], the mode every read of a value uses.
+    #[test]
+    fn a_two_page_run_is_crc_checked_by_every_read() {
+        let (mut file, ovf, count) = image(&value_of_pages(2));
+        assert_eq!(count, 4, "a two-page run");
+        read(&file, (ovf, count, TXN, false, RunCrc::MultiPage)).expect("the undamaged run");
+        file[3 * P + 17] ^= 0x10;
+        let got = read(&file, (ovf, count, TXN, false, RunCrc::MultiPage)).map(<[u8]>::len);
+        assert!(matches!(got, Err(Error::Corrupt(_))), "second page flip: {got:?}");
+    }
+
+    /// A cell naming a run at a meta page, or a value over [`MAX_VALUE`], is refused by the cell's
+    /// own checks before any page is sliced, even in a file large enough to hold the range: page
+    /// 1 is the meta page the writer rewrites in place, and the oversized length would map 16 MiB
+    /// or more.
+    #[test]
+    fn a_meta_page_or_an_oversized_run_is_refused_before_its_slice() {
+        let (_, ovf, _) = image(&value_of_pages(3));
+        for bad in [Ovf { pgno: 1, ..ovf }, Ovf { len: MAX_VALUE as u32 + 1, ..ovf }] {
+            let got = checked_run(bad, P, u32::MAX, TXN, false, RunCrc::MultiPage, |_, _| {
+                panic!("{bad:?}: sliced before the cell's checks")
+            });
+            assert!(matches!(got, Err(Error::Corrupt(_))), "{bad:?}: {got:?}");
         }
     }
 }
