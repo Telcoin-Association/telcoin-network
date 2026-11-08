@@ -99,10 +99,10 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   key's nested root from the map while the map holds the key, never from the cell.
 - **A packed key has no map entry (invariant P).** A packed write rewrites the outer cell at once
   (README do-not-flag 22), so the cell is the truth for a packed key and nothing overlays it. Map
-  entries come only from a nested cell, a nested create and a promotion, and leave with their
-  cell; a nested key never demotes (do-not-flag 24), so a map hit is always nested. `dup_entry`
-  checks it in debug builds (`Corrupt` on a disagreement: only damage), and the free walks' hit count fails a drop or clear that meets an entry
-  whose cell is packed.
+  entries come only from a nested cell, a nested create and a promotion, and leave with their cell;
+  a nested key never demotes (do-not-flag 24), so a map hit is always nested. `dup_entry` checks it
+  in debug builds (`Corrupt` on a disagreement: only damage), and the free walks' hit count fails a
+  drop or clear that meets an entry whose cell is packed.
 - **A packed set is checked at its first use, never at copy-on-write.** Reads run
   `PackedView::new` and the rows they touch; every write that decodes a set, the free walks and
   `Env::check` run `packed::validate` before anything changes. Never parse a set in the page
@@ -163,10 +163,10 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
     `PageFile::trust_tail` (the whole file as this process's growth, undoing `distrust_tail`),
     `PageFile::open_with_max_growth`; `Env::crash` (`EnvInner::crash_on_drop`: drop as a crash
     would).
-  - Reports: `max_save_rounds`, `data_by_file`, `stamped_on`, the allocator's `load_log`,
-    `free_log` and `run_stats`, `PageSet::visited`, `file::take_advice_log` (the advice each
-    mapping got), `sys::take_dir_sync_log` (the directories `fsync_directory` synced); plus test accessors (the `Allocator`'s `freed`, `pool`, `take_freed`,
-    `add_to_pool`).
+  - Reports: `max_save_rounds`, `data_by_file`, `stamped_on`, the allocator's `load_log`, `free_log`
+    and `run_stats`, `PageSet::visited`, `file::take_advice_log` (the advice each mapping got),
+    `sys::take_dir_sync_log` (the directories `fsync_directory` synced); plus test accessors (the
+    `Allocator`'s `freed`, `pool`, `take_freed`, `add_to_pool`).
   - Hooks: `RwTxn::forget_nested`, `RwTxn::plant_nested` (a working entry no nested cell
     names), `PageWrite::merges_applied` (the `MergeReport` of a delete that merged or refused a
     sibling; `MemStore.merge_report` keeps the last, reset by a test before the delete it reads;

@@ -1604,9 +1604,9 @@ from a cell the map supersedes, and from the cell otherwise.
   (`dup_txn_cursors_and_direct_writes_match_the_composite_twin`) holds the two copies to the
   same behaviour.
 
-**Errors.** Damage a move or a write through the cursor meets (an outer key of another width, an outer cell that is not a nested
-cell or, in a table that packs, a packed set, an empty or damaged nested root, a packed set that
-fails a check, a subkey of another length, any check of a descent) is
+**Errors.** Damage a move or a write through the cursor meets (an outer key of another width, an
+outer cell that is not a nested cell or, in a table that packs, a packed set, an empty or damaged
+nested root, a packed set that fails a check, a subkey of another length, any check of a descent) is
 `Corrupt`, latches, and leaves the cursor unset (a `DupTxnCursor` out of the deleted state too).
 `WrongTxn`, `StaleTable`, the width refusals and refused writes change nothing and do not latch.
 
@@ -2047,14 +2047,13 @@ argument and the measurements. Code and other docs cite the items by number, so 
    - `file.rs`: a read-only open's mapping (`map`), `msync`, and the `from_raw_parts` page slices.
      The writer's reservation is an `MmapRaw` from the safe `map_raw`, so every page slice, the
      writer's and the readers', is formed from the base pointer over exactly its own bytes, and no
-     reference to the whole mapping exists. Sound under the single-writer model: the base is
-     stable inside the reservation, readers see only published, immutable pages (the two meta pages, which the writer rewrites in
-     place and no reader slices, aside), retired mappings
-     outlive every view of them, and a read-only open's shared lock keeps every writer out. It
-     also rests on a truthful free list: a crafted file whose free list names a live page can make
-     a write overwrite bytes a reader still holds
-     ([Free list and page reuse](#free-list-and-page-reuse)).
-     Copy-on-write adds no `unsafe` ([Commit protocol](#commit-protocol)).
+     reference to the whole mapping exists. Sound under the single-writer model: the base is stable
+     inside the reservation, readers see only published, immutable pages (the two meta pages, which
+     the writer rewrites in place and no reader slices, aside), retired mappings outlive every view
+     of them, and a read-only open's shared lock keeps every writer out. It also rests on a truthful
+     free list: a crafted file whose free list names a live page can make a write overwrite bytes a
+     reader still holds ([Free list and page reuse](#free-list-and-page-reuse)). Copy-on-write adds
+     no `unsafe` ([Commit protocol](#commit-protocol)).
    - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf` and `flock`,
      each on a live file descriptor (`sysconf` takes none).
    - `crc.rs`: the aarch64 PMULL kernel (`pmull::update`, a copy of `tn-storage`'s), called only
