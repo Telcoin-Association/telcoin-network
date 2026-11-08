@@ -79,9 +79,8 @@
 # with them on over off and each read's p50 and p99; with epoch closes, the closing and normal
 # outputs' total means; with an export, its duration, the database growth while it held its read and
 # the writer's total mean beside it over without; each pair's B/A ratio of those; and the median
-# ratio with its spread (min..max). On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a
-# plain fsync for tn-lmdb, so backend-mode durable commit times there are not like-for-like; the
-# report says so.
+# ratio with its spread (min..max). On macOS both backends' durable commits are msync (libmdbx its
+# used span, tn-lmdb its dirty pages), neither a drive-cache flush; the report says so.
 #
 # From each run's per-output rows the table also has the tail and drift rows: the total's p90, p95
 # and p99 pooled over every output of a side's paired rounds (one percentile of all of them, linear
@@ -1043,7 +1042,7 @@ kv "cache dirs" "$side_a $cache_a, $side_b $cache_b"
 unset_page="(TN_EXEC_BENCH_PAGE_SIZE or the default)"
 kv "page sizes" "$side_a ${page_a:-$unset_page}, $side_b ${page_b:-$unset_page}"
 if [ "$(uname -s)" = "Darwin" ]; then
-    kv "sync note" "macOS: libmdbx's durable commit is F_FULLFSYNC, tn-lmdb's a plain fsync; durable commit times are not like-for-like between the backends"
+    kv "sync note" "macOS: both backends' durable commits are msync (libmdbx its used span, tn-lmdb its dirty pages), neither a drive-cache flush"
 fi
 if [ "$sys_sample" = 1 ]; then
     disk_text="$sys_disk"

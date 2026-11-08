@@ -1935,9 +1935,12 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   APFS (Darwin 24) by snapshots of what the device held, as a power cut would leave it: `fsync`,
   `F_FULLFSYNC` and `F_BARRIERFSYNC` alike left in memory only the dirtied pages of the first 16 MiB
   of any dirty extent wider than that, every time (about a quarter of 1500 scattered rewrites of a
-  64 MiB file), and those pages stayed unwritten for minutes, after `munmap` and `close` too. Every
-  form of `msync` wrote them all, and `mincore`'s `MINCORE_MODIFIED` counted exactly the pages left. So on macOS the engine never relies on an `fsync` for a mapped page
-  (do-not-flag item 30): step 4 syncs a scattered commit's pages by an `msync(MS_ASYNC)`, then an
+  64 MiB file). Those pages stayed unwritten until the volume was unmounted: 20 minutes and more,
+  through `munmap`, `close` and `sync(2)`. Every form of `msync` wrote them all, and `mincore`'s
+  `MINCORE_MODIFIED` counted exactly the pages left. A snapshot taken after scattered durable
+  commits that synced by the `fsync` opened as `Corrupt` every time (12 of 12, no key readable),
+  and after the same commits synced by the `msync` passes below, clean at the last commit (14 of
+  14). So on macOS the engine never relies on an `fsync` for a mapped page (do-not-flag item 30): step 4 syncs a scattered commit's pages by an `msync(MS_ASYNC)`, then an
   `msync(MS_SYNC)`, of each merged range (`data_sync`'s `DataSync::Ranges`,
   `PageFile::msync_ranges`), `PageFile::fdatasync_all` msyncs the whole mapping before its fsync,
   and a writer open msyncs its mapping once, before it builds on the file, for the pages a crashed

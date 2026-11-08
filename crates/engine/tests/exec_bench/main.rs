@@ -227,8 +227,11 @@
 //! (per key `idle` and `active`, with the ratios active over idle). The stage keys are
 //! [`STAGES`]'s. It is written to a temp file, synced and renamed into place.
 //!
-//! **Durable sync on macOS.** libmdbx's durable commit uses `F_FULLFSYNC` and tn-lmdb's a plain
-//! fsync, so Mac durable commit times are not like-for-like between the backends.
+//! **Durable sync on macOS.** Both backends make a commit durable by `msync`, and neither flushes
+//! the drive's cache. libmdbx, in the write-map mode reth opens it in, msyncs its whole used span
+//! and its meta pages; tn-lmdb msyncs its commit's dirty pages and its meta page. Both write every
+//! page, so Mac durable times compare the same guarantee. reth's static files sync by
+//! `File::sync_all` (`F_FULLFSYNC` on macOS) in both builds.
 //!
 //! **Reading the database writes.** The disk bytes are only an approximation: Linux's
 //! `write_bytes` counts a page as it is dirtied, so a page dirtied once and synced counts once, and
@@ -2639,8 +2642,9 @@ fn report(
     out += &disk_bytes_line(DISK_BYTES_SOURCE, header.disk_error.as_deref());
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
-        out += "  note: on macOS libmdbx's durable commit uses F_FULLFSYNC and tn-lmdb's a plain \
-                fsync: durable commit times are not like-for-like between the backends\n";
+        out += "  note: on macOS both backends' durable commits are msync (libmdbx its used span, \
+                tn-lmdb its dirty pages), neither a drive-cache flush; the static files' syncs are \
+                F_FULLFSYNC in both\n";
     }
     out += &format!("  base: {}\n  aged: {}\n", header.base, header.aged);
     out += &format!(

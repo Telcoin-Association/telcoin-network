@@ -63,10 +63,11 @@
 //!
 //! **Caveats.**
 //!
-//! - On macOS reth's bundled libmdbx makes each durable commit with `fcntl(F_FULLFSYNC)`, which
-//!   flushes the drive's cache, while tn-lmdb syncs with a plain `fsync`, which does not. A durable
-//!   run on macOS therefore compares unequal syncs; judge the engines there by `nosync`, where
-//!   neither waits for the disk, and leave the durable verdict to Linux.
+//! - On macOS both engines' durable commits are `msync`, neither a drive-cache flush: reth's
+//!   bundled libmdbx, in write-map mode, msyncs its whole used span and its meta pages, and
+//!   tn-lmdb its commit's dirty pages and its meta page. Runs from before tn-lmdb synced mapped
+//!   pages by `msync` on macOS flattered it: its scattered commits took a plain `fsync`, which
+//!   leaves some of those pages unwritten there. The durable verdict stays Linux's.
 //! - reth's static-file writes (`save_blocks` appends, and the commit syncs them with
 //!   `File::sync_all` whatever the database's sync mode) are the same code in both builds and add
 //!   the same cost to both, so they narrow the ratio between the engines.

@@ -581,9 +581,11 @@ accounts; the median of 5 alternating runs per build; ms per commit):
 Both are well inside the reference (tn-lmdb's per-block persist p99 at most 1.25× MDBX's). Most of a
 persist on macOS is reth's static files: their commit is a `File::sync_all`, which is
 `F_FULLFSYNC` on macOS, on every commit in both builds. The verdict uses the no-sync runs
-(MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`), because a durable commit on macOS is `F_FULLFSYNC` for reth's
-MDBX but a plain fsync for tn-lmdb, so durable rows are not a like-for-like engine comparison (3+3
-durable runs: p99 ratio 0.93 and 0.91). The backends' Linux comparison is the execution benchmark's
+(MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`). The durable runs
+(3+3: p99 ratio 0.93 and 0.91) predate tn-lmdb's `msync` of mapped pages on macOS. Its scattered
+commits then took a plain `fsync`, which leaves some of those pages unwritten there, so they priced
+less work than MDBX's `msync` of its used span. Neither engine's durable commit flushes the drive's
+cache on macOS. The backends' Linux comparison is the execution benchmark's
 ("Current result" below).
 
 Under no-sync, `tn-lmdb.dat` grew to 2 GiB in every run, against 65 MiB durable: the pages a commit
@@ -612,8 +614,9 @@ report under `<bench dir>/reports/`. `EXEC_PAGE_SIZE_MDBX` and `EXEC_PAGE_SIZE_T
 backend's database page size independently (the bench's `TN_EXEC_BENCH_PAGE_SIZE`, a power of two
 from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`: MDBX the OS page,
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
-The script's header lists its settings and everything it writes. On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a plain fsync for tn-lmdb, so
-durable commit times there are not like-for-like between the backends. The stages named `mdbx`
+The script's header lists its settings and everything it writes. On macOS both backends' durable
+commits are `msync` (libmdbx its used span, tn-lmdb its dirty pages), and neither flushes the
+drive's cache. The stages named `mdbx`
 (`mdbx` and `commit mdbx`, the JSON keys `save_blocks_mdbx` and `commit_mdbx`) carry reth's metric
 names, which reth keeps whatever the engine: on tn-lmdb they time tn-lmdb.
 
