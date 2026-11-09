@@ -601,10 +601,13 @@ mod tests {
         }
         assert_eq!(base_dir_name(&spec, V1, 4096, "aged200")?, format!("{name}-aged200"));
         let v2 = base_dir_name(&spec, V2, 4096, "")?;
-        let cache = tempfile::tempdir()?;
-        let refused = build_base(&spec, V2, 4096, cache.path()).expect_err("v2 is not selectable");
-        assert!(refused.to_string().contains("cannot be selected yet"), "{refused}");
-        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0, "refused before any write");
+        if !cfg!(feature = "tn-lmdb") {
+            // v2 is tn-lmdb only: the MDBX build refuses it before it writes anything.
+            let cache = tempfile::tempdir()?;
+            let refused = build_base(&spec, V2, 4096, cache.path()).expect_err("v2 on MDBX");
+            assert!(refused.to_string().contains("tn-lmdb only"), "{refused}");
+            assert_eq!(std::fs::read_dir(cache.path())?.count(), 0, "refused before any write");
+        }
         assert_eq!(v2, name.replace(&format!("base-{BACKEND}-"), &format!("base-{BACKEND}-v2-")));
         Ok(())
     }

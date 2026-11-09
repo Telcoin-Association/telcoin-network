@@ -22,7 +22,7 @@
 //!    and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE` and reth's storage
 //!    layout `LAYOUT` ([`StorageLayout`]): both are fixed when the datadir is created, so the base,
 //!    the aged base and every clone share them. The layout is selected in one place,
-//!    `StorageLayout::select`, which refuses v2 until the env can build a v2 datadir.
+//!    `StorageLayout::select`, which sets it on the env's config (v2 needs the tn-lmdb build).
 //! 3. The aged base: `AGING` outputs executed on a clone of the base, closed and cached beside it
 //!    under [`base_dir_name`] with an `extra` that keys the aging ([`Aging::extra`]). It is built
 //!    in a `.building` dir, its meta ([`AgedMeta`]) synced, and becomes the aged base by one

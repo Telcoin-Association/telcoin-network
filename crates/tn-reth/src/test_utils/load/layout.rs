@@ -8,11 +8,11 @@
 //! opens against it ([`open_production_env_with_layout`](super::open_production_env_with_layout)):
 //! a run never measures another layout than the one it reports.
 //!
-//! **Selection.** The env has no layout choice yet: every new datadir is v1
-//! (`StorageSettings::base()`). Until it has one, [`StorageLayout::select`] refuses
-//! [`StorageLayout::V2`] rather than build v1 under a v2 label. Once the env takes a layout
-//! (`RethConfig` or its CLI), `select` sets it, for v1 too: a default that later turns v2 must not
-//! turn a v1 bench into a v2 one.
+//! **Selection.** [`StorageLayout::select`] sets the env's choice for a new datadir
+//! ([`RethConfig::with_new_datadir_layout`]) for v1 too, so the env's default for new datadirs
+//! (`env::StorageLayout::for_new_datadirs`) never decides a bench's layout. v2 needs the tn-lmdb
+//! build (the env refuses it on MDBX), so [`StorageLayout::selectable`] refuses it on the MDBX
+//! build before the bench builds anything.
 
 use crate::{RethConfig, RethEnv};
 use reth_provider::{
@@ -61,23 +61,33 @@ impl StorageLayout {
         }
     }
 
-    /// Whether the env can build a new datadir in this layout: an error naming why not. The env
-    /// has no choice yet, so only v1, its only layout, can.
+    /// The env's layout of the same name.
+    pub const fn env_layout(self) -> crate::env::StorageLayout {
+        match self {
+            Self::V1 => crate::env::StorageLayout::V1,
+            Self::V2 => crate::env::StorageLayout::V2,
+        }
+    }
+
+    /// Whether this build can make a new datadir in this layout: an error naming why not. v2 is
+    /// tn-lmdb only.
     pub fn selectable(self) -> eyre::Result<()> {
         match self {
             Self::V1 => Ok(()),
+            Self::V2 if cfg!(feature = "tn-lmdb") => Ok(()),
             Self::V2 => eyre::bail!(
-                "storage layout v2 cannot be selected yet: the env builds every new datadir in v1 \
-                 (StorageSettings::base). Run layout v1, or wire the env's layout choice into \
-                 StorageLayout::select (tn_reth::test_utils::load::layout)"
+                "storage layout v2 runs on tn-lmdb only: build with --features tn-reth/tn-lmdb, \
+                 or run layout v1"
             ),
         }
     }
 
     /// Select this layout for a new datadir opened with `config` (see the module docs), refused
-    /// unless [`Self::selectable`]. The env has no choice yet, so v1 needs nothing.
-    pub fn select(self, _config: &mut RethConfig) -> eyre::Result<()> {
-        self.selectable()
+    /// unless [`Self::selectable`].
+    pub fn select(self, config: &mut RethConfig) -> eyre::Result<()> {
+        self.selectable()?;
+        *config = config.clone().with_new_datadir_layout(self.env_layout());
+        Ok(())
     }
 
     /// The layout `env`'s datadir holds: its stored storage settings, which must be the ones its

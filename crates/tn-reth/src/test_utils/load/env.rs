@@ -580,14 +580,29 @@ mod tests {
             assert_eq!(StorageLayout::of(&env)?, StorageLayout::V1, "{run}");
         }
         let v2 = tmp.path().join("v2");
-        let tasks = TaskManager::default();
-        let Err(refused) =
-            open_production_env_with_layout(&v2, chain, &DURABLE, StorageLayout::V2, &tasks)
-        else {
-            panic!("v2 cannot be selected yet");
-        };
-        assert!(refused.to_string().contains("cannot be selected yet"), "{refused}");
-        assert!(!v2.join("db").exists(), "refused before the database opens");
+        if cfg!(feature = "tn-lmdb") {
+            for run in ["new", "reopened"] {
+                let tasks = TaskManager::new(run);
+                let (env, _db) = open_production_env_with_layout(
+                    &v2,
+                    chain.clone(),
+                    &DURABLE,
+                    StorageLayout::V2,
+                    &tasks,
+                )?;
+                assert_eq!(StorageLayout::of(&env)?, StorageLayout::V2, "{run}");
+            }
+        } else {
+            // v2 is tn-lmdb only: the MDBX build refuses it before the database opens.
+            let tasks = TaskManager::default();
+            let Err(refused) =
+                open_production_env_with_layout(&v2, chain, &DURABLE, StorageLayout::V2, &tasks)
+            else {
+                panic!("v2 opened on MDBX");
+            };
+            assert!(refused.to_string().contains("tn-lmdb only"), "{refused}");
+            assert!(!v2.join("db").exists(), "refused before the database opens");
+        }
         assert_eq!(StorageLayout::parse("v2")?, StorageLayout::V2);
         assert!(StorageLayout::parse("v3").is_err());
         Ok(())
