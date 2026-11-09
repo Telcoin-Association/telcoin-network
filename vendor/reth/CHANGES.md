@@ -552,3 +552,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `blocking_io_permit_tests` drop each request while its blocking task is stalled on the account
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
+
+- **TN-0042** — Storage v2 writes `TransactionHashNumbers` to the database table. *Kind*: fix.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`).
+  *Why*: TN-0014 removed `RocksDB`, which wrote this table under v2, but `save_blocks` still
+  skipped the database write under v2, so a v2 node could not find a transaction by hash. The
+  sorted batch now goes to the table in both layouts, in the `save_blocks` transaction. Every
+  reader (`transaction_id`) and the unwind (`remove_blocks_above`) already used the table in both
+  layouts (`EitherReader`/`EitherWriter` route it to the database only). Storage path, v2 only:
+  the v1 write is unchanged. *Upstream*: n/a (upstream writes it to `RocksDB`).

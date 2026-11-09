@@ -553,9 +553,10 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             let mdbx_start = Instant::now();
 
             // Collect all transaction hashes across all blocks, sort them, and write in batch
-            if !self.cached_storage_settings().storage_v2 &&
-                self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full())
-            {
+            //
+            // TN(TN-0042): written in both layouts. Upstream's v2 sends these to `RocksDB`; TN keeps
+            // them in the database table, in this transaction.
+            if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
                 let start = Instant::now();
                 let total_tx_count: usize =
                     blocks.iter().map(|b| b.recovered_block().body().transaction_count()).sum();
