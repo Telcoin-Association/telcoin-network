@@ -46,7 +46,7 @@ use reth_db_api::{
     table::Table,
     tables,
     transaction::{DbTx, DbTxMut},
-    BlockNumberList, PlainAccountState, PlainStorageState,
+    BlockNumberList, DatabaseError, PlainAccountState, PlainStorageState,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, Chain, ExecutionOutcome};
 use reth_node_types::{BlockTy, BodyTy, HeaderTy, NodeTypes, ReceiptTy, TxTy};
@@ -71,7 +71,8 @@ use reth_trie::{
 };
 use reth_trie_db::{ChangesetCache, DatabaseStorageTrieCursor};
 use revm_database::states::{
-    PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
+    reverts::AccountInfoRevert, AccountRevert, PlainStateReverts, PlainStorageChangeset,
+    PlainStorageRevert, StateChangeset,
 };
 use std::{
     cmp::Ordering,
@@ -553,9 +554,10 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             let mdbx_start = Instant::now();
 
             // Collect all transaction hashes across all blocks, sort them, and write in batch
-            if !self.cached_storage_settings().storage_v2 &&
-                self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full())
-            {
+            //
+            // TN(TN-0042): written in both layouts. Upstream's v2 sends these to `RocksDB`; TN
+            // keeps them in the database table, in this transaction.
+            if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
                 let start = Instant::now();
                 let total_tx_count: usize =
                     blocks.iter().map(|b| b.recovered_block().body().transaction_count()).sum();
@@ -616,6 +618,30 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 }
             }
 
+            // TN(TN-0043): under v2 the history indices come from the blocks' reverts, the source
+            // of the static-file changesets. `update_history_indices` would read those changesets
+            // back, but this transaction cannot see them before commit. The wipe check reads
+            // `HashedStorages`, so it runs before the hashed state below is written.
+            let start = Instant::now();
+            let v2_history = if save_mode.with_state() && self.cached_storage_settings().storage_v2
+            {
+                let transitions =
+                    HistoryTransitions::from_reverts(blocks.iter().flat_map(|block| {
+                        let number = block.recovered_block().number();
+                        block
+                            .execution_outcome()
+                            .state
+                            .reverts
+                            .iter()
+                            .map(move |reverts| (number, reverts.as_slice()))
+                    }));
+                self.ensure_wiped_accounts_had_no_storage(&transitions)?;
+                Some(transitions)
+            } else {
+                None
+            };
+            let v2_history_build = start.elapsed();
+
             // Write all hashed state and trie updates in single batches.
             // This reduces cursor open/close overhead from N calls to 1.
             if save_mode.with_state() {
@@ -641,8 +667,12 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // Full mode: update history indices
             if save_mode.with_state() {
                 let start = Instant::now();
-                self.update_history_indices(first_number..=last_block_number)?;
-                timings.update_history_indices = start.elapsed();
+                if let Some(transitions) = v2_history {
+                    self.insert_history_transitions(transitions)?;
+                } else {
+                    self.update_history_indices(first_number..=last_block_number)?;
+                }
+                timings.update_history_indices = v2_history_build + start.elapsed();
             }
 
             // Update pipeline progress
@@ -791,6 +821,18 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 .prune_receipts(to_delete, last_block)?;
         }
 
+        Ok(())
+    }
+
+    /// Writes bytecodes to MDBX.
+    fn write_bytecodes(
+        &self,
+        bytecodes: impl IntoIterator<Item = (B256, Bytecode)>,
+    ) -> ProviderResult<()> {
+        let mut bytecodes_cursor = self.tx_ref().cursor_write::<tables::Bytecodes>()?;
+        for (hash, bytecode) in bytecodes {
+            bytecodes_cursor.upsert(hash, &bytecode)?;
+        }
         Ok(())
     }
 }
@@ -1046,7 +1088,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
             return Ok(Vec::new())
         }
 
-        let len = range.end().saturating_sub(*range.start()) as usize;
+        let len = range.end().saturating_sub(*range.start()) as usize + 1;
         let mut blocks = Vec::with_capacity(len);
 
         let headers = headers_range(range.clone())?;
@@ -1216,6 +1258,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     /// `HashedAccounts`/`HashedStorages`. Addresses are hashed via `keccak256` for DB lookups,
     /// while storage keys from changesets are assumed to already be hashed and are used as-is.
     /// The output `BundleStateInit`/`RevertsInit` structures remain keyed by plain address.
+    ///
+    /// TN(TN-0044): changeset keys are plain slots (upstream 815037e27). They are hashed for the
+    /// `HashedStorages` lookup, and the output is keyed by plain address and plain slot.
     fn populate_bundle_state_hashed(
         &self,
         account_changeset: Vec<(u64, AccountBeforeTx)>,
@@ -1256,13 +1301,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
                 hash_map::Entry::Occupied(entry) => entry.into_mut(),
             };
 
+            debug_assert!(old_storage.key.is_plain(), "storage changesets hold plain slots");
             let storage_key = old_storage.key.as_b256();
             match account_state.2.entry(storage_key) {
                 hash_map::Entry::Vacant(entry) => {
                     let hashed_address = keccak256(address);
+                    let hashed_storage_key = old_storage.key.to_hashed();
                     let new_storage = hashed_storage_cursor
-                        .seek_by_key_subkey(hashed_address, storage_key)?
-                        .filter(|storage| storage.key == storage_key)
+                        .seek_by_key_subkey(hashed_address, hashed_storage_key)?
+                        .filter(|storage| storage.key == hashed_storage_key)
                         .unwrap_or_default();
                     entry.insert((old_storage.value, new_storage.value));
                 }
@@ -1284,7 +1331,101 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     }
 }
 
+/// TN(TN-0043): history index transitions taken from blocks' in-memory reverts.
+///
+/// Built with the filter the static-file changeset writers apply through
+/// `to_plain_state_reverts` (`StaticFileProvider::write_account_changesets` and
+/// `write_storage_changesets`): an account is listed at a block when its info revert is not
+/// `DoNothing`, and a slot when the account's storage revert has it. The history then has an entry
+/// exactly where a changeset row exists. Storage keys are plain slots (TN-0044).
+#[derive(Debug, Default)]
+struct HistoryTransitions {
+    /// The blocks, ascending, at which each account has an account changeset row.
+    accounts: BTreeMap<Address, Vec<BlockNumber>>,
+    /// The blocks, ascending, at which each `(address, slot)` has a storage changeset row.
+    storages: BTreeMap<(Address, B256), Vec<BlockNumber>>,
+    /// Each account whose storage a block wiped, with that block.
+    wiped: Vec<(BlockNumber, Address)>,
+}
+
+impl HistoryTransitions {
+    /// Collects the transitions of `(block number, reverts)` pairs given in ascending block
+    /// order. A block may come in several pairs.
+    fn from_reverts<'a>(
+        blocks: impl IntoIterator<Item = (BlockNumber, &'a [(Address, AccountRevert)])>,
+    ) -> Self {
+        fn push(blocks: &mut Vec<BlockNumber>, block: BlockNumber) {
+            debug_assert!(blocks.last().is_none_or(|last| *last <= block), "blocks out of order");
+            if blocks.last() != Some(&block) {
+                blocks.push(block);
+            }
+        }
+
+        let mut this = Self::default();
+        for (block, reverts) in blocks {
+            for (address, revert) in reverts {
+                if !matches!(revert.account, AccountInfoRevert::DoNothing) {
+                    push(this.accounts.entry(*address).or_default(), block);
+                }
+                if revert.wipe_storage {
+                    this.wiped.push((block, *address));
+                }
+                for slot in revert.storage.keys() {
+                    let key = StorageSlotKey::from_u256(*slot).as_b256();
+                    push(this.storages.entry((*address, key)).or_default(), block);
+                }
+            }
+        }
+        this
+    }
+}
+
+impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
+    /// TN(TN-0043): fails if a block wiped the storage of an account that had storage before it.
+    ///
+    /// v1 records the slots such a wipe removes by reading them from `PlainStorageState`
+    /// (`write_state_reverts`). Storage v2 has no plain state and builds its changesets and history
+    /// from the reverts alone, which list only the slots the block itself touched, so those slots
+    /// would be missing from both. Since Cancun this cannot happen: `SELFDESTRUCT` clears only an
+    /// account created in the same transaction, and EIP-7610 refuses to create an account at an
+    /// address that has storage. This makes that argument a check rather than a silent gap.
+    ///
+    /// Must run before the batch's hashed state is written, while `HashedStorages` still holds the
+    /// storage from before the batch. A slot changed by an earlier block of the same batch counts
+    /// as storage too.
+    fn ensure_wiped_accounts_had_no_storage(
+        &self,
+        transitions: &HistoryTransitions,
+    ) -> ProviderResult<()> {
+        if transitions.wiped.is_empty() {
+            return Ok(())
+        }
+        let mut hashed_storages = self.tx.cursor_dup_read::<tables::HashedStorages>()?;
+        for &(block, address) in &transitions.wiped {
+            let changed_earlier_in_batch = transitions
+                .storages
+                .range((address, B256::ZERO)..=(address, B256::repeat_byte(0xff)))
+                .any(|(_, blocks)| blocks.first().is_some_and(|first| *first < block));
+            if changed_earlier_in_batch || hashed_storages.seek_exact(keccak256(address))?.is_some()
+            {
+                return Err(DatabaseError::Other(format!(
+                    "block {block} wiped the storage of {address}, which had storage before the \
+                     wipe; storage v2 cannot record the removed slots"
+                ))
+                .into())
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
+    /// TN(TN-0043): writes history indices built from blocks' reverts.
+    fn insert_history_transitions(&self, transitions: HistoryTransitions) -> ProviderResult<()> {
+        self.insert_account_history_index(transitions.accounts)?;
+        self.insert_storage_history_index(transitions.storages)
+    }
+
     /// Insert history index to the database.
     ///
     /// For each updated partial key, this function retrieves the last shard from the database
@@ -2316,8 +2457,30 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         config: StateWriteConfig,
     ) -> ProviderResult<()> {
         let execution_outcome = execution_outcome.into();
-        let first_block = execution_outcome.first_block();
 
+        if self.cached_storage_settings().use_hashed_state() &&
+            !config.write_receipts &&
+            !config.write_account_changesets &&
+            !config.write_storage_changesets
+        {
+            // In storage v2 with all outputs directed to static files, plain state and changesets
+            // are written elsewhere. Only bytecodes need MDBX writes, so skip the expensive
+            // to_plain_state_and_reverts conversion that iterates all accounts and storage.
+            //
+            // TN(TN-0041): skip the empty bytecode as `to_plain_state` does, so `Bytecodes`
+            // holds the same rows as on the converting path.
+            self.write_bytecodes(
+                execution_outcome
+                    .state()
+                    .contracts
+                    .iter()
+                    .filter(|(h, _)| **h != alloy_consensus::constants::KECCAK_EMPTY)
+                    .map(|(h, b)| (*h, Bytecode(b.clone()))),
+            )?;
+            return Ok(());
+        }
+
+        let first_block = execution_outcome.first_block();
         let (plain_state, reverts) =
             execution_outcome.state().to_plain_state_and_reverts(is_value_known);
 
@@ -2438,11 +2601,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                     storage_changes.iter().map(|change| change.storage_revert.len()).sum();
                 let mut changeset = Vec::with_capacity(total_changes);
                 for PlainStorageRevert { address, wiped, storage_revert } in storage_changes {
+                    // TN(TN-0044): changesets hold the plain slot in both storage layouts.
                     let mut storage = storage_revert
                         .into_iter()
-                        .map(|(k, v)| {
-                            (StorageSlotKey::from_u256(k).to_changeset_key(use_hashed_state), v)
-                        })
+                        .map(|(k, v)| (StorageSlotKey::from_u256(k).as_b256(), v))
                         .collect::<Vec<_>>();
                     // sort storage slots by key.
                     storage.par_sort_unstable_by_key(|a| a.0);
@@ -2451,11 +2613,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                     // storage state has to be taken from the database and written to storage
                     // history. See [StorageWipe::Primary] for more details.
                     //
-                    // When `use_hashed_state` is enabled, we read from `HashedStorages`
-                    // instead of `PlainStorageState`. The hashed entries already have
-                    // `keccak256(slot)` keys which is exactly the format needed for hashed
-                    // changesets (static file changesets always use hashed keys when
-                    // `use_hashed_state` is true).
+                    // TN(TN-0044): when `use_hashed_state` is enabled there is no plain state,
+                    // and `HashedStorages` holds only `keccak256(slot)`, not the plain slot the
+                    // changeset needs. A wipe of an account that has storage is then an error
+                    // (it cannot happen since Cancun; see `ensure_wiped_accounts_had_no_storage`).
                     //
                     // TODO(mediocregopher): This could be rewritten in a way which doesn't
                     // require collecting wiped entries into a Vec like this, see
@@ -2465,13 +2626,12 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                         tracing::trace!(?address, "Wiping storage");
                         if use_hashed_state {
                             let hashed_address = keccak256(address);
-                            if let Some((_, entry)) =
-                                hashed_storages_cursor.seek_exact(hashed_address)?
-                            {
-                                wiped_storage.push((entry.key, entry.value));
-                                while let Some(entry) = hashed_storages_cursor.next_dup_val()? {
-                                    wiped_storage.push((entry.key, entry.value))
-                                }
+                            if hashed_storages_cursor.seek_exact(hashed_address)?.is_some() {
+                                return Err(DatabaseError::Other(format!(
+                                    "block {block_number} wiped the storage of {address}, which \
+                                     has storage; storage v2 cannot record the removed slots"
+                                ))
+                                .into())
                             }
                         } else if let Some((_, entry)) = storages_cursor.seek_exact(address)? {
                             wiped_storage.push((entry.key, entry.value));
@@ -2574,10 +2734,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         // Write bytecode
         tracing::trace!(len = changes.contracts.len(), "Writing bytecodes");
-        let mut bytecodes_cursor = self.tx_ref().cursor_write::<tables::Bytecodes>()?;
-        for (hash, bytecode) in changes.contracts {
-            bytecodes_cursor.upsert(hash, &Bytecode(bytecode))?;
-        }
+        self.write_bytecodes(
+            changes.contracts.into_iter().map(|(hash, bytecode)| (hash, Bytecode(bytecode))),
+        )?;
 
         Ok(())
     }
@@ -2706,11 +2865,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
                 for (storage_key, (old_storage_value, _new_storage_value)) in storage {
                     let hashed_address = keccak256(address);
+                    // TN(TN-0044): the state is keyed by plain slot (upstream 815037e27).
+                    let hashed_storage_key = keccak256(storage_key);
                     let storage_entry =
-                        StorageEntry { key: *storage_key, value: *old_storage_value };
+                        StorageEntry { key: hashed_storage_key, value: *old_storage_value };
                     if hashed_storage_cursor
-                        .seek_by_key_subkey(hashed_address, *storage_key)?
-                        .filter(|s| s.key == *storage_key)
+                        .seek_by_key_subkey(hashed_address, hashed_storage_key)?
+                        .filter(|s| s.key == hashed_storage_key)
                         .is_some()
                     {
                         hashed_storage_cursor.delete_current()?
@@ -2875,11 +3036,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
                 for (storage_key, (old_storage_value, _new_storage_value)) in storage {
                     let hashed_address = keccak256(address);
+                    // TN(TN-0044): the state is keyed by plain slot (upstream 815037e27).
+                    let hashed_storage_key = keccak256(storage_key);
                     let storage_entry =
-                        StorageEntry { key: *storage_key, value: *old_storage_value };
+                        StorageEntry { key: hashed_storage_key, value: *old_storage_value };
                     if hashed_storage_cursor
-                        .seek_by_key_subkey(hashed_address, *storage_key)?
-                        .filter(|s| s.key == *storage_key)
+                        .seek_by_key_subkey(hashed_address, hashed_storage_key)?
+                        .filter(|s| s.key == hashed_storage_key)
                         .is_some()
                     {
                         hashed_storage_cursor.delete_current()?
@@ -3207,26 +3370,24 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
             .collect::<Vec<_>>();
         last_indices.sort_unstable_by_key(|(a, _)| *a);
 
-        if self.cached_storage_settings().storage_v2 {
-        } else {
-            // Unwind the account history index in MDBX.
-            let mut cursor = self.tx.cursor_write::<tables::AccountsHistory>()?;
-            for &(address, rem_index) in &last_indices {
-                let partial_shard = unwind_history_shards::<_, tables::AccountsHistory, _>(
-                    &mut cursor,
-                    ShardedKey::last(address),
-                    rem_index,
-                    |sharded_key| sharded_key.key == address,
-                )?;
+        // TN(TN-0043): the index is a database table in both layouts.
+        // Unwind the account history index in MDBX.
+        let mut cursor = self.tx.cursor_write::<tables::AccountsHistory>()?;
+        for &(address, rem_index) in &last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::AccountsHistory, _>(
+                &mut cursor,
+                ShardedKey::last(address),
+                rem_index,
+                |sharded_key| sharded_key.key == address,
+            )?;
 
-                // Check the last returned partial shard.
-                // If it's not empty, the shard needs to be reinserted.
-                if !partial_shard.is_empty() {
-                    cursor.insert(
-                        ShardedKey::last(address),
-                        &BlockNumberList::new_pre_sorted(partial_shard),
-                    )?;
-                }
+            // Check the last returned partial shard.
+            // If it's not empty, the shard needs to be reinserted.
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    ShardedKey::last(address),
+                    &BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
             }
         }
 
@@ -3264,29 +3425,27 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
             .collect::<Vec<_>>();
         storage_changesets.sort_by_key(|(address, key, _)| (*address, *key));
 
-        if self.cached_storage_settings().storage_v2 {
-        } else {
-            // Unwind the storage history index in MDBX.
-            let mut cursor = self.tx.cursor_write::<tables::StoragesHistory>()?;
-            for &(address, storage_key, rem_index) in &storage_changesets {
-                let partial_shard = unwind_history_shards::<_, tables::StoragesHistory, _>(
-                    &mut cursor,
-                    StorageShardedKey::last(address, storage_key),
-                    rem_index,
-                    |storage_sharded_key| {
-                        storage_sharded_key.address == address &&
-                            storage_sharded_key.sharded_key.key == storage_key
-                    },
-                )?;
+        // TN(TN-0043): the index is a database table in both layouts.
+        // Unwind the storage history index in MDBX.
+        let mut cursor = self.tx.cursor_write::<tables::StoragesHistory>()?;
+        for &(address, storage_key, rem_index) in &storage_changesets {
+            let partial_shard = unwind_history_shards::<_, tables::StoragesHistory, _>(
+                &mut cursor,
+                StorageShardedKey::last(address, storage_key),
+                rem_index,
+                |storage_sharded_key| {
+                    storage_sharded_key.address == address &&
+                        storage_sharded_key.sharded_key.key == storage_key
+                },
+            )?;
 
-                // Check the last returned partial shard.
-                // If it's not empty, the shard needs to be reinserted.
-                if !partial_shard.is_empty() {
-                    cursor.insert(
-                        StorageShardedKey::last(address, storage_key),
-                        &BlockNumberList::new_pre_sorted(partial_shard),
-                    )?;
-                }
+            // Check the last returned partial shard.
+            // If it's not empty, the shard needs to be reinserted.
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    StorageShardedKey::last(address, storage_key),
+                    &BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
             }
         }
 
@@ -3314,18 +3473,33 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
         )
     }
 
+    /// TN(TN-0043): under storage v2 the changesets are read back from static files, which show
+    /// only what earlier transactions committed. Changesets written in this transaction are not
+    /// visible yet, so `save_blocks` builds v2 history from the blocks' reverts instead of calling
+    /// this. Here a range past the committed static-file tip is an error, not an index with blocks
+    /// missing.
     #[instrument(level = "debug", target = "providers::db", skip_all)]
     fn update_history_indices(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        let storage_settings = self.cached_storage_settings();
-        if !storage_settings.storage_v2 {
-            let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
-            self.insert_account_history_index(indices)?;
+        if self.cached_storage_settings().storage_v2 {
+            for segment in
+                [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+            {
+                let tip = self.static_file_provider.get_highest_static_file_block(segment);
+                if tip.is_none_or(|tip| tip < *range.end()) {
+                    return Err(DatabaseError::Other(format!(
+                        "cannot index history for blocks {range:?} from {segment} static files \
+                         committed up to {tip:?}"
+                    ))
+                    .into())
+                }
+            }
         }
 
-        if !storage_settings.storage_v2 {
-            let indices = self.changed_storages_and_blocks_with_range(range)?;
-            self.insert_storage_history_index(indices)?;
-        }
+        let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
+        self.insert_account_history_index(indices)?;
+
+        let indices = self.changed_storages_and_blocks_with_range(range)?;
+        self.insert_storage_history_index(indices)?;
 
         Ok(())
     }
@@ -3581,23 +3755,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> BlockWriter
         // This is necessary because with edge storage, changesets are written to static files
         // whose index isn't updated until commit, making them invisible to subsequent reads
         // within the same transaction.
-        let use_hashed = self.cached_storage_settings().use_hashed_state();
-        let (account_transitions, storage_transitions) = {
-            let mut account_transitions: BTreeMap<Address, Vec<u64>> = BTreeMap::new();
-            let mut storage_transitions: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();
-            for (block_idx, block_reverts) in execution_outcome.bundle.reverts.iter().enumerate() {
-                let block_number = first_number + block_idx as u64;
-                for (address, account_revert) in block_reverts {
-                    account_transitions.entry(*address).or_default().push(block_number);
-                    for storage_key in account_revert.storage.keys() {
-                        let key =
-                            StorageSlotKey::from_u256(*storage_key).to_changeset_key(use_hashed);
-                        storage_transitions.entry((*address, key)).or_default().push(block_number);
-                    }
-                }
-            }
-            (account_transitions, storage_transitions)
-        };
+        //
+        // TN(TN-0043): built like `save_blocks`' v2 history, so an account whose info did not
+        // change gets no account history entry (it has no account changeset row).
+        let transitions =
+            HistoryTransitions::from_reverts(
+                execution_outcome.bundle.reverts.iter().enumerate().map(|(block_idx, reverts)| {
+                    (first_number + block_idx as u64, reverts.as_slice())
+                }),
+            );
 
         // Insert the blocks
         for block in blocks {
@@ -3614,17 +3780,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> BlockWriter
 
         // Use pre-computed transitions for history indices since static file
         // writes aren't visible until commit.
-        // Note: For MDBX we use insert_*_history_index. For RocksDB we use
-        // append_*_history_shard which handles read-merge-write internally.
-        let storage_settings = self.cached_storage_settings();
-        if storage_settings.storage_v2 {
-        } else {
-            self.insert_account_history_index(account_transitions)?;
-        }
-        if storage_settings.storage_v2 {
-        } else {
-            self.insert_storage_history_index(storage_transitions)?;
-        }
+        // TN(TN-0043): the indices are database tables in both layouts.
+        self.insert_history_transitions(transitions)?;
         durations_recorder.record_relative(metrics::Action::InsertHistoryIndices);
 
         // Update pipeline progress
@@ -4814,7 +4971,7 @@ mod tests {
         let sf = factory.static_file_provider();
         let storage_cs = sf.storage_changeset(1).unwrap();
         assert!(!storage_cs.is_empty());
-        assert_eq!(storage_cs[0].1.key.as_b256(), hashed_slot);
+        assert_eq!(storage_cs[0].1.key.as_b256(), slot_key);
 
         let account_cs = sf.account_block_changeset(1).unwrap();
         assert!(!account_cs.is_empty());
@@ -5020,8 +5177,9 @@ mod tests {
 
                 for (_, entry) in &storage_cs {
                     assert!(
-                        entry.key.is_hashed(),
-                        "v2: static file storage changeset should have hashed slot keys"
+                        entry.key.is_plain() &&
+                            entry.key.as_b256() != keccak256(entry.key.as_b256()),
+                        "v2: static file storage changeset should have plain slot keys"
                     );
                 }
             }
@@ -5374,11 +5532,7 @@ mod tests {
         let sf = factory.static_file_provider();
         let storage_cs = sf.storage_changeset(1).unwrap();
         assert!(!storage_cs.is_empty(), "v2: storage changesets should be in static files");
-        assert_eq!(
-            storage_cs[0].1.key.as_b256(),
-            hashed_slot,
-            "v2: changeset key should be hashed"
-        );
+        assert_eq!(storage_cs[0].1.key.as_b256(), slot_key, "v2: changeset key should be plain");
 
         provider_rw.remove_state_above(0).unwrap();
 
@@ -5412,7 +5566,8 @@ mod tests {
     }
 
     #[test]
-    fn test_populate_bundle_state_hashed_with_hashed_keys() {
+    // TN(TN-0044): changesets hold plain slots under v2; the output is keyed by plain slot.
+    fn test_populate_bundle_state_hashed_with_plain_keys() {
         let factory = create_test_provider_factory();
         factory.set_storage_settings_cache(StorageSettings::v2());
 
@@ -5440,7 +5595,7 @@ mod tests {
 
         let storage_changeset = vec![(
             BlockNumberAddress((1, address)),
-            ChangesetEntry { key: StorageSlotKey::Hashed(hashed_slot), value: old_value },
+            ChangesetEntry { key: StorageSlotKey::Plain(slot_key), value: old_value },
         )];
 
         let account_changeset = vec![(
@@ -5471,7 +5626,7 @@ mod tests {
         assert_eq!(new_account.unwrap().nonce, 1);
 
         let (old_val, new_val) =
-            storage_map.get(&hashed_slot).expect("hashed slot should be in storage map");
+            storage_map.get(&slot_key).expect("plain slot should be in storage map");
         assert_eq!(*old_val, old_value);
         assert_eq!(*new_val, current_value);
 
@@ -5479,7 +5634,7 @@ mod tests {
         let (_, storage_reverts) =
             block_reverts.get(&address).expect("address should have reverts");
         assert_eq!(storage_reverts.len(), 1);
-        assert_eq!(storage_reverts[0].key, hashed_slot);
+        assert_eq!(storage_reverts[0].key, slot_key);
         assert_eq!(storage_reverts[0].value, old_value);
     }
 }

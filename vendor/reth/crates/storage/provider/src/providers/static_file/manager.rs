@@ -513,16 +513,15 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
 
         if let Some(block_index) = block_index {
             // Find first block range that contains the requested block
-            if let Some((_, range)) = block_index.iter().find(|(max_block, _)| block <= **max_block)
-            {
+            if let Some((_, range)) = block_index.range(block..).next() {
                 // Found matching range for an existing file using block index
                 return *range;
             } else if let Some((_, range)) = block_index.last_key_value() {
                 // Didn't find matching range for an existing file, derive a new range from the end
                 // of the last existing file range.
                 //
-                // `block` is always higher than `range.end()` here, because we iterated over all
-                // `block_index` ranges above and didn't find one that contains our block
+                // `block` is always higher than `range.end()` here, because `block_index` holds no
+                // range with a `max_block` greater than or equal to `block`
                 let blocks_after_last_range = block - range.end();
                 let segments_to_skip = (blocks_after_last_range - 1) / blocks_per_file;
                 let start = range.end() + 1 + segments_to_skip * blocks_per_file;
@@ -708,7 +707,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            key: StorageSlotKey::from_u256(key).to_hashed(),
+                            // TN(TN-0044): the plain slot, as in v1's changesets (upstream
+                            // 815037e27).
+                            key: StorageSlotKey::from_u256(key).as_b256(),
                             value: revert_to_slot.to_previous_value(),
                         }
                     })
@@ -2602,7 +2603,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
                     .with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {
@@ -2638,8 +2639,9 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             for i in offset.changeset_range() {
                 if let Some(change) = cursor.get_one::<StorageChangesetMask>(i.into())? {
                     let block_address = BlockNumberAddress((block_number, change.address));
+                    // TN(TN-0044): static-file storage changesets hold plain slots.
                     let entry = ChangesetEntry {
-                        key: StorageSlotKey::hashed(change.key),
+                        key: StorageSlotKey::plain(change.key),
                         value: change.value,
                     };
                     changeset.push((block_address, entry));
@@ -2705,8 +2707,9 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
         {
+            // TN(TN-0044): static-file storage changesets hold plain slots.
             return Ok(Some(ChangesetEntry {
-                key: StorageSlotKey::hashed(change.key),
+                key: StorageSlotKey::plain(change.key),
                 value: change.value,
             }));
         }
@@ -2734,7 +2737,7 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                     .with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {

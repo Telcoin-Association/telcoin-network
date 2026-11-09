@@ -775,6 +775,68 @@ mod tests {
         }
     }
 
+    /// TN(TN-0044): a genesis-allocated slot reads its genesis value at a block after genesis
+    /// under storage v2, as under v1. Genesis writes `StoragesHistory` with the plain slot; while
+    /// the vendored v2 read history by `keccak256(slot)`, such a slot read as never written (zero).
+    #[test]
+    fn v2_genesis_storage_reads_after_genesis() {
+        use reth_provider::{HistoricalStateProviderRef, StateProvider, StorageChangeSetReader};
+
+        let address = Address::with_last_byte(2);
+        let slot = B256::with_last_byte(1);
+        let value = B256::with_last_byte(0x2a);
+        let chain_spec = Arc::new(ChainSpec {
+            chain: Chain::from_id(1),
+            genesis: Genesis {
+                alloc: BTreeMap::from([(
+                    address,
+                    GenesisAccount {
+                        balance: U256::from(1),
+                        storage: Some(BTreeMap::from([(slot, value)])),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            hardforks: Default::default(),
+            paris_block_and_final_difficulty: None,
+            deposit_contract: None,
+            ..Default::default()
+        });
+
+        let mut layouts = Vec::new();
+        for settings in [StorageSettings::v1(), StorageSettings::v2()] {
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+            init_genesis_with_settings(&factory, settings).unwrap();
+            let provider = factory.provider().unwrap();
+
+            // The state at the start of block 1 is genesis'; at block 0 the slot is unset.
+            let after_genesis = HistoricalStateProviderRef::new(&provider, 1);
+            assert_eq!(
+                after_genesis.storage(address, slot).unwrap(),
+                Some(U256::from_be_bytes(value.0)),
+                "{settings:?}"
+            );
+            let before_genesis = HistoricalStateProviderRef::new(&provider, 0);
+            assert_eq!(
+                before_genesis.storage(address, slot).unwrap().unwrap_or_default(),
+                U256::ZERO,
+                "{settings:?}"
+            );
+
+            let changeset = provider.storage_changeset(0).unwrap();
+            assert_eq!(changeset.len(), 1, "{settings:?}");
+            assert_eq!(changeset[0].1.key.as_b256(), slot, "{settings:?}: plain changeset slot");
+
+            let tx = provider.tx_ref();
+            layouts.push((
+                collect_table_entries::<DatabaseEnv, tables::AccountsHistory>(tx).unwrap(),
+                collect_table_entries::<DatabaseEnv, tables::StoragesHistory>(tx).unwrap(),
+            ));
+        }
+        assert_eq!(layouts[0], layouts[1], "genesis history differs between v1 and v2");
+    }
+
     #[test]
     fn warn_storage_settings_mismatch() {
         let factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());

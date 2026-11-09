@@ -29,8 +29,7 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, ChangesetEntry, DatabaseProviderFactory, NodePrimitivesProvider,
-    StateProvider, StateProviderBox, StorageChangeSetReader, StorageSettingsCache,
-    TryIntoHistoricalStateProvider,
+    StateProvider, StateProviderBox, StorageChangeSetReader, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use revm_database::states::PlainStorageRevert;
@@ -223,6 +222,9 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
     /// When `use_hashed_state` is enabled, storage changeset keys are already hashed, so current
     /// values are read directly from [`reth_db_api::tables::HashedStorages`]. Otherwise, values
     /// are read via [`StateProvider::storage`] which queries plain state tables.
+    ///
+    /// TN(TN-0044): changeset keys are plain in both storage layouts, so every value is read with
+    /// [`StateProvider::storage`], which hashes the slot itself under v2.
     fn populate_bundle_state(
         &self,
         account_changeset: Vec<(u64, AccountBeforeTx)>,
@@ -1313,7 +1315,6 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<Vec<(BlockNumberAddress, ChangesetEntry)>> {
-        let use_hashed = self.storage_provider.cached_storage_settings().use_hashed_state();
         if let Some(state) =
             self.head_block.as_ref().and_then(|b| b.block_on_chain(block_number.into()))
         {
@@ -1329,7 +1330,8 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                 .flatten()
                 .flat_map(|revert: PlainStorageRevert| {
                     revert.storage_revert.into_iter().map(move |(key, value)| {
-                        let tagged_key = StorageSlotKey::from_u256(key).to_changeset(use_hashed);
+                        // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                        let tagged_key = StorageSlotKey::from_u256(key);
                         (
                             BlockNumberAddress((block_number, revert.address)),
                             ChangesetEntry { key: tagged_key, value: value.to_previous_value() },
@@ -1368,7 +1370,6 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
         address: Address,
         storage_key: B256,
     ) -> ProviderResult<Option<ChangesetEntry>> {
-        let use_hashed = self.storage_provider.cached_storage_settings().use_hashed_state();
         if let Some(state) =
             self.head_block.as_ref().and_then(|b| b.block_on_chain(block_number.into()))
         {
@@ -1387,7 +1388,8 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                         return None
                     }
                     revert.storage_revert.into_iter().find_map(|(key, value)| {
-                        let tagged_key = StorageSlotKey::from_u256(key).to_changeset(use_hashed);
+                        // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                        let tagged_key = StorageSlotKey::from_u256(key);
                         (tagged_key.as_b256() == storage_key).then(|| ChangesetEntry {
                             key: tagged_key,
                             value: value.to_previous_value(),
@@ -1421,8 +1423,6 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
         let database_start = range.start;
         let mut database_end = range.end;
 
-        let use_hashed = self.storage_provider.cached_storage_settings().use_hashed_state();
-
         if let Some(head_block) = &self.head_block {
             database_end = head_block.anchor().number;
 
@@ -1440,8 +1440,8 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                     .flatten()
                     .flat_map(|revert: PlainStorageRevert| {
                         revert.storage_revert.into_iter().map(move |(key, value)| {
-                            let tagged_key =
-                                StorageSlotKey::from_u256(key).to_changeset(use_hashed);
+                            // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                            let tagged_key = StorageSlotKey::from_u256(key);
                             (
                                 BlockNumberAddress((state.number(), revert.address)),
                                 ChangesetEntry {
@@ -2157,8 +2157,8 @@ mod tests {
         let account_state = state.get(&address).expect("should have account in bundle state");
         let storage = &account_state.storage;
 
-        let slot_as_u256 = U256::from_be_bytes(*hashed_slot);
-        let storage_slot = storage.get(&slot_as_u256).expect("should have the slot in storage");
+        // TN(TN-0044): v2 changesets hold plain slots, so the bundle is keyed by the plain slot.
+        let storage_slot = storage.get(&slot).expect("should have the slot in storage");
 
         assert_eq!(
             storage_slot.present_value,
@@ -2342,7 +2342,7 @@ mod tests {
 
         assert_eq!(
             db_key, mem_key,
-            "DB and in-memory changesets should return the same key format (hashed) for the same logical slot"
+            "DB and in-memory changesets should return the same key format (plain, TN-0044) for the same logical slot"
         );
 
         Ok(())

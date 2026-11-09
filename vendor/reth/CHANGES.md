@@ -459,6 +459,54 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   taken); the other pins the no-permit path, which would hang with an awaited acquire.
   *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.
 
+- **TN-0038** — Backport a774920b7: size the `block_range` buffer for the inclusive span.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`block_range`).
+  *Why*: the `Vec` for an inclusive block range was allocated one short, so every multi-block read
+  reallocated once. Capacity only: the blocks returned are unchanged, so it cannot reach
+  execution or storage. *Upstream*: n/a (upstream commit).
+
+- **TN-0039** — Backport 70e776bfe: find a block's static-file range with a B-tree range lookup.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs`
+  (`StaticFileProviderInner::find_fixed_range_with_block_index`).
+  *Why*: the lookup walked every file range of the segment for each block; `range(block..)` takes
+  the first range whose `max_block` is at or above the block, the same answer in O(log n). It
+  picks which file a block is read from or appended to, so it is on the storage path, but the
+  result is identical by construction (the index is a `BTreeMap` keyed by `max_block`).
+  *Upstream*: n/a (upstream commit).
+
+- **TN-0040** — Backport 7839f3d87: keep one `.csoff` reader per loaded changeset jar.
+  *Kind*: backport.
+  *Files*: `crates/static-file/types/src/{changeset_offsets.rs, lib.rs}` (the reader reads with
+  `read_exact_at` through `&self`; the module is `unix`-only), `crates/storage/provider/src/
+  providers/static_file/{mod.rs, jar.rs, writer.rs, writer_tests.rs}` (`LoadedJar` opens the
+  sidecar once, the jar provider uses it), `.../static_file/manager.rs` (two `let mut reader`
+  that the `&self` reader no longer needs; upstream had already moved that code).
+  *Why*: every changeset lookup (each storage v2 historical read that resolves through a
+  changeset, and each changeset walk) did a `stat` and an `open` of the sidecar. The reader is
+  now opened when the jar is loaded, which `update_index` redoes after each commit, so its length
+  is the committed one, as before. A changeset jar whose header counts offsets but has no sidecar
+  now fails at load instead of reading as "no offsets". Read path only: the bytes read are the
+  same, so it cannot change execution or what is written. TN builds for Linux and macOS only,
+  both `unix`. *Upstream*: n/a (upstream commit).
+
+- **TN-0041** — Backport a195b777e: storage v2's `write_state` skips the plain-state conversion
+  when nothing it produces goes to the database. *Kind*: backport, adapted.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`write_state`, new
+  `write_bytecodes`, used by `write_state_changes` too).
+  *Why*: under v2, `save_blocks` sends receipts and both changesets to static files and v2 keeps
+  no plain state, so the per-block `to_plain_state_and_reverts` (a walk and copy of every changed
+  account and slot) fed only the bytecode writes. The early return writes the bytecodes
+  directly. Adapted: upstream writes every entry of the bundle's `contracts`, while
+  `to_plain_state` drops the empty bytecode (`KECCAK_EMPTY`); TN keeps that filter, so the
+  `Bytecodes` table is the same on both paths. Storage path, v2 only: the condition needs
+  `use_hashed_state()`, which is false for every v1 datadir, so v1 writes are unchanged; genesis
+  and other `StateWriteConfig::default()` callers still convert. *Tests*:
+  `v2_matches_v1_on_a_generated_chain` (TN-0045) puts the empty bytecode in a bundle and requires
+  `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
+  filter.
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
@@ -507,6 +555,105 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
 
+- **TN-0042** — Storage v2 writes `TransactionHashNumbers` to the database table. *Kind*: fix.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`).
+  *Why*: TN-0014 removed `RocksDB`, which wrote this table under v2, but `save_blocks` still
+  skipped the database write under v2, so a v2 node could not find a transaction by hash. The
+  sorted batch now goes to the table in both layouts, in the `save_blocks` transaction. Every
+  reader (`transaction_id`) and the unwind (`remove_blocks_above`) already used the table in both
+  layouts (`EitherReader`/`EitherWriter` route it to the database only). Storage path, v2 only:
+  the v1 write is unchanged. *Tests*: `v2_matches_v1_on_a_generated_chain` and
+  `v2_history_unwind_round_trip` (TN-0045) look every transaction up by hash, and the unwound ones
+  must be gone; the first fails with the v2 gate restored. *Upstream*: n/a (upstream writes it to
+  `RocksDB`).
+
+- **TN-0043** — Storage v2 writes and unwinds `AccountsHistory` and `StoragesHistory` in the
+  database tables. *Kind*: fix.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`, new
+  `HistoryTransitions`, `ensure_wiped_accounts_had_no_storage` and `insert_history_transitions`,
+  `update_history_indices`, `unwind_account_history_indices`, `unwind_storage_history_indices`,
+  `append_blocks_with_state`).
+  *Why*: TN-0014 removed `RocksDB`, which held both history indices under v2, and left empty
+  `if storage_v2 {}` arms where it wrote and unwound them, so a v2 node had no history: every
+  historical account or storage read past the latest block fell back to "not yet written".
+  Re-enabling `update_history_indices` alone does not work, because under v2 it reads the
+  changesets back from static files, and those show only what earlier transactions committed.
+  - Under v2, `save_blocks` builds the block lists from each block's in-memory reverts, with the
+    same filter the static-file changeset writers use, so history has an entry exactly where a
+    changeset row exists. It writes them with `insert_account_history_index` and
+    `insert_storage_history_index`, in the `save_blocks` transaction, timed as
+    `update_history_indices`. `append_blocks_with_state` (test-only) shares the builder in both
+    layouts, which also stops it giving an account whose info did not change a history entry
+    with no changeset row.
+  - A wiped account's pre-existing slots are not in the reverts. v1 reads them from
+    `PlainStorageState`; v2 has no plain state. The new check fails `save_blocks` if a wiped
+    account had storage before the wipe (in `HashedStorages` before the batch, or changed by an
+    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen; the check makes
+    that an error instead of a silent gap.
+  - The history unwinds run in both layouts.
+  - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
+    committed static-file tip is below the range end, instead of indexing nothing.
+  Storage path: v1's `save_blocks` still calls `update_history_indices` and its unwinds are the
+  same code, so v1 datadirs are written as before. *Tests* (TN-0045):
+  `v2_matches_v1_on_a_generated_chain` (the tables equal v1's; fails without the v2 insert or
+  with the `DoNothing` filter dropped), `v2_history_unwind_round_trip` (fails with either empty
+  unwind arm restored), `v2_wipe_of_existing_storage_fails_closed`,
+  `v2_wipe_of_storage_written_earlier_in_the_batch_fails_closed` and
+  `v2_update_history_indices_refuses_uncommitted_changesets` (each fails with its check
+  removed). *Upstream*: n/a (upstream writes these to `RocksDB`; its v2 has the same wipe gap).
+
+- **TN-0044** — Storage v2 keys storage changesets and `StoragesHistory` by the plain slot, as v1
+  does (the key form of upstream 815037e27). *Kind*: fix (format).
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (the static-file
+  storage-changeset writer and readers), `.../providers/state/historical.rs` (storage history
+  and changeset lookups, `storage_by_hashed_key`), `.../providers/database/provider.rs`
+  (`HistoryTransitions`, `write_state_reverts`, `populate_bundle_state_hashed`,
+  `remove_state_above`, `take_state_above`, tests), `.../providers/consistent.rs` (in-memory
+  changesets, a test), `crates/primitives-traits/src/storage.rs` (removes
+  `StorageSlotKey::{from_raw, to_changeset_key, to_changeset}` and `StorageEntry::slot_key`),
+  `crates/storage/storage-api/src/{storage.rs, state.rs}` (docs), `crates/trie/db/src/
+  {state.rs, storage.rs}` (tests), `crates/storage/db-common/src/init.rs` (a test).
+  *Why*: v1.11.4's v2 wrote `keccak256(slot)` into the static-file storage changesets and looked
+  history up by it, while genesis (`insert_storage_history`) writes `StoragesHistory` by the plain
+  slot, so under v2 a genesis-allocated slot read as never written at every block before its
+  first later change; TN's consensus registry is such a slot. Upstream went back to plain slots
+  in 815037e27. TN takes the key form only, not that commit's slot-preimage machinery (pipeline
+  only) or its removal of `StorageSlotKey` and `ChangesetEntry`: changeset readers now tag every
+  key `Plain`, so the callers that hash through `StorageSlotKey::to_hashed` (`unwind_storage_hashing`,
+  `reth-trie-db`'s reverts and prefix sets) need no change, and the few that used the raw key for
+  `HashedStorages` hash it. The helpers that encoded "v2 changesets are hashed" are removed so
+  nothing can use that form again. With plain keys, v2's changesets and three index tables are
+  byte-identical to v1's for the same chain. Two v2 consequences:
+  - History cannot be looked up by a hashed slot (v2 keeps no preimages), so a historical
+    `storage_by_hashed_key` returns `UnsupportedProvider` in both layouts. Nothing in TN called it.
+  - `write_state_reverts` cannot record a wiped account's slots from `HashedStorages` (it holds
+    only hashes), so under v2 such a wipe is an error (see TN-0043; impossible since Cancun).
+  Storage path, v2 format: any v2 datadir written before this reads wrongly. None is deployed;
+  testnet is v1, whose keys were already plain. v1 reads and writes are unchanged.
+  *Tests*: `v2_genesis_storage_reads_after_genesis` (db-common; fails with the hashed lookup),
+  `test_populate_bundle_state_hashed_with_plain_keys`, `test_write_and_remove_state_roundtrip_v2`
+  and the TN-0045 differential. *Upstream*: n/a (upstream commit).
+
+- **TN-0045** — Tests: storage v2 without `RocksDB` against v1 on the same generated chain.
+  *Kind*: test.
+  *Files*: new `crates/storage/provider/src/providers/database/tn_v2_tests.rs` (TN-owned),
+  `.../providers/database/mod.rs` (the `#[cfg(test)]` module line).
+  *Why*: the oracle for TN-0041 to TN-0044. A seeded generator builds blocks 1 to 12 with
+  transactions, account creations and updates, accounts whose only change is storage (an info
+  revert of `DoNothing`), slots changed in several blocks, slots cleared, and the empty bytecode
+  in a bundle's contracts. The chain is saved with `save_blocks` into a v1 and a v2 factory in
+  single- and multi-block batches. `v2_matches_v1_on_a_generated_chain` checks that v2 writes
+  the three ex-`RocksDB` tables, that they, the changesets and `Bytecodes` equal v1's row for
+  row, that every historical account and storage read at the start of each block equals v1's
+  answer and the generator's state, and that every transaction is found by hash.
+  `v2_history_unwind_round_trip` removes blocks with `remove_block_and_execution_above` in both
+  layouts, compares the tables and reads with a save of the shorter chain, then saves the removed
+  blocks again and compares with a full save. Three tests cover the fail-closed paths of
+  TN-0043: a v2 wipe of an account with committed storage, and of storage written earlier in the
+  same batch, fail (a wipe of an account without storage saves), and `update_history_indices`
+  refuses blocks whose static-file changesets are not committed yet while re-indexing committed
+  ones to what `save_blocks` wrote. Each test fails with the change it guards undone.
+  *Upstream*: n/a.
 - **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
   only).
   *Files*: `crates/fs-util/{Cargo.toml, src/lib.rs}` (new `fsync_file`, used by

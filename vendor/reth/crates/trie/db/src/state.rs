@@ -577,7 +577,7 @@ mod tests {
                 .append_storage_changeset(
                     vec![StorageBeforeTx {
                         address: address1,
-                        key: hashed_slot2,
+                        key: plain_slot2,
                         value: U256::from(200),
                     }],
                     1,
@@ -587,7 +587,7 @@ mod tests {
                 .append_storage_changeset(
                     vec![StorageBeforeTx {
                         address: address1,
-                        key: hashed_slot1,
+                        key: plain_slot1,
                         value: U256::from(100),
                     }],
                     2,
@@ -597,7 +597,7 @@ mod tests {
                 .append_storage_changeset(
                     vec![StorageBeforeTx {
                         address: address1,
-                        key: hashed_slot1,
+                        key: plain_slot1,
                         value: U256::from(999),
                     }],
                     3,

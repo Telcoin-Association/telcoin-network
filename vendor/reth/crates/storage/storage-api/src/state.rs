@@ -56,6 +56,10 @@ pub trait StateProvider:
     /// The `address` remains unhashed (plain) since history indices are keyed by plain address.
     /// This is used when changeset keys are pre-hashed (e.g., `use_hashed_state` mode)
     /// to avoid double-hashing.
+    ///
+    /// TN(TN-0044): changeset and history keys are plain slots in both storage layouts, so a
+    /// historical provider cannot serve a hashed slot and returns
+    /// `ProviderError::UnsupportedProvider`.
     fn storage_by_hashed_key(
         &self,
         address: Address,
