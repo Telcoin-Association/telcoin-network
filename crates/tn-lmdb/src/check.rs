@@ -12,15 +12,19 @@
 //! [`check_since`] is open's check of a trusted weak head: the same walk and the same checks of
 //! every page it reaches, but it descends only into a page or a run its parent names with a txn
 //! after the last sync's, and it skips the counters and the page accounting, which need the whole
-//! state (README, Open and recovery).
+//! state (README, Open and recovery). So it keeps only the pages it claims ([`Claims::Visited`]),
+//! where `Env::check` keeps a word for every page of the state ([`Claims::Every`]).
 
-use std::collections::BTreeMap;
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
+
+use memmap2::MmapMut;
 
 use crate::{
     catalog::{self, DupRecord, TableRecord},
     crc::CrcState,
     env::Snapshot,
     error::{Error, Result},
+    file,
     freelist::{decode_pages, RecordKey},
     overflow::{self, Ovf, RunCrc},
     packed,
@@ -63,6 +67,91 @@ pub struct TableCheck {
 /// Who uses a page: index into [`Checker::owners`] (0: nothing).
 type Owner = u32;
 
+/// The bytes of an [`Owner`] in [`Claims::Every`]'s table.
+const OWNER_BYTES: usize = size_of::<Owner>();
+
+/// Who claimed each page.
+enum Claims {
+    /// An owner word for every page below the state's page count, as `Env::check`'s page
+    /// accounting needs ([`leaked_runs`]): 4 bytes a page, in an anonymous mapping, whose pages
+    /// are zero-filled as the walk first touches them, so only the pages it claims cost memory.
+    /// A meta counting far more pages than the file holds data for (a sparse file meets open's
+    /// length check for free) is a crafted file: its table costs address space and one scan, not
+    /// memory (16 GiB of address space at most; a host that refuses it is
+    /// [`Error::OutOfMemory`], [`Claims::every`]).
+    Every(MmapMut),
+    /// The pages claimed, by number, and nothing for the others: [`check_since`] visits the pages
+    /// written since the last sync and the free pages its free leaves list, so its memory follows
+    /// what it reads, not the size of the file.
+    Visited(HashMap<u32, Owner>),
+}
+
+impl Claims {
+    /// A table of every page of a state of `page_count` pages, none claimed: [`Self::Every`]. A
+    /// table the host refuses is [`Error::OutOfMemory`] (on a 32-bit target, one whose size
+    /// passes `usize` is the mapping's [`Error::Io`], never a wrapped size).
+    fn every(page_count: u32) -> Result<Self> {
+        Self::zeroed((page_count as usize).saturating_mul(OWNER_BYTES)).map(Self::Every)
+    }
+
+    /// `bytes` of zeros, mapped anonymously: a mapping refused for want of memory is
+    /// [`Error::OutOfMemory`] ([`file::mapped`]). `vec![0; n]` would abort the process when the
+    /// allocator refuses, and a fallible reservation would need its zeros written, every page of
+    /// it then costing memory.
+    fn zeroed(bytes: usize) -> Result<MmapMut> {
+        file::mapped(MmapMut::map_anon(bytes), bytes)
+    }
+
+    /// Claim page `p` for `owner`, or, if something claimed it already, leave it to that first
+    /// owner and return it.
+    fn claim(&mut self, p: u32, owner: Owner) -> Option<Owner> {
+        match self {
+            Self::Every(table) => {
+                let word = &mut table.as_chunks_mut::<OWNER_BYTES>().0[p as usize];
+                let first = Owner::from_ne_bytes(*word);
+                if first != 0 {
+                    return Some(first);
+                }
+                *word = owner.to_ne_bytes();
+                None
+            }
+            Self::Visited(claimed) => match claimed.entry(p) {
+                Entry::Occupied(first) => Some(*first.get()),
+                Entry::Vacant(slot) => {
+                    slot.insert(owner);
+                    None
+                }
+            },
+        }
+    }
+
+    /// The runs of pages nothing claimed ([`leaked_runs`]), or `None`: always for
+    /// [`Self::Visited`], which knows only the pages claimed.
+    fn leaked(&self) -> Option<String> {
+        match self {
+            Self::Every(table) => leaked_runs(table.as_chunks::<OWNER_BYTES>().0),
+            Self::Visited(_) => None,
+        }
+    }
+
+    /// Test-only: the pages the claims hold room for: every page of the table, or the map's
+    /// capacity.
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        match self {
+            Self::Every(table) => table.len() / OWNER_BYTES,
+            Self::Visited(claimed) => claimed.capacity(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the slots ([`Claims::slots`]) of this thread's last walk that reached the page
+    /// accounting, read by its tests.
+    static CLAIM_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What the leaves of a walked tree may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leaves {
@@ -78,12 +167,9 @@ enum Leaves {
 /// The page walk's state: who uses each page, and every page claimed twice.
 struct Checker<'s> {
     snapshot: &'s Snapshot,
-    /// The owner of each page number below the page count: 4 bytes per page the meta counts,
-    /// allocated zeroed, so only the pages the walk claims are written. A meta counting far more
-    /// pages than the file holds data for (a sparse file meets open's length check for free) is
-    /// a crafted file: its table costs address space and one scan, not memory (up to 16 GiB of
-    /// address space at most: a process that cannot have it aborts, as on any allocation).
-    owner: Vec<Owner>,
+    /// The owner of each page claimed: of every page of the state in a full walk, of the pages
+    /// claimed only in [`check_since`]'s.
+    claims: Claims,
     /// The owners' names: `[none, catalog, free tree, free list, tables...]`.
     owners: Vec<String>,
     /// The pages claimed twice.
@@ -150,13 +236,11 @@ impl Checker<'_> {
 
     /// Claim page `p` for `owner`: false (and noted) if something claimed it already.
     fn claim(&mut self, p: u32, owner: Owner) -> bool {
-        let first = self.owner[p as usize];
-        if first != 0 {
-            self.twice.note(p, first, owner);
-            return false;
-        }
-        self.owner[p as usize] = owner;
-        true
+        let Some(first) = self.claims.claim(p, owner) else {
+            return true;
+        };
+        self.twice.note(p, first, owner);
+        false
     }
 
     /// Walk the tree `root` names for `owner`, checking every page, holding its leaves to
@@ -425,21 +509,29 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
 /// one named at or before it was written by a txn at or before the last sync, so it was on disk
 /// before that sync's meta was. It covers the catalog, every table (a dup table's outer tree and
 /// its nested trees) and the free tree. A page reached twice is [`Error::Corrupt`]; the counters
-/// and the accounting of the file's other pages are not checked. When `since` is 2^31 or more
-/// txns before the head, the walk descends into everything. Returns the pages checked.
+/// and the accounting of the file's other pages are not checked, so it keeps only the pages it
+/// claims ([`Claims::Visited`]): its memory follows the pages it reads, not the file's page count.
+/// When `since` is 2^31 or more txns before the head, the walk descends into everything. Returns
+/// the pages checked.
 pub(crate) fn check_since(snapshot: &Snapshot, since: u64) -> Result<u64> {
     let prune = snapshot.meta.txn.checked_sub(since).is_some_and(|gap| gap < 1 << 31);
     let report = walk_state(snapshot, prune.then_some(since), false)?;
     Ok(report.catalog_pages + report.table_pages + report.free_tree_pages)
 }
 
-/// The walk of [`check_snapshot`] (`accounting`: its counters and its page accounting too) or of
-/// [`check_since`] (`since`: only what was written after it).
+/// The walk of [`check_snapshot`] (`accounting`: its counters and its page accounting too, over
+/// a table of every page, [`Claims::every`], which a host that refuses it fails as
+/// [`Error::OutOfMemory`]) or of [`check_since`] (`since`: only what was written after it, its
+/// claims in a map of the pages claimed).
 fn walk_state(snapshot: &Snapshot, since: Option<u64>, accounting: bool) -> Result<CheckReport> {
     let meta = snapshot.meta;
     let mut checker = Checker {
         snapshot,
-        owner: vec![0; meta.page_count as usize],
+        claims: if accounting {
+            Claims::every(meta.page_count)?
+        } else {
+            Claims::Visited(HashMap::new())
+        },
         owners: ["", "catalog", "free tree", "free list"].map(String::from).to_vec(),
         twice: Twice::default(),
         since,
@@ -500,7 +592,9 @@ fn walk_state(snapshot: &Snapshot, since: Option<u64>, accounting: bool) -> Resu
     report.free_pages = free_pages;
     report.free_records = free_records;
 
-    let leaked = if accounting { leaked_runs(&checker.owner) } else { None };
+    #[cfg(test)]
+    CLAIM_SLOTS.with(|slots| slots.set(checker.claims.slots()));
+    let leaked = checker.claims.leaked();
     if leaked.is_none() && checker.twice.is_empty() {
         return Ok(report);
     }
@@ -517,16 +611,17 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The runs of pages of `2..owner.len()` nothing claimed, found in one pass, as compact runs:
-/// `[2, 5..8]`; `None` if there are none. Only the first [`LISTED`] runs are kept, the rest
-/// counted: `[2, 5..8, ...; 7 more runs, 4294967268 pages in all]`. So a meta whose page count
-/// runs far past the pages any tree or record names (a crafted file) costs no memory past the
-/// owner table.
-fn leaked_runs(owner: &[Owner]) -> Option<String> {
+/// The runs of pages of `2..owner.len()` nothing claimed (each page's owner word, its type's
+/// default, zero, for none), found in one pass, as compact runs: `[2, 5..8]`; `None` if there are
+/// none. Only the first [`LISTED`] runs are kept, the rest counted: `[2, 5..8, ...; 7 more runs,
+/// 4294967268 pages in all]`. So a meta whose page count runs far past the pages any tree or
+/// record names (a crafted file) costs no memory past the owner table.
+fn leaked_runs<W: Default + PartialEq>(owner: &[W]) -> Option<String> {
+    let none = W::default();
     let (mut listed, mut runs, mut pages, mut start) = (Vec::new(), 0_u64, 0_u64, 2);
-    for chunk in owner.get(2..).unwrap_or_default().chunk_by(|a, b| (*a == 0) == (*b == 0)) {
+    for chunk in owner.get(2..).unwrap_or_default().chunk_by(|a, b| (*a == none) == (*b == none)) {
         let end = start + chunk.len();
-        if chunk[0] == 0 {
+        if chunk[0] == none {
             runs += 1;
             pages += chunk.len() as u64;
             if listed.len() < LISTED {
@@ -551,7 +646,13 @@ fn leaked_runs(owner: &[Owner]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        env::{Env, EnvOptions},
+        ReadTxn as _,
+    };
 
     /// The skip rule of open's check of a weak head: a txn named in a parent's 32 bits is after the
     /// last sync exactly when it is 1 to 2^31 - 1 past it, whatever the high bits and across the
@@ -621,6 +722,90 @@ mod tests {
         assert_eq!(
             many.describe(&owners),
             format!("[{}, ...; {} more]", named.join(", "), pages - LISTED as u32)
+        );
+    }
+
+    /// Both claim structures give a page to its first claimer: a second claim is refused,
+    /// returning that first owner, and a third too (the first is kept). The table of every page
+    /// starts with every page unclaimed (its zeros, which [`leaked_runs`] reads); the map of the
+    /// pages claimed holds room for those it claims, however high their numbers.
+    #[test]
+    fn a_page_claimed_twice_stays_its_first_claimers() {
+        let table = Claims::every(64).expect("a table of 64 pages");
+        assert_eq!(table.slots(), 64);
+        assert_eq!(table.leaked().as_deref(), Some("[2..64]"), "nothing claimed");
+        for (mut claims, pages) in [
+            (table, [2, 9, 63]),
+            (Claims::Visited(HashMap::new()), [2, u32::MAX - 2, u32::MAX - 1]),
+        ] {
+            for (owner, &p) in (4..).zip(&pages) {
+                assert_eq!(claims.claim(p, owner), None, "page {p}'s first claim");
+            }
+            for (owner, &p) in (4..).zip(&pages) {
+                assert_eq!(claims.claim(p, CATALOG), Some(owner), "page {p} claimed twice");
+                assert_eq!(claims.claim(p, FREE_LIST), Some(owner), "page {p}: the first is kept");
+            }
+            if let Claims::Every(_) = claims {
+                assert_eq!(claims.leaked().as_deref(), Some("[3..9, 10..63]"));
+            } else {
+                assert!(claims.slots() < 8, "{} slots for 3 pages", claims.slots());
+                assert_eq!(claims.leaked(), None, "the map knows only the pages claimed");
+            }
+        }
+    }
+
+    /// A table of every page that the host refuses to map (here more than the address space) is
+    /// [`Error::OutOfMemory`], with the bytes asked for and `mmap`'s `ENOMEM`: `Env::check`
+    /// returns it where an infallible allocation would abort the process.
+    #[test]
+    fn a_page_table_the_host_refuses_is_out_of_memory() {
+        let refused = Claims::zeroed(isize::MAX as usize);
+        let Err(Error::OutOfMemory { bytes, source }) = &refused else { panic!("{refused:?}") };
+        assert_eq!((*bytes, source.raw_os_error()), (isize::MAX as u64, Some(libc::ENOMEM)));
+        assert_eq!(Claims::zeroed(1 << 20).expect("a MiB").iter().filter(|&&b| b != 0).count(), 0);
+    }
+
+    /// Open's check of a weak head since the last sync holds room for the pages it claims (the
+    /// pages written since the sync and the free pages their free leaves list), not for every page
+    /// the meta counts: over the same state with a page count of 2^32 - 1, the most a file holds
+    /// (16 GiB of owner words in a table of every page), it passes with a map a few times the
+    /// size of what it read.
+    #[test]
+    fn the_check_since_the_last_sync_holds_the_pages_it_claims_not_the_files() {
+        let dir = tempfile::TempDir::with_prefix("tn_lmdb_check").expect("temp dir");
+        let env = Env::open(dir.path().join("db"), EnvOptions::default()).expect("open");
+        let mut txn = env.begin_rw().expect("begin");
+        let table = txn.create_table("a").expect("table");
+        for i in 0_u32..2_000 {
+            txn.put(&table, &i.to_be_bytes(), &[7; 100]).expect("put");
+        }
+        let since = txn.commit().expect("the last sync");
+        let mut txn = env.begin_rw().expect("begin");
+        let table = txn.open_table("a").expect("open").expect("table a");
+        for i in (0_u32..2_000).step_by(500) {
+            txn.put(&table, &i.to_be_bytes(), &[8; 100]).expect("put");
+        }
+        txn.commit().expect("the head");
+        let head = env.inner().current();
+        let full = check_snapshot(&head).expect("the head's full check");
+        let state_pages = full.catalog_pages + full.table_pages + full.free_tree_pages;
+
+        let mut meta = head.meta;
+        meta.page_count = u32::MAX;
+        let huge = Snapshot {
+            meta,
+            geometry: head.geometry,
+            view: Arc::clone(&head.view),
+            tables: Default::default(),
+        };
+        let pages = check_since(&huge, since).expect("the pages since the last sync pass");
+        let slots = CLAIM_SLOTS.with(std::cell::Cell::get);
+        assert!(0 < pages && pages < state_pages, "{pages} of {state_pages} pages checked");
+        let claimed = pages + full.free_pages;
+        assert!(
+            slots as u64 <= 2 * claimed + 4,
+            "{slots} slots for {pages} pages checked and {} free pages listed",
+            full.free_pages
         );
     }
 }

@@ -697,7 +697,7 @@ fn map_reservation(file: &File, len: u64, readahead: bool) -> Result<MmapRaw> {
 
 /// The mapping `map` of `len` bytes, its refusal for want of memory ([`libc::ENOMEM`]) as
 /// [`Error::OutOfMemory`], any other failure as [`Error::Io`].
-fn mapped<M>(map: io::Result<M>, len: usize) -> Result<M> {
+pub(crate) fn mapped<M>(map: io::Result<M>, len: usize) -> Result<M> {
     map.map_err(|source| match source.raw_os_error() {
         Some(libc::ENOMEM) => Error::OutOfMemory { bytes: len as u64, source },
         _ => Error::Io(source),

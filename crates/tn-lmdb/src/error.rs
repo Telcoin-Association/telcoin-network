@@ -19,13 +19,15 @@ pub enum Error {
     /// file is reopened.
     #[error("tn-lmdb: environment failed: {0}")]
     Failed(String),
-    /// The host refused to map the file: `mmap` failed with `ENOMEM` (the address space, `ulimit
-    /// -v`, or the process's count of mappings exhausted, as many environments open at once can
-    /// do). `bytes` is the length of the mapping asked for: the writer's reservation
-    /// (`EnvOptions::map_reserve` at open, a larger one at a growth past it) or the file, for
-    /// [`crate::Env::open_read_only`]. From a growth inside a write it latches the environment,
-    /// as an I/O error does.
-    #[error("tn-lmdb: out of memory: mapping {bytes} bytes of the file failed: {source}")]
+    /// The host refused a mapping: `mmap` failed with `ENOMEM` (the address space, `ulimit -v`,
+    /// a strict overcommit limit, or the process's count of mappings exhausted, as many
+    /// environments open at once can do). `bytes` is the length of the mapping asked for: the
+    /// writer's reservation of the file (`EnvOptions::map_reserve` at open, a larger one at a
+    /// growth past it), the file, for [`crate::Env::open_read_only`], or the table of 4 bytes a
+    /// page [`crate::Env::check`] keeps of the state's pages. From a growth inside a write it
+    /// latches the environment, as an I/O error does, and from `Env::check` as any failed check
+    /// does.
+    #[error("tn-lmdb: out of memory: mapping {bytes} bytes failed: {source}")]
     OutOfMemory {
         /// The length of the mapping refused.
         bytes: u64,
