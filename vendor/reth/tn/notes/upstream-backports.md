@@ -79,6 +79,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8760eb000 | TN-0066 | `trace_get` selects the frame whose `traceAddress` equals the list (was a flat index into `trace_transaction`) | upstream test |
 | 3dd806a43 | TN-0067 | `trace_replayTransaction` returns `transactionHash` with the traces, the shape `trace_replayBlockTransactions` already used | upstream test |
 | e3d7f0952 | TN-0068 | `trace_replayTransaction` answers `null` for an unknown transaction (was `-32001`), like `trace_transaction` | upstream test |
+| d8d704cf7 | TN-0069 | `trace_callMany` with no block runs on `latest`, not `pending` (review R9) | upstream test |
 
 ## Open
 

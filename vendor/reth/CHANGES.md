@@ -773,6 +773,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `replay_missing_transaction_returns_null` (with and without trace types, over
   the RPC module) and the updated `rpc-builder` smoke test. *Upstream*: n/a (upstream commit).
 
+- **TN-0069** — Backport d8d704cf7: `trace_callMany` without a block runs on `latest`.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-api/src/trace.rs` (method docs), `crates/rpc/rpc/src/trace.rs`
+  (`trace_call_many`; upstream's test `trace_call_many_defaults_to_latest` in the `tests` module,
+  its imports inside the test as the module's other tests keep them).
+  *Why*: an omitted block parameter selected `pending`, where `trace_call`, `eth_call` and the
+  other Parity-style clients default to `latest` (review R9). A `pending` the client names still
+  selects the pending block. `docs/src/rpc-methods/trace/trace_callmany.md` records the default.
+  RPC only.
+  *Tests*: upstream's `trace_call_many_defaults_to_latest` (an omitted block equals `latest` and
+  differs from `pending`, over the API and the RPC module). *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 

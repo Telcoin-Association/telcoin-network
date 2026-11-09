@@ -16,7 +16,7 @@ The request shares a gas budget of `--rpc.gascap` across all its calls. A reques
 
 `Array` - The calls, in execution order. Each call is a two-element array: the transaction call object, with the fields [trace\_call](trace_call.md) lists, and the trace types to return for that call, any of `"trace"`, `"vmTrace"` and `"stateDiff"`.
 
-`QUANTITY|TAG|DATA` - (optional) The block whose state the first call runs on: a hexadecimal block number, a 32-byte block hash, or one of the string tags `latest`, `earliest`, `pending`, `safe` or `finalized`. See the [default block parameter](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block). Defaults to `pending`.
+`QUANTITY|TAG|DATA` - (optional) The block whose state the first call runs on: a hexadecimal block number, a 32-byte block hash, or one of the string tags `latest`, `earliest`, `pending`, `safe` or `finalized`. See the [default block parameter](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block). Defaults to `latest`.
 
 #### Returns
 
