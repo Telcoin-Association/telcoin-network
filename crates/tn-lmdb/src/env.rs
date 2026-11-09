@@ -809,7 +809,10 @@ impl Writer {
     pub(crate) fn defer_sync(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         self.stats.nosync_commits += 1;
         self.add_unsynced(pages);
-        let slot = self.copy_meta(meta, Tag::weak(self.boot_id))?;
+        // MEASUREMENT ONLY, never merge: the weak copy is skipped (no store to the meta page),
+        // the slot bookkeeping kept, to attribute commit.small's cost to that store.
+        let _ = (meta, Tag::weak(self.boot_id));
+        let slot = slot_to_write(&self.slots);
         self.slots[slot] = Some(Slot { txn: meta.txn, weak: true });
         Ok(())
     }
