@@ -283,6 +283,25 @@ where
         rx
     }
 
+    /// TN(TN-0056): [`Self::add_pending_listener`] for an RPC client, refused with `None` once
+    /// [`PoolConfig::max_rpc_tx_listeners`] listeners are registered.
+    pub fn try_add_pending_listener(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<mpsc::Receiver<TxHash>> {
+        let (sender, rx) = mpsc::channel(self.config.pending_tx_listener_buffer_size);
+        let listener = PendingTransactionHashListener { sender, kind };
+
+        let mut listeners = self.pending_transaction_listener.write();
+        listeners.retain(|l| !l.sender.is_closed());
+        if listeners.len() >= self.config.max_rpc_tx_listeners {
+            return None
+        }
+        listeners.push(listener);
+
+        Some(rx)
+    }
+
     /// Adds a new transaction listener to the pool that gets notified about every new transaction.
     pub fn add_new_transaction_listener(
         &self,
@@ -298,6 +317,25 @@ where
 
         rx
     }
+    /// TN(TN-0056): [`Self::add_new_transaction_listener`] for an RPC client, refused with `None`
+    /// once [`PoolConfig::max_rpc_tx_listeners`] listeners are registered.
+    pub fn try_add_new_transaction_listener(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<mpsc::Receiver<NewTransactionEvent<T::Transaction>>> {
+        let (sender, rx) = mpsc::channel(self.config.new_tx_listener_buffer_size);
+        let listener = TransactionListener { sender, kind };
+
+        let mut listeners = self.transaction_listener.write();
+        listeners.retain(|l| !l.sender.is_closed());
+        if listeners.len() >= self.config.max_rpc_tx_listeners {
+            return None
+        }
+        listeners.push(listener);
+
+        Some(rx)
+    }
+
     /// Adds a new blob sidecar listener to the pool that gets notified about every new
     /// eip4844 transaction's blob sidecar.
     pub fn add_blob_sidecar_listener(&self) -> mpsc::Receiver<NewBlobSidecar> {
@@ -1735,6 +1773,29 @@ mod tests {
 
         // Assert that the pool's blob store matches the expected blob store.
         assert_eq!(*test_pool.blob_store(), blob_store);
+    }
+
+    /// TN(TN-0056): RPC listeners are refused at the configured count; the node's own are not.
+    #[test]
+    fn rpc_listeners_are_bounded() {
+        use crate::TransactionListenerKind;
+
+        let config = PoolConfig { max_rpc_tx_listeners: 2, ..Default::default() };
+        let test_pool = &TestPoolBuilder::default().with_config(config).pool;
+
+        let _own = test_pool.add_pending_listener(TransactionListenerKind::All);
+        let _own_new = test_pool.add_new_transaction_listener(TransactionListenerKind::All);
+        let first = test_pool.try_add_pending_listener(TransactionListenerKind::All);
+        assert!(first.is_some());
+        assert!(test_pool.try_add_pending_listener(TransactionListenerKind::All).is_none());
+        let _second_new = test_pool
+            .try_add_new_transaction_listener(TransactionListenerKind::All)
+            .expect("one RPC slot is free");
+        assert!(test_pool.try_add_new_transaction_listener(TransactionListenerKind::All).is_none());
+
+        // a dropped listener frees its slot
+        drop(first);
+        assert!(test_pool.try_add_pending_listener(TransactionListenerKind::All).is_some());
     }
 
     #[test]

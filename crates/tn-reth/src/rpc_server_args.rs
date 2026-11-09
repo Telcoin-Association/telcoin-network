@@ -6,9 +6,10 @@
 //! since validator RPC endpoints may be publicly reachable:
 //!
 //! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
-//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), and 1024
-//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`). These cap memory held
-//!   per connection and the fan-out of websocket subscriptions.
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 1024
+//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per
+//!   batch request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out
+//!   of websocket subscriptions, and how many calls one request can queue.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
 //!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
@@ -157,6 +158,22 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-subscriptions-per-connection", alias = "rpc-max-subscriptions-per-connection", default_value_t = RPC_DEFAULT_MAX_SUBS_PER_CONN.into())]
     pub rpc_max_subscriptions_per_connection: MaxU32,
 
+    /// Maximum number of calls in one JSON-RPC batch request, on HTTP, WS and IPC.
+    ///
+    /// A larger batch is refused whole. Each call in a batch holds its parsed parameters until it
+    /// runs, so this bounds what one request can queue (vendored TN-0055).
+    #[arg(long = "rpc.max-batch-requests", value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..), default_value_t = constants::DEFAULT_MAX_BATCH_REQUESTS)]
+    pub rpc_max_batch_requests: u32,
+
+    /// Maximum number of installed filters (`eth_newFilter`, `eth_newBlockFilter`,
+    /// `eth_newPendingTransactionFilter`) across all clients.
+    ///
+    /// Filters outlive the connection that made them and are removed only when uninstalled or
+    /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored
+    /// TN-0056).
+    #[arg(long = "rpc.max-active-filters", value_name = "COUNT", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), default_value_t = constants::DEFAULT_MAX_ACTIVE_FILTERS)]
+    pub rpc_max_active_filters: usize,
+
     /// Maximum number of RPC server connections.
     #[arg(long = "rpc.max-connections", alias = "rpc-max-connections", value_name = "COUNT", default_value_t = RPC_DEFAULT_MAX_CONNECTIONS.into())]
     pub rpc_max_connections: MaxU32,
@@ -286,6 +303,8 @@ impl Default for RpcServerArgs {
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
+            rpc_max_batch_requests: constants::DEFAULT_MAX_BATCH_REQUESTS,
+            rpc_max_active_filters: constants::DEFAULT_MAX_ACTIVE_FILTERS,
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
@@ -327,6 +346,8 @@ impl From<RpcServerArgs> for reth_node_core::args::RpcServerArgs {
             rpc_max_response_size: v.rpc_max_response_size,
             rpc_max_subscriptions_per_connection: v.rpc_max_subscriptions_per_connection,
             rpc_max_connections: v.rpc_max_connections,
+            rpc_max_batch_requests: v.rpc_max_batch_requests,
+            rpc_max_active_filters: v.rpc_max_active_filters,
             rpc_max_tracing_requests: v.rpc_max_tracing_requests,
             rpc_max_trace_filter_blocks: v.rpc_max_trace_filter_blocks,
             rpc_max_blocks_per_filter: v.rpc_max_blocks_per_filter,

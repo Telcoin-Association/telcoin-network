@@ -742,3 +742,51 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `bundle_over_the_transaction_count_is_refused_before_decoding` (2,381 undecodable
   entries fail on the count, so nothing was decoded) and `bundle_at_the_transaction_count_is_decoded`
   (2,380 fail on the decode). *Upstream*: yes; upstream main (6351fbb92) only caches recoveries.
+
+- **TN-0055** — A limit on calls per JSON-RPC batch, on HTTP, WS and IPC. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-server-types/src/constants.rs` (`DEFAULT_MAX_BATCH_REQUESTS`, 100),
+  `crates/node/core/src/args/rpc_server.rs` (`--rpc.max-batch-requests`, at least 1, in
+  `RpcServerArgs` and `DefaultRpcServerArgs`), `crates/rpc/rpc-builder/src/config.rs`
+  (`http_ws_server_builder` sets jsonrpsee's `BatchRequestConfig::Limit`; `ipc_server_builder`
+  sets the IPC one), `crates/rpc/ipc/src/server/mod.rs` (`Settings::max_batch_requests`, the
+  builder method, and the test `can_set_max_batch_requests`), `crates/rpc/ipc/src/server/ipc.rs`
+  (`process_batch_request` refuses a longer batch with jsonrpsee's own too-big-batch error).
+  *Why*: jsonrpsee defaults to unlimited batches and reth never set a limit, and reth's IPC server
+  parses batches itself with no limit at all. One 15 MB batch queued about 100k calls on one
+  connection, each holding its parsed parameters while waiting on a permit, and made every
+  per-request cost (filters, listeners) cheap to repeat (review R27). TN's `RpcServerArgs`
+  (`tn-reth/src/rpc_server_args.rs`) exposes the flag with the same default. A batch over the
+  limit is refused whole with jsonrpsee's error -32010. RPC transport only.
+  *Tests*: `can_set_max_batch_requests` (IPC: two calls pass at a limit of two, three are refused);
+  jsonrpsee's own limit covers HTTP and WS. *Upstream*: yes.
+
+- **TN-0056** — Caps on installed filters and on the pool listeners RPC clients register. *Kind*:
+  fix (security).
+  *Files*: `crates/rpc/rpc-server-types/src/constants.rs` (`DEFAULT_MAX_ACTIVE_FILTERS`, 1,000),
+  `crates/rpc/rpc-eth-types/src/builder/config.rs` (`EthConfig::max_active_filters`,
+  `EthFilterConfig::max_active_filters`), `crates/rpc/rpc-builder/src/config.rs` (passes it),
+  `crates/node/core/src/args/rpc_server.rs` (`--rpc.max-active-filters`, at least 1),
+  `crates/node/core/src/args/txpool.rs` (fills the new pool field with its default),
+  `crates/rpc/rpc/src/eth/filter.rs` (`install_filter` refuses at the cap; the pending-transaction
+  filters take their pool listener through the fallible methods; `EthFilterError::TooManyActiveFilters`
+  and `TooManyTransactionListeners`, both -32604 server-busy; test `active_filters_are_bounded`),
+  `crates/rpc/rpc/src/eth/pubsub.rs` (`newPendingTransactions` subscriptions take their listener
+  the same way and fail with the same error), `crates/transaction-pool/src/config.rs`
+  (`PoolConfig::max_rpc_tx_listeners`, `MAX_RPC_TX_LISTENERS` 1,024), `crates/transaction-pool/src/traits.rs`
+  (`TransactionPool::try_pending_transactions_listener_for` and `try_new_transactions_listener_for`,
+  with defaults that never refuse), `crates/transaction-pool/src/lib.rs` (`Pool` implements them),
+  `crates/transaction-pool/src/pool/mod.rs` (`try_add_pending_listener`,
+  `try_add_new_transaction_listener`, test `rpc_listeners_are_bounded`).
+  *Why*: `eth_newFilter`, `eth_newBlockFilter` and `eth_newPendingTransactionFilter` inserted into
+  an unbounded map; a filter polled within five minutes never expires and outlives its connection,
+  so connection limits did not bound them, and each one can carry a filter near the request size
+  limit. Every pending-transaction filter and every `newPendingTransactions` subscription also
+  registered a pool listener that every pool insertion walks with a `try_send`, with no bound on
+  their number (review R2). The node now refuses the filter past `--rpc.max-active-filters`
+  (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
+  `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
+  TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones never count against the
+  cap or get refused. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
+  constant. RPC and pool-listener registration only: pool admission and ordering are unchanged.
+  *Tests*: `active_filters_are_bounded`, `rpc_listeners_are_bounded`; the rest of the filter,
+  pubsub and pool tests. *Upstream*: yes.

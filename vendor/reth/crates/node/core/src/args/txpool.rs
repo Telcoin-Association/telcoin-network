@@ -538,6 +538,7 @@ impl RethTransactionPoolConfig for TxPoolArgs {
             pending_tx_listener_buffer_size: self.pending_tx_listener_buffer_size,
             new_tx_listener_buffer_size: self.new_tx_listener_buffer_size,
             max_new_pending_txs_notifications: self.max_new_pending_txs_notifications,
+            max_rpc_tx_listeners: default_config.max_rpc_tx_listeners,
             max_queued_lifetime: self.max_queued_lifetime,
             max_inflight_delegated_slot_limit: default_config.max_inflight_delegated_slot_limit,
         }

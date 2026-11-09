@@ -32,7 +32,9 @@ use reth_storage_api::{
     ProviderReceipt, ReceiptProvider,
 };
 use reth_tasks::TaskSpawner;
-use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
+use reth_transaction_pool::{
+    NewSubpoolTransactionStream, PoolTransaction, SubPool, TransactionListenerKind, TransactionPool,
+};
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -137,8 +139,12 @@ where
     /// let filter = EthFilter::new(eth_api, Default::default(), TokioTaskExecutor::default().boxed());
     /// ```
     pub fn new(eth_api: Eth, config: EthFilterConfig, task_spawner: Box<dyn TaskSpawner>) -> Self {
-        let EthFilterConfig { max_blocks_per_filter, max_logs_per_response, stale_filter_ttl } =
-            config;
+        let EthFilterConfig {
+            max_blocks_per_filter,
+            max_logs_per_response,
+            stale_filter_ttl,
+            max_active_filters,
+        } = config;
         let inner = EthFilterInner {
             eth_api,
             active_filters: ActiveFilters::new(),
@@ -146,6 +152,7 @@ where
             max_headers_range: MAX_HEADERS_RANGE,
             task_spawner,
             stale_filter_ttl,
+            max_active_filters,
             query_limits: QueryLimits { max_blocks_per_filter, max_logs_per_response },
         };
 
@@ -351,14 +358,23 @@ where
     ) -> RpcResult<FilterId> {
         trace!(target: "rpc::eth", "Serving eth_newPendingTransactionFilter");
 
+        // TN(TN-0056): a listener the pool refuses fails the request, so a client cannot register
+        // more pool listeners than the pool walks per insertion.
         let transaction_kind = match kind.unwrap_or_default() {
             PendingTransactionFilterKind::Hashes => {
-                let receiver = self.pool().pending_transactions_listener();
+                let receiver = self
+                    .pool()
+                    .try_pending_transactions_listener_for(TransactionListenerKind::PropagateOnly)
+                    .ok_or(EthFilterError::TooManyTransactionListeners)?;
                 let pending_txs_receiver = PendingTransactionsReceiver::new(receiver);
                 FilterKind::PendingTransaction(PendingTransactionKind::Hashes(pending_txs_receiver))
             }
             PendingTransactionFilterKind::Full => {
-                let stream = self.pool().new_pending_pool_transactions_listener();
+                let receiver = self
+                    .pool()
+                    .try_new_transactions_listener_for(TransactionListenerKind::PropagateOnly)
+                    .ok_or(EthFilterError::TooManyTransactionListeners)?;
+                let stream = NewSubpoolTransactionStream::new(receiver, SubPool::Pending);
                 let full_txs_receiver = FullTransactionsReceiver::new(
                     stream,
                     dyn_clone::clone(self.inner.eth_api.converter()),
@@ -439,6 +455,8 @@ struct EthFilterInner<Eth: EthApiTypes> {
     task_spawner: Box<dyn TaskSpawner>,
     /// Duration since the last filter poll, after which the filter is considered stale
     stale_filter_ttl: Duration,
+    /// TN(TN-0056): how many filters may be installed at once.
+    max_active_filters: usize,
 }
 
 impl<Eth> EthFilterInner<Eth>
@@ -596,6 +614,10 @@ where
             jsonrpsee_types::SubscriptionId::Str(s) => FilterId::Str(s.into_owned()),
         };
         let mut filters = self.active_filters.inner.lock().await;
+        // TN(TN-0056): filters outlive their connection, so bound them here, not per connection.
+        if filters.len() >= self.max_active_filters {
+            return Err(EthFilterError::TooManyActiveFilters(self.max_active_filters).into())
+        }
         filters.insert(
             id.clone(),
             ActiveFilter {
@@ -655,6 +677,7 @@ where
             };
             if let Some(res) = res {
                 let _ = tx.send(res);
+        let mut matching_headers = Vec::new();
             }
         }));
 
@@ -677,7 +700,6 @@ where
         limits: QueryLimits,
     ) -> Result<Vec<Log>, EthFilterError> {
         let mut all_logs = Vec::new();
-        let mut matching_headers = Vec::new();
 
         // get current chain tip to determine processing mode
         let chain_tip = self.provider().best_block_number()?;
@@ -688,6 +710,7 @@ where
         {
             let headers = self.provider().headers_range(from..=to)?;
 
+        }
             let mut headers_iter = headers.into_iter().peekable();
 
             while let Some(header) = headers_iter.next() {
@@ -710,7 +733,6 @@ where
 
                 matching_headers.push(SealedHeader::new(header, block_hash));
             }
-        }
 
         // initialize the appropriate range mode based on collected headers
         let mut range_mode = RangeMode::new(
@@ -955,6 +977,12 @@ pub enum EthFilterError {
     /// Error thrown when a spawned task failed to deliver a response.
     #[error("internal filter error")]
     InternalError,
+    /// TN(TN-0056): the node holds as many filters as it allows.
+    #[error("too many active filters, the limit is {0}")]
+    TooManyActiveFilters(usize),
+    /// TN(TN-0056): the pool holds as many RPC transaction listeners as it allows.
+    #[error("too many pending transaction listeners")]
+    TooManyTransactionListeners,
 }
 
 impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
@@ -974,6 +1002,11 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
             EthFilterError::BlockRangeExceedsHead) => {
                 rpc_error_with_code(jsonrpsee::types::error::INVALID_PARAMS_CODE, err.to_string())
             }
+            err @ (EthFilterError::TooManyActiveFilters(_) |
+            EthFilterError::TooManyTransactionListeners) => rpc_error_with_code(
+                jsonrpsee::types::error::ErrorCode::ServerIsBusy.code(),
+                err.to_string(),
+            ),
         }
     }
 }
@@ -2022,6 +2055,27 @@ mod tests {
             pending_tasks: FuturesOrdered::new(),
         };
         (range_mode, headers)
+    }
+
+    /// TN(TN-0056): the third filter is refused at a limit of two, and uninstalling frees a slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_filters_are_bounded() {
+        use reth_rpc_eth_api::EthFilterApiServer;
+
+        let provider = MockEthProvider::default();
+        // installing a filter records the chain tip
+        provider.add_header(FixedBytes::random(), alloy_consensus::Header::default());
+        let eth_filter = super::EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default().max_active_filters(2),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let first = eth_filter.new_block_filter().await.expect("first filter");
+        eth_filter.new_block_filter().await.expect("second filter");
+        let err = eth_filter.new_block_filter().await.expect_err("third filter");
+        assert_eq!(err.message(), "too many active filters, the limit is 2");
+        assert!(eth_filter.uninstall_filter(first).await.expect("uninstall"));
+        eth_filter.new_block_filter().await.expect("a slot is free again");
     }
 
     #[tokio::test(flavor = "multi_thread")]

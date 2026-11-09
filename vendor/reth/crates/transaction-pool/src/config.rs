@@ -31,6 +31,9 @@ pub const REPLACE_BLOB_PRICE_BUMP: u128 = 100;
 /// Default maximum new transactions for broadcasting.
 pub const MAX_NEW_PENDING_TXS_NOTIFICATIONS: usize = 200;
 
+/// TN(TN-0056): the default [`PoolConfig::max_rpc_tx_listeners`].
+pub const MAX_RPC_TX_LISTENERS: usize = 1024;
+
 /// Default maximum allowed in flight delegated transactions per account.
 pub const DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS: usize = 1;
 
@@ -64,6 +67,10 @@ pub struct PoolConfig {
     pub pending_tx_listener_buffer_size: usize,
     /// Bound on number of new transactions from `reth_network::TransactionsManager` to buffer.
     pub new_tx_listener_buffer_size: usize,
+    /// TN(TN-0056): bound on the pending-hash listeners and on the new-transaction listeners the
+    /// RPC layer may register (each is walked on every insertion); the node's own listeners do
+    /// not count against it.
+    pub max_rpc_tx_listeners: usize,
     /// How many new pending transactions to buffer and send iterators in progress.
     pub max_new_pending_txs_notifications: usize,
     /// Maximum lifetime for transactions in the pool
@@ -126,6 +133,7 @@ impl Default for PoolConfig {
             local_transactions_config: Default::default(),
             pending_tx_listener_buffer_size: PENDING_TX_LISTENER_BUFFER_SIZE,
             new_tx_listener_buffer_size: NEW_TX_LISTENER_BUFFER_SIZE,
+            max_rpc_tx_listeners: MAX_RPC_TX_LISTENERS,
             max_new_pending_txs_notifications: MAX_NEW_PENDING_TXS_NOTIFICATIONS,
             max_queued_lifetime: MAX_QUEUED_TRANSACTION_LIFETIME,
             max_inflight_delegated_slot_limit: DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS,

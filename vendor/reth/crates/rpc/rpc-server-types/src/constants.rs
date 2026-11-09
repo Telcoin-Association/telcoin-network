@@ -15,6 +15,13 @@ pub const DEFAULT_MAX_BLOCKS_PER_FILTER: u64 = 100_000;
 /// The default maximum of logs in a single response.
 pub const DEFAULT_MAX_LOGS_PER_RESPONSE: usize = 20_000;
 
+/// TN(TN-0055): the most calls one JSON-RPC batch may carry, on every transport.
+pub const DEFAULT_MAX_BATCH_REQUESTS: u32 = 100;
+
+/// TN(TN-0056): the most filters (`eth_newFilter`, `eth_newBlockFilter`,
+/// `eth_newPendingTransactionFilter`) a node keeps installed at once.
+pub const DEFAULT_MAX_ACTIVE_FILTERS: usize = 1000;
+
 /// The default maximum number of blocks for `trace_filter` requests.
 pub const DEFAULT_MAX_TRACE_FILTER_BLOCKS: u64 = 100;
 
