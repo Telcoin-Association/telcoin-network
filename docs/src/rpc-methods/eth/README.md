@@ -23,7 +23,7 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | `eth_getRawTransactionByBlockHashAndIndex` | |
 | `eth_getRawTransactionByBlockNumberAndIndex` | |
 | `eth_getRawTransactionByHash` | |
-| `eth_getTransactionBySenderAndNonce` | |
+| `eth_getTransactionBySenderAndNonce` | `null` when the sender's nonce moved without a transaction of theirs in the block (a contract creation, or a system call) |
 | `eth_sendRawTransactionSync` | Guarded by `--rpc.txfeecap` like `eth_sendRawTransaction` |
 | `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks`. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
 | `eth_subscribe`, `eth_unsubscribe` | WebSocket and IPC only |

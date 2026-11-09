@@ -687,6 +687,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `call_allowance_respects_rpc_gas_cap`; TN-0057's `call_many_budget_tests`.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0063** — Backport dfcb10454: `eth_getTransactionBySenderAndNonce` answers `null` when the
+  located block holds no transaction from the sender. *Kind*: backport.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/transaction.rs` (`get_transaction_by_sender_and_nonce`),
+  `crates/rpc/rpc/src/eth/core.rs` (upstream's three tests). TN-0036 had already taken the
+  commit's mock-provider hunk.
+  *Why*: the binary search finds the block in which the sender's nonce passed the requested value,
+  then the handler mapped "no matching transaction in that block" onto the same `HeaderNotFound`
+  error as a missing block. A nonce can move without a transaction from the sender: EIP-7702
+  authorizations, and on TN contract creations and the system-call sender (review R22). An
+  existing block with no match is now `null`; a block the provider cannot read is still the
+  header error. The vendored `TransactionInfo` has no `block_timestamp` field, so that line of
+  upstream's change is not taken. RPC only.
+  *Tests*: upstream's `test_transaction_by_sender_and_nonce_without_sender_transaction_returns_none`,
+  `..._missing_block_returns_error` and `..._returns_matching_transaction`.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

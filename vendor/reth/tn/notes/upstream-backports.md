@@ -73,6 +73,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | d46664fc8 | TN-0059 | `eth_simulateV1` loads the state of the block it resolved, not a second resolution of `latest` | existing simulate tests; no upstream test |
 | f12d52de2 | TN-0060 | `--txpool.max-batch-size 0` is refused at parse time (it parked the transaction batcher for good) | upstream test |
 | 5b6863039 | TN-0062 | a priced call with no `gas` field stays within `--rpc.gascap` (the caller allowance was clamped to the block limit only) | upstream test |
+| dfcb10454 | TN-0063 | `eth_getTransactionBySenderAndNonce` returns `null`, not a header error, when the sender's nonce moved without a transaction of theirs in the block (the mock hunk came with TN-0036) | upstream tests |
 
 ## Open
 

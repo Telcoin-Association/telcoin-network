@@ -358,32 +358,35 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
             .await?;
 
             let block_id = num.into();
-            self.recovered_block(block_id)
-                .await?
-                .and_then(|block| {
-                    let block_hash = block.hash();
-                    let block_number = block.number();
-                    let base_fee_per_gas = block.base_fee_per_gas();
+            let Some(block) = self.recovered_block(block_id).await? else {
+                return Err(EthApiError::HeaderNotFound(block_id).into())
+            };
 
-                    block
-                        .transactions_with_sender()
-                        .enumerate()
-                        .find(|(_, (signer, tx))| **signer == sender && (*tx).nonce() == nonce)
-                        .map(|(index, (signer, tx))| {
-                            #[allow(clippy::needless_update)]
-                            let tx_info = TransactionInfo {
-                                hash: Some(*tx.tx_hash()),
-                                block_hash: Some(block_hash),
-                                block_number: Some(block_number),
-                                base_fee: base_fee_per_gas,
-                                index: Some(index as u64),
-                                ..Default::default()
-                            };
-                            Ok(self.converter().fill(tx.clone().with_signer(*signer), tx_info)?)
-                        })
+            let block_hash = block.hash();
+            let block_number = block.number();
+            let base_fee_per_gas = block.base_fee_per_gas();
+
+            // TN(TN-0063): a nonce can be consumed without a transaction from the sender
+            // (EIP-7702 authorizations; on TN also contract creations and the system-call
+            // sender), so an existing block may contain no matching transaction: that is
+            // `None`, not a missing header.
+            block
+                .transactions_with_sender()
+                .enumerate()
+                .find(|(_, (signer, tx))| **signer == sender && (*tx).nonce() == nonce)
+                .map(|(index, (signer, tx))| {
+                    #[allow(clippy::needless_update)]
+                    let tx_info = TransactionInfo {
+                        hash: Some(*tx.tx_hash()),
+                        block_hash: Some(block_hash),
+                        block_number: Some(block_number),
+                        base_fee: base_fee_per_gas,
+                        index: Some(index as u64),
+                        ..Default::default()
+                    };
+                    Ok(self.converter().fill(tx.clone().with_signer(*signer), tx_info)?)
                 })
-                .ok_or(EthApiError::HeaderNotFound(block_id))?
-                .map(Some)
+                .transpose()
         }
     }
 
