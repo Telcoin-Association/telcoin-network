@@ -314,7 +314,7 @@ fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
     use crate::env::layout::{self, StorageLayout};
 
     let tx = mdbx.tx().wrap_err("failed to begin a read of the MDBX database")?;
-    let mut row = |key: &str| -> eyre::Result<Option<Vec<u8>>> {
+    let row = |key: &str| -> eyre::Result<Option<Vec<u8>>> {
         match tx.get::<reth_db::tables::Metadata>(key.to_string()) {
             Ok(row) => Ok(row),
             // a database written before reth added the table has no rows in it
@@ -331,7 +331,8 @@ fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
         || marked.is_some_and(|l| l != StorageLayout::V1)
     {
         eyre::bail!(
-            "the MDBX database is not in storage layout v1 (storage_settings: {stored:?}, TN's              marker: {marked:?}): the migration to tn-lmdb moves only v1 databases"
+            "the MDBX database is not in storage layout v1 (storage_settings: {stored:?}, TN's \
+             marker: {marked:?}): the migration to tn-lmdb moves only v1 databases"
         );
     }
     Ok(())

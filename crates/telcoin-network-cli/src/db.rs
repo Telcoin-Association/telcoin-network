@@ -117,7 +117,8 @@ impl DbResetExecutionArgs {
         }
         if self.force {
             println!(
-                "moved the execution database ({}) aside to {}; the next start rebuilds it from                  genesis. To undo, stop the node and move the entries back into {}",
+                "moved the execution database ({}) aside to {}; the next start rebuilds it from \
+                 genesis. To undo, stop the node and move the entries back into {}",
                 moves.join(", "),
                 plan.target.display(),
                 datadir.display(),

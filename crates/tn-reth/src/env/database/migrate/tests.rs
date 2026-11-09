@@ -990,12 +990,15 @@ fn an_mdbx_database_not_in_layout_v1_is_refused() {
     use crate::env::layout::{RETH_SETTINGS_KEY, TN_LAYOUT_KEY};
     use reth_db::table::Compress as _;
 
+    /// A refused case: its name, its `Metadata` rows, and the refusal's text.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a [u8])], &'a str);
+
     // a `Metadata` row as MDBX stores it: the key's bytes, the value compressed
     let row = |key: &str, value: &[u8]| (key.as_bytes().to_vec(), value.to_vec().compress());
     let v1 = br#"{"storage_v2":false}"#.as_slice();
     let v2 = br#"{"storage_v2":true}"#.as_slice();
     let marker_v1 = br#"{"version":1,"layout":"v1"}"#.as_slice();
-    let refused: [(&str, &[(&str, &[u8])], &str); 5] = [
+    let refused: [Case<'_>; 5] = [
         ("settings v2", &[(RETH_SETTINGS_KEY, v2)], "not in storage layout v1"),
         (
             "marker v2",
