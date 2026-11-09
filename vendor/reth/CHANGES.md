@@ -490,6 +490,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   same, so it cannot change execution or what is written. TN builds for Linux and macOS only,
   both `unix`. *Upstream*: n/a (upstream commit).
 
+- **TN-0041** — Backport a195b777e: storage v2's `write_state` skips the plain-state conversion
+  when nothing it produces goes to the database. *Kind*: backport, adapted.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`write_state`, new
+  `write_bytecodes`, used by `write_state_changes` too).
+  *Why*: under v2, `save_blocks` sends receipts and both changesets to static files and v2 keeps
+  no plain state, so the per-block `to_plain_state_and_reverts` (a walk and copy of every changed
+  account and slot) fed only the bytecode writes. The early return writes the bytecodes
+  directly. Adapted: upstream writes every entry of the bundle's `contracts`, while
+  `to_plain_state` drops the empty bytecode (`KECCAK_EMPTY`); TN keeps that filter, so the
+  `Bytecodes` table is the same on both paths. Storage path, v2 only: the condition needs
+  `use_hashed_state()`, which is false for every v1 datadir, so v1 writes are unchanged; genesis
+  and other `StateWriteConfig::default()` callers still convert. *Upstream*: yes, the
+  `KECCAK_EMPTY` filter.
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
