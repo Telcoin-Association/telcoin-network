@@ -685,7 +685,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            key: StorageSlotKey::from_u256(key).to_hashed(),
+                            // TN(TN-0044): the plain slot, as in v1's changesets (upstream
+                            // 815037e27).
+                            key: StorageSlotKey::from_u256(key).as_b256(),
                             value: revert_to_slot.to_previous_value(),
                         }
                     })
@@ -2613,8 +2615,9 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             for i in offset.changeset_range() {
                 if let Some(change) = cursor.get_one::<StorageChangesetMask>(i.into())? {
                     let block_address = BlockNumberAddress((block_number, change.address));
+                    // TN(TN-0044): static-file storage changesets hold plain slots.
                     let entry = ChangesetEntry {
-                        key: StorageSlotKey::hashed(change.key),
+                        key: StorageSlotKey::plain(change.key),
                         value: change.value,
                     };
                     changeset.push((block_address, entry));
@@ -2680,8 +2683,9 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
         {
+            // TN(TN-0044): static-file storage changesets hold plain slots.
             return Ok(Some(ChangesetEntry {
-                key: StorageSlotKey::hashed(change.key),
+                key: StorageSlotKey::plain(change.key),
                 value: change.value,
             }));
         }

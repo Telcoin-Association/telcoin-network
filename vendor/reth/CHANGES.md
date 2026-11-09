@@ -591,3 +591,35 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   Storage path: v1's `save_blocks` still calls `update_history_indices` and its unwinds are the
   same code, so v1 datadirs are written as before. *Upstream*: n/a (upstream writes these to
   `RocksDB`; its v2 has the same wipe gap).
+
+- **TN-0044** — Storage v2 keys storage changesets and `StoragesHistory` by the plain slot, as v1
+  does (the key form of upstream 815037e27). *Kind*: fix (format).
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (the static-file
+  storage-changeset writer and readers), `.../providers/state/historical.rs` (storage history
+  and changeset lookups, `storage_by_hashed_key`), `.../providers/database/provider.rs`
+  (`HistoryTransitions`, `write_state_reverts`, `populate_bundle_state_hashed`,
+  `remove_state_above`, `take_state_above`, tests), `.../providers/consistent.rs` (in-memory
+  changesets, a test), `crates/primitives-traits/src/storage.rs` (removes
+  `StorageSlotKey::{from_raw, to_changeset_key, to_changeset}` and `StorageEntry::slot_key`),
+  `crates/storage/storage-api/src/{storage.rs, state.rs}` (docs), `crates/trie/db/src/
+  {state.rs, storage.rs}` (tests), `crates/storage/db-common/src/init.rs` (a test).
+  *Why*: v1.11.4's v2 wrote `keccak256(slot)` into the static-file storage changesets and looked
+  history up by it, while genesis (`insert_storage_history`) writes `StoragesHistory` by the plain
+  slot, so under v2 a genesis-allocated slot read as never written at every block before its
+  first later change; TN's consensus registry is such a slot. Upstream went back to plain slots
+  in 815037e27. TN takes the key form only, not that commit's slot-preimage machinery (pipeline
+  only) or its removal of `StorageSlotKey` and `ChangesetEntry`: changeset readers now tag every
+  key `Plain`, so the callers that hash through `StorageSlotKey::to_hashed` (`unwind_storage_hashing`,
+  `reth-trie-db`'s reverts and prefix sets) need no change, and the few that used the raw key for
+  `HashedStorages` hash it. The helpers that encoded "v2 changesets are hashed" are removed so
+  nothing can use that form again. With plain keys, v2's changesets and three index tables are
+  byte-identical to v1's for the same chain. Two v2 consequences:
+  - History cannot be looked up by a hashed slot (v2 keeps no preimages), so a historical
+    `storage_by_hashed_key` returns `UnsupportedProvider` in both layouts. Nothing in TN called it.
+  - `write_state_reverts` cannot record a wiped account's slots from `HashedStorages` (it holds
+    only hashes), so under v2 such a wipe is an error (see TN-0043; impossible since Cancun).
+  Storage path, v2 format: any v2 datadir written before this reads wrongly. None is deployed;
+  testnet is v1, whose keys were already plain. v1 reads and writes are unchanged.
+  *Tests*: `v2_genesis_storage_reads_after_genesis` (db-common; fails with the hashed lookup),
+  `test_populate_bundle_state_hashed_with_plain_keys`, `test_write_and_remove_state_roundtrip_v2`
+  and the TN-0045 differential. *Upstream*: n/a (upstream commit).
