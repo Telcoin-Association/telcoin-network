@@ -132,24 +132,28 @@ pub struct TnLmdbArgs {
     pub sync: SyncMode,
     /// [`SyncMode::NoSync`]: a commit commits durably once at least this long has passed since the
     /// last durable state (default `None`: never by time): the engine's `EnvOptions::sync_period`,
-    /// checked at each commit. The first commit after an open commits durably whatever this says
-    /// (the open is not a durable state). A crash then loses only commits made less than this
-    /// after the last durable state. Ignored in [`SyncMode::Durable`] and by a read-only open.
+    /// checked at each commit. The first commit that changes something after an open commits
+    /// durably whatever this says (the open is not a durable state). A crash then loses only
+    /// commits made less than this after the last durable state. Ignored in [`SyncMode::Durable`]
+    /// and by a read-only open.
     pub sync_period: Option<Duration>,
-    /// [`SyncMode::NoSync`]: a commit commits durably once the pages stamped since the last
-    /// durable state, its own included, hold at least this many bytes (default `None`: never by
-    /// size): the engine's `EnvOptions::sync_bytes`. The first commit after an open commits
-    /// durably whatever this says (the open is not a durable state). It bounds what a crash loses
-    /// and how long freed pages wait, so how far the file grows past its live pages. Ignored in
-    /// [`SyncMode::Durable`] and by a read-only open.
+    /// [`SyncMode::NoSync`]: a commit commits durably once the pages stamped since the last durable
+    /// state, its own included, hold at least this many bytes (default `None`: never by size): the
+    /// engine's `EnvOptions::sync_bytes`. The first commit that changes something after an open
+    /// commits durably whatever this says (the open is not a durable state). It bounds what a
+    /// crash loses and how long freed pages wait, so how far the file grows past its live
+    /// pages. Ignored in [`SyncMode::Durable`] and by a read-only open.
     pub sync_bytes: Option<u64>,
     /// Trust, at open, a [`SyncMode::NoSync`] commit's weak meta (written with no sync) when the
     /// running boot wrote it (default `true`): the engine's `EnvOptions::trust_unsynced`. A crash
-    /// of the process alone then loses no commit; a reboot rolls back to the last sync either
-    /// way. The engine trusts a weak meta only once the pages it names since the last sync pass a
-    /// full check, and opens at the last sync if any fails (a drive pulled, then plugged back in
-    /// the same boot, may have lost them). `false` opens at the last sync, unchecked: a choice to
-    /// discard every commit since it. Applies to read-only opens too.
+    /// of the process alone then loses no commit (but for one inside the 128-byte copy of a meta,
+    /// which rolls back to the last sync); a reboot rolls back to the last sync either way. The
+    /// engine trusts a weak meta only once the pages it names since the last sync pass a full
+    /// check, and opens at the last sync if any fails (a drive pulled, then plugged back in the
+    /// same boot, may have lost them). `false` opens at the last sync, unchecked. It does not
+    /// discard the commits since it: they stay in their slot until this environment's first
+    /// commit that changes something writes over it, so a later open with `true` in the same boot
+    /// can open at them again. Applies to read-only opens too.
     pub trust_unsynced: bool,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
@@ -557,13 +561,12 @@ impl TnLmdbEnv {
     /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
     /// durable only at the next sync (this, the environment's drop, which syncs unless it latched,
     /// a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`], or the first
-    /// commit after the open); before it, its
-    /// weak meta keeps it through a crash of the process alone, not a reboot. A no-op when
-    /// nothing is pending, in [`SyncMode::Durable`] (but after an open that trusted a weak meta)
-    /// and in a read-only environment, unless the environment is latched: then it fails in every
-    /// mode. Waits while a write transaction is
-    /// open. A failure is [`DatabaseError::Commit`] and latches the environment: later writes
-    /// and commits fail until it is reopened.
+    /// commit that changes something after the open); before it, its weak meta keeps it through a
+    /// crash of the process alone, not a reboot. A no-op when nothing is pending and in
+    /// [`SyncMode::Durable`] (but after an open that trusted a weak meta), unless the environment
+    /// is latched: then it fails. Always a no-op, `Ok`, in a read-only environment, latched or
+    /// not. Waits while a write transaction is open. A failure is [`DatabaseError::Commit`] and
+    /// latches the environment: later writes and commits fail until it is reopened.
     pub fn sync(&self) -> Result<(), DatabaseError> {
         self.env.sync().map_err(|e| DatabaseError::Commit(error::info(&e)))
     }
@@ -572,7 +575,9 @@ impl TnLmdbEnv {
     /// tree, every overflow run with its full CRC, each table's entry and page counts, and the
     /// exact accounting of the file's pages). It reads through a snapshot, beside readers and the
     /// writer. Damage is [`DatabaseError::Read`] with `MDBX_CORRUPTED` and latches the
-    /// environment; the detail is in [`Self::failure`].
+    /// environment; the detail is in [`Self::failure`]. A host that refuses the check's table of
+    /// the state's pages (an anonymous mapping of 4 bytes a page) is [`DatabaseError::Read`] with
+    /// `ENOMEM`, and latches too.
     pub fn check(&self) -> Result<CheckReport, DatabaseError> {
         self.env.check().map_err(error::read)
     }

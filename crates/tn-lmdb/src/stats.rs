@@ -24,9 +24,8 @@ use std::time::Instant;
 /// writes and syncs the meta. A [`crate::SyncMode::NoSync`] commit runs steps 1 and 3 (and
 /// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`), then copies its meta as a weak
 /// record, unsynced and untimed; the sync that makes its state
-/// durable runs steps 4 to 6: an [`crate::Env::sync`], or a later `NoSync` commit past
-/// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`], which runs all seven
-/// steps itself.
+/// durable runs steps 4 to 6: an [`crate::Env::sync`], or a later `NoSync` commit that commits
+/// durably ([`IoStats::auto_syncs`]), which runs all seven steps itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
     /// States made durable: each run of steps 4 to 6, by a [`crate::SyncMode::Durable`] commit,
@@ -37,10 +36,12 @@ pub struct IoStats {
     /// [`crate::SyncMode::NoSync`] commits that deferred their sync: steps 1, 3 and 7, and their
     /// weak meta's copy (no sync).
     pub nosync_commits: u64,
-    /// [`crate::SyncMode::NoSync`] commits that committed durably, past
-    /// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`]: steps 1 to 7, over
-    /// their own pages and those of the `NoSync` commits since the last sync. Each also counts in
-    /// [`Self::commits`], never in [`Self::nosync_commits`].
+    /// [`crate::SyncMode::NoSync`] commits that committed durably: past
+    /// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`], the first that
+    /// changes something after an open, or one more than 2^20 txns past the last sync
+    /// ([`crate::SyncMode::NoSync`]). Steps 1 to 7, over their own pages and those of the `NoSync`
+    /// commits since the last sync. Each also counts in [`Self::commits`], never in
+    /// [`Self::nosync_commits`].
     pub auto_syncs: u64,
     /// Of [`Self::commits`], those for which the file had grown since the last durable state,
     /// so its size needed a sync too (by step 5, or by step 4's `fdatasync`).

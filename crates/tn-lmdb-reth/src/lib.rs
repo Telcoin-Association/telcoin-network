@@ -135,14 +135,15 @@
 //! environment latched an earlier failure: writes and commits fail until it is reopened) is
 //! `MDBX_PANIC`, MDBX's "fatal environment error"; `Io` carries the OS error number when there is
 //! one (its own, or its source's where the engine wrapped it with what it was doing), else `EIO`;
-//! `OutOfMemory` (the host refused to map the file) carries `ENOMEM`, as MDBX's own failed
-//! mapping does; `Full` (the file used every page number) is `MDBX_MAP_FULL`; `NotTnLmdb` is
-//! `MDBX_INVALID`; and `UnsupportedVersion` is `MDBX_VERSION_MISMATCH`. `Failed` is also this
-//! crate's refusal of a write transaction whose held delete (the dup rewrite) broke the adapter's
-//! invariant: its row missing (damage the engine did not detect), or a second delete held before
-//! the first ran (an adapter bug); or whose `delete_current_duplicates` on an engine dup table
-//! removed no row, or left a row of its key (the tree and the cursor disagree). Its message says
-//! the environment did not latch: the commit refuses that transaction, and later ones carry on.
+//! `OutOfMemory` (the host refused a mapping: the file's, or the page table of a full check)
+//! carries `ENOMEM`, as MDBX's own failed mapping does; `Full` (the file used every page number) is
+//! `MDBX_MAP_FULL`; `NotTnLmdb` is `MDBX_INVALID`; and `UnsupportedVersion` is
+//! `MDBX_VERSION_MISMATCH`. `Failed` is also this crate's refusal of a write transaction whose held
+//! delete (the dup rewrite) broke the adapter's invariant: its row missing (damage the engine did
+//! not detect), or a second delete held before the first ran (an adapter bug); or whose
+//! `delete_current_duplicates` on an engine dup table removed no row, or left a row of its key (the
+//! tree and the cursor disagree). Its message says the environment did not latch: the commit
+//! refuses that transaction, and later ones carry on.
 //!
 //! **Differences from MDBX.** reth's code reaches none of them. Each cursor difference is pinned
 //! beside MDBX's result by `known_cursor_deviations_from_mdbx` or

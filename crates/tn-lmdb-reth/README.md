@@ -41,13 +41,17 @@ tx.commit()?;
   is created), the engine's map reserve, the engine's largest growth step (1 GiB;
   `with_max_growth`, at least `MIN_GROWTH`, 1 MiB, the engine's constant re-exported, else the
   open is `MDBX_EINVAL`), and `SyncMode::Durable` (or `NoSync`, made durable by `TnLmdbEnv::sync`,
-  the drop, or a commit past `with_sync_period` or `with_sync_bytes`, the engine's automatic syncs,
-  which bound what a reboot loses and how far the file grows; both off by default). A `NoSync`
-  commit writes a weak meta (no sync), so a crash of the process alone loses nothing; a reboot
-  rolls back to the last sync. The engine trusts a weak meta only once the pages it names since the
-  last sync pass a full check, and opens at the last sync if any fails (a volume lost without a
-  reboot). `with_trust_unsynced(false)` (the engine's `EnvOptions::trust_unsynced`) opens at the
-  last sync instead, discarding the commits since it. A clean drop gives back the file's preallocated tail (the engine's close).
+  the drop, a commit past `with_sync_period` or `with_sync_bytes`, the engine's automatic syncs,
+  which bound what a reboot loses and how far the file grows, both off by default, or the first
+  commit that changes something after each open). A `NoSync` commit writes a weak meta (no sync),
+  so a crash of the process alone loses nothing, but for one inside the 128-byte copy of a meta,
+  which rolls back to the last sync; a reboot rolls back to the last sync. The engine trusts a weak
+  meta only once the pages it names since the last sync pass a full check, and opens at the last
+  sync if any fails (a volume lost without a reboot). `with_trust_unsynced(false)` (the engine's
+  `EnvOptions::trust_unsynced`) opens at the last sync instead; the commits since it stay in their
+  slot until this environment's first commit that changes something writes over it, so a later
+  open that trusts them, in the same boot, can still open at them. A clean drop gives back the
+  file's preallocated tail (the engine's close).
 - **Read cursors are pooled per transaction:** a `TnLmdbTx` keeps the engine cursors its dropped
   cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
   table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new

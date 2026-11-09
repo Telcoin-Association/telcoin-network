@@ -273,7 +273,7 @@ The engine reads a few errno values. Each is a place to check on a new OS:
 
 | where | errno | meaning |
 |---|---|---|
-| `file::mapped` | `ENOMEM` | a refused reservation is `Error::OutOfMemory`, anything else `Error::Io` |
+| `file::mapped` | `ENOMEM` | a refused mapping (the writer's reservation, a read-only open's file, `Env::check`'s anonymous table of the state's pages: `check::Claims::every`) is `Error::OutOfMemory`, anything else `Error::Io` |
 | `sys::allocate_range` | Linux `EOPNOTSUPP`, `ENOSYS`; macOS `ENOTSUP` | no preallocation here: fall back to a sparse `set_len`. Every other error (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`) fails the growth |
 | `sys::fsync_directory` | `EACCES` (open), `EINVAL`, `ENOTSUP`, `EOPNOTSUPP` (fsync) | skipped with a warning |
 | `sys::retry_interrupted` | `EINTR` (`ErrorKind::Interrupted`) | the call is issued again |

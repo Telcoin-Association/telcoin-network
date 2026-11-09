@@ -3062,10 +3062,10 @@ impl RwTxn {
     /// `SyncMode::Durable`; in `SyncMode::NoSync` at the next sync, which is this commit when it
     /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes` or is the first commit that
     /// changes something since the open, and safe from a crash of the process alone at once, by
-    /// its weak meta) and return its txn id. A
-    /// transaction that changed nothing returns the id of the state it began from, with no
-    /// I/O. An error latches the environment, and whether the commit survives is unknown until
-    /// the file is reopened.
+    /// its weak meta, but for a crash inside the 128-byte copy of a later meta, which rolls back
+    /// to the last sync: `SyncMode::NoSync`) and return its txn id. A transaction that changed
+    /// nothing returns the id of the state it began from, with no I/O. An error latches the
+    /// environment, and whether the commit survives is unknown until the file is reopened.
     pub fn commit(mut self) -> Result<u64> {
         let inner = &*self.inner;
         inner.latch.check()?;

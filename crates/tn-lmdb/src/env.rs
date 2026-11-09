@@ -25,11 +25,13 @@
 //! A commit (see `RwTxn::commit`) stamps the CRC of every page the transaction wrote, makes
 //! them durable (one `msync` when they form one range, else one `fdatasync` of the file, or on
 //! macOS an `msync` of each range; see [`data_sync`]), then the file's size if it grew and that
-//! sync did not already cover it, and only then writes the new meta over the slot holding the
-//! lower txn and syncs that one page. A crash before the meta is copied recovers the previous
-//! state; after its sync, the new one; in between, the new one if its record survived intact (a
-//! process crash keeps it in the page cache, which a reopen reads; a power loss, only if it
-//! reached the disk), else the previous one (README, Commit protocol). In [`SyncMode::NoSync`] a
+//! sync did not already cover it, and only then writes the new meta into the slot that does not
+//! hold the newest steady meta (with both steady, the one holding the lower txn; beside a weak
+//! record, the weak one: [`slot_to_write`]) and syncs that one page. A crash before the meta is
+//! copied recovers the previous state; after its sync, the new one; in between, the new one if
+//! its record survived intact (a process crash keeps it in the page cache, which a reopen reads;
+//! a power loss, only if it reached the disk), else the one the other slot holds, the last
+//! durable state (README, Commit protocol). In [`SyncMode::NoSync`] a
 //! commit stamps, copies its meta as a weak record into the slot that does not hold the newest
 //! steady one (no sync: [`Writer::defer_sync`]) and publishes; [`Env::sync`] (or the
 //! environment's drop) runs the durable steps for the newest state, and so does a commit past
@@ -140,29 +142,32 @@ pub enum SyncMode {
     #[default]
     Durable,
     /// A commit is visible in this process at once, and durable at the next sync: an
-    /// [`Env::sync`], the close (which runs in the drop of the environment's last handle, on that
-    /// thread: a reader's or cursor's drop can be the one that syncs, and a handle alive when the
-    /// process exits skips it), or a commit past [`EnvOptions::sync_period`] or
-    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does. So
-    /// does the first commit that changes something after each open, whatever the bounds (the
-    /// open is not a durable state: a weak head it trusted stays weak until then), and a commit
-    /// whose txn is 2^20 past the last durable state's, so a writer never runs further than that
-    /// past it: no txn a writer stamped pages with is then given to a later writer's commit that
-    /// does not sync (`meta::Chosen::next_txn`).
+    /// [`Env::sync`], the close (which runs in the drop of the environment's last handle, on
+    /// that thread: a reader's or cursor's drop can be the one that syncs, and a handle alive
+    /// when the process exits skips it), or a commit past [`EnvOptions::sync_period`] or
+    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does.
+    /// So does the first commit that changes something after each open, whatever the bounds
+    /// (the open is not a durable state: a weak head it trusted stays weak until then), and a
+    /// commit whose txn is more than 2^20 past the last durable state's, so a writer never
+    /// runs further than that past it: no txn a writer stamped pages with is then given to a
+    /// later writer's commit that does not sync (`meta::Chosen::next_txn`).
     ///
     /// A commit that does not sync still writes its meta: unsynced, with no system call, *weak*
-    /// (tagged with the running boot's id), into the slot that does not hold the last sync's
-    /// meta. So a crash of the process alone loses nothing: a reopen in the same boot trusts the
-    /// weak meta, whose pages the page cache holds ([`EnvOptions::trust_unsynced`]). A system
-    /// crash, a power loss or any other reboot rolls back to the last sync. Neither leaves the
-    /// file corrupt: the last sync's pages are never overwritten and its meta is never rewritten
-    /// before the next sync. A host whose boot id cannot be read trusts no weak meta, so there a
-    /// process crash too rolls back to the last sync. A volume lost without a reboot (pulled, then
-    /// plugged back in the same boot) keeps the boot id but can leave a weak meta naming pages
-    /// that never reached the disk, or reached it torn: so open trusts a weak meta only once the
-    /// pages it names that were written since the last sync pass a full check (their CRCs among
-    /// it), and opens at the last sync, with a warning, if any fails. That check costs about one
-    /// CRC pass over those pages, and only after an unclean end (README, Open and recovery).
+    /// (tagged with the running boot's id), into the slot that does not hold the last sync's meta.
+    /// So a crash of the process alone loses nothing, but for one inside the 128-byte copy of a
+    /// meta (a commit's weak one, or a sync's steady one over the weak slot), which leaves that
+    /// slot torn and rolls back to the last sync (README, Commit protocol): a reopen in the same
+    /// boot trusts the weak meta, whose pages the page cache holds
+    /// ([`EnvOptions::trust_unsynced`]). A system crash, a power loss or any other reboot rolls
+    /// back to the last sync. Neither leaves the file corrupt: the last sync's pages are never
+    /// overwritten and its meta is never rewritten before the next sync. A host whose boot id
+    /// cannot be read trusts no weak meta, so there a process crash too rolls back to the last
+    /// sync. A volume lost without a reboot (pulled, then plugged back in the same boot) keeps the
+    /// boot id but can leave a weak meta naming pages that never reached the disk, or reached it
+    /// torn: so open trusts a weak meta only once the pages it names that were written since the
+    /// last sync pass a full check (their CRCs among it), and opens at the last sync, with a
+    /// warning, if any fails. That check costs about one CRC pass over those pages, and only after
+    /// an unclean end (README, Open and recovery).
     ///
     /// Pages freed meanwhile wait for a sync (README, Free list and page reuse), so without
     /// either bound the file grows until one.
@@ -205,31 +210,36 @@ pub struct EnvOptions {
     /// [`SyncMode::NoSync`]: a commit that changes something commits durably once at least this
     /// long has passed since the last durable state (the last run of the durable steps: a durable
     /// commit, an [`Env::sync`]) (default `None`: never by time). The open is not one: the first
-    /// commit that changes something after it commits durably whatever this says, and with it
-    /// the commits of a weak head the open trusted ([`SyncMode::NoSync`]). Checked at each
-    /// commit, so no thread or timer syncs: commits that then stop wait for the next commit, an
-    /// [`Env::sync`] or the close. A reboot then loses only commits made less than this after the
-    /// last durable state (a crash of the process alone loses none: [`SyncMode::NoSync`]), and
-    /// freed pages come back within about one period and a commit. Ignored in
+    /// commit that changes something after it commits durably whatever this says, and with it the
+    /// commits of a weak head the open trusted ([`SyncMode::NoSync`]). Checked at each commit, so
+    /// no thread or timer syncs: commits that then stop wait for the next commit, an [`Env::sync`]
+    /// or the close. A reboot then loses only commits made less than this after the last durable
+    /// state (a crash of the process alone none, but inside a meta's copy: [`SyncMode::NoSync`]),
+    /// and freed pages come back within about one period and a commit. Ignored in
     /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
     pub sync_period: Option<Duration>,
-    /// [`SyncMode::NoSync`]: a commit that changes something commits durably once the pages
-    /// stamped since the last durable state, its own included, hold at least this many bytes
-    /// (pages times the page size) (default `None`: never by size). The open is not a durable
-    /// state: the first commit that changes something after it commits durably whatever this
-    /// says, and with it the commits of a weak head the open trusted ([`SyncMode::NoSync`]). A
-    /// reboot then loses less than this many bytes of pages (a crash of the process alone, none),
-    /// and freed pages come back within about this many bytes of commits, plus a commit. Ignored
-    /// in [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
+    /// [`SyncMode::NoSync`]: a commit that changes something commits durably once the pages stamped
+    /// since the last durable state, its own included, hold at least this many bytes (pages times
+    /// the page size) (default `None`: never by size). The open is not a durable state: the first
+    /// commit that changes something after it commits durably whatever this says, and with it the
+    /// commits of a weak head the open trusted ([`SyncMode::NoSync`]). A reboot then loses less
+    /// than this many bytes of pages (a crash of the process alone, none, but inside a meta's
+    /// copy: [`SyncMode::NoSync`]), and freed pages come back within about this many bytes of
+    /// commits, plus a commit. Ignored in [`SyncMode::Durable`], where every commit is
+    /// durable, and by [`Env::open_read_only`].
     pub sync_bytes: Option<u64>,
     /// Trust a weak meta, the meta a [`SyncMode::NoSync`] commit writes with no sync, at open when
     /// the running boot wrote it (default `true`): a crash of the process alone then loses no
-    /// commit, once open's check of the pages the weak meta names that were written since the
-    /// last sync passes (a volume lost without a reboot, an external drive pulled and plugged back
-    /// in the same boot, may have lost them; a failed check opens at the last sync, with a
-    /// warning). `false` opens at the last sync whatever the slots hold, unchecked, as a reboot
-    /// does: a choice to discard every commit since the last sync (README, Open and recovery).
-    /// Applies to [`Env::open_read_only`] too.
+    /// commit (but for one inside a meta's copy: [`SyncMode::NoSync`]), once open's check of the
+    /// pages the weak meta names that were written since the last sync passes (a volume lost
+    /// without a reboot, an external drive pulled and plugged back in the same boot, may have lost
+    /// them; a failed check opens at the last sync, with a warning). `false` opens at the last
+    /// sync whatever the slots hold, unchecked, as a reboot does. It does not discard the
+    /// commits since that sync: their weak meta stays in its slot until this environment's
+    /// first commit that changes something writes its steady meta over it (an [`Env::sync`] or
+    /// the close with nothing committed leaves it), so a later open with `true` in the same
+    /// boot can open at them again, once they pass its check (README, Open and recovery).
+    /// Applies to [`Env::open_read_only`] too, which never writes that slot.
     pub trust_unsynced: bool,
 }
 
@@ -1550,8 +1560,9 @@ impl Env {
     ///
     /// Errors: as [`Self::open`]'s, except that a missing file is [`Error::Io`] (`NotFound`) and
     /// an empty one [`Error::NotTnLmdb`]; [`Error::Locked`] if a handle with a writer holds it.
-    /// `options.page_size` is validated as [`Self::open`] validates it and `options.readahead`
-    /// advises the mapping as [`Self::open`]'s; no other field applies.
+    /// `options.page_size` is validated as [`Self::open`] validates it, `options.readahead`
+    /// advises the mapping as [`Self::open`]'s, and `options.trust_unsynced` chooses the meta as
+    /// in [`Self::open`]; no other field applies.
     pub fn open_read_only(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         Geometry::new(options.page_size)?;
         let file = open_shared(path.as_ref())?;
@@ -1617,11 +1628,11 @@ impl Env {
 
     /// Make every commit durable: in [`SyncMode::NoSync`], sync the pages committed since the
     /// last sync and write the newest state's steady meta (a no-op when no state is pending: a
-    /// steady meta holds the newest one; always in an environment opened read-only, and in
-    /// [`SyncMode::Durable`] but after an open that trusted a weak head, which this makes
-    /// steady). Waits while a write
-    /// transaction is open, as [`Self::begin_rw`] does, in every mode. A failure latches the
-    /// environment, and once it is latched this is [`Error::Failed`] in every mode.
+    /// steady meta holds the newest one; and in [`SyncMode::Durable`] but after an open that
+    /// trusted a weak head, which this makes steady). Waits while a write transaction is open, as
+    /// [`Self::begin_rw`] does, in every mode. A failure latches the environment, and once it is
+    /// latched this is [`Error::Failed`] in every mode. In an environment opened read-only it
+    /// does nothing and returns `Ok(())`, latched or not.
     pub fn sync(&self) -> Result<()> {
         if self.inner.writable().is_err() {
             return Ok(());
@@ -1641,8 +1652,10 @@ impl Env {
     /// the trees (their runs' included) and those the free list lists are disjoint and cover
     /// `2..page_count` exactly. Any failure is [`Error::Corrupt`] naming the damage, or the pages
     /// leaked (used by nothing) and used twice (the first 16 runs and pages named, the rest
-    /// counted), and latches the environment. It reads through a snapshot, alongside readers and
-    /// the writer.
+    /// counted), and latches the environment. It keeps 4 bytes per page of the state's page count
+    /// in an anonymous mapping, of which only the pages the walk touches cost memory; a host that
+    /// refuses that mapping is [`Error::OutOfMemory`], which latches as any failed check does. It
+    /// reads through a snapshot, alongside readers and the writer.
     pub fn check(&self) -> Result<CheckReport> {
         let inner = &self.inner;
         check::check_snapshot(&inner.current()).inspect_err(|e| inner.latch.latch_error(e))
