@@ -459,6 +459,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   taken); the other pins the no-permit path, which would hang with an awaited acquire.
   *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.
 
+- **TN-0038** — Backport a774920b7: size the `block_range` buffer for the inclusive span.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`block_range`).
+  *Why*: the `Vec` for an inclusive block range was allocated one short, so every multi-block read
+  reallocated once. Capacity only: the blocks returned are unchanged, so it cannot reach
+  execution or storage. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
