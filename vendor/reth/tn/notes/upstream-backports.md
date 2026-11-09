@@ -70,6 +70,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 078c22d5f | TN-0052 | `BlockState` drops its parent chain iteratively (no stack overflow on a long unpersisted chain); Drop only | upstream test |
 | 1a6ba945a | TN-0052 | `AlloyHeader::from_compact` returns the buffer past the header; headers TN stores decode as before | codecs tests |
 | e7ebeb869 | TN-0052 | `receipts_by_block` returns `None` instead of a partial list for a block missing receipts | upstream tests |
+| d46664fc8 | TN-0059 | `eth_simulateV1` loads the state of the block it resolved, not a second resolution of `latest` | existing simulate tests; no upstream test |
 
 ## Open
 

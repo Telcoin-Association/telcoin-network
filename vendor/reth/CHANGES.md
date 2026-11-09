@@ -651,6 +651,19 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   adjusted pruning tests.
   *Upstream*: n/a (upstream commits).
 
+- **TN-0059** — Backport d46664fc8: `eth_simulateV1` simulates over the state of the block it
+  resolved. *Kind*: backport.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1`).
+  *Why*: the handler resolved the parent header from the request's block tag, then passed the tag
+  again to `spawn_with_state_at_block`, which resolved `latest` a second time. On TN's block rate
+  the simulated chain could be built on header N over the state of N+1: `NonceTooLow` under
+  `validation: true`, and block numbers that describe a chain that never existed (review R8). The
+  state is now loaded by the resolved block's hash; `pending` still goes through the pending state.
+  RPC only.
+  *Tests*: none added; upstream has none (the race needs the tip to move between two reads). The
+  simulate tests in `rpc/src/eth/helpers/call.rs` and tn-reth's `simulate_v1` tests cover the
+  unchanged behaviour. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
