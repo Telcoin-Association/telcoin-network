@@ -98,8 +98,16 @@ impl StorageLayout {
         }
     }
 
+    /// Whether this build can run the layout: v2 is tn-lmdb only.
+    pub const fn is_supported(self) -> bool {
+        match self {
+            Self::V1 => true,
+            Self::V2 => V2_SUPPORTED,
+        }
+    }
+
     /// The layout of reth's settings.
-    const fn of(settings: StorageSettings) -> Self {
+    pub const fn of(settings: StorageSettings) -> Self {
         if settings.is_v2() {
             Self::V2
         } else {

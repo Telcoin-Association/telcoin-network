@@ -7,8 +7,9 @@
 //! genesis slot changed and one set to zero, a slot set and zeroed in a later block, and the
 //! `ConsensusRegistry` rewrites of an epoch close.
 //!
-//! v2 datadirs are made with [`init_genesis_with_storage_settings`], called for v1 too so neither
-//! layout depends on the env's default.
+//! Each datadir's layout is chosen with [`RethConfig::with_new_datadir_layout`], for v1 too, so
+//! neither depends on the env's default for new datadirs. v2 runs on the tn-lmdb build only, so
+//! this module builds there only.
 
 use crate::{
     init_reth_defaults,
@@ -16,11 +17,10 @@ use crate::{
     snapshot::SnapshotRestorer,
     test_utils::{
         consensus_output_for_tests_at, execute_payload_and_update_canonical_chain,
-        governance_owner_factory, init_genesis_with_storage_settings,
-        test_genesis_with_consensus_registry_and_workers,
+        governance_owner_factory, test_genesis_with_consensus_registry_and_workers,
     },
     worker::WorkerNetwork,
-    MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv,
+    MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv, StorageLayout,
 };
 use jsonrpsee::{core::params::ArrayParams, Methods, RpcModule};
 use reth_node_core::{
@@ -39,7 +39,9 @@ use tn_types::{
 };
 
 /// The layouts under test.
-const LAYOUTS: [StorageSettings; 2] = [StorageSettings::v1(), StorageSettings::v2()];
+fn layouts() -> [StorageSettings; 2] {
+    [StorageLayout::V1.settings(), StorageLayout::V2.settings()]
+}
 
 /// A contract that stores its second calldata word at the slot its first word names:
 /// `SSTORE(calldataload(0), calldataload(32))`.
@@ -208,9 +210,9 @@ impl Datadir {
             },
             ..NodeConfig::default()
         };
-        let config = RethConfig::from_node_config(node_config);
+        let config = RethConfig::from_node_config(node_config)
+            .with_new_datadir_layout(StorageLayout::of(settings));
         let db = RethEnv::new_database(&config, dir.path())?;
-        init_genesis_with_storage_settings(&config, &db, settings)?;
         Ok(Self { config, db, _dir: dir })
     }
 
@@ -284,7 +286,7 @@ async fn snapshot_export_is_identical_in_both_storage_layouts() -> eyre::Result<
     let plan = Plan::new();
     let mut packs = Vec::new();
     let mut hashes = Vec::new();
-    for settings in LAYOUTS {
+    for settings in layouts() {
         let chain = Chain::build(&plan, settings, B)?;
         hashes.push(chain.hashes(B)?);
         let dir = TempDir::new()?;
@@ -324,7 +326,7 @@ async fn snapshot_export_reads_each_key_once_across_history_shards() -> eyre::Re
 
     let plan = Plan::new();
     let mut packs = Vec::new();
-    for settings in LAYOUTS {
+    for settings in layouts() {
         let tasks = TaskManager::new("storage layout shards");
         let datadir = Datadir::new(plan.chain.clone(), settings)?;
         let env = datadir.open(&tasks, settings)?;
@@ -360,7 +362,7 @@ async fn snapshot_export_reads_each_key_once_across_history_shards() -> eyre::Re
 #[tokio::test]
 async fn snapshot_restores_across_storage_layouts() -> eyre::Result<()> {
     let plan = Plan::new();
-    for source_settings in LAYOUTS {
+    for source_settings in layouts() {
         let source = Chain::build(&plan, source_settings, B)?;
         let pack = TempDir::new()?;
         export(&source.env, pack.path())?;
@@ -371,7 +373,7 @@ async fn snapshot_restores_across_storage_layouts() -> eyre::Result<()> {
         plan.execute(&source.env, B + 1, TIP)?;
         let source_tip = header(&source.env, TIP)?.hash();
 
-        for target_settings in LAYOUTS {
+        for target_settings in layouts() {
             let case = format!("{} pack into {}", name(source_settings), name(target_settings));
             let tasks = TaskManager::new("storage layout restore");
             let target = Datadir::new(plan.chain.clone(), target_settings)?;
@@ -433,7 +435,7 @@ async fn registry_reads_at_past_headers_match_across_storage_layouts() -> eyre::
 
     let plan = Plan::new();
     let mut answers = Vec::new();
-    for settings in LAYOUTS {
+    for settings in layouts() {
         let chain = Chain::build(&plan, settings, TIP)?;
         let env = &chain.env;
         let mut reads = Vec::new();
@@ -484,7 +486,7 @@ async fn registry_reads_at_past_headers_match_across_storage_layouts() -> eyre::
 async fn rpc_reads_match_across_storage_layouts() -> eyre::Result<()> {
     let plan = Plan::new();
     let mut answers = Vec::new();
-    for settings in LAYOUTS {
+    for settings in layouts() {
         let chain = Chain::build(&plan, settings, TIP)?;
         let methods = rpc_methods(&chain.env)?;
         let mut calls = Vec::new();

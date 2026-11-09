@@ -73,8 +73,8 @@ impl StorageLayout {
     /// tn-lmdb only.
     pub fn selectable(self) -> eyre::Result<()> {
         match self {
+            _ if self.env_layout().is_supported() => Ok(()),
             Self::V1 => Ok(()),
-            Self::V2 if cfg!(feature = "tn-lmdb") => Ok(()),
             Self::V2 => eyre::bail!(
                 "storage layout v2 runs on tn-lmdb only: build with --features tn-reth/tn-lmdb, \
                  or run layout v1"
