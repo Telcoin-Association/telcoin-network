@@ -466,6 +466,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   reallocated once. Capacity only: the blocks returned are unchanged, so it cannot reach
   execution or storage. *Upstream*: n/a (upstream commit).
 
+- **TN-0039** — Backport 70e776bfe: find a block's static-file range with a B-tree range lookup.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs`
+  (`StaticFileProviderInner::find_fixed_range_with_block_index`).
+  *Why*: the lookup walked every file range of the segment for each block; `range(block..)` takes
+  the first range whose `max_block` is at or above the block, the same answer in O(log n). It
+  picks which file a block is read from or appended to, so it is on the storage path, but the
+  result is identical by construction (the index is a `BTreeMap` keyed by `max_block`).
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
