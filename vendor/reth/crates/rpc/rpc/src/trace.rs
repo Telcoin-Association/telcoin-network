@@ -26,7 +26,9 @@ use reth_rpc_eth_api::{
     helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::EthApiError, utils::recover_raw_transaction, EthConfig};
+use reth_rpc_eth_types::{
+    call_many, error::EthApiError, utils::recover_raw_transaction, CallManyBudget, EthConfig,
+};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
@@ -158,6 +160,9 @@ where
         calls: Vec<(RpcTxReq<Eth::NetworkTypes>, HashSet<TraceType>)>,
         block_id: Option<BlockId>,
     ) -> Result<Vec<TraceResults>, Eth::Error> {
+        // TN(TN-0057): the request shares one gas budget, as a block's transactions do.
+        let gas_budget = self.eth_api().call_gas_limit();
+        call_many::check_call_count(gas_budget, calls.len()).map_err(Eth::Error::from_eth_err)?;
         let permit = self.trace_task_permit().await?;
         let at = block_id.unwrap_or(BlockId::pending());
         let (evm_env, at) = self.eth_api().evm_env_at(at).await?;
@@ -166,6 +171,7 @@ where
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
                 let _permit = permit;
+                let mut budget = CallManyBudget::new(gas_budget);
                 let mut results = Vec::with_capacity(calls.len());
                 let mut calls = calls.into_iter().peekable();
 
@@ -182,6 +188,7 @@ where
                     let config = TracingInspectorConfig::from_parity_config(&trace_types);
                     let mut inspector = TracingInspector::new(config);
                     let res = eth_api.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
+                    budget.charge(res.result.gas_used()).map_err(Eth::Error::from_eth_err)?;
 
                     let trace_res = inspector
                         .into_parity_builder()

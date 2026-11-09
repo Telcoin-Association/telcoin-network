@@ -10,6 +10,8 @@
 
 Executes a sequence of calls on the state of a block, each one on top of the state changes of the calls before it, and returns the trace types requested for each call. This traces dependent transactions, such as an approval followed by a transfer, without sending them. Unlike [trace\_call](trace_call.md), this method takes no state or block overrides.
 
+The request shares a gas budget of `--rpc.gascap` across all its calls. A request with more calls than the budget can hold at 21,000 gas each is refused before any runs, and the request fails once the gas its calls used exceeds the budget.
+
 #### Parameters
 
 `Array` - The calls, in execution order. Each call is a two-element array: the transaction call object, with the fields [trace\_call](trace_call.md) lists, and the trace types to return for that call, any of `"trace"`, `"vmTrace"` and `"stateDiff"`.

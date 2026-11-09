@@ -12,6 +12,8 @@ Runs bundles of calls in sequence on one block's state, without creating transac
 
 When all of the block's transactions are replayed (the default), the bundles run on the state after the block. With a smaller `transactionIndex` the node starts from the block's parent state and replays that many of the block's transactions first; this path does not apply the block's pre-transaction system calls.
 
+The request shares a gas budget of `--rpc.gascap` across all its calls. A request with more calls than the budget can hold at 21,000 gas each is refused before any runs, and the request fails once the gas its calls used exceeds the budget.
+
 #### Parameters
 
 `Array` - The bundles, run in order. Each bundle is an object:

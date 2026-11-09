@@ -29,7 +29,7 @@ use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
     FromEthApiError, RpcConvert, RpcNodeCore,
 };
-use reth_rpc_eth_types::EthApiError;
+use reth_rpc_eth_types::{call_many, CallManyBudget, EthApiError};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, HeaderProvider, ProviderBlock, ReceiptProviderIdExt,
@@ -450,6 +450,13 @@ where
         if bundles.is_empty() {
             return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into())
         }
+        // TN(TN-0057): the request shares one gas budget, as a block's transactions do.
+        let gas_budget = self.eth_api().call_gas_limit();
+        call_many::check_call_count(
+            gas_budget,
+            bundles.iter().map(|bundle| bundle.transactions.len()).sum::<usize>(),
+        )
+        .map_err(Eth::Error::from_eth_err)?;
 
         let permit = self.trace_task_permit().await?;
         let StateContext { transaction_index, block_number } = state_context.unwrap_or_default();
@@ -484,6 +491,7 @@ where
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
                 let _permit = permit;
+                let mut budget = CallManyBudget::new(gas_budget);
                 // the outer vec for the bundles
                 let mut all_bundles = Vec::with_capacity(bundles.len());
 
@@ -533,6 +541,7 @@ where
                             tx_env.clone(),
                             &mut inspector,
                         )?;
+                        budget.charge(res.result.gas_used()).map_err(Eth::Error::from_eth_err)?;
                         let trace = inspector
                             .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
                             .map_err(Eth::Error::from_eth_err)?;

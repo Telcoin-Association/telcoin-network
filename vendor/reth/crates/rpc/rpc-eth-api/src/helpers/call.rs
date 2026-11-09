@@ -31,9 +31,10 @@ use reth_revm::{
 use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
     cache::db::StateProviderTraitObjWrapper,
+    call_many,
     error::{AsEthApiError, FromEthApiError},
     simulate::{self, EthSimulateError},
-    EthApiError, StateCacheDb,
+    CallManyBudget, EthApiError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox};
 use reth_tasks::{cancel::is_cancelled, CancelOnDrop};
@@ -317,6 +318,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             if bundles.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into());
             }
+            // TN(TN-0057): the request shares one gas budget, as a block's transactions do.
+            let gas_budget = self.call_gas_limit();
+            call_many::check_call_count(
+                gas_budget,
+                bundles.iter().map(|bundle| bundle.transactions.len()).sum::<usize>(),
+            )
+            .map_err(Self::Error::from_eth_err)?;
 
             let permit = self
                 .acquire_owned_blocking_io()
@@ -366,6 +374,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             self.spawn_with_state_at_block(at, move |this, mut db| {
                 let _permit = permit;
+                let mut budget = CallManyBudget::new(gas_budget);
                 let mut all_results = Vec::with_capacity(bundles.len());
 
                 if replay_block_txs {
@@ -419,6 +428,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                                 ))
                             },
                         )?;
+                        budget.charge(res.result.gas_used()).map_err(Self::Error::from_eth_err)?;
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {

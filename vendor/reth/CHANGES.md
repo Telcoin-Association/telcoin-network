@@ -790,3 +790,26 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   constant. RPC and pool-listener registration only: pool admission and ordering are unchanged.
   *Tests*: `active_filters_are_bounded`, `rpc_listeners_are_bounded`; the rest of the filter,
   pubsub and pool tests. *Upstream*: yes.
+
+- **TN-0057** — `eth_callMany`, `trace_callMany` and `debug_traceCallMany` are bounded as one
+  request. *Kind*: fix (security).
+  *Files*: added `crates/rpc/rpc-eth-types/src/call_many.rs` (`max_calls`, `check_call_count`,
+  `CallManyBudget`, with unit tests), `crates/rpc/rpc-eth-types/src/lib.rs` (declares it);
+  `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`call_many`), `crates/rpc/rpc/src/trace.rs`
+  (`trace_call_many`), `crates/rpc/rpc/src/debug.rs` (`debug_trace_call_many`),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`call_many_budget_tests`).
+  *Why*: each of the three ran any number of calls in one blocking task with only
+  `prepare_call_env`'s per-call gas cap: no call count, no cumulative gas, and cancellation only
+  between calls, so a 15 MB request of about 100k calls to a loop contract ran about 5e12 gas on
+  one thread, the shape TN-0046 closed for `eth_callBundle` (review R6). Each request now refuses,
+  before taking a permit or reading state, more calls than its gas cap can hold at the intrinsic
+  21,000 each (2,380 at the default cap), and charges every call's gas used against one budget of
+  `--rpc.gascap`, failing the request once it is exceeded. A call is charged after it ran, so a
+  request can overshoot by at most one call's cap; the budget is on gas used, not gas limits,
+  because a call with no `gas` field defaults to the cap. Requests that stayed under the budget
+  get the same results as before. RPC only.
+  *Tests*: `call_many_budget_tests` (two 21,000-gas transfers pass a 50,000 budget; two 25,800-gas
+  calls pass the count check and fail the budget after the second ran; a 42,000 cap refuses three
+  calls before any runs);
+  `call_many::tests`. The trace and debug variants share the helper and keep their existing
+  tests. *Upstream*: yes.
