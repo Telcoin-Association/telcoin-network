@@ -1,22 +1,22 @@
 //! The static files' sync timing per segment, for the exec bench's per-output rows:
 //! [`SfSyncStats`], and [`SfSyncSource`], what reads (and resets) it from an env.
 //!
-//! A persist syncs each static-file segment it wrote: the data file, its offsets (`.off`), a
-//! changeset segment's `.csoff` sidecar, the `.conf` written at the commit, and the directory.
-//! reth's metrics time the static-file arm and its commit whole (`save_blocks_sf`,
-//! `save_blocks_commit_sf`); these split them by segment and phase.
-//!
-//! The provider measures none of it yet, so [`SfSyncSource::take_sf_sync_stats`] answers `None`
-//! for a [`RethEnv`] and the bench reports the section as not measured. Wiring a provider that
-//! keeps such timers (a take-and-reset call on the static-file provider) is its body alone: one
-//! [`SfSyncStats::add`] per segment and phase the provider timed.
+//! A persist syncs each static-file segment it wrote, in the segment's own thread inside
+//! `save_blocks` (vendor/reth CHANGES.md TN-0051): the data file, its offsets (`.off`), a
+//! changeset segment's `.csoff` sidecar, then the `.conf` freeze (temp file, `fsync`, rename and
+//! the directory's `fsync`). The commit then only updates the readers' index. reth's metrics time
+//! the static-file arm and its commit whole (`save_blocks_sf`, `save_blocks_commit_sf`); these
+//! split them by segment and phase, from the static-file provider's own timers
+//! (`StaticFileProvider::take_sync_stats`, TN-0052, through
+//! [`RethEnv::take_static_file_sync_stats`]).
 
 use crate::RethEnv;
 use std::collections::BTreeMap;
 
 /// The phases a segment's sync splits into, by their labels: the data file, the offsets file, the
-/// changeset offsets sidecar, the config file and the directory.
-pub const PHASES: [&str; 5] = ["data", "off", "csoff", "conf", "dir"];
+/// changeset offsets sidecar, the config file's freeze (its directory `fsync` included), and the
+/// readers' index update at the commit.
+pub const PHASES: [&str; 5] = ["data", "off", "csoff", "conf", "index"];
 
 /// One phase of one segment's syncs over a span (an output, say).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,16 +61,77 @@ pub trait SfSyncSource {
 }
 
 impl SfSyncSource for RethEnv {
-    /// `None`: the static-file provider keeps no per-segment sync timers yet (see the module
-    /// docs).
+    /// The static-file provider's timers since the last take, one entry per segment and phase
+    /// that ran; `Some` even when nothing synced (an empty span).
     fn take_sf_sync_stats(&self) -> Option<SfSyncStats> {
-        None
+        let mut stats = SfSyncStats::default();
+        for (segment, phases) in self.take_static_file_sync_stats().iter() {
+            let label = segment.as_str();
+            for (phase, timing) in [
+                (PHASES[0], phases.data_sync),
+                (PHASES[1], phases.offsets_sync),
+                (PHASES[2], phases.csoff_sync),
+                (PHASES[3], phases.conf_freeze),
+                (PHASES[4], phases.update_index),
+            ] {
+                if timing.calls > 0 {
+                    stats.add(
+                        label,
+                        phase,
+                        timing.calls,
+                        u64::try_from(timing.total.as_nanos()).unwrap_or(u64::MAX),
+                        u64::try_from(timing.max.as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+            }
+        }
+        Some(stats)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        payload::TNPayload,
+        test_utils::{consensus_output_for_tests, execute_payload_and_update_canonical_chain},
+        RethChainSpec,
+    };
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tn_types::{test_genesis, TaskManager};
+
+    /// An env's source reads the provider's timers: after one persist (past the first, whose
+    /// writer opens update the index too) each v1 segment reports one data, offsets, config and
+    /// index call under its label, no `.csoff` (v1 has no changeset segment), and the take
+    /// drains them.
+    #[tokio::test]
+    async fn test_env_reports_the_providers_sync_timers() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("sf sync source");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+        let output1 = consensus_output_for_tests(2, 0, 1, false);
+        let payload1 = TNPayload::new_for_test(chain.sealed_genesis_header(), &output1);
+        let block1 = execute_payload_and_update_canonical_chain(&env, payload1, vec![])?;
+        env.take_sf_sync_stats();
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 =
+            TNPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &output2);
+        execute_payload_and_update_canonical_chain(&env, payload2, vec![])?;
+        let stats = env.take_sf_sync_stats().expect("the provider measures its syncs");
+        for segment in ["headers", "transactions", "receipts"] {
+            for phase in ["data", "off", "conf", "index"] {
+                let timing = stats.phases.get(&(segment, phase)).copied().unwrap_or_default();
+                assert_eq!(timing.calls, 1, "{segment} {phase}");
+                assert!(timing.max_ns <= timing.total_ns, "{segment} {phase}");
+            }
+            assert!(!stats.phases.contains_key(&(segment, "csoff")), "{segment} csoff");
+        }
+        let drained = env.take_sf_sync_stats().expect("still measured");
+        assert!(drained.phases.is_empty(), "a take drains the timers");
+        Ok(())
+    }
 
     /// Adding sums the calls and the time and keeps the longest call, per segment and phase.
     #[test]
