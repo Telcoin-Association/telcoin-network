@@ -581,10 +581,11 @@ mod tests {
         }
         let v2 = tmp.path().join("v2");
         let tasks = TaskManager::default();
-        let refused =
+        let Err(refused) =
             open_production_env_with_layout(&v2, chain, &DURABLE, StorageLayout::V2, &tasks)
-                .err()
-                .expect("v2 cannot be selected yet");
+        else {
+            panic!("v2 cannot be selected yet");
+        };
         assert!(refused.to_string().contains("cannot be selected yet"), "{refused}");
         assert!(!v2.join("db").exists(), "refused before the database opens");
         assert_eq!(StorageLayout::parse("v2")?, StorageLayout::V2);
