@@ -109,6 +109,42 @@ fn a_read_only_open_reads_every_table_and_changes_nothing() {
     assert!(bytes_and_mtime(&path) == before);
 }
 
+/// A read-only open applies the weak rule and writes nothing: after `SyncMode::NoSync` commits
+/// and a crash, it trusts the weak head in the same boot (every commit, which checks), opens at
+/// the last sync with `trust_unsynced` off and after a reboot, and leaves the file byte-identical
+/// with its modification time unchanged each time.
+#[test]
+fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
+    let (_dir, path) = temp("tn_lmdb_ro_weak");
+    let synced = written(&path);
+    let env = open(&path, SyncMode::NoSync);
+    let mut state = synced.clone();
+    for round in 0..3_u32 {
+        let mut txn = env.begin_rw().expect("begin");
+        for i in (round..1500).step_by(7) {
+            put(&mut txn, &mut state, "a", &i.to_be_bytes(), &value(10 + round, i, 60));
+        }
+        txn.commit().expect("a NoSync commit");
+    }
+    let (head, synced_txn) = (env.stat().txn_id, env.stat().txn_id - 3);
+    env.crash();
+    let before = bytes_and_mtime(&path);
+    for (trust_unsynced, want_txn, want) in [(true, head, &state), (false, synced_txn, &synced)] {
+        let options = EnvOptions { trust_unsynced, ..EnvOptions::default() };
+        let env = Env::open_read_only(&path, options).expect("open read-only");
+        assert_eq!(env.stat().txn_id, want_txn, "trust_unsynced {trust_unsynced}");
+        assert!(newest_state(&env) == *want, "trust_unsynced {trust_unsynced}: the state");
+        drop(env);
+        assert!(bytes_and_mtime(&path) == before, "the read-only open changed the file");
+    }
+    disk_model::reboot();
+    let env = open_ro(&path);
+    assert_eq!(env.stat().txn_id, synced_txn, "after a reboot");
+    assert!(newest_state(&env) == synced, "after a reboot: the state");
+    drop(env);
+    assert!(bytes_and_mtime(&path) == before, "the read-only open changed the file");
+}
+
 /// A read-only open syncs nothing: a meta that reached the page cache but not the disk (its
 /// commit's msync never finished) is the state it reads, and a power loss after it still loses
 /// that meta, where an ordinary open would have made it durable.
@@ -128,8 +164,8 @@ fn a_read_only_open_syncs_nothing() {
     let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
     let mut record = [0; META_LEN];
     file.read_exact_at(&mut record, 0).expect("read");
-    let meta = Meta { txn: 3, ..Meta::decode(&record).expect("txn 2") };
-    file.write_all_at(&meta.encode(), P).expect("write");
+    let meta = Meta { txn: 3, ..Meta::decode(&record).expect("txn 2").0 };
+    file.write_all_at(&meta.encode(Tag::default()), P).expect("write");
     drop(file);
 
     let env = open_ro(&path);

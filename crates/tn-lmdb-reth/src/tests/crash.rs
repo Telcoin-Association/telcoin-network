@@ -67,6 +67,10 @@ use std::{
 /// Set in the child's environment to the directory of the environment it writes.
 const CHILD_ENV: &str = "TN_LMDB_RETH_CRASH_CHILD";
 
+/// Set in the child's environment when it commits in `SyncMode::NoSync`, with no automatic sync:
+/// its commits are then never synced, and only their weak metas carry them through the kill.
+const NOSYNC_ENV: &str = "TN_LMDB_RETH_CRASH_NOSYNC";
+
 /// Set in the child's environment when its environment's nested layouts' tables are in the
 /// composite form.
 const COMPOSITE_ENV: &str = "TN_LMDB_RETH_CRASH_COMPOSITE";
@@ -344,7 +348,10 @@ fn say(line: &str) {
 #[test]
 fn crash_cycle_child() {
     let Some(dir) = std::env::var_os(CHILD_ENV) else { return };
-    let args = Form::nested(std::env::var_os(COMPOSITE_ENV).is_none()).args();
+    let mut args = Form::nested(std::env::var_os(COMPOSITE_ENV).is_none()).args();
+    if std::env::var_os(NOSYNC_ENV).is_some() {
+        args = args.with_sync_mode(tn_lmdb::SyncMode::NoSync);
+    }
     let mut db = super::open_env(Path::new(&dir), TnLmdbEnvKind::RW, args).unwrap();
     db.create_tables().unwrap();
     let start = progress(&db.tx().unwrap()) + 1;
@@ -524,8 +531,9 @@ struct Landed {
 }
 
 /// Run `cycles` crash cycles in a fresh directory, its nested layouts' tables in one form
-/// (`nested`, else composite). Returns the final progress and where the kills landed.
-fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
+/// (`nested`, else composite), the child committing in `SyncMode::NoSync` with `no_sync`. Returns
+/// the final progress and where the kills landed.
+fn crash_cycles(cycles: u32, nested: bool, no_sync: bool) -> (u64, Landed) {
     let seed = std::env::var(SEED_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -566,6 +574,11 @@ fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
             command.env_remove(COMPOSITE_ENV);
         } else {
             command.env(COMPOSITE_ENV, "1");
+        }
+        if no_sync {
+            command.env(NOSYNC_ENV, "1");
+        } else {
+            command.env_remove(NOSYNC_ENV);
         }
         let mut child = ChildGuard(super::spawn(&mut command).unwrap());
         let stdout = child.0.stdout.take().unwrap();
@@ -649,8 +662,13 @@ fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
 /// against the rest of a round cannot leave the commit untested; without it (too few cycles for
 /// that to be sure) only warn.
 fn run_crash_cycles(cycles: u32, in_commit: bool, nested: bool) {
+    run_crash_cycles_in(cycles, in_commit, nested, false);
+}
+
+/// [`run_crash_cycles`], the child committing in `SyncMode::NoSync` with `no_sync`.
+fn run_crash_cycles_in(cycles: u32, in_commit: bool, nested: bool, no_sync: bool) {
     let started = Instant::now();
-    let (progress, landed) = crash_cycles(cycles, nested);
+    let (progress, landed) = crash_cycles(cycles, nested, no_sync);
     let form = if nested { "nested" } else { "composite" };
     eprintln!(
         "{cycles} cycles ({form}): progress {progress}, kills {landed:?}, {:?}",
@@ -668,6 +686,14 @@ fn run_crash_cycles(cycles: u32, in_commit: bool, nested: bool) {
 #[test]
 fn killed_child_reopens_to_its_last_commit() {
     run_crash_cycles(5, false, true);
+}
+
+/// [`killed_child_reopens_to_its_last_commit`] with the child committing in `SyncMode::NoSync`
+/// and never syncing: each commit's weak meta carries it through the kill, which keeps the page
+/// cache, so the reopen finds the same progress as after a durable commit.
+#[test]
+fn killed_child_reopens_to_its_last_no_sync_commit() {
+    run_crash_cycles_in(5, false, true, true);
 }
 
 /// [`killed_child_reopens_to_its_last_commit`] on the composite form.

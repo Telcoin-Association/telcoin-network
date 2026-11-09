@@ -1148,10 +1148,12 @@ fn table_stats_skip_a_table_the_file_lacks() {
     assert_gauges_match_table_stats(&db);
 }
 
-/// `sync` makes `NoSync` commits durable. A copy of the file is what a process crash leaves (the
-/// committed pages are in the page cache, but no meta names them until a sync), so each copy here
-/// holds the state of the last sync: before the first, not even the tables; after it, every commit
-/// up to it; a commit after it only once the next sync runs.
+/// `sync` makes `NoSync` commits durable. A copy of the file is what a process crash leaves: the
+/// committed pages are in the page cache, and each commit's weak meta names them, so a copy opened
+/// as is holds every commit; opened with `trust_unsynced` off (as a reboot would open it) it holds
+/// the state of the last sync: before the first, not even the tables; after it, every commit up
+/// to it; a commit after it only once the next sync runs. So `with_trust_unsynced` reaches the
+/// engine, a read-only open's included.
 #[test]
 fn sync_makes_no_sync_commits_durable() {
     use tn_lmdb::SyncMode;
@@ -1167,22 +1169,35 @@ fn sync_makes_no_sync_commits_durable() {
     };
     put(1);
     assert_eq!(durable_rows(dir.path()), None, "no commit is durable before a sync");
+    assert_eq!(crashed_rows(dir.path()), Some(1), "a process crash loses no commit");
     db.sync().unwrap();
     assert_eq!(durable_rows(dir.path()), Some(1), "every commit before the sync is durable");
     put(2);
     assert_eq!(durable_rows(dir.path()), Some(1), "a commit after the sync is not, yet");
+    assert_eq!(crashed_rows(dir.path()), Some(2), "a process crash loses no commit");
     db.sync().unwrap();
     assert_eq!(durable_rows(dir.path()), Some(2), "until the next sync");
     db.sync().unwrap();
     assert_eq!(db.failure(), None, "a sync with nothing pending changes nothing");
 }
 
-/// The `CanonicalHeaders` rows of a copy of the file in `dir` (what a process crash leaves), or
-/// `None` if it lacks the table.
+/// The `CanonicalHeaders` rows of the last sync in a copy of the file in `dir`: the copy opened
+/// with `trust_unsynced` off, as a reboot opens it. `None` if it lacks the table.
 fn durable_rows(dir: &std::path::Path) -> Option<usize> {
+    copy_rows(dir, TnLmdbArgs::default().with_trust_unsynced(false))
+}
+
+/// The `CanonicalHeaders` rows in a copy of the file in `dir`, opened as after a process crash.
+/// `None` if it lacks the table.
+fn crashed_rows(dir: &std::path::Path) -> Option<usize> {
+    copy_rows(dir, TnLmdbArgs::default())
+}
+
+/// The `CanonicalHeaders` rows in a copy of the file in `dir`, opened read-only with `args`.
+fn copy_rows(dir: &std::path::Path, args: TnLmdbArgs) -> Option<usize> {
     let copy = tempfile::TempDir::new().unwrap();
     std::fs::copy(dir.join(crate::DATA_FILE), copy.path().join(crate::DATA_FILE)).unwrap();
-    let db = super::open_env(copy.path(), TnLmdbEnvKind::RO, TnLmdbArgs::default()).unwrap();
+    let db = super::open_env(copy.path(), TnLmdbEnvKind::RO, args).unwrap();
     let tx = db.tx().unwrap();
     tx.entries::<CanonicalHeaders>().ok()
 }

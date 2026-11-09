@@ -141,6 +141,14 @@ pub struct TnLmdbArgs {
     /// freed pages wait, so how far the file grows past its live pages. Ignored in
     /// [`SyncMode::Durable`] and by a read-only open.
     pub sync_bytes: Option<u64>,
+    /// Trust, at open, a [`SyncMode::NoSync`] commit's weak meta (written with no sync) when the
+    /// running boot wrote it (default `true`): the engine's `EnvOptions::trust_unsynced`. A crash
+    /// of the process alone then loses no commit; a reboot rolls back to the last sync either
+    /// way. `false` opens at the last sync: the way back from a volume lost without a reboot (a
+    /// drive pulled, then plugged back in the same boot), where a weak meta may name pages that
+    /// never reached the disk and reads of its state are `MDBX_CORRUPTED`. Applies to read-only
+    /// opens too.
+    pub trust_unsynced: bool,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
@@ -170,6 +178,7 @@ impl Default for TnLmdbArgs {
             sync: SyncMode::Durable,
             sync_period: engine.sync_period,
             sync_bytes: engine.sync_bytes,
+            trust_unsynced: engine.trust_unsynced,
             #[cfg(test)]
             nested_dup: true,
             #[cfg(test)]
@@ -202,6 +211,13 @@ impl TnLmdbArgs {
     /// which a [`SyncMode::NoSync`] commit commits durably (`None`: never by size).
     pub const fn with_sync_bytes(mut self, sync_bytes: Option<u64>) -> Self {
         self.sync_bytes = sync_bytes;
+        self
+    }
+
+    /// Set [`Self::trust_unsynced`]: whether an open trusts a weak meta the running boot wrote
+    /// (`false`: open at the last sync).
+    pub const fn with_trust_unsynced(mut self, trust_unsynced: bool) -> Self {
+        self.trust_unsynced = trust_unsynced;
         self
     }
 
@@ -263,6 +279,7 @@ impl TnLmdbArgs {
             max_growth: self.max_growth,
             sync_period: self.sync_period,
             sync_bytes: self.sync_bytes,
+            trust_unsynced: self.trust_unsynced,
             ..EnvOptions::default()
         }
     }
@@ -537,9 +554,11 @@ impl TnLmdbEnv {
 
     /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
     /// durable only at the next sync (this, the environment's drop, which syncs unless it latched,
-    /// or a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`]). A no-op when
-    /// nothing is pending, in [`SyncMode::Durable`] and in a read-only environment, unless the
-    /// environment is latched: then it fails in every mode. Waits while a write transaction is
+    /// or a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`]); before it, its
+    /// weak meta keeps it through a crash of the process alone, not a reboot. A no-op when
+    /// nothing is pending, in [`SyncMode::Durable`] (but after an open that trusted a weak meta)
+    /// and in a read-only environment, unless the environment is latched: then it fails in every
+    /// mode. Waits while a write transaction is
     /// open. A failure is [`DatabaseError::Commit`] and latches the environment: later writes
     /// and commits fail until it is reopened.
     pub fn sync(&self) -> Result<(), DatabaseError> {

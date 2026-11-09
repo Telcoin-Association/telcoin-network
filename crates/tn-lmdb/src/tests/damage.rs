@@ -10,7 +10,7 @@ use crate::{
     catalog, crc,
     env::tests::{assert_fails_closed, flip},
     freelist::{decode_pages, encode_pages},
-    meta::{Meta, META_LEN},
+    meta::{Meta, Tag, META_LEN},
     page,
     tree::{PageRead as _, TreeRoot},
     Error,
@@ -345,7 +345,7 @@ fn damage_at_rest_fails_closed_or_latches() {
         for slot in 0..2 {
             let mut record = [0; META_LEN];
             file.read_exact_at(&mut record, slot * P).expect("read");
-            let meta = Meta::decode(&record).expect("meta");
+            let meta = Meta::decode(&record).expect("meta").0;
             if best.is_none_or(|(_, b)| meta.txn > b.txn) {
                 best = Some((slot, meta));
             }
@@ -375,7 +375,7 @@ fn damage_at_rest_fails_closed_or_latches() {
                 // Past the physical end, not just past the page count (slack is harmless).
                 let len = file.metadata().expect("metadata").len();
                 let grown = Meta { page_count: (len / P) as u32 + 1, ..meta };
-                file.write_all_at(&grown.encode(), slot * P).expect("write");
+                file.write_all_at(&grown.encode(Tag::default()), slot * P).expect("write");
             }),
             |e| matches!(e, Error::Corrupt(m) if m.contains("shorter")),
         ),
@@ -386,7 +386,7 @@ fn damage_at_rest_fails_closed_or_latches() {
                 let (slot, meta) = newest(p);
                 let file = fs::OpenOptions::new().write(true).open(p).expect("open");
                 let last = Meta { txn: u64::MAX, ..meta };
-                file.write_all_at(&last.encode(), slot * P).expect("write");
+                file.write_all_at(&last.encode(Tag::default()), slot * P).expect("write");
             }),
             |e| matches!(e, Error::Corrupt(m) if m.contains("no next txn")),
         ),
@@ -1065,11 +1065,11 @@ fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
         file.read_exact_at(&mut record, at * P).expect("read");
         record
     };
-    let txn_of = |at: u64| Meta::decode(&slot(at)).expect("meta").txn;
+    let txn_of = |at: u64| Meta::decode(&slot(at)).expect("meta").0.txn;
     let newest = if txn_of(0) > txn_of(1) { 0 } else { 1 };
     // Re-encoded, so the record passes its CRC.
-    let last = Meta { txn: u64::MAX - 1, ..Meta::decode(&slot(newest)).expect("meta") };
-    file.write_all_at(&last.encode(), newest * P).expect("write");
+    let last = Meta { txn: u64::MAX - 1, ..Meta::decode(&slot(newest)).expect("meta").0 };
+    file.write_all_at(&last.encode(Tag::default()), newest * P).expect("write");
     let slots = [slot(0), slot(1)];
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
         let env = open(&path, sync);
@@ -1132,12 +1132,12 @@ fn a_far_meta_txn_saturates_the_gate_lag() {
     let slot = |at: u64| {
         let mut record = [0; META_LEN];
         file.read_exact_at(&mut record, at * P).expect("read");
-        Meta::decode(&record).expect("meta")
+        Meta::decode(&record).expect("meta").0
     };
     let newest = if slot(0).txn > slot(1).txn { 0 } else { 1 };
     // Re-encoded, so the record passes its CRC.
     let far = Meta { txn: u64::MAX - 1, ..slot(newest) };
-    file.write_all_at(&far.encode(), newest * P).expect("write");
+    file.write_all_at(&far.encode(Tag::default()), newest * P).expect("write");
     let env = open(&path, SyncMode::Durable);
     let mut txn = env.begin_rw().expect("rw");
     let w = txn.create_table("w").expect("w");

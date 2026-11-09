@@ -16,7 +16,7 @@ use super::*;
 use crate::{
     catalog, crc, disk_model,
     env::{Env, EnvOptions, SyncMode},
-    meta::{Meta, PAGE_SIZES},
+    meta::{Meta, Tag, PAGE_SIZES},
     tree::{
         test_harness::{ReportSeed, Rng},
         PageWrite,
@@ -277,37 +277,42 @@ fn leftover_pages_are_listed_under_the_keys_taken_and_reused_at_once() {
     check(&env);
 }
 
-/// In `SyncMode::NoSync` the meta slots move only at a sync: a freed page comes back once both
-/// slots hold states from its freeing on, so after two syncs.
+/// In `SyncMode::NoSync` a freed page comes back one commit after the sync that follows its free:
+/// each commit's weak meta goes into the slot that does not hold the last sync's steady meta, so
+/// the gate (the lower slot) stays at the sync before until the first commit after a sync replaces
+/// that slot, and then stands at the sync. Every page reused was freed by a txn the sync covered.
 #[test]
-fn nosync_reuse_waits_for_two_syncs() {
+fn nosync_reuse_waits_for_the_next_sync() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::NoSync);
     log_pages(&env);
     let mut slot_floor: HashMap<u64, u64> = HashMap::new();
     let mut step = |env: &Env, generation: u32| {
-        let floor = env.with_writer(|w| w.slots().iter().flatten().copied().min().expect("valid"));
+        let floor = env
+            .with_writer(|w| w.slots().iter().flatten().map(|slot| slot.txn).min().expect("valid"));
         let txn = churn(env, "t", 200, generation, 120);
         slot_floor.insert(txn, floor);
         check(env);
+        txn
     };
     for generation in 0..10 {
         step(&env, generation);
     }
+    assert!(logs(&env).0.is_empty(), "nothing is reused before a sync");
     env.sync().expect("sync");
-    for generation in 10..15 {
-        step(&env, generation);
-    }
-    assert!(logs(&env).0.is_empty(), "nothing is reused before the second sync");
-    env.sync().expect("sync");
-    for generation in 15..20 {
+    let synced = env.stat().txn_id;
+    step(&env, 10);
+    assert!(logs(&env).0.is_empty(), "the first commit after the sync still has the older slot");
+    for generation in 11..15 {
         step(&env, generation);
     }
     let reuses = reuses(&env);
-    assert!(!reuses.is_empty(), "the second sync lets pages come back");
+    assert!(!reuses.is_empty(), "the second commit after the sync reuses pages");
     for &(t, n, p) in &reuses {
         assert!(n <= slot_floor[&t], "page {p} freed by txn {n} reused by txn {t}");
+        assert!(n <= synced, "page {p} freed by txn {n}, after the sync at {synced}");
     }
+    assert_eq!(reuses.iter().map(|&(t, ..)| t).min(), Some(synced + 2), "{reuses:?}");
 }
 
 /// Overwriting the same keys commit after commit keeps the file at a steady size.
@@ -866,8 +871,8 @@ fn check_reports_damage_leaks_and_double_uses() {
     let leak = case("leak", &|p: &Path| {
         let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
         let grown = Meta { page_count: meta.page_count + 1, ..meta };
-        file.write_all_at(&grown.encode(), 0).expect("write");
-        file.write_all_at(&grown.encode(), 4096).expect("write");
+        file.write_all_at(&grown.encode(Tag::default()), 0).expect("write");
+        file.write_all_at(&grown.encode(Tag::default()), 4096).expect("write");
     });
     assert!(leak.contains(&format!("leaked [{}]; used twice []", meta.page_count)), "{leak}");
 }

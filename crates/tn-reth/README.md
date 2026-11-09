@@ -442,9 +442,10 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
   MiB): a commit returns before it is durable, and the first commit a second after the last
   durable state, or whose pages bring those written since to 64 MiB, commits durably with every
-  commit before it. A crash, of the system or of the process alone, rolls back to the last durable
-  state and never corrupts the file, and the pages commits free wait at most about two of those
-  intervals, so the file stays bounded (an engine `NoSync` with no syncs would grow until one: see
+  commit before it. Every other commit writes the engine's weak meta (no sync), so a crash of the
+  process alone loses nothing; a system crash or a power loss rolls back to the last durable state.
+  Neither corrupts the file, and the pages commits free wait at most about one of those intervals
+  and a commit, so the file stays bounded (an engine `NoSync` with no syncs would grow until one: see
   "Persist benchmark"). Refused at startup, naming the flag: `--db.exclusive`,
   `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`, and reth's
   `UtterlyNoSync` and `NoMetaSync` sync modes (neither has a CLI value). The `UtterlyNoSync`

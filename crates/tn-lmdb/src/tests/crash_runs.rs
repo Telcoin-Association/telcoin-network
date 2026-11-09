@@ -12,7 +12,7 @@
 use std::fs;
 
 use super::{
-    crash::{assert_gets, matrix, matrix_of, run_case, slack, Base, Case, Mode},
+    crash::{assert_gets, matrix, matrix_of, run_case, slack, weak_matrix, Base, Case, Mode},
     damage::tree,
     *,
 };
@@ -49,7 +49,11 @@ const SLACK: std::ops::RangeInclusive<u64> = 150..=190;
 /// drops; table `h`, nine-page runs between `e`'s pages and the end of the file; table `e` (low
 /// page numbers, runs among them) dropped by the second-to-last commit, so its pages are free
 /// records a reopened writer may reuse for tree pages and runs; and a filler table `f`, sized to
-/// leave [`SLACK`] pages of slack, dropped by the last commit.
+/// leave [`SLACK`] pages of slack, dropped by the last commit. The filler's leaves alternate with
+/// those of table `k`, which stays, so its free pages hold no run of two pages or more: once they
+/// pass the gate (from the second `SyncMode::NoSync` commit after the open, whose first weak meta
+/// replaced the older steady slot), they take tree pages only, and the crash commit's last run
+/// still goes past the newest page.
 fn runs_base(page_size: u32) -> Base {
     let (dir, path) = temp("tn_lmdb_crash_runs");
     let env = Env::open(&path, EnvOptions { page_size, ..EnvOptions::default() }).expect("open");
@@ -86,7 +90,8 @@ fn runs_base(page_size: u32) -> Base {
             if left > *SLACK.end() { left - (SLACK.start() + SLACK.end()) / 2 } else { left + 1 };
         let mut txn = env.begin_rw().expect("begin");
         for _ in 0..pages * per_page {
-            put(&mut txn, &mut state, "f", &key(next), &value(6, next, 900));
+            let table = if next % 2 == 0 { "f" } else { "k" };
+            put(&mut txn, &mut state, table, &key(next), &value(6, next, 900));
             next += 1;
         }
         txn.commit().expect("commit");
@@ -230,6 +235,23 @@ fn every_crash_point_of_an_automatic_sync_recovers_a_workload_of_overflow_runs()
 fn every_crash_point_of_an_automatic_sync_recovers_a_workload_of_overflow_runs_heavy() {
     for page_size in [4096, 16384] {
         matrix_of(&runs_base(page_size), 40, &[Mode::AutoSync]);
+    }
+}
+
+/// `SyncMode::NoSync`'s weak metas ([`weak_matrix`]) on the run workload: a process crash keeps
+/// every commit, every value in a run read back byte for byte, and a reboot, a torn weak record,
+/// a distrusted or unknown boot recovers the last sync exactly.
+#[test]
+fn a_process_crash_keeps_every_nosync_commit_of_overflow_runs() {
+    weak_matrix(&runs_base(4096), 2);
+}
+
+/// The run workload's weak matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn a_process_crash_keeps_every_nosync_commit_of_overflow_runs_heavy() {
+    for page_size in [4096, 16384] {
+        weak_matrix(&runs_base(page_size), 20);
     }
 }
 

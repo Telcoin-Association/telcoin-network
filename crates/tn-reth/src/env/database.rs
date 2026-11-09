@@ -460,11 +460,12 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 ///   `NoSync` with automatic syncs: a commit returns before it is durable, and the first commit
 ///   made at least [`SAFE_NO_SYNC_PERIOD`] after the last durable state, or whose pages bring those
 ///   written since then to [`SAFE_NO_SYNC_BYTES`], commits durably, with every commit before it
-///   (the engine's `sync_period` and `sync_bytes`). A crash, of the system or of the process alone,
-///   rolls back to the last durable state and never corrupts the file; the automatic syncs bound
-///   what it loses and how long the pages commits free wait before they are reused, so the file
-///   stays bounded. reth's `UtterlyNoSync` (no CLI value) is refused: the engine has no mode that
-///   never syncs. reth's `NoMetaSync` (no CLI value either) is refused.
+///   (the engine's `sync_period` and `sync_bytes`). Every other commit writes a weak meta (no
+///   sync), so a crash of the process alone loses nothing; a system crash or a power loss rolls
+///   back to the last durable state. Neither corrupts the file; the automatic syncs bound what a
+///   system crash loses and how long the pages commits free wait before they are reused, so the
+///   file stays bounded. reth's `UtterlyNoSync` (no CLI value) is refused: the engine has no mode
+///   that never syncs. reth's `NoMetaSync` (no CLI value either) is refused.
 /// - `--db.growth-step` is the largest growth step (`max_growth`; unset, the engine's 1 GiB): the
 ///   file grows by doubling up to it, then by it, each step preallocated. A step under the engine's
 ///   minimum (`MIN_GROWTH`, 1 MiB) is refused here.
@@ -544,18 +545,20 @@ fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
 
 /// `--db.sync-mode safe-no-sync`'s automatic sync by time on tn-lmdb (the engine's
 /// `sync_period`): a commit made at least this long after the last durable state commits durably,
-/// with every commit since. A crash, of the system or of the process alone, loses at most about
-/// this long's commits (those made within it of the last durable state), and the pages commits
-/// free wait at most about two of these before they are reused. Checked at commit: commits that
-/// then stop wait for the next commit or the close.
+/// with every commit since. A system crash loses at most about this long's commits (those made
+/// within it of the last durable state; a crash of the process alone loses none, by the engine's
+/// weak metas), and the pages commits free wait at most about one of these, and a commit, before
+/// they are reused. Checked at commit: commits that then stop wait for the next commit or the
+/// close.
 #[cfg(feature = "tn-lmdb")]
 const SAFE_NO_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// `--db.sync-mode safe-no-sync`'s automatic sync by size on tn-lmdb (the engine's `sync_bytes`):
 /// a commit whose pages bring those stamped since the last durable state to this many bytes
-/// commits durably, with every commit since. A crash, of the system or of the process alone, loses
-/// at most about this many bytes of commits, and the pages commits free wait at most about two of
-/// these before they are reused, so they hold at most about twice this beyond the live pages.
+/// commits durably, with every commit since. A system crash loses at most about this many bytes of
+/// commits (a crash of the process alone, none), and the pages commits free wait at most about one
+/// of these, and a commit, before they are reused, so they hold at most about this beyond the live
+/// pages.
 #[cfg(feature = "tn-lmdb")]
 const SAFE_NO_SYNC_BYTES: u64 = 64 << 20;
 

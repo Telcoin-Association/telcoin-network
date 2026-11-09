@@ -22,7 +22,8 @@ use std::time::Instant;
 /// The commit protocol's steps: 1 writes the changed tables' roots into the catalog and saves the
 /// free list, 3 stamps the CRCs, 4 syncs the data pages, 5 syncs the file's size if it grew, 6
 /// writes and syncs the meta. A [`crate::SyncMode::NoSync`] commit runs steps 1 and 3 (and
-/// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`); the sync that makes its state
+/// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`), then copies its meta as a weak
+/// record, unsynced and untimed; the sync that makes its state
 /// durable runs steps 4 to 6: an [`crate::Env::sync`], or a later `NoSync` commit past
 /// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`], which runs all seven
 /// steps itself.
@@ -30,10 +31,11 @@ use std::time::Instant;
 pub struct IoStats {
     /// States made durable: each run of steps 4 to 6, by a [`crate::SyncMode::Durable`] commit,
     /// by a [`crate::SyncMode::NoSync`] commit that commits durably ([`Self::auto_syncs`]), or by
-    /// an [`crate::Env::sync`] that found a `NoSync` state to make durable (a sync with nothing
-    /// pending counts nothing).
+    /// an [`crate::Env::sync`] that found a state no steady meta holds (a `NoSync` commit's, or a
+    /// weak head the open trusted) to make durable (a sync with nothing pending counts nothing).
     pub commits: u64,
-    /// [`crate::SyncMode::NoSync`] commits that deferred their sync: steps 1, 3 and 7 only.
+    /// [`crate::SyncMode::NoSync`] commits that deferred their sync: steps 1, 3 and 7, and their
+    /// weak meta's copy (no sync).
     pub nosync_commits: u64,
     /// [`crate::SyncMode::NoSync`] commits that committed durably, past
     /// [`crate::EnvOptions::sync_period`] or [`crate::EnvOptions::sync_bytes`]: steps 1 to 7, over

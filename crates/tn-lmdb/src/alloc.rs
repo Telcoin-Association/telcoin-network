@@ -4,7 +4,7 @@
 //! (`next_pgno`).
 //!
 //! A page leaving a tree goes to `freed` if a published tree can still reach it (it is reusable
-//! only once no durable meta and no reader can), or straight back to `pool` if the transaction
+//! only once no meta slot and no reader can), or straight back to `pool` if the transaction
 //! created it ("loose": nothing outside the transaction ever saw it). An allocation takes a page
 //! from `pool`, else the next page number at the end of the file, growing it. The writer refills
 //! an empty pool from the persisted free list ([`crate::freelist`]) first, through
@@ -332,7 +332,7 @@ impl Allocator {
     }
 
     /// At commit: the pages the free list must list, as `(pool, freed)`, each ascending. The
-    /// pool's pages are free in every state a durable meta or a reader holds (loaded from records
+    /// pool's pages are free in every state a meta slot or a reader holds (loaded from records
     /// the gate passed, or never published), so they may be reused at once; the freed pages are
     /// reachable from the transaction's base state, so they wait for the gate to pass the
     /// committing txn. Two kinds of duplicate are damage ([`Error::Corrupt`]):

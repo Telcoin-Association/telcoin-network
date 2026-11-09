@@ -2589,9 +2589,9 @@ impl Work {
     /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog
     /// (a dup table's record refused as [`Error::Corrupt`] if its totals break a record rule:
     /// [`Self::set_dup_record`]), the free list's save, the new meta, the pages' CRCs, the durable
-    /// steps (or, in `SyncMode::NoSync`, their deferral, unless the commit is past a bound of
-    /// `Writer::sync_due`), and publication. The writer then begins the next txn, so a
-    /// txn of `u64::MAX` (its base meta's id is one only a crafted meta has) is
+    /// steps (or, in `SyncMode::NoSync`, their deferral and the weak meta, unless the commit is
+    /// past a bound of `Writer::sync_due`), and publication. The writer then begins the next txn,
+    /// so a txn of `u64::MAX` (its base meta's id is one only a crafted meta has) is
     /// [`Error::Corrupt`] before anything is written.
     fn commit(&mut self, inner: &EnvInner) -> Result<u64> {
         let Some(next_txn) = self.txn.checked_add(1) else {
@@ -2647,7 +2647,7 @@ impl Work {
         match inner.sync_mode {
             SyncMode::Durable => writer.make_durable(&pages, &meta)?,
             SyncMode::NoSync if writer.sync_due(pages.len()) => writer.sync_with(&pages, &meta)?,
-            SyncMode::NoSync => writer.defer_sync(&pages),
+            SyncMode::NoSync => writer.defer_sync(&pages, &meta)?,
         }
         writer.publish(inner, meta);
         writer.alloc.begin_txn(next_txn);
@@ -2657,13 +2657,15 @@ impl Work {
 
 impl RwTxn {
     pub(crate) fn new(inner: Arc<EnvInner>, writer: Box<Writer>) -> Self {
-        let base = writer.last;
-        debug_assert_eq!(writer.alloc.txn(), base.txn + 1, "the writer is set for the next txn");
+        let (base, txn) = (writer.last, writer.alloc.txn());
+        // One past the base, but after an open that passed over a weak head one past that head
+        // (`meta::Chosen::next_txn`).
+        debug_assert!(txn > base.txn, "the writer is set for a txn after its base");
         Self {
             inner,
             work: Work {
                 writer: Some(writer),
-                txn: base.txn + 1,
+                txn,
                 base,
                 catalog: base.catalog,
                 catalog_trusted: false,
@@ -3056,7 +3058,8 @@ impl RwTxn {
 
     /// Commit: make this transaction's state the newest (durable when this returns in
     /// `SyncMode::Durable`; in `SyncMode::NoSync` at the next sync, which is this commit when it
-    /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes`) and return its txn id. A
+    /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes`, and safe from a crash of the
+    /// process alone at once, by its weak meta) and return its txn id. A
     /// transaction that changed nothing returns the id of the state it began from, with no
     /// I/O. An error latches the environment, and whether the commit survives is unknown until
     /// the file is reopened.

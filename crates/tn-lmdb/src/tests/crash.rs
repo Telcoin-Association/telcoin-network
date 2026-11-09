@@ -1,10 +1,14 @@
 //! The crash matrix: a commit (or, in `SyncMode::NoSync`, a sync; or a `NoSync` commit past
 //! `EnvOptions::sync_period`, which syncs itself) stopped at each point of the commit protocol,
-//! then a process crash, a strict power loss or a random-writeback power loss,
-//! must reopen to exactly the state the protocol allows — the last durable state `L` until the
-//! new meta is written, the new state `M` once its msync completed, and in between `M` exactly
-//! when the slot holds `M`'s intact record — pass `Env::check`, and reopen to the same state again
-//! after a crash right after that reopen.
+//! then a process crash, a strict power loss or a random-writeback power loss (each power loss a
+//! reboot too: `disk_model::power_loss`), must reopen to exactly the state the protocol allows,
+//! pass `Env::check`, and reopen to the same state again after a crash right after that reopen
+//! (or, from a weak head, to `L` after a power loss then). A power loss recovers the last durable
+//! state `L` until the new meta is written, the new state `M` once its msync completed, and in
+//! between `M` exactly when the slot holds `M`'s intact steady record. A process crash recovers
+//! the newest record the slot holds intact, weak or steady: `M`'s once it is copied (in
+//! `SyncMode::NoSync` its weak one, before the sync that stops), else that of the newest commit
+//! before it (`NoSync`'s unsynced commits leave weak ones), else `L`.
 
 use std::{fs, os::unix::fs::FileExt as _, time::Duration};
 
@@ -18,7 +22,8 @@ use crate::{
     catalog::{self, DupRecord},
     disk_model,
     env::CrashAt,
-    meta::slot_to_write,
+    error::{Error, Result},
+    meta::{slot_to_write, META_LEN},
     packed::PackedView,
     page::{self, Find, Val},
     tree::{read::descend, PageRead as _, TreeRoot},
@@ -221,9 +226,9 @@ fn stops_the_commit(mode: Mode, at: CrashAt) -> bool {
 /// Copy the base to a tracked case file, open it as `mode` commits, make the commits (unsynced
 /// ones first in `SyncMode::NoSync`) and stop at `at` (`None`: run to the end, with a sync).
 /// With `by_msync`, step 4 syncs the data by one `msync` (`Writer::data_by_msync`), else by the
-/// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made, the slot
-/// `M`'s meta goes to, how the durable steps synced the data, and what the writer reused and
-/// how it placed its runs. The environment is crashed.
+/// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made and the
+/// state before it, the slot `M`'s meta goes to, how the durable steps synced the data, and what
+/// the writer reused and how it placed its runs. The environment is crashed.
 pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<CrashAt>) -> Case {
     let path = base.dir.path().join("case");
     fs::copy(&base.path, &path).expect("copy");
@@ -250,6 +255,7 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     if mode == Mode::AutoSync {
         env.with_writer(|w| w.clock_at = Some(w.durable_at + AUTO_PERIOD));
     }
+    let before = latest.clone();
     let slot = env.with_writer(|w| slot_to_write(&w.slots()));
     let mut txn = env.begin_rw().expect("begin");
     (base.crash)(&mut txn, &mut latest);
@@ -277,7 +283,7 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     let (by_file, reused, runs) =
         env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
     env.crash();
-    Case { path, latest, slot, by_file, reused, runs }
+    Case { path, latest, before, slot, by_file, reused, runs }
 }
 
 /// What [`run_case`] left.
@@ -286,6 +292,8 @@ pub(super) struct Case {
     pub(super) path: PathBuf,
     /// The state the last commit made (`M`).
     pub(super) latest: State,
+    /// The state before it: the base's in `SyncMode::Durable`, the unsynced commits' else.
+    pub(super) before: State,
     /// The meta slot `M`'s record goes to.
     pub(super) slot: usize,
     /// The last durable steps synced the data by one `fdatasync` of the file (on macOS also by
@@ -314,16 +322,23 @@ pub(super) fn assert_gets(env: &Env, want: &State, case: &str) {
 /// a strict power loss right after the first reopen) to exactly the state allowed.
 fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) {
     let case = format!("{mode:?} by_msync={by_msync} {at:?} {loss:?}");
-    let Case { path, latest, slot, .. } = run_case(base, mode, by_msync, Some(at));
+    let Case { path, latest, before, slot, .. } = run_case(base, mode, by_msync, Some(at));
     match loss {
         Loss::Process => {}
         Loss::Strict => disk_model::power_loss(&path),
         Loss::Random(seed) => disk_model::power_loss_random(&path, seed),
     }
+    let process = matches!(loss, Loss::Process);
     let m_txn = base.txn + if mode == Mode::Durable { 1 } else { 3 };
-    // `M` survives exactly when its slot holds its intact record, which must be after step 6
-    // completed, may be during it, and must not be before it (a `NoSync` commit never writes it).
-    let reaches_m = slot_holds(&path, base.page_size, slot, m_txn);
+    // The slot every record of the case's commits went to (the unsynced commits' weak ones, the
+    // crash commit's, and the sync's steady one): a process crash recovers what it holds intact,
+    // weak or steady, a power loss (a reboot) only a steady record.
+    let record = slot_record(&path, base.page_size, slot);
+    let trusted = record.filter(|&(_, weak)| process || !weak);
+    let reaches_m = trusted.is_some_and(|(txn, _)| txn == m_txn);
+    // `M`'s steady record survives exactly when step 6 completed, may during it, and must not
+    // before it; in `NoSync` its weak record is in the slot from the crash commit on.
+    let weak_m = mode == Mode::NoSync && !stops_the_commit(mode, at);
     match (at, loss) {
         (CrashAt::AfterMetaMsync, _) => assert!(reaches_m, "{case}: the msynced meta survives"),
         (CrashAt::AfterMetaCopy, Loss::Process) => {
@@ -333,16 +348,32 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
             assert!(!reaches_m, "{case}: an unflushed meta is lost")
         }
         (CrashAt::AfterMetaCopy, Loss::Random(_)) => {}
-        _ => assert!(!reaches_m, "{case}: no meta is written before step 6"),
+        (_, Loss::Process) if weak_m => assert!(reaches_m, "{case}: the crash commit's weak meta"),
+        _ => assert!(!reaches_m, "{case}: no meta of M is trusted before step 6"),
     }
-    let (want_txn, want) = if reaches_m { (m_txn, &latest) } else { (base.txn, &base.state) };
+    // Short of `M`, a process crash in `SyncMode::NoSync` recovers the unsynced commits' weak
+    // head, which nothing replaced; anything else `L`.
+    let weak_before = process && mode != Mode::Durable;
+    if weak_before && !reaches_m {
+        assert_eq!(trusted, Some((base.txn + 2, true)), "{case}: the unsynced commits' head");
+    }
+    let mut want = match () {
+        _ if reaches_m => (m_txn, &latest, trusted.is_some_and(|(_, weak)| weak)),
+        _ if weak_before => (base.txn + 2, &before, true),
+        _ => (base.txn, &base.state, false),
+    };
     for reopen in 0..2 {
+        let (want_txn, want_state, weak) = want;
         let env = open_in(&path, mode);
         assert_eq!(env.stat().txn_id, want_txn, "{case}: reopen {reopen}");
-        assert!(newest_state(&env) == *want, "{case}: reopen {reopen}: the state differs");
-        assert_gets(&env, want, &format!("{case}: reopen {reopen}"));
+        assert!(newest_state(&env) == *want_state, "{case}: reopen {reopen}: the state differs");
+        assert_gets(&env, want_state, &format!("{case}: reopen {reopen}"));
         env.crash();
         disk_model::power_loss(&path);
+        // A weak head stays weak on disk until a sync: the reboot rolls it back to `L`.
+        if weak {
+            want = (base.txn, &base.state, false);
+        }
     }
     disk_model::untrack(&path);
     fs::remove_file(&path).expect("remove");
@@ -475,6 +506,254 @@ fn older_state_stays_recoverable(base: &Base) {
     let env = open(&path, SyncMode::Durable);
     assert_eq!(env.stat().txn_id, base.txn - 1);
     assert_eq!(newest_state(&env), base.prev);
+}
+
+/// How the machine went down after [`weak_case`]'s `SyncMode::NoSync` commits.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum WeakLoss {
+    /// Only the process died, in the same boot: the page cache survives.
+    Process,
+    /// The process died inside the last commit's copy of its weak meta (after any sync): the
+    /// record's first [`TORN_AT`] bytes are the new one's, the rest the slot's record before it.
+    Torn,
+    /// Only the process died, and the reopen has `EnvOptions::trust_unsynced` off.
+    Distrusted,
+    /// The process died on a host whose boot id cannot be read: the weak metas carry zeros.
+    UnknownBoot,
+    /// A strict power loss, a reboot.
+    Strict,
+    /// A random-writeback power loss, a reboot (seeded).
+    Random(u64),
+}
+
+/// Where [`WeakLoss::Torn`] cuts the record: inside the catalog root, so its txn is the new one's.
+const TORN_AT: usize = 40;
+
+/// Every way down of [`weak_case`], with `seeds` random power losses.
+pub(super) fn weak_losses(seeds: u64) -> Vec<WeakLoss> {
+    let mut losses = vec![
+        WeakLoss::Process,
+        WeakLoss::Torn,
+        WeakLoss::Distrusted,
+        WeakLoss::UnknownBoot,
+        WeakLoss::Strict,
+    ];
+    losses.extend((0..seeds).map(WeakLoss::Random));
+    losses
+}
+
+/// The weak metas of `SyncMode::NoSync` (no automatic sync) on `base`: its `commits` commits (1 to
+/// 3: the two unsynced ones, then the crash commit), with a sync after the first when `synced`, go
+/// down by `loss`, then reopen to exactly the state allowed. A process crash in the same boot
+/// recovers the last commit, by its weak meta; every other way down the last sync (the base's,
+/// or the first commit's when `synced`): a torn weak record is invalid, a distrusted, zero-tagged
+/// or other boot's one passed over for the steady slot beside it. The reopen checks, and a power
+/// loss right after it recovers the last sync too (a weak head stays weak until a sync).
+pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss) {
+    let case = format!("{commits} commits, synced {synced}, {loss:?}");
+    let path = base.dir.path().join("weak");
+    fs::copy(&base.path, &path).expect("copy");
+    disk_model::track(&path);
+    if let WeakLoss::UnknownBoot = loss {
+        disk_model::set_boot_id(None);
+    }
+    let env = open_in(&path, Mode::NoSync);
+    if !base.grows {
+        env.with_writer(|w| w.file.trust_tail());
+    }
+    let mut latest = (base.txn, base.state.clone());
+    let mut last_sync = latest.clone();
+    let mut torn = None;
+    for n in 0..commits {
+        let slot = env.with_writer(|w| slot_to_write(&w.slots()));
+        let size = u64::from(base.page_size);
+        let before = env.with_writer(|w| {
+            w.file.pages(slot as u32, size as usize, META_LEN).expect("the slot").to_vec()
+        });
+        let mut txn = env.begin_rw().expect("begin");
+        if n < 2 {
+            (base.unsynced)(&mut txn, &mut latest.1, n);
+        } else {
+            (base.crash)(&mut txn, &mut latest.1);
+        }
+        latest.0 = txn.commit().expect("a NoSync commit");
+        assert_eq!(latest.0, base.txn + u64::from(n) + 1, "{case}");
+        torn = Some((slot as u64 * size, before));
+        if synced && n == 0 {
+            env.sync().expect("sync");
+            last_sync = latest.clone();
+        }
+    }
+    let stats = env.io_stats();
+    assert_eq!((stats.nosync_commits, stats.auto_syncs), (u64::from(commits), 0), "{case}");
+    env.crash();
+    match loss {
+        WeakLoss::Process | WeakLoss::Distrusted | WeakLoss::UnknownBoot => {}
+        WeakLoss::Torn => {
+            let (at, before) = torn.expect("a commit");
+            let file = fs::OpenOptions::new().write(true).open(&path).expect("open");
+            file.write_all_at(&before[TORN_AT..], at + TORN_AT as u64).expect("tear");
+        }
+        WeakLoss::Strict => disk_model::power_loss(&path),
+        WeakLoss::Random(seed) => disk_model::power_loss_random(&path, seed),
+    }
+    let mut want = match loss {
+        WeakLoss::Process => &latest,
+        _ => &last_sync,
+    };
+    let trust_unsynced = !matches!(loss, WeakLoss::Distrusted);
+    for reopen in 0..2 {
+        let options = EnvOptions { trust_unsynced, ..options(SyncMode::NoSync) };
+        let env = Env::open(&path, options).expect("reopen");
+        assert_eq!(env.stat().txn_id, want.0, "{case}: reopen {reopen}");
+        assert!(newest_state(&env) == want.1, "{case}: reopen {reopen}: the state differs");
+        assert_gets(&env, &want.1, &format!("{case}: reopen {reopen}"));
+        env.crash();
+        disk_model::power_loss(&path);
+        want = &last_sync;
+    }
+    disk_model::untrack(&path);
+    fs::remove_file(&path).expect("remove");
+    if let WeakLoss::UnknownBoot = loss {
+        disk_model::reboot();
+    }
+}
+
+/// [`weak_case`] on `base` after one to three commits, with and without a sync after the first,
+/// every way down (but a torn weak record where the sync wrote the last record).
+pub(super) fn weak_matrix(base: &Base, seeds: u64) {
+    for commits in 1..=3 {
+        for synced in [false, true] {
+            for loss in weak_losses(seeds) {
+                if !(synced && commits == 1 && matches!(loss, WeakLoss::Torn)) {
+                    weak_case(base, commits, synced, loss);
+                }
+            }
+        }
+    }
+}
+
+/// `SyncMode::NoSync`'s weak metas: after one to three commits (and a sync after the first, or
+/// none), a process crash in the same boot recovers the last commit; a torn weak record, a reopen
+/// with `trust_unsynced` off, an unknown boot id, a strict and random power losses (reboots)
+/// recover the last sync exactly; every reopen checks.
+#[test]
+fn a_process_crash_keeps_every_nosync_commit_and_a_reboot_recovers_the_last_sync() {
+    weak_matrix(&base(4096), 3);
+}
+
+/// The weak matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn a_process_crash_keeps_every_nosync_commit_and_a_reboot_recovers_the_last_sync_heavy() {
+    for page_size in [4096, 16384] {
+        weak_matrix(&base(page_size), 30);
+    }
+}
+
+/// A copy of `base` to crash on, tracked, opened in `SyncMode::NoSync` with its unsynced commits
+/// (`rounds` of them, at most 2) made: the environment and the state they made.
+fn weak_copy(base: &Base, name: &str, rounds: u32) -> (PathBuf, Env, State) {
+    let path = base.dir.path().join(name);
+    fs::copy(&base.path, &path).expect("copy");
+    disk_model::track(&path);
+    let env = open_in(&path, Mode::NoSync);
+    let mut state = base.state.clone();
+    for round in 0..rounds {
+        let mut txn = env.begin_rw().expect("begin");
+        (base.unsynced)(&mut txn, &mut state, round);
+        txn.commit().expect("a NoSync commit");
+    }
+    (path, env, state)
+}
+
+/// Open `path` in `SyncMode::NoSync`, trusting a weak head of this boot or not.
+fn open_trusting(path: &Path, trust_unsynced: bool) -> Result<Env> {
+    Env::open(path, EnvOptions { trust_unsynced, ..options(SyncMode::NoSync) })
+}
+
+/// A volume lost without a reboot (pulled, then plugged back in the same boot) is the one case a
+/// weak meta cannot tell. Here the kernel wrote back the weak meta's page before the pages it
+/// names (an msync of that page alone stands for that writeback), then the volume went: a reopen
+/// in the same boot trusts a head whose pages never reached the disk, and open or `Env::check`,
+/// whichever comes first, finds it `Corrupt`, never another state. The same over random
+/// writebacks: each copy opens to exactly the head's state or `Corrupt`. With `trust_unsynced`
+/// off every one opens at the last sync, which checks and takes a commit.
+#[test]
+fn a_volume_lost_in_the_same_boot_is_corrupt_and_opens_at_the_last_sync_distrusted() {
+    let base = base(4096);
+    let (path, env, mut latest) = weak_copy(&base, "lost", 2);
+    let mut txn = env.begin_rw().expect("begin");
+    (base.crash)(&mut txn, &mut latest);
+    txn.commit().expect("a NoSync commit");
+    env.with_writer(|w| {
+        let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("a weak slot");
+        w.file.msync_page(slot as u32, base.page_size as usize).expect("the meta page's writeback");
+    });
+    env.crash();
+    let opened = |path: &Path| open_trusting(path, true).and_then(|env| env.check().map(|_| env));
+    let mut corrupt = 0;
+    for seed in 0..8 {
+        let copy = base.dir.path().join(format!("lost{seed}"));
+        disk_model::copy_tracked(&path, &copy);
+        disk_model::volume_loss_random(&copy, seed);
+        match opened(&copy) {
+            Ok(env) => assert!(newest_state(&env) == latest, "seed {seed}: the head's state"),
+            Err(Error::Corrupt(_)) => corrupt += 1,
+            Err(e) => panic!("seed {seed}: {e:?}"),
+        }
+        let env = open_trusting(&copy, false).expect("the last sync");
+        assert!(newest_state(&env) == base.state, "seed {seed}: the last sync");
+        drop(env);
+        disk_model::untrack(&copy);
+    }
+    assert!(corrupt > 0, "some writeback leaves the head naming lost pages");
+    disk_model::volume_loss(&path);
+    let found = opened(&path);
+    assert!(matches!(found, Err(Error::Corrupt(_))), "{found:?}");
+    let env = open_trusting(&path, false).expect("the last sync");
+    assert_eq!(env.stat().txn_id, base.txn);
+    assert!(newest_state(&env) == base.state, "the last sync");
+    let mut txn = env.begin_rw().expect("begin");
+    put(&mut txn, &mut latest, "a", &key(0), b"on top");
+    let mut want = base.state.clone();
+    want.get_mut("a").expect("table a").insert(key(0).to_vec(), b"on top".to_vec());
+    txn.commit().expect("a commit on the last sync");
+    drop(env);
+    let env = open_trusting(&path, true).expect("reopen");
+    assert!(newest_state(&env) == want, "the commit on the last sync");
+    drop(env);
+    disk_model::untrack(&path);
+}
+
+/// A writer opened past a weak head of its own boot (`trust_unsynced` off) gives its transactions
+/// txns past the head's (`Chosen::next_txn`), so no page it writes passes for one of the head's.
+/// Here its first commit rewrites the rows the head's one commit wrote, with other values (the
+/// same pages, by the same allocation), and stops after its stamp; a reopen that trusts the head
+/// again finds those pages newer than the head, `Corrupt`, never the head's state over the new
+/// writer's bytes. With `trust_unsynced` off it opens at the last sync, which checks.
+#[test]
+fn a_writer_past_a_distrusted_weak_head_never_reuses_its_txns() {
+    let base = base(4096);
+    let (path, env, _) = weak_copy(&base, "past", 1);
+    env.crash();
+    let env = open_trusting(&path, false).expect("the last sync");
+    assert_eq!(env.stat().txn_id, base.txn);
+    let mut txn = env.begin_rw().expect("begin");
+    assert_eq!(txn.writer_mut().alloc.txn(), base.txn + 2, "past the weak head's txn");
+    let table = txn.open_table("b").expect("open").expect("table b");
+    for i in (0..200).step_by(9) {
+        txn.put(&table, &key(i), &value(99, i, 120)).expect("put");
+    }
+    txn.writer_mut().crash_at = Some(CrashAt::AfterStamp);
+    txn.commit().expect_err("the commit stops after its stamp");
+    env.crash();
+    let found = open_trusting(&path, true).and_then(|env| env.check().map(|_| env.stat()));
+    assert!(matches!(found, Err(Error::Corrupt(_))), "{found:?}");
+    let env = open_trusting(&path, false).expect("the last sync");
+    assert!(newest_state(&env) == base.state, "the last sync");
+    drop(env);
+    disk_model::untrack(&path);
 }
 
 /// The dup table of [`dup_base`].

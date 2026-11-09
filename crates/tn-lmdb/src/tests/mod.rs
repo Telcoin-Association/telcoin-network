@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use crate::{
     env::{Env, EnvOptions, SyncMode},
-    meta::{Meta, META_LEN},
+    meta::{Meta, Tag, META_LEN},
     CheckReport, ReadTxn, RwTxn, Table,
 };
 
@@ -67,13 +67,13 @@ fn check(env: &Env) -> CheckReport {
     r
 }
 
-/// True if meta slot `slot` of the file (of `page_size`-byte pages) holds an intact record of
-/// txn `txn`.
-fn slot_holds(path: &Path, page_size: u32, slot: usize, txn: u64) -> bool {
+/// The intact record meta slot `slot` of the file (of `page_size`-byte pages) holds, if any: its
+/// txn and whether it is weak.
+fn slot_record(path: &Path, page_size: u32, slot: usize) -> Option<(u64, bool)> {
     let file = fs::File::open(path).expect("open");
     let mut record = [0; META_LEN];
-    file.read_exact_at(&mut record, slot as u64 * u64::from(page_size)).is_ok()
-        && Meta::decode(&record).is_ok_and(|meta| meta.txn == txn)
+    file.read_exact_at(&mut record, slot as u64 * u64::from(page_size)).ok()?;
+    Meta::decode(&record).ok().map(|(meta, tag)| (meta.txn, tag.weak))
 }
 
 /// A value of `len` bytes that differs by `tag` and `i`.

@@ -3,7 +3,9 @@
 //! snapshot), syncs, and reopens after clean closes, process crashes, strict and random power
 //! losses, and commits stopped at a random point of the commit protocol — with the sync mode
 //! drawn afresh at every reopen. After every commit and every reopen `Env::check` passes, and
-//! every reopen finds exactly the state the protocol allows. Values are inline only, or, in the
+//! every reopen finds exactly the state the protocol allows: after a process crash the newest
+//! commit whose meta reached its slot (in `SyncMode::NoSync` a weak one), after a power loss (a
+//! reboot) the newest steady one. Values are inline only, or, in the
 //! large-value variant, spread over inline values and overflow runs of 1 to 10 pages. In the
 //! draining variant, stretches of mostly deletes empty the tables, so many deletes merge pages;
 //! every variant's coverage gate counts the deletes that merged (`Writer::merging_deletes`).
@@ -131,6 +133,10 @@ struct Coverage {
     stopped_commits: u32,
     stopped_to_new: u32,
     stopped_to_old: u32,
+    /// Reopens at a weak head, newer than the durable state (after a process crash), and commits
+    /// whose txn skipped past a weak head an open passed over (after a power loss).
+    weak_reopens: u32,
+    skipped_txns: u32,
     /// Deletes whose merges absorbed a sibling (`Writer::merging_deletes`).
     merging_deletes: u64,
     /// Each dup table's, in the dup variant ([`DUPS`]).
@@ -187,7 +193,9 @@ struct Run {
     rng: Rng,
     env: Option<Env>,
     sync: SyncMode,
-    /// The newest committed state, and the newest durable one (its txn and state).
+    /// The newest committed state, which a process crash recovers (in `SyncMode::NoSync` by its
+    /// weak meta), and the newest durable one, whose meta is steady, which a power loss (a reboot)
+    /// recovers (each its txn and state).
     latest: (u64, State),
     durable: (u64, State),
     readers: Vec<(RoTxn, State)>,
@@ -525,9 +533,12 @@ impl Run {
             txn.abort();
             self.seen.aborts += 1;
         } else {
+            let planned = txn.writer_mut().alloc.txn();
             let id = txn.commit().expect("commit");
             if id != self.latest.0 {
-                assert_eq!(id, self.latest.0 + 1);
+                // One past the base, or past an untrusted weak head the open passed over.
+                assert!(id == planned && id > self.latest.0, "txn {id} after {}", self.latest.0);
+                self.seen.skipped_txns += u32::from(id > self.latest.0 + 1);
                 self.latest = (id, work);
                 self.nested_at.insert(id, self.nested());
                 if self.sync == SyncMode::Durable {
@@ -584,11 +595,14 @@ impl Run {
         }
     }
 
-    /// Reopen in a random sync mode: the file must hold exactly `want`, and check, each dup
-    /// table's nested trees those of its forms at `want`. A crash right after the reopen (no
-    /// commit) changes nothing. The forms of commits past `want` are forgotten.
-    fn reopen(&mut self, want: (u64, State)) {
+    /// Reopen in a random sync mode: the file must hold exactly `want` (the newest durable state,
+    /// or after a process crash a newer one), and check, each dup table's nested trees those of
+    /// its forms at `want`. A crash and a power loss right after the reopen (no commit) find the
+    /// same again, but a power loss after a reopen at a weak head finds the durable state: the
+    /// head stays weak until a sync. The forms of commits past `want` are forgotten.
+    fn reopen(&mut self, mut want: (u64, State)) {
         drop(self.nested_at.split_off(&(want.0 + 1)));
+        self.seen.weak_reopens += u32::from(want.0 > self.durable.0);
         loop {
             self.sync = if self.rng.below(2) == 0 { SyncMode::Durable } else { SyncMode::NoSync };
             let env = open(&self.path, self.sync);
@@ -606,12 +620,15 @@ impl Run {
                 self.env = Some(env);
                 break;
             }
-            // A crash and a power loss right after the reopen: the next one must find the same.
+            // A crash and a power loss right after the reopen: the next one must find the same
+            // steady state.
             env.crash();
             disk_model::power_loss(&self.path);
+            want = self.durable.clone();
+            drop(self.nested_at.split_off(&(want.0 + 1)));
         }
-        self.latest = want.clone();
-        self.durable = want;
+        assert!(want.0 >= self.durable.0, "a reopen below the durable state");
+        self.latest = want;
     }
 
     /// A commit (or, in `SyncMode::NoSync`, the sync after it) stopped at a random point of the
@@ -630,6 +647,7 @@ impl Run {
         let env = self.env.take().expect("open");
         let slot = env.with_writer(|w| slot_to_write(&w.slots()));
         let mut txn = env.begin_rw().expect("begin");
+        let planned = txn.writer_mut().alloc.txn();
         let mut work = self.latest.1.clone();
         self.restart_forms();
         self.random_ops(&mut txn, &mut work, step);
@@ -651,24 +669,38 @@ impl Run {
         };
         let e = stopped.expect_err("the commit stops at its crash point");
         assert!(e.to_string().contains("injected crash"), "{at:?}: {e}");
-        let new = (self.latest.0 + 1, work);
+        let new = (planned, work);
         self.nested_at.insert(new.0, self.nested());
         self.env = Some(env);
         let loss = self.rng.below(3);
         self.go_down(loss);
+        // A process crash keeps the page cache: a record intact in the slot counts, weak or
+        // steady. A power loss (a reboot) trusts a steady one only.
+        let record = slot_record(&self.path, self.page_size, slot);
+        let trusted = record.filter(|&(txn, weak)| txn == new.0 && (loss == 0 || !weak));
         let reaches_new = match at {
             _ if self.sync == SyncMode::NoSync && in_commit => false,
             CrashAt::AfterMetaMsync => true,
-            CrashAt::AfterMetaCopy => slot_holds(&self.path, self.page_size, slot, new.0),
+            CrashAt::AfterMetaCopy => trusted.is_some(),
+            // The commit's weak meta, before the sync that stopped wrote its steady one.
+            _ if self.sync == SyncMode::NoSync => loss == 0,
             _ => false,
         };
+        assert_eq!(reaches_new, trusted.is_some(), "{at:?}, loss {loss}: {record:?}");
         self.seen.stopped_commits += 1;
         let want = if reaches_new {
             self.seen.stopped_to_new += 1;
+            if trusted.is_some_and(|(_, weak)| !weak) {
+                self.durable = new.clone();
+            }
             new
         } else {
             self.seen.stopped_to_old += 1;
-            self.durable.clone()
+            if loss == 0 {
+                self.latest.clone()
+            } else {
+                self.durable.clone()
+            }
         };
         self.reopen(want);
     }
@@ -750,14 +782,16 @@ fn random_run_with(
                 run.drop_readers();
                 drop(run.env.take());
                 run.seen.clean_reopens += 1;
+                // The close syncs.
+                run.durable = run.latest.clone();
                 let latest = run.latest.clone();
                 run.reopen(latest);
             }
             82..91 => {
                 let loss = run.rng.below(3);
                 run.go_down(loss);
-                let durable = run.durable.clone();
-                run.reopen(durable);
+                let want = if loss == 0 { run.latest.clone() } else { run.durable.clone() };
+                run.reopen(want);
             }
             _ => run.stopped_commit(step),
         }
@@ -789,6 +823,8 @@ fn a_random_multi_table_workload_with_crashes_matches_the_model() {
         seen.random_losses >= 10,
         seen.stopped_to_new >= 3,
         seen.stopped_to_old >= 20,
+        seen.weak_reopens >= 3,
+        seen.skipped_txns >= 3,
         seen.merging_deletes >= 3,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -838,6 +874,8 @@ fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model(
         seen.random_losses >= 5,
         seen.stopped_to_new >= 3,
         seen.stopped_to_old >= 10,
+        seen.weak_reopens >= 3,
+        seen.skipped_txns >= 3,
         seen.merging_deletes >= 10,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -892,6 +930,8 @@ fn a_draining_multi_table_workload_with_crashes_matches_the_model() {
         seen.random_losses >= 30,
         seen.stopped_to_new >= 10,
         seen.stopped_to_old >= 50,
+        seen.weak_reopens >= 3,
+        seen.skipped_txns >= 3,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }
@@ -947,6 +987,8 @@ fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
         seen.random_losses >= 30,
         seen.stopped_to_new >= 10,
         seen.stopped_to_old >= 50,
+        seen.weak_reopens >= 3,
+        seen.skipped_txns >= 3,
     ];
     for d in &seen.dups {
         gate.extend([

@@ -1,6 +1,6 @@
 //! Thin wrappers over the system calls the page file needs: file and directory syncs, block
-//! preallocation, the OS page size and the open locks (exclusive for a writer, shared for a
-//! read-only open).
+//! preallocation, the OS page size, the open locks (exclusive for a writer, shared for a
+//! read-only open) and the boot id ([`boot_id`]).
 //!
 //! **macOS.** Neither `msync` nor `fsync` is a full power-loss barrier there (that needs
 //! `F_FULLFSYNC`, a flush of the whole drive's write cache). Commits are `msync`, so every other
@@ -18,7 +18,72 @@
 //!
 //! In tests every successful sync reports to the disk model (`disk_model`).
 
-use std::{fs::File, io, os::fd::AsRawFd, path::Path};
+use std::{fs::File, io, os::fd::AsRawFd, path::Path, sync::OnceLock};
+
+/// A boot id: 16 bytes that differ from one boot of the host to the next ([`boot_id`]). All zeros
+/// stands for an unknown one.
+pub(crate) type BootId = [u8; 16];
+
+/// The id of the host's running boot, read once per process: a weak meta carries it, and open
+/// trusts a weak meta only in the boot that wrote it (`meta::choose_meta`). Linux reads
+/// `/proc/sys/kernel/random/boot_id`, macOS `sysctlbyname("kern.bootsessionuuid")`, each a UUID
+/// string. `None` when it cannot be read or parsed, or is the nil UUID: a weak meta then carries
+/// zeros, which no open trusts, so such a host recovers every crash at the last sync.
+///
+/// In tests the thread's machine model answers first (`disk_model::boot_id`): the host's id until
+/// a power loss on the thread reboots it.
+pub(crate) fn boot_id() -> Option<BootId> {
+    #[cfg(test)]
+    if let Some(id) = crate::disk_model::boot_id() {
+        return id;
+    }
+    static ID: OnceLock<Option<BootId>> = OnceLock::new();
+    *ID.get_or_init(|| read_boot_id().as_deref().and_then(parse_uuid))
+}
+
+/// The host's boot id as the kernel prints it (see [`boot_id`]).
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()
+}
+
+/// The host's boot id as the kernel prints it (see [`boot_id`]).
+#[cfg(target_os = "macos")]
+fn read_boot_id() -> Option<String> {
+    let mut buf = [0_u8; 64];
+    let mut len = buf.len();
+    // SAFETY: the name is a NUL-terminated string; `buf` is a live stack buffer of `len` bytes,
+    // the most the kernel writes, and `len` a live `size_t` it reads and then sets to the length
+    // written; no new value is set (null, 0). No Rust memory past the call is touched.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let text = buf.get(..len).filter(|_| rc == 0)?;
+    let text = text.split(|&b| b == 0).next()?;
+    String::from_utf8(text.to_vec()).ok()
+}
+
+/// A UUID's 16 bytes from its text (`8-4-4-4-12` hex digits, white space around them allowed);
+/// `None` for any other text, and for the nil UUID, which names no boot.
+fn parse_uuid(text: &str) -> Option<BootId> {
+    let text = text.trim();
+    if !text.split('-').map(str::len).eq([8, 4, 4, 4, 12]) {
+        return None;
+    }
+    let mut digits = text.chars().filter(|&c| c != '-').map(|c| c.to_digit(16));
+    let mut id = [0_u8; 16];
+    for byte in &mut id {
+        let (high, low) = (digits.next()??, digits.next()??);
+        *byte = (high << 4 | low) as u8;
+    }
+    (id != [0; 16]).then_some(id)
+}
 
 /// Fsync a directory so recent directory-entry changes (file creates, renames) are durable.
 ///
@@ -381,6 +446,39 @@ mod tests {
         });
         assert_eq!(failed.expect_err("a full disk is an error").raw_os_error(), Some(libc::ENOSPC));
         assert_eq!(calls, 1, "a real error is not retried");
+    }
+
+    /// A UUID parses to its 16 bytes, in either case and with the kernel's newline; any other
+    /// shape, a non-hex digit (a sign included) and the nil UUID are refused.
+    #[test]
+    fn a_boot_id_parses_from_its_uuid() {
+        let id = [
+            0x68, 0x48, 0xEE, 0x5F, 0xDF, 0x00, 0x45, 0x50, 0x96, 0xC7, 0x6F, 0x1B, 0x92, 0xC8,
+            0x21, 0xF2,
+        ];
+        assert_eq!(parse_uuid("6848EE5F-DF00-4550-96C7-6F1B92C821F2"), Some(id));
+        assert_eq!(parse_uuid("6848ee5f-df00-4550-96c7-6f1b92c821f2\n"), Some(id));
+        for bad in [
+            "",
+            "6848EE5FDF00455096C76F1B92C821F2",
+            "6848EE5F-DF00-4550-96C7-6F1B92C821F",
+            "6848EE5F-DF00-4550-96C76-F1B92C821F2",
+            "6848EE5F-DF00-4550-96C7-6F1B92C821G2",
+            "+848EE5F-DF00-4550-96C7-6F1B92C821F2",
+            "6848EE5F-DF00-4550-96C7-6F1B92C821F2-",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert_eq!(parse_uuid(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The host's boot id is known on both supported platforms, and stays the same within the
+    /// process: on a host without one, no weak meta would ever be trusted.
+    #[test]
+    fn the_host_boot_id_is_known_and_stable() {
+        let id = boot_id().expect("the host's boot id");
+        assert_ne!(id, [0; 16]);
+        assert_eq!(boot_id(), Some(id));
     }
 
     #[test]

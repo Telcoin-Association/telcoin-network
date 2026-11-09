@@ -9,9 +9,10 @@
 //! only to a file holding bytes: a dangling one, or one to an empty file, is refused (the rename
 //! would replace the link, not create its target). The file is then locked
 //! (`flock(LOCK_EX | LOCK_NB)`, so a second open fails with [`Error::Locked`], in this process
-//! too), and the newest valid meta chosen ([`choose_meta`]). Open never writes to an existing
-//! file: a file that is shorter than the chosen meta's page count, not a tn-lmdb file, or whose
-//! catalog or free-tree root fails its checks fails closed, unchanged.
+//! too), and the meta chosen ([`choose_meta`]: the newest valid one, but a weak one only in the
+//! boot that wrote it). Open never writes to an existing file: a file that is shorter than the
+//! chosen meta's page count, not a tn-lmdb file, or whose catalog or free-tree root fails its
+//! checks fails closed, unchanged.
 //!
 //! [`Env::open_read_only`] opens an existing file no writer holds (`O_RDONLY`, a shared
 //! `flock`), chooses the meta and checks the roots exactly as [`Env::open`] does, and maps the
@@ -28,9 +29,12 @@
 //! state; after its sync, the new one; in between, the new one if its record survived intact (a
 //! process crash keeps it in the page cache, which a reopen reads; a power loss, only if it
 //! reached the disk), else the previous one (README, Commit protocol). In [`SyncMode::NoSync`] a
-//! commit only stamps and publishes in memory; [`Env::sync`] (or the environment's drop) runs the
-//! durable steps for the newest state, and so does a commit past [`EnvOptions::sync_period`] or
-//! [`EnvOptions::sync_bytes`] for its own ([`Writer::sync_due`]), as a durable commit does.
+//! commit stamps, copies its meta as a weak record into the slot that does not hold the newest
+//! steady one (no sync: [`Writer::defer_sync`]) and publishes; [`Env::sync`] (or the
+//! environment's drop) runs the durable steps for the newest state, and so does a commit past
+//! [`EnvOptions::sync_period`] or [`EnvOptions::sync_bytes`] for its own ([`Writer::sync_due`]),
+//! as a durable commit does. A reopen in the same boot trusts a weak head; after a reboot it
+//! opens at the newest steady meta ([`choose_meta`]).
 //!
 //! ## Readers
 //!
@@ -49,7 +53,7 @@
 //! ## Page reuse
 //!
 //! Pages a commit freed are listed in the free tree ([`crate::freelist`]) and reused once no
-//! durable meta and no live reader can reach them ([`Writer::reuse_gate`]).
+//! meta slot, weak or steady, and no live reader can reach them ([`Writer::reuse_gate`]).
 //!
 //! ## I/O counters
 //!
@@ -82,13 +86,13 @@ use crate::{
     file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE, MAX_GROWTH, MIN_GROWTH},
     freelist,
     latch::{Latch, UnwindLatch},
-    meta::{choose_meta, slot_to_write, Chosen, Meta, META_LEN},
+    meta::{choose_meta, slot_to_write, Chosen, Meta, Slot, Tag, META_LEN},
     overflow::{checked_run, Ovf, RunCrc},
     page::{self, Geometry, Kind},
     page_set::PageSet,
     stamp,
     stats::{elapsed_ns, lap, IoStats},
-    sys,
+    sys::{self, BootId},
     tree::{
         read::{checked_child, checked_page},
         write::Scratch,
@@ -134,17 +138,30 @@ pub enum SyncMode {
     /// [`Env::sync`], the close (which runs in the drop of the environment's last handle, on that
     /// thread: a reader's or cursor's drop can be the one that syncs, and a handle alive when the
     /// process exits skips it), or a commit past [`EnvOptions::sync_period`] or
-    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does. A
-    /// crash, even of the process alone, rolls back to the last sync: an [`Env::sync`], the
-    /// close, or a commit past `sync_period` or `sync_bytes`. The file stays consistent, since
-    /// the durable state's pages are never overwritten. Pages freed meanwhile wait for the syncs
-    /// (README, Free list and page reuse), so without either bound the file grows until a sync.
+    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does.
+    ///
+    /// A commit that does not sync still writes its meta: unsynced, with no system call, *weak*
+    /// (tagged with the running boot's id), into the slot that does not hold the last sync's
+    /// meta. So a crash of the process alone loses nothing: a reopen in the same boot trusts the
+    /// weak meta, whose pages the page cache holds ([`EnvOptions::trust_unsynced`]). A system
+    /// crash, a power loss or any other reboot rolls back to the last sync. Neither leaves the
+    /// file corrupt: the last sync's pages are never overwritten and its meta is never rewritten
+    /// before the next sync. A host whose boot id cannot be read trusts no weak meta, so there a
+    /// process crash too rolls back to the last sync. One case a weak meta cannot tell: a volume
+    /// lost without a reboot (pulled, then plugged back in the same boot) can leave it naming
+    /// pages that never reached the disk, or reached it torn. [`Env::check`] finds that state
+    /// [`Error::Corrupt`] (open or a read may find it first, but a page torn by sector passes a
+    /// read's checks), and `trust_unsynced = false` opens at the last sync (README, Open and
+    /// recovery).
+    ///
+    /// Pages freed meanwhile wait for a sync (README, Free list and page reuse), so without
+    /// either bound the file grows until one.
     NoSync,
 }
 
 /// How [`Env::open`] opens (or creates) a file. [`Env::open_read_only`] validates `page_size` as
-/// [`Env::open`] does and uses `readahead`, and no other field: it maps the file at its length and
-/// commits nothing.
+/// [`Env::open`] does and uses `readahead` and `trust_unsynced`, and no other field: it maps the
+/// file at its length and commits nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvOptions {
     /// The page size of a new file: a power of two in 4 KiB..=64 KiB (default 4096). An
@@ -179,16 +196,27 @@ pub struct EnvOptions {
     /// long has passed since the last durable state (the open, or the last run of the durable
     /// steps: a durable commit, an [`Env::sync`]) (default `None`: never by time). Checked at each
     /// commit, so no thread or timer syncs: commits that then stop wait for the next commit, an
-    /// [`Env::sync`] or the close. A crash then loses only commits made less than this after the
-    /// last durable state, and freed pages come back within about two periods. Ignored in
+    /// [`Env::sync`] or the close. A reboot then loses only commits made less than this after the
+    /// last durable state (a crash of the process alone loses none: [`SyncMode::NoSync`]), and
+    /// freed pages come back within about one period and a commit. Ignored in
     /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
     pub sync_period: Option<Duration>,
     /// [`SyncMode::NoSync`]: a commit that changes something commits durably once the pages
     /// stamped since the last durable state, its own included, hold at least this many bytes
-    /// (pages times the page size) (default `None`: never by size). A crash then loses less than
-    /// this many bytes of pages, and freed pages come back within about twice this. Ignored in
+    /// (pages times the page size) (default `None`: never by size). A reboot then loses less than
+    /// this many bytes of pages (a crash of the process alone, none), and freed pages come back
+    /// within about this many bytes of commits, plus a commit. Ignored in
     /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
     pub sync_bytes: Option<u64>,
+    /// Trust a weak meta, the meta a [`SyncMode::NoSync`] commit writes with no sync, at open when
+    /// the running boot wrote it (default `true`): a crash of the process alone then loses no
+    /// commit. `false` opens at the last sync whatever the slots hold, as a reboot does. It is the
+    /// way back from the one case a weak meta cannot tell: a volume lost without a reboot (an
+    /// external drive pulled, then plugged back in the same boot), where a weak meta may name
+    /// pages that never reached the disk, or reached it torn. [`Env::check`] finds such a state
+    /// [`Error::Corrupt`] (a read may return a torn page's bytes first), and the last sync's state
+    /// is intact beside it (README, Open and recovery). Applies to [`Env::open_read_only`] too.
+    pub trust_unsynced: bool,
 }
 
 impl Default for EnvOptions {
@@ -201,6 +229,7 @@ impl Default for EnvOptions {
             max_growth: MAX_GROWTH,
             sync_period: None,
             sync_bytes: None,
+            trust_unsynced: true,
         }
     }
 }
@@ -430,13 +459,14 @@ impl EnvInner {
     }
 }
 
-/// The close: in [`SyncMode::NoSync`] the final sync, then the trim of the file's preallocated
-/// tail ([`Writer::trim_tail`]). A latched environment does neither (its newest state may not be
-/// durable, and the slots' bookkeeping may not match the disk), nor does a read-only one, which
-/// has no writer, nor a copy in a process the opener forked, whose file it is not (its state is
-/// the parent's as of the fork: its sync could write a stale meta, its trim cut the parent's
-/// slack under the parent's next writes). A failed sync skips the trim; a failed trim is logged
-/// and changes nothing that matters: the file keeps its tail, which is slack.
+/// The close: the final sync (in [`SyncMode::Durable`] a no-op, unless the open trusted a weak
+/// head that no commit has replaced since: [`Writer::sync`]), then the trim of the file's
+/// preallocated tail ([`Writer::trim_tail`]). A latched environment does neither (its newest state
+/// may not be durable, and the slots' bookkeeping may not match the disk), nor does a read-only
+/// one, which has no writer, nor a copy in a process the opener forked, whose file it is not (its
+/// state is the parent's as of the fork: its sync could write a stale meta, its trim cut the
+/// parent's slack under the parent's next writes). A failed sync skips the trim; a failed trim is
+/// logged and changes nothing that matters: the file keeps its tail, which is slack.
 impl Drop for EnvInner {
     fn drop(&mut self) {
         if std::process::id() != self.pid {
@@ -454,11 +484,9 @@ impl Drop for EnvInner {
         let Some(writer) = self.writer.get_mut().as_mut() else {
             return;
         };
-        if self.sync_mode == SyncMode::NoSync {
-            if let Err(e) = writer.sync(&self.latch) {
-                tracing::error!(target: "tn_lmdb", "the final sync failed: {e}");
-                return;
-            }
+        if let Err(e) = writer.sync(&self.latch) {
+            tracing::error!(target: "tn_lmdb", "the final sync failed: {e}");
+            return;
         }
         if let Err(e) = writer.trim_tail() {
             tracing::warn!(
@@ -494,8 +522,8 @@ impl Published {
 }
 
 /// The single writer's state, held by one write transaction at a time: the page file, the
-/// page allocator, the newest committed state, what the meta slots hold on disk, and the
-/// snapshots published to readers.
+/// page allocator, the newest committed state, what the meta slots hold, and the snapshots
+/// published to readers.
 #[derive(Debug)]
 pub(crate) struct Writer {
     /// The page file (only the writer changes it).
@@ -511,13 +539,18 @@ pub(crate) struct Writer {
     pub(crate) alloc: Allocator,
     /// The newest committed state (durable or not): the next transaction's base.
     pub(crate) last: Meta,
-    /// The txn of the meta each slot holds on disk (`None`: invalid).
-    slots: [Option<u64>; 2],
+    /// What each meta slot holds in the file (`None`: invalid), weak or steady: in the page cache,
+    /// which a weak record has not left.
+    slots: [Option<Slot>; 2],
+    /// The boot this writer runs in (`sys::boot_id`, zero when unknown), the tag of every record
+    /// it writes.
+    boot_id: BootId,
     /// [`SyncMode::NoSync`]: the pages commits stamped since the last sync.
     unsynced: PageSet,
     /// The pages [`Self::unsynced`] holds: each commit's stamped pages counted as it defers them,
     /// distinct from those already there, because a page a `NoSync` commit stamped is reused only
-    /// once a sync has moved the slots past the txn that frees it.
+    /// once the reuse gate has passed the txn that frees it, which takes a sync after it (the gate
+    /// is at most the newest steady slot's txn).
     unsynced_pages: u64,
     /// [`SyncMode::NoSync`]'s automatic syncs ([`Self::sync_due`]): `None` in
     /// [`SyncMode::Durable`] and when neither bound is set, so a commit then tests one field.
@@ -726,10 +759,26 @@ impl Writer {
         self.durable_at.elapsed()
     }
 
-    /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
-    pub(crate) fn defer_sync(&mut self, pages: &[u32]) {
+    /// A [`SyncMode::NoSync`] commit that defers its sync: record the `pages` it stamped for the
+    /// next sync, then copy its `meta` into its slot ([`slot_to_write`]: the one that does not hold
+    /// the newest steady meta) as a weak record, through the mapping: no msync, no system call. A
+    /// process crash from then on recovers this state in the same boot, whose page cache holds its
+    /// pages; a reboot recovers the newest steady one, which this never touches.
+    pub(crate) fn defer_sync(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         self.stats.nosync_commits += 1;
         self.add_unsynced(pages);
+        let slot = self.copy_meta(meta, Tag::weak(self.boot_id))?;
+        self.slots[slot] = Some(Slot { txn: meta.txn, weak: true });
+        Ok(())
+    }
+
+    /// Copy `meta`'s record, tagged `tag`, into the slot [`slot_to_write`] picks, and return the
+    /// slot. Nothing is synced, and the caller records the slot's new record.
+    fn copy_meta(&mut self, meta: &Meta, tag: Tag) -> Result<usize> {
+        let slot = slot_to_write(&self.slots);
+        let size = self.geometry.page_size();
+        self.file.page_mut(slot as u32, size)?[..META_LEN].copy_from_slice(&meta.encode(tag));
+        Ok(slot)
     }
 
     /// Add `pages`, stamped by a [`SyncMode::NoSync`] commit, to [`Self::unsynced`].
@@ -769,8 +818,9 @@ impl Writer {
     /// The durable steps of a commit (4–6): sync `pages` (ascending) by the one `msync` or the
     /// one `fdatasync` [`data_sync`] picks (on macOS the `msync`s of `DataSync::Ranges` instead
     /// of the `fdatasync`), then the file's size if it grew (a no-op after the `fdatasync`, which
-    /// syncs the size too), then write `meta` over the slot holding the lower txn and sync that
-    /// page.
+    /// syncs the size too), then write `meta` as a steady record into the slot that does not hold
+    /// the newest steady one ([`slot_to_write`]: with both steady, the lower txn; beside a weak
+    /// record, the weak one) and sync that page.
     pub(crate) fn make_durable(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         let size = self.geometry.page_size();
         let plan = data_sync(pages, size as u64);
@@ -818,12 +868,11 @@ impl Writer {
         self.stats.size_sync_ns += lap(&mut clock);
         #[cfg(test)]
         self.crash_point(CrashAt::AfterSizeSync)?;
-        let slot = slot_to_write(&self.slots);
-        self.file.page_mut(slot as u32, size)?[..META_LEN].copy_from_slice(&meta.encode());
+        let slot = self.copy_meta(meta, Tag::steady(self.boot_id))?;
         #[cfg(test)]
         self.crash_point(CrashAt::AfterMetaCopy)?;
         self.file.msync_page(slot as u32, size)?;
-        self.slots[slot] = Some(meta.txn);
+        self.slots[slot] = Some(Slot { txn: meta.txn, weak: false });
         self.stats.meta_sync_ns += lap(&mut clock);
         self.durable_at = clock;
         self.stats.commits += 1;
@@ -855,11 +904,13 @@ impl Writer {
         Err(Error::Failed(format!("injected crash at {at:?}")))
     }
 
-    /// Make the newest committed state durable if a [`SyncMode::NoSync`] commit left it in
-    /// memory only. A failure latches. The caller checks the latch first.
+    /// Make the newest committed state durable unless a steady slot already holds it: after
+    /// [`SyncMode::NoSync`] commits that deferred their sync, or an open that trusted a weak head
+    /// (in either mode). The check is against the newest *steady* slot: a weak slot may hold the
+    /// newest state's txn, and its pages may be only in the page cache. A failure latches. The
+    /// caller checks the latch first.
     fn sync(&mut self, latch: &Latch) -> Result<()> {
-        let durable = self.slots.iter().flatten().copied().max();
-        if durable.is_some_and(|txn| txn >= self.last.txn) {
+        if self.steady_txn().is_some_and(|txn| txn >= self.last.txn) {
             return Ok(());
         }
         let guard = UnwindLatch(latch, "a sync panicked");
@@ -914,14 +965,22 @@ impl Writer {
         txn
     }
 
+    /// The txn of the newest steady meta the slots hold: the last state made durable.
+    fn steady_txn(&self) -> Option<u64> {
+        self.slots.iter().flatten().filter(|slot| !slot.weak).map(|slot| slot.txn).max()
+    }
+
     /// The reuse gate: the latest txn whose free records may be reused, the lowest of the txns
-    /// the valid meta slots hold on disk and of the oldest snapshot a reader may hold. A page
-    /// freed by a transaction no later than it is unreachable from both durable states (whichever
-    /// a crash recovers) and from every live snapshot. In [`SyncMode::NoSync`] the slots move
-    /// only at a sync.
+    /// the valid meta slots hold, weak or steady, and of the oldest snapshot a reader may hold. A
+    /// page freed by a transaction no later than it is unreachable from every state a crash can
+    /// recover (the newest steady meta's, a weak head's in the same boot) and from every live
+    /// snapshot: each is the writer's base or an earlier state of its chain, at or past the gate,
+    /// and the base's free list still lists the page (README, Free list and page reuse). With a
+    /// weak slot the gate is the steady slot's txn, the lower one, so a `SyncMode::NoSync`
+    /// commit's freed pages wait for a sync.
     pub(crate) fn reuse_gate(&mut self) -> u64 {
-        let durable = self.slots.iter().flatten().copied().min().unwrap_or(0);
-        durable.min(self.oldest_reader_txn())
+        let recoverable = self.slots.iter().flatten().map(|slot| slot.txn).min().unwrap_or(0);
+        recoverable.min(self.oldest_reader_txn())
     }
 
     /// Refill the empty pool from the free list of the transaction's base state ([`Self::load`]),
@@ -989,13 +1048,13 @@ impl Writer {
             .ok_or_else(|| Error::Failed(format!("no length holds {used} bytes")))
     }
 
-    /// The bytes of the file's pages in use: the most pages any state a meta slot holds on disk
-    /// names, and never fewer than the newest state's ([`Self::last`]), times the page size. A
-    /// file cut to it still opens to every state its slots hold: the clean close's trim
+    /// The bytes of the file's pages in use: the most pages any state a meta slot holds names,
+    /// weak or steady, and never fewer than the newest state's ([`Self::last`]), times the page
+    /// size. A file cut to it still opens to every state its slots hold: the clean close's trim
     /// ([`Self::trim_len`]), and open's cut of an inherited tail ([`PageFile::distrust_tail`]). A
     /// torn or invalid slot (`None`) names no state an open can recover, so it is left out; a
-    /// valid slot whose record in the file does not decode to its txn is one this writer cannot
-    /// account for, and is [`Error::Failed`].
+    /// valid slot whose record in the file does not decode to its txn and kind is one this writer
+    /// cannot account for, and is [`Error::Failed`].
     ///
     /// The page count never shrinks from one committed state to the next (the allocator's next
     /// page number only grows within a transaction, and an abort puts it back), so the newest
@@ -1004,14 +1063,16 @@ impl Writer {
     fn used_len(&self) -> Result<u64> {
         let size = self.geometry.page_size();
         let mut pages = self.last.page_count;
-        for (slot, txn) in self.slots.iter().enumerate() {
-            let Some(txn) = *txn else { continue };
-            let record = self.file.page(slot as u32, size).and_then(|page| page.first_chunk());
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(Slot { txn, weak }) = *slot else { continue };
+            let record = self.file.page(i as u32, size).and_then(|page| page.first_chunk());
             match record.map(Meta::decode) {
-                Some(Ok(meta)) if meta.txn == txn => pages = pages.max(meta.page_count),
+                Some(Ok((meta, tag))) if meta.txn == txn && tag.weak == weak => {
+                    pages = pages.max(meta.page_count)
+                }
                 _ => {
                     return Err(Error::Failed(format!(
-                        "meta slot {slot} does not hold the state of txn {txn}"
+                        "meta slot {i} does not hold the state of txn {txn} (weak: {weak})"
                     )))
                 }
             }
@@ -1019,9 +1080,9 @@ impl Writer {
         Ok(u64::from(pages) * size as u64)
     }
 
-    /// Test-only: the txns the meta slots hold on disk.
+    /// Test-only: what the meta slots hold.
     #[cfg(test)]
-    pub(crate) fn slots(&self) -> [Option<u64>; 2] {
+    pub(crate) fn slots(&self) -> [Option<Slot>; 2] {
         self.slots
     }
 }
@@ -1356,20 +1417,24 @@ impl Env {
             return Err(Error::InvalidMapReserve(options.map_reserve));
         }
         let file = open_locked(path, options.page_size)?;
-        let (chosen, geometry) = choose_state(&file)?;
+        let boot_id = sys::boot_id();
+        let trusted = options.trust_unsynced.then_some(boot_id).flatten();
+        let (chosen, geometry) = choose_state(&file, trusted)?;
         let meta = chosen.meta;
-        // A crash may have left a meta in the page cache whose msync never finished, or a
-        // created file whose name never reached the disk (a `create` that died, or failed, before
-        // its directory sync): make what this open reads, and the name it found it by, durable
-        // before anything is built on them (a directory that cannot be synced is skipped, with
-        // a warning: `sys::fsync_directory`).
+        // A crash may have left a meta in the page cache whose msync never finished, a weak head
+        // whose pages a dead writer left there, or a created file whose name never reached the
+        // disk (a `create` that died, or failed, before its directory sync): make what this open
+        // reads, and the name it found it by, durable before anything is built on them (a
+        // directory that cannot be synced is skipped, with a warning: `sys::fsync_directory`).
+        // A weak head stays weak on disk: the next sync writes its steady meta.
         sys::fsync_file(&file)?;
         sys::fsync_directory(parent_dir(path))?;
         let file =
             PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
-        // macOS: that fsync leaves pages a crashed writer dirtied through its mapping unwritten,
-        // and only an msync writes them (README, Platform notes). Every mapping of the file
-        // shares its pages, so an msync of this one does, once, before anything is built on them.
+        // macOS: that fsync leaves pages a crashed writer dirtied through its mapping unwritten (a
+        // trusted weak head's among them), and only an msync writes them (README, Platform
+        // notes). Every mapping of the file shares its pages, so an msync of this one does, once,
+        // before anything is built on them.
         #[cfg(target_os = "macos")]
         file.msync_range(0..file.file_len())?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
@@ -1377,9 +1442,13 @@ impl Env {
             view: file.view(),
             file,
             geometry,
-            alloc: Allocator::new(meta.txn + 1, meta.page_count),
+            alloc: Allocator::new(
+                chosen.next_txn().expect("choose_state refuses a slot with no next txn"),
+                meta.page_count,
+            ),
             last: meta,
             slots: chosen.slots,
+            boot_id: boot_id.unwrap_or_default(),
             unsynced: PageSet::default(),
             unsynced_pages: 0,
             auto_sync: AutoSync::new(&options),
@@ -1443,7 +1512,8 @@ impl Env {
     pub fn open_read_only(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         Geometry::new(options.page_size)?;
         let file = open_shared(path.as_ref())?;
-        let (chosen, geometry) = choose_state(&file)?;
+        let trusted = options.trust_unsynced.then(sys::boot_id).flatten();
+        let (chosen, geometry) = choose_state(&file, trusted)?;
         // No sync, unlike `open`: nothing is built on what this open reads.
         let file = ReadOnlyFile::from_file(file, options.readahead)?;
         let snapshot = checked_snapshot(chosen.meta, geometry, file.view())?;
@@ -1503,8 +1573,10 @@ impl Env {
     }
 
     /// Make every commit durable: in [`SyncMode::NoSync`], sync the pages committed since the
-    /// last sync and write the newest state's meta (a no-op when nothing is pending, and always
-    /// in [`SyncMode::Durable`] and in an environment opened read-only). Waits while a write
+    /// last sync and write the newest state's steady meta (a no-op when no state is pending: a
+    /// steady meta holds the newest one; always in an environment opened read-only, and in
+    /// [`SyncMode::Durable`] but after an open that trusted a weak head, which this makes
+    /// steady). Waits while a write
     /// transaction is open, as [`Self::begin_rw`] does, in every mode. A failure latches the
     /// environment, and once it is latched this is [`Error::Failed`] in every mode.
     pub fn sync(&self) -> Result<()> {
@@ -1770,7 +1842,7 @@ fn create(path: &Path, page_size: u32) -> Result<()> {
     }
     file.set_len(0)?;
     let p = page_size as usize;
-    let record = Meta::initial(page_size).encode();
+    let record = Meta::initial(page_size).encode(Tag::steady(sys::boot_id().unwrap_or_default()));
     let mut metas = vec![0; 2 * p];
     metas[..META_LEN].copy_from_slice(&record);
     metas[p..p + META_LEN].copy_from_slice(&record);
@@ -1800,15 +1872,16 @@ fn remove_unused(tmp: &Path, file: &File) {
     }
 }
 
-/// Choose the state an open recovers from `file`, locked (open steps 4–6): the newest valid meta
-/// ([`choose_meta`]) and its geometry, refusing a txn id with no next one and a file shorter than
-/// the meta's pages. Reads only.
-fn choose_state(file: &File) -> Result<(Chosen, Geometry)> {
-    let chosen = choose_meta(|offset| read_record(file, offset))?;
+/// Choose the state an open recovers from `file`, locked (open steps 4–6): the meta
+/// [`choose_meta`] picks, trusting weak metas of the boot `trusted` (`None`: none), and its
+/// geometry, refusing a slot's txn id with no next one ([`Chosen::next_txn`]) and a file shorter
+/// than the meta's pages. Reads only.
+fn choose_state(file: &File, trusted: Option<BootId>) -> Result<(Chosen, Geometry)> {
+    let chosen = choose_meta(|offset| read_record(file, offset), trusted)?;
     let meta = chosen.meta;
     let geometry = Geometry::new(meta.page_size)?;
-    if meta.txn == u64::MAX {
-        return Err(Error::Corrupt("open: the meta's txn id leaves no next txn".to_string()));
+    if chosen.next_txn().is_none() {
+        return Err(Error::Corrupt("open: a meta's txn id leaves no next txn".to_string()));
     }
     let needed = u64::from(meta.page_count) * u64::from(meta.page_size);
     let len = file.metadata()?.len();

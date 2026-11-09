@@ -5,23 +5,23 @@
 //! sort by txn) and its value the page numbers, strictly ascending, as `u32` LE (at most
 //! [`record_capacity`] of them; an empty value is allowed).
 //!
-//! **Loading.** A write transaction reuses a page only once no durable meta and no live reader
-//! can reach it. A record's txn is the reuse gate its pages wait for: once the gate reaches it,
-//! no state a durable meta or a reader still holds reaches them. So the writer takes records in
-//! key order ([`next_record`]), smallest first, while their txn is no later than the reuse gate:
-//! the lower txn of the two meta slots and the oldest snapshot a reader may hold
+//! **Loading.** A write transaction reuses a page only once no meta slot and no live reader can
+//! reach it. A record's txn is the reuse gate its pages wait for: once the gate reaches it, no
+//! state a meta slot (weak or steady) or a reader still holds reaches them. So the writer takes
+//! records in key order ([`next_record`]), smallest first, while their txn is no later than the
+//! reuse gate: the lower txn of the two meta slots and the oldest snapshot a reader may hold
 //! (`Writer::reuse_gate`). The pages a transaction `N` freed are listed under `N`: in
-//! `SyncMode::Durable` they are reusable from txn `N + 2`; in `SyncMode::NoSync` the slots move
-//! only at a sync, so they come back once two syncs have made states from `N` on durable in both
-//! slots. A record's pages are checked before any is handed out ([`decode_pages`]): the leaf
-//! holding it passes its CRC and structure checks, and each page is a tree page of the state
-//! (`2 <= p < page_count`), strictly ascending, and not already taken from the list by this
-//! transaction. The free tree itself is not changed while the transaction runs.
+//! `SyncMode::Durable` they are reusable from txn `N + 2`; in `SyncMode::NoSync` the steady slot
+//! moves only at a sync, so they come back at the second commit after the first sync at or after
+//! `N` (README, Free list and page reuse). A record's pages are checked before any is handed out
+//! ([`decode_pages`]): the leaf holding it passes its CRC and structure checks, and each page is a
+//! tree page of the state (`2 <= p < page_count`), strictly ascending, and not already taken from
+//! the list by this transaction. The free tree itself is not changed while the transaction runs.
 //!
 //! **Saving** at commit ([`save`]), with loading stopped (pages come from the pool or the end of
 //! the file): the records taken are deleted, then the pages to list are written. Those left in the
 //! pool (taken from records, or added to the file by this transaction, and in no tree now) are free
-//! in every state a durable meta or a reader holds, so they go back under the keys of the records
+//! in every state a meta slot or a reader holds, so they go back under the keys of the records
 //! taken, which the gate has passed, and the next transaction may take them at once. Those the
 //! transaction freed, and pool pages past what the keys taken hold, are written as records
 //! `(M, 0..k)` of the committing txn `M`. Two records never list one page: the records taken are

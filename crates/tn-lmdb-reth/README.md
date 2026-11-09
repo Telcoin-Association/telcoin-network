@@ -42,7 +42,11 @@ tx.commit()?;
   `with_max_growth`, at least `MIN_GROWTH`, 1 MiB, the engine's constant re-exported, else the
   open is `MDBX_EINVAL`), and `SyncMode::Durable` (or `NoSync`, made durable by `TnLmdbEnv::sync`,
   the drop, or a commit past `with_sync_period` or `with_sync_bytes`, the engine's automatic syncs,
-  which bound what a crash loses and how far the file grows; both off by default). A clean drop gives back the file's preallocated tail (the engine's close).
+  which bound what a reboot loses and how far the file grows; both off by default). A `NoSync`
+  commit writes a weak meta (no sync), so a crash of the process alone loses nothing; a reboot
+  rolls back to the last sync. `with_trust_unsynced(false)` (the engine's
+  `EnvOptions::trust_unsynced`) opens at the last sync instead, the way back from a volume lost
+  without a reboot. A clean drop gives back the file's preallocated tail (the engine's close).
 - **Read cursors are pooled per transaction:** a `TnLmdbTx` keeps the engine cursors its dropped
   cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
   table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new
@@ -56,11 +60,11 @@ tx.commit()?;
   table, in the order of `Tables::ALL`; `page_size` gives the file's page size. The
   `DatabaseMetrics` gauges (`db.table_size`, `db.table_pages`, `db.table_entries`) report the same
   figures under MDBX's names and labels.
-- **Sync and check:** `sync` makes every `NoSync` commit durable (the engine's `Env::sync`; a
-  failure is `DatabaseError::Commit` and latches the environment). `check` runs the engine's full
-  structural check of the newest committed state (`Env::check`) and returns its `CheckReport`;
-  damage is `DatabaseError::Read` with `MDBX_CORRUPTED`, latches the environment, and its detail
-  is in `failure`. TN's MDBX to tn-lmdb migration (`tn-reth`) copies with `NoSync`, then syncs and
+- **Sync and check:** `sync` makes every `NoSync` commit durable across a reboot (the engine's
+  `Env::sync`; a failure is `DatabaseError::Commit` and latches the environment). `check` runs
+  the engine's full structural check of the newest committed state (`Env::check`) and returns its
+  `CheckReport`; damage is `DatabaseError::Read` with `MDBX_CORRUPTED`, latches the environment,
+  and its detail is in `failure`. TN's MDBX to tn-lmdb migration (`tn-reth`) copies with `NoSync`, then syncs and
   checks before it moves the file into place.
 - **Limits:** a value up to 16 MiB. One up to the inline limit (about half a page: 2016 bytes
   with an 8-byte key at 4 KiB pages, where MDBX keeps 2020 in the leaf) stays in its leaf; a

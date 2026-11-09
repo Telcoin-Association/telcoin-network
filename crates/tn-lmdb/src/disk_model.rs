@@ -15,17 +15,55 @@
 //!
 //! An fsync here is Linux's, which writes every page dirtied through a mapping. On macOS the page
 //! file never relies on an fsync for those pages (it leaves some unwritten there): it msyncs them.
+//!
+//! **The boot.** A power loss is also a reboot: each thread runs on a machine of its own whose
+//! boot id (`sys::boot_id`) is the host's until [`power_loss`] or [`power_loss_random`] on that
+//! thread gives it a new one ([`reboot`]), so a weak meta written before it is never trusted after
+//! it. [`volume_loss`] and [`volume_loss_random`] lose the unsynced bytes as [`power_loss`] and
+//! [`power_loss_random`] do but keep the boot: a volume pulled and plugged back in. [`set_boot_id`]
+//! stands for a host whose id cannot be read.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     fs::{File, OpenOptions},
     os::unix::fs::{FileExt as _, MetadataExt as _},
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex, PoisonError,
     },
 };
+
+use crate::sys::BootId;
+
+thread_local! {
+    /// This thread's boot id, as [`boot_id`] reports it.
+    static BOOT: Cell<Option<Option<BootId>>> = const { Cell::new(None) };
+}
+
+/// The reboots so far, in every thread: each gets a boot id no other has.
+static REBOOTS: AtomicU64 = AtomicU64::new(0);
+
+/// The boot id `sys::boot_id` reports on this thread: `None` for the host's (no reboot or
+/// [`set_boot_id`] on this thread yet), else the one they set (`Some(None)`: an unknown id).
+pub(crate) fn boot_id() -> Option<Option<BootId>> {
+    BOOT.with(Cell::get)
+}
+
+/// Reboot this thread's machine: its boot id becomes one that neither the host nor any other
+/// reboot has.
+pub(crate) fn reboot() {
+    let n = REBOOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut id = [0xB0; 16];
+    id[8..].copy_from_slice(&n.to_le_bytes());
+    BOOT.with(|boot| boot.set(Some(Some(id))));
+}
+
+/// Set this thread's boot id: `None` stands for a host whose id cannot be read.
+pub(crate) fn set_boot_id(id: Option<BootId>) {
+    BOOT.with(|boot| boot.set(Some(id)));
+}
 
 /// The unit a disk writes atomically in [`power_loss_random`]'s model.
 const SECTOR: usize = 512;
@@ -157,10 +195,18 @@ fn image_of(path: &Path) -> (u64, Image, File) {
     (ino, image, file)
 }
 
-/// A power loss: the file at `path` keeps only what its image holds. It gets its durable length
-/// back (an unsynced growth is cut off, an unsynced truncation undone) and every byte is the
-/// image's.
+/// A power loss: the file at `path` keeps only what its image holds ([`volume_loss`]), and the
+/// thread's machine reboots ([`reboot`]).
 pub(crate) fn power_loss(path: &Path) {
+    volume_loss(path);
+    reboot();
+}
+
+/// The volume holding the file at `path` was lost without a reboot (pulled, then plugged back in
+/// within the same boot): the file keeps only what its image holds, as at a power loss, and the
+/// boot id stays. It gets its durable length back (an unsynced growth is cut off, an unsynced
+/// truncation undone) and every byte is the image's.
+pub(crate) fn volume_loss(path: &Path) {
     let (ino, image, file) = image_of(path);
     file.set_len(image.bytes.len() as u64).expect("restore the durable length");
     file.write_all_at(&image.bytes, 0).expect("write the image");
@@ -185,8 +231,16 @@ pub(crate) fn power_loss(path: &Path) {
 ///
 /// Pages whose bytes all agree are left alone and cost no draw, so the outcome depends only on
 /// `seed` and on which pages changed. The image becomes the resulting bytes (they are what the
-/// disk now holds, length included), so a later [`power_loss`] keeps them.
+/// disk now holds, length included), so a later [`power_loss`] keeps them. The thread's machine
+/// reboots ([`reboot`]).
 pub(crate) fn power_loss_random(path: &Path, seed: u64) {
+    volume_loss_random(path, seed);
+    reboot();
+}
+
+/// [`power_loss_random`]'s loss without the reboot: the volume lost, then back in the same boot
+/// ([`volume_loss`]).
+pub(crate) fn volume_loss_random(path: &Path, seed: u64) {
     let (ino, image, file) = image_of(path);
     let live = file.metadata().expect("metadata").len() as usize;
     let mut rng = SplitMix64(seed);

@@ -6,9 +6,10 @@
 //! single writer builds the next version of the trees in pages no reader can reach, while any
 //! number of readers see consistent snapshots. A commit makes the new version durable by writing
 //! one of two fixed meta pages (atomic commit, O(1) recovery: open picks the valid meta with the
-//! highest transaction id), and pages freed by a commit are reused only once no durable meta and no
-//! live reader can reach them, through a free list persisted in the file itself. There is no log:
-//! the meta pages and the gated page reuse carry all crash safety.
+//! highest transaction id, a [`SyncMode::NoSync`] commit's unsynced weak meta only in the boot that
+//! wrote it), and pages freed by a commit are reused only once no meta slot and no live reader can
+//! reach them, through a free list persisted in the file itself. There is no log: the meta pages
+//! and the gated page reuse carry all crash safety.
 //!
 //! A table is plain or dup. A plain table maps byte-string keys to values. A dup table
 //! ([`RwTxn::create_dup_table`], [`DupOptions`]) keys every row `k ‖ s`, an outer key of a fixed
