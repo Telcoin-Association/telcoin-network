@@ -9757,6 +9757,7 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "eyre",
+ "lru",
  "rayon",
  "tempfile",
  "tn-reth",
@@ -10269,6 +10270,7 @@ dependencies = [
  "async-trait",
  "eyre",
  "futures",
+ "lru",
  "metrics",
  "metrics-util",
  "parking_lot",

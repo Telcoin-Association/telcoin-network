@@ -62,7 +62,7 @@ use tn_config::ConsensusConfig;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{wait_until, CommitteeFixture};
-use tn_types::TaskManager;
+use tn_types::{NetworkPublicKey, TaskManager};
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet, time::timeout};
 
 /// Number of load-generating peers or datagram senders.

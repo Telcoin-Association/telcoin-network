@@ -39,6 +39,8 @@ mod admission;
 mod frame;
 mod request;
 
-pub use admission::{PeerSlot, PeerSlots, PeerTier, ReservedPeers, ReservedPool};
+pub use admission::{
+    HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier, ReservedPeers, ReservedPool,
+};
 pub use frame::{read_frame, write_frame, DenyReason, SyncFrame, SyncFrameError};
 pub use request::{PrimarySyncRequest, WorkerSyncRequest};

@@ -61,8 +61,8 @@ use std::{
 };
 use tn_types::{
     gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
-    EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner,
-    TransactionSigned, TxHash, U256,
+    Decodable2718 as _, EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError,
+    TaskSpawner, TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
@@ -1156,6 +1156,30 @@ pub fn recover_raw_transaction(tx: &[u8]) -> TnRethResult<Recovered<TransactionS
 pub fn recover_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> {
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
     Ok(recovered.into_inner())
+}
+
+/// Decode bytes into a signed transaction without signer recovery.
+///
+/// The decode rules and errors match [`recover_signed_transaction`]. Empty input fails, and
+/// trailing bytes fail. This function does not check the signature. Call
+/// [`verify_transaction_signature`] before you trust the transaction.
+pub fn decode_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> {
+    if tx.is_empty() {
+        Err(crate::EthApiError::EmptyRawTransactionData.into())
+    } else {
+        TransactionSigned::decode_2718_exact(tx)
+            .map_err(|_| crate::EthApiError::FailedToDecodeSignedTransaction.into())
+    }
+}
+
+/// Verify the signature of a signed transaction by signer recovery.
+///
+/// The recovery applies the EIP-2 rule for the `s` value. This function discards the recovered
+/// signer. A bad signature returns the same error as [`recover_signed_transaction`].
+pub fn verify_transaction_signature(tx: &TransactionSigned) -> TnRethResult<()> {
+    tx.recover_signer()
+        .map(|_| ())
+        .map_err(|_| crate::EthApiError::InvalidTransactionSignature.into())
 }
 
 /// Recover a pooled transaction.
