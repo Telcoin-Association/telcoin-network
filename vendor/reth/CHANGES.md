@@ -744,6 +744,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   describes the path semantics. RPC only.
   *Tests*: upstream's `trace_get_selects_tree_paths` (a root with two children and a grandchild,
   every path and three misses, over the RPC module). *Upstream*: n/a (upstream commit).
+- **TN-0067** — Backport 3dd806a43: `trace_replayTransaction` returns the transaction's hash.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-api/src/trace.rs` (return type), `crates/rpc/rpc/src/trace.rs`
+  (`replay_transaction` and its handler, which keep TN-0038's permit handling; upstream's test
+  `replay_transaction_includes_transaction_hash` in the `tests` module without its RPC-cache seeding,
+  as TN-0066).
+  *Why*: `trace_replayTransaction` returned the bare trace results, where the other Parity-style
+  clients and `trace_replayBlockTransactions` wrap them with `transactionHash` (review R26). The
+  result now has the same shape as one entry of a block replay, so a client can tell which
+  transaction a replay belongs to; `docs/src/rpc-methods/trace/trace_replaytransaction.md` shows
+  the field. RPC only.
+  *Tests*: upstream's `replay_transaction_includes_transaction_hash` (with and without trace types,
+  the result carries the hash and equals the block replay's entry). *Upstream*: n/a (upstream
+  commit).
+
 
 ## TN fixes (not from an upstream commit)
 

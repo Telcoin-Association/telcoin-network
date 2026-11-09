@@ -15,8 +15,9 @@ Traces cover the block's transactions only. The system calls a block runs before
 
 #### Returns
 
-`Object` - The requested traces:
+`Object` - The requested traces, in the shape of one entry of [trace\_replayBlockTransactions](trace_replayblocktransactions.md):
 
+* `transactionHash`: `DATA`, 32 Bytes - The hash of the replayed transaction.
 * `output`: `DATA` - The return data of the top-level call; `0x` for a plain transfer.
 * `stateDiff`: `Object` - With `stateDiff` requested, the state changes keyed by account address; otherwise `null`. Each account has `balance`, `code`, `nonce` and `storage` (keyed by slot). Each value is `"="` when unchanged, `{"+": value}` when created, `{"-": value}` when removed, or `{"*": {"from": old, "to": new}}` when changed.
 * `trace`: `Array` - With `trace` requested, the call frames, top-level first; otherwise `[]`. Each frame has `type`, `action`, `error` (only when the frame failed), `result`, `subtraces` and `traceAddress`, with the meanings [trace\_transaction](trace_transaction.md) gives them, and no block or transaction fields. The top-level frame's `action.gas` and `result.gasUsed` leave out the intrinsic gas, so for a plain transfer with a 21,000 gas limit both are `0x0`.
@@ -40,6 +41,7 @@ curl http://localhost:8545 \
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
+    "transactionHash": "0xa794c7eb915c26fdb77242159053c1a36241bcd016b671fb07abe3fa9050805e",
     "output": "0x",
     "stateDiff": null,
     "trace": [

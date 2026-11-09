@@ -77,6 +77,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 48df75d88 | TN-0064 | `debug_trace*` lookups of a missing block or transaction, and tracing genesis, fail with -32000 as geth does (prerequisite of 5d6634a6f) | upstream test |
 | 5d6634a6f | TN-0065 | `debug_traceCall` at an unknown block fails with -32000 like the other `debug_trace*` methods | upstream test |
 | 8760eb000 | TN-0066 | `trace_get` selects the frame whose `traceAddress` equals the list (was a flat index into `trace_transaction`) | upstream test |
+| 3dd806a43 | TN-0067 | `trace_replayTransaction` returns `transactionHash` with the traces, the shape `trace_replayBlockTransactions` already used | upstream test |
 
 ## Open
 
