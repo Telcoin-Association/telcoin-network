@@ -729,6 +729,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `trace_call_out_of_range_block_error`, with `eth_call` checked for -32001
   beside it. *Upstream*: n/a (upstream commit).
 
+- **TN-0066** — Backport 8760eb000: `trace_get` selects a frame by its `traceAddress` path.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-api/src/trace.rs` (method docs), `crates/rpc/rpc/src/trace.rs`
+  (`trace_get`, which takes its TN-0038 permit itself like the other traces, where upstream's body
+  takes none; `trace_get_index` keeps the flat lookup; upstream's test `trace_get_selects_tree_paths`
+  in a new `tests` module, the vendored file had none, without upstream's RPC-cache seeding since
+  the vendored mock provider resolves blocks after TN-0036).
+  *Why*: `trace_get` took the list as a single flat index into `trace_transaction`'s output and
+  answered `null` for any other list length, where OpenEthereum, Erigon and Nethermind read it as
+  the frame's path in the call tree (review R26). It now returns the frame whose `traceAddress`
+  equals the list, `[]` being the top-level call, and `null` when no frame has that path. Clients
+  that passed `["0x0"]` for the root now get its first child; `docs/src/rpc-methods/trace/trace_get.md`
+  describes the path semantics. RPC only.
+  *Tests*: upstream's `trace_get_selects_tree_paths` (a root with two children and a grandchild,
+  every path and three misses, over the RPC module). *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
