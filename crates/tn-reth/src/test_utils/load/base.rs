@@ -277,6 +277,8 @@ pub fn build_base(
         return Ok((dir, meta));
     }
 
+    // refuse a layout the env cannot build before anything is written
+    layout.selectable()?;
     std::fs::create_dir_all(cache_dir)?;
     let building = cache_dir.join(format!("{name}.building"));
     if building.symlink_metadata().is_ok() {
@@ -576,7 +578,8 @@ mod tests {
     }
 
     /// The dir name keys every spec field, the page size and the extra component, and names the
-    /// backend and the page size.
+    /// backend, a v2 layout and the page size; a v2 base is refused before any write while the
+    /// env cannot build one.
     #[test]
     fn test_base_dir_name_keys_the_spec() -> eyre::Result<()> {
         let spec = spec();
@@ -598,6 +601,10 @@ mod tests {
         }
         assert_eq!(base_dir_name(&spec, V1, 4096, "aged200")?, format!("{name}-aged200"));
         let v2 = base_dir_name(&spec, V2, 4096, "")?;
+        let cache = tempfile::tempdir()?;
+        let refused = build_base(&spec, V2, 4096, cache.path()).expect_err("v2 is not selectable");
+        assert!(refused.to_string().contains("cannot be selected yet"), "{refused}");
+        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0, "refused before any write");
         assert_eq!(v2, name.replace(&format!("base-{BACKEND}-"), &format!("base-{BACKEND}-v2-")));
         Ok(())
     }

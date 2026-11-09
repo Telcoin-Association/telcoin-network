@@ -632,8 +632,8 @@ Without a commit it builds this checkout twice, MDBX (the default features) and 
 (`--features tn-reth/tn-lmdb`), each into its own target directory under the bench directory, and
 refuses identical binaries; with a commit it compares that commit (which must have the bench)
 against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`). It runs the profiles in
-`EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch` and
-`busy-export` when named) as interleaved pairs
+`EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch`,
+`busy-export` and `busy-history` when named) as interleaved pairs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
 report to the repo root, `reth-exec-<host>-<time>.txt`: per profile, each side's medians over the
 rounds and each pair's B/A ratio, with the median ratio and its spread, beside each run's JSON
@@ -643,7 +643,14 @@ from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`:
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
 The script's header lists its settings and everything it writes. On macOS both backends' durable
 commits are `msync` (libmdbx its used span, tn-lmdb its dirty pages), and neither flushes the
-drive's cache. The stages named `mdbx`
+drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` once the env can select it, in
+`StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
+every opened datadir; `TN_EXEC_BENCH_READ_MIX=history` (the `busy-history` profile) has the readers
+read balances and storage at past blocks and transactions by hash; and `TN_EXEC_BENCH_DIFF` writes
+a seeded sample of past-block and by-hash reads with their answers, which `TN_EXEC_BENCH_DIFF_AGAINST`
+compares to an earlier run's (two layouts or backends of one load must answer alike). The report
+also splits the static files by segment, and has a section for their per-segment sync timing that
+stays empty until the static-file provider times them. The stages named `mdbx`
 (`mdbx` and `commit mdbx`, the JSON keys `save_blocks_mdbx` and `commit_mdbx`) carry reth's metric
 names, which reth keeps whatever the engine: on tn-lmdb they time tn-lmdb.
 
@@ -903,7 +910,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`); `RethDb` is re-exported from `src/env/database.rs`. |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
-| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the database's counters and page size (`db_counters`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`) and the RPC side load (`readers`). See "Execution benchmark". |
+| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the database's counters and page size (`db_counters`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`), the RPC side load (`readers`), the storage-layout differential (`differential`), the storage layout choice (`layout`) and the static files' sync timing (`sf_sync`). See "Execution benchmark". |
 
 ## Feature flags
 

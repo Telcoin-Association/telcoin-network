@@ -61,9 +61,9 @@ impl StorageLayout {
         }
     }
 
-    /// Select this layout for a new datadir opened with `config` (see the module docs). The env
-    /// has no choice yet, so v1, its only layout, needs nothing and v2 is refused.
-    pub fn select(self, _config: &mut RethConfig) -> eyre::Result<()> {
+    /// Whether the env can build a new datadir in this layout: an error naming why not. The env
+    /// has no choice yet, so only v1, its only layout, can.
+    pub fn selectable(self) -> eyre::Result<()> {
         match self {
             Self::V1 => Ok(()),
             Self::V2 => eyre::bail!(
@@ -72,6 +72,12 @@ impl StorageLayout {
                  StorageLayout::select (tn_reth::test_utils::load::layout)"
             ),
         }
+    }
+
+    /// Select this layout for a new datadir opened with `config` (see the module docs), refused
+    /// unless [`Self::selectable`]. The env has no choice yet, so v1 needs nothing.
+    pub fn select(self, _config: &mut RethConfig) -> eyre::Result<()> {
+        self.selectable()
     }
 
     /// The layout `env`'s datadir holds: its stored storage settings, which must be the ones its
