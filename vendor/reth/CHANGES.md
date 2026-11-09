@@ -481,7 +481,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/static-file/types/src/{changeset_offsets.rs, lib.rs}` (the reader reads with
   `read_exact_at` through `&self`; the module is `unix`-only), `crates/storage/provider/src/
   providers/static_file/{mod.rs, jar.rs, writer.rs, writer_tests.rs}` (`LoadedJar` opens the
-  sidecar once, the jar provider uses it).
+  sidecar once, the jar provider uses it), `.../static_file/manager.rs` (two `let mut reader`
+  that the `&self` reader no longer needs; upstream had already moved that code).
   *Why*: every changeset lookup (each storage v2 historical read that resolves through a
   changeset, and each changeset walk) did a `stat` and an `open` of the sidecar. The reader is
   now opened when the jar is loaded, which `update_index` redoes after each commit, so its length
