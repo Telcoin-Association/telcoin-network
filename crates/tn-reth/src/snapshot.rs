@@ -178,7 +178,7 @@ impl PinnedStateView {
     /// one account each, emitted in ascending plain address order, each with its storage in
     /// ascending plain slot order. Accounts and their storage are produced by a merge join of an
     /// account source and a storage source keyed by plain address, walked in lockstep so each is
-    /// scanned once ([`export_plain_state`]); bytecode is resolved with one `Bytecodes` point read
+    /// scanned once (`export_plain_state`); bytecode is resolved with one `Bytecodes` point read
     /// per contract account against the pinned transaction. Zero-valued storage slots are omitted
     /// (an absent slot is already zero in the trie, so keeping a zeroed row would only bloat the
     /// pack). Only plain keys and values are written — the restore side rebuilds the hashed,
@@ -202,7 +202,9 @@ impl PinnedStateView {
     /// revert. A snapshot restore writes one for each account and slot it imports
     /// ([`SnapshotRestorer::import_state`]). Validators are archive nodes and never prune history
     /// (`ensure_archive_mode`). `snapshot_export_is_identical_in_both_storage_layouts` exports the
-    /// same chain from a v1 and a v2 datadir and compares the bytes.
+    /// same chain from a v1 and a v2 datadir and compares the bytes. Were a key ever missing from
+    /// the history, the pack's accounts would hash to another root than the one it records, and
+    /// the restore refuses it ([`SnapshotRestorer::import_state`]): never a silently short pack.
     ///
     /// # Memory profile
     ///
