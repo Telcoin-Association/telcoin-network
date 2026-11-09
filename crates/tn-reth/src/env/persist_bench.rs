@@ -94,14 +94,12 @@ use crate::{
 };
 use alloy::primitives::keccak256;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-use reth_db::{
-    cursor::DbDupCursorRO as _,
-    mdbx::SyncMode,
-    tables::{PlainAccountState, PlainStorageState},
-    transaction::DbTx as _,
-};
+use reth_db::mdbx::SyncMode;
 use reth_node_core::args::{DatabaseArgs, TxPoolArgs};
-use reth_provider::{BlockNumReader as _, DatabaseProviderFactory as _};
+use reth_provider::{
+    AccountReader as _, BlockNumReader as _, DatabaseProviderFactory as _, LatestStateProviderRef,
+    StateProvider as _,
+};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     path::Path,
@@ -515,22 +513,20 @@ fn run_mode(
 
 /// Assert the last persisted block is in the database tables: the last block number, the last
 /// new slot it wrote and the last account it created.
+///
+/// The state is read through the database's latest state provider, not the in-memory chain, so
+/// the reads see only what was persisted, in either storage layout (the plain tables under v1,
+/// the hashed tables under v2).
 fn read_back(reth_env: &RethEnv, tip: &SealedHeader, last_number: u64, last: &BlockTxs) {
     assert_eq!(tip.number, last_number);
     let provider = reth_env.blockchain_provider().database_provider_ro().expect("provider");
     assert_eq!(provider.last_block_number().expect("last block"), last_number);
+    let state = LatestStateProviderRef::new(&provider);
     let (key, value) = last.new_slot;
-    let entry = provider
-        .tx_ref()
-        .cursor_dup_read::<PlainStorageState>()
-        .expect("storage cursor")
-        .seek_by_key_subkey(STORE_ADDRESS, key)
-        .expect("storage seek")
-        .expect("the last new slot is persisted");
-    assert_eq!((entry.key, entry.value), (key, value), "the last new slot holds its value");
-    let account = provider
-        .tx_ref()
-        .get::<PlainAccountState>(last.new_account)
+    let stored = state.storage(STORE_ADDRESS, key).expect("storage read");
+    assert_eq!(stored, Some(value), "the last new slot is persisted with its value");
+    let account = state
+        .basic_account(&last.new_account)
         .expect("account read")
         .expect("the last new account is persisted");
     assert_eq!(account.balance, U256::from(TRANSFER_VALUE));

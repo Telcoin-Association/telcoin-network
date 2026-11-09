@@ -1,4 +1,4 @@
-//! Snapshot export and restore for reth's plain EVM state.
+//! Snapshot export and restore for reth's EVM state.
 //!
 //! This module has two sides. The export side ([`PinnedStateView`]) streams a state-only dump out
 //! of a live node into an [exec state pack](tn_storage::exec_state_pack); the restore side
@@ -6,30 +6,40 @@
 //! [restore documentation](SnapshotRestorer) covers the rebuild algorithm; the rest of these module
 //! docs describe the export side.
 //!
-//! # Export: pinned, read-consistent view over reth's plain EVM state
+//! # Export: pinned, read-consistent view over reth's EVM state
 //!
-//! [`RethEnv::pin_state_view`] opens a single reth read-only transaction on the reth database
-//! ([`RethDbEnv`]) and calls `disable_long_read_transaction_safety()` on it. On MDBX (the default
-//! build) this matters: MDBX enforces a reader timeout (~5 minutes) that kills long-lived read
-//! transactions to keep the free list from stalling, and a full-state export can easily run longer
-//! than that. Disabling the guard exempts *only this one transaction* — it does not touch any
-//! env-wide configuration, so other readers and the writer keep their normal safety limits. On
-//! tn-lmdb (the `tn-lmdb` feature) the call does nothing: the engine has no reader timeout. A long
-//! export only holds back page reuse while it runs, and the adapter (`tn_lmdb_reth`) logs a
-//! long-reader warning, at most once a minute, while a reader has held a superseded snapshot for
-//! over a minute.
+//! [`RethEnv::pin_state_view`] opens a single reth read-only database provider on the reth
+//! database ([`RethDbEnv`]) and calls `disable_long_read_transaction_safety()` on its transaction.
+//! On MDBX (the default build) this matters: MDBX enforces a reader timeout (~5 minutes) that kills
+//! long-lived read transactions to keep the free list from stalling, and a full-state export can
+//! easily run longer than that. Disabling the guard exempts *only this one transaction* — it does
+//! not touch any env-wide configuration, so other readers and the writer keep their normal safety
+//! limits. On tn-lmdb (the `tn-lmdb` feature) the call does nothing: the engine has no reader
+//! timeout. A long export only holds back page reuse while it runs, and the adapter
+//! (`tn_lmdb_reth`) logs a long-reader warning, at most once a minute, while a reader has held a
+//! superseded snapshot for over a minute.
 //!
-//! The returned [`PinnedStateView`] owns the transaction (which itself keeps the database
+//! The returned [`PinnedStateView`] owns the provider (whose transaction itself keeps the database
 //! environment alive) and is [`Send`], so an uploader can move it into a background task and stream
 //! the export off the hot path.
+//!
+//! # Both storage layouts export the same pack
+//!
+//! The pack holds plain addresses and plain storage slots. In reth's storage v1 layout the export
+//! walks the plain state tables. Storage v2 keeps no plain state, only the hashed tables, so the
+//! export takes the plain keys from the history indices instead: `AccountsHistory` is keyed by
+//! plain address and `StoragesHistory` by plain `(address, slot)` (TN-0044), and every key that
+//! holds state has a history shard (see [`PinnedStateView::export_state_pack`]). It then reads each
+//! key's current value through reth's latest state provider, which hashes the key. Both layouts
+//! emit the same accounts and slots in the same order, so the same state gives the same pack
+//! bytes.
 //!
 //! # Storage format is the exec state pack (not JSONL)
 //!
 //! [`PinnedStateView::export_state_pack`] writes an [`ExecStatePackWriter`]: the caller-supplied
 //! state root and block header(s), then one
-//! [`ExecStateAccount`](tn_storage::exec_state_pack::ExecStateAccount) per plain-state account. The
-//! pack
-//! is a compact, CRC32- and zstd-framed binary artifact (see `tn_storage::exec_state_pack`) — it
+//! [`ExecStateAccount`](tn_storage::exec_state_pack::ExecStateAccount) per account. The pack is a
+//! compact, CRC32- and zstd-framed binary artifact (see `tn_storage::exec_state_pack`) — it
 //! does not go through reth's private JSONL `init_from_state_dump` path at all. The restore side
 //! rebuilds state from the pack directly using reth's *public* state-insertion and trie building
 //! blocks.
@@ -39,7 +49,7 @@
 //! [`PinnedStateView::export_state_pack`] takes the expected state root as a parameter and simply
 //! records it. It deliberately does not recompute the root from the pinned transaction: a from-tx
 //! recompute on a live database just re-reads the already-cached trie tables and proves nothing
-//! about the plain-state rows we actually stream. The restore side is the real check — it rebuilds
+//! about the state rows we actually stream. The restore side is the real check — it rebuilds
 //! the trie from scratch out of the accounts in the pack and hard-fails on any mismatch.
 //!
 //! # Trust boundary: what restore verifies, and what it trusts
@@ -68,22 +78,25 @@
 
 use crate::{
     error::{TnRethError, TnRethResult},
+    traits::TelcoinNode,
     RethConfig, RethDatabaseT, RethDb, RethDbEnv, RethEnv,
 };
 use alloy::consensus::constants::KECCAK_EMPTY;
 use eyre::{eyre, WrapErr as _};
 use reth_db::{
     cursor::DbCursorRO,
+    table::Table,
     tables::{
-        AccountsTrie, BlockBodyIndices, Bytecodes, HashedAccounts, HashedStorages, HeaderNumbers,
-        PlainAccountState, PlainStorageState, StoragesTrie,
+        AccountsHistory, AccountsTrie, BlockBodyIndices, Bytecodes, HashedAccounts, HashedStorages,
+        HeaderNumbers, PlainAccountState, PlainStorageState, StoragesHistory, StoragesTrie,
     },
     transaction::{DbTx, DbTxMut},
 };
 use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{
-    BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, HashingWriter,
-    HistoryWriter, ProviderError, PruneCheckpointWriter, StageCheckpointWriter, StateWriter,
+    AccountReader, BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProvider,
+    DatabaseProviderFactory, HashingWriter, HistoryWriter, LatestStateProviderRef, ProviderError,
+    PruneCheckpointWriter, StageCheckpointWriter, StateProvider, StateWriter,
     StaticFileProviderFactory, StaticFileSegment, StaticFileWriter, StorageSettingsCache,
     TrieWriter,
 };
@@ -110,24 +123,28 @@ use tracing::{debug, info};
 /// The pinned read-only transaction type of the reth database — with long-read safety disabled.
 type PinnedTx = <RethDbEnv as RethDatabaseT>::TX;
 
+/// The pinned read-only database provider: [`PinnedTx`] plus the storage layout it reads.
+type PinnedProvider = DatabaseProvider<PinnedTx, TelcoinNode>;
+
 /// Emit a scaffold-progress log every this many blocks. The chain scaffold's cost scales with chain
 /// height (not state size), so on a mature chain the header/body loops churn through millions of
 /// static-file writes; periodic logging makes a long scaffold observable instead of silent.
 const SCAFFOLD_LOG_INTERVAL: u64 = 500_000;
 
-/// A read-consistent view of reth's plain EVM state pinned to the tip at open time.
+/// A read-consistent view of reth's EVM state pinned to the tip at open time.
 ///
-/// Wraps a single reth read-only transaction that has been exempted from the
+/// Wraps a single reth read-only database provider whose transaction has been exempted from the
 /// long-read-transaction reader-kill (see the module docs). The view reads only database-resident
-/// tables (`PlainAccountState`, `PlainStorageState`, `Bytecodes`, `HeaderNumbers`,
-/// `BlockBodyIndices`), so the transaction alone is enough to keep everything it needs alive; no
-/// static-file or provider handle is required.
+/// tables: the plain state tables under storage v1, the history indices and hashed state tables
+/// under storage v2, and `Bytecodes`, `HeaderNumbers` and `BlockBodyIndices` in both. The provider
+/// is kept for its storage layout and its latest state reads; nothing the view reads lives in
+/// static files.
 ///
 /// The transaction keeps its MVCC snapshot for as long as this value lives, so callers should drop
 /// it promptly once the export finishes to let the database reclaim retained pages.
 pub struct PinnedStateView {
-    /// The pinned read-only transaction. `Send`, and self-sufficient for keeping the env alive.
-    tx: PinnedTx,
+    /// The pinned read-only provider. `Send`, and self-sufficient for keeping the env alive.
+    provider: PinnedProvider,
 }
 
 impl PinnedStateView {
@@ -139,31 +156,53 @@ impl PinnedStateView {
     /// skip a stale or unexpected snapshot rather than shipping the wrong state; `Ok(true)` only
     /// when both reads agree with `expected`.
     pub fn verify_tip(&self, expected: BlockNumHash) -> TnRethResult<bool> {
+        let tx = self.provider.tx_ref();
         // the header hash must resolve to the expected number
-        match self.tx.get::<HeaderNumbers>(expected.hash).map_err(ProviderError::from)? {
+        match tx.get::<HeaderNumbers>(expected.hash).map_err(ProviderError::from)? {
             Some(number) if number == expected.number => {}
             _ => return Ok(false),
         }
 
         // the highest block-body-indices key is the last executed block, i.e. the pinned tip
-        let mut cursor = self.tx.cursor_read::<BlockBodyIndices>().map_err(ProviderError::from)?;
+        let mut cursor = tx.cursor_read::<BlockBodyIndices>().map_err(ProviderError::from)?;
         match cursor.last().map_err(ProviderError::from)? {
             Some((number, _)) if number == expected.number => Ok(true),
             _ => Ok(false),
         }
     }
 
-    /// Stream the full plain EVM state at the pinned view into an exec state pack in `out_dir`.
+    /// Stream the full EVM state at the pinned view into an exec state pack in `out_dir`.
     ///
     /// The pack records the caller-supplied `state_root` and `headers` (snapshot header first, then
     /// recent ancestors — the snapshot header's `state_root` must equal `state_root`), followed by
-    /// one account each, emitted in ascending address order (the `PlainAccountState` cursor order).
-    /// Accounts and their storage are produced by a merge join of the `PlainAccountState` and
-    /// dup-sorted `PlainStorageState` cursors, walked in lockstep so each table is scanned once;
-    /// bytecode is resolved with one `Bytecodes` point read per contract account against the
-    /// pinned transaction. Zero-valued storage slots are omitted (an absent slot is already zero
-    /// in the trie, so keeping a zeroed row would only bloat the pack). Only plain state is
-    /// written — the restore side rebuilds the hashed, history, and trie tables itself.
+    /// one account each, emitted in ascending plain address order, each with its storage in
+    /// ascending plain slot order. Accounts and their storage are produced by a merge join of an
+    /// account source and a storage source keyed by plain address, walked in lockstep so each is
+    /// scanned once ([`export_plain_state`]); bytecode is resolved with one `Bytecodes` point read
+    /// per contract account against the pinned transaction. Zero-valued storage slots are omitted
+    /// (an absent slot is already zero in the trie, so keeping a zeroed row would only bloat the
+    /// pack). Only plain keys and values are written — the restore side rebuilds the hashed,
+    /// history, and trie tables itself.
+    ///
+    /// # Sources by storage layout
+    ///
+    /// - **v1**: the `PlainAccountState` and dup-sorted `PlainStorageState` cursors.
+    /// - **v2** (no plain state): the plain keys come from the history indices, and each value from
+    ///   reth's latest state provider, which reads `HashedAccounts`/`HashedStorages` by the key's
+    ///   hash. `AccountsHistory` yields every address with a shard and `StoragesHistory` every
+    ///   `(address, slot)` with a shard (both keyed plain, TN-0044, in the same order as the plain
+    ///   tables); an address or slot that no longer holds state (an account emptied away, a slot
+    ///   set back to zero) reads as absent and is skipped, exactly as v1 has no row for it.
+    ///
+    /// The v2 walk is complete because every key that holds state has a history shard. Genesis
+    /// writes one for each allocated account and slot (`insert_genesis_history`). A block writes
+    /// one for each account whose info its reverts change and each slot its reverts list
+    /// (`HistoryTransitions::from_reverts`, TN-0043): an account the block creates, even with no
+    /// storage, reverts to "absent", and every slot a block sets is in the account's storage
+    /// revert. A snapshot restore writes one for each account and slot it imports
+    /// ([`SnapshotRestorer::import_state`]). Validators are archive nodes and never prune history
+    /// (`ensure_archive_mode`). `snapshot_export_is_identical_in_both_storage_layouts` exports the
+    /// same chain from a v1 and a v2 datadir and compares the bytes.
     ///
     /// # Memory profile
     ///
@@ -182,43 +221,14 @@ impl PinnedStateView {
         headers: &[ExecHeader],
         out_dir: &Path,
     ) -> TnRethResult<ExecStateStats> {
-        let tx = &self.tx;
+        let tx = self.provider.tx_ref();
         let mut writer = ExecStatePackWriter::create(out_dir, state_root, headers)
             .map_err(|e| TnRethError::Snapshot(format!("failed to create state pack: {e}")))?;
-
-        let mut account_cursor =
-            tx.cursor_read::<PlainAccountState>().map_err(ProviderError::from)?;
-        let mut storage_cursor =
-            tx.cursor_dup_read::<PlainStorageState>().map_err(ProviderError::from)?;
-
-        // merge-join drivers: both tables are keyed by address in the same order, so a single
-        // forward pass over each suffices. `first()` seeds each iterator, `next()` advances it —
-        // the same cursor discipline the previous hand-rolled loop used.
-        let mut account_started = false;
-        let accounts = std::iter::from_fn(move || {
-            let step = if account_started {
-                account_cursor.next()
-            } else {
-                account_started = true;
-                account_cursor.first()
-            };
-            step.map_err(ProviderError::from).map_err(TnRethError::from).transpose()
-        });
-        let mut storage_started = false;
-        let slots = std::iter::from_fn(move || {
-            let step = if storage_started {
-                storage_cursor.next()
-            } else {
-                storage_started = true;
-                storage_cursor.first()
-            };
-            step.map_err(ProviderError::from).map_err(TnRethError::from).transpose()
-        });
 
         // one point read per contract account, deliberately NOT memoized: a memo would retain
         // every distinct bytecode until the walk ends, so exporter memory would scale with the
         // number of contracts in state. The read hits the already-open pinned transaction that is
-        // walking both full tables anyway.
+        // walking the state anyway.
         let resolve_code = move |address: Address, hash: B256| {
             tx.get::<Bytecodes>(hash)
                 .map_err(ProviderError::from)?
@@ -231,12 +241,81 @@ impl PinnedStateView {
                 .map(|bytecode| bytecode.original_bytes())
         };
 
-        export_plain_state(accounts, slots, resolve_code, &mut writer)?;
+        if self.provider.cached_storage_settings().use_hashed_state() {
+            // storage v2: plain keys from the history indices, values from the hashed state
+            let state = LatestStateProviderRef::new(&self.provider);
+            let addresses = distinct_keys(
+                cursor_rows(tx.cursor_read::<AccountsHistory>().map_err(ProviderError::from)?)
+                    .map(|row| row.map(|(key, _)| key.key)),
+            );
+            let accounts = addresses.filter_map(|address| {
+                address
+                    .and_then(|address| {
+                        Ok(state.basic_account(&address)?.map(|account| (address, account)))
+                    })
+                    .transpose()
+            });
+            let slot_keys = distinct_keys(
+                cursor_rows(tx.cursor_read::<StoragesHistory>().map_err(ProviderError::from)?)
+                    .map(|row| row.map(|(key, _)| (key.address, key.sharded_key.key))),
+            );
+            let slots = slot_keys.filter_map(|key| {
+                key.and_then(|(address, slot)| {
+                    Ok(state
+                        .storage(address, slot)?
+                        .map(|value| (address, StorageEntry { key: slot, value })))
+                })
+                .transpose()
+            });
+            export_plain_state(accounts, slots, resolve_code, &mut writer)?;
+        } else {
+            // storage v1: both plain tables are keyed by address in the same order, so a single
+            // forward pass over each suffices
+            let accounts =
+                cursor_rows(tx.cursor_read::<PlainAccountState>().map_err(ProviderError::from)?);
+            let slots = cursor_rows(
+                tx.cursor_dup_read::<PlainStorageState>().map_err(ProviderError::from)?,
+            );
+            export_plain_state(accounts, slots, resolve_code, &mut writer)?;
+        }
 
         writer
             .finish()
             .map_err(|e| TnRethError::Snapshot(format!("failed to finish state pack: {e}")))
     }
+}
+
+/// Every row of `cursor`'s table in key order (a dup-sorted table's duplicates included): `first()`
+/// seeds the walk and `next()` advances it.
+fn cursor_rows<T: Table>(
+    mut cursor: impl DbCursorRO<T>,
+) -> impl Iterator<Item = TnRethResult<(T::Key, T::Value)>> {
+    let mut started = false;
+    std::iter::from_fn(move || {
+        let step = if started {
+            cursor.next()
+        } else {
+            started = true;
+            cursor.first()
+        };
+        step.map_err(ProviderError::from).map_err(TnRethError::from).transpose()
+    })
+}
+
+/// `keys` with consecutive repeats dropped: one key per run of history shards, which share their
+/// key and differ only in the shard's highest block. Errors pass through.
+fn distinct_keys<K: Copy + PartialEq>(
+    keys: impl Iterator<Item = TnRethResult<K>>,
+) -> impl Iterator<Item = TnRethResult<K>> {
+    let mut previous = None;
+    keys.filter(move |key| match key {
+        Ok(key) if previous == Some(*key) => false,
+        Ok(key) => {
+            previous = Some(*key);
+            true
+        }
+        Err(_) => true,
+    })
 }
 
 /// Sink for the streamed export walk: one header per account followed by that account's bounded
@@ -281,17 +360,18 @@ impl StatePackSink for ExecStatePackWriter {
     }
 }
 
-/// Merge-join walk over plain accounts and dup-sorted storage rows, streaming each account into
-/// `sink` as one header plus [`STORAGE_CHUNK_SLOTS`]-bounded storage chunks.
+/// Merge-join walk over accounts and storage rows keyed by plain address and slot, streaming each
+/// account into `sink` as one header plus [`STORAGE_CHUNK_SLOTS`]-bounded storage chunks.
 ///
 /// Both sources must yield rows in ascending address order (the cursor order of
-/// `PlainAccountState` / `PlainStorageState`); storage rows must additionally arrive in strictly
+/// `PlainAccountState` / `PlainStorageState`, and of the history indices storage v2 walks instead;
+/// see [`PinnedStateView::export_state_pack`]); storage rows must additionally arrive in strictly
 /// ascending slot-key order within each account, which [`stream_account_slots`] verifies rather
 /// than assumes since the pack's deterministic chunk layout depends on it. Storage rows for
-/// addresses with no plain-account row (a db inconsistency) contribute no account and are
-/// dropped; zero-valued slots are elided. `resolve_code` is invoked once per contract account
-/// (any account whose `bytecode_hash` is set and is not [`KECCAK_EMPTY`]); resolved bytes are
-/// handed straight to the sink and never retained here.
+/// addresses with no account row (a db inconsistency in v1, an account no longer in state in v2)
+/// contribute no account and are dropped; zero-valued slots are elided. `resolve_code` is invoked
+/// once per contract account (any account whose `bytecode_hash` is set and is not
+/// [`KECCAK_EMPTY`]); resolved bytes are handed straight to the sink and never retained here.
 ///
 /// # Memory profile
 ///
@@ -328,9 +408,10 @@ where
 /// chunks, flushing each chunk as soon as it fills. Rows for addresses after `address` are left
 /// un-consumed for the next account.
 ///
-/// Slot keys must arrive in strictly ascending order (MDBX's dup-sort invariant); a violation is
-/// reported as an error rather than silently re-sorted, because chunk contents and boundaries —
-/// and therefore the pack's bytes — depend on that order.
+/// Slot keys must arrive in strictly ascending order (the dup-sort invariant of
+/// `PlainStorageState`, and the key order of `StoragesHistory`); a violation is reported as an
+/// error rather than silently re-sorted, because chunk contents and boundaries — and therefore the
+/// pack's bytes — depend on that order.
 fn stream_account_slots<S, W>(
     slots: &mut Peekable<S>,
     address: Address,
@@ -359,7 +440,7 @@ where
             let (key, value) = row?;
             previous.is_none_or(|prev| prev < key).then_some(()).ok_or_else(|| {
                 TnRethError::Snapshot(format!(
-                    "PlainStorageState cursor yielded out-of-order slot {key} for account \
+                    "the storage source yielded out-of-order slot {key} for account \
                      {address}: not strictly above the preceding slot"
                 ))
             })?;
@@ -386,22 +467,20 @@ impl std::fmt::Debug for PinnedStateView {
 }
 
 impl RethEnv {
-    /// Open a read-only database transaction pinned to the current tip for snapshot export.
+    /// Open a read-only database provider pinned to the current tip for snapshot export.
     ///
-    /// The transaction is exempted from the long-read-transaction reader-kill (see the module docs)
+    /// Its transaction is exempted from the long-read-transaction reader-kill (see the module docs)
     /// so a full-state export can run without racing MDBX's reader timeout (tn-lmdb has none). The
     /// returned [`PinnedStateView`] is `Send` and self-contained, ready to be handed to a
     /// background task.
     pub fn pin_state_view(&self) -> TnRethResult<PinnedStateView> {
-        // one RO transaction, exempted from the reader-kill, then unwrapped to the raw tx so the
-        // view only carries what it needs (the plain-state tables all live in the db, not static
-        // files, so no provider/static-file handle has to be kept alive alongside it)
-        let tx = self
+        // one RO transaction, exempted from the reader-kill. The view keeps the provider around it
+        // for the storage layout and the latest state reads; every table it reads lives in the db
+        let provider = self
             .blockchain_provider()
             .database_provider_ro()?
-            .disable_long_read_transaction_safety()
-            .into_tx();
-        Ok(PinnedStateView { tx })
+            .disable_long_read_transaction_safety();
+        Ok(PinnedStateView { provider })
     }
 }
 
@@ -522,18 +601,21 @@ impl SnapshotRestorer {
     /// once before [`import_state`](Self::import_state):
     ///
     /// - Clears the genesis alloc from `PlainAccountState`, `PlainStorageState`, `HashedAccounts`,
-    ///   `HashedStorages`, `AccountsTrie`, and `StoragesTrie`. `init_genesis` (run in
-    ///   [`open`](Self::open)) wrote the genesis alloc into these tables, but the pack OMITS
-    ///   zero-valued storage slots; a genesis slot later zeroed on-chain would otherwise survive
-    ///   the import and diverge the recomputed state root. `Bytecodes` and the genesis header are
-    ///   deliberately kept.
+    ///   `HashedStorages`, `AccountsTrie`, and `StoragesTrie` (the plain tables are already empty
+    ///   under storage v2). `init_genesis` (run in [`open`](Self::open)) wrote the genesis alloc
+    ///   into these tables, but the pack OMITS zero-valued storage slots; a genesis slot later
+    ///   zeroed on-chain would otherwise survive the import and diverge the recomputed state root.
+    ///   `Bytecodes` and the genesis header are deliberately kept.
     /// - Appends headers `1..=B-1` to the Headers static file: the real header (with its real hash)
     ///   for every block inside `window`, and a zero-hash dummy for every block below it. Real
     ///   hashes inside the window keep `BLOCKHASH` resolvable.
     /// - Advances the transactions/receipts/senders static-file segments to `B-1`, inserts block
-    ///   `B` itself with an empty body (advancing headers and transactions to `B`), and advances
-    ///   receipts to `B` — mirroring reth's own dummy-chain shaping so the segments stay internally
-    ///   consistent.
+    ///   `B` itself with an empty body (advancing headers, transactions and senders to `B`), and
+    ///   advances receipts to `B` — mirroring reth's own dummy-chain shaping so the segments stay
+    ///   internally consistent. Under storage v2 it also advances the account and storage changeset
+    ///   segments to `B` with an empty changeset per block: every static-file segment then ends at
+    ///   the stage checkpoints, which the startup consistency check (`check_consistency` in
+    ///   `RethEnv::new`) requires.
     /// - Writes `HeaderNumbers` (hash → number) for every window header so `BLOCKHASH` resolves by
     ///   hash, and sets every stage checkpoint to `B`.
     /// - Writes the datadir's restored-state floor marker (= `B`, the window's final block) BEFORE
@@ -690,8 +772,8 @@ impl SnapshotRestorer {
         }
 
         // advance the body-bearing segments to B-1 so insert_block(B) and the receipt increment
-        // below land on the right block. only touch segments that exist (senders may live in mdbx
-        // rather than a static file, in which case it is skipped here).
+        // below land on the right block. only touch segments that exist (senders live in the db
+        // under storage v1 and in a static file under v2; a missing segment is skipped here).
         for segment in [
             StaticFileSegment::Transactions,
             StaticFileSegment::Receipts,
@@ -729,6 +811,29 @@ impl SnapshotRestorer {
             sf.latest_writer(StaticFileSegment::Receipts)?.increment_block(b)?;
         }
 
+        // the changesets to B: blocks-only mode skips them too. they are static-file segments
+        // only under storage v2 (v1 keeps them in the db, and genesis writes no segment for them).
+        // each block gets an empty changeset, as the import writes none for B (see `import_state`)
+        for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+        {
+            if sf.get_highest_static_file_block(segment).is_none() {
+                continue;
+            }
+            let mut writer = sf.latest_writer(segment)?;
+            for number in 1..=b {
+                writer.increment_block(number)?;
+                if number.is_multiple_of(SCAFFOLD_LOG_INTERVAL) {
+                    info!(
+                        target: "tn::reth",
+                        ?segment,
+                        block = number,
+                        total = b,
+                        "snapshot restore: advancing changeset segments"
+                    );
+                }
+            }
+        }
+
         // HeaderNumbers for every window header so BLOCKHASH resolves by hash (insert_block
         // already covered block B; the rest are written here)
         {
@@ -751,8 +856,7 @@ impl SnapshotRestorer {
         Ok(())
     }
 
-    /// Import the pack's plain-state accounts into the scaffolded datadir and return the recomputed
-    /// state root.
+    /// Import the pack's accounts into the scaffolded datadir and return the recomputed state root.
     ///
     /// Drives the pack's chunked read stream ([`ExecStatePackReader::next_entry`]): each
     /// [`StateEntry::Account`] writes one account header (`PlainAccountState`, `HashedAccounts`,
@@ -762,7 +866,13 @@ impl SnapshotRestorer {
     /// [`StateWriter::write_state_changes`], the hashed tables through [`HashingWriter`], and
     /// the history indices through [`HistoryWriter`] — the same hashed/history/plain rows
     /// reth's private `dump_state` writes, but never the `AccountChangeSets`/
-    /// `StorageChangeSets` those helpers also fabricate (see the change-set section). The state
+    /// `StorageChangeSets` those helpers also fabricate (see the change-set section).
+    ///
+    /// The datadir's storage layout decides the plain rows. Under storage v1 they are written;
+    /// storage v2 keeps no plain state, so only the hashed tables, the history indices and
+    /// `Bytecodes` are written (`write_state_changes` itself skips the plain tables there). The
+    /// history indices are keyed by plain address and plain slot in both layouts (TN-0044), so a
+    /// pack from either layout restores into either. The state
     /// root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
     /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk
     /// as they accumulate rather than pinned in RAM. The import hard-fails unless
@@ -788,16 +898,17 @@ impl SnapshotRestorer {
     /// state root is recomputed from the HASHED tables (not change sets); the node never
     /// unwinds a persisted canonical block (`TN reorgs are impossible`) and restore finalizes
     /// `B`, so `B` and below are never rolled back; every registry/fee read pins the canonical
-    /// tip (`= B`), which reth serves from a `LatestStateProvider` (plain state, no change-set
-    /// read); and the node runs archive mode with the pruner fully disabled, so a historical
-    /// read below `B` resolves through `HistoryInfo::NotYetWritten` (the single-`[B]` history
-    /// index + absent prune boundary) rather than a change-set lookup. Blocks executed forward
-    /// from `B` write their change sets normally through `save_blocks`.
+    /// tip (`= B`), which reth serves from a `LatestStateProvider` (the current state, no
+    /// change-set read); and the node runs archive mode with the pruner fully disabled, so a
+    /// historical read below `B` resolves through `HistoryInfo::NotYetWritten` (the
+    /// single-`[B]` history index + absent prune boundary) rather than a change-set lookup.
+    /// Blocks executed forward from `B` write their change sets normally through `save_blocks`.
     ///
     /// # Ascending-address invariant
     ///
     /// The exporter ([`PinnedStateView::export_state_pack`]) emits accounts in strictly ascending,
-    /// unique address order (it walks the `PlainAccountState` cursor). The per-account
+    /// unique address order (it walks the `PlainAccountState` cursor, or `AccountsHistory` under
+    /// storage v2). The per-account
     /// [`HashingWriter::insert_storage_for_hashing`] MERGES a chunk's slots into any existing
     /// `HashedStorages` dup-list for the address, so re-visiting an address across the stream would
     /// silently fold two accounts' storage together; the per-account/per-chunk history-index writes
@@ -809,19 +920,6 @@ impl SnapshotRestorer {
         let b = reader.meta().block_number;
 
         let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
-
-        // TN keeps EVM state in the PLAIN tables (the exporter reads PlainAccountState /
-        // PlainStorageState, and the account-header / storage-chunk writers below target the plain
-        // tables). reth's `write_state_changes` silently SKIPS plain writes when the db is in
-        // hashed-state mode, so a hashed-mode db here would leave the plain tables empty and the
-        // node unable to serve state. assert the mode up front rather than importing a
-        // half-populated db.
-        if provider.cached_storage_settings().use_hashed_state() {
-            return Err(eyre!(
-                "snapshot restore: reth db is in hashed-state mode, but the import writes plain \
-                 state; refusing to import a db whose plain tables would be left empty"
-            ));
-        }
 
         // drive the pack's chunked read stream, writing one account header or one bounded storage
         // chunk at a time. only the current chunk (and one header) is ever resident, so a whale
@@ -986,7 +1084,8 @@ impl SnapshotRestorer {
     ///
     /// This is the account-only half of what reth's `insert_state` + `insert_genesis_hashes` +
     /// `insert_history` write for a single account: `write_state_changes` upserts
-    /// `PlainAccountState` and (via `contracts`) `Bytecodes` but no `AccountChangeSets`;
+    /// `PlainAccountState` (storage v1 only) and (via `contracts`) `Bytecodes` but no
+    /// `AccountChangeSets`;
     /// `insert_account_for_hashing` upserts `HashedAccounts`; `insert_account_history_index`
     /// appends the single `[b]` transition to `AccountsHistory`. The account's storage arrives
     /// separately as [`Self::write_storage_chunk`] calls, so this never touches storage.
@@ -1013,7 +1112,7 @@ impl SnapshotRestorer {
         };
         let account = Account { nonce: meta.nonce, balance: meta.balance, bytecode_hash };
 
-        // plain account + bytecode only: `write_state_changes` writes NO change sets.
+        // plain account (storage v1 only) + bytecode: `write_state_changes` writes NO change sets.
         provider.write_state_changes(StateChangeset {
             accounts: vec![(meta.address, Some(account.into()))],
             storage: Vec::new(),
@@ -1033,7 +1132,8 @@ impl SnapshotRestorer {
     /// `chunk` is a slice of the account's `(slot, value)` pairs (at most `STORAGE_CHUNK_SLOTS`),
     /// already ascending by slot and free of zero values (the exporter filters them). This is the
     /// storage half of reth's `insert_state`/`insert_genesis_hashes`/`insert_history`:
-    /// `write_state_changes` upserts `PlainStorageState` (no `StorageChangeSets`);
+    /// `write_state_changes` upserts `PlainStorageState` (no `StorageChangeSets`; skipped under
+    /// storage v2, which has no plain state);
     /// `insert_storage_for_hashing` MERGES the chunk into the address's `HashedStorages` dup-list;
     /// `insert_storage_history_index` appends the single `[b]` transition per slot to
     /// `StoragesHistory`. Merging is why the caller must never re-visit an address (see the
@@ -1045,29 +1145,31 @@ impl SnapshotRestorer {
         b: u64,
     ) -> eyre::Result<()>
     where
-        Provider: StateWriter + HashingWriter + HistoryWriter,
+        Provider: StateWriter + HashingWriter + HistoryWriter + StorageSettingsCache,
     {
         if chunk.is_empty() {
             return Ok(());
         }
 
-        // plain storage: `write_state_changes` upserts PlainStorageState (values are U256; the
-        // exporter already dropped zero-valued slots) and writes NO change sets. `wipe_storage` is
-        // false — the scaffold cleared the tables, so there is nothing to wipe and every account is
-        // visited once.
-        let plain_storage: Vec<(U256, U256)> = chunk
-            .iter()
-            .map(|(slot, value)| (U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0)))
-            .collect();
-        provider.write_state_changes(StateChangeset {
-            accounts: Vec::new(),
-            storage: vec![PlainStorageChangeset {
-                address,
-                wipe_storage: false,
-                storage: plain_storage,
-            }],
-            contracts: Vec::new(),
-        })?;
+        // plain storage (storage v1 only; v2 has no plain state and `write_state_changes` would
+        // drop the rows): upserts PlainStorageState (values are U256; the exporter already dropped
+        // zero-valued slots) and writes NO change sets. `wipe_storage` is false — the scaffold
+        // cleared the tables, so there is nothing to wipe and every account is visited once.
+        if !provider.cached_storage_settings().use_hashed_state() {
+            let plain_storage: Vec<(U256, U256)> = chunk
+                .iter()
+                .map(|(slot, value)| (U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0)))
+                .collect();
+            provider.write_state_changes(StateChangeset {
+                accounts: Vec::new(),
+                storage: vec![PlainStorageChangeset {
+                    address,
+                    wipe_storage: false,
+                    storage: plain_storage,
+                }],
+                contracts: Vec::new(),
+            })?;
+        }
 
         // hashed storage: merges this chunk's slots into the address's existing dup-list.
         let hashed_entries = chunk
@@ -1075,7 +1177,8 @@ impl SnapshotRestorer {
             .map(|(slot, value)| StorageEntry { key: *slot, value: U256::from_be_bytes(value.0) });
         provider.insert_storage_for_hashing([(address, hashed_entries)])?;
 
-        // storage history: one `[b]` transition per slot, keyed by (address, slot).
+        // storage history: one `[b]` transition per slot, keyed by (address, plain slot) in both
+        // storage layouts (TN-0044).
         let history = chunk.iter().map(|(slot, _)| ((address, *slot), [b]));
         provider.insert_storage_history_index(history)?;
 
