@@ -1,15 +1,26 @@
 //! Deterministic startup sync scheduling tests using Tokio's paused clock.
 
 use super::{
-    drive_epoch_record_sync, STARTUP_PEER_POLL_INTERVAL, STARTUP_SYNC_PASS_TIMEOUT,
-    STARTUP_SYNC_TIMEOUT,
+    drive_epoch_record_sync, CollectedPass, STARTUP_PEER_POLL_INTERVAL, STARTUP_SYNC_PASS_TIMEOUT,
+    STARTUP_SYNC_RETRY_BACKOFF, STARTUP_SYNC_TIMEOUT, STARTUP_SYNC_UNANSWERED_BUDGET,
 };
 use std::{
     cell::{Cell, RefCell},
     future::{pending, ready},
     time::Duration,
 };
+use tn_types::Epoch;
 use tokio::time::Instant;
+
+/// A pass that ended on a peer's answer at `epoch`.
+fn answered(epoch: Epoch) -> eyre::Result<CollectedPass> {
+    Ok(CollectedPass { epoch, definitive: true })
+}
+
+/// A pass that stopped at `epoch` because no peer answered.
+fn unanswered(epoch: Epoch) -> eyre::Result<CollectedPass> {
+    Ok(CollectedPass { epoch, definitive: false })
+}
 
 /// A repair can move backward; the initial cursor and an unequal pass never prove quiescence.
 #[tokio::test(start_paused = true)]
@@ -20,7 +31,7 @@ async fn startup_sync_requires_equal_consecutive_passes() {
         || ready(1),
         |epoch| {
             requested.borrow_mut().push(epoch);
-            ready(Ok(results.next().unwrap_or(5)))
+            ready(answered(results.next().unwrap_or(5)))
         },
         || ready(0),
         pending(),
@@ -43,7 +54,7 @@ async fn startup_sync_waits_without_established_peers() {
         },
         |epoch| {
             work.set(work.get() + 1);
-            ready(Ok(epoch))
+            ready(answered(epoch))
         },
         || {
             work.set(work.get() + 1);
@@ -72,7 +83,7 @@ async fn startup_sync_collects_after_delayed_connection() {
         |epoch| {
             assert_eq!(polls.get(), 3);
             passes.set(passes.get() + 1);
-            ready(Ok(epoch))
+            ready(answered(epoch))
         },
         || ready(0),
         pending(),
@@ -115,7 +126,7 @@ async fn startup_sync_shutdown_cancels_peer_wait() {
         || ready(0),
         |epoch| {
             passes.set(passes.get() + 1);
-            ready(Ok(epoch))
+            ready(answered(epoch))
         },
         || ready(0),
         tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL),
@@ -162,7 +173,7 @@ async fn startup_sync_resumes_after_a_capped_pass_with_progress() {
                     prefix.set(6);
                     pending().await
                 } else {
-                    Ok(5)
+                    answered(5)
                 }
             }
         },
@@ -198,7 +209,7 @@ async fn startup_sync_deadline_bounds_continuous_progress() {
 #[tokio::test(start_paused = true)]
 async fn startup_sync_deadline_bounds_peer_count() {
     let start = Instant::now();
-    drive_epoch_record_sync(pending, |epoch| ready(Ok(epoch)), || ready(0), pending())
+    drive_epoch_record_sync(pending, |epoch| ready(answered(epoch)), || ready(0), pending())
         .await
         .unwrap();
     assert_eq!(start.elapsed(), STARTUP_SYNC_TIMEOUT);
@@ -234,7 +245,7 @@ async fn startup_sync_honors_existing_shutdown() {
             work.set(work.get() + 1);
             1
         },
-        |epoch| ready(Ok(epoch)),
+        |epoch| ready(answered(epoch)),
         || ready(0),
         ready(()),
     )
@@ -263,4 +274,121 @@ async fn startup_sync_stops_on_a_local_storage_failure() {
     assert!(err.to_string().contains("failed to persist"), "unexpected error: {err}");
     assert_eq!(passes.get(), 1);
     assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// Unanswered passes are repeated after a short pause, even when two of them end at the same
+/// epoch, and the sync goes on to the tip once peers answer (issue #1792).
+#[tokio::test(start_paused = true)]
+async fn startup_sync_retries_unanswered_passes_until_peers_answer() {
+    let start = Instant::now();
+    let mut results = [unanswered(1), unanswered(1), unanswered(1)].into_iter();
+    let requested = RefCell::new(Vec::new());
+    drive_epoch_record_sync(
+        || ready(1),
+        |epoch| {
+            requested.borrow_mut().push(epoch);
+            ready(results.next().unwrap_or_else(|| answered(4)))
+        },
+        || ready(0),
+        pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*requested.borrow(), [0, 1, 1, 1, 4]);
+    assert_eq!(start.elapsed(), STARTUP_SYNC_RETRY_BACKOFF * 3);
+}
+
+/// A node at the tip, whose peers answer that they do not hold the next record, stops after two
+/// equal answered passes without pausing.
+#[tokio::test(start_paused = true)]
+async fn startup_sync_stops_promptly_on_answered_passes_at_the_tip() {
+    let start = Instant::now();
+    let requested = RefCell::new(Vec::new());
+    drive_epoch_record_sync(
+        || ready(1),
+        |epoch| {
+            requested.borrow_mut().push(epoch);
+            ready(answered(3))
+        },
+        || ready(0),
+        pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*requested.borrow(), [0, 3]);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// Quiescence needs two consecutive answered passes: an unanswered pass between two equal answered
+/// passes starts the comparison over.
+#[tokio::test(start_paused = true)]
+async fn startup_sync_unanswered_pass_breaks_a_quiescent_pair() {
+    let mut results = [answered(2), unanswered(2)].into_iter();
+    let requested = RefCell::new(Vec::new());
+    drive_epoch_record_sync(
+        || ready(1),
+        |epoch| {
+            requested.borrow_mut().push(epoch);
+            ready(results.next().unwrap_or_else(|| answered(2)))
+        },
+        || ready(0),
+        pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*requested.borrow(), [0, 2, 2, 2]);
+}
+
+/// Peers that never answer keep the sync asking for the unanswered budget, after which their
+/// silence counts as the answer: the whole network may be starting at once, and no node serves
+/// anyone before finishing this sync itself.
+#[tokio::test(start_paused = true)]
+async fn startup_sync_unanswered_passes_stop_once_the_budget_is_spent() {
+    let start = Instant::now();
+    let passes = Cell::new(0u128);
+    drive_epoch_record_sync(
+        || ready(1),
+        |_| {
+            passes.set(passes.get() + 1);
+            ready(unanswered(0))
+        },
+        || ready(0),
+        pending(),
+    )
+    .await
+    .unwrap();
+    assert!(STARTUP_SYNC_UNANSWERED_BUDGET < STARTUP_SYNC_TIMEOUT);
+    assert_eq!(start.elapsed(), STARTUP_SYNC_UNANSWERED_BUDGET);
+    // one pass per backoff until the budget is spent, then two passes that count as answered and
+    // agree with each other
+    let expected =
+        STARTUP_SYNC_UNANSWERED_BUDGET.as_millis() / STARTUP_SYNC_RETRY_BACKOFF.as_millis() + 2;
+    assert_eq!(passes.get(), expected);
+}
+
+/// An answered pass ends a run of unanswered ones: the budget starts over for the next run.
+#[tokio::test(start_paused = true)]
+async fn startup_sync_answered_pass_restarts_the_unanswered_budget() {
+    let start = Instant::now();
+    let mut results = [unanswered(1), unanswered(1), answered(2), unanswered(2), unanswered(2)]
+        .into_iter()
+        .chain(std::iter::repeat_with(|| unanswered(2)));
+    let passes = Cell::new(0u128);
+    drive_epoch_record_sync(
+        || ready(1),
+        |_| {
+            passes.set(passes.get() + 1);
+            ready(results.next().unwrap())
+        },
+        || ready(0),
+        pending(),
+    )
+    .await
+    .unwrap();
+    // two backoffs, an answer, then a full budget of silence before the sync stops
+    let expected_elapsed = STARTUP_SYNC_RETRY_BACKOFF * 2 + STARTUP_SYNC_UNANSWERED_BUDGET;
+    assert_eq!(start.elapsed(), expected_elapsed);
+    let expected_passes =
+        3 + STARTUP_SYNC_UNANSWERED_BUDGET.as_millis() / STARTUP_SYNC_RETRY_BACKOFF.as_millis() + 2;
+    assert_eq!(passes.get(), expected_passes);
 }
