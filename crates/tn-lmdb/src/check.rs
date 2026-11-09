@@ -8,6 +8,11 @@
 //! a plain one, under the table's name, or, in a table that packs, a packed set, validated whole.
 //! The record's nested totals must be the sums of the nested roots' counters, and its
 //! `packed_rows` the rows of the packed sets (`Checker::walk_dup`).
+//!
+//! [`check_since`] is open's check of a trusted weak head: the same walk and the same checks of
+//! every page it reaches, but it descends only into a page or a run its parent names with a txn
+//! after the last sync's, and it skips the counters and the page accounting, which need the whole
+//! state (README, Open and recovery).
 
 use std::collections::BTreeMap;
 
@@ -83,6 +88,11 @@ struct Checker<'s> {
     owners: Vec<String>,
     /// The pages claimed twice.
     twice: Twice,
+    /// [`check_since`]'s last sync: the walk descends only into what its parent names with a txn
+    /// after it ([`named_after`]). `None`: into everything.
+    since: Option<u64>,
+    /// Hold each root's and record's counters to what the walk found (a full walk only).
+    accounting: bool,
 }
 
 /// The pages claimed twice: every one counted, the first [`LISTED`] kept as `(page, first owner,
@@ -131,6 +141,13 @@ const FREE_LIST: Owner = 3;
 const LISTED: usize = 16;
 
 impl Checker<'_> {
+    /// Whether the walk descends into a page or run its parent names with the low 32 bits `txn`
+    /// of the txn that wrote it: always, but in [`check_since`] only when that txn is after the
+    /// last sync's.
+    fn descends(&self, txn: u32) -> bool {
+        self.since.is_none_or(|since| named_after(txn, since))
+    }
+
     /// Claim page `p` for `owner`: false (and noted) if something claimed it already.
     fn claim(&mut self, p: u32, owner: Owner) -> bool {
         let first = self.owner[p as usize];
@@ -144,9 +161,10 @@ impl Checker<'_> {
 
     /// Walk the tree `root` names for `owner`, checking every page, holding its leaves to
     /// `policy` and passing each leaf entry to `entry`. Returns the tree's page count. A page
-    /// claimed already is noted and not descended into. A root whose entry count or page
-    /// counters differ from what the walk found is [`Error::Corrupt`] (unless a page was
-    /// claimed twice: the accounting reports that).
+    /// claimed already is noted and not descended into, and so is one the walk skips
+    /// ([`Self::descends`]). In a full walk, a root whose entry count or page counters differ from
+    /// what the walk found is [`Error::Corrupt`] (unless a page was claimed twice: the accounting
+    /// reports that).
     fn walk(
         &mut self,
         root: &TreeRoot,
@@ -155,7 +173,7 @@ impl Checker<'_> {
         mut entry: impl FnMut(&mut Self, &[u8], Val<'_>) -> Result<()>,
     ) -> Result<u64> {
         root.check()?;
-        if root.is_empty() {
+        if root.is_empty() || !self.descends(root.root_txn) {
             return Ok(0);
         }
         let snapshot = self.snapshot;
@@ -210,6 +228,7 @@ impl Checker<'_> {
                     entry(self, k, v).map_err(|e| corrupt(p, e.to_string()))?;
                     match v {
                         Val::Inline(_) => {}
+                        Val::Overflow(ovf) if !self.descends(ovf.txn) => {}
                         Val::Overflow(ovf) => {
                             overflows += self
                                 .claim_run(ovf, owner)
@@ -231,6 +250,9 @@ impl Checker<'_> {
             }
             for i in 0..n {
                 let (child, child_txn) = page::branch_child(page, i)?;
+                if !self.descends(child_txn) {
+                    continue;
+                }
                 let child_lo =
                     if i == 0 { lo.clone() } else { Some(page::branch_key(page, i)?.to_vec()) };
                 let child_hi = if i + 1 < n {
@@ -241,7 +263,7 @@ impl Checker<'_> {
                 stack.push((child, child_txn, depth + 1, child_lo, child_hi));
             }
         }
-        if !self.twice.is_empty() {
+        if !self.twice.is_empty() || !self.accounting {
             return Ok(branches + leaves + overflows);
         }
         if entries != root.entries {
@@ -335,7 +357,7 @@ impl Checker<'_> {
             }
             Ok(())
         })?;
-        if self.twice.is_empty() {
+        if self.twice.is_empty() && self.accounting {
             let [trees, entries, branches, leaves, overflows] = sums;
             let fields = [
                 ("nested_trees", trees, u64::from(dup.nested_trees)),
@@ -379,14 +401,49 @@ impl Checker<'_> {
     }
 }
 
+/// Whether a page or run its parent names with `txn`, the low 32 bits of the txn that wrote it,
+/// was written after txn `since`: its wrapping distance from `since`'s low 32 bits is 1 to
+/// 2^31 - 1. That is exact for every txn after `since` and fewer than 2^31 past it
+/// ([`check_since`] walks everything past that); a txn at or before `since` and less than 2^31
+/// before it is never after, and one further back may be taken as after, only checked needlessly.
+pub(crate) fn named_after(txn: u32, since: u64) -> bool {
+    let distance = txn.wrapping_sub(since as u32);
+    distance != 0 && distance < 1 << 31
+}
+
 /// `Env::check` of one snapshot.
 pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
+    walk_state(snapshot, None, true)
+}
+
+/// Open's check of a trusted weak head (README, Open and recovery): `snapshot` is the head's
+/// state and `since` the txn of the steady meta beside it, the last sync. Every page and run the
+/// walk reaches passes `Env::check`'s checks (the full CRC and structure of each page, its txn the
+/// one its parent names, its keys inside its parents' separators, each run's full CRC and zero
+/// pad, every packed set validated, every catalog and free record decoded), but the walk descends
+/// into a page or run only when its parent names it with a txn after `since` ([`named_after`]):
+/// one named at or before it was written by a txn at or before the last sync, so it was on disk
+/// before that sync's meta was. It covers the catalog, every table (a dup table's outer tree and
+/// its nested trees) and the free tree. A page reached twice is [`Error::Corrupt`]; the counters
+/// and the accounting of the file's other pages are not checked. When `since` is 2^31 or more
+/// txns before the head, the walk descends into everything. Returns the pages checked.
+pub(crate) fn check_since(snapshot: &Snapshot, since: u64) -> Result<u64> {
+    let prune = snapshot.meta.txn.checked_sub(since).is_some_and(|gap| gap < 1 << 31);
+    let report = walk_state(snapshot, prune.then_some(since), false)?;
+    Ok(report.catalog_pages + report.table_pages + report.free_tree_pages)
+}
+
+/// The walk of [`check_snapshot`] (`accounting`: its counters and its page accounting too) or of
+/// [`check_since`] (`since`: only what was written after it).
+fn walk_state(snapshot: &Snapshot, since: Option<u64>, accounting: bool) -> Result<CheckReport> {
     let meta = snapshot.meta;
     let mut checker = Checker {
         snapshot,
         owner: vec![0; meta.page_count as usize],
         owners: ["", "catalog", "free tree", "free list"].map(String::from).to_vec(),
         twice: Twice::default(),
+        since,
+        accounting,
     };
     let mut report =
         CheckReport { txn_id: meta.txn, page_count: meta.page_count, ..Default::default() };
@@ -443,7 +500,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
     report.free_pages = free_pages;
     report.free_records = free_records;
 
-    let leaked = leaked_runs(&checker.owner);
+    let leaked = if accounting { leaked_runs(&checker.owner) } else { None };
     if leaked.is_none() && checker.twice.is_empty() {
         return Ok(report);
     }
@@ -495,6 +552,28 @@ fn leaked_runs(owner: &[Owner]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The skip rule of open's check of a weak head: a txn named in a parent's 32 bits is after the
+    /// last sync exactly when it is 1 to 2^31 - 1 past it, whatever the high bits and across the
+    /// 32-bit wrap: every txn after the sync and fewer than 2^31 past it is checked, and none at or
+    /// before it and fewer than 2^31 before it.
+    #[test]
+    fn a_txn_is_named_after_the_last_sync_by_its_wrapping_distance() {
+        for since in
+            [0, 5, u64::from(u32::MAX) - 2, (7 << 32) + (1 << 31) + 9, u64::MAX - 1 - (1 << 31)]
+        {
+            let named = |txn: u64| named_after(txn as u32, since);
+            for d in [1, 2, 1000, (1 << 31) - 1] {
+                assert!(named(since + d), "{since} + {d}");
+            }
+            for d in [0, 1, 2, 1000, (1 << 31) - 1] {
+                if let Some(txn) = since.checked_sub(d) {
+                    assert!(!named(txn), "{since} - {d}");
+                }
+            }
+            assert!(!named(since + (1 << 31)), "{since} + 2^31: taken as before, so walked whole");
+        }
+    }
 
     /// Leaked pages are named as runs, up to [`LISTED`] of them, and the rest counted: the
     /// message stays short however many runs the meta's page count leaves unclaimed.

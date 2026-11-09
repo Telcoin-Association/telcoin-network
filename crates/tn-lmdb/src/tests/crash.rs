@@ -21,8 +21,8 @@ use crate::{
     alloc::RunStats,
     catalog::{self, DupRecord},
     disk_model,
-    env::CrashAt,
-    error::{Error, Result},
+    env::{self, CrashAt},
+    error::Result,
     meta::{slot_to_write, META_LEN},
     packed::PackedView,
     page::{self, Find, Val},
@@ -524,12 +524,19 @@ pub(super) enum WeakLoss {
     Strict,
     /// A random-writeback power loss, a reboot (seeded).
     Random(u64),
+    /// The volume lost in the same boot (pulled, then plugged back in), after the kernel wrote
+    /// back the weak meta's page alone: the head is trusted, but the pages it names that were
+    /// written since the last sync are lost.
+    Volume,
+    /// [`Self::Volume`] after random writeback of the other pages, some torn by sector (seeded).
+    VolumeRandom(u64),
 }
 
 /// Where [`WeakLoss::Torn`] cuts the record: inside the catalog root, so its txn is the new one's.
 const TORN_AT: usize = 40;
 
-/// Every way down of [`weak_case`], with `seeds` random power losses.
+/// Every way down of [`weak_case`], with `seeds` random power losses and as many random volume
+/// losses.
 pub(super) fn weak_losses(seeds: u64) -> Vec<WeakLoss> {
     let mut losses = vec![
         WeakLoss::Process,
@@ -537,19 +544,25 @@ pub(super) fn weak_losses(seeds: u64) -> Vec<WeakLoss> {
         WeakLoss::Distrusted,
         WeakLoss::UnknownBoot,
         WeakLoss::Strict,
+        WeakLoss::Volume,
     ];
     losses.extend((0..seeds).map(WeakLoss::Random));
+    losses.extend((0..seeds).map(WeakLoss::VolumeRandom));
     losses
 }
 
 /// The weak metas of `SyncMode::NoSync` (no automatic sync) on `base`: its `commits` commits (1 to
 /// 3: the two unsynced ones, then the crash commit), with a sync after the first when `synced`, go
 /// down by `loss`, then reopen to exactly the state allowed. A process crash in the same boot
-/// recovers the last commit, by its weak meta; every other way down the last sync (the base's,
-/// or the first commit's when `synced`): a torn weak record is invalid, a distrusted, zero-tagged
-/// or other boot's one passed over for the steady slot beside it. The reopen checks, and a power
-/// loss right after it recovers the last sync too (a weak head stays weak until a sync).
-pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss) {
+/// recovers the last commit, by its weak meta, once open's check of the pages written since the
+/// last sync passes; every other way down the last sync (the base's, or the first commit's when
+/// `synced`): a torn weak record is invalid, a distrusted, zero-tagged or other boot's one passed
+/// over for the steady slot beside it, and a head trusted after a volume loss in the same boot
+/// fails that check (a strict loss always, a random one unless every page it names survived, when
+/// it opens at the head). The reopen checks, and a power loss right after it recovers the last
+/// sync too (a weak head stays weak until a sync). Returns whether the reopen fell back from a
+/// trusted weak head.
+pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss) -> bool {
     let case = format!("{commits} commits, synced {synced}, {loss:?}");
     let path = base.dir.path().join("weak");
     fs::copy(&base.path, &path).expect("copy");
@@ -586,6 +599,15 @@ pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss)
     }
     let stats = env.io_stats();
     assert_eq!((stats.nosync_commits, stats.auto_syncs), (u64::from(commits), 0), "{case}");
+    let volume = matches!(loss, WeakLoss::Volume | WeakLoss::VolumeRandom(_));
+    if volume {
+        env.with_writer(|w| {
+            if let Some(slot) = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)) {
+                w.file.msync_page(slot as u32, base.page_size as usize).expect("the writeback");
+            }
+        });
+    }
+    let head = latest.0 > last_sync.0;
     env.crash();
     match loss {
         WeakLoss::Process | WeakLoss::Distrusted | WeakLoss::UnknownBoot => {}
@@ -596,15 +618,34 @@ pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss)
         }
         WeakLoss::Strict => disk_model::power_loss(&path),
         WeakLoss::Random(seed) => disk_model::power_loss_random(&path, seed),
+        WeakLoss::Volume => disk_model::volume_loss(&path),
+        WeakLoss::VolumeRandom(seed) => disk_model::volume_loss_random(&path, seed),
     }
     let mut want = match loss {
         WeakLoss::Process => &latest,
         _ => &last_sync,
     };
     let trust_unsynced = !matches!(loss, WeakLoss::Distrusted);
+    let mut fell_back = false;
     for reopen in 0..2 {
         let options = EnvOptions { trust_unsynced, ..options(SyncMode::NoSync) };
         let env = Env::open(&path, options).expect("reopen");
+        if reopen == 0 {
+            // Open checks a weak head it trusts, and only then: after a process crash it passes,
+            // after a strict volume loss it fails, after a random one either.
+            let checked = env::take_weak_head_check();
+            let trusted = head && (matches!(loss, WeakLoss::Process) || volume);
+            assert_eq!(checked.is_some(), trusted, "{case}: {checked:?}");
+            match (loss, checked) {
+                (WeakLoss::Process, Some(found)) => {
+                    assert!(found.is_ok_and(|pages| pages > 0), "{case}: {found:?}")
+                }
+                (WeakLoss::Volume, Some(found)) => assert!(found.is_err(), "{case}"),
+                (WeakLoss::VolumeRandom(_), Some(Ok(_))) => want = &latest,
+                _ => {}
+            }
+            fell_back = matches!(checked, Some(Err(())));
+        }
         assert_eq!(env.stat().txn_id, want.0, "{case}: reopen {reopen}");
         assert!(newest_state(&env) == want.1, "{case}: reopen {reopen}: the state differs");
         assert_gets(&env, &want.1, &format!("{case}: reopen {reopen}"));
@@ -617,20 +658,26 @@ pub(super) fn weak_case(base: &Base, commits: u32, synced: bool, loss: WeakLoss)
     if let WeakLoss::UnknownBoot = loss {
         disk_model::reboot();
     }
+    fell_back
 }
 
 /// [`weak_case`] on `base` after one to three commits, with and without a sync after the first,
-/// every way down (but a torn weak record where the sync wrote the last record).
+/// every way down (but a torn weak record where the sync wrote the last record). Some random
+/// volume loss must fall back from a trusted head too.
 pub(super) fn weak_matrix(base: &Base, seeds: u64) {
+    let mut random_falls_back = 0;
     for commits in 1..=3 {
         for synced in [false, true] {
             for loss in weak_losses(seeds) {
                 if !(synced && commits == 1 && matches!(loss, WeakLoss::Torn)) {
-                    weak_case(base, commits, synced, loss);
+                    let fell_back = weak_case(base, commits, synced, loss);
+                    random_falls_back +=
+                        u32::from(fell_back && matches!(loss, WeakLoss::VolumeRandom(_)));
                 }
             }
         }
     }
+    assert!(seeds == 0 || random_falls_back > 0, "a random volume loss falls back");
 }
 
 /// `SyncMode::NoSync`'s weak metas: after one to three commits (and a sync after the first, or
@@ -672,66 +719,265 @@ fn open_trusting(path: &Path, trust_unsynced: bool) -> Result<Env> {
     Env::open(path, EnvOptions { trust_unsynced, ..options(SyncMode::NoSync) })
 }
 
-/// A volume lost without a reboot (pulled, then plugged back in the same boot) is the one case a
-/// weak meta cannot tell. Here the kernel wrote back the weak meta's page before the pages it
-/// names (an msync of that page alone stands for that writeback), then the volume went: a reopen
-/// in the same boot trusts a head whose pages never reached the disk, and open or `Env::check`,
-/// whichever comes first, finds it `Corrupt`, never another state. The same over random
-/// writebacks: each copy opens to exactly the head's state or `Corrupt`. With `trust_unsynced`
-/// off every one opens at the last sync, which checks and takes a commit.
-#[test]
-fn a_volume_lost_in_the_same_boot_is_corrupt_and_opens_at_the_last_sync_distrusted() {
-    let base = base(4096);
-    let (path, env, mut latest) = weak_copy(&base, "lost", 2);
+/// A copy of `base` with its two unsynced commits and its crash commit made in
+/// `SyncMode::NoSync` since the base's last sync, then the kernel's writeback of the weak meta's
+/// page alone (an msync of that page stands for it), then a process crash: the path, the head's
+/// state and txn.
+fn lost_head(base: &Base, name: &str) -> (PathBuf, State, u64) {
+    let (path, env, mut latest) = weak_copy(base, name, 2);
     let mut txn = env.begin_rw().expect("begin");
     (base.crash)(&mut txn, &mut latest);
-    txn.commit().expect("a NoSync commit");
+    let head = txn.commit().expect("a NoSync commit");
     env.with_writer(|w| {
         let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("a weak slot");
         w.file.msync_page(slot as u32, base.page_size as usize).expect("the meta page's writeback");
     });
     env.crash();
-    let opened = |path: &Path| open_trusting(path, true).and_then(|env| env.check().map(|_| env));
-    let mut corrupt = 0;
-    for seed in 0..8 {
+    (path, latest, head)
+}
+
+/// Reopen `path`, trusting a weak head of this boot, to exactly the head's state (`head`, after
+/// open's check of its pages since the last sync passed) or the base's last sync (after that
+/// check failed), and pass `Env::check`: whether it fell back.
+fn reopen_head_or_last_sync(path: &Path, base: &Base, head: &(u64, State), case: &str) -> bool {
+    let env = open_trusting(path, true).unwrap_or_else(|e| panic!("{case}: {e:?}"));
+    let checked = env::take_weak_head_check().unwrap_or_else(|| panic!("{case}: no check"));
+    let want = if checked.is_ok() { head } else { &(base.txn, base.state.clone()) };
+    assert_eq!(env.stat().txn_id, want.0, "{case}: {checked:?}");
+    assert!(newest_state(&env) == want.1, "{case}: the state differs");
+    checked.is_err()
+}
+
+/// A volume lost without a reboot (pulled, then plugged back in the same boot) keeps the boot id,
+/// so a weak meta the kernel wrote back is trusted though the pages it names may be lost. Open
+/// checks the pages it names that were written since the last sync, and falls back to the last
+/// sync when any fails: here the kernel wrote back the weak meta's page before the others, then
+/// the volume went. Over random writebacks (some pages torn by sector) each copy opens to exactly
+/// the head's state or the last sync, never `Corrupt`, and checks; after a strict loss it opens
+/// at the last sync, which checks and takes a commit. With `trust_unsynced` off every one opens at
+/// the last sync, unchecked.
+#[test]
+fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync() {
+    volume_lost_opens_at_the_last_sync(&base(4096), 32);
+}
+
+/// [`a_volume_lost_in_the_same_boot_opens_at_the_last_sync`] on the dup base and at 16 KiB pages,
+/// with many random writebacks.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync_heavy() {
+    volume_lost_opens_at_the_last_sync(&base(16384), 200);
+    volume_lost_opens_at_the_last_sync(&dup_base(4096, Bound::Default), 200);
+}
+
+/// [`a_volume_lost_in_the_same_boot_opens_at_the_last_sync`] on `base` with `seeds` random
+/// writebacks.
+fn volume_lost_opens_at_the_last_sync(base: &Base, seeds: u64) {
+    let (path, latest, head) = lost_head(base, "lost");
+    let head = (head, latest);
+    let mut fell_back = 0;
+    for seed in 0..seeds {
         let copy = base.dir.path().join(format!("lost{seed}"));
         disk_model::copy_tracked(&path, &copy);
         disk_model::volume_loss_random(&copy, seed);
-        match opened(&copy) {
-            Ok(env) => assert!(newest_state(&env) == latest, "seed {seed}: the head's state"),
-            Err(Error::Corrupt(_)) => corrupt += 1,
-            Err(e) => panic!("seed {seed}: {e:?}"),
-        }
+        fell_back += u32::from(reopen_head_or_last_sync(&copy, base, &head, &format!("{seed}")));
         let env = open_trusting(&copy, false).expect("the last sync");
+        assert_eq!(
+            env::take_weak_head_check(),
+            None,
+            "seed {seed}: a distrusted head is unchecked"
+        );
         assert!(newest_state(&env) == base.state, "seed {seed}: the last sync");
         drop(env);
         disk_model::untrack(&copy);
+        fs::remove_file(&copy).expect("remove");
     }
-    assert!(corrupt > 0, "some writeback leaves the head naming lost pages");
+    assert!(fell_back > 0, "some writeback leaves the head naming lost pages");
     disk_model::volume_loss(&path);
-    let found = opened(&path);
-    assert!(matches!(found, Err(Error::Corrupt(_))), "{found:?}");
-    let env = open_trusting(&path, false).expect("the last sync");
-    assert_eq!(env.stat().txn_id, base.txn);
-    assert!(newest_state(&env) == base.state, "the last sync");
+    assert!(reopen_head_or_last_sync(&path, base, &head, "strict"), "a strict loss falls back");
+    // Open wrote nothing: the head is still in its slot, and the next open falls back again.
+    assert!(reopen_head_or_last_sync(&path, base, &head, "strict again"), "it falls back again");
+    let env = open_trusting(&path, true).expect("the last sync");
+    let mut state = base.state.clone();
     let mut txn = env.begin_rw().expect("begin");
-    put(&mut txn, &mut latest, "a", &key(0), b"on top");
-    let mut want = base.state.clone();
-    want.get_mut("a").expect("table a").insert(key(0).to_vec(), b"on top".to_vec());
+    assert_eq!(txn.writer_mut().alloc.txn(), head.0 + 1, "past the head's txn");
+    put(&mut txn, &mut state, "a", &key(0), b"on top");
     txn.commit().expect("a commit on the last sync");
     drop(env);
     let env = open_trusting(&path, true).expect("reopen");
-    assert!(newest_state(&env) == want, "the commit on the last sync");
+    assert!(newest_state(&env) == state, "the commit on the last sync");
     drop(env);
     disk_model::untrack(&path);
+}
+
+/// The case reads cannot see: a page the head names, written since the last sync, torn by sector
+/// so that its header (txn, kind, keys) is the new one but a later sector is the old bytes. Reads
+/// check a page's header and identity, not its CRC, so only a full check finds it, and open's
+/// check of a trusted weak head is one. For every page that differs between the head's file (a
+/// process crash) and the last sync's (a strict volume loss), a copy holding the head's bytes
+/// with that page alone torn opens to exactly the head's state (the page is one the head does not
+/// name: written and freed since the sync) or falls back to the last sync, and checks. On the dup
+/// base the head names nested trees, runs and packed sets written since the sync, so every kind of
+/// page is torn; most pages fall back, among them some whose header still names the head's txn.
+#[test]
+fn a_page_torn_by_sector_since_the_last_sync_falls_back_at_open() {
+    let base = dup_base(4096, Bound::Default);
+    let (path, latest, head) = lost_head(&base, "torn");
+    let head = (head, latest);
+    let new = fs::read(&path).expect("the head's bytes");
+    let old_path = base.dir.path().join("torn-old");
+    disk_model::copy_tracked(&path, &old_path);
+    disk_model::volume_loss(&old_path);
+    let mut old = fs::read(&old_path).expect("the last sync's bytes");
+    old.resize(new.len(), 0);
+    disk_model::untrack(&old_path);
+    disk_model::untrack(&path);
+    let size = base.page_size as usize;
+    let (mut torn, mut fell_back, mut header_kept) = (0, 0, 0);
+    let copy = base.dir.path().join("torn-copy");
+    for p in 2..new.len() / size {
+        let page = p * size..(p + 1) * size;
+        let Some(sector) = (0..size / 512)
+            .rev()
+            .map(|i| page.start + i * 512..page.start + (i + 1) * 512)
+            .find(|s| new[s.clone()] != old[s.clone()])
+        else {
+            continue;
+        };
+        let mut bytes = new.clone();
+        bytes[sector.clone()].copy_from_slice(&old[sector.clone()]);
+        fs::write(&copy, &bytes).expect("write the torn copy");
+        torn += 1;
+        let falls = reopen_head_or_last_sync(&copy, &base, &head, &format!("page {p}"));
+        fell_back += u32::from(falls);
+        let named =
+            page::kind(&bytes[page.clone()]).is_ok() && page::txn(&bytes[page.clone()]) == head.0;
+        header_kept += u32::from(falls && sector.start > page.start && named);
+    }
+    fs::remove_file(&copy).expect("remove");
+    assert!(torn > 20 && fell_back > torn / 2, "{fell_back} of {torn} torn pages fell back");
+    assert!(
+        header_kept > torn / 2,
+        "{header_kept} torn pages kept the head's header: found by CRC"
+    );
+}
+
+/// Open's check of a trusted weak head walks the free tree too, below its root: here the head's
+/// one NoSync commit since the last sync drops a large table, so its free tree has two levels,
+/// written since the sync. After a volume lost in the same boot that keeps the weak meta's page
+/// and loses a sector of one free-tree leaf (a byte of its last sector changed), the open falls
+/// back to the last sync, which checks.
+#[test]
+fn a_free_tree_leaf_lost_since_the_last_sync_falls_back_at_open() {
+    let (_dir, path) = temp("tn_lmdb_lost_free");
+    let env = open(&path, SyncMode::Durable);
+    let mut synced = State::new();
+    let mut txn = env.begin_rw().expect("begin");
+    for i in 0..200_u32 {
+        put(&mut txn, &mut synced, "t", &i.to_be_bytes(), &value(1, i, 40));
+    }
+    for i in 0..4400_u32 {
+        put(&mut txn, &mut synced, "big", &i.to_be_bytes(), &value(2, i, 900));
+    }
+    let synced_txn = txn.commit().expect("commit");
+    drop(env);
+    disk_model::track(&path);
+    let env = open(&path, SyncMode::NoSync);
+    let mut txn = env.begin_rw().expect("begin");
+    drop_table(&mut txn, &mut synced.clone(), "big");
+    txn.commit().expect("a NoSync commit");
+    let (free, size) = env.with_writer(|w| (w.last.free, w.geometry.page_size()));
+    assert!(free.height >= 2 && free.root_txn as u64 > synced_txn, "{free:?}");
+    let leaf = env.with_writer(|w| {
+        let root = w.file.pages(free.root, size, size).expect("the free root");
+        page::branch_child(root, 0).expect("a child").0
+    });
+    env.with_writer(|w| {
+        let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("a weak slot");
+        w.file.msync_page(slot as u32, size).expect("the meta page's writeback");
+    });
+    env.crash();
+    disk_model::untrack(&path);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let at = u64::from(leaf) * size as u64 + size as u64 - 100;
+    let mut b = [0];
+    file.read_exact_at(&mut b, at).expect("read");
+    file.write_all_at(&[b[0] ^ 0x5A], at).expect("write");
+    drop(file);
+    let env = open_trusting(&path, true).expect("the last sync");
+    assert_eq!(env::take_weak_head_check(), Some(Err(())), "the free-tree leaf fails its check");
+    assert_eq!(env.stat().txn_id, synced_txn);
+    assert!(newest_state(&env) == synced, "the last sync");
+}
+
+/// What open's check of a trusted weak head costs: the head over about `mib` MiB of pages written
+/// since the last sync (1000-byte values at random keys, in NoSync commits of 4 MiB of rows, which
+/// fill the leaves about half), opened after a process crash
+/// with its pages in the page cache. The first open also writes back the pages the dead writer
+/// left dirty (its fsync); the second, on clean pages, is the check alone, against a steady open
+/// of the same file after a clean close made the head steady. Returns `(first, checked, steady,
+/// pages checked)`.
+fn weak_head_open_cost(mib: u64) -> (Duration, Duration, Duration, u64) {
+    let (_dir, path) = temp("tn_lmdb_weak_cost");
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("m").expect("table");
+    txn.put(&t, b"k", b"v").expect("put");
+    txn.commit().expect("commit");
+    drop(env);
+    let env = open(&path, SyncMode::NoSync);
+    let rows = mib * 512; // ~1 KiB a row, ~2 KiB of leaf
+    let value = vec![0x5A; 1000];
+    for chunk in (0..rows).collect::<Vec<_>>().chunks(4 * 1024) {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("m").expect("open").expect("m");
+        for &i in chunk {
+            txn.put(&t, &(i * 0x9E37_79B9 % rows).to_be_bytes(), &value).expect("put");
+        }
+        txn.commit().expect("a NoSync commit");
+    }
+    env.crash();
+    let timed = |path: &Path| {
+        let at = std::time::Instant::now();
+        let env = open_trusting(path, true).expect("open");
+        (at.elapsed(), env, env::take_weak_head_check())
+    };
+    let (first, env, _) = timed(&path);
+    env.crash();
+    let (checked, env, pages) = timed(&path);
+    let pages = pages.expect("checked").expect("the check passes");
+    drop(env);
+    let (steady, env, none) = timed(&path);
+    assert_eq!(none, None, "a steady head is not checked");
+    drop(env);
+    (first, checked, steady, pages)
+}
+
+/// The cost of open's check of a trusted weak head, at 64 and 512 MiB written since the last
+/// sync: about the pages written since it (each page's CRC and structure), and only after an
+/// unclean end. Guards that the check covers those pages, and a loose bound on its time.
+#[test]
+#[ignore = "measurement: run with --release --nocapture"]
+fn a_weak_head_check_costs_the_pages_written_since_the_last_sync() {
+    for mib in [64, 512] {
+        let (first, checked, steady, pages) = weak_head_open_cost(mib);
+        println!(
+            "~{mib} MiB since the last sync: {pages} pages ({} MiB) checked; open after the crash \
+             {first:?}, again on clean pages {checked:?}, steady open {steady:?}",
+            (pages * 4096) >> 20
+        );
+        assert!(pages >= mib * 256 / 2, "{pages} pages checked for {mib} MiB");
+        assert!(checked < Duration::from_secs(mib / 8 + 2), "{checked:?}");
+    }
 }
 
 /// A writer opened past a weak head of its own boot (`trust_unsynced` off) gives its transactions
 /// txns past the head's (`Chosen::next_txn`), so no page it writes passes for one of the head's.
 /// Here its first commit rewrites the rows the head's one commit wrote, with other values (the
 /// same pages, by the same allocation), and stops after its stamp; a reopen that trusts the head
-/// again finds those pages newer than the head, `Corrupt`, never the head's state over the new
-/// writer's bytes. With `trust_unsynced` off it opens at the last sync, which checks.
+/// again finds those pages newer than the txn the head names in its check, and falls back to the
+/// last sync, never the head's state over the new writer's bytes. With `trust_unsynced` off it
+/// opens at the last sync too, unchecked.
 #[test]
 fn a_writer_past_a_distrusted_weak_head_never_reuses_its_txns() {
     let base = base(4096);
@@ -748,8 +994,11 @@ fn a_writer_past_a_distrusted_weak_head_never_reuses_its_txns() {
     txn.writer_mut().crash_at = Some(CrashAt::AfterStamp);
     txn.commit().expect_err("the commit stops after its stamp");
     env.crash();
-    let found = open_trusting(&path, true).and_then(|env| env.check().map(|_| env.stat()));
-    assert!(matches!(found, Err(Error::Corrupt(_))), "{found:?}");
+    let env = open_trusting(&path, true).expect("the last sync");
+    assert_eq!(env::take_weak_head_check(), Some(Err(())), "the head fails its check");
+    assert_eq!(env.stat().txn_id, base.txn);
+    assert!(newest_state(&env) == base.state, "the last sync");
+    drop(env);
     let env = open_trusting(&path, false).expect("the last sync");
     assert!(newest_state(&env) == base.state, "the last sync");
     drop(env);
@@ -1067,6 +1316,26 @@ fn every_crash_point_recovers_a_dup_table_heavy() {
     for page_size in [4096, 16384] {
         for bound in Bound::ALL {
             matrix(&dup_base(page_size, bound), 20);
+        }
+    }
+}
+
+/// The weak matrix over a dup table beside plain ones: weak heads over one to three NoSync
+/// commits since the last sync that change nested trees, runs and packed sets. After a process
+/// crash open's check of the head's pages since the last sync passes and the reopen keeps every
+/// commit; after a volume lost in the same boot the check fails and the reopen is the last sync.
+#[test]
+fn a_weak_head_over_a_dup_table_is_checked_since_the_last_sync() {
+    weak_matrix(&dup_base(4096, Bound::Default), 1);
+}
+
+/// The dup weak matrix at every bound and two page sizes, with more random losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn a_weak_head_over_a_dup_table_is_checked_since_the_last_sync_heavy() {
+    for page_size in [4096, 16384] {
+        for bound in Bound::ALL {
+            weak_matrix(&dup_base(page_size, bound), 8);
         }
     }
 }

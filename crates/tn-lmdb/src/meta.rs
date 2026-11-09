@@ -226,6 +226,10 @@ pub(crate) struct Chosen {
     /// included. An untrusted weak slot is listed as it is: its txn is above the steady slot's,
     /// and it is the next one written ([`slot_to_write`]).
     pub(crate) slots: [Option<Slot>; 2],
+    /// When `meta` is a trusted weak head, the steady meta beside it, the last sync: open checks
+    /// the pages the head names that were written since it, and opens at it if any fails
+    /// (`check::check_since`). `None` when `meta` is steady.
+    pub(crate) last_sync: Option<Meta>,
 }
 
 #[cfg(test)]
@@ -273,7 +277,9 @@ impl Chosen {
 /// of the boot that wrote them holds them for sure. A weak meta from any other boot, or with an
 /// unknown id, is passed over for the other slot, which must then hold a valid steady meta, else
 /// [`Error::Corrupt`]: never the weak head. A trusted weak head needs that steady slot beside it
-/// too, as every write keeps one ([`slot_to_write`]): a file without one is damaged.
+/// too, as every write keeps one ([`slot_to_write`]): a file without one is damaged. It is
+/// reported as [`Chosen::last_sync`], which open falls back to if the head's pages written since
+/// it fail their check.
 pub(crate) fn choose_meta(
     read: impl Fn(u64) -> io::Result<Option<[u8; META_LEN]>>,
     trusted: Option<BootId>,
@@ -287,7 +293,7 @@ pub(crate) fn choose_meta(
     };
     let (meta, tag) = found[newest].expect("read_slots returns a valid meta");
     if !tag.weak {
-        return Ok(Chosen { meta, slots });
+        return Ok(Chosen { meta, slots, last_sync: None });
     }
     let steady = found[1 - newest].filter(|(_, other)| !other.weak);
     let Some((steady, _)) = steady else {
@@ -297,7 +303,11 @@ pub(crate) fn choose_meta(
         )));
     };
     let trust = trusted.is_some_and(|boot| boot != [0; 16] && boot == tag.boot_id);
-    Ok(Chosen { meta: if trust { meta } else { steady }, slots })
+    Ok(if trust {
+        Chosen { meta, slots, last_sync: Some(steady) }
+    } else {
+        Chosen { meta: steady, slots, last_sync: None }
+    })
 }
 
 /// A record as read from a slot: its bytes and what they decode to.
@@ -522,12 +532,20 @@ mod tests {
             let file = image(p, Some(meta(p, 5).encode(STEADY)), Some(meta(p, 6).encode(STEADY)));
             assert_eq!(
                 choose(&file).expect("choose"),
-                Chosen { meta: meta(p, 6), slots: [Slot::steady(5), Slot::steady(6)] }
+                Chosen {
+                    meta: meta(p, 6),
+                    slots: [Slot::steady(5), Slot::steady(6)],
+                    last_sync: None
+                }
             );
             let file = image(p, Some(meta(p, 8).encode(STEADY)), Some(meta(p, 7).encode(STEADY)));
             assert_eq!(
                 choose(&file).expect("choose"),
-                Chosen { meta: meta(p, 8), slots: [Slot::steady(8), Slot::steady(7)] }
+                Chosen {
+                    meta: meta(p, 8),
+                    slots: [Slot::steady(8), Slot::steady(7)],
+                    last_sync: None
+                }
             );
         }
     }
@@ -540,7 +558,10 @@ mod tests {
         torn[17] ^= 0x40;
         let chosen =
             choose(&image(4096, Some(meta(4096, 5).encode(STEADY)), Some(torn))).expect("choose");
-        assert_eq!(chosen, Chosen { meta: meta(4096, 5), slots: [Slot::steady(5), None] });
+        assert_eq!(
+            chosen,
+            Chosen { meta: meta(4096, 5), slots: [Slot::steady(5), None], last_sync: None }
+        );
         assert_eq!(slot_to_write(&chosen.slots), 1);
 
         // Meta 0 torn: meta 1 is found by probing its page size, at every page size.
@@ -549,7 +570,10 @@ mod tests {
             torn[CRC_AT] ^= 1;
             let chosen =
                 choose(&image(p, Some(torn), Some(meta(p, 8).encode(STEADY)))).expect("choose");
-            assert_eq!(chosen, Chosen { meta: meta(p, 8), slots: [None, Slot::steady(8)] });
+            assert_eq!(
+                chosen,
+                Chosen { meta: meta(p, 8), slots: [None, Slot::steady(8)], last_sync: None }
+            );
             assert_eq!(slot_to_write(&chosen.slots), 0);
             // Zeroed meta 0 (a never-written page) probes the same way.
             let chosen = choose(&image(p, None, Some(meta(p, 8).encode(STEADY)))).expect("choose");
@@ -595,7 +619,11 @@ mod tests {
                     file[at..at + META_LEN].copy_from_slice(&planted);
                     assert_eq!(
                         choose(&file).expect("opens at meta 1"),
-                        Chosen { meta: meta(p, 8), slots: [None, Slot::steady(8)] },
+                        Chosen {
+                            meta: meta(p, 8),
+                            slots: [None, Slot::steady(8)],
+                            last_sync: None
+                        },
                         "page size {p}, record at {later}"
                     );
                     // Meta 1 torn too: no valid meta, whatever the later page holds.
@@ -741,7 +769,8 @@ mod tests {
 
     /// A weak head is chosen exactly when it was written in the trusted boot (both ids known):
     /// with another boot, an unknown id on either side or nothing trusted, the steady slot beside
-    /// it is, and both slots are reported as they are, in either order.
+    /// it is, and both slots are reported as they are, in either order. A trusted head carries
+    /// that steady meta as the last sync, which open falls back to; an untrusted one carries none.
     #[test]
     fn a_weak_head_is_trusted_only_in_its_own_boot() {
         let (s, w) = (meta(4096, 5), meta(4096, 8));
@@ -755,19 +784,19 @@ mod tests {
             (unknown, Some(BOOT), false),
         ] {
             let case = format!("{head_boot:?} trusted {trusted:?}");
-            let want = if trusts { w } else { s };
+            let (want, last_sync) = if trusts { (w, Some(s)) } else { (s, None) };
             let (steady_rec, weak_rec) =
                 (s.encode(Tag::steady(BOOT)), w.encode(Tag::weak(head_boot)));
             let chosen = choose_in(&slots_image(steady_rec, weak_rec), trusted).expect(&case);
             assert_eq!(
                 chosen,
-                Chosen { meta: want, slots: [Slot::steady(5), Slot::weak(8)] },
+                Chosen { meta: want, slots: [Slot::steady(5), Slot::weak(8)], last_sync },
                 "{case}"
             );
             let chosen = choose_in(&slots_image(weak_rec, steady_rec), trusted).expect(&case);
             assert_eq!(
                 chosen,
-                Chosen { meta: want, slots: [Slot::weak(8), Slot::steady(5)] },
+                Chosen { meta: want, slots: [Slot::weak(8), Slot::steady(5)], last_sync },
                 "{case}"
             );
         }
@@ -800,7 +829,11 @@ mod tests {
             let chosen = choose_in(&file, trusted).expect("the steady head");
             assert_eq!(
                 chosen,
-                Chosen { meta: meta(4096, 9), slots: [Slot::steady(9), Slot::weak(5)] }
+                Chosen {
+                    meta: meta(4096, 9),
+                    slots: [Slot::steady(9), Slot::weak(5)],
+                    last_sync: None
+                }
             );
         }
     }
@@ -816,7 +849,11 @@ mod tests {
             let chosen = choose_in(&file, trusted).expect("choose");
             assert_eq!(
                 chosen,
-                Chosen { meta: meta(4096, 6), slots: [Slot::steady(5), Slot::steady(6)] }
+                Chosen {
+                    meta: meta(4096, 6),
+                    slots: [Slot::steady(5), Slot::steady(6)],
+                    last_sync: None
+                }
             );
         }
     }

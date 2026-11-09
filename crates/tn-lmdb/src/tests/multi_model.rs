@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     disk_model,
-    env::CrashAt,
+    env::{self, CrashAt},
     meta::slot_to_write,
     tree::{
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
@@ -137,6 +137,11 @@ struct Coverage {
     /// whose txn skipped past a weak head an open passed over (after a power loss).
     weak_reopens: u32,
     skipped_txns: u32,
+    /// Volumes lost in the same boot after the kernel wrote back the weak meta, and the reopens
+    /// after one that fell back from the trusted head to the durable state (open's check of the
+    /// head's pages since the last sync failed).
+    volume_losses: u32,
+    volume_falls_back: u32,
     /// Deletes whose merges absorbed a sibling (`Writer::merging_deletes`).
     merging_deletes: u64,
     /// Each dup table's, in the dup variant ([`DUPS`]).
@@ -578,20 +583,52 @@ impl Run {
     }
 
     /// Drop every handle as a crash would and take the power down as `loss` says (0: process
-    /// crash only, 1: strict, 2: random).
+    /// crash only, 1: strict, 2: random, 3: the volume lost in the same boot after the kernel
+    /// wrote back the weak meta's page, if a slot holds one, random writeback for the rest).
     fn go_down(&mut self, loss: u64) {
         self.drop_readers();
-        self.env.take().expect("open").crash();
+        let env = self.env.take().expect("open");
+        if loss == 3 {
+            let size = self.page_size as usize;
+            env.with_writer(|w| {
+                if let Some(slot) = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)) {
+                    w.file.msync_page(slot as u32, size).expect("the meta page's writeback");
+                }
+            });
+        }
+        env.crash();
         match loss {
             0 => self.seen.process_crashes += 1,
             1 => {
                 disk_model::power_loss(&self.path);
                 self.seen.strict_losses += 1;
             }
-            _ => {
+            2 => {
                 disk_model::power_loss_random(&self.path, self.rng.next());
                 self.seen.random_losses += 1;
             }
+            _ => {
+                disk_model::volume_loss_random(&self.path, self.rng.next());
+                self.seen.volume_losses += 1;
+            }
+        }
+    }
+
+    /// The state a reopen after `go_down(3)` must find: the newest commit if open's check of the
+    /// trusted weak head passes (every page it names since the durable state survived), else the
+    /// durable state. A read-only open, which writes nothing, runs the same check first.
+    fn after_volume_loss(&mut self) -> (u64, State) {
+        if self.latest.0 == self.durable.0 {
+            return self.durable.clone();
+        }
+        let ro = Env::open_read_only(&self.path, options(SyncMode::Durable)).expect("read-only");
+        let checked = env::take_weak_head_check().expect("a trusted head is checked");
+        drop(ro);
+        if checked.is_ok() {
+            self.latest.clone()
+        } else {
+            self.seen.volume_falls_back += 1;
+            self.durable.clone()
         }
     }
 
@@ -788,9 +825,18 @@ fn random_run_with(
                 run.reopen(latest);
             }
             82..91 => {
-                let loss = run.rng.below(3);
+                // Every other random loss is a volume loss in the same boot instead: the same
+                // draws, so the workload's random sequence is the one without volume losses.
+                let loss = match run.rng.below(3) {
+                    2 if (run.seen.random_losses + run.seen.volume_losses) % 2 == 1 => 3,
+                    loss => loss,
+                };
                 run.go_down(loss);
-                let want = if loss == 0 { run.latest.clone() } else { run.durable.clone() };
+                let want = match loss {
+                    0 => run.latest.clone(),
+                    3 => run.after_volume_loss(),
+                    _ => run.durable.clone(),
+                };
                 run.reopen(want);
             }
             _ => run.stopped_commit(step),
@@ -825,6 +871,7 @@ fn a_random_multi_table_workload_with_crashes_matches_the_model() {
         seen.stopped_to_old >= 20,
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
+        seen.volume_falls_back >= 1,
         seen.merging_deletes >= 3,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -876,6 +923,7 @@ fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model(
         seen.stopped_to_old >= 10,
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
+        seen.volume_falls_back >= 1,
         seen.merging_deletes >= 10,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -932,6 +980,7 @@ fn a_draining_multi_table_workload_with_crashes_matches_the_model() {
         seen.stopped_to_old >= 50,
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
+        seen.volume_falls_back >= 1,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }
@@ -989,6 +1038,7 @@ fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
         seen.stopped_to_old >= 50,
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
+        seen.volume_falls_back >= 1,
     ];
     for d in &seen.dups {
         gate.extend([

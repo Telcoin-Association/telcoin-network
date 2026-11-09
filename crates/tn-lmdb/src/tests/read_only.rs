@@ -14,7 +14,11 @@ use super::{
     damage::{fixture, places, restamped, set_child, tree, write_page, Stage, P},
     *,
 };
-use crate::{disk_model, env::tests::flip, Error};
+use crate::{
+    disk_model,
+    env::{self, tests::flip},
+    Error,
+};
 
 fn open_ro(path: &Path) -> Env {
     Env::open_read_only(path, EnvOptions::default()).expect("open read-only")
@@ -110,9 +114,10 @@ fn a_read_only_open_reads_every_table_and_changes_nothing() {
 }
 
 /// A read-only open applies the weak rule and writes nothing: after `SyncMode::NoSync` commits
-/// and a crash, it trusts the weak head in the same boot (every commit, which checks), opens at
-/// the last sync with `trust_unsynced` off and after a reboot, and leaves the file byte-identical
-/// with its modification time unchanged each time.
+/// and a crash, it trusts the weak head in the same boot once the head's pages since the last
+/// sync pass its check (every commit, which checks), opens at the last sync with
+/// `trust_unsynced` off and after a reboot, unchecked, and leaves the file byte-identical with its
+/// modification time unchanged each time.
 #[test]
 fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
     let (_dir, path) = temp("tn_lmdb_ro_weak");
@@ -132,6 +137,8 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
     for (trust_unsynced, want_txn, want) in [(true, head, &state), (false, synced_txn, &synced)] {
         let options = EnvOptions { trust_unsynced, ..EnvOptions::default() };
         let env = Env::open_read_only(&path, options).expect("open read-only");
+        let checked = env::take_weak_head_check();
+        assert_eq!(checked.is_some_and(|found| found.is_ok()), trust_unsynced, "{checked:?}");
         assert_eq!(env.stat().txn_id, want_txn, "trust_unsynced {trust_unsynced}");
         assert!(newest_state(&env) == *want, "trust_unsynced {trust_unsynced}: the state");
         drop(env);
@@ -139,10 +146,56 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
     }
     disk_model::reboot();
     let env = open_ro(&path);
+    assert_eq!(env::take_weak_head_check(), None, "another boot's head is unchecked");
     assert_eq!(env.stat().txn_id, synced_txn, "after a reboot");
     assert!(newest_state(&env) == synced, "after a reboot: the state");
     drop(env);
     assert!(bytes_and_mtime(&path) == before, "the read-only open changed the file");
+}
+
+/// A read-only open after a volume lost in the same boot falls back as `Env::open` does: the
+/// kernel wrote back the weak meta's page alone, then the volume went, so the head is trusted but
+/// the pages it names since the last sync are gone. The open checks them, falls back to the last
+/// sync, which checks, and writes nothing: the file stays byte-identical with its modification
+/// time unchanged, and the next open falls back again. Commits that reuse free pages keep the
+/// file's length, so the pages' check finds the loss; commits that grow the file lose their
+/// growth with the volume, so the file is shorter than the head's pages.
+#[test]
+fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
+    for (rows, grows) in [(97, false), (7, true)] {
+        let (_dir, path) = temp("tn_lmdb_ro_lost");
+        let synced = written(&path);
+        disk_model::track(&path);
+        let env = open(&path, SyncMode::NoSync);
+        let mut state = synced.clone();
+        for round in 0..3_u32 {
+            let mut txn = env.begin_rw().expect("begin");
+            for i in (round..1500).step_by(rows) {
+                put(&mut txn, &mut state, "a", &i.to_be_bytes(), &value(10 + round, i, 60));
+            }
+            txn.commit().expect("a NoSync commit");
+        }
+        let (synced_txn, head_pages) = (env.stat().txn_id - 3, env.stat().page_count);
+        env.with_writer(|w| {
+            let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
+            w.file.msync_page(slot as u32, P as usize).expect("the meta page's writeback");
+        });
+        env.crash();
+        disk_model::volume_loss(&path);
+        disk_model::untrack(&path);
+        let short = fs::metadata(&path).expect("metadata").len() < u64::from(head_pages) * P;
+        assert_eq!(short, grows, "rows step {rows}");
+        let before = bytes_and_mtime(&path);
+        for reopen in 0..2 {
+            let case = format!("rows step {rows}, reopen {reopen}");
+            let env = open_ro(&path);
+            assert_eq!(env::take_weak_head_check(), Some(Err(())), "{case}: it falls back");
+            assert_eq!(env.stat().txn_id, synced_txn, "{case}: the last sync");
+            assert!(newest_state(&env) == synced, "{case}: the state");
+            drop(env);
+            assert!(bytes_and_mtime(&path) == before, "{case}: the open changed the file");
+        }
+    }
 }
 
 /// A read-only open syncs nothing: a meta that reached the page cache but not the disk (its

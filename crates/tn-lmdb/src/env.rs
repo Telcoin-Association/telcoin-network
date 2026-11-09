@@ -10,9 +10,10 @@
 //! would replace the link, not create its target). The file is then locked
 //! (`flock(LOCK_EX | LOCK_NB)`, so a second open fails with [`Error::Locked`], in this process
 //! too), and the meta chosen ([`choose_meta`]: the newest valid one, but a weak one only in the
-//! boot that wrote it). Open never writes to an existing file: a file that is shorter than the
-//! chosen meta's page count, not a tn-lmdb file, or whose catalog or free-tree root fails its
-//! checks fails closed, unchanged.
+//! boot that wrote it, and only once the pages it names since the last sync pass
+//! [`check::check_since`], else the last sync: [`opened_snapshot`]). Open never writes to an
+//! existing file: a file that is shorter than the chosen meta's page count, not a tn-lmdb file, or
+//! whose catalog or free-tree root fails its checks fails closed, unchanged.
 //!
 //! [`Env::open_read_only`] opens an existing file no writer holds (`O_RDONLY`, a shared
 //! `flock`), chooses the meta and checks the roots exactly as [`Env::open`] does, and maps the
@@ -33,8 +34,9 @@
 //! steady one (no sync: [`Writer::defer_sync`]) and publishes; [`Env::sync`] (or the
 //! environment's drop) runs the durable steps for the newest state, and so does a commit past
 //! [`EnvOptions::sync_period`] or [`EnvOptions::sync_bytes`] for its own ([`Writer::sync_due`]),
-//! as a durable commit does. A reopen in the same boot trusts a weak head; after a reboot it
-//! opens at the newest steady meta ([`choose_meta`]).
+//! as a durable commit does. A reopen in the same boot trusts a weak head once its pages since the
+//! last sync pass their check; after a reboot it opens at the newest steady meta
+//! ([`choose_meta`]).
 //!
 //! ## Readers
 //!
@@ -147,12 +149,12 @@ pub enum SyncMode {
     /// crash, a power loss or any other reboot rolls back to the last sync. Neither leaves the
     /// file corrupt: the last sync's pages are never overwritten and its meta is never rewritten
     /// before the next sync. A host whose boot id cannot be read trusts no weak meta, so there a
-    /// process crash too rolls back to the last sync. One case a weak meta cannot tell: a volume
-    /// lost without a reboot (pulled, then plugged back in the same boot) can leave it naming
-    /// pages that never reached the disk, or reached it torn. [`Env::check`] finds that state
-    /// [`Error::Corrupt`] (open or a read may find it first, but a page torn by sector passes a
-    /// read's checks), and `trust_unsynced = false` opens at the last sync (README, Open and
-    /// recovery).
+    /// process crash too rolls back to the last sync. A volume lost without a reboot (pulled, then
+    /// plugged back in the same boot) keeps the boot id but can leave a weak meta naming pages
+    /// that never reached the disk, or reached it torn: so open trusts a weak meta only once the
+    /// pages it names that were written since the last sync pass a full check (their CRCs among
+    /// it), and opens at the last sync, with a warning, if any fails. That check costs about one
+    /// CRC pass over those pages, and only after an unclean end (README, Open and recovery).
     ///
     /// Pages freed meanwhile wait for a sync (README, Free list and page reuse), so without
     /// either bound the file grows until one.
@@ -210,12 +212,12 @@ pub struct EnvOptions {
     pub sync_bytes: Option<u64>,
     /// Trust a weak meta, the meta a [`SyncMode::NoSync`] commit writes with no sync, at open when
     /// the running boot wrote it (default `true`): a crash of the process alone then loses no
-    /// commit. `false` opens at the last sync whatever the slots hold, as a reboot does. It is the
-    /// way back from the one case a weak meta cannot tell: a volume lost without a reboot (an
-    /// external drive pulled, then plugged back in the same boot), where a weak meta may name
-    /// pages that never reached the disk, or reached it torn. [`Env::check`] finds such a state
-    /// [`Error::Corrupt`] (a read may return a torn page's bytes first), and the last sync's state
-    /// is intact beside it (README, Open and recovery). Applies to [`Env::open_read_only`] too.
+    /// commit, once open's check of the pages the weak meta names that were written since the
+    /// last sync passes (a volume lost without a reboot, an external drive pulled and plugged back
+    /// in the same boot, may have lost them; a failed check opens at the last sync, with a
+    /// warning). `false` opens at the last sync whatever the slots hold, unchecked, as a reboot
+    /// does: a choice to discard every commit since the last sync (README, Open and recovery).
+    /// Applies to [`Env::open_read_only`] too.
     pub trust_unsynced: bool,
 }
 
@@ -1420,7 +1422,6 @@ impl Env {
         let boot_id = sys::boot_id();
         let trusted = options.trust_unsynced.then_some(boot_id).flatten();
         let (chosen, geometry) = choose_state(&file, trusted)?;
-        let meta = chosen.meta;
         // A crash may have left a meta in the page cache whose msync never finished, a weak head
         // whose pages a dead writer left there, or a created file whose name never reached the
         // disk (a `create` that died, or failed, before its directory sync): make what this open
@@ -1437,7 +1438,8 @@ impl Env {
         // before anything is built on them.
         #[cfg(target_os = "macos")]
         file.msync_range(0..file.file_len())?;
-        let snapshot = checked_snapshot(meta, geometry, file.view())?;
+        let snapshot = opened_snapshot(&chosen, geometry, file.view())?;
+        let meta = snapshot.meta;
         let mut writer = Writer {
             view: file.view(),
             file,
@@ -1516,7 +1518,7 @@ impl Env {
         let (chosen, geometry) = choose_state(&file, trusted)?;
         // No sync, unlike `open`: nothing is built on what this open reads.
         let file = ReadOnlyFile::from_file(file, options.readahead)?;
-        let snapshot = checked_snapshot(chosen.meta, geometry, file.view())?;
+        let snapshot = opened_snapshot(&chosen, geometry, file.view())?;
         let inner = EnvInner::new(geometry, SyncMode::Durable, snapshot, None, Some(file));
         Ok(Env { inner: Arc::new(inner) })
     }
@@ -1875,23 +1877,90 @@ fn remove_unused(tmp: &Path, file: &File) {
 /// Choose the state an open recovers from `file`, locked (open steps 4–6): the meta
 /// [`choose_meta`] picks, trusting weak metas of the boot `trusted` (`None`: none), and its
 /// geometry, refusing a slot's txn id with no next one ([`Chosen::next_txn`]) and a file shorter
-/// than the meta's pages. Reads only.
+/// than the meta's pages. A trusted weak head the file is too short for lost its growth with the
+/// volume: the open falls back to the last sync beside it ([`fall_back`]), whose pages the file
+/// must hold. Reads only.
 fn choose_state(file: &File, trusted: Option<BootId>) -> Result<(Chosen, Geometry)> {
-    let chosen = choose_meta(|offset| read_record(file, offset), trusted)?;
-    let meta = chosen.meta;
-    let geometry = Geometry::new(meta.page_size)?;
+    let mut chosen = choose_meta(|offset| read_record(file, offset), trusted)?;
+    let geometry = Geometry::new(chosen.meta.page_size)?;
     if chosen.next_txn().is_none() {
         return Err(Error::Corrupt("open: a meta's txn id leaves no next txn".to_string()));
     }
-    let needed = u64::from(meta.page_count) * u64::from(meta.page_size);
     let len = file.metadata()?.len();
-    if len < needed {
+    let needed = |meta: &Meta| u64::from(meta.page_count) * u64::from(meta.page_size);
+    if let Some(last_sync) = chosen.last_sync.filter(|_| len < needed(&chosen.meta)) {
+        let why =
+            format!("the file is {len} bytes, shorter than its {} pages", chosen.meta.page_count);
+        chosen =
+            Chosen { meta: fall_back(chosen.meta, last_sync, &why), last_sync: None, ..chosen };
+    }
+    let meta = chosen.meta;
+    if len < needed(&meta) {
         return Err(Error::Corrupt(format!(
             "open: the file is {len} bytes, shorter than the {} pages of its newest meta (txn {})",
             meta.page_count, meta.txn
         )));
     }
     Ok((chosen, geometry))
+}
+
+/// The snapshot an open recovers, read through `view` (the file mapped by open step 8): the
+/// state `chosen` names once its roots pass [`check_root`] (open step 9). A trusted weak head
+/// ([`Chosen::last_sync`]) must also pass [`check::check_since`], the check of every page it names
+/// that was written since the last sync; if it fails in any way (its roots too), the open falls
+/// back to the last sync, with a warning, as for a torn newest record: the volume may have been
+/// lost in this boot, and those pages with it (README, Open and recovery). Reads only.
+fn opened_snapshot(
+    chosen: &Chosen,
+    geometry: Geometry,
+    view: Arc<MapView>,
+) -> Result<Arc<Snapshot>> {
+    let Some(last_sync) = chosen.last_sync else {
+        return checked_snapshot(chosen.meta, geometry, view);
+    };
+    let head = chosen.meta;
+    let checked = checked_snapshot(head, geometry, Arc::clone(&view))
+        .and_then(|snapshot| Ok((check::check_since(&snapshot, last_sync.txn)?, snapshot)));
+    match checked {
+        Ok((_pages, snapshot)) => {
+            #[cfg(test)]
+            WEAK_HEAD_CHECK.with(|last| last.set(Some(Ok(_pages))));
+            Ok(snapshot)
+        }
+        Err(e) => checked_snapshot(fall_back(head, last_sync, &e), geometry, view),
+    }
+}
+
+/// Fall back from the trusted weak head `head`, whose state failed open's check (`why`), to the
+/// last sync beside it, with a warning: the meta to open at.
+fn fall_back(head: Meta, last_sync: Meta, why: &dyn std::fmt::Display) -> Meta {
+    tracing::warn!(
+        target: "tn_lmdb",
+        "open: the weak meta of txn {} names pages written since the last sync (txn {}) that \
+         fail their check, so the open falls back to the last sync: {why}",
+        head.txn,
+        last_sync.txn
+    );
+    #[cfg(test)]
+    WEAK_HEAD_CHECK.with(|last| last.set(Some(Err(()))));
+    last_sync
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: what this thread's last open found when it checked a trusted weak head
+    /// ([`opened_snapshot`]): the pages it checked, or `Err` when it fell back to the last sync.
+    /// Read and cleared by [`take_weak_head_check`].
+    static WEAK_HEAD_CHECK: std::cell::Cell<Option<std::result::Result<u64, ()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: what this thread's last open found when it checked a trusted weak head since the
+/// last sync (`Some(Ok(pages))`: it passed, `Some(Err(()))`: it fell back), and `None` if no open
+/// checked one since the last call.
+#[cfg(test)]
+pub(crate) fn take_weak_head_check() -> Option<std::result::Result<u64, ()>> {
+    WEAK_HEAD_CHECK.with(std::cell::Cell::take)
 }
 
 /// The snapshot of the state `meta` names, read through `view` (the file mapped by open step 8),

@@ -144,10 +144,10 @@ pub struct TnLmdbArgs {
     /// Trust, at open, a [`SyncMode::NoSync`] commit's weak meta (written with no sync) when the
     /// running boot wrote it (default `true`): the engine's `EnvOptions::trust_unsynced`. A crash
     /// of the process alone then loses no commit; a reboot rolls back to the last sync either
-    /// way. `false` opens at the last sync: the way back from a volume lost without a reboot (a
-    /// drive pulled, then plugged back in the same boot), where a weak meta may name pages that
-    /// never reached the disk and reads of its state are `MDBX_CORRUPTED`. Applies to read-only
-    /// opens too.
+    /// way. The engine trusts a weak meta only once the pages it names since the last sync pass a
+    /// full check, and opens at the last sync if any fails (a drive pulled, then plugged back in
+    /// the same boot, may have lost them). `false` opens at the last sync, unchecked: a choice to
+    /// discard every commit since it. Applies to read-only opens too.
     pub trust_unsynced: bool,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table

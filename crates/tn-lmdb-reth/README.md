@@ -44,9 +44,10 @@ tx.commit()?;
   the drop, or a commit past `with_sync_period` or `with_sync_bytes`, the engine's automatic syncs,
   which bound what a reboot loses and how far the file grows; both off by default). A `NoSync`
   commit writes a weak meta (no sync), so a crash of the process alone loses nothing; a reboot
-  rolls back to the last sync. `with_trust_unsynced(false)` (the engine's
-  `EnvOptions::trust_unsynced`) opens at the last sync instead, the way back from a volume lost
-  without a reboot. A clean drop gives back the file's preallocated tail (the engine's close).
+  rolls back to the last sync. The engine trusts a weak meta only once the pages it names since the
+  last sync pass a full check, and opens at the last sync if any fails (a volume lost without a
+  reboot). `with_trust_unsynced(false)` (the engine's `EnvOptions::trust_unsynced`) opens at the
+  last sync instead, discarding the commits since it. A clean drop gives back the file's preallocated tail (the engine's close).
 - **Read cursors are pooled per transaction:** a `TnLmdbTx` keeps the engine cursors its dropped
   cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
   table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new

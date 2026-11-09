@@ -6,7 +6,8 @@ overflow run of contiguous pages (up to 16 MiB). A single writer builds the next
 the trees in pages no reader can reach, while any number of readers see consistent snapshots
 without locks. A commit becomes durable by writing one of two fixed meta pages: commits are
 atomic, and recovery is O(1) because open picks the valid meta with the highest transaction id
-(a `NoSync` commit's weak meta only in the boot that wrote it). Pages a commit frees are reused
+(a `NoSync` commit's weak meta only in the boot that wrote it, once the pages it names since the
+last sync pass a check). Pages a commit frees are reused
 only once no meta slot and no live reader can reach them.
 The free list that tracks them is persisted in the file itself.
 
@@ -541,6 +542,7 @@ page cache: a power loss, a kernel crash):
 | steps 1–3 (memory only) | L | the previous commit (its weak meta, or the last sync's) | the last synced state |
 | a deferring commit's weak meta copy | not applicable | M | the last synced state |
 | a torn weak meta (the process dies inside its 128-byte copy) | not applicable | the last synced state: the torn slot is invalid, the steady slot beside it untouched | the last synced state |
+| a volume lost and back in the same boot (a drive pulled, then plugged back in), after any step | as a reboot | the newest weak meta if the kernel wrote its record back and every page it names since the last sync passes open's check, else the last synced state | as a reboot |
 | step 4 or 5 of a sync (`Env::sync`, the close, a commit past `sync_period` or `sync_bytes`) | L. M's meta was never written, and L's pages are untouched, because pages reachable from either slot are never reused. | the newest weak meta: M's for an `Env::sync` or the close, the previous commit's for a commit that syncs | the last synced state |
 | step 6, before the meta's msync completes | M if its record reached the disk with a valid CRC, else L | M: the page cache holds its steady record | M if its steady record reached the disk with a valid CRC, else the last synced state |
 | after step 6 | M | M | M |
@@ -558,9 +560,9 @@ weak slot already holds the newest txn. Dropping the environment calls it unless
 is latched. Because the reuse gate counts every slot, neither the last sync's pages nor the weak
 head's are overwritten, and the file stays consistent whatever is lost. What a reopen finds
 depends on what survived: a process crash keeps the page cache, so the weak head and its pages
-are there and a reopen in the same boot trusts it; a reboot may have lost pages the weak head
-names, so a reopen in another boot passes over it to the last sync ([Open and
-recovery](#open-and-recovery)). A host whose boot id cannot be read tags its weak metas with
+are there and a reopen in the same boot trusts it, once the pages it names since the last sync
+pass open's check; a reboot may have lost pages the weak head names, so a reopen in another boot
+passes over it to the last sync ([Open and recovery](#open-and-recovery)). A host whose boot id cannot be read tags its weak metas with
 zeros, which no open trusts: there a process crash too rolls back to the last sync.
 
 **Automatic syncs** (`EnvOptions::sync_period`, `EnvOptions::sync_bytes`, both off by default)
@@ -1042,7 +1044,9 @@ checks as `Cursor`'s.
      wrote them holds them for sure. An untrusted weak head (another boot's, a zero id, or
      `trust_unsynced` off) is passed over for the other slot, which must then hold a valid steady
      meta, else `Corrupt`: never the weak head. A trusted weak head needs that steady slot beside it
-     too, as every write keeps one (`meta::slot_to_write`): a file without one is damaged.
+     too, as every write keeps one (`meta::slot_to_write`): a file without one is damaged. It is
+     opened at only once its pages since that last sync pass step 9's check; else the open falls
+     back to the last sync.
    - Both valid requires equal page sizes, and equal txns must be byte-identical.
    - An `UnsupportedVersion` record in either slot refuses the file.
    - No valid meta is `Corrupt` if any slot carries the magic, else `NotTnLmdb`.
@@ -1059,7 +1063,9 @@ checks as `Cursor`'s.
    `Corrupt` before commit step 1 (nothing is written, the environment latches;
    `a_commit_of_the_last_txn_id_is_refused_before_it_writes`).
 6. **Length check.** A file shorter than `page_count × P` is `Corrupt`. Open never falls back to
-   the older meta.
+   the older meta, but for a trusted weak head: a file too short for it lost the growth its
+   commits made, never synced (a volume lost in the same boot), so the open falls back to the last
+   sync beside it, with a warning, and holds that meta to the same check.
 7. **`fsync_file` once, then the directory.** A crash may have left a meta in the page cache whose
    msync never finished, a trusted weak head whose pages a dead writer left there, and a `create`
    that died or failed between its rename and its `fsync_directory` may have left the file's name
@@ -1085,7 +1091,23 @@ checks as `Cursor`'s.
 9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
    its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
    txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
-   already capped at 48 by the decode.
+   already capped at 48 by the decode. A trusted weak head W must then pass the **check since the
+   last sync** S, the steady meta beside it (`check::check_since`, from `opened_snapshot`): the
+   walk of `Env::check`, with every check it makes of a page it reaches (the full CRC and
+   `page::validate`, the txn its parent names, the keys inside its parents' separators, a run's
+   full CRC and zero pad, a packed set's `packed::validate`, each catalog and free record
+   decoded), over the catalog, every table (a dup table's outer tree and its nested trees) and the
+   free tree, but descending only into a page or run its parent names with a txn after S's. It
+   skips the counters and the page accounting, which need the whole state; a page reached twice
+   is `Corrupt`. If W fails it in any way, its roots' check included, the open is at S, with a
+   warning naming both txns and the failure, as for a torn newest record: the slots stay as they
+   are (W's is the next one written, the writer's next txn is past W's: step 5) and open still
+   writes nothing. A steady head is never checked this way (its pages were synced before its
+   meta), nor is a head `trust_unsynced = false` passes over. The check reads about the pages
+   written since S, and runs only after an unclean end, as a clean close leaves a steady head:
+   on an Apple M-series laptop (release build, page cache warm) it took 9 ms for 61 MiB of pages
+   and 115 ms for 463 MiB, about 4 GB/s of CRC, beside 0.4 and 12.5 ms for the steady open of
+   the same files (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`).
 
 **Open never writes to an existing file.** Every failure above leaves the file unchanged.
 Recovery is choosing a meta: there is no repair, no reinitialisation of a non-empty file, and no
@@ -1093,19 +1115,46 @@ fallback past a short file. A torn or invalid slot counts as the lowest and is t
 later commit overwrites. A weak head stays weak: the next sync (`Env::sync`, the close, a durable
 commit) writes a steady meta over it, in `Durable` mode too.
 
-**The one case a weak meta cannot tell: a volume lost without a reboot.** If the volume holding
-the file goes away and comes back within the same boot (an external drive pulled, then plugged
-back in), the page cache is gone but the boot id is not: a weak meta the kernel had written back
-is trusted, though some pages it names may never have reached the disk, or reached it torn. Its
-state is then damaged. Open may find it (`check_root`, the length check), and a read's per-fetch
-checks find a stale or never-written page (its header or txn identity), but only `Env::check`
-finds a page torn by sector, whose header is the new one: it recomputes every page's CRC, which
-reads do not (do-not-flag item 3), so a read before it can return such a page's bytes.
-`Env::check` then is `Corrupt`, or passes on exactly the weak head's state
-(`a_volume_lost_in_the_same_boot_is_corrupt_and_opens_at_the_last_sync_distrusted`). The last
-sync's state is intact in the other slot: after such an event, run `Env::check` before trusting
-the data, and on `Corrupt` open with `EnvOptions::trust_unsynced = false`, which opens at the last
-sync.
+**A volume lost without a reboot.** If the volume holding the file goes away and comes back
+within the same boot (an external drive pulled, then plugged back in), the page cache is gone but
+the boot id is not: a weak meta the kernel had written back is trusted by its boot id, though
+some pages it names may never have reached the disk, or reached it torn by sector, with the new
+header and old bytes after it. Reads do not recompute a page's CRC (do-not-flag item 3), so a
+read could return such a page's bytes. That is why step 9 checks a trusted weak head's pages
+written since the last sync, CRCs included, and opens at the last sync, intact in the other
+slot, when any fails (`a_volume_lost_in_the_same_boot_opens_at_the_last_sync`,
+`a_page_torn_by_sector_since_the_last_sync_falls_back_at_open`). A head whose every page
+survived opens as after a process crash.
+
+**Why the check may skip what was written by the last sync.** The walk skips a page or run its
+parent names with a txn at or before S's. Such a page was stamped by a transaction at or before
+S (a page is written only while private to its transaction, which stamps it with its txn, and a
+parent names the txn its child carries), and nothing has written it since: W's tree still names
+it, and a page a slot's state reaches is never reused (the reuse gate counts W's slot and S's),
+so no later transaction rewrote it in place. It was on the disk before S's meta was:
+- A transaction of the writer that wrote S stamped it: a `Durable` commit's step 4 writes its
+  pages before its meta, and every sync (`Env::sync`, the close, a commit past `sync_period` or
+  `sync_bytes`) writes every page stamped since the previous one, the writer's `unsynced` set,
+  before its steady meta.
+- Or a dead writer before it stamped it, under a weak head an earlier writer open trusted: that
+  open's whole-file sync, before its writer's first meta write, wrote every page the dead writer
+  left dirty, through its mapping too: on Linux step 7's `fsync`, which writes every dirty page of
+  the file; on macOS step 8's `msync` of the whole mapping, since the `fsync` there leaves pages
+  dirtied through a mapping unwritten.
+- An open that passed over a weak head (another boot's, or `trust_unsynced = false`) builds on
+  the steady state beside it, whose pages are durable, and stamps every page with a txn past the
+  head's (step 5), so it names no page of the head's commits. A read-only open writes nothing.
+
+A volume loss keeps what reached the disk, so every skipped page is intact. The parents name
+txns by their low 32 bits (a branch cell's `child_txn`, a `TreeRoot`'s `root_txn`, an overflow
+cell's txn), so the walk compares them by wrapping distance from S's (`check::named_after`): a
+txn is after S when it is 1 to 2^31 − 1 past it. That is exact for every txn after S while W is
+fewer than 2^31 txns past S, the only case the walk prunes (past that it walks everything); a
+page stamped at or before S and less than 2^31 txns before it is skipped, and one from further
+back may be checked needlessly, never skipped wrongly.
+
+`trust_unsynced = false` remains a choice: it opens at the last sync, unchecked, discarding every
+commit since it.
 
 **Known limit: open cannot see a meta writeback error reported earlier.** If a meta msync fails
 (say EIO), the environment latches. On Linux the page cache may keep the new meta in a page now
@@ -1137,7 +1186,8 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
    names, retried up to three times as in step 3 above.
 4. **Choose a meta**, 5. **txn check**, 6. **length check**: exactly as above (`choose_state`):
    an invalid slot is skipped, a weak head is trusted only in the boot that wrote it (and with
-   `trust_unsynced` on), and a file shorter than the chosen meta's pages is still `Corrupt`
+   `trust_unsynced` on), a file too short for a trusted weak head falls back to the last sync,
+   and a file shorter than the chosen meta's pages is still `Corrupt`
    (`a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing`).
 7. **No fsync.** Nothing is built on what this open reads. A meta that a crash left in the page
    cache unsynced (a trusted weak head among them) is the state it reads, and a power loss
@@ -1146,7 +1196,11 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
 8. **Map read-only:** one `PROT_READ` shared mapping of the file's length (`ReadOnlyFile`), with
    no reservation and no growth, advised as in `Env::open`'s step 8. Readers reach it through the
    same `MapView`.
-9. **Check both tree roots**, as above.
+9. **Check both tree roots**, and a trusted weak head since the last sync, as above: a failure
+   opens at the last sync, and nothing is written
+   (`a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing`). On the file of a
+   `NoSync` writer whose process died, that check reads every page written since its last sync;
+   the automatic syncs bound those (`sync_period`, `sync_bytes`).
 
 The environment has no writer. `begin_rw` and `try_begin_rw` return `ReadOnly`, which does not
 latch, whether or not the environment has latched. `sync` returns `Ok(())`, and the drop does
@@ -1759,9 +1813,9 @@ so does a write's `Io` or `Failed` (an environment latched already included), as
 |---|---|
 | `Env::open(path, EnvOptions) -> Result<Env>` | open or create, then recover (see above) |
 | `Env::open_read_only(path, EnvOptions) -> Result<Env>` | open an existing file no writer holds, read-only (see [Read-only open](#read-only-open)): a shared lock, the same meta choice and root checks, a read-only mapping; never creates, writes or syncs; `begin_rw`/`try_begin_rw` return `ReadOnly` |
-| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth, sync_period, sync_bytes, trust_unsynced }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB, `None`, `None`, `true`. `sync_period` and `sync_bytes` are `NoSync`'s automatic syncs: a commit past either commits durably ([Commit protocol](#commit-protocol)); `Durable` and `open_read_only` ignore them. `trust_unsynced: false` makes an open (`open_read_only`'s too) pass over every weak meta for the last sync, the way back from a volume lost without a reboot ([Open and recovery](#open-and-recovery)). `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is `OutOfMemory` after a missing file was created. |
+| `EnvOptions { page_size, map_reserve, sync, readahead, max_growth, sync_period, sync_bytes, trust_unsynced }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere, 1 GiB, `None`, `None`, `true`. `sync_period` and `sync_bytes` are `NoSync`'s automatic syncs: a commit past either commits durably ([Commit protocol](#commit-protocol)); `Durable` and `open_read_only` ignore them. `trust_unsynced: true` trusts a weak meta of the running boot once its pages since the last sync pass open's check (else the open is at the last sync); `false` makes an open (`open_read_only`'s too) pass over every weak meta for the last sync, unchecked, discarding the commits since it ([Open and recovery](#open-and-recovery)). `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). `max_growth` is the largest growth step: the file grows by doubling up to it, then linearly by it, each step preallocated ([Platform notes](#platform-notes)); under `MIN_GROWTH` (1 MiB, public) `Env::open` refuses it with `InvalidMaxGrowth`, before touching the file, and `open_read_only` ignores it. A `map_reserve` past `isize::MAX` is `InvalidMapReserve`, also before the file is touched (`open_read_only` maps the file at its length and ignores it); a reservation the host refuses is `OutOfMemory` after a missing file was created. |
 | `MIN_GROWTH` | the smallest growth step, 1 MiB, and the least `EnvOptions::max_growth` an open accepts, for a caller that checks its own setting first (the reth adapter re-exports it) |
-| `SyncMode::{Durable, NoSync}` | durable at commit, or at the next sync: an `Env::sync`, the drop, or a commit past `sync_period` or `sync_bytes`. A `NoSync` commit's weak meta keeps it through a crash of the process alone; a reboot rolls back to that sync |
+| `SyncMode::{Durable, NoSync}` | durable at commit, or at the next sync: an `Env::sync`, the drop, or a commit past `sync_period` or `sync_bytes`. A `NoSync` commit's weak meta keeps it through a crash of the process alone, once the pages it names since the last sync pass open's check; a reboot, or a failed check (a volume lost in the same boot), rolls back to that sync |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
 | `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
 | `Env::sync()` | make NoSync commits durable (a no-op when no state is pending, that is when a steady slot holds the newest one, and in a read-only environment; in `Durable` mode it makes a weak head the open trusted steady); waits for an open writer in every mode, and returns `Failed` once the environment is latched |
@@ -2259,7 +2313,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
    - the test-only `disk_model.rs`: a copy out of a live mapping into the model's own buffer.
 3. **Reads do not recompute a tree page's CRC, nor a 1-page overflow run's.** The per-fetch checks
    (and a 1-page run's header checks) catch misdirected and reused pages; the CRC is checked before
-   copy-on-write, on the roots at open, on free-list leaves before reuse, and in `Env::check`. A
+   copy-on-write, on the roots at open, on a trusted weak head's pages written since the last
+   sync at open, on free-list leaves before reuse, and in `Env::check`. A
    run of more than one page is the exception (item 13). See
    [Readers and snapshots](#readers-and-snapshots).
 4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector: a
@@ -2412,7 +2467,7 @@ invariants a change must keep.
 | `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
 | `freelist.rs` | free-record codec, gated loading, the fixed-point save |
 | `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
-| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting |
+| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting; `check_since`, open's check of a trusted weak head since the last sync (the same walk, pruned by `named_after`, no accounting) |
 | `latch.rs` | the failure latch |
 | `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, the cut of an inherited tail `distrust_tail`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
@@ -2583,7 +2638,8 @@ commits are not yet measured under the new rule (see
   a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
   tail ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
   which bound its growth and what a reboot loses, and weak metas (format version 6), so that a
-  crash of the process alone loses no `NoSync` commit: it serves as an opt-in fast mode. On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
+  crash of the process alone loses no `NoSync` commit, trusted at open once the pages they name
+  since the last sync pass a check (a volume lost in the same boot falls back to the last sync): it serves as an opt-in fast mode. On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
   A B B A, commits judged where both engines' drive syncs ran fast) put tn-lmdb within 2% of MDBX
   at peak and busy load and within 5% on the other four profiles, with its tables within 1–3% of
   MDBX's size. Of the remaining peak cost, most is step 3's page CRCs, which MDBX does not have.
