@@ -561,3 +561,33 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   reader (`transaction_id`) and the unwind (`remove_blocks_above`) already used the table in both
   layouts (`EitherReader`/`EitherWriter` route it to the database only). Storage path, v2 only:
   the v1 write is unchanged. *Upstream*: n/a (upstream writes it to `RocksDB`).
+
+- **TN-0043** — Storage v2 writes and unwinds `AccountsHistory` and `StoragesHistory` in the
+  database tables. *Kind*: fix.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`, new
+  `HistoryTransitions`, `ensure_wiped_accounts_had_no_storage` and `insert_history_transitions`,
+  `update_history_indices`, `unwind_account_history_indices`, `unwind_storage_history_indices`,
+  `append_blocks_with_state`).
+  *Why*: TN-0014 removed `RocksDB`, which held both history indices under v2, and left empty
+  `if storage_v2 {}` arms where it wrote and unwound them, so a v2 node had no history: every
+  historical account or storage read past the latest block fell back to "not yet written".
+  Re-enabling `update_history_indices` alone does not work, because under v2 it reads the
+  changesets back from static files, and those show only what earlier transactions committed.
+  - Under v2, `save_blocks` builds the block lists from each block's in-memory reverts, with the
+    same filter the static-file changeset writers use, so history has an entry exactly where a
+    changeset row exists. It writes them with `insert_account_history_index` and
+    `insert_storage_history_index`, in the `save_blocks` transaction, timed as
+    `update_history_indices`. `append_blocks_with_state` (test-only) shares the builder in both
+    layouts, which also stops it giving an account whose info did not change a history entry
+    with no changeset row.
+  - A wiped account's pre-existing slots are not in the reverts. v1 reads them from
+    `PlainStorageState`; v2 has no plain state. The new check fails `save_blocks` if a wiped
+    account had storage before the wipe (in `HashedStorages` before the batch, or changed by an
+    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen; the check makes
+    that an error instead of a silent gap.
+  - The history unwinds run in both layouts.
+  - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
+    committed static-file tip is below the range end, instead of indexing nothing.
+  Storage path: v1's `save_blocks` still calls `update_history_indices` and its unwinds are the
+  same code, so v1 datadirs are written as before. *Upstream*: n/a (upstream writes these to
+  `RocksDB`; its v2 has the same wipe gap).
