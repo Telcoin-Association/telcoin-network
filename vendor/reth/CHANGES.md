@@ -506,3 +506,85 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `blocking_io_permit_tests` drop each request while its blocking task is stalled on the account
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
+
+- **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
+  only).
+  *Files*: `crates/fs-util/{Cargo.toml, src/lib.rs}` (new `fsync_file`, used by
+  `atomic_write_file`; tests), `crates/storage/nippy-jar/src/writer.rs` (data and offsets syncs,
+  and the prune path's), `crates/static-file/types/{Cargo.toml, src/changeset_offsets.rs}` (the
+  `.csoff` sidecar's sync, truncate and open-time heal), and the `.csoff` heal in
+  `crates/storage/provider/src/providers/static_file/writer.rs`.
+  *Why*: every static-file sync was `File::sync_all`, which on macOS is `fcntl(F_FULLFSYNC)`, a
+  drive cache flush per call (about 5 ms each on an M1 Max): 12 a persist under storage v1 and 26
+  under v2, a fixed tax that made Mac benches measure reth's static files instead of the engine.
+  TN's own stores sync with a plain `fsync` on macOS (`tn_storage::archive::data_file::fsync_file`,
+  tn-lmdb's `sys`), and the static files now do the same through one helper,
+  `reth_fs_util::fsync_file`: `rustix::fs::fsync` on macOS (safe; rustix 1.1.4 with `fs` was
+  already in the lockfile through tempfile, so only dependency edges are added), `File::sync_all`
+  elsewhere, so Linux is unchanged. What is written, and the order of writes and syncs, are
+  unchanged, so this cannot reach execution or block validity. *Tests*: `reth-fs-util`'s new
+  tests (a file and a directory sync; a failed sync is returned, which fails if the helper
+  swallows the error; `atomic_write_file` replaces the file and leaves no `.tmp`), and the
+  nippy-jar, static-file-types and provider suites. *Upstream*: no; upstream calls
+  `File::sync_all`, which std makes `F_FULLFSYNC` on macOS.
+
+- **TN-0051** — `save_blocks` writes each static-file segment's configuration in the segment's
+  thread. *Kind*: performance (storage commit path).
+  *Files*: `crates/storage/provider/src/providers/static_file/writer.rs` (new
+  `StaticFileProviderRW::sync_and_freeze`, the `index_pending` flag that `finalize` and `commit`
+  honour), `crates/storage/provider/src/providers/static_file/manager.rs` (`write_segment` calls
+  it; test `frozen_rows_stay_unindexed_until_finalize`),
+  `crates/storage/provider/src/providers/database/provider.rs` (a comment in
+  `DatabaseProvider::commit`; tests `test_save_blocks_without_db_commit_heals_v{1,2}`).
+  *Why*: `DatabaseProvider::commit` wrote every dirty segment's `.conf` one after another on the
+  commit thread (`StaticFileWriters::finalize`), each a temp-file write and `fsync`, a rename
+  and a directory `fsync`: 6 serial syncs a persist under storage v1 and 12 under v2, on the
+  critical path between `save_blocks` and the database commit (Linux p50 5-21 ms, Mac about
+  31 ms). Each segment's thread in `write_blocks_data` now syncs its data, offsets and `.csoff`
+  and then writes its `.conf` itself, beside the database writes of `save_blocks`; `finalize`
+  is left with the in-memory index update (`update_index`). What is written is unchanged, and
+  every `.conf` is still durable before the database commit, because `save_blocks` joins the
+  segment threads first. So a crash anywhere leaves states the startup heal already handles:
+  static files ahead of the database checkpoints, which `check_consistency` prunes back (TN
+  refuses only the opposite direction, an unwind). The one new path to that state is a failure
+  in `save_blocks`' database arm or before the commit after the segments froze; it is the state
+  a crash between `finalize` and the database commit always left. The rows stay unindexed until
+  `finalize`, so readers, which route by the index, do not see them earlier. A jar loaded on a
+  cache miss in that window holds the new rows, and `update_index` replaces it when it publishes
+  them. A range read on `StaticFileProvider` that runs past the index tip inside such a jar can
+  return them early. That is harmless: the index was already ahead of the database for the
+  whole database commit before this change, so callers already see rows the database has not
+  committed. Prune and unwind commits and file rotations keep the full `commit`. It cannot
+  reach execution: the bytes written are the same; only when the `.conf` syncs run changes.
+  *Tests*: `test_save_blocks_without_db_commit_heals_v{1,2}` (save, abort the database
+  transaction: every written segment's `.conf` is on disk at the new tip while the index is
+  not; a reopen through `ProviderFactory::new_checked` prunes them back to genesis without an
+  unwind and the blocks save again) and `frozen_rows_stay_unindexed_until_finalize` (a cache
+  miss after the freeze loads the longer jar, reads by number still stop at the index tip, and
+  `finalize` publishes the rows). They fail if the configuration is not written in the
+  segment thread, if it is published before `finalize`, or if `finalize` skips the index
+  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last. TN's
+  `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
+  tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
+  semantics.
+
+- **TN-0052** — Per-segment timings of the static-file syncs, for benches. *Kind*: TN feature
+  (instrumentation).
+  *Files*: `crates/storage/provider/src/providers/static_file/sync_stats.rs` (new:
+  `StaticFileSyncStats`, `SegmentSyncStats`, `SyncPhaseStats`), `.../static_file/{mod.rs,
+  manager.rs, writer.rs}` (the provider's `sync_stats`, `take_sync_stats`, `record_sync`; the
+  writer times its syncs; test `sync_stats_record_each_phase_per_segment`),
+  `crates/storage/provider/src/providers/mod.rs` (re-exports),
+  `crates/storage/nippy-jar/src/writer.rs` (`sync_data` split out of `sync_all`, and
+  `commit_offsets` made public, so the two syncs are timed apart).
+  *Why*: reth's metrics time the static-file arm of `save_blocks` and the static-file part of
+  the commit as wholes, so nothing showed which sync of which segment a persist waits on.
+  `StaticFileProvider::take_sync_stats` returns, per segment, the calls, total and longest time
+  of five phases since the last take: the data file's write-out and `fsync`, the offsets'
+  append and `fsync`, the `.csoff` `fsync`, the `.conf` freeze (TN-0051) and the index update.
+  Each provider keeps its own under a mutex (about ten uncontended locks a persist), so tests
+  never share them. TN reads them through `RethEnv::take_static_file_sync_stats` (test-utils).
+  Nothing written or synced changes, so this cannot reach execution or storage. *Tests*:
+  `sync_stats_record_each_phase_per_segment` (each phase once per segment, `.csoff` only for a
+  changeset segment, a take drains them; fails when a phase is not recorded) and tn-reth's
+  `test_persist_reports_static_file_sync_stats`. *Upstream*: no.

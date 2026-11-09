@@ -340,20 +340,76 @@ where
     }
 
     // fsync() file
-    file.sync_all().map_err(|err| FsPathError::fsync(err, &tmp_path))?;
+    fsync_file(&file).map_err(|err| FsPathError::fsync(err, &tmp_path))?;
 
     // Rename file, not move
     rename(&tmp_path, file_path)?;
 
     // fsync() directory
     if let Some(parent) = file_path.parent() {
-        OpenOptions::new()
+        let dir = OpenOptions::new()
             .read(true)
             .open(parent)
-            .map_err(|err| FsPathError::open(err, parent))?
-            .sync_all()
-            .map_err(|err| FsPathError::fsync(err, parent))?;
+            .map_err(|err| FsPathError::open(err, parent))?;
+        fsync_file(&dir).map_err(|err| FsPathError::fsync(err, parent))?;
     }
 
     Ok(())
+}
+
+/// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where `sync_all` is
+/// `fcntl(F_FULLFSYNC)` (a drive cache flush on every call) and this is a plain `fsync`.
+///
+/// TN(TN-0050): every static-file sync (`NippyJar` data, offsets and config, the `.csoff`
+/// sidecar, their directory) goes through here, so a persist on macOS pays no `F_FULLFSYNC`. A
+/// plain `fsync` there hands the writes to the drive without flushing its cache, the durability
+/// TN's own stores give on macOS; Linux keeps `sync_all`, which is `fsync`. An interrupted call is
+/// retried, as `sync_all` retries it.
+pub fn fsync_file(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    loop {
+        match rustix::fs::fsync(file) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fsync_file_syncs_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"synced").unwrap();
+        fsync_file(&file).unwrap();
+        fsync_file(&File::open(dir.path()).unwrap()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"synced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_file_returns_the_error() {
+        // A pipe cannot be synced (EINVAL on Linux and macOS), so the call must fail rather than
+        // report a sync that did not happen.
+        let (_reader, writer) = io::pipe().unwrap();
+        let pipe = File::from(std::os::fd::OwnedFd::from(writer));
+        assert!(fsync_file(&pipe).is_err());
+    }
+
+    #[test]
+    fn atomic_write_file_replaces_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        fs::write(&path, b"old").unwrap();
+        atomic_write_file(&path, |file| file.write_all(b"new")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(!path.with_extension("tmp").exists());
+    }
 }

@@ -53,7 +53,8 @@ impl ChangesetOffsetWriter {
                 "Truncating partial changeset offset record"
             );
             file.set_len(truncated_len)?;
-            file.sync_all()?; // Sync required for crash safety
+            // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and below.
+            reth_fs_util::fsync_file(&file)?; // Sync required for crash safety
             truncated_len
         } else {
             file_len
@@ -74,7 +75,7 @@ impl ChangesetOffsetWriter {
                     "Truncating uncommitted changeset offset records after crash recovery"
                 );
                 file.set_len(target_len)?;
-                file.sync_all()?; // Sync required for crash safety
+                reth_fs_util::fsync_file(&file)?; // Sync required for crash safety
             }
             std::cmp::Ordering::Less => {
                 // INVARIANT VIOLATION: This should be impossible if healing ran correctly.
@@ -128,7 +129,7 @@ impl ChangesetOffsetWriter {
 
     /// Syncs all data to disk. Must be called before committing the header.
     pub fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        reth_fs_util::fsync_file(&self.file)
     }
 
     /// Truncates the file to contain exactly `len` records and syncs to disk.
@@ -138,7 +139,7 @@ impl ChangesetOffsetWriter {
     /// resurrect the old file length.
     pub fn truncate(&mut self, len: u64) -> io::Result<()> {
         self.file.set_len(len * Self::RECORD_SIZE as u64)?;
-        self.file.sync_all()?;
+        reth_fs_util::fsync_file(&self.file)?;
         self.records_written = len;
         Ok(())
     }

@@ -507,6 +507,17 @@ impl RethEnv {
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// BENCH-ONLY: the static files' sync timings since the last call, per segment and phase
+    /// (data, offsets and `.csoff` syncs and the `.conf` freeze, which `save_blocks` runs in
+    /// each segment's thread, and the index update in the commit), and starts a new period
+    /// (vendored TN-0052). Call it after each [`Self::persist_executed_output`] for that
+    /// persist's split. Timings are this environment's own; no other provider adds to them.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn take_static_file_sync_stats(&self) -> reth_provider::providers::StaticFileSyncStats {
+        use reth_provider::StaticFileProviderFactory as _;
+        self.inner.blockchain_provider.static_file_provider().take_sync_stats()
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +534,48 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tempfile::TempDir;
     use tn_types::{test_genesis, Address, Bytes, TaskManager, U256};
+
+    /// `take_static_file_sync_stats` reports one persist's static-file syncs: under storage v1
+    /// the headers, transactions and receipts segments each sync their data and offsets, freeze
+    /// their `.conf` and update the index exactly once, and a second take is empty. The first
+    /// persist only warms up: opening a segment's writer runs its heal, which updates the index.
+    #[tokio::test]
+    async fn test_persist_reports_static_file_sync_stats() -> eyre::Result<()> {
+        use reth_provider::StaticFileSegment;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("static file sync stats");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let output1 = consensus_output_for_tests(2, 0, 1, false);
+        let payload1 = TNPayload::new_for_test(chain.sealed_genesis_header(), &output1);
+        let block1 = execute_payload_and_update_canonical_chain(&env, payload1, vec![])?;
+        let _ = env.take_static_file_sync_stats();
+
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 =
+            TNPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &output2);
+        execute_payload_and_update_canonical_chain(&env, payload2, vec![])?;
+        let stats = env.take_static_file_sync_stats();
+        for segment in [
+            StaticFileSegment::Headers,
+            StaticFileSegment::Transactions,
+            StaticFileSegment::Receipts,
+        ] {
+            let s = stats.segment(segment);
+            for (phase, calls) in [
+                ("data", s.data_sync.calls),
+                ("offsets", s.offsets_sync.calls),
+                ("conf", s.conf_freeze.calls),
+                ("update_index", s.update_index.calls),
+            ] {
+                assert_eq!(calls, 1, "{segment:?} {phase}");
+            }
+        }
+        assert!(env.take_static_file_sync_stats().is_empty(), "a take drains the stats");
+        Ok(())
+    }
 
     /// Every block `build_block_from_batch_payload` builds records exactly one sample in each
     /// `RethEnvMetrics::block_*_seconds` histogram, and each nested stage fits inside the stage
