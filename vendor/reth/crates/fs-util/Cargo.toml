@@ -16,3 +16,11 @@ workspace = true
 serde_json = { workspace = true, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
+
+# TN(TN-0050): a plain `fsync` on macOS for `fsync_file` (already in the lockfile through
+# tempfile, with these features).
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true

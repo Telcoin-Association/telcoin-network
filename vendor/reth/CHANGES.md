@@ -506,3 +506,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `blocking_io_permit_tests` drop each request while its blocking task is stalled on the account
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
+
+- **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
+  only).
+  *Files*: `crates/fs-util/{Cargo.toml, src/lib.rs}` (new `fsync_file`, used by
+  `atomic_write_file`; tests), `crates/storage/nippy-jar/src/writer.rs` (data and offsets syncs,
+  and the prune path's), `crates/static-file/types/{Cargo.toml, src/changeset_offsets.rs}` (the
+  `.csoff` sidecar's sync, truncate and open-time heal), and the `.csoff` heal in
+  `crates/storage/provider/src/providers/static_file/writer.rs`.
+  *Why*: every static-file sync was `File::sync_all`, which on macOS is `fcntl(F_FULLFSYNC)`, a
+  drive cache flush per call (about 5 ms each on an M1 Max): 12 a persist under storage v1 and 26
+  under v2, a fixed tax that made Mac benches measure reth's static files instead of the engine.
+  TN's own stores sync with a plain `fsync` on macOS (`tn_storage::archive::data_file::fsync_file`,
+  tn-lmdb's `sys`), and the static files now do the same through one helper,
+  `reth_fs_util::fsync_file`: `rustix::fs::fsync` on macOS (safe; rustix 1.1.4 with `fs` was
+  already in the lockfile through tempfile, so only dependency edges are added), `File::sync_all`
+  elsewhere, so Linux is unchanged. What is written, and the order of writes and syncs, are
+  unchanged, so this cannot reach execution or block validity. *Tests*: `reth-fs-util`'s new
+  tests (a file and a directory sync; a failed sync is returned, which fails if the helper
+  swallows the error; `atomic_write_file` replaces the file and leaves no `.tmp`), and the
+  nippy-jar, static-file-types and provider suites. *Upstream*: no; upstream calls
+  `File::sync_all`, which std makes `F_FULLFSYNC` on macOS.

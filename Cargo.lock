@@ -7430,6 +7430,7 @@ dependencies = [
 name = "reth-fs-util"
 version = "1.11.3"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7971,6 +7972,7 @@ dependencies = [
  "alloy-primitives",
  "derive_more",
  "fixed-map",
+ "reth-fs-util",
  "reth-stages-types",
  "serde",
  "strum",

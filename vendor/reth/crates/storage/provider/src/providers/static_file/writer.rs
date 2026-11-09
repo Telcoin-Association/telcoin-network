@@ -447,7 +447,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     .open(&csoff_path)
                     .map_err(ProviderError::other)?;
                 file.set_len(correct_blocks * 16).map_err(ProviderError::other)?;
-                file.sync_all().map_err(ProviderError::other)?;
+                // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`).
+                reth_fs_util::fsync_file(&file).map_err(ProviderError::other)?;
 
                 tracing::debug!(
                     target: "reth::static_file",

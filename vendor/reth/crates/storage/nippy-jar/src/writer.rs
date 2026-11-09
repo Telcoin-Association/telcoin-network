@@ -331,8 +331,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
             self.commit_offsets_inner()?;
         }
 
-        self.offsets_file.get_ref().sync_all()?;
-        self.data_file.get_ref().sync_all()?;
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
 
         self.offsets_file.seek(SeekFrom::End(0))?;
         self.data_file.seek(SeekFrom::End(0))?;
@@ -370,7 +370,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// configuration and mark the writer as clean.
     pub fn sync_all(&mut self) -> Result<(), NippyJarError> {
         self.data_file.flush()?;
-        self.data_file.get_ref().sync_all()?;
+        // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and at every sync below.
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
 
         self.commit_offsets()?;
         Ok(())
@@ -407,7 +408,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Flushes offsets to disk.
     pub(crate) fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
         self.commit_offsets_inner()?;
-        self.offsets_file.get_ref().sync_all()?;
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
 
         Ok(())
     }
@@ -419,8 +420,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Flushes offsets to disk.
     ///
-    /// CAUTION: Does not call `sync_all` on the offsets file and requires a manual call to
-    /// `self.offsets_file.get_ref().sync_all()`.
+    /// CAUTION: Does not sync the offsets file and requires a manual call to
+    /// `reth_fs_util::fsync_file(self.offsets_file.get_ref())`.
     fn commit_offsets_inner(&mut self) -> Result<(), NippyJarError> {
         // The last offset on disk can be the first offset of `self.offsets` given how
         // `append_column()` works alongside commit. So we need to skip it.
