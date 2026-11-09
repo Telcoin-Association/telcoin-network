@@ -71,6 +71,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 1a6ba945a | TN-0052 | `AlloyHeader::from_compact` returns the buffer past the header; headers TN stores decode as before | codecs tests |
 | e7ebeb869 | TN-0052 | `receipts_by_block` returns `None` instead of a partial list for a block missing receipts | upstream tests |
 | d46664fc8 | TN-0059 | `eth_simulateV1` loads the state of the block it resolved, not a second resolution of `latest` | existing simulate tests; no upstream test |
+| f12d52de2 | TN-0060 | `--txpool.max-batch-size 0` is refused at parse time (it parked the transaction batcher for good) | upstream test |
 
 ## Open
 

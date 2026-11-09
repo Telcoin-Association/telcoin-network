@@ -664,6 +664,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   simulate tests in `rpc/src/eth/helpers/call.rs` and tn-reth's `simulate_v1` tests cover the
   unchanged behaviour. *Upstream*: n/a (upstream commit).
 
+- **TN-0060** — Backport f12d52de2: `--txpool.max-batch-size` refuses 0. *Kind*: backport.
+  *Files*: `crates/node/core/src/args/txpool.rs` (`TxPoolArgs::max_batch_size`, upstream's test).
+  *Why*: tokio's `poll_recv_many` returns zero items for a limit of 0 without registering a waker,
+  so the pool's transaction batcher returned `Pending` forever and every `eth_sendRawTransaction`
+  queued on a oneshot that never answered. TN parses reth's `TxPoolArgs` unchanged
+  (`tn-reth/src/cli.rs`), so the value reached TN's pool (review R13). The flag now takes 1 or
+  more; the default (and every running node) is unchanged. Pool plumbing only.
+  *Tests*: upstream's `txpool_max_batch_size_must_be_nonzero`. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
