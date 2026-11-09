@@ -472,14 +472,14 @@ where
     )
     .await
     .unwrap_err();
-    TraceApiClient::<TransactionRequest>::replay_transaction(
+    assert!(TraceApiClient::<TransactionRequest>::replay_transaction(
         client,
         B256::default(),
         HashSet::default(),
     )
     .await
-    .err()
-    .unwrap();
+    .unwrap()
+    .is_none());
     TraceApiClient::<TransactionRequest>::trace_block(client, block_id).await.unwrap_err();
     TraceApiClient::<TransactionRequest>::replay_block_transactions(
         client,

@@ -759,6 +759,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the result carries the hash and equals the block replay's entry). *Upstream*: n/a (upstream
   commit).
 
+- **TN-0068** — Backport e3d7f0952: `trace_replayTransaction` returns `null` for an unknown
+  transaction.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-api/src/trace.rs` (return type), `crates/rpc/rpc/src/trace.rs`
+  (`replay_transaction` and its handler, which keep TN-0038's permit handling; upstream's test
+  `replay_missing_transaction_returns_null` in the `tests` module),
+  `crates/rpc/rpc-builder/tests/it/http.rs` (the `trace` smoke test expects `null`).
+  *Why*: a replay of a transaction the node does not know failed with `-32001` and
+  `transaction not found`, where `trace_transaction` and `trace_get` answer `null` for the same
+  miss (review R26). It now answers `null` too, as upstream and the other Parity-style clients
+  do; `docs/src/rpc-methods/trace/trace_replaytransaction.md` records the change. RPC only.
+  *Tests*: upstream's `replay_missing_transaction_returns_null` (with and without trace types, over
+  the RPC module) and the updated `rpc-builder` smoke test. *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 

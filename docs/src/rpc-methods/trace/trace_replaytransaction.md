@@ -3,7 +3,7 @@
 > [!NOTE]
 > Served only when `trace` is named in `--http.api` or `--ws.api`; see [Enabling Namespaces](../enabling-namespaces.md).
 
-Replays a mined transaction and returns the trace types requested: the call frames, the executed instructions, the state changes, or any combination. The node re-executes the transaction's block up to and including the transaction. A transaction the node does not know fails with `-32001` and the message `transaction not found`.
+Replays a mined transaction and returns the trace types requested: the call frames, the executed instructions, the state changes, or any combination. The node re-executes the transaction's block up to and including the transaction. The result is `null` for a transaction the node does not know, as [trace\_transaction](trace_transaction.md) answers.
 
 Traces cover the block's transactions only. The system calls a block runs before its transactions (EIP-4788 beacon root, EIP-2935 block hashes) and the epoch-closing system calls (`applyIncentives` and `concludeEpoch`) are not transactions, so no tracer shows them.
 
@@ -15,7 +15,7 @@ Traces cover the block's transactions only. The system calls a block runs before
 
 #### Returns
 
-`Object` - The requested traces, in the shape of one entry of [trace\_replayBlockTransactions](trace_replayblocktransactions.md):
+`Object|null` - The requested traces, in the shape of one entry of [trace\_replayBlockTransactions](trace_replayblocktransactions.md):
 
 * `transactionHash`: `DATA`, 32 Bytes - The hash of the replayed transaction.
 * `output`: `DATA` - The return data of the top-level call; `0x` for a plain transfer.
