@@ -278,8 +278,8 @@
 //! **Durable sync on macOS.** Both backends make a commit durable by `msync`, and neither flushes
 //! the drive's cache. libmdbx, in the write-map mode reth opens it in, msyncs its whole used span
 //! and its meta pages; tn-lmdb msyncs its commit's dirty pages and its meta page. Both write every
-//! page, so Mac durable times compare the same guarantee. reth's static files sync by
-//! `File::sync_all` (`F_FULLFSYNC` on macOS) in both builds.
+//! page, so Mac durable times compare the same guarantee. reth's static files sync by a plain
+//! `fsync` on macOS in both builds (vendor/reth TN-0050; `F_FULLFSYNC` before it).
 //!
 //! **Reading the database writes.** The disk bytes are only an approximation: Linux's
 //! `write_bytes` counts a page as it is dirtied, so a page dirtied once and synced counts once, and
@@ -2798,8 +2798,8 @@ fn report(
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
         out += "  note: on macOS both backends' durable commits are msync (libmdbx its used span, \
-                tn-lmdb its dirty pages), neither a drive-cache flush; the static files' syncs are \
-                F_FULLFSYNC in both\n";
+                tn-lmdb its dirty pages), neither a drive-cache flush; the static files' syncs are a \
+                plain fsync (vendor/reth TN-0050), not F_FULLFSYNC\n";
     }
     out += &format!("  base: {}\n  aged: {}\n", header.base, header.aged);
     out += &format!(

@@ -717,8 +717,9 @@ accounts; the median of 5 alternating runs per build; ms per commit):
 | no-sync | 4 | 86.9 | 77.7 | 0.89 | 41.9 / 30.6 (0.73) |
 
 Both are well inside the reference (tn-lmdb's per-block persist p99 at most 1.25× MDBX's). Most of a
-persist on macOS is reth's static files: their commit is a `File::sync_all`, which is
-`F_FULLFSYNC` on macOS, on every commit in both builds. The verdict uses the no-sync runs
+persist on macOS is reth's static files: their commit was then a `File::sync_all`, which is
+`F_FULLFSYNC` on macOS, on every commit in both builds (a plain `fsync` since vendor/reth
+TN-0050). The verdict uses the no-sync runs
 (MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`). The durable runs
 (3+3: p99 ratio 0.93 and 0.91) predate tn-lmdb's `msync` of mapped pages on macOS. Its scattered
 commits then took a plain `fsync`, which leaves some of those pages unwritten there, so they priced
