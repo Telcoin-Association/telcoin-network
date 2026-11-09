@@ -460,9 +460,10 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 ///   `NoSync` with automatic syncs: a commit returns before it is durable, and the first commit
 ///   made at least [`SAFE_NO_SYNC_PERIOD`] after the last durable state, or whose pages bring those
 ///   written since then to [`SAFE_NO_SYNC_BYTES`], commits durably, with every commit before it
-///   (the engine's `sync_period` and `sync_bytes`). Every other commit writes a weak meta (no
-///   sync), so a crash of the process alone loses nothing; a system crash or a power loss rolls
-///   back to the last durable state. Neither corrupts the file; the automatic syncs bound what a
+///   (the engine's `sync_period` and `sync_bytes`), and so does the first commit after each open
+///   (the open is not a durable state). Every other commit writes a weak meta (no sync), so a
+///   crash of the process alone loses nothing; a system crash or a power loss rolls back to the
+///   last durable state. Neither corrupts the file; the automatic syncs bound what a
 ///   system crash loses and how long the pages commits free wait before they are reused, so the
 ///   file stays bounded. reth's `UtterlyNoSync` (no CLI value) is refused: the engine has no mode
 ///   that never syncs. reth's `NoMetaSync` (no CLI value either) is refused.

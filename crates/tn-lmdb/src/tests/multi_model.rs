@@ -5,7 +5,8 @@
 //! drawn afresh at every reopen. After every commit and every reopen `Env::check` passes, and
 //! every reopen finds exactly the state the protocol allows: after a process crash the newest
 //! commit whose meta reached its slot (in `SyncMode::NoSync` a weak one), after a power loss (a
-//! reboot) the newest steady one. Values are inline only, or, in the
+//! reboot) the newest steady one; each open's first commit takes the txn the slots give
+//! (`first_txn_over`), and is durable in `SyncMode::NoSync` too. Values are inline only, or, in the
 //! large-value variant, spread over inline values and overflow runs of 1 to 10 pages. In the
 //! draining variant, stretches of mostly deletes empty the tables, so many deletes merge pages;
 //! every variant's coverage gate counts the deletes that merged (`Writer::merging_deletes`).
@@ -133,8 +134,9 @@ struct Coverage {
     stopped_commits: u32,
     stopped_to_new: u32,
     stopped_to_old: u32,
-    /// Reopens at a weak head, newer than the durable state (after a process crash), and commits
-    /// whose txn skipped past a weak head an open passed over (after a power loss).
+    /// Reopens at a weak head, newer than the durable state (after a process crash), and an
+    /// open's first commits whose txn skipped past a weak head that open passed over (after a
+    /// power loss).
     weak_reopens: u32,
     skipped_txns: u32,
     /// Volumes lost in the same boot after the kernel wrote back the weak meta, and the reopens
@@ -203,6 +205,12 @@ struct Run {
     /// recovers (each its txn and state).
     latest: (u64, State),
     durable: (u64, State),
+    /// The txn the last open gives its first commit that changes something, from the slots before
+    /// it (`first_txn_over`), until that commit: in `SyncMode::NoSync` a durable one too
+    /// (`Writer::sync_due`). And whether the open passed over a slot's record newer than the
+    /// state it opened at (an untrusted or fallen-back weak head).
+    first: Option<u64>,
+    passed_over: bool,
     readers: Vec<(RoTxn, State)>,
     seen: Coverage,
 }
@@ -541,12 +549,15 @@ impl Run {
             let planned = txn.writer_mut().alloc.txn();
             let id = txn.commit().expect("commit");
             if id != self.latest.0 {
-                // One past the base, or past an untrusted weak head the open passed over.
-                assert!(id == planned && id > self.latest.0, "txn {id} after {}", self.latest.0);
-                self.seen.skipped_txns += u32::from(id > self.latest.0 + 1);
+                // The open's first txn (past the run of the newest steady slot's, so past any
+                // weak head the open passed over), else one past the base.
+                let first = self.first.take();
+                let next = first.unwrap_or(self.latest.0 + 1);
+                assert!(id == planned && id == next, "txn {id} after {}", self.latest.0);
+                self.seen.skipped_txns += u32::from(std::mem::take(&mut self.passed_over));
                 self.latest = (id, work);
                 self.nested_at.insert(id, self.nested());
-                if self.sync == SyncMode::Durable {
+                if self.sync == SyncMode::Durable || first.is_some() {
                     self.durable = self.latest.clone();
                 }
                 self.forget_nested();
@@ -642,6 +653,9 @@ impl Run {
         self.seen.weak_reopens += u32::from(want.0 > self.durable.0);
         loop {
             self.sync = if self.rng.below(2) == 0 { SyncMode::Durable } else { SyncMode::NoSync };
+            let records = [0, 1].map(|slot| slot_record(&self.path, self.page_size, slot));
+            self.first = Some(first_txn_over(records));
+            self.passed_over = records.iter().flatten().any(|&(txn, _)| txn > want.0);
             let env = open(&self.path, self.sync);
             assert_eq!(env.stat().txn_id, want.0, "reopen");
             assert!(newest_state(&env) == want.1, "reopen at txn {}: the state differs", want.0);
@@ -668,8 +682,9 @@ impl Run {
         self.latest = want;
     }
 
-    /// A commit (or, in `SyncMode::NoSync`, the sync after it) stopped at a random point of the
-    /// commit protocol, a random way down, and a reopen to the state the protocol allows.
+    /// A commit (or, in `SyncMode::NoSync`, the sync after it, but for the open's first commit,
+    /// which is durable) stopped at a random point of the commit protocol, a random way down, and
+    /// a reopen to the state the protocol allows.
     fn stopped_commit(&mut self, step: u32) {
         let points = [
             CrashAt::BeforeSave,
@@ -685,6 +700,9 @@ impl Run {
         let slot = env.with_writer(|w| slot_to_write(&w.slots()));
         let mut txn = env.begin_rw().expect("begin");
         let planned = txn.writer_mut().alloc.txn();
+        assert_eq!(planned, self.first.unwrap_or(self.latest.0 + 1), "the stopped commit's txn");
+        // The open's first commit that changes something is durable in `SyncMode::NoSync` too.
+        let durable_commit = self.sync == SyncMode::Durable || self.first.is_some();
         let mut work = self.latest.1.clone();
         self.restart_forms();
         self.random_ops(&mut txn, &mut work, step);
@@ -694,7 +712,7 @@ impl Run {
         let v = value(step, 0, 50);
         txn.put(&t, &key(0), &v).expect("put");
         work.entry("t0".to_string()).or_default().insert(key(0), v);
-        let in_commit = self.sync == SyncMode::Durable
+        let in_commit = durable_commit
             || matches!(at, CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp);
         let stopped = if in_commit {
             txn.writer_mut().crash_at = Some(at);
@@ -716,11 +734,11 @@ impl Run {
         let record = slot_record(&self.path, self.page_size, slot);
         let trusted = record.filter(|&(txn, weak)| txn == new.0 && (loss == 0 || !weak));
         let reaches_new = match at {
-            _ if self.sync == SyncMode::NoSync && in_commit => false,
+            _ if !durable_commit && in_commit => false,
             CrashAt::AfterMetaMsync => true,
             CrashAt::AfterMetaCopy => trusted.is_some(),
             // The commit's weak meta, before the sync that stopped wrote its steady one.
-            _ if self.sync == SyncMode::NoSync => loss == 0,
+            _ if !durable_commit => loss == 0,
             _ => false,
         };
         assert_eq!(reaches_new, trusted.is_some(), "{at:?}, loss {loss}: {record:?}");
@@ -789,6 +807,8 @@ fn random_run_with(
         sync: SyncMode::Durable,
         latest: (0, State::new()),
         durable: (0, State::new()),
+        first: Some(after_steady(0)),
+        passed_over: false,
         readers: Vec::new(),
         seen: Coverage::default(),
     };
@@ -905,7 +925,7 @@ fn a_random_multi_table_workload_with_crashes_matches_the_model_heavy() {
 /// clears of tables holding runs, under the same crashes, power losses and stopped commits.
 #[test]
 fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model() {
-    let seen = random_run(0x7A11_0B16, 300, 4096, true, false);
+    let seen = random_run(0x7A11_0B17, 300, 4096, true, false);
     let gate = [
         seen.run_puts >= 1000,
         seen.ten_page_puts >= 100,
@@ -1025,7 +1045,7 @@ fn packing_gate(seen: &Coverage) -> [bool; 3] {
 /// create packed keys and promote them, the other never packs.
 #[test]
 fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
-    let seen = random_run_with(0xD0B1_3A12, 1500, 4096, false, false, true);
+    let seen = random_run_with(0xD0B1_3A14, 1500, 4096, false, false, true);
     let mut gate = vec![
         seen.commits >= 500,
         seen.aborts >= 50,

@@ -123,16 +123,25 @@ fn an_update_copies_and_checks_its_path() {
     assert_eq!(aborted.commits, 0);
 }
 
-/// NoSync commits count as such and sync nothing; the `Env::sync` that makes their state
-/// durable publishes its durable steps at once, the pages synced being every page the commits
-/// stamped since the last sync; a sync with nothing pending counts nothing.
+/// NoSync commits after the open's first (durable whatever the bounds) count as such and sync
+/// nothing, though one grows the file; the `Env::sync` that makes their state durable publishes
+/// its durable steps at once, the pages synced being every page the commits stamped since the
+/// last sync, the growth counted; a sync with nothing pending counts nothing.
 #[test]
 fn nosync_commits_sync_their_pages_at_env_sync() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::NoSync);
-    put_keys(&env, 0..20, 1, 50);
+    put_keys(&env, [1000], 0, 50);
+    let opened = env.io_stats();
+    assert_eq!((opened.auto_syncs, opened.commits, opened.nosync_commits), (1, 1, 0));
+    let len = |path: &Path| fs::metadata(path).expect("len").len();
+    let synced_len = len(&path);
+    // Values in overflow runs past the slack of the first commit's growth step.
+    put_keys(&env, 0..20, 1, 60_000);
+    assert!(len(&path) > synced_len, "a weak commit grew the file");
     put_keys(&env, [3], 2, 50);
-    let s = env.io_stats();
+    let at_sync = env.io_stats();
+    let s = at_sync.since(&opened);
     assert_eq!((s.nosync_commits, s.commits), (2, 0), "{s:?}");
     assert_eq!((s.pages_synced, s.msync_syncs, s.fdatasync_syncs), (0, 0, 0), "{s:?}");
     assert_eq!((s.data_sync_ns, s.size_sync_ns, s.meta_sync_ns), (0, 0, 0), "{s:?}");
@@ -140,7 +149,7 @@ fn nosync_commits_sync_their_pages_at_env_sync() {
     let pending = env.with_writer(|w| w.unsynced.count()) as u64;
     assert!(pending > 0);
     env.sync().expect("sync");
-    let d = env.io_stats().since(&s);
+    let d = env.io_stats().since(&at_sync);
     assert_eq!((d.commits, d.nosync_commits, d.grown_commits), (1, 0, 1), "{d:?}");
     assert_eq!(d.pages_synced, pending, "{d:?}");
     assert_eq!(d.msync_syncs + d.fdatasync_syncs, 1, "{d:?}");

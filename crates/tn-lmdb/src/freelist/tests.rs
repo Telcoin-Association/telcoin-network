@@ -17,6 +17,7 @@ use crate::{
     catalog, crc, disk_model,
     env::{Env, EnvOptions, SyncMode},
     meta::{Meta, Tag, PAGE_SIZES},
+    tests::{after_steady, first_txn},
     tree::{
         test_harness::{ReportSeed, Rng},
         PageWrite,
@@ -654,7 +655,8 @@ fn file_with_records(path: &Path) -> Records {
     let base = leaf_page.as_ptr() as u64;
     let record = |i: usize| {
         let (k, v) = page::leaf_inline_entry(leaf_page, i).expect("entry");
-        assert_eq!(RecordKey::decode(k).expect("key"), RecordKey { txn: 2, seq: i as u32 });
+        let dropped = after_steady(0) + 1; // the drop's txn: the open's first plus one
+        assert_eq!(RecordKey::decode(k).expect("key"), RecordKey { txn: dropped, seq: i as u32 });
         let offset = u64::from(leaf) * 4096 + (v.as_ptr() as u64 - base);
         (offset, decode_pages(v, snapshot.meta.page_count).expect("pages"))
     };
@@ -935,11 +937,11 @@ fn check_refuses_children_outside_their_separators() {
     assert!(err.contains("outside its parents' separators"), "{err}");
 }
 
-/// A free record keyed by the txn after the state's (the last record of the free tree's leaf
-/// rekeyed, its CRC stamped again; it never passes the reuse gate) is refused where it is met:
-/// `Env::check` finds it later than the state, and the next commit's save, which writes a
-/// record of that key, finds it already there instead of overwriting it (and leaking its
-/// pages). Both are `Corrupt`.
+/// A free record keyed by the txn the next writer is given (`Chosen::next_txn`, past the state's;
+/// the last record of the free tree's leaf rekeyed, its CRC stamped again; it never passes the
+/// reuse gate) is refused where it is met: `Env::check` finds it later than the state, and the
+/// next commit's save, which writes a record of that key, finds it already there instead of
+/// overwriting it (and leaking its pages). Both are `Corrupt`.
 #[test]
 fn a_free_record_of_a_later_txn_is_refused_by_check_and_the_save() {
     let (_dir, path) = temp();
@@ -957,7 +959,9 @@ fn a_free_record_of_a_later_txn_is_refused_by_check_and_the_save() {
         let key = page::leaf_key(&page, page::nkeys(&page) - 1).expect("key");
         key.as_ptr() as usize - page.as_ptr() as usize
     };
-    let later = RecordKey { txn: meta.txn + 1, seq: 0 }.encode();
+    let next = first_txn(&path, 4096);
+    assert!(next > meta.txn);
+    let later = RecordKey { txn: next, seq: 0 }.encode();
     page[off..off + later.len()].copy_from_slice(&later);
     page::stamp(&mut page);
     file.write_all_at(&page, u64::from(meta.free.root) * 4096).expect("write");

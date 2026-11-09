@@ -34,9 +34,12 @@
 //! steady one (no sync: [`Writer::defer_sync`]) and publishes; [`Env::sync`] (or the
 //! environment's drop) runs the durable steps for the newest state, and so does a commit past
 //! [`EnvOptions::sync_period`] or [`EnvOptions::sync_bytes`] for its own ([`Writer::sync_due`]),
-//! as a durable commit does. A reopen in the same boot trusts a weak head once its pages since the
-//! last sync pass their check; after a reboot it opens at the newest steady meta
-//! ([`choose_meta`]).
+//! as a durable commit does, and the first commit that changes something after each open, and one
+//! [`meta::MAX_WEAK_RUN`] txns past the newest steady meta. A reopen in the same boot trusts a weak
+//! head once its pages since the last sync pass their check; after a reboot it opens at the newest
+//! steady meta ([`choose_meta`]). Each open starts its writer [`meta::MAX_WEAK_RUN`] + 1 txns past
+//! the newest steady meta ([`Chosen::next_txn`]), so no txn a dead or rolled-back writer stamped
+//! pages with is given to a commit that does not sync.
 //!
 //! ## Readers
 //!
@@ -88,7 +91,7 @@ use crate::{
     file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE, MAX_GROWTH, MIN_GROWTH},
     freelist,
     latch::{Latch, UnwindLatch},
-    meta::{choose_meta, slot_to_write, Chosen, Meta, Slot, Tag, META_LEN},
+    meta::{self, choose_meta, slot_to_write, Chosen, Meta, Slot, Tag, META_LEN},
     overflow::{checked_run, Ovf, RunCrc},
     page::{self, Geometry, Kind},
     page_set::PageSet,
@@ -140,7 +143,12 @@ pub enum SyncMode {
     /// [`Env::sync`], the close (which runs in the drop of the environment's last handle, on that
     /// thread: a reader's or cursor's drop can be the one that syncs, and a handle alive when the
     /// process exits skips it), or a commit past [`EnvOptions::sync_period`] or
-    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does.
+    /// [`EnvOptions::sync_bytes`], which commits durably as a [`Self::Durable`] commit does. So
+    /// does the first commit that changes something after each open, whatever the bounds (the
+    /// open is not a durable state: a weak head it trusted stays weak until then), and a commit
+    /// whose txn is 2^20 past the last durable state's, so a writer never runs further than that
+    /// past it: no txn a writer stamped pages with is then given to a later writer's commit that
+    /// does not sync (`meta::Chosen::next_txn`).
     ///
     /// A commit that does not sync still writes its meta: unsynced, with no system call, *weak*
     /// (tagged with the running boot's id), into the slot that does not hold the last sync's
@@ -195,8 +203,10 @@ pub struct EnvOptions {
     /// that tail back.
     pub max_growth: u64,
     /// [`SyncMode::NoSync`]: a commit that changes something commits durably once at least this
-    /// long has passed since the last durable state (the open, or the last run of the durable
-    /// steps: a durable commit, an [`Env::sync`]) (default `None`: never by time). Checked at each
+    /// long has passed since the last durable state (the last run of the durable steps: a durable
+    /// commit, an [`Env::sync`]) (default `None`: never by time). The open is not one: the first
+    /// commit that changes something after it commits durably whatever this says, and with it
+    /// the commits of a weak head the open trusted ([`SyncMode::NoSync`]). Checked at each
     /// commit, so no thread or timer syncs: commits that then stop wait for the next commit, an
     /// [`Env::sync`] or the close. A reboot then loses only commits made less than this after the
     /// last durable state (a crash of the process alone loses none: [`SyncMode::NoSync`]), and
@@ -205,10 +215,12 @@ pub struct EnvOptions {
     pub sync_period: Option<Duration>,
     /// [`SyncMode::NoSync`]: a commit that changes something commits durably once the pages
     /// stamped since the last durable state, its own included, hold at least this many bytes
-    /// (pages times the page size) (default `None`: never by size). A reboot then loses less than
-    /// this many bytes of pages (a crash of the process alone, none), and freed pages come back
-    /// within about this many bytes of commits, plus a commit. Ignored in
-    /// [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
+    /// (pages times the page size) (default `None`: never by size). The open is not a durable
+    /// state: the first commit that changes something after it commits durably whatever this
+    /// says, and with it the commits of a weak head the open trusted ([`SyncMode::NoSync`]). A
+    /// reboot then loses less than this many bytes of pages (a crash of the process alone, none),
+    /// and freed pages come back within about this many bytes of commits, plus a commit. Ignored
+    /// in [`SyncMode::Durable`], where every commit is durable, and by [`Env::open_read_only`].
     pub sync_bytes: Option<u64>,
     /// Trust a weak meta, the meta a [`SyncMode::NoSync`] commit writes with no sync, at open when
     /// the running boot wrote it (default `true`): a crash of the process alone then loses no
@@ -554,12 +566,25 @@ pub(crate) struct Writer {
     /// once the reuse gate has passed the txn that frees it, which takes a sync after it (the gate
     /// is at most the newest steady slot's txn).
     unsynced_pages: u64,
+    /// [`SyncMode::NoSync`]: the newest txn a commit may leave weak, [`meta::MAX_WEAK_RUN`] past
+    /// the newest steady slot's ([`meta::weak_limit`]): a commit past it commits durably
+    /// ([`Self::sync_due`]). Set at open, below the writer's first txn ([`Chosen::next_txn`]), so
+    /// the first commit that changes something after any open is durable, and after each run of
+    /// the durable steps over a state this writer committed: not after an [`Env::sync`] of the
+    /// state the open found (a trusted weak head), which would raise it past the first txn.
+    weak_limit: u64,
     /// [`SyncMode::NoSync`]'s automatic syncs ([`Self::sync_due`]): `None` in
-    /// [`SyncMode::Durable`] and when neither bound is set, so a commit then tests one field.
+    /// [`SyncMode::Durable`] and when neither bound is set, so a commit then tests
+    /// [`Self::weak_limit`] alone.
     auto_sync: Option<AutoSync>,
-    /// When the last durable state became durable: the open, then the end of each run of the
-    /// durable steps ([`Self::make_durable`], which takes it from its last clock read).
+    /// When the last run of the durable steps ended ([`Self::make_durable`], which takes it from
+    /// its last clock read), and the open's time before the first: no period is counted from it,
+    /// as the writer's first commit that changes something is durable anyway
+    /// ([`Self::weak_limit`]).
     pub(crate) durable_at: Instant,
+    /// The txn ids the open skipped ([`Chosen::skipped_txns`]), which the reuse gate's lag does
+    /// not count ([`Self::load`]); it ends at the writer's first txn ([`Self::weak_limit`]).
+    skipped: Range<u64>,
     /// The snapshots published, oldest first (see [`Self::oldest_reader_txn`]).
     readers: VecDeque<Published>,
     /// The queue's length after its last full pass (see [`Self::prune_readers`]).
@@ -734,14 +759,19 @@ impl Writer {
         Some(stamp::crcs(&units, threads))
     }
 
-    /// Whether a [`SyncMode::NoSync`] commit that stamped `pages` pages commits durably
-    /// ([`Self::sync_with`]) rather than deferring them ([`Self::defer_sync`]): when the pages
-    /// stamped since the last durable state, these included, hold at least
+    /// Whether a [`SyncMode::NoSync`] commit of `txn` that stamped `pages` pages commits durably
+    /// ([`Self::sync_with`]) rather than deferring them ([`Self::defer_sync`]): when `txn` is past
+    /// [`Self::weak_limit`], more than [`meta::MAX_WEAK_RUN`] txns past the newest steady slot's
+    /// (the writer's first commit after an open always is: [`Chosen::next_txn`]); or when the
+    /// pages stamped since the last durable state, these included, hold at least
     /// [`EnvOptions::sync_bytes`] (pages times the page size), or at least
     /// [`EnvOptions::sync_period`] has passed since that state ([`Self::durable_at`]). With
-    /// neither bound set, a test of one field; the clock is read only with a period set.
+    /// neither bound set, a test of two fields; the clock is read only with a period set.
     #[inline]
-    pub(crate) fn sync_due(&self, pages: usize) -> bool {
+    pub(crate) fn sync_due(&self, txn: u64, pages: usize) -> bool {
+        if txn > self.weak_limit {
+            return true;
+        }
         let Some(auto) = &self.auto_sync else {
             return false;
         };
@@ -875,6 +905,12 @@ impl Writer {
         self.crash_point(CrashAt::AfterMetaCopy)?;
         self.file.msync_page(slot as u32, size)?;
         self.slots[slot] = Some(Slot { txn: meta.txn, weak: false });
+        if meta.txn >= self.skipped.end {
+            // A state this writer committed: its later commits may run weak from it. A sync of
+            // the state the open found leaves the limit below the writer's first txn, so its
+            // first commit is still durable.
+            self.weak_limit = meta::weak_limit(&self.slots);
+        }
         self.stats.meta_sync_ns += lap(&mut clock);
         self.durable_at = clock;
         self.stats.commits += 1;
@@ -908,9 +944,10 @@ impl Writer {
 
     /// Make the newest committed state durable unless a steady slot already holds it: after
     /// [`SyncMode::NoSync`] commits that deferred their sync, or an open that trusted a weak head
-    /// (in either mode). The check is against the newest *steady* slot: a weak slot may hold the
-    /// newest state's txn, and its pages may be only in the page cache. A failure latches. The
-    /// caller checks the latch first.
+    /// (in either mode) and has committed nothing since (its first commit is durable). The check is
+    /// against the newest *steady* slot: a weak slot may hold the newest state's txn, and its
+    /// pages may be only in the page cache. A failure latches. The caller checks the latch
+    /// first.
     fn sync(&mut self, latch: &Latch) -> Result<()> {
         if self.steady_txn().is_some_and(|txn| txn >= self.last.txn) {
             return Ok(());
@@ -969,7 +1006,7 @@ impl Writer {
 
     /// The txn of the newest steady meta the slots hold: the last state made durable.
     fn steady_txn(&self) -> Option<u64> {
-        self.slots.iter().flatten().filter(|slot| !slot.weak).map(|slot| slot.txn).max()
+        meta::newest_steady(&self.slots)
     }
 
     /// The reuse gate: the latest txn whose free records may be reused, the lowest of the txns
@@ -1008,7 +1045,11 @@ impl Writer {
     fn load(&mut self, mut enough: impl FnMut(&mut Allocator, u32) -> bool) -> Result<()> {
         let started = Instant::now();
         let gate = self.reuse_gate();
-        let lag = self.alloc.txn().saturating_sub(gate);
+        // A gate from before the open is behind by the txn ids the open skipped too, which no
+        // commit took: the lag counts commits.
+        let skipped =
+            if gate < self.skipped.start { self.skipped.end - self.skipped.start } else { 0 };
+        let lag = self.alloc.txn().saturating_sub(gate).saturating_sub(skipped);
         self.stats.gate_lag_sum = self.stats.gate_lag_sum.saturating_add(lag);
         self.stats.gate_lag_samples += 1;
         self.stats.max_gate_lag = self.stats.max_gate_lag.max(lag);
@@ -1440,21 +1481,21 @@ impl Env {
         file.msync_range(0..file.file_len())?;
         let snapshot = opened_snapshot(&chosen, geometry, file.view())?;
         let meta = snapshot.meta;
+        let skipped = chosen.skipped_txns().expect("choose_state refuses a slot with no next txn");
         let mut writer = Writer {
             view: file.view(),
             file,
             geometry,
-            alloc: Allocator::new(
-                chosen.next_txn().expect("choose_state refuses a slot with no next txn"),
-                meta.page_count,
-            ),
+            alloc: Allocator::new(skipped.end, meta.page_count),
             last: meta,
             slots: chosen.slots,
             boot_id: boot_id.unwrap_or_default(),
             unsynced: PageSet::default(),
             unsynced_pages: 0,
+            weak_limit: meta::weak_limit(&chosen.slots),
             auto_sync: AutoSync::new(&options),
             durable_at: Instant::now(),
+            skipped,
             readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
             scratch: None,

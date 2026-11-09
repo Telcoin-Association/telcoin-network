@@ -2646,7 +2646,9 @@ impl Work {
         writer.crash_point(CrashAt::AfterStamp)?;
         match inner.sync_mode {
             SyncMode::Durable => writer.make_durable(&pages, &meta)?,
-            SyncMode::NoSync if writer.sync_due(pages.len()) => writer.sync_with(&pages, &meta)?,
+            SyncMode::NoSync if writer.sync_due(txn, pages.len()) => {
+                writer.sync_with(&pages, &meta)?
+            }
             SyncMode::NoSync => writer.defer_sync(&pages, &meta)?,
         }
         writer.publish(inner, meta);
@@ -2658,8 +2660,8 @@ impl Work {
 impl RwTxn {
     pub(crate) fn new(inner: Arc<EnvInner>, writer: Box<Writer>) -> Self {
         let (base, txn) = (writer.last, writer.alloc.txn());
-        // One past the base, but after an open that passed over a weak head one past that head
-        // (`meta::Chosen::next_txn`).
+        // One past the base, but after an open `meta::MAX_WEAK_RUN` + 1 past the newest steady
+        // slot's, so past every slot's (`meta::Chosen::next_txn`).
         debug_assert!(txn > base.txn, "the writer is set for a txn after its base");
         Self {
             inner,
@@ -3058,8 +3060,9 @@ impl RwTxn {
 
     /// Commit: make this transaction's state the newest (durable when this returns in
     /// `SyncMode::Durable`; in `SyncMode::NoSync` at the next sync, which is this commit when it
-    /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes`, and safe from a crash of the
-    /// process alone at once, by its weak meta) and return its txn id. A
+    /// passes `EnvOptions::sync_period` or `EnvOptions::sync_bytes` or is the first commit that
+    /// changes something since the open, and safe from a crash of the process alone at once, by
+    /// its weak meta) and return its txn id. A
     /// transaction that changed nothing returns the id of the state it began from, with no
     /// I/O. An error latches the environment, and whether the commit survives is unknown until
     /// the file is reopened.

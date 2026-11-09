@@ -13,7 +13,9 @@ use std::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{catalog, crc, disk_model, meta::PAGE_SIZES, ReadTxn, Table, TableStat};
+use crate::{
+    catalog, crc, disk_model, meta::PAGE_SIZES, tests::after_steady, ReadTxn, Table, TableStat,
+};
 
 fn temp() -> (TempDir, PathBuf) {
     let dir = TempDir::with_prefix("tn_lmdb_env").expect("temp dir");
@@ -41,6 +43,13 @@ fn put_all(env: &Env, name: &str, entries: &[(&[u8], &[u8])]) -> u64 {
         txn.put(&table, k, v).expect("put");
     }
     txn.commit().expect("commit")
+}
+
+/// The first commit that changes something after an open, durable in `SyncMode::NoSync` too
+/// (`Writer::sync_due`): one row in table `opened`, so a `NoSync` test's commits after it defer
+/// until a bound or a sync. Its txn, the open's first ([`after_steady`] of the steady slot).
+fn durable_first_commit(env: &Env) -> u64 {
+    put_all(env, "opened", &[(b"k", b"v")])
 }
 
 fn table(txn: &impl ReadTxn, name: &str) -> Table {
@@ -91,19 +100,20 @@ fn create_and_reopen_at_every_page_size() {
             model.insert(k, v);
         }
         txn.put(&b, b"only", b"one").expect("put b");
-        assert_eq!(txn.commit().expect("commit"), 1);
+        let first = after_steady(0);
+        assert_eq!(txn.commit().expect("commit"), first);
         let mut txn = env.begin_rw().expect("begin");
         for i in (0..40_u32).step_by(3) {
             let k = format!("k{i:07}").into_bytes();
             assert!(txn.delete(&a, &k).expect("delete"));
             model.remove(&k);
         }
-        assert_eq!(txn.commit().expect("commit"), 2);
+        assert_eq!(txn.commit().expect("commit"), first + 1);
         drop(env);
 
         let env = open(&path);
         assert_eq!(env.stat().page_size, p);
-        assert_eq!((env.stat().txn_id, env.stat().tables), (2, 2));
+        assert_eq!((env.stat().txn_id, env.stat().tables), (first + 1, 2));
         let ro = env.begin_ro().expect("ro");
         let (a, b) = (table(&ro, "a"), table(&ro, "b"));
         let stat = ro.table_stat(&a).expect("stat");
@@ -115,7 +125,7 @@ fn create_and_reopen_at_every_page_size() {
         assert_eq!(val(&ro, &a, b"k0000000"), None);
         assert_eq!(val(&ro, &b, b"only").as_deref(), Some(&b"one"[..]));
         drop(ro);
-        assert_eq!(put_all(&env, "b", &[(b"more", b"two")]), 3);
+        assert_eq!(put_all(&env, "b", &[(b"more", b"two")]), after_steady(first + 1));
         drop(env);
         let env = open(&path);
         let ro = env.begin_ro().expect("ro");
@@ -247,9 +257,10 @@ fn a_symlinked_path_opens_only_the_database_it_names() {
     assert!(matches!(e, Error::NotTnLmdb), "{e}");
 
     fs::remove_file(&target).expect("remove");
-    put_all(&open(&target), "t", &[(b"k", b"v")]);
+    let first = put_all(&open(&target), "t", &[(b"k", b"v")]);
+    assert_eq!(first, after_steady(0));
     let env = open(&path);
-    assert_eq!(put_all(&env, "t", &[(b"k2", b"v2")]), 2);
+    assert_eq!(put_all(&env, "t", &[(b"k2", b"v2")]), after_steady(first));
     drop(env);
     assert_eq!(fs::read_link(&path).expect("still a link"), target);
     let ro = Env::open_read_only(&target, EnvOptions::default()).expect("the target");
@@ -368,7 +379,7 @@ fn readers_keep_their_snapshot_of_every_table() {
     txn.put(&d, b"k", b"v").expect("put d");
     txn.commit().expect("commit");
 
-    assert_eq!(old.txn_id(), 1);
+    assert_eq!(old.txn_id(), after_steady(0));
     for (i, t) in tables.iter().enumerate() {
         assert_eq!(old.table_stat(t).expect("stat").entries, 50);
         for k in [0_u32, 25, 49] {
@@ -451,23 +462,24 @@ fn an_abort_leaves_no_trace() {
 fn a_damaged_newest_meta_falls_back_one_txn() {
     let (_dir, path) = temp();
     let env = open(&path);
-    put_all(&env, "a", &[(b"k", b"1")]); // txn 1: slot 1 (a tie goes to slot 1)
-    put_all(&env, "a", &[(b"k", b"2")]); // txn 2: slot 0
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(2), Slot::steady(1)]);
+    let first = put_all(&env, "a", &[(b"k", b"1")]); // slot 1 (a tie goes to slot 1)
+    assert_eq!(first, after_steady(0));
+    put_all(&env, "a", &[(b"k", b"2")]); // first + 1: slot 0
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(first + 1), Slot::steady(first)]);
     drop(env);
     flip(&path, 20);
 
     let env = open(&path);
-    assert_eq!(env.stat().txn_id, 1);
+    assert_eq!(env.stat().txn_id, first);
     let ro = env.begin_ro().expect("ro");
     assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"1"[..]));
     drop(ro);
-    assert_eq!(env.with_writer(|w| w.slots), [None, Slot::steady(1)]);
-    assert_eq!(put_all(&env, "a", &[(b"k", b"3")]), 2);
+    assert_eq!(env.with_writer(|w| w.slots), [None, Slot::steady(first)]);
+    assert_eq!(put_all(&env, "a", &[(b"k", b"3")]), after_steady(first));
     drop(env);
     let mut record = [0; META_LEN];
     fs::File::open(&path).expect("open").read_exact_at(&mut record, 0).expect("read");
-    assert_eq!(Meta::decode(&record).expect("slot 0 rewritten").0.txn, 2);
+    assert_eq!(Meta::decode(&record).expect("slot 0 rewritten").0.txn, after_steady(first));
     let env = open(&path);
     let ro = env.begin_ro().expect("ro");
     assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"3"[..]));
@@ -488,7 +500,7 @@ fn a_value_holding_meta_bytes_never_refuses_the_open() {
     for at in (4096 - crate::overflow::RUN_HEADER..value.len() - planted.len()).step_by(4096) {
         value[at..at + planted.len()].copy_from_slice(&planted);
     }
-    put_all(&env, "a", &[(b"k", &value)]); // txn 1: slot 1 (a tie goes to slot 1)
+    put_all(&env, "a", &[(b"k", &value)]); // slot 1 (a tie goes to slot 1)
     drop(env);
     let bytes = fs::read(&path).expect("read");
     for p in [8, 16] {
@@ -497,7 +509,7 @@ fn a_value_holding_meta_bytes_never_refuses_the_open() {
     flip(&path, 20); // meta 0, txn 0
 
     let env = open(&path);
-    assert_eq!(env.with_writer(|w| w.slots), [None, Slot::steady(1)]);
+    assert_eq!(env.with_writer(|w| w.slots), [None, Slot::steady(after_steady(0))]);
     let ro = env.begin_ro().expect("ro");
     assert_eq!(val(&ro, &table(&ro, "a"), b"k"), Some(value));
 }
@@ -511,7 +523,8 @@ fn damaged_metas_and_roots_fail_closed() {
     put_all(&env, "a", &[(b"k", b"1")]);
     put_all(&env, "a", &[(b"k", b"2")]);
     let catalog_root = env.inner().current().meta.catalog;
-    assert_eq!((catalog_root.root_txn, catalog_root.height), (2, 1));
+    let root_txn = (after_steady(0) + 1) as u32; // a page names its txn's low 32 bits
+    assert_eq!((catalog_root.root_txn, catalog_root.height), (root_txn, 1));
     drop(env);
 
     // The catalog root fails its CRC (a byte of its last record's value: the page's structure
@@ -525,7 +538,7 @@ fn damaged_metas_and_roots_fail_closed() {
     let mut page = vec![0; 4096];
     file.read_exact_at(&mut page, u64::from(catalog_root.root) * 4096).expect("read");
     let original = page.clone();
-    page[8] ^= 0x02; // header txn 2 -> 0: no later than the meta's, but not the root's
+    page[8] ^= 0x02; // the header txn less 2: no later than the meta's, but not the root's
     page::stamp(&mut page);
     file.write_all_at(&page, u64::from(catalog_root.root) * 4096).expect("write");
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
@@ -679,7 +692,8 @@ fn short_and_foreign_files_fail_closed() {
 fn a_failed_msync_latches() {
     let (_dir, path) = temp();
     let env = open(&path);
-    put_all(&env, "a", &[(b"k", b"1")]);
+    let first = put_all(&env, "a", &[(b"k", b"1")]);
+    assert_eq!(first, after_steady(0));
     env.with_writer(|w| w.file.fail_next_msync());
     let mut txn = env.begin_rw().expect("begin");
     let a = txn.create_table("a").expect("a");
@@ -691,12 +705,12 @@ fn a_failed_msync_latches() {
     assert!(matches!(env.sync(), Err(Error::Failed(_))));
     let ro = env.begin_ro().expect("reads continue");
     assert_eq!(val(&ro, &a, b"k").as_deref(), Some(&b"1"[..]));
-    assert_eq!(env.stat().txn_id, 1);
+    assert_eq!(env.stat().txn_id, first);
     drop(ro);
     drop(env);
     let env = open(&path);
     assert_eq!(env.failure(), None, "a reopen clears the latch");
-    assert_eq!(env.stat().txn_id, 1);
+    assert_eq!(env.stat().txn_id, first);
 }
 
 /// The sync a commit's injected failure hits, for [`a_failed_sync_latches_and_recovers`].
@@ -793,12 +807,13 @@ fn a_failed_meta_msync_latches_and_recovers_the_last_or_the_new_commit() {
 }
 
 /// A write that fails part way latches: the open transaction's later writes and its commit
-/// fail, and in `NoSync` the environment's drop does not sync, so the unsynced commits stay weak,
-/// as after a crash: a reboot loses them.
+/// fail, and in `NoSync` the environment's drop does not sync, so the unsynced commits (those
+/// after the open's first, durable one) stay weak, as after a crash: a reboot loses them.
 #[test]
 fn a_latched_env_neither_writes_nor_syncs_on_drop() {
     let (_dir, path) = temp();
     let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    let durable = durable_first_commit(&env);
     put_all(&env, "a", &[(b"k", b"1")]);
     let mut txn = env.begin_rw().expect("begin");
     let b = txn.create_table("b").expect("b");
@@ -813,7 +828,7 @@ fn a_latched_env_neither_writes_nor_syncs_on_drop() {
     drop(env);
     disk_model::reboot();
     let env = open(&path);
-    assert_eq!(env.stat().txn_id, 0, "the unsynced commit was not synced by the drop");
+    assert_eq!(env.stat().txn_id, durable, "the unsynced commit was not synced by the drop");
 }
 
 /// A sync a destructor runs while an unrelated panic unwinds makes the state durable and leaves
@@ -828,18 +843,19 @@ fn a_sync_a_destructor_runs_during_an_unrelated_unwind_does_not_latch() {
     }
     let (_dir, path) = temp();
     let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
-    put_all(&env, "a", &[(b"k", b"1")]);
+    let weak = durable_first_commit(&env) + 1;
+    assert_eq!(put_all(&env, "a", &[(b"k", b"1")]), weak);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _sync = SyncOnDrop(env.clone());
         panic!("unrelated");
     }));
     assert!(caught.is_err());
     assert_eq!(env.failure(), None);
-    assert_eq!(put_all(&env, "a", &[(b"k", b"2")]), 2);
+    assert_eq!(put_all(&env, "a", &[(b"k", b"2")]), weak + 1);
     env.crash();
     disk_model::reboot();
     let env = open(&path);
-    assert_eq!(env.stat().txn_id, 1, "the sync made txn 1 durable");
+    assert_eq!(env.stat().txn_id, weak, "the sync made the weak commit durable");
 }
 
 /// A write and a commit that a destructor runs during an unrelated panic's unwind succeed and do
@@ -862,51 +878,67 @@ fn a_write_and_commit_a_destructor_runs_during_an_unrelated_unwind_do_not_latch(
     assert!(caught.is_err());
     assert_eq!(env.failure(), None);
     let ro = env.begin_ro().expect("ro");
-    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (2, Some(b"2".to_vec())));
+    let txn = after_steady(0) + 1;
+    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (txn, Some(b"2".to_vec())));
 }
 
-/// `NoSync` commits are visible in-process at once, and each writes a weak meta into the slot that
-/// does not hold the last sync's: a process crash in the same boot recovers the last commit, one
-/// after a reboot the last sync (the weak meta untrusted, though its bytes are all there); a sync
-/// and a clean drop make the newest state steady. The writer reopened past an untrusted weak head
-/// gives its first commit a txn past that head's.
+/// `NoSync` commits are visible in-process at once, and each but an open's first (durable) writes
+/// a weak meta into the slot that does not hold the last sync's: a process crash in the same boot
+/// recovers the last commit, one after a reboot the last sync (the weak meta untrusted, though its
+/// bytes are all there); a sync and a clean drop make the newest state steady. The writer reopened
+/// past an untrusted weak head gives its first commit a txn past that head's, and that commit,
+/// durable, replaces the head.
 #[test]
 fn nosync_commits_survive_a_process_crash_and_roll_back_at_a_reboot() {
     let (_dir, path) = temp();
     let nosync = options(4096, SyncMode::NoSync);
     let env = Env::open(&path, nosync).expect("open");
-    put_all(&env, "a", &[(b"k", b"1")]); // txn 1: weak, slot 1 (both steady at txn 0: a tie)
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::weak(1)]);
+    let first = durable_first_commit(&env); // slot 1 (both steady at txn 0: a tie)
+    assert_eq!(first, after_steady(0));
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::steady(first)]);
+    put_all(&env, "a", &[(b"k", b"1")]); // weak, slot 0
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(first + 1), Slot::steady(first)]);
     env.crash();
     let env = Env::open(&path, nosync).expect("reopen");
     let ro = env.begin_ro().expect("ro");
-    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (1, Some(b"1".to_vec())));
+    let read = (ro.txn_id(), val(&ro, &table(&ro, "a"), b"k"));
+    assert_eq!(read, (first + 1, Some(b"1".to_vec())));
     drop(ro);
 
+    let reopened = durable_first_commit(&env);
+    assert_eq!(reopened, after_steady(first), "past the run of the steady slot's");
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(reopened), Slot::steady(first)]);
     put_all(&env, "a", &[(b"k", b"2")]);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::weak(2)]);
+    let synced = reopened + 1;
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(reopened), Slot::weak(synced)]);
     assert!(env.with_writer(|w| w.unsynced.count()) > 0);
     env.sync().expect("sync");
-    let synced = [Slot::steady(0), Slot::steady(2)];
-    assert_eq!(env.with_writer(|w| (w.slots, w.unsynced.count())), (synced, 0));
+    let both = [Slot::steady(reopened), Slot::steady(synced)];
+    assert_eq!(env.with_writer(|w| (w.slots, w.unsynced.count())), (both, 0));
     env.sync().expect("a sync with nothing pending");
     put_all(&env, "a", &[(b"k", b"3")]);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(3), Slot::steady(2)]);
+    let head = synced + 1;
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(head), Slot::steady(synced)]);
     env.crash();
 
     disk_model::reboot();
     let env = Env::open(&path, nosync).expect("reopen");
     let ro = env.begin_ro().expect("ro");
-    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (2, Some(b"2".to_vec())));
+    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (synced, Some(b"2".to_vec())));
     drop(ro);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(3), Slot::steady(2)], "as found");
-    assert_eq!(put_all(&env, "a", &[(b"k", b"4")]), 4, "past the untrusted head's txn");
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(4), Slot::steady(2)]);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(head), Slot::steady(synced)], "as found");
+    let past = after_steady(synced);
+    assert!(past > head);
+    assert_eq!(put_all(&env, "a", &[(b"k", b"4")]), past, "past the untrusted head's txn");
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(past), Slot::steady(synced)]);
+    put_all(&env, "a", &[(b"k", b"5")]);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(past), Slot::weak(past + 1)]);
     drop(env); // a clean drop syncs
     let env = open(&path);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(4), Slot::steady(2)]);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(past), Slot::steady(past + 1)]);
     let ro = env.begin_ro().expect("ro");
-    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (4, Some(b"4".to_vec())));
+    let read = (ro.txn_id(), val(&ro, &table(&ro, "a"), b"k"));
+    assert_eq!(read, (past + 1, Some(b"5".to_vec())));
 }
 
 /// `Env::sync` after a `NoSync` commit runs the durable steps although a slot already holds the
@@ -918,14 +950,15 @@ fn a_sync_after_a_weak_commit_runs_the_durable_steps() {
     let (_dir, path) = temp();
     let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
     disk_model::track(&path);
+    let first = durable_first_commit(&env);
     let txn = put_all(&env, "a", &[(b"k", b"1")]);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::weak(txn)]);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(txn), Slot::steady(first)]);
     let before = env.io_stats();
     env.sync().expect("sync");
     let synced = env.io_stats().since(&before);
     assert_eq!(synced.commits, 1, "{synced:?}");
     assert!(synced.pages_synced > 0, "{synced:?}");
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::steady(txn)]);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(txn), Slot::steady(first)]);
     env.crash();
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
@@ -942,17 +975,18 @@ fn a_durable_open_makes_a_trusted_weak_head_steady_at_sync_and_close() {
     for by_close in [false, true] {
         let (_dir, path) = temp();
         let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+        let first = durable_first_commit(&env);
         let txn = put_all(&env, "a", &[(b"k", b"1")]);
         env.crash();
         let env = open(&path);
         assert_eq!(env.stat().txn_id, txn, "by_close {by_close}: the trusted weak head");
-        assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::weak(txn)]);
+        assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(txn), Slot::steady(first)]);
         if by_close {
             drop(env);
         } else {
             env.sync().expect("sync");
             assert_eq!(env.io_stats().commits, 1, "by_close {by_close}: the sync's durable steps");
-            assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(0), Slot::steady(txn)]);
+            assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(txn), Slot::steady(first)]);
             env.crash();
         }
         disk_model::reboot();
@@ -982,7 +1016,8 @@ fn commits_survive_a_power_loss_once_durable() {
 
         let env = open(&path);
         let ro = env.begin_ro().expect("ro");
-        let want_txn = if sync == SyncMode::Durable { 3 } else { 2 };
+        let first = after_steady(0);
+        let want_txn = if sync == SyncMode::Durable { first + 2 } else { first + 1 };
         assert_eq!(ro.txn_id(), want_txn, "{sync:?}");
         let (a, b) = (table(&ro, "a"), table(&ro, "b"));
         for (k, v) in &rows {
@@ -1033,17 +1068,19 @@ fn durable_txn_of(w: &Writer) -> u64 {
     w.steady_txn().expect("a steady slot")
 }
 
-/// `NoSync` with `sync_bytes`: the commit whose stamped pages bring the unsynced pages to the bound
-/// commits durably, over its own pages and the deferred commit's (a strict power loss keeps it),
-/// and the count starts again from it, so the next, smaller commit defers; with a bound one byte
-/// higher, the same commit defers.
+/// `NoSync` with `sync_bytes`, after the open's first commit (durable whatever the bound): the
+/// commit whose stamped pages bring the unsynced pages to the bound commits durably, over its own
+/// pages and the deferred commit's (a strict power loss keeps it), and the count starts again from
+/// it, so the next, smaller commit defers; with a bound one byte higher, the same commit defers.
 #[test]
 fn a_nosync_commit_reaching_sync_bytes_commits_durably() {
-    // The unsynced pages after each round, on a file that never syncs (the rounds allocate the
-    // same pages whatever the bound: nothing freed is reusable before the second sync).
+    // The unsynced pages after each round, on a file that never syncs after the open's first
+    // commit (the rounds allocate the same pages whatever the bound: nothing freed is reusable
+    // before the second sync).
     let unsynced: Vec<u64> = {
         let (_dir, path) = temp();
         let env = open_auto(&path, None, None);
+        durable_first_commit(&env);
         (0..3)
             .map(|round| {
                 auto_sync_round(&env, round);
@@ -1057,23 +1094,33 @@ fn a_nosync_commit_reaching_sync_bytes_commits_durably() {
     let (_dir, path) = temp();
     let env = open_auto(&path, None, Some(reach));
     disk_model::track(&path);
+    let first = after_steady(0);
+    assert_eq!(durable_first_commit(&env), first);
+    let opened = env.io_stats();
+    assert_eq!((opened.nosync_commits, opened.auto_syncs, opened.commits), (0, 1, 1));
     auto_sync_round(&env, 0);
-    let deferred = env.io_stats();
+    let deferred = env.io_stats().since(&opened);
     assert_eq!((deferred.nosync_commits, deferred.auto_syncs, deferred.commits), (1, 0, 0));
+    let deferred = env.io_stats();
     auto_sync_round(&env, 1);
     let d = env.io_stats().since(&deferred);
     assert_eq!((d.nosync_commits, d.auto_syncs, d.commits), (0, 1, 1), "{d:?}");
     assert_eq!(d.pages_synced, unsynced[1], "both commits' pages: {d:?}");
-    assert_eq!(env.with_writer(|w| (durable_txn_of(w), w.unsynced_pages)), (2, 0));
+    assert_eq!(env.with_writer(|w| (durable_txn_of(w), w.unsynced_pages)), (first + 2, 0));
     auto_sync_round(&env, 2);
-    let s = env.io_stats();
+    let s = env.io_stats().since(&opened);
     assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (2, 1, 1), "{s:?}");
     env.crash();
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
     let env = open(&path);
     let ro = env.begin_ro().expect("ro");
-    assert_eq!(ro.txn_id(), 2, "the commit that reached the bound survives, the next does not");
+    let reached = first + 2;
+    assert_eq!(
+        ro.txn_id(),
+        reached,
+        "the commit that reached the bound survives, the next does not"
+    );
     let a = table(&ro, "a");
     for i in 0..300_u32 {
         assert_eq!(val(&ro, &a, &i.to_be_bytes()), Some(auto_sync_value(i, 2)), "row {i}");
@@ -1085,28 +1132,32 @@ fn a_nosync_commit_reaching_sync_bytes_commits_durably() {
     let (_dir, path) = temp();
     let env = open_auto(&path, None, Some(reach + 1));
     disk_model::track(&path);
+    assert_eq!(durable_first_commit(&env), first);
+    let opened = env.io_stats();
     auto_sync_round(&env, 0);
     auto_sync_round(&env, 1);
-    let s = env.io_stats();
+    let s = env.io_stats().since(&opened);
     assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (2, 0, 0), "{s:?}");
     env.crash();
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
-    assert_eq!(open(&path).stat().txn_id, 0, "a byte short of the bound, nothing was synced");
+    let txn = open(&path).stat().txn_id;
+    assert_eq!(txn, first, "a byte short of the bound, nothing past the first commit was synced");
 }
 
 /// `NoSync` with `sync_period`: `Duration::ZERO` makes every commit that changes something
-/// durable. With a period, a commit made one nanosecond short of it after the last durable state
-/// defers and one made at it commits durably (the writer's clock moved by `Writer::clock_at`, so
-/// nothing waits); the period then counts from that commit's durable steps, and from an
-/// `Env::sync`'s, not from the open.
+/// durable. With a period, the open's first commit is durable short of it (the open is no durable
+/// state the period counts from); then a commit made one nanosecond short of it after the last
+/// durable state defers and one made at it commits durably (the writer's clock moved by
+/// `Writer::clock_at`, so nothing waits); the period counts from each durable commit's durable
+/// steps, and from an `Env::sync`'s.
 #[test]
 fn a_nosync_commit_past_sync_period_commits_durably() {
     let (_dir, path) = temp();
     let env = open_auto(&path, Some(Duration::ZERO), None);
-    for i in 1..=3_u8 {
+    for i in 0..3 {
         put_all(&env, "a", &[(b"k", &[i])]);
-        assert_eq!(durable_txn(&env), u64::from(i));
+        assert_eq!(durable_txn(&env), after_steady(0) + u64::from(i));
     }
     env.begin_rw().expect("begin").commit().expect("a commit of no change");
     let s = env.io_stats();
@@ -1118,36 +1169,41 @@ fn a_nosync_commit_past_sync_period_commits_durably() {
     let env = open_auto(&path, Some(period), None);
     let due = |env: &Env| env.with_writer(|w| w.durable_at + period);
     let set_clock = |env: &Env, at: Instant| env.with_writer(|w| w.clock_at = Some(at));
-    let opened = due(&env);
-    set_clock(&env, opened - Duration::from_nanos(1));
+    set_clock(&env, due(&env) - Duration::from_nanos(1));
+    let first = put_all(&env, "a", &[(b"k", b"0")]);
+    assert_eq!(first, after_steady(0));
+    assert_eq!(durable_txn(&env), first, "the open's first commit, short of the period");
+    let after_first = due(&env);
+    set_clock(&env, after_first - Duration::from_nanos(1));
     put_all(&env, "a", &[(b"k", b"1")]);
-    assert_eq!(durable_txn(&env), 0, "short of the period since the open");
-    set_clock(&env, opened);
+    assert_eq!(durable_txn(&env), first, "short of the period since the first commit");
+    set_clock(&env, after_first);
     put_all(&env, "a", &[(b"k", b"2")]);
-    assert_eq!(durable_txn(&env), 2, "the period since the open");
+    assert_eq!(durable_txn(&env), first + 2, "the period since the first commit");
     put_all(&env, "a", &[(b"k", b"3")]);
-    assert_eq!(durable_txn(&env), 2, "short of the period since commit 2");
+    assert_eq!(durable_txn(&env), first + 2, "short of the period since commit 2");
     set_clock(&env, due(&env));
     put_all(&env, "a", &[(b"k", b"4")]);
-    assert_eq!(durable_txn(&env), 4, "the period since commit 2");
+    assert_eq!(durable_txn(&env), first + 4, "the period since commit 2");
     let after_4 = due(&env);
     set_clock(&env, after_4 - Duration::from_nanos(1));
     put_all(&env, "a", &[(b"k", b"5")]);
     env.sync().expect("sync");
     set_clock(&env, after_4);
     put_all(&env, "a", &[(b"k", b"6")]);
-    assert_eq!(durable_txn(&env), 5, "short of the period since the sync");
+    assert_eq!(durable_txn(&env), first + 5, "short of the period since the sync");
     let s = env.io_stats();
-    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (4, 2, 3), "{s:?}");
+    assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (4, 3, 4), "{s:?}");
 }
 
 /// A `NoSync` churn of rewrites, each freeing the pages it copies: with `sync_bytes` the file's
 /// pages stay within the live pages plus what one sync interval and a few commits can hold (a page
 /// freed by txn N is reused from the second commit after the first sync at or after N, once that
 /// commit's weak meta replaced the older steady slot; an interval stamps less than the bound plus
-/// its syncing commit), while with no automatic sync nothing is reused and every commit grows
-/// them. The file's length follows its pages by the growth policy. (Before weak metas a freed
-/// page waited for two syncs, and the same churn held about 290 pages against this bound's 232.)
+/// its syncing commit), while with no bound (only the open's first commit, the load, syncs)
+/// nothing is reused and every commit grows them. The file's length follows its pages by the growth
+/// policy. (Before weak metas a freed page waited for two syncs, and the same churn held about 290
+/// pages against this bound's 232.)
 #[test]
 fn nosync_churn_with_sync_bytes_keeps_the_file_bounded() {
     const ROWS: u32 = 2000;
@@ -1190,15 +1246,134 @@ fn nosync_churn_with_sync_bytes_keeps_the_file_bounded() {
     let (_dir, path) = temp();
     let env = open_auto(&path, None, None);
     load(&env);
-    let loaded = env.stat().page_count;
+    let (loaded, after_load) = (env.stat().page_count, env.io_stats());
+    assert_eq!(after_load.auto_syncs, 1, "the open's first commit: {after_load:?}");
     for round in 0..ROUNDS {
         churn(&env, round);
     }
     let unbounded = u64::from(env.stat().page_count);
-    let s = env.io_stats();
+    let s = env.io_stats().since(&after_load);
     assert_eq!((s.auto_syncs, s.pages_from_pool), (0, 0), "{s:?}");
     assert!(unbounded >= u64::from(loaded) + u64::from(ROUNDS), "every commit grew the file");
     assert!(unbounded > bound, "{unbounded} pages, within the bounded run's {bound}");
+}
+
+/// A writer open is not a durable state, even over a trusted weak head: the first commit that
+/// changes something after it commits durably whatever the bounds (`Writer::sync_due`). So a
+/// loop of short runs in one boot, each a reopen over the last run's weak head, one commit of
+/// 200 rewritten rows under `sync_bytes` (about 53 pages of 200) or `sync_period` (none of it
+/// passing), or with neither bound, and a process crash, syncs once per run: the steady slot
+/// moves with every run, the file stops growing once the reuse gate passes the first runs' freed
+/// pages, and a power loss after the loop loses nothing.
+#[test]
+fn a_crash_loop_in_one_boot_syncs_once_per_run() {
+    let bounds = [(None, Some(200 * 4096)), (Some(Duration::from_secs(3600)), None), (None, None)];
+    for (sync_period, sync_bytes) in bounds {
+        let case = format!("sync_period {sync_period:?}, sync_bytes {sync_bytes:?}");
+        let (_dir, path) = temp();
+        drop(open_auto(&path, sync_period, sync_bytes));
+        disk_model::track(&path);
+        let mut counts = Vec::new();
+        let mut last = 0;
+        for run in 0..10_u32 {
+            let env = open_auto(&path, sync_period, sync_bytes);
+            let mut txn = env.begin_rw().expect("begin");
+            let table = txn.create_table("t").expect("t");
+            for k in 0..200_u32 {
+                txn.put(&table, &k.to_be_bytes(), &[run as u8; 900]).expect("put");
+            }
+            last = txn.commit().expect("commit");
+            let s = env.io_stats();
+            assert_eq!((s.auto_syncs, s.nosync_commits), (1, 0), "{case}, run {run}: {s:?}");
+            assert_eq!(durable_txn(&env), last, "{case}, run {run}: the steady slot moved");
+            counts.push(env.stat().page_count);
+            env.crash();
+        }
+        assert!(counts[4..].iter().all(|&c| c == counts[3]), "{case}: the file grows: {counts:?}");
+        disk_model::power_loss(&path);
+        let env = open(&path);
+        assert_eq!(env.stat().txn_id, last, "{case}: a power loss after the loop loses nothing");
+        let ro = env.begin_ro().expect("ro");
+        let table = ro.open_table("t").expect("open").expect("t");
+        assert_eq!(val(&ro, &table, &0_u32.to_be_bytes()), Some(vec![9; 900]), "{case}");
+        drop(ro);
+        drop(env);
+        disk_model::untrack(&path);
+    }
+}
+
+/// `EnvOptions::sync_bytes` bounds what a reboot loses across a reopen over a trusted weak head
+/// too: the reopen is not a durable state, so its first commit that changes something commits
+/// durably, with the head's deferred commits, though alone it holds fewer pages than the bound.
+/// Here the bound is the pages of the head's one deferred commit and of the reopen's commit: the
+/// commit that brings the pages since the last durable state to it syncs, and a power loss after
+/// it keeps it.
+#[test]
+fn the_sync_bytes_bound_holds_across_a_reopen_over_a_weak_head() {
+    // The pages of rounds 1 and 2, each deferred after a synced round 0.
+    let pages: Vec<u64> = {
+        let (_dir, path) = temp();
+        let env = open_auto(&path, None, None);
+        auto_sync_round(&env, 0);
+        env.sync().expect("sync");
+        (1..3)
+            .map(|round| {
+                auto_sync_round(&env, round);
+                env.with_writer(|w| w.unsynced_pages)
+            })
+            .collect()
+    };
+    assert!(pages[0] > 0 && pages[1] > pages[0], "{pages:?}");
+    let reach = pages[1] * 4096;
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, Some(reach));
+    disk_model::track(&path);
+    auto_sync_round(&env, 0);
+    env.sync().expect("sync");
+    let deferred = env.io_stats().nosync_commits;
+    auto_sync_round(&env, 1);
+    assert_eq!(env.io_stats().nosync_commits - deferred, 1, "round 1 defers: under the bound");
+    let head = env.stat().txn_id;
+    env.crash();
+    let env = open_auto(&path, None, Some(reach));
+    assert_eq!(env.stat().txn_id, head, "the weak head is trusted");
+    auto_sync_round(&env, 2);
+    let s = env.io_stats();
+    assert_eq!(
+        (s.auto_syncs, s.nosync_commits),
+        (1, 0),
+        "round 2 brings the pages since the last \
+         durable state to the bound: {s:?}"
+    );
+    let round2 = env.stat().txn_id;
+    env.crash();
+    disk_model::power_loss(&path);
+    disk_model::untrack(&path);
+    assert_eq!(open(&path).stat().txn_id, round2, "a power loss keeps the synced round 2");
+}
+
+/// An `Env::sync` of the state an open found (here a trusted weak head, made steady) is not a
+/// commit of the writer's: its first commit that changes something after the open is still
+/// durable (`Writer::weak_limit`). It starts past the steady slot the open found, not past the
+/// head (`Chosen::next_txn`), so a weak first commit could be given a txn an earlier writer had
+/// stamped pages with (a dead commit at the end of its run of weak commits).
+#[test]
+fn a_sync_of_the_opened_state_keeps_the_first_commit_durable() {
+    let (_dir, path) = temp();
+    let env = open_auto(&path, None, None);
+    let steady = durable_first_commit(&env);
+    auto_sync_round(&env, 0);
+    let head = env.stat().txn_id;
+    assert_eq!(durable_txn(&env), steady, "round 0 defers");
+    env.crash();
+    let env = open_auto(&path, None, None);
+    assert_eq!(env.stat().txn_id, head, "the weak head is trusted");
+    env.sync().expect("sync");
+    assert_eq!(durable_txn(&env), head, "the sync made the head steady");
+    auto_sync_round(&env, 1);
+    let s = env.io_stats();
+    assert_eq!((s.auto_syncs, s.nosync_commits), (1, 0), "the first commit is durable: {s:?}");
+    assert_eq!(durable_txn(&env), after_steady(steady), "its txn: past the steady slot found");
 }
 
 /// A commit whose pages are scattered over the file (copies taking pages that earlier commits
@@ -1289,22 +1464,23 @@ fn a_commit_of_two_ranges_survives_a_power_loss() {
 fn open_makes_the_meta_it_reads_durable() {
     let (_dir, path) = temp();
     let env = open(&path);
-    put_all(&env, "a", &[(b"k", b"1")]); // txn 1: slot 1
-    put_all(&env, "a", &[(b"k", b"2")]); // txn 2: slot 0
+    let first = put_all(&env, "a", &[(b"k", b"1")]); // slot 1
+    assert_eq!(first, after_steady(0));
+    put_all(&env, "a", &[(b"k", b"2")]); // first + 1: slot 0
     drop(env);
     disk_model::track(&path);
-    // Rewrite slot 1 as txn 3 naming txn 2's state, in the page cache only.
+    // Rewrite slot 1 as txn first + 2 naming first + 1's state, in the page cache only.
     let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
     let mut record = [0; META_LEN];
     file.read_exact_at(&mut record, 0).expect("read");
-    let meta = Meta { txn: 3, ..Meta::decode(&record).expect("txn 2").0 };
+    let meta = Meta { txn: first + 2, ..Meta::decode(&record).expect("first + 1").0 };
     file.write_all_at(&meta.encode(Tag::default()), 4096).expect("write");
     drop(file);
 
-    assert_eq!(open(&path).stat().txn_id, 3);
+    assert_eq!(open(&path).stat().txn_id, first + 2);
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
-    assert_eq!(open(&path).stat().txn_id, 3, "the open synced the meta it chose");
+    assert_eq!(open(&path).stat().txn_id, first + 2, "the open synced the meta it chose");
 }
 
 /// Every writer open syncs the directory naming the file, so a file whose creator died (or
@@ -1408,8 +1584,9 @@ fn begin_rw_waits_for_the_open_writer() {
     };
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "the second writer must wait");
     let committer = std::thread::spawn(move || first.commit().expect("commit"));
-    assert_eq!(committer.join().expect("join"), 1);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(30)).expect("the waiter proceeds"), 2);
+    let txn = after_steady(0);
+    assert_eq!(committer.join().expect("join"), txn);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(30)).expect("the waiter proceeds"), txn + 1);
     waiter.join().expect("join");
     assert!(env.try_begin_rw().expect("try").is_some());
 }
@@ -1515,7 +1692,7 @@ fn oversized_entries_do_not_latch() {
     assert_eq!(env.failure(), None);
     txn.put(&a, &vec![3; max_key], b"v").expect("the longest key");
     txn.put(&a, &[2; 16], &vec![0; max_value]).expect("the longest value");
-    assert_eq!(txn.commit().expect("commit"), 1);
+    assert_eq!(txn.commit().expect("commit"), after_steady(0));
 }
 
 /// A handle of a dropped table is stale, even once the name is re-created (the new table has a
@@ -1555,7 +1732,8 @@ fn stale_handles_are_refused() {
 fn a_commit_of_no_change_writes_nothing() {
     let (_dir, path) = temp();
     let env = open(&path);
-    put_all(&env, "a", &[(b"k", b"v")]);
+    let first = put_all(&env, "a", &[(b"k", b"v")]);
+    assert_eq!(first, after_steady(0));
     put_all(&env, "empty", &[]);
     let before = fs::read(&path).expect("read");
     let mut txn = env.begin_rw().expect("begin");
@@ -1563,9 +1741,9 @@ fn a_commit_of_no_change_writes_nothing() {
     let empty = txn.create_table("empty").expect("empty");
     assert!(!txn.delete(&a, b"missing").expect("delete"));
     txn.clear_table(&empty).expect("clear");
-    assert_eq!(txn.commit().expect("commit"), 2);
-    assert_eq!(env.stat().txn_id, 2);
-    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(2), Slot::steady(1)]);
+    assert_eq!(txn.commit().expect("commit"), first + 1);
+    assert_eq!(env.stat().txn_id, first + 1);
+    assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(first + 1), Slot::steady(first)]);
     assert!(fs::read(&path).expect("read") == before, "a commit of no change wrote");
 }
 
@@ -1589,7 +1767,7 @@ fn table_names_are_validated() {
         let t = txn.create_table(name).expect("valid name");
         assert_eq!(t.name(), name);
     }
-    assert_eq!(txn.commit().expect("commit"), 1);
+    assert_eq!(txn.commit().expect("commit"), after_steady(0));
     assert_eq!((env.failure(), env.stat().tables), (None, 3));
 }
 
@@ -1602,26 +1780,27 @@ fn oldest_reader_txn_tracks_live_snapshots() {
     let oldest = |env: &Env| env.with_writer(|w| w.oldest_reader_txn());
     assert_eq!(oldest(&env), 0);
     let r0 = env.begin_ro().expect("ro");
-    put_all(&env, "a", &[(b"k", b"1")]);
+    let first = put_all(&env, "a", &[(b"k", b"1")]);
+    assert_eq!(first, after_steady(0));
     put_all(&env, "a", &[(b"k", b"2")]);
     assert_eq!(oldest(&env), 0);
     let r2 = env.begin_ro().expect("ro");
     drop(r0);
-    assert_eq!(oldest(&env), 2);
+    assert_eq!(oldest(&env), first + 1);
     put_all(&env, "a", &[(b"k", b"3")]);
-    assert_eq!(oldest(&env), 2);
+    assert_eq!(oldest(&env), first + 1);
     drop(r2);
-    assert_eq!(oldest(&env), 3);
+    assert_eq!(oldest(&env), first + 2);
 
     let stuck = env.begin_ro().expect("ro");
     for i in 0..200_u32 {
         put_all(&env, "a", &[(b"k", &i.to_be_bytes())]);
     }
-    assert_eq!(oldest(&env), 3);
+    assert_eq!(oldest(&env), first + 2);
     let queued = env.with_writer(|w| w.readers.len());
     assert!(queued <= 2 * 16 + 1, "the queue holds {queued} snapshots");
     drop(stuck);
-    assert_eq!(oldest(&env), 203);
+    assert_eq!(oldest(&env), first + 202);
 }
 
 /// The oldest reader's age counts from when a commit superseded the oldest snapshot a live reader
@@ -2527,7 +2706,8 @@ fn a_forked_childs_drop_leaves_the_parents_file_alone() {
 }
 
 /// The forking half of [`a_forked_childs_drop_leaves_the_parents_file_alone`], in `Durable` and
-/// `NoSync` (an unsynced commit pending): the child drops the environment and leaves at once
+/// `NoSync` (an unsynced commit pending, after the open's first, durable, one: the
+/// [`durable_first_commit`]): the child drops the environment and leaves at once
 /// (`_exit`: nothing else of the process runs in it); the file is then byte for byte as it was,
 /// and the parent's next commit, which writes into its slack, and the reopen are sound.
 #[test]
@@ -2539,7 +2719,11 @@ fn a_forked_childs_drop_changes_nothing_in_the_child() {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
         let (_dir, path) = temp();
         let env = Env::open(&path, options(4096, sync)).expect("open");
+        durable_first_commit(&env);
         commit_rows(&env, "a", 0, 50, 100);
+        if sync == SyncMode::NoSync {
+            assert!(env.with_writer(|w| w.unsynced_pages) > 0, "an unsynced commit pending");
+        }
         let before = fs::read(&path).expect("read");
         // SAFETY: the child only drops the environment and calls `_exit`. The harness's other
         // thread waits on a channel, holding no lock the drop takes (both libcs make `malloc`

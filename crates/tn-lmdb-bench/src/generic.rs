@@ -29,8 +29,8 @@ pub(crate) fn seq(dir: &Path, options: EnvOptions, data: &Data, out: &mut Out<'_
     let n = data.sizes.n;
     let wanted = [out.wants("put.seq"), out.wants("put.seq.commit")];
     let ([puts, commit], _, ()) = fresh_passes(dir, "seq", options, wanted, |env| {
+        let table = create_table(env, "seq");
         let mut txn = env.begin_rw().expect("begin");
-        let table = txn.create_table("seq").expect("create");
         let start = Instant::now();
         for i in 0..n {
             txn.put(&table, &(i as u64).to_be_bytes(), data.value(i)).expect("put");
@@ -52,8 +52,8 @@ pub(crate) fn rand(dir: &Path, options: EnvOptions, data: &Data, out: &mut Out<'
     let n = data.sizes.n;
     let wanted = [out.wants("put.rand"), out.wants("put.rand.commit")];
     let ([puts, commit], env, table) = fresh_passes(dir, "rand", options, wanted, |env| {
+        let table = create_table(env, "rand");
         let mut txn = env.begin_rw().expect("begin");
-        let table = txn.create_table("rand").expect("create");
         let start = Instant::now();
         for (i, k) in data.rand_keys.iter().enumerate() {
             txn.put(&table, k, data.value(i)).expect("put");
@@ -67,6 +67,16 @@ pub(crate) fn rand(dir: &Path, options: EnvOptions, data: &Data, out: &mut Out<'
     out.push("put.rand.commit", nanos(commit));
     out.push("put.rand.file_bytes", used_bytes(&env));
     reads(&env, &table, data, out);
+}
+
+/// Create table `name` in a commit of its own, untimed: a fresh environment's first commit that
+/// changes something is durable in `SyncMode::NoSync` too, so the timed commit of a pass is its
+/// second, and a no-sync run times no sync.
+fn create_table(env: &Env, name: &str) -> Table {
+    let mut txn = env.begin_rw().expect("begin");
+    let table = txn.create_table(name).expect("create");
+    txn.commit().expect("commit");
+    table
 }
 
 /// The read rows over the random table of `n` entries, each the fastest of its passes.

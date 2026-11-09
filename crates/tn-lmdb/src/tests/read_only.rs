@@ -114,16 +114,17 @@ fn a_read_only_open_reads_every_table_and_changes_nothing() {
 }
 
 /// A read-only open applies the weak rule and writes nothing: after `SyncMode::NoSync` commits
-/// and a crash, it trusts the weak head in the same boot once the head's pages since the last
-/// sync pass its check (every commit, which checks), opens at the last sync with
-/// `trust_unsynced` off and after a reboot, unchecked, and leaves the file byte-identical with its
-/// modification time unchanged each time.
+/// (past the open's first, durable: the last sync) and a crash, it trusts the weak head in the same
+/// boot once the head's pages since the last sync pass its check (every commit, which checks),
+/// opens at the last sync with `trust_unsynced` off and after a reboot, unchecked, and leaves the
+/// file byte-identical with its modification time unchanged each time.
 #[test]
 fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
     let (_dir, path) = temp("tn_lmdb_ro_weak");
-    let synced = written(&path);
+    let mut state = written(&path);
     let env = open(&path, SyncMode::NoSync);
-    let mut state = synced.clone();
+    let synced_txn = durable_first_commit(&env, &mut state);
+    let synced = state.clone();
     for round in 0..3_u32 {
         let mut txn = env.begin_rw().expect("begin");
         for i in (round..1500).step_by(7) {
@@ -131,7 +132,8 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
         }
         txn.commit().expect("a NoSync commit");
     }
-    let (head, synced_txn) = (env.stat().txn_id, env.stat().txn_id - 3);
+    let head = env.stat().txn_id;
+    assert_eq!(head, synced_txn + 3);
     env.crash();
     let before = bytes_and_mtime(&path);
     for (trust_unsynced, want_txn, want) in [(true, head, &state), (false, synced_txn, &synced)] {
@@ -155,19 +157,20 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
 
 /// A read-only open after a volume lost in the same boot falls back as `Env::open` does: the
 /// kernel wrote back the weak meta's page alone, then the volume went, so the head is trusted but
-/// the pages it names since the last sync are gone. The open checks them, falls back to the last
-/// sync, which checks, and writes nothing: the file stays byte-identical with its modification
-/// time unchanged, and the next open falls back again. Commits that reuse free pages keep the
-/// file's length, so the pages' check finds the loss; commits that grow the file lose their
-/// growth with the volume, so the file is shorter than the head's pages.
+/// the pages it names since the last sync (the open's first commit, durable) are gone. The open
+/// checks them, falls back to the last sync, which checks, and writes nothing: the file stays
+/// byte-identical with its modification time unchanged, and the next open falls back again. Commits
+/// that reuse free pages keep the file's length, so the pages' check finds the loss; commits that
+/// grow the file lose their growth with the volume, so the file is shorter than the head's pages.
 #[test]
 fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
     for (rows, grows) in [(97, false), (7, true)] {
         let (_dir, path) = temp("tn_lmdb_ro_lost");
-        let synced = written(&path);
+        let mut state = written(&path);
         disk_model::track(&path);
         let env = open(&path, SyncMode::NoSync);
-        let mut state = synced.clone();
+        let synced_txn = durable_first_commit(&env, &mut state);
+        let synced = state.clone();
         for round in 0..3_u32 {
             let mut txn = env.begin_rw().expect("begin");
             for i in (round..1500).step_by(rows) {
@@ -175,7 +178,8 @@ fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
             }
             txn.commit().expect("a NoSync commit");
         }
-        let (synced_txn, head_pages) = (env.stat().txn_id - 3, env.stat().page_count);
+        assert_eq!(env.stat().txn_id, synced_txn + 3);
+        let head_pages = env.stat().page_count;
         env.with_writer(|w| {
             let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
             w.file.msync_page(slot as u32, P as usize).expect("the meta page's writeback");
@@ -206,28 +210,30 @@ fn a_read_only_open_syncs_nothing() {
     let (_dir, path) = temp("tn_lmdb_ro_sync");
     let env = open(&path, SyncMode::Durable);
     let mut state = State::new();
+    let first = after_steady(0);
     for v in [&b"1"[..], b"2"] {
         let mut txn = env.begin_rw().expect("begin");
         put(&mut txn, &mut state, "a", b"k", v);
-        txn.commit().expect("commit"); // txn 1: slot 1; txn 2: slot 0
+        txn.commit().expect("commit"); // first: slot 1; first + 1: slot 0
     }
     drop(env);
     disk_model::track(&path);
-    // Rewrite slot 1 as txn 3 naming txn 2's state, in the page cache only.
+    // Rewrite slot 1 as txn first + 2 naming first + 1's state, in the page cache only.
     let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
     let mut record = [0; META_LEN];
     file.read_exact_at(&mut record, 0).expect("read");
-    let meta = Meta { txn: 3, ..Meta::decode(&record).expect("txn 2").0 };
+    let meta = Meta { txn: first + 2, ..Meta::decode(&record).expect("first + 1").0 };
     file.write_all_at(&meta.encode(Tag::default()), P).expect("write");
     drop(file);
 
     let env = open_ro(&path);
-    assert_eq!(env.stat().txn_id, 3, "the page cache's newest meta");
+    assert_eq!(env.stat().txn_id, first + 2, "the page cache's newest meta");
     check(&env);
     drop(env);
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
-    assert_eq!(open_ro(&path).stat().txn_id, 2, "the read-only open synced nothing");
+    let txn = open_ro(&path).stat().txn_id;
+    assert_eq!(txn, first + 1, "the read-only open synced nothing");
 }
 
 /// Read-only opens share the lock: any number coexist, and while one (or a transaction of it)
@@ -314,14 +320,14 @@ fn a_read_only_open_falls_back_past_a_damaged_newest_meta() {
     for v in [&b"1"[..], b"2"] {
         let mut txn = env.begin_rw().expect("begin");
         put(&mut txn, &mut state, "a", b"k", v);
-        txn.commit().expect("commit"); // txn 1: slot 1; txn 2: slot 0
+        txn.commit().expect("commit"); // after_steady(0): slot 1; one past it: slot 0
     }
     drop(env);
     flip(&path, 20);
     let before = fs::read(&path).expect("read");
 
     let env = open_ro(&path);
-    assert_eq!(env.stat().txn_id, 1);
+    assert_eq!(env.stat().txn_id, after_steady(0));
     let ro = env.begin_ro().expect("ro");
     let a = ro.open_table("a").expect("open table").expect("a");
     assert_eq!(ro.get(&a, b"k").expect("get"), Some(&b"1"[..]));

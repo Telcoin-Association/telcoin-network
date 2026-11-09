@@ -10,7 +10,7 @@ use crate::{
     catalog, crc,
     env::tests::{assert_fails_closed, flip},
     freelist::{decode_pages, encode_pages},
-    meta::{Meta, Tag, META_LEN},
+    meta::{Meta, Tag, MAX_WEAK_RUN, META_LEN},
     page,
     tree::{PageRead as _, TreeRoot},
     Error,
@@ -1045,10 +1045,12 @@ fn a_dup_cursor_reads_its_own_working_map_beside_a_table_of_its_id() {
     assert!(env.failure().is_none());
 }
 
-/// A meta whose txn id is one short of the last (only a crafted record has it) opens, and its
-/// reads serve; its commit, which would take the last id and leave the writer none to begin, is
-/// `Corrupt` before anything is written, in either sync mode: no panic, no wrap, both meta slots
-/// as they were. It latches, reads go on, and a reopen finds the state as it was.
+/// A steady meta whose txn id is [`MAX_WEAK_RUN`] + 1 short of the last (only a crafted record
+/// has it) opens, its writer given the last id (`Chosen::next_txn`), and its reads serve; its
+/// commit, which would take the last id and leave the writer none to begin, is `Corrupt` before
+/// anything is written, in either sync mode: no panic, no wrap, both meta slots as they were. It
+/// latches, reads go on, and a reopen finds the state as it was. A steady meta one higher leaves
+/// the open no next txn: the open is `Corrupt` and writes nothing.
 #[test]
 fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
     let (_dir, path) = temp("tn_lmdb_last_txn");
@@ -1068,13 +1070,15 @@ fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
     let txn_of = |at: u64| Meta::decode(&slot(at)).expect("meta").0.txn;
     let newest = if txn_of(0) > txn_of(1) { 0 } else { 1 };
     // Re-encoded, so the record passes its CRC.
-    let last = Meta { txn: u64::MAX - 1, ..Meta::decode(&slot(newest)).expect("meta").0 };
+    let highest = u64::MAX - MAX_WEAK_RUN - 1;
+    let last = Meta { txn: highest, ..Meta::decode(&slot(newest)).expect("meta").0 };
     file.write_all_at(&last.encode(Tag::default()), newest * P).expect("write");
     let slots = [slot(0), slot(1)];
+    assert_eq!(first_txn(&path, P as u32), u64::MAX, "the open's first txn is the last id");
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
         let env = open(&path, sync);
         let ro = env.begin_ro().expect("ro");
-        assert_eq!(ro.txn_id(), u64::MAX - 1, "{sync:?}");
+        assert_eq!(ro.txn_id(), highest, "{sync:?}");
         let a = ro.open_table("a").expect("open").expect("a");
         let mut txn = env.begin_rw().expect("rw");
         assert_eq!(txn.txn_id(), u64::MAX, "{sync:?}");
@@ -1091,20 +1095,25 @@ fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
         drop(env);
         assert_eq!([slot(0), slot(1)], slots, "{sync:?}: neither meta slot changed");
     }
+    let past = Meta { txn: highest + 1, ..last };
+    file.write_all_at(&past.encode(Tag::default()), newest * P).expect("write");
+    assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("no next txn")));
+    file.write_all_at(&last.encode(Tag::default()), newest * P).expect("restore");
     let env = open(&path, SyncMode::Durable);
     let ro = env.begin_ro().expect("ro");
-    assert_eq!(ro.txn_id(), u64::MAX - 1);
+    assert_eq!(ro.txn_id(), highest);
     assert_eq!(
         state_of(&ro, ["a"]),
         State::from([("a".to_string(), Rows::from([(b"key".to_vec(), b"a".to_vec())]))])
     );
 }
 
-/// A meta whose txn id is far above the other slot's (one short of the last: a valid record,
-/// which open takes) makes the reuse gate's lag, the writer's txn less the older slot's, near
-/// `u64::MAX`: a write that loads free records more than once sums it into
-/// `IoStats::gate_lag_sum`, which saturates (no overflow panic, no wrap), and its commit is then
-/// the `Corrupt` that [`a_commit_of_the_last_txn_id_is_refused_before_it_writes`] pins.
+/// A meta whose txn id is far above the other slot's (the highest a steady record open takes may
+/// hold, [`MAX_WEAK_RUN`] + 1 short of the last: a valid record) makes the reuse gate's lag, the
+/// writer's txn less the older slot's, near `u64::MAX`: a write that loads free records more than
+/// once sums it into `IoStats::gate_lag_sum`, which saturates (no overflow panic, no wrap), and its
+/// commit is then the `Corrupt` that [`a_commit_of_the_last_txn_id_is_refused_before_it_writes`]
+/// pins.
 #[test]
 fn a_far_meta_txn_saturates_the_gate_lag() {
     let (_dir, path) = temp("tn_lmdb_far_txn");
@@ -1136,7 +1145,7 @@ fn a_far_meta_txn_saturates_the_gate_lag() {
     };
     let newest = if slot(0).txn > slot(1).txn { 0 } else { 1 };
     // Re-encoded, so the record passes its CRC.
-    let far = Meta { txn: u64::MAX - 1, ..slot(newest) };
+    let far = Meta { txn: u64::MAX - MAX_WEAK_RUN - 1, ..slot(newest) };
     file.write_all_at(&far.encode(Tag::default()), newest * P).expect("write");
     let env = open(&path, SyncMode::Durable);
     let mut txn = env.begin_rw().expect("rw");

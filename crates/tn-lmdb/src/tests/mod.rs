@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use crate::{
     env::{Env, EnvOptions, SyncMode},
-    meta::{Meta, Tag, META_LEN},
+    meta::{Meta, Tag, MAX_WEAK_RUN, META_LEN},
     CheckReport, ReadTxn, RwTxn, Table,
 };
 
@@ -74,6 +74,30 @@ fn slot_record(path: &Path, page_size: u32, slot: usize) -> Option<(u64, bool)> 
     let mut record = [0; META_LEN];
     file.read_exact_at(&mut record, slot as u64 * u64::from(page_size)).ok()?;
     Meta::decode(&record).ok().map(|(meta, tag)| (meta.txn, tag.weak))
+}
+
+/// The txn a writer open gives its first transaction over slots holding `records` (each one's txn
+/// and whether it is weak, as `slot_record` reads them, `None` for a slot with no intact record):
+/// `MAX_WEAK_RUN` + 1 past the newest steady record's, and at least one past every record's
+/// (`Chosen::next_txn`).
+pub(crate) fn first_txn_over(records: [Option<(u64, bool)>; 2]) -> u64 {
+    let newest = records.iter().flatten().map(|&(txn, _)| txn + 1).max().expect("a record");
+    let steady = records.iter().flatten().filter(|&&(_, weak)| !weak).map(|&(txn, _)| txn).max();
+    steady.map_or(newest, |txn| newest.max(after_steady(txn)))
+}
+
+/// The txn a writer open gives its first transaction over the file at `path` (of
+/// `page_size`-byte pages): `first_txn_over` its slots' records, read before the open (which
+/// may rewrite a slot).
+pub(crate) fn first_txn(path: &Path, page_size: u32) -> u64 {
+    first_txn_over([slot_record(path, page_size, 0), slot_record(path, page_size, 1)])
+}
+
+/// The txn a writer open gives its first transaction over a file whose newest steady record is
+/// at `txn` (a new file's, at 0; the last durable commit's or sync's): `MAX_WEAK_RUN` + 1 past
+/// it, past every weak record a writer leaves beside it (`Chosen::next_txn`).
+pub(crate) const fn after_steady(txn: u64) -> u64 {
+    txn + MAX_WEAK_RUN + 1
 }
 
 /// A value of `len` bytes that differs by `tag` and `i`.
@@ -141,6 +165,19 @@ fn put(txn: &mut RwTxn, state: &mut State, name: &str, key: &[u8], value: &[u8])
     let table = txn.create_table(name).expect("table");
     txn.put(&table, key, value).expect("put");
     state.entry(name.to_string()).or_default().insert(key.to_vec(), value.to_vec());
+}
+
+/// The table of the open's first commit in `SyncMode::NoSync` ([`durable_first_commit`]).
+const OPENED: &str = "opened";
+
+/// The first commit that changes something after an open, which commits durably in
+/// `SyncMode::NoSync` too (`Writer::sync_due`): one row in table [`OPENED`], in the transaction
+/// and in `state`, so the `NoSync` commits a test makes after it defer. Its txn: with `state`,
+/// the last sync before them.
+fn durable_first_commit(env: &Env, state: &mut State) -> u64 {
+    let mut txn = env.begin_rw().expect("begin");
+    put(&mut txn, state, OPENED, b"k", b"v");
+    txn.commit().expect("the open's first commit")
 }
 
 /// Remove `key` from table `name` (which must exist), in the transaction and in the model.

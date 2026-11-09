@@ -245,16 +245,69 @@ impl Slot {
     }
 }
 
+/// The most txns a writer stamps past its newest steady meta: a `SyncMode::NoSync` commit whose
+/// txn is further past it commits durably (`Writer::sync_due`), and a writer open starts one past
+/// that run ([`Chosen::next_txn`]). Open's check of a weak head and every fetch's identity check
+/// tell a page from another only by its number and its writer's txn, so no txn may be given to a
+/// commit whose pages a weak meta names while pages another writer stamped with it can be on the
+/// disk; the run is what makes every txn a dead or rolled-back writer stamped lower than the next
+/// writer's first. 2^20: a writer that never syncs on its own (`SyncMode::NoSync` with neither
+/// bound) syncs once per about a million changing commits, which costs nothing measurable; an open
+/// consumes at most 2^20 + 1 txn ids, so the ids last 2^43 opens; and a weak head is at most 2^20
+/// past the steady meta beside it, far inside the 2^31 window open's check of it prunes in
+/// (`check::named_after`).
+pub(crate) const MAX_WEAK_RUN: u64 = 1 << 20;
+
 impl Chosen {
-    /// The txn of the writer's first transaction after this open: one past every txn a valid slot
-    /// holds, an untrusted weak head's too, so no txn id is ever given twice. Every page written
-    /// from then on is newer than every state a slot names: if a later open trusted a weak head
-    /// this one passed over (`EnvOptions::trust_unsynced` off, then on again, in the same boot),
-    /// a page this writer reused under it fails the read's checks (`Corrupt`), never passing for
-    /// the head's own. `None` when a slot holds `u64::MAX`, which leaves no next txn.
+    /// The txn of the writer's first transaction after this open: [`MAX_WEAK_RUN`] + 1 past the
+    /// newest steady slot's, and at least one past every txn a valid slot holds, an untrusted weak
+    /// head's too. So no txn a commit stamped pages with is ever given to a weak commit again.
+    /// Every writer runs at most [`MAX_WEAK_RUN`] txns past its newest steady meta before a commit
+    /// is durable, and its first changing commit, at this txn, is one; that steady meta stays on
+    /// the disk (no write touches the newest steady slot, and open syncs what it found before
+    /// building on it), so every txn a writer that ended in any way stamped (a commit dead in its
+    /// steps 3 to 6, a torn weak or steady copy, weak commits a reboot or a volume lost in the boot
+    /// rolled back, whose pages the kernel had written) is below the next open's first, but for
+    /// the one a durable commit stamped at the end of a full run, which only the next writer's
+    /// first, durable, commit is given again: its pages are synced before its meta is copied, so
+    /// no meta naming that txn ever finds the dead commit's pages. Anchoring the start at the
+    /// steady slot rather than at the newest slot keeps that so when the newest slot is lost: a
+    /// writer that opened over a weak head and died inside its first commit's steady copy over
+    /// the weak slot leaves the steady slot alone, and the next open starts at the dead
+    /// commit's txn again, not below it. Every page written from then on is also newer than
+    /// every state a slot names: if a later open trusted a weak head this one passed over
+    /// (`EnvOptions::trust_unsynced` off, then on again, in the same boot), a page this writer
+    /// reused under it fails the read's checks (`Corrupt`), never passing for the head's own.
+    /// `None` when the txn cannot be formed (a slot at `u64::MAX`, a steady slot less than
+    /// [`MAX_WEAK_RUN`] + 1 below it).
     pub(crate) fn next_txn(&self) -> Option<u64> {
-        self.slots.iter().flatten().map(|slot| slot.txn).max()?.checked_add(1)
+        let newest = self.slots.iter().flatten().map(|slot| slot.txn).max()?.checked_add(1)?;
+        let past_run = match newest_steady(&self.slots) {
+            Some(txn) => txn.checked_add(MAX_WEAK_RUN + 1)?,
+            None => 0,
+        };
+        Some(newest.max(past_run))
     }
+
+    /// The txn ids this open's writer never gives: from one past the newest valid slot's up to
+    /// [`Self::next_txn`]. The reuse gate's lag leaves them out (`IoStats::gate_lag_sum`). `None`
+    /// as for [`Self::next_txn`].
+    pub(crate) fn skipped_txns(&self) -> Option<std::ops::Range<u64>> {
+        let next = self.next_txn()?;
+        let newest = self.slots.iter().flatten().map(|slot| slot.txn).max()?;
+        Some(newest + 1..next)
+    }
+}
+
+/// The txn of the newest steady record `slots` hold, the last state made durable.
+pub(crate) fn newest_steady(slots: &[Option<Slot>; 2]) -> Option<u64> {
+    slots.iter().flatten().filter(|slot| !slot.weak).map(|slot| slot.txn).max()
+}
+
+/// The newest txn a `SyncMode::NoSync` commit may leave weak beside `slots`: [`MAX_WEAK_RUN`]
+/// past the newest steady slot's (`Writer::sync_due`); 0 with none, which no open leaves.
+pub(crate) fn weak_limit(slots: &[Option<Slot>; 2]) -> u64 {
+    newest_steady(slots).map_or(0, |txn| txn.saturating_add(MAX_WEAK_RUN))
 }
 
 /// Choose the meta to open at (open step 4). `read(offset)` returns the 128-byte record at

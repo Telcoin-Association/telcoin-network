@@ -1351,7 +1351,7 @@ fn run_tn_lmdb(
     let mut col = Column::new(name);
     let path = dir.join("data.tn-lmdb");
     let options = tn_lmdb_options(page_size, sync);
-    let env = Env::open(&path, options).expect("open tn-lmdb");
+    let env = open_tn_lmdb(&path, options);
     let n = data.n;
 
     let seq = sel.needs_seq().then(|| {
@@ -1471,7 +1471,7 @@ fn tn_lmdb_changesets(
         for (pass, form) in CsForm::ABBA.into_iter().enumerate() {
             let at = form as usize;
             let path = dir.join(format!("{}-{pass}.tn-lmdb", shape.name));
-            let env = Env::open(&path, options).expect("open tn-lmdb");
+            let env = open_tn_lmdb(&path, options);
             let (table, load) = cs_load(&env, shape, data, form);
             let txn = Arc::new(env.begin_ro().expect("begin"));
             let walk = sel.median(|| cs_walks(&txn, &table, form, data));
@@ -1558,7 +1558,7 @@ fn tn_lmdb_rw_pass(
     load: impl FnOnce(&mut RwTxn) -> Table,
     mut txn_loop: impl FnMut(&mut RwTxn, &Table, usize),
 ) -> (Duration, Option<Duration>) {
-    let env = Env::open(path, options).expect("open tn-lmdb");
+    let env = open_tn_lmdb(path, options);
     let mut txn = env.begin_rw().expect("begin");
     let table = load(&mut txn);
     txn.commit().expect("commit");
@@ -1631,7 +1631,7 @@ fn tn_lmdb_dup_txn(txn: &mut RwTxn, table: &Table, data: &RwData, picks: &[u32],
 /// The large-value rows, each size into a fresh table of its own fresh environment in `dir`.
 fn tn_lmdb_big(dir: &Path, options: EnvOptions, data: &Data, sel: &Selection, col: &mut Column) {
     for (len, count, rows) in BIG {
-        let env = Env::open(dir.join(format!("big{len}.tn-lmdb")), options).expect("open tn-lmdb");
+        let env = open_tn_lmdb(dir.join(format!("big{len}.tn-lmdb")), options);
         let start = Instant::now();
         let mut txn = env.begin_rw().expect("begin");
         let table = txn.create_table(&format!("big{len}")).expect("create");
@@ -1659,10 +1659,23 @@ fn tn_lmdb_big(dir: &Path, options: EnvOptions, data: &Data, sel: &Selection, co
     }
 }
 
+/// Open the environment at `path`, then make its first commit that changes something, untimed (a
+/// table created and dropped): in `SyncMode::NoSync` that commit is durable, so no timed region of
+/// a no-sync column holds a sync.
+fn open_tn_lmdb(path: impl AsRef<Path>, options: EnvOptions) -> Env {
+    let env = Env::open(path, options).expect("open tn-lmdb");
+    let base = env.stat().txn_id;
+    let mut txn = env.begin_rw().expect("begin");
+    let table = txn.create_table("first-commit").expect("create");
+    txn.drop_table(table).expect("drop");
+    assert!(txn.commit().expect("commit") > base, "the first commit changes something");
+    env
+}
+
 /// A fresh environment at `path` holding the random table: all N entries, put in one
 /// transaction (untimed).
 fn tn_lmdb_rand_env(path: &Path, options: EnvOptions, data: &Data) -> (Env, Table) {
-    let env = Env::open(path, options).expect("open tn-lmdb");
+    let env = open_tn_lmdb(path, options);
     let mut txn = env.begin_rw().expect("begin");
     let rand = txn.create_table("rand").expect("create rand");
     for (i, k) in data.rand_keys.iter().enumerate() {
@@ -1724,7 +1737,7 @@ fn tn_lmdb_delete(dir: &Path, options: EnvOptions, data: &Data, sel: &Selection,
     drop(env);
 
     let path = dir.join("churn.tn-lmdb");
-    let env = Env::open(&path, options).expect("open tn-lmdb");
+    let env = open_tn_lmdb(&path, options);
     let mut txn = env.begin_rw().expect("begin");
     let table = txn.create_table("churn").expect("create churn");
     txn.commit().expect("commit");
@@ -1773,7 +1786,7 @@ enum ApiPut {
 /// One API row: N sequential keys put `how` into a fresh table of a fresh environment at `path`;
 /// returns the put loop's time (from `begin`), then commits.
 fn tn_lmdb_fresh_puts(path: &Path, options: EnvOptions, data: &Data, how: ApiPut) -> Duration {
-    let env = Env::open(path, options).expect("open tn-lmdb");
+    let env = open_tn_lmdb(path, options);
     let start = Instant::now();
     let mut txn = env.begin_rw().expect("begin");
     let table = txn.create_table("fresh").expect("create");

@@ -68,7 +68,8 @@ use std::{
 const CHILD_ENV: &str = "TN_LMDB_RETH_CRASH_CHILD";
 
 /// Set in the child's environment when it commits in `SyncMode::NoSync`, with no automatic sync:
-/// its commits are then never synced, and only their weak metas carry them through the kill.
+/// its commits but each open's first that changes something (durable whatever the bounds) are
+/// then never synced, and only their weak metas carry them through the kill.
 const NOSYNC_ENV: &str = "TN_LMDB_RETH_CRASH_NOSYNC";
 
 /// Set in the child's environment when its environment's nested layouts' tables are in the
@@ -689,8 +690,9 @@ fn killed_child_reopens_to_its_last_commit() {
 }
 
 /// [`killed_child_reopens_to_its_last_commit`] with the child committing in `SyncMode::NoSync`
-/// and never syncing: each commit's weak meta carries it through the kill, which keeps the page
-/// cache, so the reopen finds the same progress as after a durable commit.
+/// and never syncing after its first round's commit (an open's first commit is durable): each
+/// later commit's weak meta carries it through the kill, which keeps the page cache, so the
+/// reopen finds the same progress as after a durable commit.
 #[test]
 fn killed_child_reopens_to_its_last_no_sync_commit() {
     run_crash_cycles_in(5, false, true, true);

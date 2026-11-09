@@ -132,13 +132,15 @@ pub struct TnLmdbArgs {
     pub sync: SyncMode,
     /// [`SyncMode::NoSync`]: a commit commits durably once at least this long has passed since the
     /// last durable state (default `None`: never by time): the engine's `EnvOptions::sync_period`,
-    /// checked at each commit. A crash then loses only commits made less than this after the last
-    /// durable state. Ignored in [`SyncMode::Durable`] and by a read-only open.
+    /// checked at each commit. The first commit after an open commits durably whatever this says
+    /// (the open is not a durable state). A crash then loses only commits made less than this
+    /// after the last durable state. Ignored in [`SyncMode::Durable`] and by a read-only open.
     pub sync_period: Option<Duration>,
     /// [`SyncMode::NoSync`]: a commit commits durably once the pages stamped since the last
     /// durable state, its own included, hold at least this many bytes (default `None`: never by
-    /// size): the engine's `EnvOptions::sync_bytes`. It bounds what a crash loses and how long
-    /// freed pages wait, so how far the file grows past its live pages. Ignored in
+    /// size): the engine's `EnvOptions::sync_bytes`. The first commit after an open commits
+    /// durably whatever this says (the open is not a durable state). It bounds what a crash loses
+    /// and how long freed pages wait, so how far the file grows past its live pages. Ignored in
     /// [`SyncMode::Durable`] and by a read-only open.
     pub sync_bytes: Option<u64>,
     /// Trust, at open, a [`SyncMode::NoSync`] commit's weak meta (written with no sync) when the
@@ -554,7 +556,8 @@ impl TnLmdbEnv {
 
     /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
     /// durable only at the next sync (this, the environment's drop, which syncs unless it latched,
-    /// or a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`]); before it, its
+    /// a commit past [`TnLmdbArgs::sync_period`] or [`TnLmdbArgs::sync_bytes`], or the first
+    /// commit after the open); before it, its
     /// weak meta keeps it through a crash of the process alone, not a reboot. A no-op when
     /// nothing is pending, in [`SyncMode::Durable`] (but after an open that trusted a weak meta)
     /// and in a read-only environment, unless the environment is latched: then it fails in every

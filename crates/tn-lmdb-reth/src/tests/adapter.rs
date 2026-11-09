@@ -1151,9 +1151,10 @@ fn table_stats_skip_a_table_the_file_lacks() {
 /// `sync` makes `NoSync` commits durable. A copy of the file is what a process crash leaves: the
 /// committed pages are in the page cache, and each commit's weak meta names them, so a copy opened
 /// as is holds every commit; opened with `trust_unsynced` off (as a reboot would open it) it holds
-/// the state of the last sync: before the first, not even the tables; after it, every commit up
-/// to it; a commit after it only once the next sync runs. So `with_trust_unsynced` reaches the
-/// engine, a read-only open's included.
+/// the state of the last sync: before the first, only the empty tables (`create_tables`, the
+/// open's first commit, which is durable in `NoSync` too); after it, every commit up to it; a
+/// commit after it only once the next sync runs. So `with_trust_unsynced` reaches the engine, a
+/// read-only open's included.
 #[test]
 fn sync_makes_no_sync_commits_durable() {
     use tn_lmdb::SyncMode;
@@ -1167,8 +1168,9 @@ fn sync_makes_no_sync_commits_durable() {
             .unwrap()
             .unwrap()
     };
+    assert_eq!(durable_rows(dir.path()), Some(0), "the open's first commit is durable");
     put(1);
-    assert_eq!(durable_rows(dir.path()), None, "no commit is durable before a sync");
+    assert_eq!(durable_rows(dir.path()), Some(0), "no later commit is durable before a sync");
     assert_eq!(crashed_rows(dir.path()), Some(1), "a process crash loses no commit");
     db.sync().unwrap();
     assert_eq!(durable_rows(dir.path()), Some(1), "every commit before the sync is durable");
@@ -1204,7 +1206,8 @@ fn copy_rows(dir: &std::path::Path, args: TnLmdbArgs) -> Option<usize> {
 
 /// `with_sync_period` and `with_sync_bytes` reach the engine's automatic syncs: a `NoSync` commit
 /// past either commits durably with no `sync` (a copy of the file holds it, and `io_stats` counts
-/// it in `auto_syncs`), while bounds it does not reach leave it to the next sync.
+/// it in `auto_syncs`), while bounds it does not reach leave it to the next sync. The commit is
+/// the one after `create_tables`, the open's first commit, which is durable whatever the bounds.
 #[test]
 fn automatic_syncs_reach_the_engine() {
     use std::time::Duration;
@@ -1226,9 +1229,11 @@ fn automatic_syncs_reach_the_engine() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
         db.create_tables().unwrap();
+        let opened = db.io_stats();
+        assert_eq!(opened.auto_syncs, 1, "{case}: the open's first commit: {opened:?}");
         db.update(|tx| tx.put::<CanonicalHeaders>(1, B256::with_last_byte(1))).unwrap().unwrap();
-        let s = db.io_stats();
-        let want = if synced { Some(1) } else { None };
+        let s = db.io_stats().since(&opened);
+        let want = if synced { Some(1) } else { Some(0) };
         assert_eq!(durable_rows(dir.path()), want, "{case}: {s:?}");
         assert_eq!((s.auto_syncs > 0, s.nosync_commits > 0), (synced, !synced), "{case}: {s:?}");
     }

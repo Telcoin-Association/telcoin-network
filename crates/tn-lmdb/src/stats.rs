@@ -105,7 +105,9 @@ pub struct IoStats {
     /// The reuse gate's lag, summed over [`Self::gate_lag_samples`]: at each load of free records,
     /// the writing transaction's id minus the reuse gate (the newest txn whose freed pages may be
     /// reused). In [`crate::SyncMode::Durable`] with no reader on an old snapshot it is 2 (a page
-    /// freed by txn N comes back at txn N + 2), 1 only for a new file's first commit; a reader
+    /// freed by txn N comes back at txn N + 2), 1 only for a new file's first commit (the txn ids
+    /// a writer open skips are not counted: a gate from before the open lags by the commits since
+    /// it, not by the ids); a reader
     /// held on an old snapshot, or
     /// [`crate::SyncMode::NoSync`] commits since the last sync, raise it. `gate_lag_sum /
     /// gate_lag_samples` of a difference ([`IoStats::since`]) is the mean lag over that interval.

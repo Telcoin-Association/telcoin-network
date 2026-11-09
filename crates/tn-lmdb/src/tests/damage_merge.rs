@@ -55,7 +55,8 @@ fn leaf_keys(env: &Env, p: u32) -> Vec<Vec<u8>> {
 /// levels) has branches `B0`, `B1`, `B2` of 7, 10 and 7 children first, the last leaf of `B0` and
 /// of `B2` holding one key (`b0_last`, `b2_last`): its delete unlinks the leaf and leaves the
 /// branch with 6 children, under a quarter, and `B0` absorbs `B1` (right), `B2` absorbs `B1`
-/// (left). `next_txn` is the id of the next write transaction.
+/// (left). `next_txn` is the id of the next write transaction: a reopened writer's first
+/// ([`after_steady`] of the last commit's, both slots steady).
 struct Fixture {
     dir: TempDir,
     path: PathBuf,
@@ -112,7 +113,7 @@ fn fixture() -> Fixture {
             last.push(keys[0].clone());
         }
     }
-    let next_txn = txn.txn_id() + 1;
+    let next_txn = after_steady(txn.txn_id());
     txn.commit().expect("commit");
 
     let l = tree(&env, "l");

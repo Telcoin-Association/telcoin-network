@@ -41,7 +41,8 @@ pub(super) struct DupFixture {
     catalog_leaf: u32,
     /// The free tree, one leaf, and its first record's key.
     free_leaf: (u32, Vec<u8>),
-    /// The id the next write transaction takes.
+    /// The id the next write transaction takes: a reopened writer's first ([`after_steady`] of the
+    /// state's, both slots steady).
     next_txn: u32,
 }
 
@@ -103,7 +104,7 @@ pub(super) fn dup_fixture() -> DupFixture {
         .collect::<BTreeMap<_, _>>();
     let key = 150u32.to_be_bytes().to_vec();
     let plain_leaf = (leaf_of(&tree(&env, "p"), &key), key);
-    let next_txn = u32::try_from(snapshot.meta.txn + 1).expect("a u32 txn");
+    let next_txn = u32::try_from(after_steady(snapshot.meta.txn)).expect("a u32 txn");
     let (hot, cold) = (cells[&HOT].1, cells[&COLD].1);
     let hot_leaf = leaf_of(&hot, &[0, 0x5a]);
     assert!(outer.height >= 2 && tree(&env, "p").height >= 2, "{outer:?}");

@@ -293,7 +293,7 @@ fn a_commit_that_grew_the_file_through_a_run_survives_a_power_loss() {
     let base = Base { crash: runs_crash_growing, grows: true, ..runs_base(4096) };
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     for by_msync in [false, true] {
-        let Case { path, latest, runs, reused, .. } =
+        let Case { path, first, latest, runs, reused, .. } =
             run_case(&base, Mode::Durable, by_msync, None);
         let what = format!("by_msync={by_msync}: {runs:?}");
         assert!(reused > 0, "{what}: pages were reused");
@@ -303,7 +303,7 @@ fn a_commit_that_grew_the_file_through_a_run_survives_a_power_loss() {
         disk_model::power_loss(&path);
         disk_model::untrack(&path);
         let env = open(&path, SyncMode::Durable);
-        assert_eq!(env.stat().txn_id, base.txn + 1, "{what}");
+        assert_eq!(env.stat().txn_id, first, "{what}");
         assert_eq!(newest_state(&env), latest, "{what}");
         assert_gets(&env, &latest, &what);
         drop(env);
