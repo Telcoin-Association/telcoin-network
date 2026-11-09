@@ -49,10 +49,10 @@ use tracing::{info, warn};
 const TEST: &str = "rethmig";
 
 /// The marker `make test-e2e-reth-migration` sets: `TN_BIN_PATH` is the `tn-lmdb` e2e binary.
-const TN_LMDB_BIN_MARKER: &str = "TN_E2E_TN_LMDB_BIN";
+pub(crate) const TN_LMDB_BIN_MARKER: &str = "TN_E2E_TN_LMDB_BIN";
 
 /// The line the `tn-lmdb` node logs once a migration has committed (`migrate_from_mdbx`).
-const MIGRATED_LOG: &str = "migrated the reth database from MDBX to tn-lmdb";
+pub(crate) const MIGRATED_LOG: &str = "migrated the reth database from MDBX to tn-lmdb";
 
 /// The validator restarted first; the others follow in a rolling upgrade.
 const FIRST: usize = 2;
@@ -110,7 +110,7 @@ fn lane_binaries() -> eyre::Result<Option<(&'static TestBinary, &'static TestBin
 }
 
 /// `true` when `path` exists; a stat error fails rather than reading as absent.
-fn exists(path: &Path) -> eyre::Result<bool> {
+pub(crate) fn exists(path: &Path) -> eyre::Result<bool> {
     path.try_exists().map_err(|e| eyre::eyre!("failed to stat {}: {e}", path.display()))
 }
 
@@ -120,7 +120,7 @@ fn datadir(base: &Path, instance: usize) -> PathBuf {
 }
 
 /// Assert a stopped validator's reth database is MDBX: `db/mdbx.dat` and no `db/tn-lmdb.dat`.
-fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
+pub(crate) fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
     let db = datadir.join("db");
     eyre::ensure!(
         exists(&db.join("mdbx.dat"))?,
@@ -138,7 +138,7 @@ fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
 
 /// Assert a restarted validator's reth database finished its migration: `db/tn-lmdb.dat` and the
 /// `db/mdbx-migrated` marker, none of MDBX's files, no temp directory, and the static files kept.
-fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
+pub(crate) fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
     let db = datadir.join("db");
     eyre::ensure!(
         exists(&db.join("tn-lmdb.dat"))?,
@@ -184,7 +184,7 @@ fn tip(client_urls: &[String; 4], instances: impl IntoIterator<Item = usize>) ->
 /// Stop validator `instance` with SIGTERM and wait for it to exit on its own. A validator that
 /// does not stop within [`STOP_TIMEOUT`] fails the test (the guard still holds it), rather than
 /// being killed, so the database the next run opens is a cleanly closed one.
-fn stop_validator(guard: &mut ProcessGuard, instance: usize) -> eyre::Result<()> {
+pub(crate) fn stop_validator(guard: &mut ProcessGuard, instance: usize) -> eyre::Result<()> {
     let child =
         guard.get_mut(instance).ok_or_else(|| eyre::eyre!("no validator-{}", instance + 1))?;
     send_term(child);

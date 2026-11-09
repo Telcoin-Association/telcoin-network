@@ -73,6 +73,10 @@ help:
 	@echo "    :::> Build the default (MDBX) and tn-lmdb e2e node binaries; start a committee on MDBX and restart each validator on tn-lmdb." ;
 	@echo "    :::> Each must migrate its reth database and follow the chain. TN_BIN_PATH_PREV = MDBX binary, TN_BIN_PATH = tn-lmdb binary." ;
 	@echo ;
+	@echo "make test-e2e-resync" ;
+	@echo "    :::> Build the MDBX and tn-lmdb e2e binaries; upgrade a validator of a TN_RESYNC_BIN_PREV committee in place, run db reset-execution" ;
+	@echo "    :::> on it, and require it to rebuild from genesis and match a validator still on PREV. TN_RESYNC_BIN_PREV defaults to the MDBX binary." ;
+	@echo ;
 	@echo "make build-e2e-bin-prev" ;
 	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
 	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
@@ -497,6 +501,26 @@ test-sigkill-tn-lmdb: build-e2e-bin-tn-lmdb
 .PHONY: test-e2e-reth-migration
 test-e2e-reth-migration: build-e2e-bin build-e2e-bin-tn-lmdb
 	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_BIN_PATH_PREV="$(E2E_BIN)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all reth_db_migration:: ;
+
+# run the execution database rebuild (crates/e2e-tests/tests/it/resync.rs): a committee starts on
+# TN_RESYNC_BIN_PREV (an MDBX reth database), validator-4 is upgraded in place to the tn-lmdb e2e
+# binary (its reth database migrates, and its consensus database too when PREV predates tndb), then
+# stopped, reset with `db reset-execution --force`, and started again: it must rebuild its execution
+# database from genesis, rejoin the committee, and agree with validator-1 (still on PREV) on every
+# block and on historical reads. TN_E2E_TN_LMDB_BIN=1 declares TN_BIN_PATH the tn-lmdb build (see
+# test-e2e-reth-migration).
+#
+# TN_RESYNC_BIN_PREV defaults to this tree's MDBX e2e binary. The release the network runs is the
+# real PREV (make build-e2e-bin-prev TN_PREV_REF=v0.16.0-adiri, then
+# make test-e2e-resync TN_RESYNC_BIN_PREV=$(E2E_BIN_PREV)), but v0.16.0-adiri and this tree do not
+# peer since #1788 changed node records: the upgraded validator migrates both databases and then
+# cannot resolve its peers, so that run fails at the upgrade, before the reset.
+TN_RESYNC_BIN_PREV ?= $(E2E_BIN)
+
+.PHONY: test-e2e-resync
+test-e2e-resync: build-e2e-bin build-e2e-bin-tn-lmdb
+	@test -x "$(TN_RESYNC_BIN_PREV)" || { echo "no previous node binary at $(TN_RESYNC_BIN_PREV)" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_BIN_PATH_PREV="$(TN_RESYNC_BIN_PREV)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all resync:: ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:

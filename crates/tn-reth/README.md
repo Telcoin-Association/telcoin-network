@@ -628,6 +628,13 @@ start of this release's binary built with `tn-lmdb`:
    the engine changes, the layout stays v1, and the node records the layout marker;
 3. runs on. Nothing else is needed: a v1 datadir keeps working on this binary.
 
+**Upgrade every node together.** Since #1788 a node record carries a network-key co-signature, and
+this release drops the records `v0.16.0-adiri` publishes (and the old binary cannot use the new
+ones): in an e2e committee started on `v0.16.0-adiri`, a validator restarted on this release
+migrated both databases but could not resolve its peers, and stalled. So a mixed committee does not
+work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
+nodes in place first (they keep v1), and rebuild in the new layout only after that.
+
 **Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
 and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
 the backup is the only way back to `v0.16.0-adiri` (see Rollback).
@@ -637,7 +644,8 @@ aside, so the next start rebuilds it from genesis by re-executing the chain, in 
 datadirs get. It moves `db/`, `static_files/` and `restored-state-floor` (the floor of a datadir
 restored from a snapshot, which would refuse the rebuilt chain's old blocks if it stayed) into
 `<datadir>/execution-reset-<UTC time>/`. It renames and never deletes; the consensus database, keys
-and config stay. It refuses while a node holds the datadir, and is a dry run without `--force`. The
+and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
+state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
 moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
 refuses to start while a `.partial` directory is there, and running the command again finishes it.
 
