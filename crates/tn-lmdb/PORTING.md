@@ -346,6 +346,7 @@ library and its tests type-check there.
 |---|---|---|---|
 | `file.rs` | `PageFile::dirty_os_pages` | `all(test, macos)` | counts modified pages with `mincore` (`MINCORE_MODIFIED`, `MINCORE_MODIFIED_OTHER`: Apple only) |
 | `file.rs` | `fdatasync_all_writes_every_page_dirtied_through_the_mapping` | `macos` | no dirty page after `fdatasync_all` |
+| `file.rs` | `a_failed_msync_of_ranges_poisons_the_file` | `macos` | `msync_ranges` (macOS only) keeps the poison rule |
 | `env/tests.rs` | `dirty_pages_form_one_range_or_take_one_fdatasync` | `macos` / `not(macos)` | the expected plan for a scattered commit |
 | `env/tests.rs` | `a_scattered_durable_commit_leaves_no_page_dirty` | `macos` | by `dirty_os_pages` |
 | `env/tests.rs` | `a_writer_open_writes_the_pages_another_mapping_left_dirty` | `macos` | by `dirty_os_pages` |

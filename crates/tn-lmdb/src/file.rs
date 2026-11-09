@@ -922,6 +922,21 @@ mod tests {
         assert!(pf.page(0, 4096).expect("reads continue").iter().all(|&b| b == 1));
     }
 
+    /// macOS: so does a failed `msync_ranges` (a scattered commit's data sync), which a poisoned
+    /// file then refuses without an msync.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_failed_msync_of_ranges_poisons_the_file() {
+        let tmp = TempDir::with_prefix("tn_lmdb_file_poison_ranges").expect("temp dir");
+        let mut pf = PageFile::open(&tmp.path().join("db"), 16 << 20).expect("open");
+        pf.ensure_len(65536).expect("grow");
+        let ranges = || [0..4096_u64, 32768..36864].into_iter();
+        pf.fail_next_msync();
+        assert!(matches!(pf.msync_ranges(ranges()), Err(Error::Io(_))));
+        assert!(pf.is_poisoned());
+        assert!(matches!(pf.msync_ranges(ranges()), Err(Error::Failed(_))), "never retried");
+    }
+
     /// Every mapping a page file makes is advised `MADV_RANDOM` (`advise_access`): the first and
     /// each remap's past the reservation, unless the file was mapped with `readahead`, which
     /// advises none. A read-only file's one mapping likewise.

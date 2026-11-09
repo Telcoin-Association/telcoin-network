@@ -6426,6 +6426,21 @@ mod tests {
         assert!(write_state(&store, &handle) == before, "the refused split changed something");
     }
 
+    /// The same for a value's overflow run: its room check (`TreeRoot::add_run`) is given the
+    /// file's page count, so a sound tree filling the file's page numbers is `Full`, not damage.
+    #[test]
+    fn an_overflow_run_with_no_page_numbers_left_is_full() {
+        let (mut store, root, _) = two_leaf_tree(20);
+        store.alloc = crate::alloc::Allocator::new(store.alloc.txn(), crate::tree::NULL_PGNO);
+        let mut handle = TreeRoot { leaf_pages: (MAX_TREE_PAGES - 2) as u32, ..root };
+        let before = write_state(&store, &handle);
+        // Longer than a page: a run.
+        let done = put(&mut store, &mut handle, &id_key(100, 200), &vec![1; 6000]);
+        let Err(Error::Full(m)) = &done else { panic!("{done:?}") };
+        assert!(m.contains("no room in the file's page numbers"), "{m}");
+        assert!(write_state(&store, &handle) == before, "the refused run changed something");
+    }
+
     /// A handle counting past what any tree holds is `Corrupt` naming the root, refused before
     /// anything changes (no page copied, written or taken; the handle as it was). Such a handle
     /// decodes (`TreeRoot::check` has no rule on the count, and allows `MAX_TREE_PAGES` pages), so

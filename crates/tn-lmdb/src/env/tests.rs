@@ -1196,6 +1196,26 @@ fn a_nosync_commit_past_sync_period_commits_durably() {
     assert_eq!((s.nosync_commits, s.auto_syncs, s.commits), (4, 3, 4), "{s:?}");
 }
 
+/// `sync_period` without the test clock (`Writer::clock_at` unset) reads the real one: after a
+/// first commit, a second within an hour of the last durable state defers, and one 30 ms after
+/// the first with a 5 ms period commits durably.
+#[test]
+fn sync_period_reads_the_real_clock() {
+    for (period, wait) in [(Duration::from_secs(3600), false), (Duration::from_millis(5), true)] {
+        let (_dir, path) = temp();
+        let env = open_auto(&path, Some(period), None);
+        assert!(env.with_writer(|w| w.clock_at.is_none()), "the real clock");
+        put_all(&env, "a", &[(b"k", b"1")]);
+        let syncs = env.io_stats().auto_syncs;
+        if wait {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let txn = put_all(&env, "a", &[(b"k", b"2")]);
+        assert_eq!(durable_txn(&env) == txn, wait, "{period:?}");
+        assert_eq!(env.io_stats().auto_syncs - syncs, u64::from(wait), "{period:?}");
+    }
+}
+
 /// A `NoSync` churn of rewrites, each freeing the pages it copies: with `sync_bytes` the file's
 /// pages stay within the live pages plus what one sync interval and a few commits can hold (a page
 /// freed by txn N is reused from the second commit after the first sync at or after N, once that
@@ -1693,6 +1713,26 @@ fn oversized_entries_do_not_latch() {
     txn.put(&a, &vec![3; max_key], b"v").expect("the longest key");
     txn.put(&a, &[2; 16], &vec![0; max_value]).expect("the longest value");
     assert_eq!(txn.commit().expect("commit"), after_steady(0));
+}
+
+/// A write that finds no page number left (the writer's allocator set at the last one) is
+/// `Error::Full` and latches the environment: its transaction cannot commit, and a reopen finds
+/// the last commit.
+#[test]
+fn a_write_with_no_page_number_left_is_full_and_latches() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let last = put_all(&env, "a", &[(b"k", b"v")]);
+    env.with_writer(|w| w.alloc = Allocator::new(w.alloc.txn(), crate::tree::NULL_PGNO));
+    let mut txn = env.begin_rw().expect("begin");
+    let a = table(&txn, "a");
+    let got = txn.put(&a, b"k2", b"w");
+    assert!(matches!(&got, Err(Error::Full(_))), "{got:?}");
+    assert!(env.failure().is_some(), "latched");
+    let done = txn.commit();
+    assert!(matches!(&done, Err(Error::Failed(_))), "{done:?}");
+    drop(env);
+    assert_eq!(open(&path).stat().txn_id, last);
 }
 
 /// A handle of a dropped table is stale, even once the name is re-created (the new table has a
@@ -2872,6 +2912,30 @@ fn a_meta_slot_the_writer_cannot_account_for_skips_the_trim() {
     assert!(trimmed_len(&env) < before, "a trim would shorten the file");
     drop(env);
     assert_eq!(file_len(&path), before, "a slot in doubt trims nothing");
+}
+
+/// So is a slot whose record holds the txn the writer holds for it but is not of its kind:
+/// `Writer::used_len` refuses the weak record of a `NoSync` commit rewritten as a steady one of
+/// the same state, and takes it once it is put back.
+#[test]
+fn a_meta_slot_of_another_kind_is_one_the_writer_cannot_account_for() {
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    put_all(&env, "a", &[(b"k", b"1")]);
+    let txn = put_all(&env, "a", &[(b"k", b"2")]);
+    env.with_writer(|w| {
+        let slot = w.slots.iter().position(|s| *s == Slot::weak(txn)).expect("the weak slot");
+        let (meta, boot) = (w.last, w.boot_id);
+        let write = |w: &mut Writer, tag: Tag| {
+            w.file.page_mut(slot as u32, 4096).expect("meta page")[..META_LEN]
+                .copy_from_slice(&meta.encode(tag));
+        };
+        write(w, Tag::steady(boot));
+        let got = w.used_len();
+        assert!(matches!(&got, Err(Error::Failed(m)) if m.contains("weak: true")), "{got:?}");
+        write(w, Tag::weak(boot));
+        w.used_len().expect("the record put back");
+    });
 }
 
 /// A power loss right after a clean close's trim, whose truncation no sync made durable,

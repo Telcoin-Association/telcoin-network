@@ -181,4 +181,44 @@ mod tests {
         assert!(matches!(e, Error::Io(_)));
         assert!(e.to_string().contains("boom"));
     }
+
+    /// Damage, I/O, a broken invariant or a latched environment, a mapping refused for want of
+    /// memory and a full file latch; every refusal of a call or an open does not.
+    #[test]
+    fn an_error_latches_by_its_kind() {
+        let io = || io::Error::other("boom");
+        let latching = [
+            Error::Corrupt(String::new()),
+            Error::Io(io()),
+            Error::Failed(String::new()),
+            Error::OutOfMemory { bytes: 1, source: io() },
+            Error::Full(String::new()),
+        ];
+        for e in &latching {
+            assert!(e.latches(), "{e:?}");
+        }
+        let refusals = [
+            Error::KeyTooLarge { len: 1, max: 0 },
+            Error::KeyTooShort { len: 0, min: 1 },
+            Error::ValueTooLarge { len: 1, max: 0 },
+            Error::AppendOutOfOrder,
+            Error::KeyExists,
+            Error::TableNotFound(String::new()),
+            Error::StaleTable(String::new()),
+            Error::TableKind(String::new()),
+            Error::InvalidDupOptions(String::new()),
+            Error::InvalidTableName,
+            Error::NotTnLmdb,
+            Error::UnsupportedVersion(1),
+            Error::InvalidPageSize(1),
+            Error::InvalidMaxGrowth(1),
+            Error::InvalidMapReserve(1),
+            Error::Locked,
+            Error::ReadOnly,
+            Error::WrongTxn,
+        ];
+        for e in &refusals {
+            assert!(!e.latches(), "{e:?}");
+        }
+    }
 }

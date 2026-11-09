@@ -837,6 +837,66 @@ fn a_free_of_a_tree_refuses_a_child_past_the_page_count_this_transaction_freed()
     }
 }
 
+/// The walk's loose-page refusal at its bound: the page numbered the state's page count, the first
+/// this transaction takes from the file's end (the copy of table `u`'s leaf, emptied again, so the
+/// page is loose in the pool), named by the forged last child of `a`'s root branch, or as `t`'s
+/// root in its catalog record. `drop_table` refuses either, `Corrupt`, naming the page.
+#[test]
+fn a_loose_page_at_the_page_count_is_refused_by_the_tree_walk() {
+    for root in [false, true] {
+        let (_dir, path) = temp("tn_lmdb_damage_loose_bound");
+        let (a_root, catalog, page_count) = {
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("begin");
+            let a = txn.create_table("a").expect("a");
+            for i in 0..200_u32 {
+                txn.put(&a, &i.to_be_bytes(), &value(1, i, 100)).expect("put");
+            }
+            for name in ["t", "u"] {
+                let t = txn.create_table(name).expect("table");
+                txn.put(&t, b"k", b"v").expect("put");
+            }
+            txn.commit().expect("commit");
+            let meta = env.inner().current().meta;
+            (tree(&env, "a"), meta.catalog, meta.page_count)
+        };
+        if root {
+            assert_eq!(catalog.height, 1, "the catalog is one leaf");
+            restamped(&path, catalog.root, |page| {
+                let i = (0..page::nkeys(page))
+                    .find(|&i| page::leaf_inline_entry(page, i).expect("entry").0 == b"t")
+                    .expect("t's record");
+                let (_, value) = page::leaf_inline_entry(page, i).expect("entry");
+                let off = value.as_ptr() as usize - page.as_ptr() as usize;
+                let mut record = catalog::TableRecord::decode(value).expect("record");
+                record.root.root = page_count;
+                let bytes = record.encode();
+                page[off..off + bytes.len()].copy_from_slice(&bytes);
+            });
+        } else {
+            assert_eq!(a_root.height, 2, "{a_root:?}");
+            restamped(&path, a_root.root, |page| {
+                set_child(page, page::nkeys(page) - 1, page_count)
+            });
+        }
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("begin");
+        let u = txn.open_table("u").expect("open").expect("u");
+        txn.put(&u, b"k", b"w").expect("put");
+        assert!(txn.delete(&u, b"k").expect("delete"));
+        let pool = txn.writer_mut().alloc.pool().to_vec();
+        assert!(pool.contains(&page_count), "root {root}: page {page_count} is loose: {pool:?}");
+        let name = if root { "t" } else { "a" };
+        let table = txn.open_table(name).expect("open").expect(name);
+        let got = txn.drop_table(table);
+        let want = format!("tree walk: page {page_count} is past the ");
+        assert!(
+            matches!(&got, Err(Error::Corrupt(m)) if m.contains(&want)),
+            "root {root}: {got:?}"
+        );
+    }
+}
+
 /// The same damage across transactions: `w` takes `L` and commits, so `L` is published when a
 /// later transaction drops `u`. That drop cannot tell (it reads only `u`'s first leaf) and frees
 /// `L` again. Once a later write hands `L` to table `x`, `w`'s gets of the keys in `L` fail the
@@ -1043,6 +1103,35 @@ fn a_dup_cursor_reads_its_own_working_map_beside_a_table_of_its_id() {
     assert_eq!(rows(&txn), [of_d(first_key(true)), of_d(two)], "d's working rows");
     assert_eq!(txn.dup_rows_for_test(&a).len(), 2, "a's rows");
     assert!(env.failure().is_none());
+}
+
+/// A slot of the last txn id fails the open closed even when the open passes it over: here an
+/// untrusted weak record of txn `u64::MAX` (another boot's) in the older slot, beside the steady
+/// state the open takes. The writer's first txn must be past every slot's (`Chosen::next_txn`), so
+/// it has none: both opens are `Corrupt`, the writer open's no panic.
+#[test]
+fn an_untrusted_weak_slot_of_the_last_txn_id_is_refused_at_open() {
+    let (_dir, path) = temp("tn_lmdb_last_txn_weak");
+    {
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let a = txn.create_table("a").expect("a");
+        txn.put(&a, b"key", b"a").expect("put");
+        txn.commit().expect("commit");
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let slot = |at: u64| {
+        let mut record = [0; META_LEN];
+        file.read_exact_at(&mut record, at * P).expect("read");
+        Meta::decode(&record).expect("meta").0
+    };
+    let newest = if slot(0).txn > slot(1).txn { 0 } else { 1 };
+    let last = Meta { txn: u64::MAX, ..slot(newest) };
+    file.write_all_at(&last.encode(Tag::weak([0xEE; 16])), (1 - newest) * P).expect("write");
+    let refused = |e: &Error| matches!(e, Error::Corrupt(m) if m.contains("no next txn"));
+    assert_fails_closed(&path, refused);
+    let ro = Env::open_read_only(&path, EnvOptions::default()).map(drop);
+    assert!(ro.as_ref().is_err_and(refused), "read-only: {ro:?}");
 }
 
 /// A steady meta whose txn id is [`MAX_WEAK_RUN`] + 1 short of the last (only a crafted record

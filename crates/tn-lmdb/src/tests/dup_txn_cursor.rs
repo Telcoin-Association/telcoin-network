@@ -1496,6 +1496,36 @@ fn a_write_refused_by_the_latch_leaves_a_dup_cursor_and_its_twin_alike() {
     }
 }
 
+/// A put through a dup cursor and through its twin's cursor that finds no page number left (the
+/// writer's allocator set at the last one), either first: the first is `Full`, which latches and
+/// leaves its cursor unset as any latching error does (`Error::latches`), the second `Failed`,
+/// its cursor unset too.
+#[test]
+fn a_write_into_a_full_file_leaves_a_dup_cursor_and_its_twin_unset() {
+    for dup_first in [true, false] {
+        let (_dir, env, d, p, _) = setup_with("tn_lmdb_dup_txn_full", &[(1, 4), (2, 3)], OPTIONS);
+        env.with_writer(|w| {
+            w.alloc = crate::alloc::Allocator::new(w.alloc.txn(), crate::tree::NULL_PGNO);
+        });
+        let mut txn = env.begin_rw().expect("rw");
+        let (mut c, mut t) = pair(&txn, &d, &p);
+        assert!(c.seek_exact(&txn, &row_key(1, 2)).expect("seek").is_some());
+        assert!(t.seek_exact(&txn, &row_key(1, 2)).expect("seek").is_some());
+        let key = row_key(1, 9);
+        let (first, second) = if dup_first {
+            let first = c.put(&mut txn, &key, b"w");
+            (first, t.put(&mut txn, &key, b"w"))
+        } else {
+            let first = t.put(&mut txn, &key, b"w");
+            (first, c.put(&mut txn, &key, b"w"))
+        };
+        assert!(matches!(&first, Err(Error::Full(_))), "dup_first {dup_first}: {first:?}");
+        assert!(matches!(&second, Err(Error::Failed(_))), "dup_first {dup_first}: {second:?}");
+        assert_eq!(c.state(), (State::Unset, false), "dup_first {dup_first}: the dup cursor");
+        assert_eq!(t.state(), (State::Unset, false), "dup_first {dup_first}: the twin's cursor");
+    }
+}
+
 /// A cursor's put into the key of the row it is at, after another writer created a key before it
 /// (moving the outer path's slots), finds its row by key rather than keep the stale outer path: a
 /// scan from it then crosses to the right keys. A put that creates a key is found by key too.

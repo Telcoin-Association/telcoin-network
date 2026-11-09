@@ -1558,4 +1558,15 @@ mod tests {
     fn the_fit_knowledge_keeps_every_allocation() {
         fit_oracle(0xf17b_0000_0000_0001, 200, 300);
     }
+
+    /// A record loaded into a pool not known ascending (pages pushed since the last sort) is
+    /// appended, so a run still takes the first fit of the pool as a set: here 2, 3, 4 from the
+    /// pages 4 and 2 pushed and 3 loaded.
+    #[test]
+    fn a_record_loaded_into_an_unsorted_pool_keeps_the_first_fit() {
+        let mut a = Allocator::new(1, 100);
+        a.add_to_pool([4, 2]);
+        a.load_record(RecordKey { txn: 0, seq: 0 }, vec![3]).expect("load");
+        assert_eq!(a.allocate_run(3, |_| panic!("the pool fits")).expect("run"), 2);
+    }
 }
