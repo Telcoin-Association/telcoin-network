@@ -6,7 +6,7 @@ use alloy_evm::env::BlockEnvironment;
 use alloy_primitives::{uint, Keccak256, U256};
 use alloy_rpc_types_mev::{EthCallBundle, EthCallBundleResponse, EthCallBundleTransactionResult};
 use jsonrpsee::core::RpcResult;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, MIN_TRANSACTION_GAS};
 use reth_evm::{ConfigureEvm, Evm};
 use reth_rpc_eth_api::{
     helpers::{Call, EthTransactions, LoadPendingBlock},
@@ -76,6 +76,15 @@ where
             )
             .into())
         }
+        // TN(TN-0054): no bundle with more transactions than its gas limit can hold (TN-0046)
+        // gets as far as decoding; the count check costs nothing and the decode would not.
+        let max_transactions = max_bundle_transactions(self.inner.eth_api.call_gas_limit());
+        if txs.len() > max_transactions {
+            return Err(EthApiError::InvalidParams(
+                EthBundleError::TooManyTransactions(max_transactions).to_string(),
+            )
+            .into())
+        }
 
         // TN(TN-0037): upstream takes no permit here (the struct's tracing guard is unused). Hold
         // a blocking-IO permit inside the blocking task, as `eth_callMany` does.
@@ -84,13 +93,6 @@ where
             .acquire_owned_blocking_io()
             .await
             .map_err(|_| EthApiError::InternalEthError)?;
-
-        let transactions = txs
-            .into_iter()
-            .map(|tx| recover_raw_transaction::<PoolPooledTx<Eth::Pool>>(&tx))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<Vec<_>>();
 
         let block_id: alloy_rpc_types_eth::BlockId = state_block_number.into();
         // Note: the block number is considered the `parent` block: <https://github.com/flashbots/mev-geth/blob/fddf97beec5877483f879a77b7dea2e58a58d653/internal/ethapi/api.go#L2104>
@@ -109,25 +111,6 @@ where
 
         if let Some(difficulty) = difficulty {
             evm_env.block_env.inner_mut().difficulty = U256::from(difficulty);
-        }
-
-        // Validate that the bundle does not contain more than MAX_BLOB_NUMBER_PER_BLOCK blob
-        // transactions.
-        let blob_gas_used = transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum::<u64>();
-        if blob_gas_used > 0 {
-            let blob_params = self
-                .eth_api()
-                .provider()
-                .chain_spec()
-                .blob_params_at_timestamp(evm_env.block_env.timestamp().saturating_to())
-                .unwrap_or_else(BlobParams::cancun);
-            if blob_gas_used > blob_params.max_blob_gas_per_block() {
-                return Err(EthApiError::InvalidParams(
-                    EthBundleError::Eip4844BlobGasExceeded(blob_params.max_blob_gas_per_block())
-                        .to_string(),
-                )
-                .into())
-            }
         }
 
         // default to call gas limit unless user requests a smaller limit
@@ -153,6 +136,35 @@ where
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, db| {
                 let _permit = permit;
+
+                // TN(TN-0054): decode and recover the transactions here, on the blocking thread
+                // the permit admits, not in the handler on the runtime that serves every request.
+                let transactions = txs
+                    .iter()
+                    .map(|tx| recover_raw_transaction::<PoolPooledTx<Eth::Pool>>(tx))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                // Validate that the bundle does not contain more than MAX_BLOB_NUMBER_PER_BLOCK
+                // blob transactions.
+                let blob_gas_used =
+                    transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum::<u64>();
+                if blob_gas_used > 0 {
+                    let blob_params = eth_api
+                        .provider()
+                        .chain_spec()
+                        .blob_params_at_timestamp(evm_env.block_env.timestamp().saturating_to())
+                        .unwrap_or_else(BlobParams::cancun);
+                    if blob_gas_used > blob_params.max_blob_gas_per_block() {
+                        return Err(Eth::Error::from_eth_err(EthApiError::InvalidParams(
+                            EthBundleError::Eip4844BlobGasExceeded(
+                                blob_params.max_blob_gas_per_block(),
+                            )
+                            .to_string(),
+                        )))
+                    }
+                }
+
                 let coinbase = evm_env.block_env.beneficiary();
                 let basefee = evm_env.block_env.basefee();
 
@@ -328,6 +340,15 @@ pub enum EthBundleError {
     /// Thrown when the gas limits of the bundle's transactions exceed the block gas limit.
     #[error("bundle gas exceeds the block gas limit of {0}")]
     BundleGasLimitExceeded(u64),
+    /// TN(TN-0054): thrown when a bundle holds more transactions than its gas limit can hold.
+    #[error("bundle exceeds the limit of {0} transactions")]
+    TooManyTransactions(usize),
+}
+
+/// TN(TN-0054): the most transactions a bundle with `block_gas_limit` can hold, since each needs
+/// at least [`MIN_TRANSACTION_GAS`] of it (TN-0046's budget refuses the first one over).
+const fn max_bundle_transactions(block_gas_limit: u64) -> usize {
+    (block_gas_limit / MIN_TRANSACTION_GAS) as usize
 }
 
 /// TN(TN-0046): the transactions of an `eth_callBundle` request share its block gas limit.
@@ -407,6 +428,55 @@ mod gas_limit_tests {
                 if message == "bundle gas exceeds the block gas limit of 50000"),
             "{err:?}"
         );
+    }
+
+    /// TN(TN-0054): `count` undecodable transactions as a bundle under the default 50M gas cap.
+    async fn call_undecodable(count: usize) -> Result<EthCallBundleResponse, EthApiError> {
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+        let block = Block {
+            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        }
+        .seal_slow();
+        provider.add_block(block.hash(), block.into_block());
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let bundle = EthBundle::new(api, BlockingTaskGuard::new(1));
+        bundle
+            .call_bundle(EthCallBundle {
+                txs: vec![alloy_primitives::Bytes::from_static(&[0x00]); count],
+                block_number: 2,
+                state_block_number: BlockNumberOrTag::Number(1),
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// One transaction over the count the gas cap can hold is refused before any is decoded.
+    #[tokio::test]
+    async fn bundle_over_the_transaction_count_is_refused_before_decoding() {
+        let max = max_bundle_transactions(50_000_000);
+        assert_eq!(max, 2_380);
+        let err = call_undecodable(max + 1).await.expect_err("one over the count");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "bundle exceeds the limit of 2380 transactions"),
+            "{err:?}"
+        );
+    }
+
+    /// At the count, the bundle is decoded, so the bad bytes are what fails.
+    #[tokio::test]
+    async fn bundle_at_the_transaction_count_is_decoded() {
+        let max = max_bundle_transactions(50_000_000);
+        let err = call_undecodable(max).await.expect_err("undecodable transactions");
+        assert!(matches!(&err, EthApiError::FailedToDecodeSignedTransaction), "{err:?}");
     }
 }
 

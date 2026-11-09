@@ -725,3 +725,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   request must not start a blocking task until the first one's ends. `debug.rs`'s test does the same
   for `debug_executionWitness` and `debug_executionWitnessByBlockHash`. All thirteen fail before the
   change. *Upstream*: yes; upstream main still releases these permits on disconnect.
+
+- **TN-0054** — `eth_callBundle` bounds its transaction count and recovers signatures in its
+  blocking task. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/bundle.rs` (`call_bundle`, `EthBundleError::TooManyTransactions`,
+  `max_bundle_transactions`, and two tests in `gas_limit_tests`).
+  *Why*: the handler decoded and signature-recovered every transaction of the bundle in its
+  `async fn` body, before the blocking-IO permit (TN-0037) and the gas budget (TN-0046) applied.
+  jsonrpsee polls that body on the runtime that started the server, which on a TN node is the
+  runtime consensus runs on; a 15 MB request holds about 100k minimal transactions, seconds of
+  recovery per request, and nothing capped the count (review R1). The count is now checked first,
+  against the most transactions the bundle's gas limit can hold (`call_gas_limit / 21_000`, 2,380
+  at the default cap; TN-0046 would refuse the first one over anyway), and decoding, recovery and
+  the blob-gas check moved into the blocking closure, after the permit, so the work runs on
+  `tn-rpc-blocking`. Same results for every bundle that was accepted before. RPC only.
+  *Tests*: `bundle_over_the_transaction_count_is_refused_before_decoding` (2,381 undecodable
+  entries fail on the count, so nothing was decoded) and `bundle_at_the_transaction_count_is_decoded`
+  (2,380 fail on the decode). *Upstream*: yes; upstream main (6351fbb92) only caches recoveries.
