@@ -502,8 +502,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `to_plain_state` drops the empty bytecode (`KECCAK_EMPTY`); TN keeps that filter, so the
   `Bytecodes` table is the same on both paths. Storage path, v2 only: the condition needs
   `use_hashed_state()`, which is false for every v1 datadir, so v1 writes are unchanged; genesis
-  and other `StateWriteConfig::default()` callers still convert. *Upstream*: yes, the
-  `KECCAK_EMPTY` filter.
+  and other `StateWriteConfig::default()` callers still convert. *Tests*:
+  `v2_matches_v1_on_a_generated_chain` (TN-0045) puts the empty bytecode in a bundle and requires
+  `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
+  filter.
 
 ## TN fixes (not from an upstream commit)
 
@@ -560,7 +562,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   sorted batch now goes to the table in both layouts, in the `save_blocks` transaction. Every
   reader (`transaction_id`) and the unwind (`remove_blocks_above`) already used the table in both
   layouts (`EitherReader`/`EitherWriter` route it to the database only). Storage path, v2 only:
-  the v1 write is unchanged. *Upstream*: n/a (upstream writes it to `RocksDB`).
+  the v1 write is unchanged. *Tests*: `v2_matches_v1_on_a_generated_chain` and
+  `v2_history_unwind_round_trip` (TN-0045) look every transaction up by hash, and the unwound ones
+  must be gone; the first fails with the v2 gate restored. *Upstream*: n/a (upstream writes it to
+  `RocksDB`).
 
 - **TN-0043** — Storage v2 writes and unwinds `AccountsHistory` and `StoragesHistory` in the
   database tables. *Kind*: fix.
@@ -589,8 +594,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
     committed static-file tip is below the range end, instead of indexing nothing.
   Storage path: v1's `save_blocks` still calls `update_history_indices` and its unwinds are the
-  same code, so v1 datadirs are written as before. *Upstream*: n/a (upstream writes these to
-  `RocksDB`; its v2 has the same wipe gap).
+  same code, so v1 datadirs are written as before. *Tests* (TN-0045):
+  `v2_matches_v1_on_a_generated_chain` (the tables equal v1's; fails without the v2 insert or
+  with the `DoNothing` filter dropped), `v2_history_unwind_round_trip` (fails with either empty
+  unwind arm restored), `v2_wipe_of_existing_storage_fails_closed`,
+  `v2_wipe_of_storage_written_earlier_in_the_batch_fails_closed` and
+  `v2_update_history_indices_refuses_uncommitted_changesets` (each fails with its check
+  removed). *Upstream*: n/a (upstream writes these to `RocksDB`; its v2 has the same wipe gap).
 
 - **TN-0044** — Storage v2 keys storage changesets and `StoragesHistory` by the plain slot, as v1
   does (the key form of upstream 815037e27). *Kind*: fix (format).
@@ -623,3 +633,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `v2_genesis_storage_reads_after_genesis` (db-common; fails with the hashed lookup),
   `test_populate_bundle_state_hashed_with_plain_keys`, `test_write_and_remove_state_roundtrip_v2`
   and the TN-0045 differential. *Upstream*: n/a (upstream commit).
+
+- **TN-0045** — Tests: storage v2 without `RocksDB` against v1 on the same generated chain.
+  *Kind*: test.
+  *Files*: new `crates/storage/provider/src/providers/database/tn_v2_tests.rs` (TN-owned),
+  `.../providers/database/mod.rs` (the `#[cfg(test)]` module line).
+  *Why*: the oracle for TN-0041 to TN-0044. A seeded generator builds blocks 1 to 12 with
+  transactions, account creations and updates, accounts whose only change is storage (an info
+  revert of `DoNothing`), slots changed in several blocks, slots cleared, and the empty bytecode
+  in a bundle's contracts. The chain is saved with `save_blocks` into a v1 and a v2 factory in
+  single- and multi-block batches. `v2_matches_v1_on_a_generated_chain` checks that v2 writes
+  the three ex-`RocksDB` tables, that they, the changesets and `Bytecodes` equal v1's row for
+  row, that every historical account and storage read at the start of each block equals v1's
+  answer and the generator's state, and that every transaction is found by hash.
+  `v2_history_unwind_round_trip` removes blocks with `remove_block_and_execution_above` in both
+  layouts, compares the tables and reads with a save of the shorter chain, then saves the removed
+  blocks again and compares with a full save. Three tests cover the fail-closed paths of
+  TN-0043: a v2 wipe of an account with committed storage, and of storage written earlier in the
+  same batch, fail (a wipe of an account without storage saves), and `update_history_indices`
+  refuses blocks whose static-file changesets are not committed yet while re-indexing committed
+  ones to what `save_blocks` wrote. Each test fails with the change it guards undone.
+  *Upstream*: n/a.

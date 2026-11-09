@@ -58,6 +58,10 @@ mod metrics;
 mod chain;
 pub use chain::*;
 
+// TN(TN-0045): storage v2 against v1 on the same generated chain.
+#[cfg(test)]
+mod tn_v2_tests;
+
 /// A common provider that fetches data from a database or static file.
 ///
 /// This provider implements most provider or provider factory traits.
