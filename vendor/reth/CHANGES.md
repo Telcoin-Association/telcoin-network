@@ -703,6 +703,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `..._missing_block_returns_error` and `..._returns_matching_transaction`.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0064** — Backport 48df75d88: tracing lookups fail with geth's error code. *Kind*: backport.
+  *Files*: `crates/rpc/rpc-eth-types/src/error/mod.rs` (`TracingTransactionNotFound`,
+  `TracingBlockNotFound`, `GenesisNotTraceable`, their -32000 mapping, upstream's test),
+  `crates/rpc/rpc/src/debug.rs` (`debug_traceBlockByNumber`/`ByHash` and `debug_traceTransaction`
+  raise them; the genesis check sits after TN-0038's permit and TN's hash lookup).
+  *Why*: `debug_trace*` answered a missing block or transaction with -32001 (`ResourceNotFound`,
+  reth's code for `eth` lookups) where geth and the execution-apis tests use -32000; tracing
+  genesis failed with "block not found" for the zero parent hash instead of saying why.
+  Prerequisite of 5d6634a6f (`debug_traceCall`, review R26), which uses these variants. Error
+  codes and messages only; RPC only.
+  *Tests*: upstream's `tracing_lookup_errors_use_call_execution_failed_code`; the `debug` doc
+  pages (`debug_traceBlockByNumber`, `ByHash`, `debug_traceTransaction`) now state -32000.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

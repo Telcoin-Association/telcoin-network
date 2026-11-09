@@ -46,7 +46,7 @@ The struct logger (no `tracer`) returns:
 * `value`: `QUANTITY` - The value transferred.
 * `type`: `String` - The call type, such as `CALL`, `STATICCALL`, `DELEGATECALL`, `CREATE` or `CREATE2`.
 
-A hash the node does not know fails with error `-32001` `transaction not found`.
+A hash the node does not know fails with error `-32000` `transaction not found` (the code geth uses; other `eth` lookups keep `-32001`).
 
 #### Example
 

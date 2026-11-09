@@ -74,6 +74,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | f12d52de2 | TN-0060 | `--txpool.max-batch-size 0` is refused at parse time (it parked the transaction batcher for good) | upstream test |
 | 5b6863039 | TN-0062 | a priced call with no `gas` field stays within `--rpc.gascap` (the caller allowance was clamped to the block limit only) | upstream test |
 | dfcb10454 | TN-0063 | `eth_getTransactionBySenderAndNonce` returns `null`, not a header error, when the sender's nonce moved without a transaction of theirs in the block (the mock hunk came with TN-0036) | upstream tests |
+| 48df75d88 | TN-0064 | `debug_trace*` lookups of a missing block or transaction, and tracing genesis, fail with -32000 as geth does (prerequisite of 5d6634a6f) | upstream test |
 
 ## Open
 

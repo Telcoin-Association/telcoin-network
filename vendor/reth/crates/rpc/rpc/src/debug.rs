@@ -235,14 +235,18 @@ where
             .provider()
             .block_hash_for_id(block_id)
             .map_err(Eth::Error::from_eth_err)?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
+            .ok_or(EthApiError::TracingBlockNotFound(block_id))?;
 
         let ((evm_env, _), block) = futures::try_join!(
             self.eth_api().evm_env_at(block_hash.into()),
             self.eth_api().recovered_block(block_hash.into()),
         )?;
 
-        let block = block.ok_or(EthApiError::HeaderNotFound(block_id))?;
+        let block = block.ok_or(EthApiError::TracingBlockNotFound(block_id))?;
+        // Tracing requires the parent state, which does not exist for the genesis block.
+        if block.number() == 0 {
+            return Err(EthApiError::GenesisNotTraceable.into())
+        }
 
         self.trace_block(block, evm_env, opts, permit).await
     }
@@ -257,7 +261,7 @@ where
     ) -> Result<GethTrace, Eth::Error> {
         let permit = self.trace_task_permit().await?;
         let (transaction, block) = match self.eth_api().transaction_and_block(tx_hash).await? {
-            None => return Err(EthApiError::TransactionNotFound.into()),
+            None => return Err(EthApiError::TracingTransactionNotFound.into()),
             Some(res) => res,
         };
         let (evm_env, _) = self.eth_api().evm_env_at(block.hash().into()).await?;
