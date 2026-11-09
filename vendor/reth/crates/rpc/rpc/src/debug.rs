@@ -27,7 +27,7 @@ use reth_rpc_api::DebugApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
-    FromEthApiError, RpcConvert, RpcNodeCore,
+    AsEthApiError, FromEthApiError, RpcConvert, RpcNodeCore,
 };
 use reth_rpc_eth_types::{call_many, CallManyBudget, EthApiError};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
@@ -373,7 +373,13 @@ where
                     .map_err(Eth::Error::from_eth_err)?;
                 Ok(trace)
             });
-        interrupt.run(trace).await
+        interrupt.run(trace).await.map_err(|err| match err.as_err() {
+            Some(EthApiError::HeaderNotFound(id)) if *id == at => {
+                // Unknown blocks use -32000: https://github.com/ethereum/execution-apis/pull/855
+                EthApiError::TracingBlockNotFound(at).into()
+            }
+            _ => err,
+        })
     }
 
     /// Helper method to execute `debug_trace_call` at a specific transaction index within a block.
@@ -393,7 +399,7 @@ where
             .eth_api()
             .recovered_block(block_id)
             .await?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
+            .ok_or(EthApiError::TracingBlockNotFound(block_id))?;
 
         if tx_index >= block.transaction_count() {
             // tx_index out of bounds
@@ -1488,6 +1494,37 @@ mod trace_permit_tests {
         TraceMethod::ExecutionWitness,
         TraceMethod::ExecutionWitnessByHash,
     ];
+
+    /// TN(TN-0065): upstream 5d6634a6f's test. `debug_traceCall` at a block the node does not
+    /// have fails with -32000 (with and without `txIndex`), where `eth_call` keeps -32001.
+    #[tokio::test]
+    async fn trace_call_out_of_range_block_error() {
+        use reth_rpc_eth_api::EthApiServer;
+
+        let fixture = Fixture::new();
+        let block_id = BlockId::number(0xfffffffff);
+        for tx_index in [None, Some(0)] {
+            let mut opts: GethDebugTracingCallOptions =
+                serde_json::from_value(serde_json::json!({ "tracer": "callTracer" })).unwrap();
+            opts.tx_index = tx_index;
+            let err = DebugApiServer::debug_trace_call(
+                &fixture.api,
+                Default::default(),
+                Some(block_id),
+                Some(opts),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), -32000, "{err}");
+            assert!(err.message().contains("not found"), "{err}");
+        }
+
+        let eth_api = fixture.chain.eth_api();
+        let err = EthApiServer::call(&eth_api, Default::default(), Some(block_id), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32001, "{err}");
+    }
 
     /// A debug API limited to one tracing permit, over [`MockChain`].
     struct Fixture {

@@ -717,6 +717,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pages (`debug_traceBlockByNumber`, `ByHash`, `debug_traceTransaction`) now state -32000.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0065** — Backport 5d6634a6f: `debug_traceCall` at a missing block fails with -32000.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`debug_trace_call`, with and without `txIndex`; upstream's
+  test `trace_call_out_of_range_block_error` on the permit fixture of `trace_permit_tests`).
+  *Why*: the two `debug_traceCall` paths resolved their block through the `eth` helpers and so
+  answered an unknown block with `eth`'s -32001 while the other `debug_trace*` methods, after
+  TN-0064, use geth's -32000 (review R26). The `HeaderNotFound` for the requested block is now
+  mapped to `TracingBlockNotFound`; TN-0049's cancellation wrapper stays around the call. Error
+  code only; RPC only.
+  *Tests*: upstream's `trace_call_out_of_range_block_error`, with `eth_call` checked for -32001
+  beside it. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
