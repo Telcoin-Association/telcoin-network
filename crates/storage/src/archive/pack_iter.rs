@@ -29,16 +29,18 @@ fn zstd_decode_error(e: io::Error) -> FetchError {
 
 /// Decompress a zstd record `compressed` payload into `out`, enforcing the in-memory
 /// `MAX_RECORD_SIZE` cap on the decompressed size, so an oversized record is reported as
-/// `RequestedDecompressSizeTooLarge`. Shared by every local decompression site: the iterators
-/// (sync, and async unless [`AsyncPackIter::bounded_for_peer`] set the bound), which reuse their
-/// buffer, and the `&self` `fetch` path (`PackInner::read_record_into`), which decompresses into
-/// a fresh buffer and then decodes the slice. Peer-facing sites go through
-/// [`decompress_peer_record`], which also bounds the stored size (#1787). Clears `out` first and
-/// returns a borrow of it.
+/// `RequestedDecompressSizeTooLarge`, and the [`stored_bound`] on the stored size, so a record
+/// stored in more bytes than zstd's worst case for its content is refused as `DeserializeValue`
+/// (GHSA-8fj9-xc3h-gmxm, #1787). Shared by every decompression site, local or peer: the iterators
+/// (sync and async), which reuse their buffer, the `&self` `fetch` path
+/// (`PackInner::read_record_into`), which decompresses into a fresh buffer and then decodes the
+/// slice, and the import's `ImportRecords::next`. Clears `out` first and returns a borrow of it.
 ///
 /// The record's frame passed its CRC before this runs, so a payload zstd rejects is what the writer
 /// produced, not a read failure: it is reported as a decode fault, never as `IO` (a peer stream's
-/// importer treats `IO` as a transport failure that says nothing about the bytes).
+/// importer treats `IO` as a transport failure that says nothing about the bytes). The peer paths
+/// map a decode fault to `PackError::UndecodableRecord` (`record_read_error`), so a padded record
+/// fails the probe and the peer is marked for the epoch.
 pub(crate) fn decompress_checked<'a>(
     compressed: &[u8],
     out: &'a mut Vec<u8>,
@@ -52,39 +54,28 @@ pub(crate) fn decompress_checked<'a>(
     if out.len() as u64 > MAX_RECORD_SIZE as u64 {
         return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
     }
-    Ok(out)
-}
-
-/// zstd's worst-case stored size for one frame of `content_len` bytes of content
-/// (`zstd_safe::compress_bound`), plus headroom for the frame header and checksum. The pack
-/// writer emits one frame per record, so every honest record meets this bound; a record above it
-/// carries bytes that are not content (#1787). Checked by [`decompress_peer_record`].
-pub(crate) fn stored_bound(content_len: usize) -> usize {
-    zstd::zstd_safe::compress_bound(content_len).saturating_add(64)
-}
-
-/// Decompress a zstd record received from a peer as [`decompress_checked`] does, then refuse it
-/// when its stored size is above [`stored_bound`] of its content. This refuses skippable frames,
-/// empty frames, empty blocks and any other padding: the sync rate meter counts stored bytes, so
-/// padding would feed the meter bytes that carry no content (GHSA-8fj9-xc3h-gmxm, #1787). The
-/// refusal is `DeserializeValue`, which the peer paths map to `PackError::UndecodableRecord`
-/// (`record_read_error`), so the probe fails and the peer is marked for the epoch.
-///
-/// Local reads keep [`decompress_checked`]: imports store a peer's bytes verbatim, so a pack
-/// imported before this bound may hold such records, and they must still read.
-pub(crate) fn decompress_peer_record<'a>(
-    compressed: &[u8],
-    out: &'a mut Vec<u8>,
-) -> Result<&'a [u8], FetchError> {
-    let content = decompress_checked(compressed, out)?;
-    let content_len = content.len();
+    let content_len = out.len();
     let bound = stored_bound(content_len);
+    let content: &'a [u8] = out;
     (compressed.len() <= bound).then_some(content).ok_or_else(|| {
         FetchError::DeserializeValue(format!(
             "zstd: {} stored bytes for {content_len} bytes of content (bound {bound})",
             compressed.len()
         ))
     })
+}
+
+/// zstd's worst-case stored size for one frame of `content_len` bytes of content
+/// (`zstd_safe::compress_bound`), plus headroom for the frame header and checksum. The pack
+/// writer emits one frame per record from one encoder, so every honest record fits; a record
+/// above the bound is refused by [`decompress_checked`] (#1787).
+///
+/// What the bound gives the sync rate meter: a record must fit zstd's worst case for its decoded
+/// content, so one record can be credited at most about its decoded size `n` plus `n / 256 + 127`
+/// bytes. The bound does not refuse padding that fits under it, and bytes after the last decoded
+/// record are still credited, since the meter counts stored bytes as they arrive.
+pub(crate) fn stored_bound(content_len: usize) -> usize {
+    zstd::zstd_safe::compress_bound(content_len).saturating_add(64)
 }
 
 /// Iterate over a pack's records (values) in insert order.
@@ -347,9 +338,6 @@ where
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
     version: u16,
-    /// When set, zstd records are decoded with [`decompress_peer_record`] (see
-    /// [`AsyncPackIter::bounded_for_peer`]); otherwise with [`decompress_checked`].
-    bound_stored: bool,
 }
 
 impl<V, R> AsyncPackIter<V, R>
@@ -383,7 +371,6 @@ where
             decompress_buffer: Vec::new(),
             compression: header.compression(),
             version: header.version(),
-            bound_stored: false,
         })
     }
 
@@ -403,17 +390,7 @@ where
             decompress_buffer: Vec::new(),
             compression,
             version,
-            bound_stored: false,
         })
-    }
-
-    /// Decode every zstd record with [`decompress_peer_record`], not [`decompress_checked`]: a
-    /// record stored in more than [`stored_bound`] of its content is refused as
-    /// `DeserializeValue` (#1787). For streams received from a peer (`bytes_to_verified_output`,
-    /// `stream_import`). A local read keeps the unbounded decode, since a pack imported before
-    /// the bound may hold padded records.
-    pub(crate) fn bounded_for_peer(self) -> Self {
-        Self { bound_stored: true, ..self }
     }
 
     /// Return the version of the underlying data.
@@ -457,19 +434,14 @@ where
         Ok(())
     }
 
-    /// Return the next V when available. A zstd record is decoded with `decompress_peer_record`
-    /// once `bounded_for_peer` set the bound (a peer's stream, #1787), else with
-    /// `decompress_checked`.
+    /// Return the next V when available. A zstd record is decoded with [`decompress_checked`],
+    /// which bounds its stored size (#1787).
     pub async fn next(&mut self) -> Option<Result<V, FetchError>> {
         let decoded = match Self::read_frame(&mut self.reader, &mut self.buffer).await {
             Ok(()) => match self.compression {
                 PackCompression::None => Ok(&self.buffer[..]),
                 PackCompression::ZStd => {
-                    if self.bound_stored {
-                        decompress_peer_record(&self.buffer[..], &mut self.decompress_buffer)
-                    } else {
-                        decompress_checked(&self.buffer[..], &mut self.decompress_buffer)
-                    }
+                    decompress_checked(&self.buffer[..], &mut self.decompress_buffer)
                 }
             },
             Err(err) => Err(err),
@@ -550,7 +522,7 @@ mod tests {
     }
 
     /// Every honest record (one level-0 frame, as the pack writer stores it) fits
-    /// [`stored_bound`] and passes [`decompress_peer_record`]: empty, tiny, block-edge and
+    /// [`stored_bound`] and passes [`decompress_checked`]: empty, tiny, block-edge and
     /// multi-block sizes of zeros, incompressible bytes and repeated text (#1787).
     #[test]
     fn stored_bound_admits_every_honest_record() {
@@ -573,34 +545,34 @@ mod tests {
                     content.len()
                 );
                 let mut out = Vec::new();
-                let decoded = decompress_peer_record(&stored, &mut out).expect("honest record");
+                let decoded = decompress_checked(&stored, &mut out).expect("honest record");
                 assert_eq!(decoded, &content[..]);
             });
     }
 
     /// A skippable frame (RFC 8878 3.1.2) before or after a record's real frame is padding. The
-    /// multi-frame decoder of [`decompress_checked`] skips it and yields the content (pinned here:
-    /// it is why the peer paths need the bound), and [`decompress_peer_record`] refuses the
-    /// record as `DeserializeValue` (GHSA-8fj9-xc3h-gmxm, #1787). The plain real frame passes.
+    /// zstd crate's multi-frame decoder skips it and yields the content (pinned here: it is why
+    /// the decode needs the bound), and [`decompress_checked`] refuses the record as
+    /// `DeserializeValue` (GHSA-8fj9-xc3h-gmxm, #1787). The plain real frame passes.
     #[test]
-    fn decompress_peer_record_rejects_skippable_frame_padding() {
+    fn decompress_checked_refuses_skippable_frame_padding() {
         let payload = pseudo_random(64);
         let real = compress(&payload);
         let mut out = Vec::new();
-        assert_eq!(decompress_peer_record(&real, &mut out).expect("plain frame"), &payload[..]);
+        assert_eq!(decompress_checked(&real, &mut out).expect("plain frame"), &payload[..]);
         let pad = skippable(4096);
         let padded = [
             pad.iter().chain(real.iter()).copied().collect::<Vec<u8>>(),
             real.iter().chain(pad.iter()).copied().collect::<Vec<u8>>(),
         ];
         padded.iter().for_each(|stored| {
-            let mut out = Vec::new();
             assert_eq!(
-                decompress_checked(stored, &mut out).expect("the decoder skips the padding"),
-                &payload[..]
+                zstd::stream::decode_all(&stored[..]).expect("the zstd decoder skips the padding"),
+                payload
             );
+            let mut out = Vec::new();
             assert!(matches!(
-                decompress_peer_record(stored, &mut out),
+                decompress_checked(stored, &mut out),
                 Err(FetchError::DeserializeValue(_))
             ));
         });

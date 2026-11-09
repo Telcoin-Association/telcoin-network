@@ -82,10 +82,20 @@ const SYNC_TARGET_RATE_MULTIPLE: u64 = 8;
 /// (`walk_with_floor_fallback`). A de-prioritised peer (one marked slow for that epoch) is read at
 /// the floor ([`SyncRateBound::Floor`]), so a network whose only peers are slow still syncs. A
 /// peer that serves at or above the target becomes the preferred sync server. It keeps the
-/// probe-first slot until it fails a probe, until an exploration walk
-/// (`SYNC_PREFERENCE_EXPLORE_EVERY` in `network/mod.rs`) finds another peer that serves at the
-/// target, or until the epoch rotates. So a peer that serves at exactly the target can hold the
-/// slot for up to that many walks (#1787).
+/// probe-first slot until it fails a probe, until another peer serves an exploration walk
+/// (`SYNC_PREFERENCE_EXPLORE_EVERY` in `network/mod.rs`, which probes the holder last) at the
+/// target, or until the epoch rotates. The last two bump a generation on the slot, so a serve by
+/// the old holder that completes afterwards does not put it back. A holder that serves at
+/// exactly the target is therefore displaced by the first exploration walk, at most
+/// `SYNC_PREFERENCE_EXPLORE_EVERY` walks away, that any other peer serves at the target (#1787).
+///
+/// A requester whose own link is below the target pays for it once per node epoch (#1787, Gap
+/// 4): the first walk that cuts two distinct peers at the target (about one window each, ~31 s
+/// at 190 KiB/s) stops its target pass there, reads the rest of that walk at the floor, and sets
+/// the handle's floor-only flag (`floor_only_this_epoch` in `network/mod.rs`), so every later walk
+/// of that node epoch reads every peer at the floor with no target probe; `clear_sync_capability`
+/// resets the flag at rotation. The worst case is two cut probes per node epoch on top of the
+/// parent's always-floor behaviour.
 pub(crate) const SYNC_TARGET_MIN_BYTES: u64 = SYNC_RATE_MIN_BYTES * SYNC_TARGET_RATE_MULTIPLE;
 
 /// Wall-clock allowance for the latency part of one exchange (stream open, request write, `Ack`

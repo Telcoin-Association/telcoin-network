@@ -4433,8 +4433,8 @@ impl Inner {
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
         // foreign app number), or a stream that ends before its header is complete (see
         // `record_read_error`), is. Its frames are read raw (`pump_import_frames`) and decoded
-        // by `ImportRecords::next` with `decompress_peer_record`; the iterator is bounded for
-        // the peer as well, so no `next` on this stream decodes a record unbounded (#1787).
+        // by `ImportRecords::next` with `decompress_checked`, which bounds the stored size of
+        // every zstd record (#1787).
         let mut stream_iter =
             AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
                 .await
@@ -4446,8 +4446,7 @@ impl Inner {
                         PackError::ReadError(e.to_string())
                     }
                     _ => PackError::UndecodableRecord(format!("stream header: {e}")),
-                })?
-                .bounded_for_peer();
+                })?;
         // A legacy v0 (batches-first) pack is only ever migrated on disk, never imported: an
         // upgraded peer serves its v0 epochs migrated, so refuse the source before writing
         // anything. An older build's honest bytes are no fault of the peer's (no penalty). A v1
@@ -5652,7 +5651,7 @@ struct ImportRecords {
 impl ImportRecords {
     /// The next record, or `None` at the stream's clean end. Bytes that do not decompress or
     /// decode are the sender's ([`record_read_error`]), and so is a record stored in more than
-    /// `stored_bound` of its content (`decompress_peer_record`, #1787). A reader that is gone
+    /// `stored_bound` of its content (`decompress_checked`, #1787). A reader that is gone
     /// without reporting an end means the import was abandoned: its future was dropped.
     fn next(&mut self) -> Result<Option<ImportRecord>, PackError> {
         let Some(frame) = self.frames.blocking_recv() else {
@@ -5662,7 +5661,7 @@ impl ImportRecords {
         let payload = match self.compression {
             PackCompression::None => &frame[..],
             PackCompression::ZStd => {
-                crate::archive::pack_iter::decompress_peer_record(&frame, &mut self.payload)
+                crate::archive::pack_iter::decompress_checked(&frame, &mut self.payload)
                     .map_err(record_read_error)?
             }
         };
@@ -5983,9 +5982,9 @@ impl OutputStreamDecoder {
 /// ConsensusOutput, verifying the header's digest equals `expected_digest` the instant it is read —
 /// BEFORE any batch record is buffered. Used on the requested-output receive path, where the
 /// expected header hash is already known (from verified gossip / a verified descendant's parent).
-/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read. Peer
-/// records are bounded by `decompress_peer_record` (`AsyncPackIter::bounded_for_peer`): a record
-/// stored in more than `stored_bound` of its content is [`PackError::UndecodableRecord`] (#1787).
+/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read. A record
+/// stored in more than `stored_bound` of its content is [`PackError::UndecodableRecord`]
+/// (`decompress_checked`, #1787).
 pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
     stream: R,
     compression: PackCompression,
@@ -5996,8 +5995,7 @@ pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
     let mut stream_iter =
         AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
             .await
-            .map_err(|e| PackError::ReadError(e.to_string()))?
-            .bounded_for_peer();
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
     iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::Digest(expected_digest))
         .await
 }
