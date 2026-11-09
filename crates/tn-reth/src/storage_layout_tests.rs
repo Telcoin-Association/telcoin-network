@@ -315,6 +315,44 @@ async fn snapshot_export_is_identical_in_both_storage_layouts() -> eyre::Result<
     Ok(())
 }
 
+/// A key whose history spans several shards (a shard holds at most `NUM_OF_INDICES_IN_SHARD`
+/// blocks) is exported once: the v2 walk meets the key once per shard.
+#[tokio::test]
+async fn snapshot_export_reads_each_key_once_across_history_shards() -> eyre::Result<()> {
+    use reth_db::{cursor::DbCursorRO as _, tables::AccountsHistory, transaction::DbTx as _};
+    use reth_provider::{DBProvider as _, HistoryWriter as _};
+
+    let plan = Plan::new();
+    let mut packs = Vec::new();
+    for settings in LAYOUTS {
+        let tasks = TaskManager::new("storage layout shards");
+        let datadir = Datadir::new(plan.chain.clone(), settings)?;
+        let env = datadir.open(&tasks, settings)?;
+        let provider = env.blockchain_provider().database_provider_rw()?;
+        provider.insert_account_history_index([(STORE, 1..=2_001)])?;
+        provider.insert_storage_history_index([((STORE, word(1)), 1..=2_001)])?;
+        let shards = provider
+            .tx_ref()
+            .cursor_read::<AccountsHistory>()?
+            .walk(None)?
+            .filter(|row| row.as_ref().is_ok_and(|(key, _)| key.key == STORE))
+            .count();
+        assert_eq!(shards, 2, "the fixture must split the history into two shards");
+        provider.commit()?;
+
+        let genesis = header(&env, 0)?;
+        let dir = TempDir::new()?;
+        env.pin_state_view()?.export_state_pack(
+            genesis.state_root,
+            &[genesis.header().clone()],
+            dir.path(),
+        )?;
+        packs.push((pack_bytes(dir.path())?, dir));
+    }
+    assert_eq!(packs[0].0, packs[1].0, "the v1 and v2 exports must be byte-identical");
+    Ok(())
+}
+
 /// A pack from either layout restores into either: the recomputed root matches, the restored
 /// datadir reopens (its static-file segments end at the stage checkpoints, which the startup
 /// consistency check requires), re-exports the same pack, and continues the chain: the next block
@@ -422,6 +460,18 @@ async fn registry_reads_at_past_headers_match_across_storage_layouts() -> eyre::
             .map(|number| Ok(env.get_current_epoch_info_at_header(&header(env, number)?)?.0))
             .collect::<eyre::Result<Vec<_>>>()?;
         assert_eq!(epochs, [0, 0, 0, 1, 1], "{}", name(settings));
+        // and the genesis state: the genesis committee, a genesis slot never rewritten (its
+        // genesis history shard), and a genesis slot rewritten later (its changeset)
+        let genesis = header(env, 0)?;
+        assert_eq!(env.epoch_state_at_header(&genesis)?.validators.len(), 5, "{}", name(settings));
+        for number in 0..=TIP {
+            let state = env.state_by_block_hash(header(env, number)?.hash())?;
+            assert_eq!(state.storage(STORE, word(3))?, Some(U256::from(3)), "{}", name(settings));
+        }
+        let at = |number| -> eyre::Result<_> {
+            Ok(env.state_by_block_hash(header(env, number)?.hash())?.storage(STORE, word(1))?)
+        };
+        assert_eq!([at(0)?, at(2)?, at(4)?], [1, 111, 1111].map(|v| Some(U256::from(v))));
         answers.push(reads);
     }
     assert_eq!(answers[0], answers[1], "v1 and v2 must answer every pinned read the same");
