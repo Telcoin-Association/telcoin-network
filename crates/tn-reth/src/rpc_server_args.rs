@@ -57,6 +57,10 @@ pub const DEFAULT_IPC_ENDPOINT: &str = r"\\.\pipe\tn.ipc";
 #[cfg(not(windows))]
 pub const DEFAULT_IPC_ENDPOINT: &str = "/tmp/tn.ipc";
 
+/// The most permits a tokio semaphore can hold; a larger permit flag panics while the RPC
+/// server is built.
+const MAX_PERMITS: u64 = tokio::sync::Semaphore::MAX_PERMITS as u64;
+
 /// Default max number of subscriptions per connection.
 pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 1024;
 
@@ -134,7 +138,11 @@ pub struct RpcServerArgs {
     #[arg(long)]
     pub ipcdisable: bool,
 
-    /// Filename for IPC socket/pipe within the datadir
+    /// Path of the IPC socket (or named pipe on Windows).
+    ///
+    /// The path is host-global, not inside the datadir: `--instance N` appends `-N`, and each
+    /// worker above 0 appends `-wN`. A node refuses to start when another process is already
+    /// serving the socket; a stale socket file left by a crash is replaced.
     #[arg(long, default_value_t = DEFAULT_IPC_ENDPOINT.to_string())]
     pub ipcpath: String,
 
@@ -184,7 +192,10 @@ pub struct RpcServerArgs {
     /// Tracing requests are generally CPU bound.
     /// Choosing a value that is higher than the available CPU cores can have a negative impact on
     /// the performance of the node and affect the node's ability to maintain sync.
-    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", default_value_t = constants::default_max_tracing_requests())]
+    ///
+    /// At least 2: `trace_filter` takes two permits at once, so with one permit it would wait
+    /// forever holding the only one, and every other tracing method with it.
+    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(2..=MAX_PERMITS), default_value_t = constants::default_max_tracing_requests())]
     pub rpc_max_tracing_requests: usize,
 
     /// Maximum number of blocks for `trace_filter` requests.
@@ -238,8 +249,9 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent getproof requests.
-    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
+    /// Maximum number of concurrent getproof requests. At least 1: with none, every
+    /// `eth_getProof` would wait forever.
+    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 
     /// The pending block behavior for `pending`-tag RPC queries.
@@ -402,6 +414,36 @@ mod tests {
     use crate::cli::RethCommand;
     use clap::Parser;
     use reth_rpc_builder::config::RethRpcServerConfig as _;
+
+    /// A permit count the semaphores cannot serve is refused at parse time: zero permits (or
+    /// one for tracing, which `trace_filter` needs two of) would hang the methods behind
+    /// them, and a count above tokio's maximum panics while the RPC server is built.
+    #[test]
+    fn permit_flags_are_bounded() {
+        let parse = |flag: &str, value: &str| {
+            RethCommand::try_parse_from(["tn-reth", flag, value]).map(|cmd| cmd.rpc)
+        };
+        let too_many = (MAX_PERMITS + 1).to_string();
+
+        assert!(parse("--rpc.max-tracing-requests", "0").is_err());
+        assert!(parse("--rpc.max-tracing-requests", "1").is_err());
+        assert!(parse("--rpc.max-tracing-requests", &too_many).is_err());
+        assert_eq!(parse("--rpc.max-tracing-requests", "2").unwrap().rpc_max_tracing_requests, 2);
+
+        assert!(parse("--rpc.proof-permits", "0").is_err());
+        assert!(parse("--rpc.proof-permits", &too_many).is_err());
+        assert_eq!(parse("--rpc.proof-permits", "1").unwrap().rpc_proof_permits, 1);
+
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", "0").is_err());
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", &too_many).is_err());
+        assert_eq!(
+            parse("--rpc-cache.max-concurrent-db-requests", "1")
+                .unwrap()
+                .rpc_state_cache
+                .max_concurrent_db_requests,
+            1
+        );
+    }
 
     /// The manual `Default` impl and the clap CLI default must agree on TN's own
     /// IPC endpoint, not reth's `/tmp/reth.ipc`.

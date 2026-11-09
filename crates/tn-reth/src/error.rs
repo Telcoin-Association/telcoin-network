@@ -104,6 +104,20 @@ pub enum TnRethError {
         /// The band offset for this worker (stride times worker id).
         offset: u32,
     },
+    /// Another process is serving the IPC socket this worker would bind.
+    ///
+    /// reth unlinks whatever is at the path before it listens, so a second node started on the
+    /// same host without `--instance` or `--ipcpath` would silently take the socket over while
+    /// the first kept serving an unlinked inode. A stale socket file (no listener) is not an
+    /// error: reth replaces it, which keeps restart-after-crash working.
+    #[error(
+        "another process is serving the IPC socket {path}; stop it, or start this node with \
+         --instance or --ipcpath"
+    )]
+    IpcSocketInUse {
+        /// The socket path this worker would have bound.
+        path: String,
+    },
     /// Multi-worker RPC derivation needs the ws base port at or above the http base.
     ///
     /// http bands stride down and ws bands stride up from the operator's bases, so

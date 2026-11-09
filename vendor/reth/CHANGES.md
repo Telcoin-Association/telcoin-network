@@ -857,3 +857,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `test_range_scan_across_windows` (2,501 blocks, three with logs, every window fetched
   in parallel; a limit of one log ends the scan in the second window), with its retry-range
   assertion on the vendored semantics; TN-0035's permit tests. *Upstream*: n/a (upstream commit).
+
+- **TN-0061** — `--rpc-cache.max-concurrent-db-requests` takes 1 up to a semaphore's capacity.
+  *Kind*: fix.
+  *Files*: `crates/node/core/src/args/rpc_state_cache.rs` (`RpcStateCacheArgs::max_concurrent_db_requests`).
+  *Why*: the flag fed a tokio semaphore unchecked. At 0 every RPC cache miss waited forever on a
+  permit that never came, holding its connection; above `usize::MAX >> 3` (`Semaphore::MAX_PERMITS`)
+  `Semaphore::new` panicked while the RPC server was built. TN flattens this struct into its own
+  `RpcServerArgs`, so the flag reaches TN unchanged; TN's own permit flags
+  (`--rpc.max-tracing-requests`, at least 2, and `--rpc.proof-permits`) got the same bounds in
+  `tn-reth/src/rpc_server_args.rs` (review R14). RPC configuration only.
+  *Tests*: tn-reth's `permit_flags_are_bounded` parses all three flags through TN's CLI.
+  *Upstream*: yes.

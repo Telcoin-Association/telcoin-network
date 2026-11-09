@@ -230,6 +230,23 @@ fn worker_rpc_server_args(
     }
 }
 
+/// Whether a process is listening on the IPC socket at `path`.
+///
+/// Connecting to a live Unix socket succeeds at once; a stale socket file refuses the
+/// connection and a missing one does not exist, and both of those reth replaces when it
+/// listens. Named pipes on Windows are not probed.
+fn ipc_socket_is_live(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Apply the operator's [`EthConfig`] values to the `eth` API builder.
 ///
 /// Mirrors `EthApiCtx::eth_api_builder` (reth v1.11.3, `crates/node/builder/src/rpc.rs`),
@@ -434,8 +451,11 @@ impl RethEnv {
         server: &RpcServer,
         worker_id: WorkerId,
     ) -> TnRethResult<RpcServerHandle> {
-        let server_config =
-            worker_rpc_server_args(&self.node_config().rpc, worker_id)?.rpc_server_config();
+        let args = worker_rpc_server_args(&self.node_config().rpc, worker_id)?;
+        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath) {
+            return Err(TnRethError::IpcSocketInUse { path: args.ipcpath });
+        }
+        let server_config = args.rpc_server_config();
         let handle = server_config.start(server).await?;
         tracing::info!(
             target: "tn::execution",
@@ -1841,6 +1861,63 @@ mod tests {
             )
             .expect("rpc server");
         reth_env.start_rpc(&server, worker_id).await.expect("rpc server starts")
+    }
+
+    /// A listening socket is live; a stale socket file and a missing path are not.
+    #[cfg(unix)]
+    #[test]
+    fn ipc_socket_probe_tells_live_from_stale() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let live = tmp_dir.path().join("live.ipc");
+        let stale = tmp_dir.path().join("stale.ipc");
+        let missing = tmp_dir.path().join("missing.ipc");
+        let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+
+        assert!(ipc_socket_is_live(&live.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&stale.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&missing.to_string_lossy()));
+        drop(listener);
+        assert!(!ipc_socket_is_live(&live.to_string_lossy()));
+    }
+
+    /// A second server on a live IPC path is refused before it binds, so a second node
+    /// started with the default `--ipcpath` cannot take over the first node's socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_start_rpc_refuses_live_ipc_socket() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+        let accumulator = GasAccumulator::new(1);
+        let handle = start_worker_rpc(&reth_env, &accumulator, 0).await;
+        assert_eq!(handle.ipc_endpoint(), Some(ipcpath.clone()));
+
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(0)).expect("txn pool");
+        let server = reth_env
+            .get_rpc_server(
+                pool,
+                WorkerNetwork::new_for_test(reth_env.chainspec()),
+                accumulator.worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )
+            .expect("rpc server");
+        let err = reth_env.start_rpc(&server, 0).await.expect_err("the socket is live");
+        assert!(matches!(&err, TnRethError::IpcSocketInUse { path } if *path == ipcpath), "{err}");
+        // the first server still owns its socket
+        assert!(ipc_socket_is_live(&ipcpath));
     }
 
     /// Two workers on one `RethEnv` bind two live IPC sockets. Before #1287 both
