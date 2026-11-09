@@ -568,6 +568,7 @@ one of reth's: its rows are not copied (reth does not read them either).
   | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
   | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
+  | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
 - **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build refuses a
   `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file and run a
@@ -577,6 +578,116 @@ one of reth's: its rows are not copied (reth does not read them either).
   the migration.
 - **`db load-state`** never migrates either: it refuses a `db/` holding `mdbx.dat`, whatever MDBX
   holds, before anything opens it (`refuse_pending_migration`); it restores into a fresh datadir.
+
+### Storage layouts
+
+reth has two storage layouts (`StorageSettings`). **v1** keeps change sets, transaction senders and
+the history indices in database tables, and plain state beside hashed state. **v2** (here without
+RocksDB) moves change sets and senders into static files and keeps only hashed state; its storage
+history is keyed by the hashed slot. v2 runs only on tn-lmdb. Nothing converts a datadir from one
+layout to the other: flipping the recorded layout alone would misread every history index, so a
+datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
+
+- **Recorded twice.** reth's `Metadata` row `storage_settings` (a missing row reads as v1), and TN's
+  marker `tn_storage_layout`, JSON `{"version":1,"layout":"v1"}`. The marker's version is TN's
+  format version of the reth database: a later change to how TN stores a table (packed trie keys, a
+  separate transaction-hash index) takes the next version, and an older binary refuses it rather
+  than misread it.
+- **A new datadir** gets `StorageLayout::for_new_datadirs()`: always v1 on the MDBX build, and
+  `NEW_DATADIR_LAYOUT_TN_LMDB` on the tn-lmdb build (v1 until the v2 write path writes the history
+  indices and the transaction-hash index; that constant is the one line that moves new datadirs to
+  v2). Benches and tests pick a layout with `RethConfig::with_new_datadir_layout`. The marker
+  commits before genesis, and genesis writes `storage_settings` with the layout
+  (`init_genesis_with_settings`).
+- **An existing datadir** opens in its stored layout, never flipped. When it differs from the layout
+  new datadirs get, every start logs a warning naming `db reset-execution`; the node runs as before.
+  A datadir from before the marker (every one is v1) gets the marker at its first open.
+- **Checked at every open**, before reth's consistency check (which prunes static files ahead of the
+  database), with the start refused and nothing changed:
+
+  | the node finds | why |
+  |---|---|
+  | v2 on the MDBX build, for a new datadir or an existing one | v2 is tn-lmdb only |
+  | a `storage_settings` row or marker that does not parse, or a marker of another format version | reth's own read takes an unparseable row for v1; a newer binary may have written the datadir |
+  | a marker whose layout disagrees with `storage_settings` | the row was changed without converting the data |
+  | a v2 datadir without the marker | no TN build wrote it |
+  | a v1 datadir whose static files hold a segment only v2 writes (senders, change sets) | another datadir's static files: a half-done swap |
+  | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
+
+- **Logs:** `new reth datadir: storage layout` or `reth datadir: storage layout` at each start, with
+  the layout.
+
+### Upgrading a testnet node
+
+A testnet node on `v0.16.0-adiri` runs MDBX for both databases, in storage layout v1. The first
+start of this release's binary built with `tn-lmdb`:
+
+1. migrates the consensus database from MDBX to tndb and removes the MDBX environments (one-way,
+   #1558);
+2. migrates the reth database from MDBX to tn-lmdb ([Migrating from MDBX](#migrating-from-mdbx)):
+   the engine changes, the layout stays v1, and the node records the layout marker;
+3. runs on. Nothing else is needed: a v1 datadir keeps working on this binary.
+
+**Upgrade every node together.** Since #1788 a node record carries a network-key co-signature, and
+this release drops the records `v0.16.0-adiri` publishes (and the old binary cannot use the new
+ones): in an e2e committee started on `v0.16.0-adiri`, a validator restarted on this release
+migrated both databases but could not resolve its peers, and stalled. So a mixed committee does not
+work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
+nodes in place first (they keep v1), and rebuild in the new layout only after that.
+
+**Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
+and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
+the backup is the only way back to `v0.16.0-adiri` (see Rollback).
+
+**Rebuilding in the new layout.** `telcoin-network db reset-execution` moves the execution database
+aside, so the next start rebuilds it from genesis by re-executing the chain, in the layout new
+datadirs get. It moves `db/`, `static_files/` and `restored-state-floor` (the floor of a datadir
+restored from a snapshot, which would refuse the rebuilt chain's old blocks if it stayed) into
+`<datadir>/execution-reset-<UTC time>/`. It renames and never deletes; the consensus database, keys
+and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
+state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
+moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
+refuses to start while a `.partial` directory is there, and running the command again finishes it.
+
+- **In place** (an observer, or a validator that can be out for the rebuild):
+
+  ```sh
+  # node stopped
+  telcoin-network db reset-execution --datadir <datadir>          # dry run: prints what moves
+  telcoin-network db reset-execution --datadir <datadir> --force
+  telcoin-network node --datadir <datadir> ...                     # rebuilds from genesis
+  ```
+
+  The node re-executes every consensus output from its own consensus database and from peers, and
+  each epoch is checked against its certified record. It is out of the committee's work for the
+  whole rebuild. On a five-validator committee with a quorum of four, one validator out leaves no
+  margin, so validators take the swap below.
+- **Side-observer swap** (validators): build the new execution database on another node, then swap
+  it in, so the validator is down only for the swap.
+  1. Run an observer on the new binary with the validator's chain config in a fresh datadir (another
+     host, or another datadir and ports on the same host), and let it sync from genesis to the tip.
+     It gets the layout new datadirs get.
+  2. Stop the observer cleanly at the tip, so its files do not change while they are copied.
+  3. Stop the validator, then move its execution database aside:
+     `telcoin-network db reset-execution --datadir <validator-datadir> --force`.
+  4. Copy the observer's `db/` and `static_files/` (and its `restored-state-floor`, only if it has
+     one) into the validator's datadir. Never copy its `consensus-db/` or its keys.
+  5. Start the validator. It opens the copied execution database and executes the consensus output
+     its own consensus database holds past the copy's tip, then rejoins.
+
+**Rollback.**
+
+- **To the database before a reset or a swap** (same binary): stop the node, move the new `db/`,
+  `static_files/` and any `restored-state-floor` out of the datadir, move the entries of
+  `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. Once the
+  rebuilt node is healthy and no rollback is wanted, delete `execution-reset-*` to free the space.
+- **To `v0.16.0-adiri`:** restore the backup taken before the upgrade, then start the old binary.
+  Without a backup there is no safe way back for a validator. The old binary cannot open a tn-lmdb
+  `db/` and has no backend guard: it creates an empty MDBX database beside `tn-lmdb.dat` and prunes
+  the static files down to it (a silent resync from genesis). Its consensus database is gone too:
+  the old binary recreates it empty and forgets the votes this validator cast in the current epoch,
+  so it could equivocate (#1558). Keep such a validator stopped until the network has closed the
+  epoch it was in, then start the old binary on a fresh datadir.
 
 ### Persist benchmark
 

@@ -305,6 +305,39 @@ pub(super) const fn needed_bytes(live: u64, max_growth: u64) -> u64 {
     live.saturating_add(live / 4).saturating_add(fixed)
 }
 
+/// Refuse an MDBX database that is not in storage layout v1, before anything is copied: the
+/// migration changes the engine, never the layout, and every MDBX database a TN build writes is v1
+/// (v2 is tn-lmdb only). A `storage_settings` row or TN layout marker that does not parse, or a
+/// marker of another format version, is refused too. The open after a migration checks the same
+/// rows (`env::layout`), but by then MDBX's files are gone.
+fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
+    use crate::env::layout::{self, StorageLayout};
+
+    let tx = mdbx.tx().wrap_err("failed to begin a read of the MDBX database")?;
+    let row = |key: &str| -> eyre::Result<Option<Vec<u8>>> {
+        match tx.get::<reth_db::tables::Metadata>(key.to_string()) {
+            Ok(row) => Ok(row),
+            // a database written before reth added the table has no rows in it
+            Err(DatabaseError::Open(info)) if info.code == MdbxError::NotFound.to_err_code() => {
+                Ok(None)
+            }
+            Err(e) => Err(eyre::Report::new(e).wrap_err("failed to read the MDBX Metadata table")),
+        }
+    };
+    let stored = layout::stored_layout(row(layout::RETH_SETTINGS_KEY)?)?;
+    let marker = layout::stored_marker(row(layout::TN_LAYOUT_KEY)?)?;
+    let marked = marker.map(|marker| marker.layout);
+    if stored.unwrap_or(StorageLayout::V1) != StorageLayout::V1
+        || marked.is_some_and(|l| l != StorageLayout::V1)
+    {
+        eyre::bail!(
+            "the MDBX database is not in storage layout v1 (storage_settings: {stored:?}, TN's \
+             marker: {marked:?}): the migration to tn-lmdb moves only v1 databases"
+        );
+    }
+    Ok(())
+}
+
 /// The live bytes of reth's tables in the MDBX database `mdbx`: the pages of each table's tree and
 /// overflow runs times the page size (the figures `db stats` reports on the MDBX build), summed
 /// over the tables it has. `mdbx.dat` is larger: it grows in steps of its geometry, and keeps the
@@ -375,6 +408,7 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
     let src = reth_db::mdbx::open_db_read_only(path, DatabaseArguments::default())
         .wrap_err("failed to open the MDBX database read-only")
         .wrap_err_with(unchanged)?;
+    refuse_non_v1_source(&src).wrap_err_with(unchanged)?;
     let live = mdbx_live_bytes(&src).wrap_err_with(unchanged)?;
     let needed = needed_bytes(live, args.max_growth);
     let free = free_bytes(path)?;

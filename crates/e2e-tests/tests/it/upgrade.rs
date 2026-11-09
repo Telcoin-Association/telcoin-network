@@ -538,7 +538,7 @@ impl Network<'_> {
 
 /// The header fields compared across nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockRoots {
+pub(crate) struct BlockRoots {
     hash: B256,
     state_root: B256,
     receipts_root: B256,
@@ -546,7 +546,7 @@ struct BlockRoots {
 
 impl BlockRoots {
     /// Names of the fields that differ between `self` and `other`.
-    fn differing_fields(&self, other: &Self) -> String {
+    pub(crate) fn differing_fields(&self, other: &Self) -> String {
         [
             ("hash", self.hash != other.hash),
             ("stateRoot", self.state_root != other.state_root),
@@ -570,7 +570,7 @@ impl fmt::Display for BlockRoots {
 }
 
 /// [`BlockRoots`] of block `number` on the node behind `provider`.
-async fn block_roots<P: Provider>(
+pub(crate) async fn block_roots<P: Provider>(
     provider: &P,
     label: &str,
     number: u64,
@@ -618,12 +618,12 @@ fn progress(message: String) {
 
 /// The light transfer load, running on its own task so the blocking waits of the test task do not
 /// pause it. Dropping it stops the load.
-struct LightLoad(JoinHandle<()>);
+pub(crate) struct LightLoad(JoinHandle<()>);
 
 impl LightLoad {
     /// Send one transfer per round through each of `urls`, each from its own sender in
     /// [`light_load_senders`].
-    fn start(urls: &[String], chain: Arc<RethChainSpec>) -> eyre::Result<Self> {
+    pub(crate) fn start(urls: &[String], chain: Arc<RethChainSpec>) -> eyre::Result<Self> {
         let providers = urls
             .iter()
             .map(|url| Ok(ProviderBuilder::new().connect_http(url.parse()?)))
@@ -642,7 +642,7 @@ impl Drop for LightLoad {
 }
 
 /// One light-load sender per validator.
-fn light_load_senders() -> Vec<TransactionFactory> {
+pub(crate) fn light_load_senders() -> Vec<TransactionFactory> {
     (0..VALIDATORS as u64)
         .map(|i| {
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(LOAD_SEED + i))
@@ -652,13 +652,13 @@ fn light_load_senders() -> Vec<TransactionFactory> {
 
 /// The foreground workload: value transfers around a ring of accounts, and a token contract that
 /// is deployed once and then called every round.
-struct Workload {
+pub(crate) struct Workload {
     /// Each account sends to the next one.
-    ring: Vec<TransactionFactory>,
+    pub(crate) ring: Vec<TransactionFactory>,
     /// Deploys the token and holds its admin and minter roles.
     deployer: TransactionFactory,
     /// Token recipients and spenders; they never send transactions.
-    holders: Vec<Address>,
+    pub(crate) holders: Vec<Address>,
     /// Token balance each holder should have.
     minted: Vec<U256>,
     /// The token proxy, once deployed.
@@ -668,7 +668,7 @@ struct Workload {
 }
 
 impl Workload {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ring = (0..RING_ACCOUNTS)
             .map(|i| {
                 TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(RING_SEED + i))
@@ -682,18 +682,22 @@ impl Workload {
     }
 
     /// The accounts that pay gas, to be funded at genesis.
-    fn senders(&self) -> impl Iterator<Item = Address> + '_ {
+    pub(crate) fn senders(&self) -> impl Iterator<Item = Address> + '_ {
         self.ring.iter().map(TransactionFactory::address).chain([self.deployer.address()])
     }
 
-    fn token(&self) -> eyre::Result<Address> {
+    pub(crate) fn token(&self) -> eyre::Result<Address> {
         self.token.ok_or_else(|| eyre::eyre!("the token is not deployed yet"))
     }
 
     /// Deploy `Stablecoin` behind an `ERC1967Proxy` through `node` and make the deployer a minter.
     /// The proxy's constructor runs `initialize` through a delegate call, which writes storage and
     /// emits events, as does the role grant.
-    async fn deploy_token(&mut self, node: &str, chain: &Arc<RethChainSpec>) -> eyre::Result<()> {
+    pub(crate) async fn deploy_token(
+        &mut self,
+        node: &str,
+        chain: &Arc<RethChainSpec>,
+    ) -> eyre::Result<()> {
         // the deployer has sent nothing before, so its first two transactions use nonces 0 and 1
         let deployer = self.deployer.address();
         let implementation = deployer.create(0);
@@ -772,8 +776,13 @@ impl Workload {
 
     /// Send one round through `node` and wait for every transaction in it: a transfer from each
     /// ring account to the next, a mint to one holder and an approval for another. Then read the
-    /// minted holder's balance back through `eth_call`.
-    async fn round(&mut self, node: &str, chain: &Arc<RethChainSpec>) -> eyre::Result<()> {
+    /// minted holder's balance back through `eth_call`. Returns the round's receipts in that
+    /// order: the ring transfers, then the mint, then the approval.
+    pub(crate) async fn round(
+        &mut self,
+        node: &str,
+        chain: &Arc<RethChainSpec>,
+    ) -> eyre::Result<Vec<TransactionReceipt>> {
         let token = self.token()?;
         let round = self.rounds;
         self.rounds += 1;
@@ -838,7 +847,7 @@ impl Workload {
         );
         let blocks: Vec<_> = receipts.iter().filter_map(|receipt| receipt.block_number).collect();
         info!(target: "upgrade-test", round, node, ?blocks, "workload round landed");
-        Ok(())
+        Ok(receipts)
     }
 }
 

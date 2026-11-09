@@ -3,7 +3,8 @@
 //! `db stats` prints read-only statistics for the execution database. `db validate` walks a
 //! consensus epoch pack's `data` stream and reports integrity issues, reproducing the importer's
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
-//! Misordered (present, but in the wrong consensus-header group).
+//! Misordered (present, but in the wrong consensus-header group). `db reset-execution` moves the
+//! execution database aside, so the next start rebuilds it from genesis (`reset_execution`).
 
 use crate::{
     node::{validate_faucet_build, NamedChain},
@@ -43,6 +44,9 @@ use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
     ExecHeader, SealedHeader, TaskManager, B256,
 };
+
+mod reset_execution;
+pub(crate) use reset_execution::refuse_interrupted_reset;
 
 /// Inspect and diagnose telcoin-network databases.
 #[derive(Debug, Parser)]
@@ -86,6 +90,48 @@ enum DbSubcommand {
     /// file); refuses while a node holds the datadir, as the other at-rest tools do, and holds the
     /// datadir while it runs, so a node started meanwhile is refused until the report finishes.
     TndbStat,
+
+    /// Move the execution database aside, so the next start rebuilds it from genesis by
+    /// re-executing the chain, in the storage layout new datadirs get. Moves `db`,
+    /// `static_files` and `restored-state-floor` into `execution-reset-<UTC time>` under the
+    /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
+    /// and config stay. The node MUST be stopped. Dry-run by default; pass `--force` to apply.
+    ResetExecution(DbResetExecutionArgs),
+}
+
+/// Move the execution database aside (`db reset-execution`).
+#[derive(Debug, Args)]
+pub struct DbResetExecutionArgs {
+    /// Move the entries. Without it, print what would move and change nothing.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbResetExecutionArgs {
+    /// Run the reset on `datadir` (a dry run without `--force`) and print what it did.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let plan = reset_execution::reset_execution(&datadir, self.force)?;
+        let moves = plan.moves.iter().map(|m| m.display().to_string()).collect::<Vec<_>>();
+        if let Some(partial) = &plan.resumes {
+            println!("finishing the unfinished execution reset in {}", partial.display());
+        }
+        if self.force {
+            println!(
+                "moved the execution database ({}) aside to {}; the next start rebuilds it from \
+                 genesis. To undo, stop the node and move the entries back into {}",
+                moves.join(", "),
+                plan.target.display(),
+                datadir.display(),
+            );
+        } else {
+            println!(
+                "dry run: would move {} into {}; pass --force to apply",
+                moves.join(", "),
+                plan.target.display(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl DbCommand {
@@ -122,6 +168,7 @@ impl DbCommand {
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
             DbSubcommand::TndbStat => tndb_stat(&datadir)?,
+            DbSubcommand::ResetExecution(args) => args.execute(datadir)?,
         }
         Ok(())
     }
@@ -2626,6 +2673,23 @@ mod tests {
         super::chain_data_dirs(&datadir_path).iter().for_each(|dir| {
             assert!(!dir.exists(), "{} must not exist after a pre-import refusal", dir.display());
         });
+    }
+
+    #[test]
+    fn parse_db_reset_execution_subcommand() {
+        for (args, force) in [
+            (&["tn", "db", "reset-execution"][..], false),
+            (&["tn", "db", "reset-execution", "--force"][..], true),
+        ] {
+            let cli = Cli::<NoArgs>::try_parse_args_from(args.iter().copied()).expect("parsed");
+            let Commands::Db(db) = cli.command else {
+                panic!("expected the db subcommand");
+            };
+            let super::DbSubcommand::ResetExecution(reset) = db.command else {
+                panic!("expected reset-execution");
+            };
+            assert_eq!(reset.force, force, "{args:?}");
+        }
     }
 
     #[test]

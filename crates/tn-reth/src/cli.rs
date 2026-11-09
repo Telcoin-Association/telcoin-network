@@ -57,14 +57,20 @@ use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
     rpc_tx_forward::TxForwardConfig,
+    StorageLayout,
 };
 
 /// A wrapper abstraction around a Reth node config.
 ///
 /// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
-/// `--sanitize-txs`), which reth's `NodeConfig` has no place for.
+/// `--sanitize-txs`), which reth's `NodeConfig` has no place for. The third is the storage layout
+/// a new datadir gets ([`RethConfig::new_datadir_layout`]).
 #[derive(Clone, Debug)]
-pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>, pub(crate) TxForwardConfig);
+pub struct RethConfig(
+    pub(crate) NodeConfig<RethChainSpec>,
+    pub(crate) TxForwardConfig,
+    pub(crate) StorageLayout,
+);
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -445,13 +451,27 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this, tx_forward)
+        Self(this, tx_forward, StorageLayout::for_new_datadirs())
     }
 
     /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
     /// restores, tests), with transaction forwarding off.
     pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
-        Self(node_config, TxForwardConfig::default())
+        Self(node_config, TxForwardConfig::default(), StorageLayout::for_new_datadirs())
+    }
+
+    /// The storage layout a new datadir gets: [`StorageLayout::for_new_datadirs`] unless
+    /// [`Self::with_new_datadir_layout`] chose another. An existing datadir always opens in the
+    /// layout it was created with (`env::layout`).
+    pub fn new_datadir_layout(&self) -> StorageLayout {
+        self.2
+    }
+
+    /// This config, giving a new datadir `layout`: for benches and tests that compare the
+    /// layouts. The MDBX build refuses v2 when it creates the datadir.
+    pub fn with_new_datadir_layout(mut self, layout: StorageLayout) -> Self {
+        self.2 = layout;
+        self
     }
 
     /// The node's `--forward-txs` / `--sanitize-txs` settings.

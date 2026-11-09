@@ -409,6 +409,8 @@ Complete tree after the node has run:
                                   #   the marker mdbx-migrated (the copy is built in
                                   #   tn-lmdb-migrating/, gone once the migration is done)
   static_files/                   # execution layer static files (block data)
+  execution-reset-<UTC time>/     # what `db reset-execution` moved aside (db/, static_files/,
+                                  #   restored-state-floor); `.partial` while it moves them
   consensus-db/                   # consensus protocol database
     tndb/                         #   consensus DB (tndb): one log per environment
       epoch/                      #     certificates, votes, payloads, last proposal
@@ -428,6 +430,13 @@ once, and an `mdbx.dat` the node refuses too (beside the marker, or beside a `tn
 migration left) is refused as the node refuses it. `telcoin-network db load-state` never runs the
 migration either: it restores into a fresh datadir, and a build with the `tn-lmdb` feature
 refuses a `db/` holding `mdbx.dat` before anything opens it.
+
+`telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
+and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
+rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
+would move. It refuses while a node holds the datadir. The layouts, the upgrade from
+`v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage
+layouts" and "Upgrading a testnet node" sections.
 
 ## RPC configuration
 
