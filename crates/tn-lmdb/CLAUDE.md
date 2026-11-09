@@ -15,7 +15,9 @@ which builds on this crate's public API (its own `CLAUDE.md` covers it).
 2. `README.md`, the section for your topic: on-disk format (overflow runs included), dup tables,
    deletes and merging, commit protocol, free list and page reuse, readers, open and recovery,
    failure latch, concurrency, and the "please do not flag" list;
-3. the module docs at the top of the file you change, then the item docs of what you touch.
+3. the module docs at the top of the file you change, then the item docs of what you touch;
+4. for a change to a platform switch, `sys.rs` or the OS calls behind a sync, a growth, the lock
+   or the mapping, or for a port to another OS: `PORTING.md`.
 
 `tree/write.rs`, `page.rs` and `txn.rs` are large, the first two about half tests: grep for the
 symbol and read with an offset.
@@ -26,7 +28,8 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 
 | file | role |
 |---|---|
-| `lib.rs` | Crate docs, `compile_error!` off unix and on every unix but Linux and macOS (the syncs are verified on those two only: README, Platform notes, "Other Unixes"), the re-exports (the whole public API). |
+| `lib.rs` | Crate docs, `compile_error!` off unix and on every unix but Linux and macOS (the syncs are verified on those two only; both messages point at `PORTING.md`, the non-unix one at its Windows section), the re-exports (the whole public API). |
+| `PORTING.md` | Not code: what a port to another OS takes. The OS contract (each service, its `sys.rs`/`file.rs`/`env.rs` user, Linux's and macOS's answer), the table of every platform switch in this crate and the adapter, the per-OS findings (BSDs, illumos, from docs and source only), Windows, and the tests a port must pass (the device-level power-cut test included) before its `compile_error!` is lifted. |
 | `error.rs` | `Error` (`thiserror`) and `Result`; `Error::latches`, the one list of the errors that latch (the latch, the write cursors' unset arms and the adapter read it). |
 | `env.rs` | `Env`: open and recovery, steps 1–9 (`choose_state` 4–6, `opened_snapshot` and `checked_snapshot` 9, `fall_back` from a trusted weak head that fails its check; README "Open and recovery"), `open_read_only` (README "Read-only open"), the writer hand-off, snapshots (`Snapshot::page_again`, do-not-flag 14; `Snapshot` aligned to 128 bytes, its `Arc` counts on a line of their own), the reader queue (`Published`, `reuse_gate`, `Env::oldest_reader_age`), commit steps 3–6 (`stamp_private`, `make_durable`, `data_sync`), NoSync's deferral, its weak meta and automatic syncs (`defer_sync`, `copy_meta`; `AutoSync`, `sync_due` the one rule, `sync_with`; README "Commit protocol"), the slots' bookkeeping (`Writer::slots`, each slot's txn and steadiness; `steady_txn`, which `Writer::sync`'s check for a pending state reads; `reuse_gate` counts every slot), the boot id an open trusts and its writer tags records with (`EnvOptions::trust_unsynced`), `alloc`, `copy_published_with` (a private source refused; `copy_unpublished`), `io_stats`, the test-only `CrashAt`, the close (`EnvInner::drop`, `Writer::trim_tail`; README "Close"). |
 | `stats.rs` | `IoStats` (public, each counter documented; `since`), `elapsed_ns` and `lap`, the commit steps' clock reads. |
@@ -72,6 +75,12 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   (`fdatasync_all`, the size sync) call `flushed_all`; a truncation (`grow`'s cut, `trim_to`)
   calls `truncated`, which keeps a later msync past the cut off the model's disk until the next
   fsync. A sync path that skips the model makes the crash tests lie.
+- **A platform switch or a `sys.rs` change updates `PORTING.md`.** Adding, removing or changing
+  any `cfg(target_os = ...)`, `cfg(unix)` or `cfg!(target_os = ...)` site (here or in
+  `crates/tn-lmdb-reth`), any function of `sys.rs`, or the OS call a sync, growth, lock or
+  mapping makes, updates `PORTING.md` in the same change: its "Every platform switch" tables and
+  the contract item the call serves. Never lift a `compile_error!` without the checks in its
+  "Verifying a port".
 - **Never panic on bytes from disk.** Page accessors bounds-check and return `Corrupt`. A page
   read from the file passes `page::validate` before its first change, which copy-on-write does.
 - **Never rely on zeros from `alloc` or `alloc_run`.** A new page or run keeps its old bytes, so

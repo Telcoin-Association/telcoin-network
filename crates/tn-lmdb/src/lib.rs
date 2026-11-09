@@ -42,13 +42,16 @@
 // The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with
 // `fallocate`/`F_PREALLOCATE` and locked with `flock`: this crate builds for unix targets only.
 #[cfg(not(unix))]
-compile_error!("tn-lmdb requires a unix target (mmap-backed page file, msync, flock)");
+compile_error!(
+    "tn-lmdb requires a unix target (mmap-backed page file, msync, flock): see \
+     crates/tn-lmdb/PORTING.md, \"Windows\", for what a port to a non-unix target takes"
+);
 // What `msync` and `fsync` make durable for a mapped file differs between unix kernels, and the
 // syncs are verified on Linux and macOS only.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 compile_error!(
-    "tn-lmdb's syncs are verified on Linux and macOS only: see README.md, Platform notes, \
-     \"Other Unixes\", for what a port to another unix must check"
+    "tn-lmdb's syncs are verified on Linux and macOS only: see crates/tn-lmdb/PORTING.md for \
+     what a port to another unix must check and prove before this target is allowed"
 );
 
 mod alloc;

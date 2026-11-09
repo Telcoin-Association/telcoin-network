@@ -2089,19 +2089,15 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   `reth.block` row and nothing on most others ([Step 4](#step-4-one-msync-or-one-fdatasync)).
   Linux's `fsync` writes every page dirtied through the mapping, so Linux keeps one `fdatasync`
   for a scattered commit.
-- **Other Unixes are refused at build time** (`compile_error!` in `lib.rs`): their kernels differ
-  in what `msync` and `fsync` make durable for a mapped file, and none is tested. A port checks,
-  for each kernel and file system: whether `fsync` writes the pages dirtied through a mapping;
-  whether `msync(MS_SYNC)` waits for the disk and also makes durable the block a page first
-  stored into a hole was given (growth there would be a sparse `set_len`, with no preallocation);
-  and whether `pread`, which open reads the metas with, sees the mapping's pages. From their
-  sources (untested): on FreeBSD (UFS, ZFS) and illumos with ZFS `fsync` writes mapped pages and
-  `msync` is a complete data sync, so Linux's rule would apply. On NetBSD (FFS) and illumos with
-  UFS `fsync` writes mapped pages, but an `msync` leaves a hole's new block allocation unwritten
-  until an `fsync`, so every `msync` of data would need an `fsync` after it. OpenBSD has no
-  unified cache: its `fsync` ignores mapped pages and its `msync(MS_SYNC)` returns before the disk
-  has them, so each durable step would need an `msync` then an `fsync`, and open would read the
-  metas through the mapping, not by `pread`.
+- **Other Unixes are refused at build time** (`compile_error!` in `lib.rs`), and so is Windows:
+  kernels differ in what `msync` and `fsync` make durable for a mapped file, and none of them is
+  tested. From their sources (untested), FreeBSD, and illumos on ZFS, would keep Linux's rule;
+  NetBSD and illumos on UFS (and, to be safe, DragonFly) would need an `fdatasync` after every
+  data `msync`; OpenBSD, with no unified cache, would need an `msync` then an `fsync` at every
+  durable step and its metas read through the mapping. [`PORTING.md`](PORTING.md) says what a
+  port takes: the OS contract, every platform switch in the code, what is known of each BSD,
+  illumos and Windows, and the device-level power-cut test a port must pass before its
+  `compile_error!` is lifted.
 - **A page size below the OS page puts both metas in one OS page** (4 KiB pages on Apple
   Silicon's 16 KiB OS pages, or on a 64 KiB-page arm64 or ppc64 Linux kernel). A mapped write
   dirties the whole OS page and an msync rounds down to it, so every meta msync also writes back
@@ -2449,7 +2445,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
 ## Source files
 
 One row per file of `src/`. `CLAUDE.md`'s crate map gives each file's entry points and the
-invariants a change must keep.
+invariants a change must keep. [`PORTING.md`](PORTING.md) lists every OS service the engine
+relies on and every platform switch in the code, for a port to another OS.
 
 | file | contents |
 |---|---|
