@@ -3755,6 +3755,8 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
             self.static_file_provider.commit()?;
         } else {
             // Normal path: finalize() will call sync_all() if not already synced
+            // TN(TN-0051): after `save_blocks`, whose segment threads already synced and wrote
+            // each configuration, finalize() only updates the reader indexes.
             let mut timings = metrics::CommitTimings::default();
 
             let start = Instant::now();
@@ -5074,6 +5076,182 @@ mod tests {
     #[test]
     fn test_save_blocks_v2_table_assertions() {
         run_save_blocks_and_verify(StorageMode::V2);
+    }
+
+    /// TN(TN-0051): `save_blocks` writes each segment's configuration in the segment's thread,
+    /// so a save whose database commit never happens (it fails, or the node dies after
+    /// `save_blocks` returned) leaves the static files it wrote durably ahead of the database.
+    /// The reader index must not show those rows, and the next open must prune them back to the
+    /// database checkpoints, after which the same blocks save and commit again.
+    fn run_save_blocks_without_db_commit_heals(mode: StorageMode) {
+        use crate::{
+            providers::RocksDBBuilder, test_utils::MockNodeTypesWithDB, MetadataWriter,
+            ProviderFactory,
+        };
+        use alloy_primitives::map::HashMap;
+        use reth_nippy_jar::NippyJar;
+        use reth_static_file_types::SegmentHeader;
+
+        // The configuration's block end on disk for the file holding block 3, if it exists.
+        fn on_disk_end(
+            static_files: &StaticFileProvider<reth_ethereum_primitives::EthPrimitives>,
+            segment: StaticFileSegment,
+        ) -> Option<Option<BlockNumber>> {
+            let range = static_files.find_fixed_range(segment, 3);
+            let path = static_files.path().join(segment.filename(&range));
+            path.exists()
+                .then(|| NippyJar::<SegmentHeader>::load(&path).unwrap().user_header().block_end())
+        }
+
+        let settings = match mode {
+            StorageMode::V1 => StorageSettings::v1(),
+            StorageMode::V2 => StorageSettings::v2(),
+        };
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(settings);
+
+        let genesis = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
+            SealedHeader::new(
+                Header { number: 0, difficulty: U256::from(1), ..Default::default() },
+                B256::ZERO,
+            ),
+            Default::default(),
+        );
+        let genesis = ExecutedBlock::new(
+            Arc::new(genesis.try_recover().unwrap()),
+            Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: vec![],
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+                state: Default::default(),
+            }),
+            ComputedTrieData::default(),
+        );
+        let provider_rw = factory.provider_rw().unwrap();
+        // Persisted, so the reopened factory below checks the same segments.
+        provider_rw.write_storage_settings(settings).unwrap();
+        provider_rw.save_blocks(vec![genesis], SaveBlocksMode::Full).unwrap();
+        provider_rw.commit().unwrap();
+
+        // Blocks 1..=3, each changing one account and one of its slots, so the changeset
+        // segments get rows under v2.
+        let mut blocks = Vec::new();
+        let mut parent_hash = B256::ZERO;
+        for number in 1..=3u64 {
+            let address = Address::with_last_byte(number as u8);
+            let info =
+                AccountInfo { nonce: number, balance: U256::from(number), ..Default::default() };
+            let storage = HashMap::from_iter([(U256::from(1), (U256::ZERO, U256::from(number)))]);
+            let bundle = BundleState::builder(number..=number)
+                .state_present_account_info(address, info)
+                .revert_account_info(number, address, Some(None))
+                .state_storage(address, storage)
+                .revert_storage(number, address, vec![(U256::from(1), U256::ZERO)])
+                .build();
+            let hashed_state =
+                HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state()).into_sorted();
+            let block = SealedBlock::<reth_ethereum_primitives::Block>::seal_parts(
+                Header { number, parent_hash, difficulty: U256::from(1), ..Default::default() },
+                Default::default(),
+            );
+            parent_hash = block.hash();
+            blocks.push(ExecutedBlock::new(
+                Arc::new(block.try_recover().unwrap()),
+                Arc::new(BlockExecutionOutput {
+                    result: BlockExecutionResult {
+                        receipts: vec![],
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                    state: bundle,
+                }),
+                ComputedTrieData { hashed_state: Arc::new(hashed_state), ..Default::default() },
+            ));
+        }
+
+        let mut expected = vec![StaticFileSegment::Headers, StaticFileSegment::Transactions];
+        if mode == StorageMode::V2 {
+            expected.extend([
+                StaticFileSegment::TransactionSenders,
+                StaticFileSegment::AccountChangeSets,
+                StaticFileSegment::StorageChangeSets,
+            ]);
+        }
+
+        let static_files = factory.static_file_provider();
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.save_blocks(blocks.clone(), SaveBlocksMode::Full).unwrap();
+        // Dropped without `commit`: the database transaction aborts.
+        drop(provider_rw);
+
+        // Every segment the save wrote has its configuration on disk at block 3, but the reader
+        // index still ends at genesis, so readers cannot see the rows.
+        for segment in StaticFileSegment::iter() {
+            let on_disk = on_disk_end(&static_files, segment);
+            if expected.contains(&segment) {
+                assert_eq!(on_disk, Some(Some(3)), "{segment:?}: configuration frozen at block 3");
+            }
+            if on_disk == Some(Some(3)) {
+                assert_eq!(
+                    static_files.get_highest_static_file_block(segment),
+                    Some(0),
+                    "{segment:?}: the index must not publish rows before the commit"
+                );
+            }
+        }
+        assert!(static_files.header_by_number(1).unwrap().is_none());
+
+        // Reopen over the same database and static files, as the next start does.
+        let db = factory.db_ref().clone();
+        let chain_spec = factory.chain_spec();
+        let static_files_path = static_files.path().to_path_buf();
+        let rocksdb_path = static_files_path.parent().unwrap().join("rocksdb");
+        drop(static_files);
+        drop(factory);
+        let factory = ProviderFactory::<MockNodeTypesWithDB>::new_checked(
+            db,
+            chain_spec,
+            StaticFileProvider::read_write(&static_files_path).unwrap(),
+            RocksDBBuilder::new(&rocksdb_path).with_default_tables().build().unwrap(),
+            reth_tasks::Runtime::test(),
+        )
+        .expect("the heal prunes the static files back to the checkpoints, with no unwind");
+        assert_eq!(factory.cached_storage_settings(), settings);
+
+        let static_files = factory.static_file_provider();
+        for segment in StaticFileSegment::iter() {
+            let on_disk = on_disk_end(&static_files, segment);
+            if expected.contains(&segment) {
+                assert_eq!(on_disk, Some(Some(0)), "{segment:?}: healed back to genesis");
+            }
+            assert_ne!(on_disk, Some(Some(3)), "{segment:?}: still ahead of the database");
+        }
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.save_blocks(blocks, SaveBlocksMode::Full).unwrap();
+        provider_rw.commit().unwrap();
+        let provider = factory.provider().unwrap();
+        for number in 1..=3 {
+            assert!(provider.header_by_number(number).unwrap().is_some(), "header {number}");
+            if mode == StorageMode::V2 {
+                assert_eq!(static_files.account_block_changeset(number).unwrap().len(), 1);
+                assert_eq!(static_files.storage_changeset(number).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_save_blocks_without_db_commit_heals_v1() {
+        run_save_blocks_without_db_commit_heals(StorageMode::V1);
+    }
+
+    #[test]
+    fn test_save_blocks_without_db_commit_heals_v2() {
+        run_save_blocks_without_db_commit_heals(StorageMode::V2);
     }
 
     #[test]

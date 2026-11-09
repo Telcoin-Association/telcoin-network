@@ -419,14 +419,17 @@ impl RethEnv {
 
         // Reconcile the storage backends before anything reads or writes through the factory.
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
-        // multi-backend commit: static files finalize, RocksDB commits, then MDBX commits last.
-        // A crash inside that window durably leaves static files and/or RocksDB one block ahead
-        // of the MDBX tip. `check_consistency` heals exactly that direction in place: it prunes
-        // the leading backends down to the MDBX stage checkpoints, which `save_blocks` advances
-        // inside the same MDBX transaction as the blocks. Without this call the divergence is
-        // permanent: every restart re-persists the same block into static files that already
-        // hold it, `save_blocks` fails with `UnexpectedStaticFileBlockNumber`, and the engine's
-        // `retryable_persist_fault` correctly treats that as terminal (issue #1238).
+        // multi-backend commit: static files are made durable, RocksDB commits, then MDBX commits
+        // last. The static files' segment threads in `save_blocks` sync each segment and write
+        // its configuration (vendored TN-0051), so from the end of `save_blocks` a crash, or a
+        // failure before the MDBX commit, durably leaves static files and/or RocksDB one output
+        // ahead of the MDBX tip. `check_consistency` heals exactly that direction in place: it
+        // prunes the leading backends down to the MDBX stage checkpoints, which
+        // `save_blocks` advances inside the same MDBX transaction as the blocks. Without
+        // this call the divergence is permanent: every restart re-persists the same block
+        // into static files that already hold it, `save_blocks` fails with
+        // `UnexpectedStaticFileBlockNumber`, and the engine's `retryable_persist_fault`
+        // correctly treats that as terminal (issue #1238).
         //
         // A returned unwind target is the opposite divergence: MDBX committed past a backend
         // that lost data. The commit ordering cannot produce that state; only corruption or
@@ -601,9 +604,10 @@ mod tests {
     /// `retryable_persist_fault` correctly treated that as terminal: a crash loop.
     ///
     /// The test persists block 1 through the production path, then reproduces the crash window
-    /// for block 2 by hand: `save_blocks` appends block 2 to both backends, ONLY the headers
-    /// static-file writer commits, and the MDBX transaction is dropped uncommitted. On disk the
-    /// headers static file is durably at 2 while MDBX is at 1, exactly the post-crash state.
+    /// for block 2 by hand: `save_blocks` appends block 2 to both backends and makes the static
+    /// files durable (each segment's configuration included, vendored TN-0051), the headers
+    /// writer's commit publishes its index, and the MDBX transaction is dropped uncommitted. On
+    /// disk the static files are durably at 2 while MDBX is at 1, exactly the post-crash state.
     /// A "restart" (a second `RethEnv` over the same datadir) must then (a) construct Ok,
     /// (b) heal the headers static-file tip back to 1 (`check_consistency` prunes the leading
     /// static files down to the MDBX stage checkpoints), and (c) accept block 2 again through
@@ -624,9 +628,10 @@ mod tests {
         assert_eq!(env1.last_block_number()?, 1, "block 1 must be committed");
 
         // block 2: build it, then simulate the crash inside the commit window. save_blocks
-        // appends block 2 to the static-file writers and the MDBX transaction; committing ONLY
-        // the headers static-file writer and then dropping the provider (aborting the MDBX
-        // transaction) leaves the headers static file durably at 2 while MDBX stays at 1.
+        // appends block 2 to the static-file writers and the MDBX transaction and leaves the
+        // static files durably at 2; the headers writer's commit only publishes its index for
+        // the assertion below, and dropping the provider aborts the MDBX transaction, so MDBX
+        // stays at 1.
         let output2 = consensus_output_for_tests(2, 0, 2, false);
         let payload2 = TNPayload::new_for_test(header1.clone(), &output2);
         let no_txs: Vec<Vec<u8>> = Vec::new();

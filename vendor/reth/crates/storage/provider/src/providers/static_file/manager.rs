@@ -700,7 +700,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Writes to a static file segment using the provided closure.
     ///
     /// The closure receives a mutable reference to the segment writer. After the closure completes,
-    /// `sync_all()` is called to flush writes to disk.
+    /// `sync_and_freeze()` flushes writes to disk and writes the segment's configuration.
     fn write_segment<F>(
         &self,
         segment: StaticFileSegment,
@@ -712,13 +712,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     {
         let mut w = self.get_writer(first_block_number, segment)?;
         f(&mut w)?;
-        w.sync_all()
+        // TN(TN-0051): the configuration is written here, in the segment's thread, not by
+        // `finalize` on the commit thread, which only updates the reader index.
+        w.sync_and_freeze()
     }
 
     /// Writes all static file data for multiple blocks in parallel per-segment.
     ///
     /// This spawns tasks on the storage thread pool for each segment type and each task calls
-    /// `sync_all()` on its writer when done.
+    /// `sync_and_freeze()` on its writer when done.
     #[instrument(level = "debug", target = "providers::static_file", skip_all)]
     pub fn write_blocks_data(
         &self,
@@ -3525,6 +3527,51 @@ mod tests {
             SegmentRangeInclusive::new(550, 649)
         );
 
+        Ok(())
+    }
+
+    /// TN(TN-0051): `sync_and_freeze` writes the configuration in the segment's thread, before
+    /// `finalize` updates the index on the commit thread, so for the rest of `save_blocks` a jar
+    /// loaded on a cache miss holds rows the index does not name yet. Readers route by the index,
+    /// so reads by number still find nothing past the old tip, and `finalize` replaces the cached
+    /// jar when it publishes the rows. (A range read that runs past the index tip inside such a
+    /// jar can return the new rows early; the index is ahead of the database for the whole
+    /// database commit anyway, so callers already see rows the database has not committed.)
+    #[test]
+    fn frozen_rows_stay_unindexed_until_finalize() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).with_blocks_per_file(10).build()?;
+        let segment = StaticFileSegment::Headers;
+        let hashes = [0x10, 0x11, 0x12].map(|byte| B256::from([byte; 32]));
+        {
+            let mut writer = static_files.latest_writer(segment)?;
+            writer.append_header(&Header::default(), &hashes[0])?;
+            writer.commit()?;
+        }
+
+        let mut writer = static_files.latest_writer(segment)?;
+        for number in 1..=2u64 {
+            let header = Header { number, ..Default::default() };
+            writer.append_header(&header, &hashes[number as usize])?;
+        }
+        writer.sync_and_freeze()?;
+
+        // A cache miss now loads the configuration with all three rows.
+        static_files.remove_cached_provider(segment, 9);
+        assert_eq!(static_files.block_hash(0)?, Some(hashes[0]));
+        assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
+
+        // The index still ends at block 0, so the frozen rows are not readable by number.
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(0));
+        assert_eq!(static_files.block_hash(1)?, None);
+        assert_eq!(static_files.block_hash(2)?, None);
+
+        writer.finalize()?;
+        drop(writer);
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
+        assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
+        assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
         Ok(())
     }
 }

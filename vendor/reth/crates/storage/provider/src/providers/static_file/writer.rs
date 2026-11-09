@@ -163,7 +163,8 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
 
     /// Finalizes all writers by committing their configuration to disk and updating indices.
     ///
-    /// Must be called after `sync_all` was called on individual writers.
+    /// Must be called after `sync_all` (or `sync_and_freeze`, which also wrote the
+    /// configuration) was called on individual writers.
     /// Returns an error if any writer has prune queued.
     #[instrument(
         name = "StaticFileWriters::finalize",
@@ -235,6 +236,9 @@ pub struct StaticFileProviderRW<N> {
     prune_on_commit: Option<PruneStrategy>,
     /// Whether `sync_all()` has been called. Used by `finalize()` to avoid redundant syncs.
     synced: bool,
+    /// TN(TN-0051): set when [`Self::sync_and_freeze`] wrote the configuration, so the next
+    /// [`Self::finalize`] or [`Self::commit`] still updates the reader index.
+    index_pending: bool,
     /// Changeset offsets sidecar writer (only for changeset segments).
     changeset_offsets: Option<ChangesetOffsetWriter>,
     /// Current block's changeset offset being written.
@@ -263,6 +267,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             metrics,
             prune_on_commit: None,
             synced: false,
+            index_pending: false,
             changeset_offsets: None,
             current_changeset_offset: None,
         };
@@ -551,6 +556,31 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// Syncs all data like [`Self::sync_all`], then writes the configuration to disk, leaving
+    /// only the reader index update to [`Self::finalize`].
+    ///
+    /// TN(TN-0051): `StaticFileProvider::write_blocks_data` calls this in each segment's thread,
+    /// so the configuration's write and syncs (temp file `fsync`, rename, directory `fsync`) run
+    /// beside the database writes of `save_blocks` instead of one segment after another in
+    /// `DatabaseProvider::commit`. The configuration is still durable before the database commit
+    /// (`save_blocks` joins the threads first), so a crash or a failed database commit leaves
+    /// static files ahead of the database checkpoints, the state a crash between `finalize` and
+    /// the database commit always left, which `check_consistency` prunes back at the next open.
+    /// Readers route by the index, so the rows stay invisible until `finalize` publishes them.
+    ///
+    /// Returns an error if prune is queued (use [`Self::commit`] instead).
+    pub fn sync_and_freeze(&mut self) -> ProviderResult<()> {
+        self.sync_all()?;
+        if self.writer.is_dirty() {
+            self.writer.finalize().map_err(ProviderError::other)?;
+            self.index_pending = true;
+        }
+        // Everything appended so far is durable; rows appended after this make the writer dirty
+        // again, and `finalize` must then sync them.
+        self.synced = false;
+        Ok(())
+    }
+
     /// Commits configuration to disk and updates the reader index.
     ///
     /// If `sync_all()` was not called, this will call it first to ensure data is persisted.
@@ -574,7 +604,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
 
             self.writer.finalize().map_err(ProviderError::other)?;
+            self.index_pending = true;
+        }
+        // TN(TN-0051): also after `sync_and_freeze`, which wrote the configuration already.
+        if self.index_pending {
             self.update_index()?;
+            self.index_pending = false;
         }
         self.synced = false;
         Ok(())
@@ -653,7 +688,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             );
 
             self.update_index()?;
+        } else if self.index_pending {
+            // TN(TN-0051): `sync_and_freeze` wrote the configuration; publish it.
+            self.update_index()?;
         }
+        self.index_pending = false;
 
         Ok(())
     }

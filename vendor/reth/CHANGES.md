@@ -527,3 +527,43 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   swallows the error; `atomic_write_file` replaces the file and leaves no `.tmp`), and the
   nippy-jar, static-file-types and provider suites. *Upstream*: no; upstream calls
   `File::sync_all`, which std makes `F_FULLFSYNC` on macOS.
+
+- **TN-0051** — `save_blocks` writes each static-file segment's configuration in the segment's
+  thread. *Kind*: performance (storage commit path).
+  *Files*: `crates/storage/provider/src/providers/static_file/writer.rs` (new
+  `StaticFileProviderRW::sync_and_freeze`, the `index_pending` flag that `finalize` and `commit`
+  honour), `crates/storage/provider/src/providers/static_file/manager.rs` (`write_segment` calls
+  it; test `frozen_rows_stay_unindexed_until_finalize`),
+  `crates/storage/provider/src/providers/database/provider.rs` (a comment in
+  `DatabaseProvider::commit`; tests `test_save_blocks_without_db_commit_heals_v{1,2}`).
+  *Why*: `DatabaseProvider::commit` wrote every dirty segment's `.conf` one after another on the
+  commit thread (`StaticFileWriters::finalize`), each a temp-file write and `fsync`, a rename
+  and a directory `fsync`: 6 serial syncs a persist under storage v1 and 12 under v2, on the
+  critical path between `save_blocks` and the database commit (Linux p50 5-21 ms, Mac about
+  31 ms). Each segment's thread in `write_blocks_data` now syncs its data, offsets and `.csoff`
+  and then writes its `.conf` itself, beside the database writes of `save_blocks`; `finalize`
+  is left with the in-memory index update (`update_index`). What is written is unchanged, and
+  every `.conf` is still durable before the database commit, because `save_blocks` joins the
+  segment threads first. So a crash anywhere leaves states the startup heal already handles:
+  static files ahead of the database checkpoints, which `check_consistency` prunes back (TN
+  refuses only the opposite direction, an unwind). The one new path to that state is a failure
+  in `save_blocks`' database arm or before the commit after the segments froze; it is the state
+  a crash between `finalize` and the database commit always left. The rows stay unindexed until
+  `finalize`, so readers, which route by the index, do not see them earlier. A jar loaded on a
+  cache miss in that window holds the new rows, and `update_index` replaces it when it publishes
+  them. A range read on `StaticFileProvider` that runs past the index tip inside such a jar can
+  return them early. That is harmless: the index was already ahead of the database for the
+  whole database commit before this change, so callers already see rows the database has not
+  committed. Prune and unwind commits and file rotations keep the full `commit`. It cannot
+  reach execution: the bytes written are the same; only when the `.conf` syncs run changes.
+  *Tests*: `test_save_blocks_without_db_commit_heals_v{1,2}` (save, abort the database
+  transaction: every written segment's `.conf` is on disk at the new tip while the index is
+  not; a reopen through `ProviderFactory::new_checked` prunes them back to genesis without an
+  unwind and the blocks save again) and `frozen_rows_stay_unindexed_until_finalize` (a cache
+  miss after the freeze loads the longer jar, reads by number still stop at the index tip, and
+  `finalize` publishes the rows). They fail if the configuration is not written in the
+  segment thread, if it is published before `finalize`, or if `finalize` skips the index
+  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last. TN's
+  `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
+  tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
+  semantics.
