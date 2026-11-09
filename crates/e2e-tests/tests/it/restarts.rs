@@ -9,7 +9,8 @@ use crate::common::{
     get_positive_balance_with_retry, network_advancing, node_log_path, scrape_metric_value,
     scrape_metrics, send_and_confirm, send_tel, start_observer, start_validator,
     start_validator_with_args, start_validator_with_env, strip_ansi, wait_for_epoch_at_least,
-    wait_for_rpc, walk_block_commit_times, EVM_TIMESTAMP_CLAMPED_SERIES, WEI_PER_TEL,
+    wait_for_node_mode, wait_for_rpc, walk_block_commit_times, EVM_TIMESTAMP_CLAMPED_SERIES,
+    WEI_PER_TEL,
 };
 use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
 use e2e_tests::{
@@ -468,15 +469,6 @@ fn test_restart_catch_up_requires_active_cvv() {
     [NodeMode::CvvInactive, NodeMode::Observer].into_iter().for_each(|mode| {
         assert!(!restart_catch_up_complete(mode, "tn_state_sync_headers_fetched_total 18\n"));
     });
-}
-
-/// Wait for a stable membership-derived role, with the URL and expected role in timeout errors.
-fn wait_for_node_mode(node: &str, expected: NodeMode) -> eyre::Result<()> {
-    wait_until_blocking(
-        Duration::from_secs(30),
-        &format!("node {node} entered {expected:?}"),
-        || Ok(get_node_mode(node).is_ok_and(|mode| mode == expected)),
-    )
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {

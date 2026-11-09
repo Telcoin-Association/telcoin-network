@@ -13,7 +13,7 @@ Traces cover the block's transactions only. The system calls a block runs before
 
 `Object` - (optional) The tracing options. When omitted, the struct logger runs with its defaults:
 
-* `tracer`: `String` - (optional) The tracer to run: `callTracer`, `flatCallTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`, `noopTracer` or `erc7562Tracer`, or the source code of a JavaScript tracer. Without it, the struct logger records every executed opcode.
+* `tracer`: `String` - (optional) The tracer to run: `callTracer`, `flatCallTracer`, `prestateTracer`, `4byteTracer`, `muxTracer`, `noopTracer` or `erc7562Tracer`, or the source code of a JavaScript tracer. Without it, the struct logger records every executed opcode. JavaScript tracers need a node built with the `js-tracer` feature, which is off by default; other nodes answer error `-32603` `JS Tracer is not enabled`. See [JavaScript tracers](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/tn-reth/js-tracer.md).
 * `tracerConfig`: `Object` - (optional) Settings for the chosen tracer, for example `{"onlyTopCall":true}` or `{"withLog":true}` for `callTracer`, or `{"diffMode":true}` for `prestateTracer`.
 * `enableMemory`: `Boolean` - (optional) Struct logger only: record memory at each step. Defaults to `false`.
 * `disableStack`: `Boolean` - (optional) Struct logger only: leave out the stack at each step. Defaults to `false`.
