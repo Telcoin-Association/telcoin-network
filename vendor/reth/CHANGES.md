@@ -813,3 +813,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   calls before any runs);
   `call_many::tests`. The trace and debug variants share the helper and keep their existing
   tests. *Upstream*: yes.
+
+- **TN-0058** — Port the rest of 055fafc72: `eth_getLogs` scans its range window by window.
+  *Kind*: backport (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`get_logs_in_block_range_inner`, `RangeMode::new`,
+  `RangeBlockMode` and its `next`, the constants above them, upstream's test
+  `test_range_scan_across_windows`).
+  *Why*: TN-0035 took only the chunk permits of 055fafc72 and left the range scan collecting
+  every bloom-matching header of the whole range (up to `--rpc.max-blocks-per-filter`, 100,000
+  blocks) before reading a single receipt, with the 20,000-log cap applying only in the receipt
+  phase. An empty filter matches every bloom and most TN blocks carry no logs, so a 100,000-block
+  request over quiet history never tripped the cap and held about 53 to 78 MB of sealed headers
+  per request, up to 256 requests at once (review R5). The scan now reads one 1,000-header window,
+  fetches that window's receipts, appends the logs and checks the cap before the next window,
+  as upstream does: memory is one window, the cap can end the query after the first window, and
+  a dropped request stops at the next one. Parallel receipt fetching is decided per window (at
+  least 1,000 matching headers in it) and its batches hold at most 256 blocks; other windows go
+  one block at a time through the receipt cache. Same logs in the same order. Kept from the
+  vendored copy: `append_matching_block_logs`'s signature and the retry range in the
+  `QueryExceedsMaxResults` error (upstream's 43a7452b0 narrows it; a separate pick). RPC only.
+  *Tests*: `test_range_scan_across_windows` (2,501 blocks, three with logs, every window fetched
+  in parallel; a limit of one log ends the scan in the second window), with its retry-range
+  assertion on the vendored semantics; TN-0035's permit tests. *Upstream*: n/a (upstream commit).
