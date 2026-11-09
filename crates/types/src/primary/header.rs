@@ -766,7 +766,7 @@ mod test {
     }
 
     /// An epoch with the V2 (nine-field) wire layout under the running cfg: `u32::MAX` under
-    /// `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 739, compared with `>=`), epoch zero
+    /// `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 747, compared with `>=`), epoch zero
     /// elsewhere (non-adiri is V2 from genesis).
     fn v2_epoch() -> Epoch {
         if cfg!(feature = "adiri") {
@@ -856,7 +856,7 @@ mod test {
     /// for every build.
     ///
     /// Trap: `u32::MAX` is also sub-second-active on BOTH builds (adiri activates at
-    /// `SUBSECOND_TIMESTAMP_FORK_EPOCH` (739), far below `u32::MAX`, compared with `>=`), so a
+    /// `SUBSECOND_TIMESTAMP_FORK_EPOCH` (747), far below `u32::MAX`, compared with `>=`), so a
     /// `Header` at this epoch encodes the V2 layout. This vector is anchored against
     /// [`HeaderReprV1`] only, never against `Header`; the `Header` side of the V1 layout is
     /// pinned at [`GOLDEN_V1_HEADER_EPOCH`] (adiri).
@@ -870,7 +870,7 @@ mod test {
     const GOLDEN_V1_HEADER_EPOCH: Epoch = SEED_SIGNATURE_FORK_EPOCH;
 
     /// Epoch of the frozen V2 golden vector: `u32::MAX` is sub-second-active under BOTH cfgs
-    /// (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (739), far below `u32::MAX`, compared
+    /// (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (747), far below `u32::MAX`, compared
     /// with `>=`; non-adiri everywhere), so one hex constant pins the V2 wire bytes for every
     /// build.
     const GOLDEN_V2_EPOCH: Epoch = u32::MAX;
