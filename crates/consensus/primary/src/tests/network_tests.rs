@@ -1161,11 +1161,12 @@ async fn test_primary_batch_gossip_topics() {
 // *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
 // the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
 
-/// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
-fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
+/// Build a gossip message from `source` carrying `vote` on `epoch_vote_topic` for `chain_id`. The
+/// swarm forwards only signed gossip, so the message has a source.
+fn epoch_vote_gossip(vote: EpochVote, chain_id: u64, source: PeerId) -> GossipMessage {
     let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(chain_id));
-    GossipMessage { source: None, data, sequence_number: None, topic }
+    GossipMessage { source: Some(source), data, sequence_number: None, topic }
 }
 
 /// Seed an uncertified epoch-0 [`EpochRecord`] (committee = the fixture's committee) into the
@@ -1208,7 +1209,7 @@ async fn test_epoch_vote_non_committee_rejected_before_verify() -> eyre::Result<
     let record = seed_uncertified_epoch0(&handler, &committee).await;
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 0, epoch_hash: record.digest(), ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert_matches!(
         res,
@@ -1236,7 +1237,7 @@ async fn test_epoch_vote_unknown_epoch_dropped_before_verify() -> eyre::Result<(
     // Epoch 9999 has no stored record in the fixture, so `get_epoch_by_number` returns `None`.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 9999, ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert!(
         res.is_ok(),
@@ -1269,7 +1270,7 @@ async fn test_epoch_vote_valid_committee_member_forwarded() -> eyre::Result<()> 
     assert!(vote.check_signature(), "test vote must be validly signed");
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    handler.process_gossip(&epoch_vote_gossip(vote, 0)).await?;
+    handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await?;
 
     let received = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -1312,7 +1313,7 @@ async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<
         ..Default::default()
     };
 
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
@@ -1344,7 +1345,7 @@ async fn test_epoch_vote_wrong_digest_rejected_before_verify() -> eyre::Result<(
     let vote = forked.sign_vote(&key_config);
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidEpochVote(0, _, _)),
@@ -1390,7 +1391,7 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
     // The vote is otherwise valid (correct digest, real committee member) — it is dropped ONLY
     // because the epoch is already certified.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert!(
         res.is_ok(),
         "a vote for an already-certified epoch must be dropped without error or penalty: {res:?}"
@@ -1404,9 +1405,10 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
-/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
-/// network. Epoch-record voting depends on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so epoch-vote gossip with
+/// an author that arrives while no `PrimaryNetwork` is running is queued (not dropped) and
+/// delivered to the next epoch's network. Epoch-record voting depends on this; enforce it going
+/// forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1472,7 +1474,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let mut epoch_a = TaskManager::new("epoch-a");
     let spawner_a = epoch_a.get_spawner();
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch),
         network_handle.clone(),
         config.clone(),
         app.clone(),
@@ -1486,7 +1488,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_a = vote_a.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_a, chain_id),
+            message: epoch_vote_gossip(vote_a, chain_id, PeerId::random()),
             relayer: None,
             author: None,
             validation: GossipValidation::detached(),
@@ -1513,7 +1515,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_gap = vote_gap.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_gap, chain_id),
+            message: epoch_vote_gossip(vote_gap, chain_id, PeerId::random()),
             relayer: None,
             author: None,
             validation: GossipValidation::detached(),
@@ -1534,7 +1536,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
     // the gap.
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch.saturating_add(1)),
         network_handle.clone(),
         config.clone(),
         app.clone(),
