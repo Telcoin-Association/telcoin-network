@@ -46,8 +46,6 @@
 //!   in-protocol ConsensusRegistry fork (registry code swap plus validator-set migration at the
 //!   configured fork epoch; see `apply_consensus_registry_fork` in `evm/block.rs`).
 //! - `test-utils` — test helpers (pulls in `secp256k1`).
-//! - `rocksdb` — opt back in to reth's RocksDB storage backend; storage is MDBX-only today, so this
-//!   is off by default (see the feature comment in `Cargo.toml`).
 //!
 //! # Re-exports
 //!
@@ -77,6 +75,10 @@ mod clippy {
     use tn_reth as _;
 }
 
+// Dependencies only for their features (see the comment above `revm` in Cargo.toml).
+use reth_trie_sparse as _;
+use revm as _;
+
 use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
 use std::sync::{Arc, OnceLock};
@@ -86,13 +88,9 @@ use tn_types::{Address, BlockBody, Genesis, SealedBlock, SealedHeader};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
-pub use reth::{
-    chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
-    rpc::builder::RpcServerHandle,
-};
 pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
-pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
+pub use reth_cli_util::parse_socket_address;
 pub use reth_db::{
     mdbx::{open_db_read_only, DatabaseArguments, Error as RethMdbxError},
     static_file::iter_static_files,
@@ -101,21 +99,21 @@ pub use reth_db::{
 pub use reth_errors::{ProviderError, RethError};
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
-    node_config::DEFAULT_PERSISTENCE_THRESHOLD,
+    dirs::MaybePlatformPath,
 };
-pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 /// Test-only re-export so engine tests can construct static-file provider errors.
 #[cfg(feature = "test-utils")]
 pub use reth_provider::StaticFileSegment;
 pub use reth_provider::{
     providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
 };
+pub use reth_rpc_builder::RpcServerHandle;
 pub use reth_rpc_eth_types::EthApiError;
-pub use reth_tracing::{FileWorkerGuard, Layers};
+pub use reth_tracing::Layers;
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
     identifier::{SenderId, SenderIdentifiers},
-    BestTransactions, EthPooledTransaction, TransactionPool as TransactionPoolT,
+    BestTransactions, EthPooledTransaction,
 };
 
 mod cli;

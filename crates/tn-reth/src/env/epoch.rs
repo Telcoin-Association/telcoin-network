@@ -77,7 +77,7 @@
 //! [`StateReadError`]'s string-only variants cannot carry.
 
 use reth_errors::ProviderError;
-use reth_eth_wire::BlockHashNumber;
+use reth_eth_wire_types::BlockHashNumber;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmEnv, EvmFactory as _};
 use reth_provider::{
     BlockIdReader as _, BlockNumReader as _, ChainStateBlockReader as _,

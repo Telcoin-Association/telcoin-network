@@ -166,11 +166,12 @@ impl Eligible {
         let chain_id = config.network_config().libp2p_config().chain_id;
         let record = NodeRecord::build(
             RecordDomain::new(chain_id, NetworkType::Primary),
-            keys.primary_network_public_key(),
+            &bls,
+            keys.primary_network_keypair(),
             validator.primary_address(),
             None,
             |data| keys.request_signature_direct(data),
-        );
+        )?;
         let row = kad::Record {
             key: node_record_key(&bls),
             value: encode(&record),

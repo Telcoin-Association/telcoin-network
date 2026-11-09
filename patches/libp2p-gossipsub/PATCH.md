@@ -1,7 +1,6 @@
 # Carried patch: libp2p-gossipsub
 
-This is the production source of `libp2p-gossipsub` 0.50.0 with a promise-expiry fix and
-a per-peer promise filter.
+This is the production source of `libp2p-gossipsub` 0.50.0 with a promise-expiry fix, a per-peer promise filter and an outbound upgrade that reports a lazily negotiated protocol rejection as unsupported.
 The root `[patch.crates-io]` selects this copy for the existing libp2p 0.57.0 stack.
 The crate is excluded from the workspace, like the carried libp2p-quic and
 libp2p-connection-limits patches, to preserve upstream lints and style. The
@@ -19,14 +18,11 @@ libp2p-connection-limits patches, to preserve upstream lints and style. The
 - Original `src/gossip_promises.rs` SHA-256: `7b6132b9a61ccee78654b09a405c95898f4d3fe551d102ec7f9f877a96cb6990`.
 - Original `src/behaviour/tests/gossip.rs` SHA-256: `2c5685d3513ed174e83b809432bfa3ea91c426173aac0707a014406d49a454ed`.
 - Original `src/protocol.rs` SHA-256: `3d3796536850af98cba80710fb26f66224eee6f4d1bfc7d05a84215ebe28074c`.
-- The carried source is the archive's complete `src/` tree with four changes: the
-  heartbeat expiry and the per-peer IHAVE filter in `src/behaviour.rs`, the per-peer
-  promise lookup in `src/gossip_promises.rs`, one regression test appended to
-  `src/behaviour/tests/gossip.rs`, and the removal of the `mod tests` block at the end
-  of `src/protocol.rs`. Those five codec tests need the rust-libp2p workspace-only
-  `quickcheck` dev-dependency, which the published manifest does not carry. Upstream's
-  `tests/smoke.rs` needs the workspace-only `libp2p-swarm-test` crate and is not carried
-  either. Every carried file keeps its MIT copyright and permission notice.
+- Original `src/handler.rs` SHA-256: `571f103dd76d59a81bcefea3f85b30159d73c6a793d30b49d941fa031111bb8b`.
+- The carried source is the archive's complete `src/` tree with five changes: the heartbeat expiry and the per-peer IHAVE filter in `src/behaviour.rs`, the per-peer promise lookup in `src/gossip_promises.rs`, one regression test appended to `src/behaviour/tests/gossip.rs`, the mapping of a lazily negotiated protocol rejection to `ProtocolUnsupported` in `src/handler.rs`, and in `src/protocol.rs` a zero-length read in the outbound upgrade plus the removal of the `mod tests` block at the end of the file.
+  The removed `mod tests` block's five codec tests need the rust-libp2p workspace-only `quickcheck` dev-dependency, which the published manifest does not carry.
+  Upstream's `tests/smoke.rs` needs the workspace-only `libp2p-swarm-test` crate and is not carried either.
+  Every carried file keeps its MIT copyright and permission notice.
 - Runtime dependencies, versions and features match the published manifest. The root
   lockfile changes only this crate's source and checksum, selecting the path package
   without moving any dependency version. There is no separate patch lockfile.
@@ -63,9 +59,18 @@ promise, so the extra requests are bounded by the per-peer IHAVE and IWANT caps,
 IDONTWANT, and by the follow-up window. With scoring enabled a broken promise still
 costs the promiser its penalty.
 
-Telcoin's network maintainers own this carried patch with the `network-libp2p`
-dependency stack. Tracking is GHSA-779j-phh4-5v67. Keep the provenance and
-regression evidence current when updating this dependency.
+The node's swarm negotiates outbound substreams with multistream-select `V1Lazy`, which applies only to the last protocol a dialer proposes.
+Gossipsub proposes `/1.1.0` and then `/1.0.0`, so an honest peer still confirms `/1.1.0` under strict negotiation and nothing changes for it.
+A peer that speaks neither id rejects `/1.1.0`, and the `/1.0.0` fallback is then proposed lazily and handed back as fully negotiated before the listener answers.
+Upstream's outbound upgrade cannot fail, so its handler never sees `StreamUpgradeError::NegotiationFailed` for that peer, never disables itself as `ProtocolUnsupported`, and the behaviour never reports `GossipsubNotSupported`, the event the node answers with a fatal penalty.
+The carried copy's outbound upgrade performs a zero-length read before framing the stream, which drives the negotiation to completion without consuming data, and its error type becomes `io::Error` instead of `Infallible`; the inbound upgrade is unchanged.
+The listener's rejection then fails the upgrade with an `io::Error` wrapping `NegotiationError::Failed`, reported as `StreamUpgradeError::Apply`, and the handler maps it to `DisabledHandler::ProtocolUnsupported` exactly like `NegotiationFailed`; any other io error from the upgrade is logged like a negotiation io error.
+An honest peer pays nothing: its stream is already complete after the strict `/1.1.0` negotiation, and the empty read returns at once.
+A listener that closes the stream after the fallback proposal instead of answering `na` is not mapped: under lazy negotiation that is a plain `UnexpectedEof`, which the handler logs and retries until it disables itself as `MaxSubstreamAttempts` without reporting the peer as unsupported, where strict negotiation reported `NegotiationFailed`; stock libp2p listeners always answer `na`, so only a non-conforming peer takes this path.
+
+Telcoin's network maintainers own this carried patch with the `network-libp2p` dependency stack.
+Tracking is GHSA-779j-phh4-5v67 for the promise changes and issue #1780 for the negotiation change.
+Keep the provenance and regression evidence current when updating this dependency.
 
 ## Upstream resolution and retirement
 
@@ -87,6 +92,11 @@ compatible with the resolved libp2p stack. Record its public upstream issue/PR, 
 revision here. Run the regression against that release, then remove the path override,
 exclusion and carried source together. Preserve the promise-expiry coverage in the
 network tests or upstream tests when removing the dedicated CI job.
+
+Upstream's handler assumes strict `V1` negotiation: its outbound upgrade is infallible, so under `V1Lazy` a rejected fallback proposal is never reported as unsupported.
+An upstream fix would be the same zero-length read in the outbound upgrade, or a `NegotiationFailed` surfaced through `Apply`.
+Retiring the patch therefore also needs a release that reports a lazily negotiated rejection as unsupported, or the node's swarm returning to strict negotiation.
+`test_peer_without_gossipsub_is_banned_under_lazy_negotiation` in `crates/network-libp2p/src/tests/network_tests.rs` covers this path; the library tests do not.
 
 ## Regression command
 

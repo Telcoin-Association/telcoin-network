@@ -30,7 +30,7 @@ const RETH_IPC_ENDPOINT: &str = "/tmp/reth.ipc";
 #[test]
 fn seeded_reth_rpc_default_carries_tn_ipcpath() {
     init_reth_defaults();
-    let args = reth::args::RpcServerArgs::default();
+    let args = reth_node_core::args::RpcServerArgs::default();
     assert_eq!(args.ipcpath, DEFAULT_IPC_ENDPOINT);
     assert_ne!(args.ipcpath, RETH_IPC_ENDPOINT);
     assert!(!args.ipcdisable, "seeding must not disable IPC for parsed nodes");

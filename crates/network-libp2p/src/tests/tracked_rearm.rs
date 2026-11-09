@@ -14,7 +14,7 @@ use rand::{rngs::StdRng, SeedableRng as _};
 use std::task::{Context, Poll, Waker};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{BlsKeypair, Signer as _, TaskManager};
+use tn_types::{BlsKeypair, NetworkPublicKey, Signer as _, TaskManager};
 
 /// The events a test swarm reports to the application.
 type TestEvent = NetworkEvent<TestWorkerRequest, TestWorkerResponse>;
@@ -208,13 +208,15 @@ async fn joined_tracked_query_with_record_resolves_member() -> eyre::Result<()> 
     assert_eq!(fixture.enter_window(HashSet::from([key]))?, HashSet::from([key]));
     assert_eq!(fixture.queries(&key), [(tracked, LookupClass::Tracked, true)]);
 
+    let network_keypair = NetworkKeypair::generate_ed25519();
     let record = NodeRecord::build(
         RecordDomain::new(911_329, NetworkType::Primary),
-        NetworkKeypair::generate_ed25519().public().into(),
+        &key,
+        &network_keypair,
         quic_address()?,
         None,
         |bytes| keypair.sign(bytes),
-    );
+    )?;
     let peer: PeerId = record.info.pubkey.clone().into();
     fixture
         .network

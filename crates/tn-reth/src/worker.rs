@@ -1,30 +1,25 @@
 //! RPC-facing network shim and per-worker execution components.
 //!
 //! Inspired by reth_node_ethereum crate. TN does not run reth's devp2p networking, but reth's
-//! RPC builder needs `NetworkInfo`/`Peers` implementations to serve the `net`, `web3`, and
+//! RPC builder needs `NetworkInfo`/`PeersInfo` implementations to serve the `net`, `web3`, and
 //! `eth` namespaces. [`WorkerNetwork`] is that shim: it answers with the chain id, a
 //! status headed at the canonical tip, and a peer count that a background task refreshes every 15
-//! seconds by polling the worker's libp2p network handle. Everything reth-specific (peer
-//! management, ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held
-//! behind an `Arc`, so cloning the shim is cheap.
+//! seconds by polling the worker's libp2p network handle. The reth-specific node record and ENR
+//! are deliberate no-ops. The chain spec is held behind an `Arc`, so cloning the shim is cheap.
 //!
 //! [`WorkerComponents`] bundles what the node keeps per worker: the retained RPC handle,
 //! the worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
 //! respawned when the epoch rolls over).
 
 use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use enr::secp256k1::SecretKey;
 use futures::{FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
-use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::DEFAULT_DISCOVERY_PORT;
-use reth_eth_wire::DisconnectReason;
-use reth_network_api::{
-    EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
-    PeersInfo, Reputation, ReputationChangeKind,
-};
+use reth_network_api::{EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeersInfo};
 use reth_network_peers::{Enr, NodeRecord, PeerId as RethPeerId};
+use reth_rpc_builder::RpcServerHandle;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -121,8 +116,7 @@ impl Drop for WorkerComponents {
 
 /// A type that implements traits used by Reth for it's RPC.
 /// Traits are filled out to provide data for net, web3 and eth namespaces when available.
-/// Much of these traits are NO-OPS are not used, they support the admin namespace for
-/// instance which TN does not use or support.
+/// The node record and ENR are no-ops: they only identify a devp2p node, which TN does not run.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WorkerNetwork {
@@ -268,10 +262,14 @@ impl WorkerNetwork {
     }
 }
 
+/// reth's default devp2p discovery port (`reth_discv4::DEFAULT_DISCOVERY_PORT`), reported by the
+/// `net_` stubs below. TN runs no devp2p network, so nothing listens on it.
+const DEVP2P_DEFAULT_PORT: u16 = 30303;
+
 impl NetworkInfo for WorkerNetwork {
     // TN Unused
     fn local_addr(&self) -> SocketAddr {
-        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
+        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEVP2P_DEFAULT_PORT).into()
     }
 
     #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]
@@ -330,64 +328,6 @@ impl PeersInfo for WorkerNetwork {
     fn local_enr(&self) -> Enr<SecretKey> {
         let sk = SecretKey::from_slice(&[0xcd; 32]).expect("secret key derived from static slice");
         Enr::builder().build(&sk).expect("ENR builds from key")
-    }
-}
-
-// These appear to support Reth's admin namespace- TN does not use this.
-impl Peers for WorkerNetwork {
-    fn add_trusted_peer_id(&self, _peer: RethPeerId) {}
-
-    fn add_peer_kind(
-        &self,
-        _peer: RethPeerId,
-        _kind: PeerKind,
-        _tcp_addr: SocketAddr,
-        _udp_addr: Option<SocketAddr>,
-    ) {
-    }
-
-    async fn get_peers_by_kind(&self, _kind: PeerKind) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    async fn get_all_peers(&self) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    async fn get_peer_by_id(&self, _peer_id: RethPeerId) -> Result<Option<PeerInfo>, NetworkError> {
-        Ok(None)
-    }
-
-    async fn get_peers_by_id(
-        &self,
-        _peer_id: Vec<RethPeerId>,
-    ) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    fn remove_peer(&self, _peer: RethPeerId, _kind: PeerKind) {}
-
-    fn disconnect_peer(&self, _peer: RethPeerId) {}
-
-    fn disconnect_peer_with_reason(&self, _peer: RethPeerId, _reason: DisconnectReason) {}
-
-    fn reputation_change(&self, _peer_id: RethPeerId, _kind: ReputationChangeKind) {}
-
-    async fn reputation_by_id(
-        &self,
-        _peer_id: RethPeerId,
-    ) -> Result<Option<Reputation>, NetworkError> {
-        Ok(None)
-    }
-
-    fn connect_peer_kind(
-        &self,
-        _peer: RethPeerId,
-        _kind: PeerKind,
-        _tcp_addr: SocketAddr,
-        _udp_addr: Option<SocketAddr>,
-    ) {
-        // unimplemented!
     }
 }
 

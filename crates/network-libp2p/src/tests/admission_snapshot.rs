@@ -16,7 +16,7 @@ use std::{cell::RefCell, collections::BTreeMap};
 use tn_config::{AdmissionMode, ConsensusConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{wait_until, CommitteeFixture};
-use tn_types::{P2pNode, TaskManager};
+use tn_types::{NetworkPublicKey, P2pNode, TaskManager};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 /// The chain id of the e2e harness.

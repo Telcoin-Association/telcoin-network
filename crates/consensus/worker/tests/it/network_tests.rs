@@ -138,6 +138,8 @@ enum Verdict {
     Accept,
     /// Reject every batch with [`BatchValidationError::EmptyBatch`].
     Reject,
+    /// Reject every batch with [`BatchValidationError::InvalidDigest`].
+    RejectDigest,
 }
 
 /// A [`BatchValidation`] that counts `validate_batch` calls and returns the same [`Verdict`] for
@@ -156,6 +158,7 @@ impl BatchValidation for CountingBatchValidator {
         match self.verdict {
             Verdict::Accept => Ok(()),
             Verdict::Reject => Err(BatchValidationError::EmptyBatch),
+            Verdict::RejectDigest => Err(BatchValidationError::InvalidDigest),
         }
     }
 
@@ -292,10 +295,11 @@ async fn test_report_batch_repeat_keeps_validated_body() {
     );
 }
 
-/// A rejected batch is never cached, so a repeat of it is validated again and never acknowledged.
-/// This pins that the dedupe only skips digests that passed validation.
+/// A rejected batch is never cached, but its digest is kept as rejected for the epoch, so a repeat
+/// is refused without validation and never acknowledged (issue #1774). Without the rejected set the
+/// repeat is validated again, so the validation count is 2 and this test fails.
 #[tokio::test]
-async fn test_report_batch_revalidates_after_rejected_report() {
+async fn test_report_batch_rejected_repeat_is_refused_without_validation() {
     let (TestTypes { committee, handler, .. }, store, counters) =
         create_counting_test_types(Verdict::Reject);
     let batch = Batch::default();
@@ -308,15 +312,48 @@ async fn test_report_batch_revalidates_after_rejected_report() {
         Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
     );
     let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert!(
+        matches!(&repeat, Err(WorkerNetworkError::RejectedBatchRepeat(d)) if *d == digest),
+        "a repeat of a rejected digest must be refused, got {repeat:?}"
+    );
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        1,
+        "a repeat of a rejected digest must not be validated again"
+    );
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());
+}
+
+/// An `InvalidDigest` failure is never kept as rejected: the body did not hash to the claimed
+/// digest, so keeping that digest would let a sender poison the digest of an honest batch. A repeat
+/// of such a report is therefore validated again (issue #1774). If the failure were kept, the
+/// repeat would be refused without validation, so the validation count would be 1 and this test
+/// fails.
+#[tokio::test]
+async fn test_report_batch_invalid_digest_is_validated_again() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::RejectDigest);
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(
+        first,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::InvalidDigest))
+    );
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
     assert_matches!(
         repeat,
-        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::InvalidDigest))
     );
 
     assert_eq!(
         counters.validations.load(Ordering::SeqCst),
         2,
-        "a rejected batch must be validated again on repeat"
+        "an invalid-digest failure must not be kept, so a repeat is validated again"
     );
     assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
     assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());

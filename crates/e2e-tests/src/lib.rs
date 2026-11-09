@@ -290,11 +290,6 @@ fn config_local_testnet_inner(
         Ok(())
     })?;
 
-    // Create an observer config.
-    let dir = temp_path.join("observer");
-    // init config ceremony for observer
-    create_observer_info(dir, passphrase.clone(), workers)?;
-
     // create committee from shared genesis dir
     let mut genesis_args: Vec<String> = vec![
         "tn".into(),
@@ -361,8 +356,26 @@ fn config_local_testnet_inner(
         std::fs::copy(shared_genesis_dir.join("parameters.yaml"), dir.join("parameters.yaml"))?;
     }
 
-    let dir = temp_path.join("observer");
-    // copy genesis files back to observer dirs
+    config_observer(temp_path, "observer", passphrase, workers)
+}
+
+/// Give an observer its own keys under `temp_path/<name>` and copy the network's genesis,
+/// committee and parameters files next to them.
+///
+/// The `config_local_testnet*` helpers call it for the `observer` datadir. It needs the genesis
+/// ceremony's output in `temp_path/shared-genesis`, so a test that wants another observer, with an
+/// identity of its own, calls it after one of those helpers. `workers` must match the worker count
+/// the network was configured with.
+pub fn config_observer(
+    temp_path: &Path,
+    name: &str,
+    passphrase: Option<String>,
+    workers: usize,
+) -> eyre::Result<()> {
+    let dir = temp_path.join(name);
+    create_observer_info(dir.clone(), passphrase, workers)?;
+
+    let shared_genesis_dir = temp_path.join("shared-genesis");
     std::fs::create_dir_all(dir.join("genesis"))?;
     std::fs::copy(
         shared_genesis_dir.join("genesis/committee.yaml"),
