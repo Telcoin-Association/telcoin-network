@@ -308,6 +308,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
+        // A `db reset-execution` stopped between its moves leaves part of the execution database
+        // in its staging directory: refuse before the open creates a database beside the rest.
+        crate::db::refuse_interrupted_reset(&tn_datadir)?;
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)

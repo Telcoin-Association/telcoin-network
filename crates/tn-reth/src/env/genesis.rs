@@ -88,7 +88,7 @@ use crate::{
     system_calls::{
         ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE,
     },
-    RethConfig, RethEnv, TxForwardConfig, BLS_G1_PRECOMPILE_ADDRESS,
+    RethConfig, RethEnv, StorageLayout, TxForwardConfig, BLS_G1_PRECOMPILE_ADDRESS,
 };
 
 impl RethEnv {
@@ -160,6 +160,50 @@ impl RethEnv {
         rpc: RpcServerArgs,
         tx_forward: TxForwardConfig,
     ) -> eyre::Result<Self> {
+        Self::open_temp_chain(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            rpc,
+            tx_forward,
+            StorageLayout::for_new_datadirs(),
+        )
+    }
+
+    /// Create a new temp RethEnv whose datadir, when new, gets storage layout `layout`.
+    ///
+    /// Test seam for the layout guard (`env::layout`): [`Self::new_for_temp_chain`] with the
+    /// layout for new datadirs chosen.
+    #[cfg(test)]
+    pub(crate) fn new_for_temp_chain_with_layout<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        layout: StorageLayout,
+    ) -> eyre::Result<Self> {
+        init_reth_defaults();
+        Self::open_temp_chain(
+            chain,
+            db_path,
+            task_manager,
+            None,
+            RpcServerArgs { ipcdisable: true, ..Default::default() },
+            TxForwardConfig::default(),
+            layout,
+        )
+    }
+
+    /// The temp chain constructors' shared body: the config, the database, then the env.
+    fn open_temp_chain<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: RpcServerArgs,
+        tx_forward: TxForwardConfig,
+        layout: StorageLayout,
+    ) -> eyre::Result<Self> {
         // `NodeConfig::default` reads reth's process-wide pool and RPC-server defaults through
         // the args types' `Default` impls, which lock them. Seed first so a temp chain built
         // before any command is parsed does not fix reth's own values (per-sender slots 16,
@@ -182,7 +226,8 @@ impl RethEnv {
             rpc,
             ..NodeConfig::default()
         };
-        let mut reth_config = RethConfig::from_node_config(node_config);
+        let mut reth_config =
+            RethConfig::from_node_config(node_config).with_new_datadir_layout(layout);
         reth_config.1 = tx_forward;
         let database = Self::new_database(&reth_config, db_path)?;
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())

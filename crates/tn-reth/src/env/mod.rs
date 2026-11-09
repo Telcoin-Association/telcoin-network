@@ -10,8 +10,11 @@
 //!
 //! - [`RethEnv::new`] MUST run inside a tokio runtime: `init_provider_factory` captures
 //!   `tokio::runtime::Handle::current()`, which panics outside one.
-//! - Opening an env initializes genesis in the database when absent (`init_genesis`), always from
-//!   the LOCAL chain spec in the supplied config — genesis is never fetched from the network.
+//! - Opening an env initializes genesis in the database when absent (`init_genesis_with_settings`),
+//!   always from the LOCAL chain spec in the supplied config — genesis is never fetched from the
+//!   network.
+//! - Opening an env settles the datadir's storage layout first (`layout::settle`): a new datadir
+//!   gets the config's layout for new datadirs, an existing one keeps its own.
 //! - [`RethEnv::new`] has two process-global side effects (base-fee address pinning and metrics
 //!   registration) — see its docs.
 //! - Opening an env loads the datadir's restored-state floor marker when one exists (a datadir
@@ -24,7 +27,7 @@ use std::{
 };
 
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_db_common::init::init_genesis;
+use reth_db_common::init::init_genesis_with_settings;
 use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -52,11 +55,13 @@ mod epoch;
 mod execution;
 mod genesis;
 mod helpers;
+mod layout;
 mod output_overlay;
 #[cfg(test)]
 mod persist_bench;
 mod rpc;
 
+pub use layout::StorageLayout;
 pub use output_overlay::OutputTrieOverlay;
 
 /// This is a wrapped abstraction around Reth.
@@ -196,7 +201,8 @@ impl RethEnv {
 
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
-        let provider_factory = Self::init_provider_factory(&node_config, database)?;
+        let provider_factory =
+            Self::init_provider_factory(&node_config, database, reth_config.new_datadir_layout())?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
         let restored_state_floor = Self::read_restored_state_floor(&node_config)?;
@@ -400,10 +406,14 @@ impl RethEnv {
             .map_or(0, |b| b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1))
     }
 
-    /// Initialize the provider factory and related components
+    /// Initialize the provider factory and related components.
+    ///
+    /// `new_datadir_layout` is the storage layout a new datadir gets; an existing datadir keeps
+    /// its own (`layout::settle`).
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
         database: RethDb,
+        new_datadir_layout: StorageLayout,
     ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();
@@ -416,6 +426,11 @@ impl RethEnv {
             rocksdb_provider,
             runtime,
         )?;
+
+        // Settle the datadir's storage layout before anything else reads or writes through the
+        // factory: the consistency check below prunes static files by the layout's rules, so a
+        // datadir it cannot classify safely is refused first.
+        let layout = layout::settle(&provider_factory, new_datadir_layout)?;
 
         // Reconcile the storage backends before anything reads or writes through the factory.
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
@@ -453,9 +468,10 @@ impl RethEnv {
                 ))
             })?;
 
-        // Initialize genesis if needed
-        let genesis_hash = init_genesis(&provider_factory)?;
-        debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
+        // Initialize genesis if needed, in the settled layout: a new datadir records it in reth's
+        // `storage_settings` row with genesis; an existing one keeps its row.
+        let genesis_hash = init_genesis_with_settings(&provider_factory, layout.settings())?;
+        debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, %layout, "Initialized genesis");
 
         Ok(provider_factory)
     }
@@ -681,33 +697,6 @@ mod tests {
         execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
         assert_eq!(env2.last_block_number()?, 2, "block 2 must commit after the heal");
 
-        Ok(())
-    }
-
-    /// A new datadir is written with reth's storage v1 layout, and a restart keeps it.
-    ///
-    /// The layout decides where receipts, change sets and history indices live, and historical
-    /// reads (including consensus-registry reads at past blocks) depend on the history indices.
-    /// A node on v2 would write no MDBX history indices and disagree with v1 nodes on those
-    /// reads. TN pins v1 through one vendored line, `StorageSettings::base()` (TN-0014), which
-    /// `init_genesis` writes into a new datadir; upstream main returns v2 there, so an upstream
-    /// sync that takes that line would silently switch new nodes. This test fails instead.
-    #[tokio::test]
-    async fn test_new_datadir_uses_storage_v1() -> eyre::Result<()> {
-        use reth_provider::{MetadataProvider as _, StorageSettings, StorageSettingsCache as _};
-
-        assert_eq!(StorageSettings::base(), StorageSettings::v1());
-
-        let genesis = test_genesis_with_consensus_registry(4);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-        let tmp = TempDir::new().expect("create temp dir");
-        for run in ["new datadir", "reopened datadir"] {
-            let tm = TaskManager::new(run);
-            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
-            let provider = env.blockchain_provider().database_provider_ro()?;
-            assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
-            assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
-        }
         Ok(())
     }
 }

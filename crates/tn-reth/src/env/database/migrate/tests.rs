@@ -982,6 +982,68 @@ fn a_second_value_for_a_dup_subkey_fails_the_migration() {
     assert_untouched(&path, &mdbx, "a second value for a subkey");
 }
 
+/// An MDBX database that is not in storage layout v1, by reth's `storage_settings` row or TN's
+/// layout marker, or whose rows do not parse, is refused before the copy and left untouched: the
+/// migration moves the engine, never the layout. A v1 database with both rows migrates.
+#[test]
+fn an_mdbx_database_not_in_layout_v1_is_refused() {
+    use crate::env::layout::{RETH_SETTINGS_KEY, TN_LAYOUT_KEY};
+    use reth_db::table::Compress as _;
+
+    // a `Metadata` row as MDBX stores it: the key's bytes, the value compressed
+    let row = |key: &str, value: &[u8]| (key.as_bytes().to_vec(), value.to_vec().compress());
+    let v1 = br#"{"storage_v2":false}"#.as_slice();
+    let v2 = br#"{"storage_v2":true}"#.as_slice();
+    let marker_v1 = br#"{"version":1,"layout":"v1"}"#.as_slice();
+    let refused: [(&str, &[(&str, &[u8])], &str); 5] = [
+        ("settings v2", &[(RETH_SETTINGS_KEY, v2)], "not in storage layout v1"),
+        (
+            "marker v2",
+            &[(RETH_SETTINGS_KEY, v1), (TN_LAYOUT_KEY, br#"{"version":1,"layout":"v2"}"#)],
+            "not in storage layout v1",
+        ),
+        (
+            "settings unparseable",
+            &[(RETH_SETTINGS_KEY, b"v2")],
+            "storage_settings row does not parse",
+        ),
+        ("marker unparseable", &[(TN_LAYOUT_KEY, b"{}")], "tn_storage_layout row does not parse"),
+        (
+            "marker of another version",
+            &[(TN_LAYOUT_KEY, br#"{"version":9,"layout":"v1"}"#)],
+            "format version 9",
+        ),
+    ];
+    for (case, metadata, expected) in refused {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let mut rows = mdbx_rows();
+        rows.insert(
+            tables::Metadata::NAME,
+            metadata.iter().map(|(key, value)| row(key, value)).collect(),
+        );
+        build_mdbx_with(&path, rows);
+        let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+        let err = open(&path).expect_err(case);
+        let msg = format!("{err:#}");
+        assert!(msg.contains(expected), "{case}: {msg}");
+        assert!(msg.contains("MDBX database is unchanged"), "{case}: {msg}");
+        assert_untouched(&path, &mdbx, case);
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let mut rows = mdbx_rows();
+    rows.insert(
+        tables::Metadata::NAME,
+        vec![row(RETH_SETTINGS_KEY, v1), row(TN_LAYOUT_KEY, marker_v1)],
+    );
+    build_mdbx_with(&path, rows);
+    open(&path).expect("a v1 database migrates");
+    assert!(!exists(&path.join(MDBX_DATA_FILE)), "migrated");
+}
+
 /// A value larger than tn-lmdb takes (16 MiB with a short key, the engine's limit; MDBX takes
 /// larger) fails the migration with the adapter's `MDBX_BAD_VALSIZE`, and leaves MDBX untouched.
 #[test]
