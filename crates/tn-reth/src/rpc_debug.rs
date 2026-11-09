@@ -10,7 +10,7 @@
 //! Reth's call-many handler consumes tracer and state options but ignores shared block
 //! overrides in `GethDebugTracingCallOptions`; clients use each bundle's `blockOverride`.
 
-use crate::rpc_call::{bundles_at_epoch, epoch_base_fee, targets_tip, with_base_fee};
+use crate::rpc_call::{bundles_at_epoch, epoch_base_fee, targets_tip, tip_context, with_base_fee};
 use alloy::{
     eips::BlockId,
     rpc::types::{
@@ -21,6 +21,7 @@ use alloy::{
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_api::DebugApiServer;
+use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use tn_types::gas_accumulator::WorkerBaseFee;
 
 /// The debug methods that simulate new calls on a selected state.
@@ -52,12 +53,18 @@ pub(crate) struct DebugSimulationWithEpochBaseFee<Api> {
     debug_api: Api,
     /// Read the current epoch's fee for each request.
     base_fee: WorkerBaseFee,
+    /// The node's `--rpc.pending-block` kind, which decides what `pending` selects.
+    pending_block: PendingBlockKind,
 }
 
 impl<Api> DebugSimulationWithEpochBaseFee<Api> {
     /// Retain the debug handler and guard from the production registry.
-    pub(crate) const fn new(debug_api: Api, base_fee: WorkerBaseFee) -> Self {
-        Self { debug_api, base_fee }
+    pub(crate) const fn new(
+        debug_api: Api,
+        base_fee: WorkerBaseFee,
+        pending_block: PendingBlockKind,
+    ) -> Self {
+        Self { debug_api, base_fee, pending_block }
     }
 }
 
@@ -91,6 +98,7 @@ where
         state_context: Option<StateContext>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<Vec<GethTrace>>> {
+        let state_context = tip_context(state_context, self.pending_block);
         self.debug_api
             .debug_trace_call_many(
                 bundles_at_epoch(bundles, &state_context, &self.base_fee),

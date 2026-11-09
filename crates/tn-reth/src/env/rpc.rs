@@ -358,7 +358,9 @@ impl RethEnv {
         // drove its answer to the 500-gwei clamp on adiri (issue #1305).
         let gas_price = GasPriceWithEpochBaseFee::new(base_fee.clone());
         // Simulations use the same epoch fee as quotes and pool admission (#1348).
-        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone());
+        let pending_block = self.node_config().rpc.rpc_pending_block;
+        let simulation =
+            SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone(), pending_block);
         // Guard the eth submission methods with the operator's `--rpc.txfeecap` (issue
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
@@ -391,7 +393,8 @@ impl RethEnv {
             engine_events,
         );
         let bundle = BundleWithEpochBaseFee::new(registry.bundle_api(), base_fee.clone());
-        let debug = DebugSimulationWithEpochBaseFee::new(registry.debug_api(), base_fee);
+        let debug =
+            DebugSimulationWithEpochBaseFee::new(registry.debug_api(), base_fee, pending_block);
         let mut server = registry.create_transport_rpc_modules(modules_config);
         // `tn` is selected like reth's modules; it is in the default set and always on IPC.
         if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
