@@ -1209,9 +1209,10 @@ where
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
-    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
-    /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
-    /// assumes it is caught up and is demoted to inactive later if that turns out to be false.
+    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record, or a
+    /// certified record for this epoch, proves it must catch up, and otherwise starts as
+    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is demoted to
+    /// inactive later if that turns out to be false.
     /// The chosen mode is written to the [`ConsensusBus`] before returning.
     async fn identify_node_mode(
         &self,
@@ -1247,12 +1248,17 @@ where
         };
         // Apply the same record-tip veto as startup so stale execution state cannot restore a
         // validator that has rotated out. A record older than this committee cannot veto admission.
-        let record = self.consensus_chain.epochs().latest_record().await;
+        let epochs = self.consensus_chain.epochs();
+        let local_epoch = consensus_config.committee().epoch();
+        let record = epochs.latest_record().await;
+        let certified =
+            super::newest_certified_record(epochs, local_epoch).await.map(|record| record.epoch);
         let mode = super::node_mode_from_epoch_record(
             initial_mode,
-            consensus_config.committee().epoch(),
+            local_epoch,
             &self.key_config.primary_public_key(),
             record.as_ref(),
+            certified,
         );
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");
@@ -2030,6 +2036,29 @@ mod tests {
         drop(restarted);
         next_tasks.abort_all_tasks();
         next_tasks.wait_for_task_shutdown().await;
+
+        // A certified record for the local epoch proves the network closed that epoch without
+        // this node, so identification demotes an active validator to catch up (issue #1792).
+        if mode.is_active_cvv() {
+            let members: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let record = tn_types::EpochRecord {
+                epoch: consensus_config.committee().epoch(),
+                committee: members.clone(),
+                next_committee: members,
+                ..Default::default()
+            };
+            let certificate = tn_types::EpochCertificate {
+                epoch_hash: record.digest(),
+                signature: tn_types::BlsSignature::default(),
+                signed_authorities: Default::default(),
+            };
+            manager.consensus_chain.epochs().save(record, certificate).await?;
+            let identified = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+            assert!(
+                identified.is_cvv_inactive(),
+                "a certified record for the local epoch must demote the validator: {identified:?}",
+            );
+        }
         Ok(())
     }
 
