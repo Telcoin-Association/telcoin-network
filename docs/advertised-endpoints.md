@@ -125,6 +125,18 @@ label. Prometheus normalizes the dot in the `tn_network.*` names to an underscor
 | `tn_worker_submit_usable_members{network}` | Current members with at least one fresh, verified advertisement admitted by the forwarder's actual endpoint policy and demotion state. A member counts once. |
 | `tn_worker_submit_observed_timestamp_seconds{network}` | Unix time of the latest successful observer snapshot, or zero when unavailable. |
 
+The scheduled and eligible keys a swarm tracks for export have their own gauges, so the label set of the three committee slots, which dashboards sum over, stays fixed.
+They carry the same `network` values, and the two `slot` values `scheduled` and `eligible`.
+
+| Gauge | Meaning |
+| --- | --- |
+| `tn_network_tracked_required_members{network,slot}` | Keys in the swarm's scheduled or eligible set, excluding this node's own BLS identity. A key in both sets counts in both slots. |
+| `tn_network_tracked_unresolved_members{network,slot}` | Those keys without a signed record. A key held only as a configuration or launch stub remains unresolved. |
+| `tn_network_tracked_records{network}` | Signed records the swarm retains for scheduled and eligible keys outside the committee cache. |
+
+The tracked gauges update when the swarm receives a key publication or retains a record, after each committee update and on each peer-manager heartbeat.
+Tracking admits nothing, so these gauges measure how much of the pool a host firewall fed from `tn_admissionSnapshot` can allow ahead of time, not committee readiness.
+
 Resolution gauges initialize at swarm startup and update after commands and network events, including
 record acceptance/replacement, failed resolution, and committee rotation. Learned identities retain
 their existing committee-window lifetime for routing; this alone does not establish submit coverage.
