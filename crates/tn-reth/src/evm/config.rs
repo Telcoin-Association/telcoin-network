@@ -46,7 +46,7 @@ use crate::{error::TnRethError, payload::TNPayload, TNPrimitives};
 use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor};
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives::{BlockTy, HeaderTy};
+use reth_primitives_traits::{BlockTy, HeaderTy};
 use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,

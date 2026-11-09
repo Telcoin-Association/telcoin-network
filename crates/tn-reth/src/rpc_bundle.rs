@@ -37,6 +37,9 @@ where
     Api: EthCallBundleApiServer + Send + Sync + 'static,
 {
     /// Use the state block's tag, since the execution block number can be in the future.
+    ///
+    /// Reth's handler takes a blocking-IO permit and holds it in its blocking task
+    /// (vendored TN-0037), so this wrapper must not take one too.
     async fn call_bundle(&self, mut bundle: EthCallBundle) -> RpcResult<EthCallBundleResponse> {
         if targets_tip(bundle.state_block_number.into()) {
             bundle.base_fee.get_or_insert_with(|| u128::from(epoch_base_fee(&self.base_fee)));

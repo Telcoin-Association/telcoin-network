@@ -1,6 +1,6 @@
 # `tn-lmdb-reth`
 
-reth's database API (`reth-db-api`, reth v1.11.3) on the [`tn-lmdb`](../tn-lmdb/README.md) engine.
+reth's database API (`reth-db-api`, the vendored reth under `vendor/reth`, v1.11.4) on the [`tn-lmdb`](../tn-lmdb/README.md) engine.
 `TnLmdbEnv` is a reth `Database` whose transactions and cursors behave as reth's MDBX ones do and
 report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchanged. Of reth's
 five dup-sort tables, the state tables are the engine's dup tables (each key's few rows packed in

@@ -12,14 +12,19 @@
 //!    one request class cannot starve another.
 //!
 //! Each [`ReservedPool`] splits its permits into a public share, which any peer may take, and a
-//! committee reserve, which only a [`PeerTier::Committee`] peer may take. A committee peer takes
-//! the reserve first and falls back to the public share. Thus peers outside the committee that
-//! fill the public share cannot block committee members from catching up. [`ReservedPeers`]
-//! classifies a peer's BLS key into its [`PeerTier`].
+//! reserve for each committee key, which only that [`PeerTier::Committee`] key may take. A
+//! committee peer takes its own reserve first and falls back to the public share. Thus peers
+//! outside the committee that fill the public share cannot block committee members from catching
+//! up, and committee keys that hold their own reserves cannot block a different committee key.
+//! [`ReservedPeers`] classifies a peer's BLS key into its [`PeerTier`].
 //!
 //! Across both phases and every class, [`PeerSlots`] caps the number of streams that one BLS key
 //! has in flight. A [`PeerSlot`] is held for the whole life of a stream and frees its count when
 //! it drops.
+//!
+//! A [`HoldBudget`] bounds the permit-hold time of one BLS key over a window. A [`HoldLease`]
+//! charges the time it was held when it drops, the charge leaks away over the window, and a key
+//! at its budget is refused a new lease until enough of its charge has leaked.
 //!
 //! No call in this module waits: a budget that is full refuses at once, so the caller can shed
 //! the stream with a `Deny` frame instead of queueing it.
@@ -28,9 +33,13 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::Duration,
 };
 use tn_types::BlsPublicKey;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 
 /// The admission tier of a peer, decided by its BLS key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,38 +75,52 @@ impl ReservedPeers {
     }
 }
 
-/// A concurrency budget split into a public share and a committee reserve.
+/// A concurrency budget split into a public share and a committee reserve for each committee key.
 ///
 /// A [`PeerTier::Public`] peer takes permits only from the public share. A
-/// [`PeerTier::Committee`] peer takes from the reserve first and then from the public share, so
-/// the public share can be full while a committee peer is still admitted. A clone shares the same
-/// permits.
+/// [`PeerTier::Committee`] peer takes from its own reserve first and then from the public share, so
+/// the public share can be full while a committee peer is still admitted.
+///
+/// The committee reserve is not one budget that all committee keys share. Each committee key has
+/// its own reserve of `reserved_per_key` permits, and no other key can take from it. Thus a few
+/// committee keys that hold their streams open without progress hold only their own reserves and
+/// the public share. They cannot stop a different committee key from catching up. See issue #1750.
+///
+/// A key gets its reserve when it first asks for a committee-tier permit. A public-tier peer never
+/// adds a reserve, so the number of reserves is at most the number of keys that
+/// [`ReservedPeers`] classifies as committee. A clone shares the same permits.
 #[derive(Clone, Debug)]
 pub struct ReservedPool {
     /// The permits that any peer may take.
     public: Arc<Semaphore>,
-    /// The permits that only a committee-tier peer may take.
-    reserved: Arc<Semaphore>,
+    /// The reserve of each committee key that has asked for a permit. Only that key may take
+    /// permits from its reserve.
+    reserved: Arc<Mutex<HashMap<BlsPublicKey, Arc<Semaphore>>>>,
+    /// The number of permits in the reserve of each committee key.
+    reserved_per_key: usize,
 }
 
 impl ReservedPool {
-    /// Create a pool with `public` permits in the public share and `reserved` permits in the
-    /// committee reserve.
-    pub fn new(public: usize, reserved: usize) -> Self {
+    /// Create a pool with `public` permits in the public share and `reserved_per_key` permits in
+    /// the reserve of each committee key.
+    pub fn new(public: usize, reserved_per_key: usize) -> Self {
         Self {
             public: Arc::new(Semaphore::new(public)),
-            reserved: Arc::new(Semaphore::new(reserved)),
+            reserved: Arc::default(),
+            reserved_per_key,
         }
     }
 
-    /// Try to take one permit for a peer of `tier`, without waiting.
+    /// Try to take one permit for `peer` of `tier`, without waiting.
     ///
-    /// A committee-tier peer takes from the reserve first and falls back to the public share. A
-    /// public-tier peer takes from the public share only. Returns `None` when no permit that the
-    /// tier may take is free. The permit returns to the share it came from when it drops.
-    pub fn try_acquire(&self, tier: PeerTier) -> Option<OwnedSemaphorePermit> {
+    /// A committee-tier peer takes from its own reserve first and falls back to the public share.
+    /// A public-tier peer takes from the public share only. Returns `None` when no permit that the
+    /// peer may take is free. The permit returns to the share it came from when it drops.
+    pub fn try_acquire(&self, peer: &BlsPublicKey, tier: PeerTier) -> Option<OwnedSemaphorePermit> {
         match tier {
-            PeerTier::Committee => Self::take(&self.reserved).or_else(|| Self::take(&self.public)),
+            PeerTier::Committee => {
+                Self::take(&self.reserve_of(peer)).or_else(|| Self::take(&self.public))
+            }
             PeerTier::Public => Self::take(&self.public),
         }
     }
@@ -107,9 +130,22 @@ impl ReservedPool {
         self.public.available_permits()
     }
 
-    /// The number of free permits in the committee reserve.
-    pub fn available_reserved(&self) -> usize {
-        self.reserved.available_permits()
+    /// The number of free permits in the reserve of committee key `peer`. A key that has not
+    /// asked for a permit yet has its full reserve free.
+    pub fn available_reserved(&self, peer: &BlsPublicKey) -> usize {
+        self.reserved
+            .lock()
+            .get(peer)
+            .map_or(self.reserved_per_key, |reserve| reserve.available_permits())
+    }
+
+    /// The reserve of committee key `peer`, created with `reserved_per_key` permits on first use.
+    fn reserve_of(&self, peer: &BlsPublicKey) -> Arc<Semaphore> {
+        self.reserved
+            .lock()
+            .entry(*peer)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.reserved_per_key)))
+            .clone()
     }
 
     /// Take one permit from `share` without waiting, or `None` when it is empty.
@@ -179,6 +215,114 @@ impl Drop for PeerSlot {
     }
 }
 
+/// A per-key budget of permit-hold time that refills over a window.
+///
+/// Each BLS key may hold permits for at most `budget` in the long run per `window`: the hold
+/// time it is charged leaks away at `budget / window` per second, and a key whose charged time
+/// has not leaked below `budget` is refused a new lease. A lease is admitted only while the key
+/// has at least `hold` of its budget left, so every admitted hold can run to the hold limit
+/// inside the budget and a key never gets two full holds back to back. A key can exceed the
+/// budget only by the slack a hold runs past `hold`. A clone shares the same ledger.
+/// (GHSA-pg7j-w22m-3qj5)
+#[derive(Clone, Debug)]
+pub struct HoldBudget {
+    /// The hold time on the books for each key, as of the instant it was last brought up to date.
+    /// A key whose time has fully leaked has no entry.
+    ledger: Arc<Mutex<HashMap<BlsPublicKey, HoldUse>>>,
+    /// The longest hold one lease covers: a lease is admitted only with this much budget left.
+    hold: Duration,
+    /// The hold time a key may use in one window.
+    budget: Duration,
+    /// The window the budget refills over.
+    window: Duration,
+}
+
+/// The hold time charged to one key, as of the instant it was last brought up to date.
+#[derive(Clone, Copy, Debug)]
+struct HoldUse {
+    /// The charged hold time that had not leaked away at `at`.
+    used: Duration,
+    /// The instant `used` was brought up to date.
+    at: Instant,
+}
+
+impl HoldUse {
+    /// The charged time left at `now`, after leaking at `budget / window` since `at`.
+    fn left_at(self, now: Instant, budget: Duration, window: Duration) -> Duration {
+        self.used.saturating_sub(leak(now.saturating_duration_since(self.at), budget, window))
+    }
+}
+
+/// The hold time that leaks away over `elapsed` at `budget / window`, in whole nanoseconds.
+fn leak(elapsed: Duration, budget: Duration, window: Duration) -> Duration {
+    let nanos = elapsed.as_nanos().saturating_mul(budget.as_nanos()) / window.as_nanos().max(1);
+    u64::try_from(nanos).map_or(Duration::MAX, Duration::from_nanos)
+}
+
+impl HoldBudget {
+    /// Create a budget that admits `budget` of hold time per `window` for each key, where one
+    /// lease covers a hold of at most `hold`.
+    pub fn new(hold: Duration, budget: Duration, window: Duration) -> Self {
+        Self { ledger: Arc::default(), hold, budget, window }
+    }
+
+    /// The hold time `peer` may still use at `now`: the budget less the charged time that has
+    /// not leaked away. A key with no entry has its whole budget.
+    pub fn remaining(&self, peer: &BlsPublicKey, now: Instant) -> Duration {
+        let used = self
+            .ledger
+            .lock()
+            .get(peer)
+            .map_or(Duration::ZERO, |hold| hold.left_at(now, self.budget, self.window));
+        self.budget.saturating_sub(used)
+    }
+
+    /// Try to lease hold time for `peer` from `now`, without waiting.
+    ///
+    /// Returns `None` when the key has less than one full hold of budget left. The lease charges
+    /// the time it was held to the key when it drops.
+    pub fn try_lease(&self, peer: BlsPublicKey, now: Instant) -> Option<HoldLease> {
+        (self.remaining(&peer, now) >= self.hold).then(|| HoldLease {
+            ledger: self.ledger.clone(),
+            budget: self.budget,
+            window: self.window,
+            peer,
+            since: now,
+        })
+    }
+}
+
+/// One hold of permit time that a key has leased from a [`HoldBudget`].
+///
+/// When the lease drops, it charges the time since it was taken to the key, so the charge is
+/// known only when the hold ends. A key fully refilled at that instant leaves the ledger.
+#[derive(Debug)]
+pub struct HoldLease {
+    /// The shared ledger of the [`HoldBudget`] that issued this lease.
+    ledger: Arc<Mutex<HashMap<BlsPublicKey, HoldUse>>>,
+    /// The hold time a key may use in one window.
+    budget: Duration,
+    /// The window the budget refills over.
+    window: Duration,
+    /// The key this lease charges.
+    peer: BlsPublicKey,
+    /// The instant the lease was taken.
+    since: Instant,
+}
+
+impl Drop for HoldLease {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let held = now.saturating_duration_since(self.since);
+        let mut ledger = self.ledger.lock();
+        let carried = ledger
+            .get(&self.peer)
+            .map_or(Duration::ZERO, |hold| hold.left_at(now, self.budget, self.window));
+        ledger.insert(self.peer, HoldUse { used: carried.saturating_add(held), at: now });
+        ledger.retain(|_, hold| hold.left_at(now, self.budget, self.window) > Duration::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,38 +335,77 @@ mod tests {
     }
 
     /// A public-tier peer never takes a reserved permit: when the public share is empty it is
-    /// refused, although the whole committee reserve is free.
+    /// refused, and no reserve is created for its key.
     #[test]
     fn public_tier_cannot_touch_the_reserve() {
-        let pool = ReservedPool::new(2, 3);
+        let pool = ReservedPool::new(2, 1);
+        let outsider = key(1);
         let held: Vec<Option<OwnedSemaphorePermit>> =
-            (0..2).map(|_| pool.try_acquire(PeerTier::Public)).collect();
+            (0..2).map(|_| pool.try_acquire(&outsider, PeerTier::Public)).collect();
         assert!(held.iter().all(Option::is_some));
-        assert!(pool.try_acquire(PeerTier::Public).is_none());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (0, 3));
+        assert!(pool.try_acquire(&outsider, PeerTier::Public).is_none());
+        assert_eq!((pool.available_public(), pool.available_reserved(&outsider)), (0, 1));
+        assert!(pool.reserved.lock().is_empty());
         drop(held);
-        assert_eq!((pool.available_public(), pool.available_reserved()), (2, 3));
+        assert_eq!(pool.available_public(), 2);
     }
 
-    /// A committee-tier peer empties the reserve first, then falls back to the public share, and
-    /// is refused only when both are empty. Each permit returns to its own share on drop.
+    /// A committee-tier peer empties its own reserve first, then falls back to the public share,
+    /// and is refused only when both are empty. Each permit returns to its own share on drop.
     #[test]
     fn committee_tier_takes_the_reserve_first_then_the_public_share() {
         let pool = ReservedPool::new(1, 2);
-        let first = pool.try_acquire(PeerTier::Committee);
+        let committee = key(1);
+        let free = || (pool.available_public(), pool.available_reserved(&committee));
+        let first = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(first.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 1));
-        let second = pool.try_acquire(PeerTier::Committee);
+        assert_eq!(free(), (1, 1));
+        let second = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(second.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 0));
-        let third = pool.try_acquire(PeerTier::Committee);
+        assert_eq!(free(), (1, 0));
+        let third = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(third.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (0, 0));
-        assert!(pool.try_acquire(PeerTier::Committee).is_none());
+        assert_eq!(free(), (0, 0));
+        assert!(pool.try_acquire(&committee, PeerTier::Committee).is_none());
         drop(third);
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 0));
+        assert_eq!(free(), (1, 0));
         drop((first, second));
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 2));
+        assert_eq!(free(), (1, 2));
+    }
+
+    /// Byzantine committee keys at the per-peer cap, with public keys that fill the public share,
+    /// cannot take the reserve of an honest committee key. Each Byzantine key holds only its own
+    /// reserved permit, and the honest key is still admitted from its own reserve. With one
+    /// reserve that all committee keys shared, three keys at two streams each held the whole
+    /// reserve and the honest key was refused. This is the starvation that issue #1750 describes.
+    #[test]
+    fn committee_keys_cannot_hold_the_reserve_of_another_committee_key() {
+        let byzantine = [key(1), key(2), key(3)];
+        let honest = key(4);
+        let reserved = ReservedPeers::new(byzantine.into_iter().chain([honest]));
+        let slots = PeerSlots::new(2);
+        let pool = ReservedPool::new(8, 1);
+        let opens: Vec<BlsPublicKey> = (10..14)
+            .map(key)
+            .chain(byzantine)
+            .flat_map(|peer| std::iter::repeat_n(peer, 2))
+            .collect();
+        let held: Vec<(PeerSlot, OwnedSemaphorePermit)> = opens
+            .iter()
+            .filter_map(|peer| {
+                slots.try_take(*peer).zip(pool.try_acquire(peer, reserved.tier(peer)))
+            })
+            .collect();
+        assert_eq!(held.len(), 8 + byzantine.len());
+        assert_eq!(pool.available_public(), 0);
+        assert!(byzantine.iter().all(|peer| pool.available_reserved(peer) == 0));
+
+        assert_eq!(pool.available_reserved(&honest), 1);
+        let honest_slot = slots.try_take(honest);
+        let honest_permit = pool.try_acquire(&honest, reserved.tier(&honest));
+        assert!(honest_slot.is_some());
+        assert!(honest_permit.is_some());
+        assert_eq!(pool.available_reserved(&honest), 0);
     }
 
     /// Three public keys, each within the per-peer cap of two, fill a public share of five
@@ -240,7 +423,9 @@ mod tests {
             .collect();
         let held: Vec<(PeerSlot, OwnedSemaphorePermit)> = opens
             .iter()
-            .filter_map(|peer| slots.try_take(*peer).zip(pool.try_acquire(reserved.tier(peer))))
+            .filter_map(|peer| {
+                slots.try_take(*peer).zip(pool.try_acquire(peer, reserved.tier(peer)))
+            })
             .collect();
         assert_eq!(held.len(), 5);
         assert_eq!(pool.available_public(), 0);
@@ -248,14 +433,14 @@ mod tests {
         let late = key(13);
         assert_eq!(reserved.tier(&late), PeerTier::Public);
         assert!(slots.try_take(late).is_some());
-        assert!(pool.try_acquire(reserved.tier(&late)).is_none());
+        assert!(pool.try_acquire(&late, reserved.tier(&late)).is_none());
 
         assert_eq!(reserved.tier(&committee), PeerTier::Committee);
         let committee_slot = slots.try_take(committee);
-        let committee_permit = pool.try_acquire(reserved.tier(&committee));
+        let committee_permit = pool.try_acquire(&committee, reserved.tier(&committee));
         assert!(committee_slot.is_some());
         assert!(committee_permit.is_some());
-        assert_eq!(pool.available_reserved(), 3);
+        assert_eq!(pool.available_reserved(&committee), 3);
     }
 
     /// Peer slots cap at `cap` for each key, are independent across keys, and free on drop. An
@@ -293,5 +478,76 @@ mod tests {
         assert_eq!(reserved.tier(&next), PeerTier::Committee);
         assert_eq!(reserved.tier(&outsider), PeerTier::Public);
         assert_eq!(ReservedPeers::default().tier(&current), PeerTier::Public);
+    }
+
+    /// The budget and window of the public batch-serve hold budget.
+    const BUDGET: Duration = Duration::from_secs(60);
+    const WINDOW: Duration = Duration::from_secs(300);
+
+    /// A lease is admitted only while the key has a full hold of budget left. A hold of 58 s
+    /// leaves 2 s, so the next lease is refused until the charge has leaked back to a full hold,
+    /// 290 s later, and a key never gets two full holds back to back. Once the charge has fully
+    /// leaked the key has its whole budget and the next drop removes its entry.
+    #[tokio::test(start_paused = true)]
+    async fn hold_budget_reserves_a_full_hold_at_admission() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let peer = key(1);
+        let first = budget.try_lease(peer, Instant::now());
+        assert!(first.is_some());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        drop(first);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(2));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // 289 s later, 57.8 s of the charge has leaked: 59.8 s left is still short of a full hold
+        tokio::time::advance(Duration::from_secs(289)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_millis(59_800));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // one more second and the whole hold is back
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        let second = budget.try_lease(peer, Instant::now());
+        assert!(second.is_some());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        drop(second);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(2));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // 58 s leaks away in 290 s: the key has its whole budget and the next drop clears it
+        tokio::time::advance(Duration::from_secs(290)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        drop(budget.try_lease(peer, Instant::now()));
+        assert!(budget.ledger.lock().is_empty());
+    }
+
+    /// One key at its budget does not affect another key.
+    #[tokio::test(start_paused = true)]
+    async fn hold_budget_is_per_key() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let (spent, fresh) = (key(1), key(2));
+        let lease = budget.try_lease(spent, Instant::now());
+        tokio::time::advance(BUDGET).await;
+        drop(lease);
+        assert!(budget.try_lease(spent, Instant::now()).is_none());
+        assert_eq!(budget.remaining(&fresh, Instant::now()), BUDGET);
+        assert!(budget.try_lease(fresh, Instant::now()).is_some());
+    }
+
+    /// A lease charges only the time it was held: 5 s held leaves 55 s of the budget. That is
+    /// short of a full hold, so the key is refused until the 5 s has leaked, 25 s later.
+    #[tokio::test(start_paused = true)]
+    async fn hold_lease_charges_only_the_held_time() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let peer = key(1);
+        let lease = budget.try_lease(peer, Instant::now());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(lease);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(55));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        assert!(budget.try_lease(peer, Instant::now()).is_some());
     }
 }

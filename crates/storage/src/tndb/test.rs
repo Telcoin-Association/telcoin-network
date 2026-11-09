@@ -812,6 +812,30 @@ fn test_tndb_durable_only_after_the_sync() {
     block_on(db.persist::<TestTable>()).expect("persist after the sync");
 }
 
+/// A group `persist` that returns finds `Durability::durable` at its batch: `advance` moves that
+/// watermark before the watch `persist` waits on, so a pause between the two holds the `persist`
+/// back rather than letting it return while `durable()` still reads the old value.
+#[test]
+fn test_tndb_durable_moves_before_persist_returns() {
+    let tmp = TempDir::with_prefix("tndb_durable_order").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    let (arrived, release) = db.core().durability.gate_next_advance();
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let target = db.core().durability.last_seq();
+    let (seen, persisted) = std::sync::mpsc::channel();
+    let waiter = db.clone();
+    std::thread::spawn(move || {
+        block_on(waiter.persist::<TestTable>()).expect("persist");
+        let _ = seen.send(waiter.core().durability.durable());
+    });
+    arrived.recv_timeout(Duration::from_secs(10)).expect("the commit thread paused in advance");
+    // Time for a `persist` let go too early to return and read `durable()`.
+    std::thread::sleep(Duration::from_millis(200));
+    drop(release);
+    let durable = persisted.recv_timeout(Duration::from_secs(10)).expect("persist returned");
+    assert!(durable >= target, "persist returned with durable() at {durable}, below {target}");
+}
+
 /// In `Sync` mode a writer does not need the commit thread: the first writer waiting syncs the log
 /// itself (and later waiters share its sync), so writes complete with the commit thread stopped,
 /// and each is durable on return (it survives a power loss).

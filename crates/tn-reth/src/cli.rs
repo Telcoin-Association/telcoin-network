@@ -2,9 +2,10 @@
 //!
 //! This is the only reth CLI/config surface TN exposes: [`RethCommand`] narrows reth's full
 //! argument set to RPC, transaction-pool, and database args, and [`RethConfig::new`] fills in
-//! the rest of reth's `NodeConfig` with pinned values — reth networking/discovery fully
-//! disabled (TN runs its own libp2p stack), no reth payload builder, no dev/debug options, and
-//! reth's metrics server never launched (the prometheus endpoint is owned by `tn-metrics`).
+//! the rest of reth's `NodeConfig` with pinned values — no reth payload builder, no dev/debug
+//! options, and reth's metrics server never launched (the prometheus endpoint is owned by
+//! `tn-metrics`). reth's devp2p networking is not compiled in at all (TN runs its own libp2p
+//! stack; see vendor/reth CHANGES.md TN-0008).
 //!
 //! Security/operational policies enforced here:
 //! - RPC namespace allowlist: only the modules in `ALLOWED_MODULES` (eth, net, web3, debug, trace,
@@ -30,32 +31,23 @@
 //!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16), and the default IPC endpoint
 //!   becomes TN's [`DEFAULT_IPC_ENDPOINT`] (`tn.ipc`) rather than reth's `reth.ipc`.
 
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::NatResolver;
-use reth_network::transactions::{
-    config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
-};
-use reth_node_builder::{
-    NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-    DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
-    DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+// The engine-tree defaults, from reth-engine-primitives (reth-tasks has its own
+// `DEFAULT_RESERVED_CPU_CORES` with a different value; this is the engine's).
+use reth_engine_primitives::{
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
 use reth_node_core::{
     args::{
-        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
-        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, EngineArgs,
+        EraArgs, EraSourceArgs, MetricArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
     },
-    node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
+    node_config::{NodeConfig, DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB},
 };
 use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
@@ -64,11 +56,15 @@ use tracing::{info, warn};
 use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
+    rpc_tx_forward::TxForwardConfig,
 };
 
 /// A wrapper abstraction around a Reth node config.
+///
+/// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
+/// `--sanitize-txs`), which reth's `NodeConfig` has no place for.
 #[derive(Clone, Debug)]
-pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>);
+pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>, pub(crate) TxForwardConfig);
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -92,8 +88,6 @@ pub struct RethCommand {
     #[clap(flatten)]
     pub db: DatabaseArgs,
 }
-
-const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// The reth rpc modules an operator may enable at all.
 ///
@@ -302,57 +296,6 @@ impl RethConfig {
         Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);
         // We don't just use Default for these Reth args.
         // This will force us to look at new options and make sure they are good for our use.
-        // We DO NOT use the Reth networking so these settings should reflect that.
-        let network = NetworkArgs {
-            discovery: DiscoveryArgs {
-                disable_discovery: true,
-                disable_nat: true,
-                disable_dns_discovery: true,
-                disable_discv4_discovery: true,
-                enable_discv5_discovery: false,
-                addr: DEFAULT_UNUSED_ADDR,
-                port: 0,
-                discv5_addr: None,
-                discv5_addr_ipv6: None,
-                discv5_port: 0,
-                discv5_port_ipv6: 0,
-                discv5_lookup_interval: 0,
-                discv5_bootstrap_lookup_interval: 0,
-                discv5_bootstrap_lookup_countdown: 0,
-            },
-            trusted_only: false,
-            trusted_peers: vec![],
-            bootnodes: None,
-            dns_retries: 0,
-            peers_file: None,
-            identity: "Reth Null Network".to_string(),
-            p2p_secret_key: None,
-            no_persist_peers: true,
-            nat: NatResolver::None,
-            addr: DEFAULT_UNUSED_ADDR,
-            port: 0,
-            max_outbound_peers: None,
-            max_inbound_peers: None,
-            max_concurrent_tx_requests: 0,
-            max_concurrent_tx_requests_per_peer: 0,
-            max_seen_tx_history: 0,
-            max_pending_pool_imports: 0,
-            soft_limit_byte_size_pooled_transactions_response: 0,
-            soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
-            max_capacity_cache_txns_pending_fetch: 0,
-            net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::None,
-            tx_ingress_policy: TransactionIngressPolicy::None,
-            disable_tx_gossip: true,
-            propagation_mode: TransactionPropagationMode::Max(0),
-            required_block_hashes: vec![],
-            network_id: None,
-            enforce_enr_fork_id: false,
-            max_peers: None,
-            netrestrict: None,
-            p2p_secret_key_hex: None,
-        };
-
         // Not using the Reth payload builder.
         let builder = PayloadBuilderArgs {
             extra_data: "tn-reth-na".to_string(),
@@ -473,13 +416,17 @@ impl RethConfig {
         // Parameters to configure block history syncing.
         let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
 
+        // The forwarding args are TN-only: take them out before `rpc` converts into reth's args,
+        // which have no field for them.
+        let tx_forward =
+            TxForwardConfig { targets: rpc.forward_txs.take(), sanitize: rpc.sanitize_txs };
+
         let mut this = NodeConfig {
             config: None,
             chain,
             metrics,
             instance,
             datadir,
-            network,
             rpc: rpc.into(),
             txpool,
             builder,
@@ -498,7 +445,18 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this)
+        Self(this, tx_forward)
+    }
+
+    /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
+    /// restores, tests), with transaction forwarding off.
+    pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
+        Self(node_config, TxForwardConfig::default())
+    }
+
+    /// The node's `--forward-txs` / `--sanitize-txs` settings.
+    pub fn tx_forward(&self) -> &TxForwardConfig {
+        &self.1
     }
 
     /// Assert the archive-mode invariant that every pinned historical read depends on.
@@ -845,6 +803,32 @@ mod tests {
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
     }
 
+    /// The TN-only forwarding args reach the config beside reth's `NodeConfig`, which has no
+    /// field for them, and a command without them leaves forwarding off.
+    #[test]
+    fn forward_txs_args_survive_reth_config_new() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1,10.0.0.2:8566",
+            "--sanitize-txs",
+        ])?;
+        let expected = crate::rpc_tx_forward::parse_forward_targets("10.0.0.1,10.0.0.2:8566")?;
+
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain.clone());
+        assert_eq!(
+            config.tx_forward(),
+            &TxForwardConfig { targets: Some(expected), sanitize: true }
+        );
+
+        let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+        assert_eq!(config.tx_forward(), &TxForwardConfig::default());
+        Ok(())
+    }
+
     /// The `--instance` port offsets the CLI README documents, checked against the values reth's
     /// `adjust_instance_ports` resolves from TN's defaults: instance 1 keeps the defaults, each
     /// further instance moves HTTP down by one and WebSocket up by two, and the IPC suffix is
@@ -878,7 +862,8 @@ mod tests {
     fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
         init_reth_defaults();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
+        let mut config =
+            RethConfig::from_node_config(NodeConfig { chain, ..NodeConfig::default() });
         enable(&mut config.0.pruning);
         config
     }

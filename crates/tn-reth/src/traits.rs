@@ -19,9 +19,11 @@ use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_engine_primitives::PayloadValidator;
-use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadBuilderAttributes};
-use reth_node_builder::{BuiltPayload, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes};
-use reth_node_ethereum::{engine::EthPayloadAttributes, EthEngineTypes};
+use reth_ethereum_engine_primitives::{
+    EthBuiltPayload, EthEngineTypes, EthPayloadAttributes, EthPayloadBuilderAttributes,
+};
+use reth_node_types::{NodeTypes, NodeTypesWithDB};
+use reth_payload_primitives::{BuiltPayload, NewPayloadError, PayloadTypes};
 use reth_primitives_traits::Block;
 use reth_provider::{BlockExecutionResult, EthStorage};
 use serde::{Deserialize, Serialize};

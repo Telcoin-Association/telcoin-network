@@ -11,7 +11,7 @@ use alloy::{
     signers::SignerSync as _,
 };
 use futures::future::try_join_all;
-use jsonrpsee::core::params::ObjectParams;
+use jsonrpsee::core::params::{ArrayParams, ObjectParams};
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use serde_json::{json, Value};
 
@@ -968,5 +968,100 @@ async fn test_rpc_simulation_signed_bundle_overrides_and_history() -> eyre::Resu
         )
         .await?;
     assert_eq!(response.pointer("/results/0/value"), Some(&json!(fee_probe_output(70, 75))));
+    Ok(())
+}
+
+/// The `eth` methods TN wraps that execute the EVM without reth's `eth_call` path, each with a
+/// request that succeeds on [`bundle_probe_genesis`] at an epoch fee of 70.
+fn blocking_io_requests(tx: &Bytes) -> [(&'static str, Vec<Value>); 4] {
+    let transfer = priced_transfer(70);
+    let unpriced = TransactionRequest {
+        from: Some(TransactionFactory::new().address()),
+        to: Some(Address::repeat_byte(0x91).into()),
+        ..Default::default()
+    };
+    [
+        ("eth_estimateGas", vec![json!(transfer)]),
+        ("eth_createAccessList", vec![json!(transfer)]),
+        // No gas limit, so the fill estimates through the same helper as eth_estimateGas.
+        ("eth_fillTransaction", vec![json!(unpriced)]),
+        (
+            "eth_callBundle",
+            vec![json!({"txs": [tx], "blockNumber": "0x2", "stateBlockNumber": "latest"})],
+        ),
+    ]
+}
+
+/// Production methods whose blocking-IO semaphore has `permits` permits.
+fn blocking_io_methods(
+    permits: usize,
+    task_manager: &TaskManager,
+    tmp_dir: &TempDir,
+) -> eyre::Result<Methods> {
+    let rpc_args = reth_node_core::args::RpcServerArgs {
+        rpc_max_blocking_io_requests: permits,
+        ..Default::default()
+    };
+    let (methods, _) = epoch_fee_methods_from_genesis(
+        70,
+        bundle_probe_genesis(100)?,
+        rpc_args,
+        task_manager,
+        tmp_dir,
+    )?;
+    Ok(methods)
+}
+
+/// Each method waits for a blocking-IO permit before it runs the EVM (review finding T1-4).
+#[tokio::test]
+async fn test_rpc_simulation_waits_for_blocking_io_permit() -> eyre::Result<()> {
+    init_reth_defaults();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let methods = blocking_io_methods(0, &task_manager, &tmp_dir)?;
+    let tx = signed_bundle_probe(BundleFeeStyle::Dynamic, 200)?;
+    let methods = &methods;
+    try_join_all(blocking_io_requests(&tx).map(|(method, params)| async move {
+        let mut call = ArrayParams::new();
+        for param in params {
+            call.insert(param)?;
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            methods.call::<_, Value>(method, call),
+        )
+        .await;
+        assert!(result.is_err(), "{method} ran with no blocking-IO permit: {result:?}");
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
+    Ok(())
+}
+
+/// With one permit, concurrent requests all complete: each takes the permit once and returns it
+/// when its blocking task ends. A second acquire for the same request would wait forever here.
+#[tokio::test]
+async fn test_rpc_simulation_shares_one_blocking_io_permit() -> eyre::Result<()> {
+    init_reth_defaults();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let methods = blocking_io_methods(1, &task_manager, &tmp_dir)?;
+    let tx = signed_bundle_probe(BundleFeeStyle::Dynamic, 200)?;
+    let methods = &methods;
+    try_join_all(blocking_io_requests(&tx).map(|(method, params)| async move {
+        let mut call = ArrayParams::new();
+        for param in params {
+            call.insert(param)?;
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            methods.call::<_, Value>(method, call),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("{method} never got the blocking-IO permit"))??;
+        assert!(response.get("error").is_none_or(Value::is_null), "{method}: {response}");
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
     Ok(())
 }

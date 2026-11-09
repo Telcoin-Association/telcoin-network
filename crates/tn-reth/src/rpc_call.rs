@@ -27,8 +27,9 @@ use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_evm::EvmEnv;
 use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, Call, EthCall, LoadState, SpawnBlocking, Trace},
-    EthApiTypes, RpcBlock, RpcNodeCore,
+    EthApiTypes, FromEthApiError, RpcBlock, RpcNodeCore,
 };
+use reth_rpc_eth_types::EthApiError;
 use tn_types::{gas_accumulator::WorkerBaseFee, MIN_PROTOCOL_BASE_FEE};
 
 /// The simulation methods whose tip environments use the worker's current fee.
@@ -153,6 +154,11 @@ where
 }
 
 /// Share the corrected estimation path with `eth_fillTransaction` before filling fees.
+///
+/// Takes the request's blocking-IO permit and holds it inside the blocking task, like reth's
+/// `eth_call`, so the binary search counts against the shared limit until it ends, even if
+/// the client leaves. Callers must not hold a blocking-IO permit: a second acquire can wait
+/// forever once every permit is taken.
 pub(crate) async fn estimate_gas_at_epoch<Api>(
     eth_api: &Api,
     request: TransactionRequest,
@@ -165,8 +171,12 @@ where
         + EthApiTypes<NetworkTypes = alloy::network::Ethereum>
         + RpcNodeCore<Evm = TnEvmConfig>,
 {
+    let permit = SpawnBlocking::acquire_owned_blocking_io(eth_api)
+        .await
+        .map_err(|_| Api::Error::from_eth_err(EthApiError::InternalEthError))?;
     let (evm_env, at) = evm_env_at_epoch(eth_api, block_id, base_fee).await?;
     SpawnBlocking::spawn_blocking_io_fut(eth_api, move |this| async move {
+        let _permit = permit;
         let state = LoadState::state_at_block_id(&this, at).await?;
         EstimateCall::estimate_gas_with(&this, evm_env, request, state, state_override)
     })
@@ -234,6 +244,9 @@ where
     }
 
     /// Delegate both access-list executions with the same corrected environment.
+    ///
+    /// Reth's helper takes the blocking-IO permit and holds it in its blocking task
+    /// (vendored TN-0037), so this handler must not take one too.
     async fn create_access_list(
         &self,
         request: TransactionRequest,

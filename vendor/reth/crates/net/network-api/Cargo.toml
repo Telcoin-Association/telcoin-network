@@ -1,0 +1,36 @@
+[package]
+name = "reth-network-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Network interfaces and commonly used types"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-network-peers.workspace = true
+reth-eth-wire-types.workspace = true
+
+# ethereum
+alloy-primitives = { workspace = true, features = ["getrandom"] }
+alloy-rpc-types-admin.workspace = true
+enr = { workspace = true, default-features = false, features = ["rust-secp256k1"] }
+
+# misc
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
+tokio = { workspace = true, features = ["sync"] }
+auto_impl.workspace = true
+
+[features]
+serde = [
+    "dep:serde",
+    "reth-eth-wire-types/serde",
+    "alloy-primitives/serde",
+    "enr/serde",
+]

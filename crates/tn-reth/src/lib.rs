@@ -26,6 +26,8 @@
 //! - `metrics` — Prometheus metrics for the execution environment.
 //! - `payload` — `TNPayload`, the per-block data derived from consensus output.
 //! - `rpc_server_args` — the subset of reth RPC server args TN exposes.
+//! - `rpc_tx_forward` — `--forward-txs`: relays raw transaction submissions to operator-configured
+//!   validator RPC endpoints instead of the local pool.
 //! - `snapshot` — export/restore of reth's plain EVM state.
 //! - `system_calls` — solidity interfaces and epoch-boundary system calls (ConsensusRegistry,
 //!   Issuance, worker configs).
@@ -44,8 +46,6 @@
 //!   in-protocol ConsensusRegistry fork (registry code swap plus validator-set migration at the
 //!   configured fork epoch; see `apply_consensus_registry_fork` in `evm/block.rs`).
 //! - `test-utils` — test helpers (pulls in `secp256k1`).
-//! - `rocksdb` — opt back in to reth's RocksDB storage backend; storage is MDBX-only today, so this
-//!   is off by default (see the feature comment in `Cargo.toml`).
 //!
 //! # Re-exports
 //!
@@ -75,11 +75,9 @@ mod clippy {
     use tn_reth as _;
 }
 
-// Dependencies only for their own `rocksdb` features (see the `rocksdb` feature in Cargo.toml).
-#[cfg(feature = "rocksdb")]
-use reth_prune as _;
-#[cfg(feature = "rocksdb")]
-use reth_stages as _;
+// Dependencies only for their features (see the comment above `revm` in Cargo.toml).
+use reth_trie_sparse as _;
+use revm as _;
 
 use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
@@ -92,16 +90,14 @@ use tn_types::{Address, BlockBody, Genesis, SealedBlock, SealedHeader};
 pub use alloy::primitives::FixedBytes;
 pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
-pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
+pub use reth_cli_util::parse_socket_address;
 pub use reth_db::{static_file::iter_static_files, Database as RethDatabaseT};
 pub use reth_errors::{ProviderError, RethError};
 pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
     dirs::MaybePlatformPath,
-    node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
-pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 /// Test-only re-export so engine tests can construct static-file provider errors.
 #[cfg(feature = "test-utils")]
 pub use reth_provider::StaticFileSegment;
@@ -110,11 +106,11 @@ pub use reth_provider::{
 };
 pub use reth_rpc_builder::RpcServerHandle;
 pub use reth_rpc_eth_types::EthApiError;
-pub use reth_tracing::{FileWorkerGuard, Layers};
+pub use reth_tracing::Layers;
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
     identifier::{SenderId, SenderIdentifiers},
-    BestTransactions, EthPooledTransaction, TransactionPool as TransactionPoolT,
+    BestTransactions, EthPooledTransaction,
 };
 
 mod cli;
@@ -140,6 +136,7 @@ mod rpc_fee_history;
 mod rpc_fill_transaction;
 mod rpc_gas_price;
 pub mod rpc_server_args;
+mod rpc_tx_forward;
 pub mod snapshot;
 pub mod system_calls;
 mod types;
@@ -165,6 +162,7 @@ pub use evm::{
 };
 pub use forward::{ForwardTargetPolicy, WorkerRpcForwarder};
 pub use metrics::report_db_metrics;
+pub use rpc_tx_forward::{ForwardTarget, ForwardTargets, TxForwardConfig};
 pub use types::*;
 
 #[cfg(any(feature = "test-utils", test))]

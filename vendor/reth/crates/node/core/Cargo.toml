@@ -1,0 +1,78 @@
+[package]
+name = "reth-node-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-primitives-traits = { workspace = true, features = ["rayon"] }
+reth-cli-util.workspace = true
+reth-db = { workspace = true, features = ["mdbx"] }
+reth-storage-errors.workspace = true
+reth-storage-api = { workspace = true, features = ["std", "db-api"] }
+reth-rpc-eth-types.workspace = true
+reth-rpc-server-types.workspace = true
+reth-rpc-convert.workspace = true
+reth-transaction-pool.workspace = true
+reth-tracing.workspace = true
+reth-config.workspace = true
+reth-prune-types.workspace = true
+reth-stages-types.workspace = true
+reth-ethereum-forks.workspace = true
+reth-engine-primitives.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["std", "jwt"] }
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+
+# misc
+eyre.workspace = true
+clap = { workspace = true, features = ["derive", "env", "string"] }
+humantime.workspace = true
+rand.workspace = true
+derive_more.workspace = true
+strum = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+url.workspace = true
+# io
+dirs-next.workspace = true
+shellexpand.workspace = true
+
+# obs
+tracing.workspace = true
+
+# crypto
+
+# async
+futures.workspace = true
+
+[dev-dependencies]
+# test vectors generation
+proptest.workspace = true
+tokio.workspace = true
+
+[features]
+# Features for vergen to generate correct env vars
+jemalloc = ["reth-cli-util/jemalloc"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+tracy = ["reth-tracing/tracy"]
+
+min-error-logs = ["tracing/release_max_level_error"]
+min-warn-logs = ["tracing/release_max_level_warn"]
+min-info-logs = ["tracing/release_max_level_info"]
+min-debug-logs = ["tracing/release_max_level_debug"]
+min-trace-logs = ["tracing/release_max_level_trace"]
+
+# TN(TN-0020, TN-0025): no build dependencies. The version comes from tn/upstream.toml, and the
+# timestamp, features and target triple from cargo (see build.rs).

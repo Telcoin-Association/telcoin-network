@@ -25,22 +25,26 @@ use std::{
 
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db_common::init::init_genesis;
-use reth_node_builder::NodeConfig;
+use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     ProviderError, ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
 };
 use reth_revm::{database::StateProviderDatabase, State};
+use reth_rpc_builder::config::RethRpcServerConfig as _;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, SealedHeader, TaskManager, TaskSpawner,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
-    error::RestoredStateFloorError, evm::TnEvmConfig, traits::TelcoinNode, RethConfig, RethDb,
-    WorkerTxPool, BASEFEE_ADDRESS,
+    error::RestoredStateFloorError,
+    evm::TnEvmConfig,
+    rpc_tx_forward::{SanitizeRules, TxForwardConfig, TxForwarder},
+    traits::TelcoinNode,
+    RethConfig, RethDb, WorkerTxPool, BASEFEE_ADDRESS,
 };
 
 pub(crate) mod database;
@@ -95,6 +99,11 @@ struct RethEnvInner {
     /// answer such reads `Ok(None)` per account, silently reading every account as "never
     /// written".
     restored_state_floor: Option<u64>,
+    /// The `--forward-txs` relay, `None` when RPC submissions go to the local pool.
+    ///
+    /// Built once and shared by every worker's RPC server (`get_rpc_server`), so all lanes use
+    /// one ordered target list, one connection pool per target and one metrics set.
+    tx_forwarder: Option<Arc<TxForwarder>>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -169,6 +178,9 @@ impl RethEnv {
     ///    whatever global metrics recorder is installed right now; the series bind to that recorder
     ///    on first use, so this must run after `tn_metrics::install_recorder` (see `metrics.rs`) or
     ///    the counters stay on the noop recorder.
+    /// 3. With `--forward-txs`, registers the forwarding metric series the same way, and building
+    ///    an `https://` target's client installs rustls's `ring` crypto provider as the process
+    ///    default when none is installed yet.
     pub fn new(
         reth_config: &RethConfig,
         task_manager: &TaskManager,
@@ -192,6 +204,7 @@ impl RethEnv {
         // baseline the block-building counters at zero now, while the recorder is known to be
         // installed, so a node that never drops a transaction still exports both series
         crate::metrics::init();
+        let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
 
         Ok(Self {
             inner: Arc::new(RethEnvInner {
@@ -200,6 +213,7 @@ impl RethEnv {
                 evm_config,
                 task_spawner,
                 restored_state_floor,
+                tx_forwarder,
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
@@ -208,6 +222,63 @@ impl RethEnv {
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
             }),
         })
+    }
+
+    /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
+    ///
+    /// The clients connect lazily, so an unreachable target does not fail startup. The log
+    /// line carries the target count only: the targets are private operator configuration.
+    fn new_tx_forwarder(
+        config: &TxForwardConfig,
+        node_config: &NodeConfig<RethChainSpec>,
+    ) -> eyre::Result<Option<Arc<TxForwarder>>> {
+        config
+            .targets
+            .as_ref()
+            .map(|targets| {
+                let sanitize =
+                    config.sanitize.then(|| SanitizeRules::new(node_config.chain.chain.id()));
+                let forwarder = TxForwarder::new(
+                    targets,
+                    sanitize,
+                    node_config.rpc.rpc_max_request_size_bytes(),
+                )?;
+                info!(
+                    target: "tn::rpc",
+                    targets = targets.as_slice().len(),
+                    sanitize = config.sanitize,
+                    "forwarding raw transaction submissions"
+                );
+                Ok(Arc::new(forwarder))
+            })
+            .transpose()
+    }
+
+    /// Whether `eth_sendRawTransaction` and `eth_sendRawTransactionSync` are forwarded to the
+    /// `--forward-txs` targets instead of entering this node's pool.
+    pub fn forwards_transactions(&self) -> bool {
+        self.inner.tx_forwarder.is_some()
+    }
+
+    /// Warn, at most once per process, that `--forward-txs` is set on a committee member.
+    ///
+    /// The flag is meant for public RPC observers. On a committee member it still works, but
+    /// transactions submitted to this node's RPC skip its own pool and batches. This is never an
+    /// error. Called at the start of every epoch in which the node is a committee member, so a
+    /// node promoted after startup is warned too. Returns whether this call logged the warning.
+    pub fn warn_if_forwarding_on_committee_member(&self) -> bool {
+        let first = self
+            .inner
+            .tx_forwarder
+            .as_ref()
+            .is_some_and(|forwarder| forwarder.claim_committee_warning());
+        if first {
+            warn!(
+                target: "tn::rpc",
+                "--forward-txs is set on a committee member: RPC submissions bypass this node's pool"
+            );
+        }
+        first
     }
 
     /// Create a new Reth DB.
@@ -610,6 +681,33 @@ mod tests {
         execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
         assert_eq!(env2.last_block_number()?, 2, "block 2 must commit after the heal");
 
+        Ok(())
+    }
+
+    /// A new datadir is written with reth's storage v1 layout, and a restart keeps it.
+    ///
+    /// The layout decides where receipts, change sets and history indices live, and historical
+    /// reads (including consensus-registry reads at past blocks) depend on the history indices.
+    /// A node on v2 would write no MDBX history indices and disagree with v1 nodes on those
+    /// reads. TN pins v1 through one vendored line, `StorageSettings::base()` (TN-0014), which
+    /// `init_genesis` writes into a new datadir; upstream main returns v2 there, so an upstream
+    /// sync that takes that line would silently switch new nodes. This test fails instead.
+    #[tokio::test]
+    async fn test_new_datadir_uses_storage_v1() -> eyre::Result<()> {
+        use reth_provider::{MetadataProvider as _, StorageSettings, StorageSettingsCache as _};
+
+        assert_eq!(StorageSettings::base(), StorageSettings::v1());
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().expect("create temp dir");
+        for run in ["new datadir", "reopened datadir"] {
+            let tm = TaskManager::new(run);
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+            let provider = env.blockchain_provider().database_provider_ro()?;
+            assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
+            assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
+        }
         Ok(())
     }
 }

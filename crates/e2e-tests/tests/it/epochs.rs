@@ -777,7 +777,7 @@ fn provision_second_workers(temp_path: &Path, committee: &[(&str, Address)]) -> 
         .map(|(name, _)| {
             let dir = temp_path.join(name);
             let path = dir.join("node-info.yaml");
-            let keys = KeyConfig::read_config(&dir, Some(NODE_PASSWORD.to_string()))?;
+            let keys = KeyConfig::read_config(&dir, Some(NODE_PASSWORD.to_string().into()))?;
             let mut info: NodeInfo = Config::load_from_path(&path, ConfigFmt::YAML)?;
             eyre::ensure!(info.p2p_info.num_workers() == 1, "fixture must start with one worker");
             let port = get_available_udp_port("127.0.0.1")

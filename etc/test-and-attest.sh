@@ -108,12 +108,12 @@ fi
 # nothing, so it runs first and fails fast)
 ./etc/archive-mode-guard.sh
 
-# guard against rocksdb re-entering the default feature graph (resolves the graph, compiles
+# guard against rocksdb coming back anywhere (reads Cargo.lock and the manifests, compiles
 # nothing). The merge queue runs this too; until it ran here as well, the queue enforced a
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and the three unit-test lanes. These live in etc/ci-lanes.sh because
+# fmt, clippy and the four unit-test lanes. These live in etc/ci-lanes.sh because
 # .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
 # `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
@@ -122,6 +122,7 @@ fi
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
 ./etc/ci-lanes.sh test-tn-lmdb
+./etc/ci-lanes.sh test-vendor-reth
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
@@ -175,7 +176,8 @@ echo "Contract state update initiated with commit hash: ${COMMIT_HASH}"
 echo "Script took ${SECONDS}s to complete"
 echo
 echo "This attestation satisfies the 'verify-on-chain' lane on the pull request. Attesting"
-echo "changes nothing on GitHub, so re-run that lane on this sha yourself: request a review"
-echo "on the PR, or re-run the failed job. Do not push -- a new sha needs a new attestation."
-echo "When the PR is queued, the merge queue re-runs fmt, clippy and the three test lanes against"
+echo "changes nothing on GitHub, so re-run that lane on this sha yourself: open the failed"
+echo "run in the Actions tab and choose 'Re-run failed jobs' ('gh run rerun <run> --failed'"
+echo "needs a token with actions: write). Do not push -- a new sha needs a new attestation."
+echo "When the PR is queued, the merge queue re-runs fmt, clippy and the test lanes against"
 echo "main + this PR; expect that second run and do not force-push while it is queued."

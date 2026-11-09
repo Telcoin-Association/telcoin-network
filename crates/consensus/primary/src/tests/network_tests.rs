@@ -13,6 +13,7 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use futures::{StreamExt as _, TryStreamExt as _};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
@@ -1402,9 +1403,9 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
-/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
-/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
+/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
+/// network. Epoch-record voting depends on this; enforce it going forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1527,6 +1528,8 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let spawner_b = epoch_b.get_spawner();
     // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
     // (`subscribe()` panics if a receiver is still checked out).
+    // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
+    // the gap.
     PrimaryNetwork::new(
         app.subscribe_primary_network_events(),
         network_handle.clone(),
@@ -2973,10 +2976,14 @@ async fn test_sync_partial_epoch_pack_over_stream() {
         assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
 
         let mut reassembled = Vec::new();
-        crate::network::sync_codec::sync_pack_reader(cursor)
-            .read_to_end(&mut reassembled)
-            .await
-            .expect("reassemble partial pack data frames");
+        crate::network::sync_codec::sync_pack_reader(
+            cursor,
+            crate::network::sync_codec::SyncRateBound::Floor,
+            crate::network::sync_codec::SyncServeMeter::default(),
+        )
+        .read_to_end(&mut reassembled)
+        .await
+        .expect("reassemble partial pack data frames");
         reassembled
     }
 
@@ -3267,6 +3274,101 @@ async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
         consensus_bus.published_consensus_num_hash(),
         (epoch, number, hash),
         "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// Feed a quorum (`1/3 + 1`) of distinct fixture signers of one consensus result through the
+/// handler, in committee order.
+async fn gossip_consensus_result_quorum(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> eyre::Result<()> {
+    let quorum = committee.committee().size() / 3 + 1;
+    futures::stream::iter(committee.authorities().take(quorum))
+        .then(|auth| async move {
+            handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, number, hash)).await
+        })
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+/// Signers of a consensus result must come from the previous, current or next committee, the
+/// window the gossip layer authorises publishers from. A stored committee for an older epoch is
+/// retired: a quorum of its keys claiming that epoch must not publish (issue #1771). The old
+/// resolver read the epoch-0 record, verified the signatures and pinned the watch at `(0, 10)`.
+#[tokio::test]
+async fn test_consensus_result_rejects_signers_outside_committee_window() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    // An observer follows the tip through the watch and never enters catch-up mode here.
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+    // The retired committee: the fixture keys, stored as the epoch-0 record.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 0, 1, 10, hash).await?;
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a quorum of a retired committee must not publish a consensus result",
+    );
+    Ok(())
+}
+
+/// A result for the previous epoch is accepted from that epoch's committee, but the certified
+/// epoch record bounds its number: `final_consensus.number` is the last output of the epoch, so a
+/// result numbered past it is dropped before the signature check and never pins the watch
+/// (issue #1771). Without the bound the first batch publishes `(1, 7)` and the real `(1, 5)` is
+/// then dropped as old, so the final assertion fails.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The certified record of epoch 1: the fixture committee, closed at consensus number 5.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+    certify_epoch_record(&handler, &committee, &record).await;
+
+    // A quorum signs a number past the epoch's certified final consensus.
+    let past_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 7, past_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a result numbered past the certified epoch record must not publish",
+    );
+
+    // The same quorum signs the epoch's real final output.
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "a result at the certified final consensus of the previous epoch must publish",
     );
     Ok(())
 }

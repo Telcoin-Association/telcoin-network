@@ -165,51 +165,81 @@ the request cannot hold the requester.
 
 ### Concurrency Limiting
 
-Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with
-a public share and a committee reserve. Committee peers are the keys of the current and the next
-committee (`ReservedPeers`). A committee peer takes a permit from the reserve first and then from
-the public share. A public peer takes a permit only from the public share. Thus public peers
-cannot use the capacity that a committee request needs.
+Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with a
+public share and a reserve for each committee key. Committee peers are the keys of the current and
+the next committee (`ReservedPeers`). A committee peer takes a permit from its own reserve first and
+then from the public share. A public peer takes a permit only from the public share. No committee
+key can take the reserve of another. Thus public peers, and committee keys that hold streams without
+progress, cannot use the capacity that a different committee key needs to catch up (issue #1750).
+The per-peer cap of 2 lets a committee key open one more stream from the public share.
 
 #### Opening-Read Pool (`MAX_CONCURRENT_OPENING_READS`)
 
-The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
-permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
-serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
-maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served stream releases the permit before the serve
-starts. A stream that is not served keeps it only for its bounded refusal or error write. If a
-public peer sends no frame in time, the worker charges the peer `Penalty::Mild`.
+The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_OPENING_READS`), which only that key can take.
+`try_admit_opening()` takes a permit *before* the serving task is spawned. The task holds the permit
+while it reads the opening `Req` frame, for a maximum of `PUBLIC_SYNC_REQUEST_READ_TIMEOUT` (1 s)
+for a public peer and `SYNC_REQUEST_READ_TIMEOUT` (5 s) for a committee peer. The task releases the
+permit as soon as the opening read ends, whatever its result, so no serve, control write or close
+holds it. A public key may hold opening-read permits for `PUBLIC_OPENING_HOLD_BUDGET` (10 s) per
+`PUBLIC_OPENING_HOLD_WINDOW` (300 s). `try_admit_opening()` leases that budget before it takes the
+permit, and admits the key only with a full `PUBLIC_SYNC_REQUEST_READ_TIMEOUT` of budget left. A key
+outside its budget takes the shed path (`Deny(DenyReason::AtCapacity)`, not charged). The lease
+charges the read time to the key when the opening read ends.
+
+The worker charges a public peer `Penalty::Mild` if it sends no frame in time, a frame
+that cannot be read, or a frame that is not a `Req`. It also charges a public peer `Penalty::Mild`
+for a valid `Req` that arrives after more than half of the 1 s bound, whether the worker then
+serves or refuses it. A prompt `Deny(AtCapacity)` answer is not charged, because an honest peer
+gets it when the batch serve pool is full.
 
 If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
 task, and the requesting peer tries another node.
 
 #### Batch Serve Pool (`MAX_CONCURRENT_BATCH_STREAMS`)
 
-The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 4 committee permits
-(`COMMITTEE_RESERVED_BATCH_STREAMS`). The task takes a permit after it reads the request frame and
-holds it until the serve ends. If no permit is available, the responder writes
-`Deny(DenyReason::AtCapacity)` and closes the stream.
+The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_BATCH_STREAMS`), which only that key can take. The task takes a
+permit after it reads the request frame and holds it until the serve ends. If no permit is
+available, the responder writes `Deny(DenyReason::AtCapacity)` and closes the stream. It does not
+charge the peer. A public serve is cut at `PUBLIC_BATCH_SERVE_TIMEOUT` (60 s); the cut is a stall
+and costs `Penalty::Mild`. A public key serves on at most `PUBLIC_BATCH_SERVES_PER_PEER` (1) of
+its streams at a time, and may hold serve permits for `PUBLIC_BATCH_SERVE_HOLD_BUDGET` (60 s) per
+`PUBLIC_BATCH_SERVE_HOLD_WINDOW` (300 s). The key is leased only with a full
+`PUBLIC_BATCH_SERVE_TIMEOUT` of budget left, so it gets one full hold per refill and never two back
+to back. A completed serve waits 5 s for each second it served before the key is leased again. To
+fill the 5 public permits for a window takes 25 keys. Outside either bound the responder writes
+`Deny(DenyReason::AtCapacity)` and does not charge the peer.
 
 Time limits release the permit when a peer stops reading:
 - `SYNC_REQUEST_READ_TIMEOUT` (5 s) for the `Ack` write and flush.
 - `SEND_STREAM_FRAME_TIMEOUT` (30 s) for each `Data` write, each chunk flush, and the `End` write.
 - `SEND_STREAM_TIMEOUT` (200 s) for the whole serve.
+- `PUBLIC_BATCH_SERVE_TIMEOUT` (60 s) for the whole of a public-tier serve; a serve cut there is a
+  stall.
 
-The serve returns a `SyncServeOutcome`. A `Stalled` serve (a time limit expired) charges a public
-peer `Penalty::Mild`. A `Failed` serve (for example, a storage error) charges no penalty.
+The serve returns a `SyncServeOutcome`. A `Stalled` serve charges a public peer `Penalty::Mild`. A
+serve is `Stalled` when a time limit expired, or when the requester stopped or closed the stream
+after the `Ack` (QUIC then reports a write error of kind `ConnectionReset` or `NotConnected`). An
+honest requester does not do this, because its read tolerance is at or above `SEND_STREAM_TIMEOUT`.
+A `Failed` serve (for example, a storage error) charges no penalty.
 
 #### Per-Peer Rate Limiting (`MAX_PENDING_REQUESTS_PER_PEER`)
 
 Each peer can have a maximum of `MAX_PENDING_REQUESTS_PER_PEER` (2) sync streams in flight, which
 `PeerSlots` counts. A stream holds its peer slot through both phases. Thus one peer cannot fill a
-pool. `try_admit_opening()` takes the peer slot first and then the opening-read permit. If one of
-them is not available, it releases what it took and refuses the stream.
+pool. `try_admit_opening()` takes the peer slot first, then (for a public key) the opening lease,
+then the opening-read permit. If one of them is not available, it releases what it took and
+refuses the stream. A public key serves on at
+most `PUBLIC_BATCH_SERVES_PER_PEER` (1) of its streams at a time; its second request is refused at
+the serve phase with `Deny(DenyReason::AtCapacity)` and no charge.
 
 #### Oversized Request Truncation (`MAX_BATCH_DIGESTS_PER_REQUEST`)
 
 Requests exceeding `MAX_BATCH_DIGESTS_PER_REQUEST` (500) digests are truncated rather than
-rejected, on both the requester and responder sides. This serves as many batches as possible while
-bounding memory:
+rejected, on both the requester and responder sides. A public request above the cap is served
+truncated and charged `Penalty::Mild`. This serves as many batches as possible while bounding
+memory:
 
 ```
 Worst-case allocation: 500 entries × ~1MB per batch ≈ 500MB
@@ -310,9 +340,45 @@ Integration tests in `tests/it/network_tests.rs` verify end-to-end batch synchro
 Concurrency tests cover:
 - Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
 - Release of the peer slot and the pool permits when an admission is dropped
-- Public peers cannot use the committee reserve of the opening-read or the batch serve pool
-- Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
-  one `Penalty::Mild` each
+- Public peers cannot use a committee reserve of the opening-read or the batch serve pool, and one
+  committee key cannot use the reserve of another
+- Silent public streams release their opening-read permits at `PUBLIC_SYNC_REQUEST_READ_TIMEOUT`
+  and get one `Penalty::Mild` each
+- `late_valid_public_openings_are_charged`: four public identities open two streams each, and
+  each request arrives 1 ms before the bound: all eight are served, each gets one `Penalty::Mild`,
+  and the pools are whole afterwards
+- Unreadable and unexpected public openings release the opening-read permit as soon as the read
+  ends and get one `Penalty::Mild`; a prompt `AtCapacity` refusal releases it and gets no penalty
+- `five_public_identities_cannot_block_a_committee_batches_request`: five public identities open
+  two streams each: one serve per identity fills the public share, the other stream of each is
+  refused at the per-key serve cap, and two committee keys are still served from their reserves
+- `public_batch_serve_is_cut_at_the_hold_limit_and_charged`: a public serve is cut at
+  `PUBLIC_BATCH_SERVE_TIMEOUT`, its grants return and the key gets one `Penalty::Mild`; a committee
+  serve started with it keeps running
+- `a_public_key_holds_one_batch_serve_permit_at_a_time`: the second stream of a public key is
+  refused at the serve phase without a charge; a committee key serves on both of its streams
+- `a_public_key_that_used_its_hold_budget_is_refused_until_it_refills`: a key whose serve was cut
+  is refused `AtCapacity` without a charge, a fresh key is served, and the spent key is served again
+  after `PUBLIC_BATCH_SERVE_HOLD_WINDOW`
+- `a_public_key_that_completed_a_serve_near_the_limit_waits_for_the_refill`: a serve that completes
+  at 58 s is not charged; the key is then refused `AtCapacity` without a charge, a fresh key is
+  served, the key is still refused 289 s later, and it is served again once its charge has leaked
+- `filling_the_public_share_for_a_window_needs_twenty_five_keys`: five rounds of five fresh keys,
+  each held to the limit, fill the public share for 300 s; every used key is refused until 300 s
+  after its own serve ended
+- `public_opening_holds_are_budgeted_per_key`: one public key that opens at just under half the
+  read bound is shed, uncharged, after about `PUBLIC_OPENING_HOLD_BUDGET` of opening time; a fresh
+  public key and a committee key are admitted at that instant, and the key is admitted again after
+  `PUBLIC_OPENING_HOLD_WINDOW`
+- `hold_budget_reserves_a_full_hold_at_admission` (`network-libp2p`): a key with less than one
+  hold limit of budget left is refused; after a 58 s hold the key is still refused 289 s later and
+  is admitted again at 290 s, so a fresh key gets one full hold per refill, not two
+- `slow_public_readers_cannot_hold_the_public_share_for_the_window`: three public keys never fill
+  the public share, each is charged once when its serve is cut, each is refused until its charge
+  has leaked, and a fourth key is served
+- `oversized_public_requests_are_served_truncated_and_charged`: a request of 501 digests reaches
+  the serve whole; a public requester gets one `Penalty::Mild`, a committee requester none
+- A stop or close of the stream after the `Ack` (`ConnectionReset`, `NotConnected`) is a stall
 - Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve
   permit
 - Per-peer limit enforcement across distinct peers

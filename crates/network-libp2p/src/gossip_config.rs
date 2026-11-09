@@ -5,10 +5,14 @@
 //! `verify_gossip` applies [`MAX_GOSSIP_MESSAGE_SIZE`]. The frame limits below bound it. They are
 //! derived from the node's own gossip message bound, not taken from the library defaults, so a
 //! dependency upgrade cannot silently change them.
+//!
+//! The node also rejects every gossip message that carries the unsigned `key` field (see
+//! [`RejectGossipKey`]). Without that check a forwarder can grow a valid message, and the frame
+//! limits would not hold for the frames that honest nodes forward.
 
 use crate::types::gossip_protocol_id_prefix;
 use libp2p::gossipsub::{self, ConfigBuilderError};
-use std::time::Duration;
+use std::{io, time::Duration};
 use tn_config::MAX_GOSSIP_MESSAGE_SIZE;
 
 #[cfg(test)]
@@ -23,6 +27,13 @@ mod gossip_config_tests;
 /// (2 + 8), `topic` (3 + topic bytes), `signature` (2 + 64) and `key` (2 + 36, sent only when the
 /// key cannot be inlined in the peer id, which never happens for ed25519). That is 166 bytes
 /// plus the topic name, so 512 covers any topic name up to 346 bytes.
+///
+/// The bound holds for the frames an author sends. It holds for the frames a node forwards only
+/// because [`RejectGossipKey`] drops every message that carries `key` (issue #1699). A node
+/// forwards the stored message as it was received. The author signs `from`, `data`, `seqno` and
+/// `topic`, so a forwarder cannot change them. The signature check fixes the length of
+/// `signature`, and `verify_gossip` bounds `data` before the node accepts and forwards the
+/// message. `key` is not signed, so it is the one field a forwarder could grow.
 pub(crate) const GOSSIP_PUBLISH_ENVELOPE_BOUND: usize = 512;
 
 /// Byte limit on the control and subscription fields of one frame.
@@ -60,6 +71,11 @@ pub(crate) const GOSSIP_FRAME_BOUND: usize = larger(
 ///
 /// One honest frame plus one read chunk. Without the chunk, two honest maximum frames sent back
 /// to back can fill the read buffer past the limit, and the receiver closes the stream.
+///
+/// A frame that an honest node forwards is also an honest frame, because [`RejectGossipKey`]
+/// drops every message that carries the unsigned `key` field (issue #1699). Without that check a
+/// forwarder could add bytes in `key` to a valid message, and every honest node would forward the
+/// larger frame.
 pub(crate) const GOSSIP_MAX_TRANSMIT_SIZE: usize = GOSSIP_FRAME_BOUND + GOSSIP_READ_CHUNK;
 
 /// The gossipsub `max_publish_messages`: the publish entries accepted in one frame.
@@ -112,6 +128,52 @@ pub(crate) const GOSSIP_MAX_IHAVE_IDS: usize =
     (GOSSIP_CONTROL_SIZE - GOSSIP_IHAVE_FRAMING_BOUND - GOSSIP_TOPIC_BOUND)
         / (2 + GOSSIP_MESSAGE_ID_BOUND);
 
+/// The gossipsub behaviour of the consensus network, with the [`RejectGossipKey`] transform.
+pub(crate) type GossipBehaviour = gossipsub::Behaviour<RejectGossipKey>;
+
+/// Inbound transform that rejects every gossip message that carries the `key` field (issue
+/// #1699).
+///
+/// The author signs `from`, `data`, `seqno` and `topic`. The `key` field is not signed. If `key`
+/// does not decode, the codec takes the public key from the peer id, so the signature still
+/// verifies when a peer adds bytes in `key` to a valid message. gossipsub stores and forwards the
+/// message as it was received, `key` included, so every honest node would forward the larger
+/// copy. An ed25519 author never sends `key`, because the public key is inlined in its peer id.
+///
+/// The check is strict on purpose: a message with any `key` is dropped. It cannot be stripped,
+/// because gossipsub stores and forwards the received message, not the output of this transform.
+/// gossipsub applies the transform before the validity check, the duplicate cache and the message
+/// cache, so a dropped copy leaves no record, and a later clean copy of the same message is
+/// accepted.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RejectGossipKey;
+
+impl gossipsub::DataTransform for RejectGossipKey {
+    fn inbound_transform(
+        &self,
+        raw_message: gossipsub::RawMessage,
+    ) -> Result<gossipsub::Message, io::Error> {
+        let gossipsub::RawMessage { source, data, sequence_number, topic, key, .. } = raw_message;
+        key.map_or_else(
+            || Ok(gossipsub::Message { source, data, sequence_number, topic }),
+            |key| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("gossip message carries an unsigned key field of {} bytes", key.len()),
+                ))
+            },
+        )
+    }
+
+    fn outbound_transform(
+        &self,
+        _topic: &gossipsub::TopicHash,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, io::Error> {
+        Ok(data)
+    }
+}
+
 /// Return the larger of two sizes in a const context.
 const fn larger(a: usize, b: usize) -> usize {
     if a > b {
@@ -137,8 +199,10 @@ const fn larger(a: usize, b: usize) -> usize {
 ///    [`MAX_GOSSIP_MESSAGE_SIZE`] bound applies to every topic.
 /// 4. Signature check of each entry (`ValidationMode::Strict`, `protocol.rs` line 460). A bad
 ///    signature drops that entry only; the stream stays open.
-/// 5. Behaviour checks in `handle_received_message`: message validity (`behaviour.rs` line 1979),
-///    then the duplicate cache (line 1983), then the subscribed-topic check (line 2020).
+/// 5. Behaviour checks in `handle_received_message`: the inbound transform (`behaviour.rs` line
+///    1932, `RejectGossipKey` for the consensus network), then message validity (line 1979), then
+///    the duplicate cache (line 1983), then the subscribed-topic check (line 2020). A transform
+///    error drops the message before the other checks, so it does not reach either cache.
 /// 6. `verify_gossip` in this crate: the [`MAX_GOSSIP_MESSAGE_SIZE`] payload check and the
 ///    publisher checks. That check is a separate control and stays in place.
 ///

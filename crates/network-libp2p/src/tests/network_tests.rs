@@ -8,6 +8,7 @@ use crate::{
     },
     freshness::RecordTimestamp,
     types::{EpochPosition, RecordDomain},
+    StreamError,
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -164,6 +165,26 @@ fn record_endpoint() -> Multiaddr {
         .with(libp2p::multiaddr::Protocol::Ip4([192, 0, 2, 1].into()))
         .with(libp2p::multiaddr::Protocol::Udp(8000))
         .with(libp2p::multiaddr::Protocol::QuicV1)
+}
+
+/// Co-sign `info` with `network_key` for the primary domain on `chain_id`, binding the network
+/// key to `bls_key`. Mirrors the private `NodeRecord::network_signing_bytes` (issue #1751).
+fn primary_cosignature(
+    network_key: &NetworkKeypair,
+    chain_id: u64,
+    bls_key: &BlsPublicKey,
+    info: &NetworkInfo,
+) -> Vec<u8> {
+    network_key
+        .sign(&encode(&(
+            b"telcoin-network/node-record/network-key/v1".as_slice(),
+            chain_id,
+            0u8,
+            0u16,
+            bls_key,
+            info,
+        )))
+        .expect("ed25519 signing is infallible")
 }
 
 /// Query both public counts while processing only commands, leaving swarm progress under the
@@ -1135,6 +1156,211 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+/// Build and run `config`'s network for `role`, keyed and addressed for that role, and
+/// start it listening. Returns the network's handle and its event receiver.
+async fn spawn_listening_network(
+    config: &ConsensusConfig<MemDatabase>,
+    role: NetworkType,
+    task_manager: &TaskManager,
+) -> eyre::Result<(
+    NetworkHandle<TestWorkerRequest, TestWorkerResponse>,
+    mpsc::Receiver<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+)> {
+    let (keypair, address) = match role {
+        NetworkType::Primary => {
+            (config.key_config().primary_network_keypair().clone(), config.primary_address())
+        }
+        NetworkType::Worker(id) => (
+            config.key_config().worker_network_keypair(id),
+            config.worker_address(id).ok_or_else(|| eyre!("no address for worker {id}"))?,
+        ),
+    };
+    let (tx, events) = mpsc::channel(10);
+    let network = ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+        config.network_config(),
+        tx,
+        config.key_config().clone(),
+        keypair,
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        role,
+        address.clone(),
+        None,
+    )?;
+    let handle = network.network_handle();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    handle.start_listening(address).await?;
+    Ok((handle, events))
+}
+
+/// A sync stream opened to a peer that does not serve the opener's sync protocol fails at
+/// open under the swarm's lazy substream negotiation (`V1Lazy`).
+///
+/// `V1Lazy` hands an outbound substream back before the listener confirms the protocol, so
+/// a rejection would otherwise surface only on the caller's first read, after the open had
+/// "succeeded". `TNStreamProtocol::upgrade_outbound` finishes the negotiation with a
+/// zero-length read; the rejection then reaches `classify_outbound` as an `Apply` error and
+/// is classified `(StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)`, the
+/// penalty-exempt pair. The caller observes the `UpgradeFailed` half (callers read it as
+/// "this peer does not speak sync") and the connection is neither dropped nor scored.
+///
+/// A primary and a worker connect at the transport but serve different per-role sync
+/// protocols (`/tn-primary-sync-*` vs `/tn-worker-0-sync-*`). An open from the same primary
+/// to another primary is the positive control.
+#[tokio::test]
+async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Result<()> {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let config_3 = authorities.next().expect("third authority").consensus_config();
+    let task_manager = TaskManager::default();
+
+    // the opener and the same-role target are primaries. the cross-role target is a worker
+    // of a third authority: a validator's primary and worker share one BLS key, and the
+    // open addresses its target by BLS key.
+    let (opener, _opener_events) =
+        spawn_listening_network(&config_1, NetworkType::Primary, &task_manager).await?;
+    let (primary, mut primary_events) =
+        spawn_listening_network(&config_2, NetworkType::Primary, &task_manager).await?;
+    let (worker, _worker_events) =
+        spawn_listening_network(&config_3, NetworkType::Worker(DEFAULT_WORKER_ID), &task_manager)
+            .await?;
+    let opener_bls = config_1.key_config().primary_public_key();
+    let primary_bls = config_2.key_config().primary_public_key();
+    let worker_bls = config_3.key_config().primary_public_key();
+    let worker_peer_id = worker.local_peer_id().await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+
+    opener
+        .add_explicit_peer(primary_bls, config_2.primary_networkkey(), config_2.primary_address())
+        .await?;
+    opener
+        .add_explicit_peer(
+            worker_bls,
+            config_3.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
+            worker_addr,
+        )
+        .await?;
+    opener.dial_by_bls(primary_bls).await?;
+    opener.dial_by_bls(worker_bls).await?;
+
+    // the same-role listener hands an inbound stream up only once it resolves the opener's
+    // BLS key; the cross-role connection is transport-only (no kad across roles)
+    let max_time = Duration::from_secs(5);
+    wait_for_peer_discovery(&primary, opener_bls, max_time).await?;
+    wait_until(max_time, "transport connection across roles establishes", || async {
+        Ok(opener.connected_peer_ids().await?.contains(&worker_peer_id))
+    })
+    .await?;
+
+    // the worker does not serve the primary's sync protocol: the open itself fails, as an
+    // unsupported protocol, instead of returning a stream that fails on its first read
+    let score_before = opener.peer_score(worker_peer_id).await?.expect("worker tracked");
+    let rejected = timeout(max_time, opener.open_stream(worker_bls)).await??;
+    assert_matches!(
+        rejected,
+        Err(NetworkError::Stream(StreamError::UpgradeFailed)),
+        "a cross-role sync open must fail at open with UpgradeFailed"
+    );
+
+    // unsupported protocol is honest role skew: the worker stays connected and unscored
+    assert!(
+        opener.connected_peer_ids().await?.contains(&worker_peer_id),
+        "a rejected sync open must not drop the connection"
+    );
+    assert_eq!(
+        opener.peer_score(worker_peer_id).await?,
+        Some(score_before),
+        "a rejected sync open must not change the peer's score"
+    );
+
+    // positive control: the same-role open negotiates and the listener receives the stream
+    let _stream = timeout(max_time, opener.open_stream(primary_bls))
+        .await??
+        .expect("same-role sync open must succeed");
+    let inbound = timeout(max_time, primary_events.recv()).await?;
+    assert_matches!(
+        inbound,
+        Some(NetworkEvent::InboundStream { peer, .. }) if peer == opener_bls,
+        "the same-role listener must receive the opener's stream"
+    );
+
+    Ok(())
+}
+
+/// A peer that does not speak gossipsub is still banned under the swarm's lazy negotiation.
+///
+/// Gossipsub proposes `/tn-meshsub-{chain}/1.1.0` and then `/1.0.0`, and `V1Lazy` applies only
+/// to a dialer's last proposal: once the peer rejects `/1.1.0`, the `/1.0.0` fallback is
+/// proposed lazily and the outbound substream is handed back before the rejection arrives. The
+/// vendored gossipsub's outbound upgrade finishes the negotiation with a zero-length read, so
+/// the rejection still disables the handler as `ProtocolUnsupported`, the behaviour reports
+/// `GossipsubNotSupported`, and the node applies the fatal penalty.
+///
+/// The raw swarm carries only the target's req-res protocol, like the legacy peer in
+/// `test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer`, so every other protocol the
+/// target tries on it fails as unsupported, which is penalty-exempt. The target subscribes to a
+/// topic before the raw swarm dials: gossipsub only opens an outbound substream to a new peer
+/// to send it the node's subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_peer_without_gossipsub_is_banned_under_lazy_negotiation() -> eyre::Result<()> {
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config, network_events: _target_events, network_handle: target, network } =
+        peer1;
+    tokio::spawn(async move {
+        let res = network.run().await;
+        debug!(target: "network", ?res, "target network shutdown");
+    });
+    let target_addr = config.primary_address();
+    target.start_listening(target_addr.clone()).await?;
+    target.subscribe(TEST_TOPIC.into()).await?;
+
+    let libp2p_config = config.network_config().libp2p_config();
+    let raw_keypair = NetworkKeypair::generate_ed25519();
+    let raw_peer_id: PeerId = raw_keypair.public().into();
+    let raw_req_res = request_response::Behaviour::with_codec(
+        TNCodec::<TestWorkerRequest, TestWorkerResponse>::new(libp2p_config.max_rpc_message_size),
+        vec![(
+            NetworkType::Primary.req_res_protocol(libp2p_config.chain_id)?,
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+    let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| raw_req_res)
+        .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    raw_swarm.dial(target_addr)?;
+    let raw_task = tokio::spawn(async move {
+        loop {
+            let _ = raw_swarm.select_next_some().await;
+        }
+    });
+
+    let ban_threshold = config.network_config().peer_config().score_config.min_score_before_ban;
+    let target = &target;
+    let banned = wait_until(
+        Duration::from_secs(10),
+        "target bans the peer without gossipsub",
+        move || async move {
+            Ok(target.peer_score(raw_peer_id).await?.is_some_and(|score| score <= ban_threshold))
+        },
+    )
+    .await;
+    raw_task.abort();
+    banned
 }
 
 #[tokio::test]
@@ -3102,8 +3328,14 @@ async fn test_node_record_validation_rejects_oversized_multiaddr_list() {
         let signing_bytes =
             encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
         let signature = key_config.request_signature_direct(&signing_bytes);
+        let network_signature = primary_cosignature(
+            &network.network_keypair,
+            chain_id,
+            &key_config.primary_public_key(),
+            &info,
+        );
         let mut record = network.get_peer_record();
-        record.value = encode(&NodeRecord { info, signature });
+        record.value = encode(&NodeRecord { info, signature, network_signature });
         record
     };
 
@@ -3342,11 +3574,12 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
     let unrelated_network = NetworkKeypair::generate_ed25519();
     let unrelated = NodeRecord::build(
         domain,
-        unrelated_network.public().into(),
+        unrelated_bls.public(),
+        &unrelated_network,
         record_endpoint(),
         None,
         |data| unrelated_bls.sign(data),
-    );
+    )?;
     let unrelated_record = kad::Record {
         key: kad::RecordKey::new(unrelated_bls.public()),
         value: encode(&unrelated),
@@ -3630,8 +3863,14 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
         let bytes =
             encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
         let signature = peer2.config.key_config().request_signature_direct(&bytes);
+        let network_signature = primary_cosignature(
+            &peer2.network.network_keypair,
+            chain_id,
+            &peer2.config.key_config().primary_public_key(),
+            &info,
+        );
         let candidate = kad::Record {
-            value: encode(&NodeRecord { info, signature }),
+            value: encode(&NodeRecord { info, signature, network_signature }),
             expires: Some(std::time::Instant::now() + Duration::from_secs(120)),
             ..current.clone()
         };
@@ -3703,11 +3942,12 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
                 domain,
-                netkey.public().into(),
+                bls.public(),
+                &netkey,
                 record_endpoint(),
                 None,
                 |data| bls.sign(data),
-            );
+            )?;
             network.process_kad_put_request(
                 source,
                 kad::Record {
@@ -3795,7 +4035,13 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     let signing_bytes =
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
     let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
-    peer2.network.node_record = NodeRecord { info, signature };
+    let network_signature = primary_cosignature(
+        &peer2.network.network_keypair,
+        chain_id,
+        &peer2.config.key_config().primary_public_key(),
+        &info,
+    );
+    peer2.network.node_record = NodeRecord { info, signature, network_signature };
     let self_record = peer2.network.get_peer_record();
     assert!(network.peer_record_valid(&self_record).is_some());
     let timestamp = RecordTimestamp::admit(peer2.network.node_record.info.timestamp, observed);
@@ -3847,7 +4093,13 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let signing_bytes =
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &peer2_info));
     let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
-    let old_record = NodeRecord { info: peer2_info, signature };
+    let network_signature = primary_cosignature(
+        &peer2.network.network_keypair,
+        chain_id,
+        &peer2.config.key_config().primary_public_key(),
+        &peer2_info,
+    );
+    let old_record = NodeRecord { info: peer2_info, signature, network_signature };
     // assert old record is valid
     let peer2_pubkey = peer2.config.key_config().primary_public_key();
     assert!(old_record.clone().verify(domain, &peer2_pubkey).is_some());
@@ -4100,7 +4352,17 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
     let target_signature =
         target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
-    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+    let target_network_signature = primary_cosignature(
+        &target_network.network_keypair,
+        chain_id,
+        &target_peer.config.key_config().primary_public_key(),
+        &target_info,
+    );
+    target_network.node_record = NodeRecord {
+        info: target_info,
+        signature: target_signature,
+        network_signature: target_network_signature,
+    };
 
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
@@ -4223,7 +4485,17 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
     let target_signature =
         target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
-    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+    let target_network_signature = primary_cosignature(
+        &target_network.network_keypair,
+        chain_id,
+        &target_peer.config.key_config().primary_public_key(),
+        &target_info,
+    );
+    target_network.node_record = NodeRecord {
+        info: target_info,
+        signature: target_signature,
+        network_signature: target_network_signature,
+    };
 
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
@@ -4493,78 +4765,116 @@ async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Inbound `AddProvider` gates the store write on the provider's ban status, at
-/// parity with the `PutRecord` path (issue #1001). Under `StoreInserts::FilterBoth`
-/// this arm is the sole write path for inbound provider records, so an un-gated
-/// arm would persist an attacker-supplied record from a peer already banned at the
-/// application layer.
+/// Whether one snapshot of `snapshotter` holds every primary-network counter in `expected`
+/// at its value.
+fn primary_counters_eq(
+    snapshotter: &metrics_util::debugging::Snapshotter,
+    expected: &[(&str, u64)],
+) -> bool {
+    use metrics_util::debugging::DebugValue;
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    expected.iter().all(|(name, count)| {
+        snapshot.iter().any(|(key, _, _, value)| {
+            key.key().name() == *name
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "network" && label.value() == "primary")
+                && matches!(value, DebugValue::Counter(seen) if seen == count)
+        })
+    })
+}
+
+/// Inbound `AddProvider` checks the provider's ban status first, at parity with the
+/// `PutRecord` path (issue #1001). The store keeps only the local self-provide (issue
+/// #1720), so no remote record is stored, and the remote-drop counter shows how far a
+/// record got.
 ///
-/// A record from an un-banned provider is stored; a record from a banned provider
-/// is dropped before it reaches the store. Deleting the ban filter in
-/// `process_kad_add_provider` (storing unconditionally, i.e. today's behaviour)
-/// makes the banned-provider assertion fail, pinning the gate.
+/// A record from an un-banned provider passes the ban filter, is dropped as a remote
+/// record and is counted. A record from a banned provider is dropped by the ban filter
+/// first and is not counted. Deleting the ban filter in `process_kad_add_provider` lets
+/// the banned record reach the remote drop, so the counter reads 2 and the test fails.
 #[tokio::test]
 async fn test_add_provider_rejects_banned_provider() {
     use libp2p::kad;
+    use metrics_util::debugging::DebuggingRecorder;
 
-    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-    let mut network = peer1.network;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
 
-    // An un-banned provider: its record is persisted (positive path preserved).
-    // libp2p guarantees `provider == source`, so the provider id is authenticated;
-    // this test drives the handler directly and keys each record on its provider.
-    let honest = PeerId::random();
-    let honest_record = kad::ProviderRecord {
-        key: kad::RecordKey::new(&honest.to_bytes()),
-        provider: honest,
-        expires: None,
-        addresses: vec![],
-    };
-    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
-    network.process_kad_add_provider(Some(honest_record.clone()));
-    assert_eq!(
-        network.swarm.behaviour_mut().kademlia.store_mut().providers(&honest_record.key).len(),
-        1,
-        "un-banned provider record is stored",
-    );
+        // An un-banned remote provider: its record is dropped before storage and counted.
+        // libp2p guarantees `provider == source`, so the provider id is authenticated;
+        // this test drives the handler directly.
+        let honest = PeerId::random();
+        let honest_record = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[0_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: honest,
+            expires: None,
+            addresses: vec![],
+        };
+        assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
+        network.process_kad_add_provider(Some(honest_record.clone()));
+        assert!(
+            network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&honest_record.key)
+                .is_empty(),
+            "remote provider record is not stored (issue #1720)",
+        );
 
-    // A banned provider: register a default record then apply a Fatal penalty,
-    // which crosses the ban threshold on the first hit.
-    let attacker = PeerId::random();
-    network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
-    network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+        // A banned provider: register a default record then apply a Fatal penalty,
+        // which crosses the ban threshold on the first hit.
+        let attacker = PeerId::random();
+        network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
+        network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+        assert!(
+            network.swarm.behaviour().peer_manager.peer_banned(&attacker),
+            "attacker provider is banned",
+        );
+
+        // Its `AddProvider` is dropped by the ban filter: nothing lands in the store.
+        let attacker_record = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[1_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: attacker,
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(attacker_record.clone()));
+        assert!(
+            network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&attacker_record.key)
+                .is_empty(),
+            "banned provider record is not stored (issue #1001)",
+        );
+    });
+
     assert!(
-        network.swarm.behaviour().peer_manager.peer_banned(&attacker),
-        "attacker provider is banned",
-    );
-
-    // Its `AddProvider` is dropped: nothing lands in the store for the attacker key.
-    let attacker_record = kad::ProviderRecord {
-        key: kad::RecordKey::new(&attacker.to_bytes()),
-        provider: attacker,
-        expires: None,
-        addresses: vec![],
-    };
-    network.process_kad_add_provider(Some(attacker_record.clone()));
-    assert!(
-        network
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .store_mut()
-            .providers(&attacker_record.key)
-            .is_empty(),
-        "banned provider record is not stored (issue #1001)",
+        primary_counters_eq(&snapshotter, &[("tn_network.add_provider_remote_dropped_total", 1)]),
+        "only the un-banned record reaches the remote-provider drop",
     );
 }
 
-/// The sixth provider announcement is dropped before storage and counted once.
+/// The sixth provider announcement from one peer is rate limited before storage and
+/// counted once. The first five pass the rate limit and are then dropped as remote
+/// records (issue #1720), so none of the six is stored and the sixth is not counted as a
+/// remote drop.
 ///
-/// Distinct keys make an accidental over-budget write observable even though
-/// repeated announcements for the same key would replace the existing provider.
+/// Distinct keys make an accidental write observable even though repeated announcements
+/// for the same key would replace the existing provider.
 #[tokio::test]
 async fn test_add_provider_rate_limit_counts_drops_before_storage() {
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::DebuggingRecorder;
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -4575,20 +4885,23 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
 
         (0_u8..5).for_each(|key| {
             let record = kad::ProviderRecord {
-                key: kad::RecordKey::new(&[key]),
+                key: kad::RecordKey::new(&[key; BlsPublicKey::COMPRESSED_BYTES]),
                 provider,
                 expires: None,
                 addresses: vec![],
             };
             network.process_kad_add_provider(Some(record.clone()));
-            assert_eq!(
-                network.swarm.behaviour_mut().kademlia.store_mut().providers(&record.key).len(),
-                1,
-            );
+            assert!(network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&record.key)
+                .is_empty());
         });
 
         let rejected = kad::ProviderRecord {
-            key: kad::RecordKey::new(&b"over-budget"),
+            key: kad::RecordKey::new(&[0xff_u8; BlsPublicKey::COMPRESSED_BYTES]),
             provider,
             expires: None,
             addresses: vec![],
@@ -4603,14 +4916,70 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
             .is_empty());
     });
 
-    assert!(snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
-        key.key().name() == "tn_network.add_provider_rate_limited_total"
-            && key
-                .key()
-                .labels()
-                .any(|label| label.key() == "network" && label.value() == "primary")
-            && matches!(value, DebugValue::Counter(1))
-    }));
+    assert!(primary_counters_eq(
+        &snapshotter,
+        &[
+            ("tn_network.add_provider_remote_dropped_total", 5),
+            ("tn_network.add_provider_rate_limited_total", 1),
+        ],
+    ));
+}
+
+/// Inbound `AddProvider` from a remote provider is dropped before storage and counted, with
+/// no penalty (issue #1720). Providing a key breaks no protocol rule, so the drop must not
+/// score the source. The local self-provide still reaches the store.
+#[tokio::test]
+async fn test_add_provider_drops_remote_provider_without_penalty() -> eyre::Result<()> {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || -> eyre::Result<()> {
+        let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
+        let source = register_untrusted_put_record_source(&mut network)?;
+
+        let remote = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[0_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: source,
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(remote.clone()));
+        assert!(
+            network.swarm.behaviour_mut().kademlia.store_mut().providers(&remote.key).is_empty(),
+            "remote provider record is not stored",
+        );
+        assert_eq!(
+            network.swarm.behaviour().peer_manager.peer_score(&source),
+            Some(0.0),
+            "the drop must not penalize the source",
+        );
+        assert!(
+            !network.swarm.behaviour().peer_manager.peer_banned(&source),
+            "the drop must not ban the source",
+        );
+
+        let local = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[1_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: *network.swarm.local_peer_id(),
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(local.clone()));
+        assert_eq!(
+            network.swarm.behaviour_mut().kademlia.store_mut().providers(&local.key).len(),
+            1,
+            "the local self-provide is stored",
+        );
+        Ok(())
+    })?;
+
+    assert!(
+        primary_counters_eq(&snapshotter, &[("tn_network.add_provider_remote_dropped_total", 1)]),
+        "the remote drop is counted once",
+    );
+    Ok(())
 }
 
 /// A cached URL is insufficient: coverage needs a live, matching verified record.
@@ -4628,11 +4997,12 @@ async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
             peer2.config.network_config().libp2p_config().chain_id,
             NetworkType::Primary,
         ),
-        keys.primary_network_public_key(),
+        &keys.primary_public_key(),
+        keys.primary_network_keypair(),
         peer2.config.primary_address(),
         Some(rpc),
         |data| keys.request_signature_direct(data),
-    );
+    )?;
     network.process_command(NetworkCommand::UpdateCommittees {
         previous: HashSet::new(),
         current: HashSet::from([owner]),
@@ -4681,11 +5051,12 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
             peer2.config.network_config().libp2p_config().chain_id,
             NetworkType::Primary,
         ),
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         peer2.config.primary_address(),
         Some(rpc),
         |data| key_config.request_signature_direct(data),
-    );
+    )?;
 
     let kad_record = kad::Record {
         key: kad::RecordKey::new(&owner_bls),
@@ -4866,18 +5237,22 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let worker_0_address = record_endpoint();
     let worker_0_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(0)),
-        worker_0_key.public().into(),
+        &publisher_key_config.primary_public_key(),
+        &worker_0_key,
         worker_0_address.clone(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let worker_1_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(1)),
-        worker_1_key.public().into(),
+        &publisher_key_config.primary_public_key(),
+        &worker_1_key,
         record_endpoint(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let mut store_0 = KadStore::new(
         db.clone(),
         local_network_key.public().into(),
@@ -4986,11 +5361,13 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
         );
         let authority_record = NodeRecord::build(
             domain,
-            key_config_2.primary_network_public_key(),
+            &key_config_2.primary_public_key(),
+            key_config_2.primary_network_keypair(),
             config_2.primary_address(),
             None,
             |data| key_config_2.request_signature_direct(data),
-        );
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: kad::RecordKey::new(&authority_bls),
             value: encode(&authority_record),
@@ -4998,11 +5375,16 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
             expires: None,
         })?;
 
-        let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
-        let outsider_record =
-            NodeRecord::build(domain, outsider_netkey, record_endpoint(), None, |data| {
-                outsider_keypair.sign(data)
-            });
+        let outsider_netkey = NetworkKeypair::generate_ed25519();
+        let outsider_record = NodeRecord::build(
+            domain,
+            outsider_keypair.public(),
+            &outsider_netkey,
+            record_endpoint(),
+            None,
+            |data| outsider_keypair.sign(data),
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: kad::RecordKey::new(&outsider_bls),
             value: encode(&outsider_record),
@@ -5095,11 +5477,13 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
         );
         let own_record = NodeRecord::build(
             domain,
-            key_config.primary_network_public_key(),
+            &key_config.primary_public_key(),
+            key_config.primary_network_keypair(),
             config_1.primary_address(),
             None,
             |data| key_config.request_signature_direct(data),
-        );
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: node_record_key(&own_bls),
             value: encode(&own_record),
@@ -5235,7 +5619,13 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
         0u16,
         &current_info,
     )));
-    peer2.network.node_record = NodeRecord { info: current_info, signature: current_signature };
+    let current_network_signature =
+        primary_cosignature(&peer2.network.network_keypair, chain, &key, &current_info);
+    peer2.network.node_record = NodeRecord {
+        info: current_info,
+        signature: current_signature,
+        network_signature: current_network_signature,
+    };
     let expected = encode(&peer2.network.node_record);
     let mut old_info = peer2.network.node_record.info.clone();
     old_info.timestamp = old_info.timestamp.saturating_sub(1);
@@ -5250,7 +5640,13 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
     )));
     let mut old = peer2.network.get_peer_record();
     old.key = node_record_key(&previous_key);
-    old.value = encode(&NodeRecord { info: old_info, signature: old_signature });
+    let old_network_signature =
+        primary_cosignature(&peer2.network.network_keypair, chain, &previous_key, &old_info);
+    old.value = encode(&NodeRecord {
+        info: old_info,
+        signature: old_signature,
+        network_signature: old_network_signature,
+    });
     peer1.network.process_kad_put_request(peer2_id, old)?;
     assert!(peer1.network.mark_published_to_peer(peer2_id));
     assert!(peer2.network.mark_published_to_peer(peer1_id));
@@ -5343,6 +5739,45 @@ async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result
     Ok(())
 }
 
+/// A lazily negotiated rejection of record retrieval takes the legacy fallback.
+///
+/// Under the swarm's `V1Lazy` negotiation a peer without the record-exchange protocol is
+/// reported on the first read as `OutboundFailure::Io` wrapping `NegotiationError::Failed`, not
+/// as `UnsupportedProtocols`. The handler normalizes it, so the failure stays penalty-exempt and
+/// starts the legacy Kademlia query instead of deferring the request as a transport failure.
+#[tokio::test]
+async fn test_record_retrieval_lazy_rejection_takes_legacy_fallback() -> eyre::Result<()> {
+    use libp2p::core::upgrade::NegotiationError;
+    use std::io;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [peer2.config.key_config().primary_public_key()].into_iter().collect(),
+        Default::default(),
+    );
+    network.process_kad_put_request(peer, peer2.network.get_peer_record())?;
+    let request = network.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
+    assert!(network.record_exchange.allow_request(peer));
+    network.record_exchange.track(peer, request);
+    network.process_record_exchange_event(ReqResEvent::OutboundFailure {
+        peer,
+        connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+        request_id: request,
+        error: ReqResOutboundFailure::Io(io::Error::from(NegotiationError::Failed)),
+    })?;
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&peer));
+    assert_eq!(
+        network.kad_record_queries.len(),
+        1,
+        "a lazy rejection must take the legacy fallback, not the deferred retry"
+    );
+    Ok(())
+}
+
 #[path = "record_review_tests.rs"]
 mod record_review_tests;
 
@@ -5431,21 +5866,62 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 }
 
 /// Finding 1 (#819): the network-layer reject path must never Fatal-ban the relaying peer for an
-/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author, and no
-/// one when the author is unresolved (anonymous message or this node's view lag) — but never the
-/// relayer, regardless of whether either identity has resolved.
+/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author that
+/// delivered its own frame, and no one when the author is unresolved (anonymous message or this
+/// node's view lag), but never the relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                true,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                false,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::Skip
         );
     });
+}
+
+/// GHSA-vw36-8f6c-vppp: a frame delivered by a peer other than its author never charges the
+/// author. The frame is static and gossipsub forgets its id after the duplicate-cache window, so
+/// any peer that once received it could otherwise ban the author after the author leaves the
+/// committee window. The relayer is not charged either (#801/#785).
+#[test]
+fn relayed_unauthorized_author_reject_charges_no_one() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    EpochPosition::Live
+                ),
+                RejectPenalty::Skip
+            );
+        });
+    });
+}
+
+/// `GossipDelivery::of` names the author only when the propagation source is the author; a
+/// different source, or an anonymous message, is a relayed delivery.
+#[test]
+fn gossip_delivery_is_by_author_only_from_the_author_connection() {
+    let author = PeerId::random();
+    assert_eq!(GossipDelivery::of(Some(&author), &author), GossipDelivery::ByAuthor);
+    assert_eq!(GossipDelivery::of(Some(&author), &PeerId::random()), GossipDelivery::Relayed);
+    assert_eq!(GossipDelivery::of(None, &author), GossipDelivery::Relayed);
 }
 
 /// A replaying node never charges an unauthorized author: its allowlists belong to the
@@ -5455,25 +5931,37 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
 fn historical_epoch_replay_never_charges_the_author() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         [true, false].into_iter().for_each(|author_resolved| {
-            assert_eq!(
-                RejectReason::UnauthorizedAuthor.penalty(
-                    relayer_resolved,
-                    author_resolved,
-                    EpochPosition::Historical
-                ),
-                RejectPenalty::Skip
-            );
+            [GossipDelivery::ByAuthor, GossipDelivery::Relayed].into_iter().for_each(|delivery| {
+                assert_eq!(
+                    RejectReason::UnauthorizedAuthor.penalty(
+                        relayer_resolved,
+                        author_resolved,
+                        delivery,
+                        EpochPosition::Historical
+                    ),
+                    RejectPenalty::Skip
+                );
+            });
         });
         assert_eq!(
-            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectReason::TooLarge.penalty(
+                true,
+                relayer_resolved,
+                GossipDelivery::Relayed,
+                EpochPosition::Historical
+            ),
             RejectPenalty::FatalRelayer
         );
     });
 }
 
 /// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
-/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
-async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+/// a topic whose allowlist excludes it, the frame delivered per `delivery`. Returns whether the
+/// author ended up banned.
+async fn unauthorized_author_banned_at(
+    position: EpochPosition,
+    delivery: GossipDelivery,
+) -> eyre::Result<bool> {
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let outsider = peer1.config.key_config().primary_public_key();
@@ -5502,31 +5990,59 @@ async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<
         reply,
     })?;
     network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    let propagation_source = match delivery {
+        GossipDelivery::ByAuthor => source,
+        GossipDelivery::Relayed => PeerId::random(),
+    };
     network.process_gossip_event(GossipEvent::Message {
-        propagation_source: PeerId::random(),
+        propagation_source,
         message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
         message: GossipMessage { source: Some(source), ..test_gossip_message() },
     })?;
     Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
 }
 
-/// A replaying node rejects the message and leaves the resolved author unbanned.
+/// A replaying node rejects the message and leaves the resolved author unbanned, even when the
+/// author delivered the frame itself.
 #[tokio::test]
 async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
     assert!(
-        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::ByAuthor).await?,
         "a replaying node must not ban a resolved author outside the replayed allowlist"
     );
     Ok(())
 }
 
-/// The same reject at the live tip still charges the resolved author: the position guard spares
-/// only a replaying node.
+/// A replaying node leaves the resolved author of a relayed frame unbanned as well.
+#[tokio::test]
+async fn historical_replay_never_bans_a_relayed_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::Relayed).await?,
+        "a replaying node must not ban the author of a relayed frame"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author when the author's own
+/// connection delivered the frame: the position guard spares only a replaying node, and the
+/// delivery guard spares only a frame someone else delivered.
 #[tokio::test]
 async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
     assert!(
-        unauthorized_author_banned_at(EpochPosition::Live).await?,
-        "a node at the tip still bans a resolved author outside the allowlist"
+        unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::ByAuthor).await?,
+        "a node at the tip still bans a resolved author that delivers its own unauthorized frame"
+    );
+    Ok(())
+}
+
+/// GHSA-vw36-8f6c-vppp: a resolved ex-member's old frame, re-sent by a different connected peer
+/// after the member left every committee slot, must not ban the member. Before the fix this
+/// delivery charged `Penalty::Fatal` to the author at the live tip.
+#[tokio::test]
+async fn live_epoch_relayed_replay_never_bans_the_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::Relayed).await?,
+        "a frame delivered by a peer other than its author must not ban the author"
     );
     Ok(())
 }
@@ -5541,11 +6057,21 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
         for position in [EpochPosition::Live, EpochPosition::Historical] {
             assert_eq!(
-                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    true,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::FatalRelayer
             );
             assert_eq!(
-                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    false,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::Skip
             );
         }
@@ -6084,4 +6610,58 @@ fn listener_error_log_suppresses_errors_inside_the_interval() {
         Some(1),
         "the next log carries only the errors suppressed since the last log"
     );
+}
+
+/// Issue #1751: a committee BLS key cannot publish a record that names another validator's
+/// network key. The forged record fails validation, and the victim's peer id is not bound to the
+/// attacker's BLS key.
+#[tokio::test]
+async fn forged_committee_record_cannot_rebind_another_peer_id() -> eyre::Result<()> {
+    use libp2p::kad;
+    use tn_types::Signer as _;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let victim_bls = peer2.config.key_config().primary_public_key();
+    let victim_peer_id = *peer2.network.swarm.local_peer_id();
+    let attacker = BlsKeypair::generate(&mut StdRng::from_seed([175; 32]));
+    let attacker_bls = *attacker.public();
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+
+    // Both keys are in the current committee, so a valid record for either key reaches the
+    // committee cache branch of the peer manager.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([victim_bls, attacker_bls]),
+        next: HashSet::new(),
+    })?;
+    network.process_kad_put_request(victim_peer_id, peer2.network.get_peer_record())?;
+
+    // The attacker signs the victim's network info with its own BLS key and copies the victim's
+    // co-signature, which covers the victim's BLS key and not the attacker's.
+    let victim_record = peer2.network.node_record.clone();
+    let payload = encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        chain_id,
+        0u8,
+        0u16,
+        &victim_record.info,
+    ));
+    let forged_record = NodeRecord { signature: attacker.sign(&payload), ..victim_record };
+    let forged = kad::Record {
+        key: node_record_key(&attacker_bls),
+        value: encode(&forged_record),
+        publisher: Some(victim_peer_id),
+        expires: None,
+    };
+    assert!(network.peer_record_valid(&forged).is_none());
+
+    // The handler can reject the forged put with an error; only its effect is checked here.
+    let _forged_put = network.process_kad_put_request(PeerId::random(), forged);
+    assert_ne!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&victim_peer_id),
+        Some(attacker_bls)
+    );
+    Ok(())
 }

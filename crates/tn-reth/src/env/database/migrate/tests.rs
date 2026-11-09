@@ -1095,10 +1095,10 @@ fn migrates_a_copy_of_a_real_database() {
 
     crate::init_reth_defaults();
     let chain = std::sync::Arc::new(tn_types::test_genesis().into());
-    let config = crate::RethConfig(reth_node_builder::NodeConfig {
+    let config = crate::RethConfig::from_node_config(reth_node_core::node_config::NodeConfig {
         chain,
         db: DatabaseArgs::default(),
-        ..reth_node_builder::NodeConfig::default()
+        ..reth_node_core::node_config::NodeConfig::default()
     });
     let started = Instant::now();
     let db = crate::env::database::open_rw(&config, &path).expect("the open migrates");

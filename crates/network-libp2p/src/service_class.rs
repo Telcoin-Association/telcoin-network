@@ -58,14 +58,18 @@ impl ServiceClass {
 
 /// The reason that inbound work was dropped before service.
 ///
-/// The swarm drops work before the application receives it (`QueueFull`, `Unsubscribed`). The
-/// application drops a forwarded request before any work for it (`Admission`, `ServeBudget`).
+/// The swarm drops work before the application receives it (`QueueFull`, `Unsubscribed`,
+/// `QueueBudget`). The application drops a forwarded request before any work for it
+/// (`Admission`, `ServeBudget`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShedReason {
     /// The bounded application event queue was full.
     QueueFull,
     /// The application queue had no subscriber, so the message was dropped instead of queued.
     Unsubscribed,
+    /// The application queue had no subscriber and already held as many messages or bytes as
+    /// its gap policy allows, so the message was dropped instead of queued.
+    QueueBudget,
     /// The primary dropped an epoch-record request at its admission cap before serving it. The
     /// dropped response channel then also counts the request as an `omitted` failure in
     /// `inbound_requests_failed_total`.
@@ -78,14 +82,20 @@ pub(crate) enum ShedReason {
 
 impl ShedReason {
     /// Every reason, in label order.
-    pub(crate) const ALL: [Self; 4] =
-        [Self::QueueFull, Self::Unsubscribed, Self::Admission, Self::ServeBudget];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::QueueFull,
+        Self::Unsubscribed,
+        Self::QueueBudget,
+        Self::Admission,
+        Self::ServeBudget,
+    ];
 
     /// The metric label value for this reason.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::QueueFull => "queue_full",
             Self::Unsubscribed => "unsubscribed",
+            Self::QueueBudget => "queue_budget",
             Self::Admission => "admission",
             Self::ServeBudget => "serve_budget",
         }

@@ -10,6 +10,7 @@ mod eject;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;
+mod forward_txs;
 mod genesis_tests;
 mod governance_safe_fork;
 mod metrics;
@@ -21,5 +22,6 @@ mod sigkill;
 mod staking;
 mod state_export_import;
 mod sync;
+mod upgrade;
 
 fn main() {}

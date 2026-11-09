@@ -1,6 +1,6 @@
 # tn-lmdb-reth: a guide for working in this crate
 
-`tn-lmdb-reth` implements reth's database API (`reth-db-api`, reth v1.11.3) on the
+`tn-lmdb-reth` implements reth's database API (`reth-db-api`, the vendored reth, v1.11.4) on the
 [`tn-lmdb`](../tn-lmdb) engine. `TnLmdbEnv` is a reth `Database` whose transactions and cursors behave
 as reth's MDBX ones do and report MDBX's error codes, so reth's code and its MDBX tests run
 unchanged. Of reth's five dup-sort tables, the state tables (`PlainStorageState`,
@@ -21,9 +21,8 @@ depends on neither reth nor `tn-storage`.
 5. for engine behaviour, `crates/tn-lmdb/CLAUDE.md` and the engine README's cursor sections
    ("Public API reference", "Detached cursors").
 
-reth's contract is in the checkout at
-`~/.cargo/git/checkouts/reth-e231042ee7db3fb7/d6324d6/crates/storage/db-api/src`; its MDBX
-implementation and tests are in `crates/storage/db/src/implementation/mdbx/` there.
+reth's contract is in the vendored copy at `vendor/reth/crates/storage/db-api/src`; its MDBX
+implementation and tests are in `vendor/reth/crates/storage/db/src/implementation/mdbx/`.
 
 ## Crate map
 

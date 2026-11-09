@@ -260,6 +260,38 @@ async fn every_namespace_serves_on_tn() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A JavaScript tracer runs only in a build with the `js-tracer` feature. Without it,
+/// `debug_traceTransaction` refuses the tracer and the built-in tracers keep working (see
+/// `crates/tn-reth/js-tracer.md`).
+#[tokio::test]
+async fn js_tracer_follows_the_build_feature() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let served = server_from_cli(
+        &["--http", "--http.api", "debug", "--ipcdisable"],
+        &task_manager,
+        &tmp_dir,
+    )?;
+    let hash = mine_transfer(&served)?;
+    let http = served.server.http_methods(|_| true).expect("http is enabled");
+
+    // reports the gas the transfer used, which only the traced execution knows
+    let js = "{fault: function() {}, result: function(ctx) { return ctx.gasUsed }}";
+    let traced = http
+        .call::<_, Value>("debug_traceTransaction", rpc_params![hash, json!({"tracer": js})])
+        .await;
+    #[cfg(feature = "js-tracer")]
+    assert_eq!(traced?, json!(21_000));
+    #[cfg(not(feature = "js-tracer"))]
+    assert_eq!(rpc_error(traced)?, (-32603, "JS Tracer is not enabled".to_string()));
+
+    let call_frame: Value = http
+        .call("debug_traceTransaction", rpc_params![hash, json!({"tracer": "callTracer"})])
+        .await?;
+    assert_eq!(field::<U64>(&call_frame, "gasUsed")?, U64::from(21_000));
+    Ok(())
+}
+
 /// `--rpc.max-trace-filter-blocks` reaches the trace namespace: with a limit of 0 a two-block
 /// range is refused while a one-block range is still served.
 #[tokio::test]

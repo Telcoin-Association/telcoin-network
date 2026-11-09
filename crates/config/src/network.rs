@@ -17,7 +17,21 @@ use tracing::{info, warn};
 pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 mod quic;
-pub use quic::QuicConfig;
+pub use quic::{InboundAcceptTask, QuicConfig};
+
+impl InboundAcceptTask {
+    /// The accepted-handshake queue capacity of the spawned mode; `None` keeps the inline path.
+    ///
+    /// The node writes this to the carried transport. The release fixtures compile `quic.rs` by
+    /// path against transports without such a field, so this node-only accessor lives here, where
+    /// their dead-code lint never sees it.
+    pub const fn spawned_capacity(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Inline => None,
+            Self::Spawned { capacity } => Some(capacity),
+        }
+    }
+}
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -1914,8 +1928,21 @@ hostname: "my-validator"
         assert_eq!(lower.max_stream_data, 100);
         let legacy: NetworkConfig = serde_json::from_str("{}")?;
         assert_eq!(legacy.swarm_budget(), Ok(None));
-        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 4 * 1024 * 1024);
         Ok(())
+    }
+
+    /// The built-in QUIC credit holds one full request-response message per stream with the same
+    /// headroom, two stream windows per connection, and at most the libp2p stream ceiling.
+    #[test]
+    fn default_quic_credit_is_bounded_by_the_message_size() {
+        let quic = super::QuicConfig::default();
+        let rpc_message =
+            u32::try_from(super::LibP2pConfig::default().max_rpc_message_size).unwrap_or(u32::MAX);
+        assert_eq!(quic.max_stream_data, rpc_message.saturating_mul(2));
+        assert_eq!(quic.max_connection_data, quic.max_stream_data.saturating_mul(2));
+        assert_eq!(quic.max_concurrent_stream_limit, 256);
+        assert_eq!(quic.with_budget(None).max_connection_data, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -2016,5 +2043,23 @@ hostname: "my-validator"
         // the remaining fields still load from the file rather than from the default
         assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
         Ok(())
+    }
+
+    /// An empty `quic_config` section yields the inline accept task on the node configuration.
+    #[test]
+    fn empty_quic_section_keeps_the_inline_accept_task() -> Result<(), serde_yaml::Error> {
+        let node: NetworkConfig = serde_yaml::from_str("quic_config: {}")?;
+        assert_eq!(node.quic_config().inbound_accept_task, super::InboundAcceptTask::Inline);
+        Ok(())
+    }
+
+    /// The inline accept task maps to no spawned capacity, and the spawned mode maps to its
+    /// capacity, which the node writes to the carried transport.
+    #[test]
+    fn spawned_capacity_maps_the_accept_task() {
+        let capacity = std::num::NonZeroUsize::MIN.saturating_add(63);
+        assert_eq!(super::InboundAcceptTask::Inline.spawned_capacity(), None);
+        let spawned = super::InboundAcceptTask::Spawned { capacity };
+        assert_eq!(spawned.spawned_capacity(), Some(capacity));
     }
 }

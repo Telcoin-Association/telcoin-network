@@ -19,6 +19,9 @@
 //! Epoch-priced simulation replacements also return registration errors. The eth
 //! methods (`crate::rpc_call`, `crate::rpc_bundle`) and debug methods (`crate::rpc_debug`)
 //! are installed only on transports configured to expose their corresponding namespace.
+//! With `--forward-txs`, the submission install is the forwarding handler
+//! (`crate::rpc_tx_forward`) instead of the fee-cap guard: it enforces the same cap, then
+//! relays to the configured validators rather than delegating to the local pool.
 //!
 //! Endpoints are derived per worker: [`RethEnv::start_rpc`] shifts the operator's
 //! configured http/ws ports into a per-worker band and suffixes the IPC path with the
@@ -50,6 +53,7 @@ use crate::{
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
     rpc_gas_price::{EpochGasPriceServer as _, GasPriceWithEpochBaseFee},
+    rpc_tx_forward::{EthSubmitForwarded, ForwardedEthSubmitServer as _},
     traits::{TNExecution, TelcoinNode},
     worker::WorkerNetwork,
     RethEnv, RpcServer, WorkerTxPool,
@@ -146,7 +150,9 @@ fn worker_shifted_port(
 ///
 /// - `http_port` shifted down by `200 * worker_id` when the http server is enabled;
 /// - `ws_port` shifted up by `400 * worker_id` when the ws server is enabled;
-/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled.
+/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled;
+/// - when http and ws share one port, `ws_allowed_origins` falling back to `http_corsdomain`, the
+///   list the shared server checks WebSocket origins against.
 ///
 /// When both http and ws are enabled on fixed (non-zero) ports, the derivation needs
 /// `ws_port >= http_port` (reth's own default layout; equality is the shared http+ws
@@ -195,7 +201,22 @@ fn worker_rpc_server_args(
             } else {
                 format!("{}-w{worker_id}", base.ipcpath)
             };
-            Ok(reth_node_core::args::RpcServerArgs { http_port, ws_port, ipcpath, ..base })
+            // On a shared http+ws port reth checks WebSocket origins against `--ws.origins`, or
+            // against `--http.corsdomain` when only that is set. The shift puts this worker's ws
+            // on its own server, which reads `--ws.origins` alone, so carry the list worker 0
+            // enforces instead of accepting every origin.
+            let ws_allowed_origins = if base.http && base.ws && base.http_port == base.ws_port {
+                base.ws_allowed_origins.clone().or_else(|| base.http_corsdomain.clone())
+            } else {
+                base.ws_allowed_origins.clone()
+            };
+            Ok(reth_node_core::args::RpcServerArgs {
+                http_port,
+                ws_port,
+                ipcpath,
+                ws_allowed_origins,
+                ..base
+            })
         }
     }
 }
@@ -254,7 +275,8 @@ impl RethEnv {
     /// forwarding observers retain their handlers.
     ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
-    /// (`crate::rpc_fee_cap`), the epoch-fee gas-price quotes, or the corrected
+    /// (`crate::rpc_fee_cap`) or, with `--forward-txs`, the forwarding handler
+    /// (`crate::rpc_tx_forward`), the epoch-fee gas-price quotes, or the corrected
     /// fill-transaction method cannot replace the stock eth handlers.
     pub fn get_rpc_server(
         &self,
@@ -339,14 +361,26 @@ impl RethEnv {
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
         // RPC boundary and then delegates to these same reth handlers. The same guard checks
-        // worker admission, live worker membership, and live node mode before decoding.
-        let fee_cap_guard = EthSubmitWithCap::new(
-            eth_api.clone(),
-            TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
-            admission,
-            base_fee.clone(),
-            node_mode,
-        );
+        // worker admission, live worker membership, and live node mode before decoding. A
+        // `--forward-txs` node enforces the same cap and then relays to its validators
+        // instead of touching its own pool; every worker's server shares the one forwarder.
+        let tx_fee_cap = TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap);
+        let submission: Methods = match &self.inner.tx_forwarder {
+            Some(forwarder) => {
+                EthSubmitForwarded::new(eth_api.clone(), forwarder.clone(), tx_fee_cap)
+                    .into_rpc()
+                    .into()
+            }
+            None => EthSubmitWithCap::new(
+                eth_api.clone(),
+                tx_fee_cap,
+                admission,
+                base_fee.clone(),
+                node_mode,
+            )
+            .into_rpc()
+            .into(),
+        };
         // Use one registry so the replacement debug handlers share reth's concurrency
         // guard with the other tracing endpoints. Delegate through their RPC traits.
         let mut registry = rpc_builder.into_registry(
@@ -367,7 +401,7 @@ impl RethEnv {
         // Replace `eth_sendRawTransaction` / `eth_sendRawTransactionSync` on every
         // transport that exposes the eth namespace. A transport without the namespace
         // serves no submission methods, so it needs no guard.
-        server.add_or_replace_if_module_configured(RethRpcModule::Eth, fee_cap_guard.into_rpc())?;
+        server.add_or_replace_if_module_configured(RethRpcModule::Eth, submission)?;
         // Replace `eth_gasPrice` / `eth_maxPriorityFeePerGas` on every transport that
         // exposes the eth namespace. A transport without the namespace serves no
         // gas-price oracle methods to replace.
@@ -1571,6 +1605,43 @@ mod tests {
         assert_eq!(worker_two.ipcpath, format!("{}-w2", base.ipcpath));
     }
 
+    /// With http and ws on one port and only `--http.corsdomain` set, worker 0's shared server
+    /// checks WebSocket origins against that list. A worker above 0 gets its ws on a separate
+    /// server, which reads `--ws.origins` alone, so the derivation must carry the list there or
+    /// that worker accepts WebSocket upgrades from every origin.
+    #[test]
+    fn test_shared_port_origins_carry_to_shifted_ws_server() {
+        let base = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ws: true,
+            http_port: 8545,
+            ws_port: 8545,
+            http_corsdomain: Some("https://observer.example".to_string()),
+            ws_allowed_origins: None,
+            ..Default::default()
+        };
+        let worker_zero = worker_rpc_server_args(&base, 0).expect("worker 0 derivation");
+        assert_eq!(worker_zero.ws_allowed_origins, None, "worker 0 keeps the config");
+
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert_ne!(worker_one.http_port, worker_one.ws_port, "the shift splits the servers");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://observer.example"));
+        assert_eq!(worker_one.http_corsdomain, base.http_corsdomain);
+
+        // an explicit ws list wins, as it does on the shared server
+        let both = reth_node_core::args::RpcServerArgs {
+            ws_allowed_origins: Some("https://ws.example".to_string()),
+            ..base.clone()
+        };
+        let worker_one = worker_rpc_server_args(&both, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://ws.example"));
+
+        // separate base ports already give ws its own server, so nothing is carried
+        let separate = reth_node_core::args::RpcServerArgs { ws_port: 8546, ..base };
+        let worker_one = worker_rpc_server_args(&separate, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins, None);
+    }
+
     /// A worker band cannot collide with any `--instance` offset. Instance arithmetic
     /// moves http down by at most 199 and ws up by at most 398 (`instance <= 200` in
     /// reth v1.11.3), and the closest approach between the two schemes is worker 1 of
@@ -1785,4 +1856,6 @@ mod tests {
         );
         assert!(std::path::Path::new(&suffixed).exists(), "worker 1 IPC socket file must exist");
     }
+
+    mod forward_txs;
 }

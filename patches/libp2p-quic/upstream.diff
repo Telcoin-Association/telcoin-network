@@ -86,10 +86,18 @@ index 9f9bd3ccddd5c1cbba003e6aff9be27787c5d8b8..e0c3b869e1c3a6de24690bf08d3c925a
 +[lints.rust]
 +unreachable_pub = "warn"
 diff --git upstream/src/config.rs patched/src/config.rs
-index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad58794a72 100644
+index 0d514db57516b19062e9b1f35781b6c95841be4a..0154b7986d06ed014c90dc7a025ba0c90499f89f 100644
 --- upstream/src/config.rs
 +++ patched/src/config.rs
-@@ -25,6 +25,8 @@ use quinn::{
+@@ -18,13 +18,15 @@
+ // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ // DEALINGS IN THE SOFTWARE.
+ 
+-use std::{sync::Arc, time::Duration};
++use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+ 
+ use quinn::{
+     MtuDiscoveryConfig, VarInt,
      crypto::rustls::{QuicClientConfig, QuicServerConfig},
  };
  
@@ -98,7 +106,7 @@ index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad
  /// Config for the transport.
  #[derive(Clone)]
  pub struct Config {
-@@ -71,6 +73,43 @@ pub struct Config {
+@@ -71,6 +73,58 @@ pub struct Config {
  
      /// Parameters governing MTU discovery. See [`MtuDiscoveryConfig`] for details.
      mtu_discovery_config: Option<MtuDiscoveryConfig>,
@@ -139,10 +147,25 @@ index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad
 +    /// Shared counters of the listener decisions. Keep a clone of the [`Arc`]
 +    /// before the transport is built to read them.
 +    pub incoming_stats: Arc<IncomingStats>,
++
++    /// Where a listener decides on inbound connection attempts and accepts them.
++    ///
++    /// `None` (default) keeps the inline path: the listener decides and accepts
++    /// inside `Transport::poll`, on the swarm task. `Some(capacity)`: each
++    /// listener spawns one task on the provider runtime that waits for attempts,
++    /// applies the Retry policy and the per-poll outcome cap, runs
++    /// `Incoming::accept`, and queues the accepted handshakes in a bounded channel
++    /// of `capacity` entries until the swarm takes them. The bound is explicit: at
++    /// most `capacity` accepted handshakes wait for the swarm, and
++    /// [`Config::max_incoming`] bounds the attempts ahead of them.
++    ///
++    /// A measurement prototype for telcoin-network issue #1741, not a production
++    /// default.
++    pub inbound_accept_task: Option<NonZeroUsize>,
  }
  
  #[expect(deprecated)]
-@@ -98,6 +137,13 @@ impl Config {
+@@ -98,6 +152,14 @@ impl Config {
              max_stream_data: 10_000_000,
              keypair: keypair.clone(),
              mtu_discovery_config: Some(Default::default()),
@@ -153,10 +176,11 @@ index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad
 +            incoming_buffer_size_total: None,
 +            max_incoming_outcomes_per_poll: 128,
 +            incoming_stats: Arc::new(IncomingStats::default()),
++            inbound_accept_task: None,
          }
      }
  
-@@ -139,6 +185,13 @@ impl From<Config> for QuinnConfig {
+@@ -139,6 +201,14 @@ impl From<Config> for QuinnConfig {
              handshake_timeout: _,
              keypair,
              mtu_discovery_config,
@@ -167,10 +191,11 @@ index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad
 +            incoming_buffer_size_total,
 +            max_incoming_outcomes_per_poll: _,
 +            incoming_stats,
++            inbound_accept_task: _,
          } = config;
          let mut transport = quinn::TransportConfig::default();
          // Disable uni-directional streams.
-@@ -160,6 +213,18 @@ impl From<Config> for QuinnConfig {
+@@ -160,6 +230,18 @@ impl From<Config> for QuinnConfig {
          // Long-term this should be enabled, however we then need to handle address change
          // on connections in the `Connection`.
          server_config.migration(false);
@@ -189,7 +214,7 @@ index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad
  
          let mut client_config = quinn::ClientConfig::new(client_tls_config);
          client_config.transport_config(transport);
-@@ -172,6 +237,7 @@ impl From<Config> for QuinnConfig {
+@@ -172,6 +254,7 @@ impl From<Config> for QuinnConfig {
              })
              .unwrap_or_default();
  
@@ -570,11 +595,74 @@ index 65c61f6e3bec84c85ea3ecce68b86592adb7427f..fe46fe8122a47ba40aeb2f6707fe2afd
  pub use provider::Provider;
  #[cfg(feature = "tokio")]
  pub use provider::tokio;
+diff --git upstream/src/provider/tokio.rs patched/src/provider/tokio.rs
+index 26436e557f2b2f29ee534143fc171ea517e09ad2..84e2227b22358bcea4e2bbb7e82fc2afc8311a2b 100644
+--- upstream/src/provider/tokio.rs
++++ patched/src/provider/tokio.rs
+@@ -19,6 +19,7 @@
+ // DEALINGS IN THE SOFTWARE.
+ 
+ use std::{
++    future::Future,
+     io,
+     net::{SocketAddr, UdpSocket},
+     task::{Context, Poll},
+@@ -57,6 +58,10 @@ impl super::Provider for Provider {
+         tokio::time::sleep(duration).boxed()
+     }
+ 
++    fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) {
++        tokio::spawn(future);
++    }
++
+     fn send_to<'a>(
+         udp_socket: &'a UdpSocket,
+         buf: &'a [u8],
+diff --git upstream/src/provider.rs patched/src/provider.rs
+index 5c2af397d314e582acedbdbe894fa95c3cdce3b6..695deee93db1eb5ab9b9234f4a56e1ff0c2f21f6 100644
+--- upstream/src/provider.rs
++++ patched/src/provider.rs
+@@ -19,6 +19,7 @@
+ // DEALINGS IN THE SOFTWARE.
+ 
+ use std::{
++    future::Future,
+     io,
+     net::{SocketAddr, UdpSocket},
+     task::{Context, Poll},
+@@ -56,6 +57,9 @@ pub trait Provider: Unpin + Send + Sized + 'static {
+     /// Sleep for specified amount of time.
+     fn sleep(duration: Duration) -> BoxFuture<'static, ()>;
+ 
++    /// Run `future` to completion as a detached task of the runtime.
++    fn spawn<F: Future<Output = ()> + Send + 'static>(future: F);
++
+     /// Sends data on the socket to the given address. On success,
+     /// returns the number of bytes written.
+     fn send_to<'a>(
 diff --git upstream/src/transport.rs patched/src/transport.rs
-index 78f633eebe8b037469a32e62b526cfebfc7e068a..283f844f9aaa039b6a457e053a2021920ebcd386 100644
+index 78f633eebe8b037469a32e62b526cfebfc7e068a..93671d83f179eec0d6a2b47240671293a334e0ca 100644
 --- upstream/src/transport.rs
 +++ patched/src/transport.rs
-@@ -52,6 +52,7 @@ use crate::{
+@@ -27,14 +27,15 @@ use std::{
+     hash::{Hash, Hasher},
+     io,
+     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
++    num::NonZeroUsize,
+     pin::Pin,
+     task::{Context, Poll, Waker},
+     time::Duration,
+ };
+ 
+ use futures::{
+-    channel::oneshot,
+-    future::{BoxFuture, Either},
++    channel::{mpsc, oneshot},
++    future::{AbortHandle, BoxFuture, Either},
+     prelude::*,
+     ready,
+     stream::{SelectAll, StreamExt},
+@@ -52,6 +53,7 @@ use crate::{
      ConnectError, Connecting, Connection, Error,
      config::{Config, QuinnConfig},
      hole_punching::hole_puncher,
@@ -582,40 +670,191 @@ index 78f633eebe8b037469a32e62b526cfebfc7e068a..283f844f9aaa039b6a457e053a202192
      provider::Provider,
  };
  
-@@ -82,6 +83,8 @@ pub struct GenTransport<P: Provider> {
+@@ -82,6 +84,10 @@ pub struct GenTransport<P: Provider> {
      waker: Option<Waker>,
      /// Holepunching attempts
      hole_punch_attempts: HashMap<SocketAddr, oneshot::Sender<Connecting>>,
 +    /// How listeners decide on incoming connection attempts.
 +    incoming_policy: IncomingPolicy,
++    /// See [`Config::inbound_accept_task`].
++    inbound_accept_task: Option<NonZeroUsize>,
  }
  
  #[expect(deprecated)]
-@@ -90,6 +93,7 @@ impl<P: Provider> GenTransport<P> {
+@@ -90,6 +96,8 @@ impl<P: Provider> GenTransport<P> {
      pub fn new(config: Config) -> Self {
          let handshake_timeout = config.handshake_timeout;
          let support_draft_29 = config.support_draft_29;
 +        let incoming_policy = IncomingPolicy::new(&config);
++        let inbound_accept_task = config.inbound_accept_task;
          let quinn_config = config.into();
          Self {
              listeners: SelectAll::new(),
-@@ -99,6 +103,7 @@ impl<P: Provider> GenTransport<P> {
+@@ -99,6 +107,8 @@ impl<P: Provider> GenTransport<P> {
              waker: None,
              support_draft_29,
              hole_punch_attempts: Default::default(),
 +            incoming_policy,
++            inbound_accept_task,
          }
      }
  
-@@ -235,6 +240,7 @@ impl<P: Provider> Transport for GenTransport<P> {
+@@ -235,6 +245,8 @@ impl<P: Provider> Transport for GenTransport<P> {
              endpoint,
              self.handshake_timeout,
              version,
 +            self.incoming_policy.clone(),
++            self.inbound_accept_task,
          )?;
          self.listeners.push(listener);
  
-@@ -449,6 +455,9 @@ struct Listener<P: Provider> {
+@@ -415,6 +427,134 @@ impl From<Error> for TransportError<Error> {
+     }
+ }
+ 
++/// What one `Incoming::accept` gives: the handshake, or its error.
++type AcceptResult = Result<quinn::Connecting, quinn::ConnectionError>;
++
++/// Where a [`Listener`] gets its incoming connection attempts from.
++/// See [`Config::inbound_accept_task`].
++enum AcceptSource {
++    /// The listener decides on the attempts and accepts them inside
++    /// `Transport::poll`, on the swarm task (the default).
++    Inline {
++        /// A future to poll new incoming connections.
++        accept: BoxFuture<'static, Option<quinn::Incoming>>,
++    },
++    /// A task of the provider runtime decides on the attempts and accepts them;
++    /// the accepted handshakes wait in a bounded queue until the swarm takes them.
++    Spawned {
++        /// The accepted handshakes, in order.
++        accepted: mpsc::Receiver<AcceptResult>,
++        /// Stops the task when the listener goes away.
++        abort: AbortHandle,
++    },
++}
++
++impl AcceptSource {
++    /// The inline source for `endpoint`.
++    fn inline(endpoint: &quinn::Endpoint) -> Self {
++        let endpoint = endpoint.clone();
++        AcceptSource::Inline {
++            accept: async move { endpoint.accept().await }.boxed(),
++        }
++    }
++
++    /// Spawn the accept task for `endpoint` on the runtime of `P` and return the
++    /// source that reads its queue.
++    ///
++    /// The queue holds `capacity` accepted handshakes: a futures channel holds its
++    /// buffer plus one entry per sender, and the task is the only sender.
++    fn spawned<P: Provider>(
++        endpoint: &quinn::Endpoint,
++        policy: &IncomingPolicy,
++        capacity: NonZeroUsize,
++    ) -> Self {
++        let (tx, accepted) = mpsc::channel(capacity.get().saturating_sub(1));
++        let state = AcceptTaskState {
++            endpoint: endpoint.clone(),
++            policy: policy.clone(),
++            outcomes_since_yield: 0,
++        };
++        let forward = futures::stream::unfold(state, AcceptTaskState::step)
++            .filter_map(std::future::ready)
++            .map(Ok::<AcceptResult, mpsc::SendError>)
++            .forward(tx);
++        let (task, abort) = futures::future::abortable(forward);
++        P::spawn(task.map(drop));
++        AcceptSource::Spawned { accepted, abort }
++    }
++}
++
++impl Drop for AcceptSource {
++    fn drop(&mut self) {
++        match self {
++            AcceptSource::Inline { .. } => {}
++            AcceptSource::Spawned { abort, .. } => abort.abort(),
++        }
++    }
++}
++
++/// The state of the accept task between two attempts.
++struct AcceptTaskState {
++    /// The listening endpoint.
++    endpoint: quinn::Endpoint,
++    /// How to decide on the attempts.
++    policy: IncomingPolicy,
++    /// Retry, Refuse or Ignore outcomes handled since the task last yielded.
++    outcomes_since_yield: usize,
++}
++
++impl AcceptTaskState {
++    /// Wait for the next attempt and decide on it. `None` when the endpoint closed.
++    /// The item is `None` for an attempt that got a Retry, Refuse or Ignore
++    /// outcome, and the result of `Incoming::accept` otherwise.
++    async fn step(mut self) -> Option<(Option<AcceptResult>, Self)> {
++        let incoming = self.endpoint.accept().await?;
++        if self.policy.retry_unvalidated && !incoming.remote_address_validated() {
++            self.policy.decide_unvalidated(incoming);
++            self.yield_at_budget().await;
++            Some((None, self))
++        } else {
++            self.outcomes_since_yield = 0;
++            Some((Some(incoming.accept()), self))
++        }
++    }
++
++    /// Count one Retry, Refuse or Ignore outcome. At
++    /// [`Config::max_incoming_outcomes_per_poll`] consecutive outcomes, count the
++    /// yield, yield to the executor once and start over, so that a stream of
++    /// attempts cannot keep the task from yielding.
++    async fn yield_at_budget(&mut self) {
++        self.outcomes_since_yield = self.outcomes_since_yield.saturating_add(1);
++        if self.outcomes_since_yield >= self.policy.max_outcomes_per_poll.max(1) {
++            self.policy.stats.inc_budget_yields();
++            YieldNow::default().await;
++            self.outcomes_since_yield = 0;
++        }
++    }
++}
++
++/// A future that is pending on its first poll, wakes its task at once, and is
++/// ready on the second poll.
++#[derive(Default)]
++struct YieldNow {
++    /// Whether the first poll happened.
++    polled: bool,
++}
++
++impl Future for YieldNow {
++    type Output = ();
++
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++        if self.polled {
++            Poll::Ready(())
++        } else {
++            self.polled = true;
++            cx.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++}
++
+ /// Listener for incoming connections.
+ struct Listener<P: Provider> {
+     /// Id of the listener.
+@@ -429,8 +569,8 @@ struct Listener<P: Provider> {
+     /// An underlying copy of the socket to be able to hole punch with
+     socket: UdpSocket,
+ 
+-    /// A future to poll new incoming connections.
+-    accept: BoxFuture<'static, Option<quinn::Incoming>>,
++    /// Where the incoming connection attempts come from.
++    accept_source: AcceptSource,
+     /// Timeout for connection establishment on inbound connections.
+     handshake_timeout: Duration,
+ 
+@@ -449,6 +589,9 @@ struct Listener<P: Provider> {
      close_listener_waker: Option<Waker>,
  
      listening_addresses: HashSet<IpAddr>,
@@ -625,15 +864,35 @@ index 78f633eebe8b037469a32e62b526cfebfc7e068a..283f844f9aaa039b6a457e053a202192
  }
  
  impl<P: Provider> Listener<P> {
-@@ -458,6 +467,7 @@ impl<P: Provider> Listener<P> {
+@@ -458,6 +601,8 @@ impl<P: Provider> Listener<P> {
          endpoint: quinn::Endpoint,
          handshake_timeout: Duration,
          version: ProtocolVersion,
 +        incoming_policy: IncomingPolicy,
++        inbound_accept_task: Option<NonZeroUsize>,
      ) -> Result<Self, Error> {
          let if_watcher;
          let pending_event;
-@@ -491,9 +501,44 @@ impl<P: Provider> Listener<P> {
+@@ -476,13 +621,15 @@ impl<P: Provider> Listener<P> {
+             })
+         }
+ 
+-        let endpoint_c = endpoint.clone();
+-        let accept = async move { endpoint_c.accept().await }.boxed();
++        let accept_source = inbound_accept_task.map_or_else(
++            || AcceptSource::inline(&endpoint),
++            |capacity| AcceptSource::spawned::<P>(&endpoint, &incoming_policy, capacity),
++        );
+ 
+         Ok(Listener {
+             endpoint,
+             socket,
+-            accept,
++            accept_source,
+             listener_id,
+             version,
+             handshake_timeout,
+@@ -491,9 +638,98 @@ impl<P: Provider> Listener<P> {
              pending_event,
              close_listener_waker: None,
              listening_addresses,
@@ -641,77 +900,133 @@ index 78f633eebe8b037469a32e62b526cfebfc7e068a..283f844f9aaa039b6a457e053a202192
          })
      }
  
-+    /// Poll for the next incoming attempt that gets a handshake, and re-arm the
-+    /// accept future.
++    /// Poll for the next accepted handshake (or the error of its
++    /// `Incoming::accept`). `Poll::Ready(None)` means that the endpoint closed.
 +    ///
-+    /// When [`Config::retry_unvalidated_incoming`] is set, attempts from addresses
++    /// With the inline source ([`Config::inbound_accept_task`] is `None`) this
++    /// decides on the attempts here, on the swarm task: when
++    /// [`Config::retry_unvalidated_incoming`] is set, attempts from addresses
 +    /// that are not validated get a Retry (or Ignore / Refuse) here and never reach
 +    /// the caller. At most [`Config::max_incoming_outcomes_per_poll`] such outcomes
 +    /// are handled per call. Then the task is woken and `Poll::Pending` is returned,
 +    /// so that the task yields to the executor. After each outcome the new accept
 +    /// future is polled, so that it registers the waker.
-+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<quinn::Incoming>> {
-+        let budget = self.incoming_policy.max_outcomes_per_poll.max(1);
-+        let flow = (0..budget).try_fold((), |(), _| match self.accept.poll_unpin(cx) {
-+            Poll::Ready(Some(incoming)) => {
-+                let endpoint = self.endpoint.clone();
-+                self.accept = async move { endpoint.accept().await }.boxed();
-+                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated() {
-+                    self.incoming_policy.decide_unvalidated(incoming);
-+                    std::ops::ControlFlow::Continue(())
-+                } else {
-+                    std::ops::ControlFlow::Break(Poll::Ready(Some(incoming)))
++    ///
++    /// With the spawned source the accept task did all of that, and this only
++    /// takes the next entry out of the bounded queue.
++    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<AcceptResult>> {
++        let Listener {
++            accept_source,
++            endpoint,
++            incoming_policy,
++            ..
++        } = self;
++        match accept_source {
++            AcceptSource::Inline { accept } => {
++                let budget = incoming_policy.max_outcomes_per_poll.max(1);
++                let flow = (0..budget).try_fold((), |(), _| match accept.poll_unpin(cx) {
++                    Poll::Ready(Some(incoming)) => {
++                        let endpoint = endpoint.clone();
++                        *accept = async move { endpoint.accept().await }.boxed();
++                        if incoming_policy.retry_unvalidated && !incoming.remote_address_validated()
++                        {
++                            incoming_policy.decide_unvalidated(incoming);
++                            std::ops::ControlFlow::Continue(())
++                        } else {
++                            std::ops::ControlFlow::Break(Poll::Ready(Some(incoming)))
++                        }
++                    }
++                    other => std::ops::ControlFlow::Break(other),
++                });
++                match flow {
++                    std::ops::ControlFlow::Break(poll) => {
++                        poll.map(|incoming| incoming.map(quinn::Incoming::accept))
++                    }
++                    std::ops::ControlFlow::Continue(()) => {
++                        incoming_policy.stats.inc_budget_yields();
++                        cx.waker().wake_by_ref();
++                        Poll::Pending
++                    }
 +                }
 +            }
-+            other => std::ops::ControlFlow::Break(other),
-+        });
-+        match flow {
-+            std::ops::ControlFlow::Break(poll) => poll,
-+            std::ops::ControlFlow::Continue(()) => {
-+                self.incoming_policy.stats.inc_budget_yields();
-+                cx.waker().wake_by_ref();
-+                Poll::Pending
-+            }
++            AcceptSource::Spawned { accepted, .. } => accepted.poll_next_unpin(cx),
 +        }
++    }
++
++    /// Count an accepted handshake and build the [`TransportEvent::Incoming`] for it.
++    fn incoming_event(&self, connecting: quinn::Connecting) -> <Self as Stream>::Item {
++        self.incoming_policy.stats.inc_accepted();
++
++        let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
++        let remote_addr = connecting.remote_address();
++        let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
++
++        TransportEvent::Incoming {
++            upgrade: Connecting::new(connecting, self.handshake_timeout)
++                .observe_incoming(&self.incoming_policy.stats),
++            local_addr,
++            send_back_addr,
++            listener_id: self.listener_id,
++        }
++    }
++
++    /// Count a failed `Incoming::accept` and build the
++    /// [`TransportEvent::ListenerError`] for it.
++    fn accept_failed_event(&self, error: quinn::ConnectionError) -> <Self as Stream>::Item {
++        self.incoming_policy.stats.inc_accept_failed();
++        TransportEvent::ListenerError {
++            listener_id: self.listener_id,
++            error: Error::Connection(crate::ConnectionError(error)),
++        }
++    }
++
++    /// The event for the result of one `Incoming::accept`.
++    fn accepted_event(&self, accepted: AcceptResult) -> <Self as Stream>::Item {
++        accepted.map_or_else(
++            |error| self.accept_failed_event(error),
++            |connecting| self.incoming_event(connecting),
++        )
 +    }
 +
      /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
      /// terminate the stream.
      fn close(&mut self, reason: Result<(), Error>) {
-@@ -587,14 +632,12 @@ impl<P: Provider> Stream for Listener<P> {
+@@ -587,32 +823,9 @@ impl<P: Provider> Stream for Listener<P> {
                  return Poll::Ready(Some(event));
              }
  
 -            match self.accept.poll_unpin(cx) {
-+            match self.poll_accept(cx) {
-                 Poll::Ready(Some(incoming)) => {
+-                Poll::Ready(Some(incoming)) => {
 -                    let endpoint = self.endpoint.clone();
 -                    self.accept = async move { endpoint.accept().await }.boxed();
 -
-                     let connecting = match incoming.accept() {
-                         Ok(connecting) => connecting,
-                         Err(error) => {
-+                            self.incoming_policy.stats.inc_accept_failed();
-                             return Poll::Ready(Some(TransportEvent::ListenerError {
-                                 listener_id: self.listener_id,
-                                 error: Error::Connection(crate::ConnectionError(error)),
-@@ -602,12 +645,15 @@ impl<P: Provider> Stream for Listener<P> {
-                         }
-                     };
- 
-+                    self.incoming_policy.stats.inc_accepted();
-+
-                     let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
-                     let remote_addr = connecting.remote_address();
-                     let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
- 
-                     let event = TransportEvent::Incoming {
+-                    let connecting = match incoming.accept() {
+-                        Ok(connecting) => connecting,
+-                        Err(error) => {
+-                            return Poll::Ready(Some(TransportEvent::ListenerError {
+-                                listener_id: self.listener_id,
+-                                error: Error::Connection(crate::ConnectionError(error)),
+-                            }));
+-                        }
+-                    };
+-
+-                    let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
+-                    let remote_addr = connecting.remote_address();
+-                    let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
+-
+-                    let event = TransportEvent::Incoming {
 -                        upgrade: Connecting::new(connecting, self.handshake_timeout),
-+                        upgrade: Connecting::new(connecting, self.handshake_timeout)
-+                            .observe_incoming(&self.incoming_policy.stats),
-                         local_addr,
-                         send_back_addr,
-                         listener_id: self.listener_id,
+-                        local_addr,
+-                        send_back_addr,
+-                        listener_id: self.listener_id,
+-                    };
+-                    return Poll::Ready(Some(event));
++            match self.poll_accept(cx) {
++                Poll::Ready(Some(accepted)) => {
++                    return Poll::Ready(Some(self.accepted_event(accepted)));
+                 }
+                 Poll::Ready(None) => {
+                     self.close(Ok(()));
 diff --git upstream/tests/stream_compliance.rs upstream/tests/stream_compliance.rs
 deleted file mode 100644
 index 8712ba15e199a3a40aba95179d8583fef83c1e2d..0000000000000000000000000000000000000000

@@ -52,6 +52,8 @@ struct SwarmMetricHandles {
     gossip_rejected_total: Counter,
     /// Inbound provider announcements dropped by the per-source rate limit.
     add_provider_rate_limited_total: Counter,
+    /// Inbound provider announcements dropped because the provider is not the local peer.
+    add_provider_remote_dropped_total: Counter,
     /// Graceful peer-exchange disconnects awaiting the peer's ack.
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
@@ -498,6 +500,119 @@ impl ConnectionDirection {
     }
 }
 
+/// The direction label of the handshake-time histogram (issue #1741 measurement companion).
+///
+/// The label values are spelled out (`inbound`, `outbound`) so the qualification tooling reads
+/// them without a translation table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandshakeDirection {
+    /// The remote opened the connection; the sample is the accept-side handshake time.
+    Inbound,
+    /// This node dialed the connection; the sample is the honest dial handshake time.
+    Outbound,
+}
+
+impl HandshakeDirection {
+    /// Every direction, in label order. The tests count one series per direction.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Inbound, Self::Outbound];
+
+    /// The direction of an established connection from the swarm's view of its endpoint.
+    pub(crate) fn from_dialer(dialer: bool) -> Self {
+        if dialer {
+            Self::Outbound
+        } else {
+            Self::Inbound
+        }
+    }
+
+    /// The metric label value for this direction.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+/// One pre-resolved metric handle per [`HandshakeDirection`].
+#[derive(Clone)]
+struct PerHandshakeDirection<T> {
+    /// The handle for [`HandshakeDirection::Inbound`].
+    inbound: T,
+    /// The handle for [`HandshakeDirection::Outbound`].
+    outbound: T,
+}
+
+impl<T> PerHandshakeDirection<T> {
+    /// Resolve one handle per direction.
+    fn new(mut resolve: impl FnMut(HandshakeDirection) -> T) -> Self {
+        Self {
+            inbound: resolve(HandshakeDirection::Inbound),
+            outbound: resolve(HandshakeDirection::Outbound),
+        }
+    }
+
+    /// The handle for `direction`.
+    fn get(&self, direction: HandshakeDirection) -> &T {
+        match direction {
+            HandshakeDirection::Inbound => &self.inbound,
+            HandshakeDirection::Outbound => &self.outbound,
+        }
+    }
+}
+
+/// The outcome label of the outbound request round-trip histogram (issue #1741 measurement
+/// companion).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutboundRequestOutcome {
+    /// The peer answered; the sample is the send-to-response round trip.
+    Response,
+    /// The request ended without a response (an outbound failure or a peer disconnect).
+    Failure,
+}
+
+impl OutboundRequestOutcome {
+    /// Every outcome, in label order. The tests count one series per outcome.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Response, Self::Failure];
+
+    /// The metric label value for this outcome.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Response => "response",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// One pre-resolved metric handle per [`OutboundRequestOutcome`].
+#[derive(Clone)]
+struct PerOutboundRequestOutcome<T> {
+    /// The handle for [`OutboundRequestOutcome::Response`].
+    response: T,
+    /// The handle for [`OutboundRequestOutcome::Failure`].
+    failure: T,
+}
+
+impl<T> PerOutboundRequestOutcome<T> {
+    /// Resolve one handle per outcome.
+    fn new(mut resolve: impl FnMut(OutboundRequestOutcome) -> T) -> Self {
+        Self {
+            response: resolve(OutboundRequestOutcome::Response),
+            failure: resolve(OutboundRequestOutcome::Failure),
+        }
+    }
+
+    /// The handle for `outcome`.
+    fn get(&self, outcome: OutboundRequestOutcome) -> &T {
+        match outcome {
+            OutboundRequestOutcome::Response => &self.response,
+            OutboundRequestOutcome::Failure => &self.failure,
+        }
+    }
+}
+
 /// How a forwarded inbound request ended without a response.
 ///
 /// `inbound_request_service_seconds` observes only answered requests, so this outcome is the
@@ -596,6 +711,8 @@ struct PerShedReason<T> {
     queue_full: T,
     /// The handle for [`ShedReason::Unsubscribed`].
     unsubscribed: T,
+    /// The handle for [`ShedReason::QueueBudget`].
+    queue_budget: T,
     /// The handle for [`ShedReason::Admission`].
     admission: T,
     /// The handle for [`ShedReason::ServeBudget`].
@@ -608,6 +725,7 @@ impl<T> PerShedReason<T> {
         Self {
             queue_full: resolve(ShedReason::QueueFull),
             unsubscribed: resolve(ShedReason::Unsubscribed),
+            queue_budget: resolve(ShedReason::QueueBudget),
             admission: resolve(ShedReason::Admission),
             serve_budget: resolve(ShedReason::ServeBudget),
         }
@@ -618,6 +736,7 @@ impl<T> PerShedReason<T> {
         match reason {
             ShedReason::QueueFull => &self.queue_full,
             ShedReason::Unsubscribed => &self.unsubscribed,
+            ShedReason::QueueBudget => &self.queue_budget,
             ShedReason::Admission => &self.admission,
             ShedReason::ServeBudget => &self.serve_budget,
         }
@@ -824,6 +943,10 @@ struct LabeledHandles {
     listeners_closed: KeyedCounters<ListenerCloseOutcome>,
     /// `outbound_request_failures_total` per failure kind.
     outbound_failed: PerOutboundFailure,
+    /// `connection_established_seconds` per direction (issue #1741 measurement companion).
+    connection_established: PerHandshakeDirection<Histogram>,
+    /// `outbound_request_duration_seconds` per outcome (issue #1741 measurement companion).
+    outbound_request_duration: PerOutboundRequestOutcome<Histogram>,
 }
 
 impl fmt::Debug for LabeledHandles {
@@ -890,6 +1013,20 @@ impl LabeledHandles {
             listeners_closed: KeyedCounters::new(ListenerCloseOutcome::ALL, |outcome| {
                 metrics::counter!(
                     "tn_network.listeners_closed_total",
+                    "network" => network.to_owned(),
+                    "outcome" => outcome.label(),
+                )
+            }),
+            connection_established: PerHandshakeDirection::new(|direction| {
+                metrics::histogram!(
+                    "tn_network.connection_established_seconds",
+                    "network" => network.to_owned(),
+                    "direction" => direction.label(),
+                )
+            }),
+            outbound_request_duration: PerOutboundRequestOutcome::new(|outcome| {
+                metrics::histogram!(
+                    "tn_network.outbound_request_duration_seconds",
                     "network" => network.to_owned(),
                     "outcome" => outcome.label(),
                 )
@@ -1038,9 +1175,11 @@ impl SwarmMetrics {
         quic: &QuicConfig,
         budget: Option<SwarmNetworkBudget>,
     ) -> Self {
-        self.handles
-            .established_connection_limit
-            .set(f64::from(budget.map_or(0, |budget| budget.connections())));
+        self.handles.established_connection_limit.set(f64::from(
+            budget.map_or(crate::consensus::MAX_ESTABLISHED_CONNECTIONS, |budget| {
+                budget.connections()
+            }),
+        ));
         self.handles
             .inbound_streams_per_connection_limit
             .set(f64::from(quic.max_concurrent_stream_limit));
@@ -1116,6 +1255,12 @@ impl SwarmMetrics {
     /// Record an inbound provider announcement dropped before a store write.
     pub(crate) fn record_add_provider_rate_limited(&self) {
         self.handles.add_provider_rate_limited_total.increment(1);
+    }
+
+    /// Record an inbound provider announcement from a remote provider, dropped before a store
+    /// write.
+    pub(crate) fn record_add_provider_remote_dropped(&self) {
+        self.handles.add_provider_remote_dropped_total.increment(1);
     }
 
     /// Update the in-flight request gauges (called once per event-loop iteration).
@@ -1219,6 +1364,30 @@ impl SwarmMetrics {
         self.labeled.service_seconds.get(class).record(elapsed.as_secs_f64());
     }
 
+    /// Record the handshake time of a newly established connection by direction.
+    ///
+    /// `established_in` is the swarm's own measurement from the dial or the accept to the
+    /// established event. The outbound samples are the honest dial handshake time of issue
+    /// #1741; with `connections_established_total{direction="out"}` and `dial_failures_total`
+    /// they give the honest dial success fraction.
+    pub(crate) fn record_connection_established(
+        &self,
+        direction: HandshakeDirection,
+        established_in: Duration,
+    ) {
+        self.labeled.connection_established.get(direction).record(established_in.as_secs_f64());
+    }
+
+    /// Record the client-side round trip of an outbound consensus request, from the send to
+    /// its response or to its failure, under the fixed `outcome` label.
+    pub(crate) fn record_outbound_request_duration(
+        &self,
+        outcome: OutboundRequestOutcome,
+        elapsed: Duration,
+    ) {
+        self.labeled.outbound_request_duration.get(outcome).record(elapsed.as_secs_f64());
+    }
+
     /// Count a forwarded inbound request of `class` that ended without a response.
     pub(crate) fn record_inbound_failure(
         &self,
@@ -1236,7 +1405,9 @@ impl SwarmMetrics {
     /// Count a forward to the application that did not queue its work as shed.
     ///
     /// A full queue counts as [`ShedReason::QueueFull`]. A queue with no subscriber drops the
-    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A closed queue
+    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A queue with no
+    /// subscriber that already holds its gap cap drops the work too, so it counts as
+    /// [`ShedReason::QueueBudget`]. A closed queue
     /// occurs at the epoch boundary, not under load, so it is not counted. A broadcast failure
     /// is not a full queue, so it is not counted either.
     pub(crate) fn record_forward<T>(
@@ -1254,6 +1425,7 @@ impl SwarmMetrics {
                 |outcome| match outcome {
                     TrySendOutcome::Queued => None,
                     TrySendOutcome::Unsubscribed => Some(ShedReason::Unsubscribed),
+                    TrySendOutcome::OverBudget => Some(ShedReason::QueueBudget),
                 },
             )
             .into_iter()
@@ -1285,6 +1457,14 @@ struct PeerManagerMetricHandles {
     discovery_peers: Gauge,
     /// Peers currently banned.
     banned_peers: Gauge,
+    /// Members of the current committee; zero until a committee is known.
+    committee_size: Gauge,
+    /// Committee peers this node expects to reach: `committee_size` minus one when this node is a
+    /// current member, else 0 (the committee alerts skip non-members).
+    committee_peers_expected: Gauge,
+    /// Unique current committee members (by BLS key) with at least one established
+    /// connection on this network; members of only the previous committee are not counted.
+    committee_peers_connected: Gauge,
     /// Connections closed (all directions).
     connections_closed_total: Counter,
     /// Failed dial attempts.
@@ -1417,6 +1597,25 @@ impl PeerManagerMetrics {
         self.handles.known_peers.set(known as f64);
         self.handles.discovery_peers.set(discovery as f64);
         self.handles.banned_peers.set(banned as f64);
+    }
+
+    /// Update the committee connectivity gauges (called from the peer manager heartbeat and
+    /// after every committee update).
+    pub(crate) fn set_committee_connectivity(
+        &self,
+        size: usize,
+        expected: usize,
+        connected: usize,
+    ) {
+        self.handles.committee_size.set(Self::gauge_value(size));
+        self.handles.committee_peers_expected.set(Self::gauge_value(expected));
+        self.handles.committee_peers_connected.set(Self::gauge_value(connected));
+    }
+
+    /// Convert a peer count to a gauge value without a lossy cast; counts above `u32::MAX`
+    /// saturate.
+    fn gauge_value(count: usize) -> f64 {
+        f64::from(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Record an established connection by direction ({`in`, `out`}).
@@ -1683,9 +1882,9 @@ mod tests {
             })
         };
         assert!(gauge_is("tn_network.established_connections", 7.0));
-        assert!(gauge_is("tn_network.established_connection_limit", 0.0));
-        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 10_000.0));
-        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 104_857_600.0));
+        assert!(gauge_is("tn_network.established_connection_limit", 128.0));
+        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 256.0));
+        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 4_194_304.0));
         assert!(snapshot.iter().any(|(key, _, _, value)| key.key().name()
             == "tn_network.connection_limit_rejections_total"
             && key
@@ -1847,7 +2046,9 @@ mod tests {
             let first = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
             let second = PeerManagerMetrics::new_for(&NetworkType::Worker(1));
             first.set_peer_counts(3, 3, 3, 3);
+            first.set_committee_connectivity(3, 3, 3);
             second.set_peer_counts(7, 7, 7, 7);
+            second.set_committee_connectivity(7, 7, 7);
             [&first, &second].into_iter().for_each(|peers| {
                 peers.record_connection_established("in");
                 peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
@@ -1875,6 +2076,9 @@ mod tests {
                 "tn_network.known_peers",
                 "tn_network.discovery_peers",
                 "tn_network.banned_peers",
+                "tn_network.committee_size",
+                "tn_network.committee_peers_expected",
+                "tn_network.committee_peers_connected",
             ]
             .into_iter()
             .for_each(|name| {
@@ -1933,6 +2137,41 @@ mod tests {
             assert_eq!(super::ConnectionLimitReason::from_text(&text).label(), *label);
         });
         assert_eq!(super::ConnectionLimitReason::from_text("other text").label(), "unknown");
+    }
+
+    /// The committee gauges start at zero and carry the values the peer manager writes, each
+    /// under the `network` label only.
+    #[test]
+    fn committee_connectivity_gauges_follow_setter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            // no committee is known on worker-1, so its gauges stay at zero
+            let _unset = PeerManagerMetrics::new_for(&NetworkType::Worker(1));
+            PeerManagerMetrics::new_for(&NetworkType::Primary).set_committee_connectivity(5, 4, 3);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge_is = |name: &str, network: &str, expected: f64| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key.key().labels().count() == 1
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| label.key() == "network" && label.value() == network)
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        [
+            ("tn_network.committee_size", 5.0),
+            ("tn_network.committee_peers_expected", 4.0),
+            ("tn_network.committee_peers_connected", 3.0),
+        ]
+        .into_iter()
+        .for_each(|(name, expected)| {
+            assert!(gauge_is(name, "primary", expected), "{name} must carry the primary value");
+            assert!(gauge_is(name, "worker-1", 0.0), "{name} must start at zero");
+        });
     }
 
     /// Every counter in the recorder as `(key, value)` pairs.
@@ -2202,6 +2441,120 @@ mod tests {
                     count(&after, name, &labels),
                     Some(*times),
                     "{name} must count {network}'s events separately"
+                );
+            });
+        });
+    }
+
+    /// Every histogram in the recorder as `(key, sample count)` pairs.
+    fn histograms(recorder: &DebuggingRecorder) -> Vec<(metrics::Key, usize)> {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Histogram(samples) => Some((key.key().clone(), samples.len())),
+                DebugValue::Counter(_) | DebugValue::Gauge(_) => None,
+            })
+            .collect()
+    }
+
+    /// The sample count of the histogram `name` whose labels include every pair in `labels`.
+    fn samples(
+        histograms: &[(metrics::Key, usize)],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<usize> {
+        histograms
+            .iter()
+            .find(|(key, _)| {
+                key.name() == name
+                    && labels.iter().all(|(label, value)| {
+                        key.labels().any(|found| found.key() == *label && found.value() == *value)
+                    })
+            })
+            .map(|(_, count)| *count)
+    }
+
+    /// `connection_established_seconds` moves the sample count of the observed direction only
+    /// and exposes exactly one series per direction label.
+    #[test]
+    fn connection_established_seconds_records_by_direction() {
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+            let outbound = HandshakeDirection::Outbound;
+            swarm.record_connection_established(outbound, Duration::from_millis(40));
+            swarm.record_connection_established(outbound, Duration::from_millis(60));
+            let inbound = HandshakeDirection::Inbound;
+            swarm.record_connection_established(inbound, Duration::from_millis(5));
+        });
+        let histograms = histograms(&recorder);
+        let name = "tn_network.connection_established_seconds";
+        let primary = ("network", "primary");
+        assert_eq!(samples(&histograms, name, &[primary, ("direction", "outbound")]), Some(2));
+        assert_eq!(samples(&histograms, name, &[primary, ("direction", "inbound")]), Some(1));
+        let series = histograms.iter().filter(|(key, _)| key.name() == name).count();
+        assert_eq!(series, HandshakeDirection::ALL.len());
+    }
+
+    /// `outbound_request_duration_seconds` moves the sample count of the observed outcome only
+    /// and exposes exactly one series per outcome label.
+    #[test]
+    fn outbound_request_duration_seconds_records_by_outcome() {
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+            let response = OutboundRequestOutcome::Response;
+            swarm.record_outbound_request_duration(response, Duration::from_millis(12));
+            swarm.record_outbound_request_duration(response, Duration::from_millis(18));
+            let failure = OutboundRequestOutcome::Failure;
+            swarm.record_outbound_request_duration(failure, Duration::from_secs(10));
+        });
+        let histograms = histograms(&recorder);
+        let name = "tn_network.outbound_request_duration_seconds";
+        let primary = ("network", "primary");
+        assert_eq!(samples(&histograms, name, &[primary, ("outcome", "response")]), Some(2));
+        assert_eq!(samples(&histograms, name, &[primary, ("outcome", "failure")]), Some(1));
+        let series = histograms.iter().filter(|(key, _)| key.name() == name).count();
+        assert_eq!(series, OutboundRequestOutcome::ALL.len());
+    }
+
+    /// The two measurement histograms keep one worker's samples out of another worker's series.
+    #[test]
+    fn measurement_histograms_are_isolated_per_swarm() {
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            [(NetworkType::Worker(0), 3), (NetworkType::Worker(1), 7)].into_iter().for_each(
+                |(network, count)| {
+                    let swarm = SwarmMetrics::new_for(&network);
+                    (0..count).for_each(|_| {
+                        swarm.record_connection_established(
+                            HandshakeDirection::Outbound,
+                            Duration::from_millis(1),
+                        );
+                        swarm.record_outbound_request_duration(
+                            OutboundRequestOutcome::Response,
+                            Duration::from_millis(1),
+                        );
+                    });
+                },
+            );
+        });
+        let histograms = histograms(&recorder);
+        [("worker-0", 3), ("worker-1", 7)].into_iter().for_each(|(network, expected)| {
+            let labels = ("network", network);
+            [
+                ("tn_network.connection_established_seconds", ("direction", "outbound")),
+                ("tn_network.outbound_request_duration_seconds", ("outcome", "response")),
+            ]
+            .into_iter()
+            .for_each(|(name, label)| {
+                assert_eq!(
+                    samples(&histograms, name, &[labels, label]),
+                    Some(expected),
+                    "{name} must retain {network}'s sample count"
                 );
             });
         });

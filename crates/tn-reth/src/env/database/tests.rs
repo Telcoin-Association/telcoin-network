@@ -8,7 +8,7 @@ use reth_db::{
     transaction::{DbTx as _, DbTxMut as _},
     Database as _,
 };
-use reth_node_builder::NodeConfig;
+use reth_node_core::node_config::NodeConfig;
 use reth_primitives_traits::{Bytecode, StorageEntry};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -23,7 +23,7 @@ fn test_db_args() -> DatabaseArgs {
 fn config(db: DatabaseArgs) -> RethConfig {
     crate::init_reth_defaults();
     let chain = Arc::new(test_genesis().into());
-    RethConfig(NodeConfig { chain, db, ..NodeConfig::default() })
+    RethConfig::from_node_config(NodeConfig { chain, db, ..NodeConfig::default() })
 }
 
 /// This build's data file, and the other build's.

@@ -289,19 +289,21 @@ pub(crate) fn send_term(child: &mut Child) {
 }
 
 /// Gracefully shut down a child process: SIGTERM -> poll up to 6s -> SIGKILL -> wait.
-pub(crate) fn kill_child(child: &mut Child) {
+///
+/// Returns whether the child exited on its own after the SIGTERM, without the SIGKILL.
+pub(crate) fn kill_child(child: &mut Child) -> bool {
     send_term(child);
-    wait_or_kill(child);
+    wait_or_kill(child)
 }
 
 /// Poll for exit up to 5 times (1.2s each), then SIGKILL + wait.
-/// Assumes SIGTERM has already been sent.
-fn wait_or_kill(child: &mut Child) {
+/// Assumes SIGTERM has already been sent. Returns whether the child exited before the SIGKILL.
+fn wait_or_kill(child: &mut Child) -> bool {
     for _ in 0..5 {
         match child.try_wait() {
             Ok(Some(_)) => {
                 info!(target: "e2e-test", "child exited");
-                return;
+                return true;
             }
             Ok(None) => {}
             Err(e) => error!(target: "e2e-test", "error waiting on child to exit: {e}"),
@@ -309,6 +311,7 @@ fn wait_or_kill(child: &mut Child) {
         std::thread::sleep(Duration::from_millis(1200));
     }
     force_kill_and_reap(child);
+    false
 }
 
 /// SIGKILL a child that did not exit within its SIGTERM grace, then reap it.
@@ -566,7 +569,7 @@ pub(crate) fn advertise_worker_rpc(
     Ok(())
 }
 
-/// Start a process running an observer node.
+/// Start a process running the observer node whose datadir is `base_dir/observer`.
 pub(crate) fn start_observer(
     instance: usize,
     bin: &'static TestBinary,
@@ -575,10 +578,39 @@ pub(crate) fn start_observer(
     test: &str,
     run: u32,
 ) -> Child {
-    let data_dir = base_dir.join("observer");
+    start_observer_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start an observer node process with additional CLI arguments (e.g. `--forward-txs`).
+pub(crate) fn start_observer_with_args(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+) -> Child {
+    start_named_observer(instance, bin, base_dir, "observer", rpc_port, test, run, extra_args)
+}
+
+/// Start a process running the observer node whose datadir is `base_dir/<name>`, as set up by
+/// [`e2e_tests::config_observer`], with additional CLI arguments.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_named_observer(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    name: &str,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+) -> Child {
+    let data_dir = base_dir.join(name);
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
-    let ipc_path = base_dir.join("observer.ipc");
+    let ipc_path = base_dir.join(format!("{name}.ipc"));
     let mut command = bin.command();
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
@@ -595,6 +627,8 @@ pub(crate) fn start_observer(
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
+
+    command.args(extra_args);
 
     setup_log_dir(&mut command, instance, test, run);
 
@@ -651,6 +685,15 @@ pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> 
 /// establish whether a transient mode occurred between calls.
 pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
     call_rpc(node, "tn_nodeMode", rpc_params![], 0, "tn_nodeMode")
+}
+
+/// Wait for a stable membership-derived role, with the URL and expected role in timeout errors.
+pub(crate) fn wait_for_node_mode(node: &str, expected: NodeMode) -> eyre::Result<()> {
+    wait_until_blocking(
+        Duration::from_secs(30),
+        &format!("node {node} entered {expected:?}"),
+        || Ok(get_node_mode(node).is_ok_and(|mode| mode == expected)),
+    )
 }
 
 /// Scrape the metrics endpoint with a raw HTTP GET (no client dependencies).

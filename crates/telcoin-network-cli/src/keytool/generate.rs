@@ -5,13 +5,15 @@ use crate::{
     keytool::{pop::PopArgs, set_rpc::build_worker_rpc},
 };
 use clap::{value_parser, Args, Subcommand};
-use std::{collections::HashSet, net::UdpSocket};
+use std::collections::HashSet;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
 use tn_types::{
-    Address, BlsPublicKey, Multiaddr, P2pNode, Protocol, RpcInfo, WorkerId, DEFAULT_WORKER_ID,
+    get_available_udp_port, Address, BlsPublicKey, Multiaddr, P2pNode, Protocol, RpcInfo, WorkerId,
+    DEFAULT_WORKER_ID,
 };
 use tracing::info;
 use url::Url;
+use zeroize::Zeroizing;
 
 /// Sign the proof of possession for `address` from `key_config` and write the
 /// PoP-derived fields (`bls_public_key`, `proof_of_possession`, `execution_address`)
@@ -165,15 +167,18 @@ pub struct KeygenArgs {
     pub rpc_ws: Option<Url>,
 }
 
-/// Reserve a local UDP port until every network address has been allocated.
+/// Allocate a local QUIC address on a UDP port that no earlier call in this process got.
 ///
-/// Keeping the sockets open prevents the OS from returning the same port for another worker.
-fn local_network_address(sockets: &mut Vec<UdpSocket>) -> eyre::Result<Multiaddr> {
-    let socket = UdpSocket::bind(("127.0.0.1", 0))?;
-    let port = socket.local_addr()?.port();
-    let address = format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse()?;
-    sockets.push(socket);
-    Ok(address)
+/// [`get_available_udp_port`] records each port that it returns in a process-wide set and
+/// does not return a recorded port again. Thus the primary and the workers of one validator
+/// get different ports. Different validators that one process generates also get different
+/// ports (the e2e harness generates all of its validators in one process).
+fn local_network_address() -> eyre::Result<Multiaddr> {
+    get_available_udp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no local UDP port is available for a network address"))
+        .and_then(|port| {
+            format!("/ip4/127.0.0.1/udp/{port}/quic-v1").parse::<Multiaddr>().map_err(Into::into)
+        })
 }
 
 impl KeygenArgs {
@@ -190,14 +195,13 @@ impl KeygenArgs {
             )
         });
 
-        // Reserve default ports across the primary and all workers until the layout is complete.
-        let mut sockets = Vec::new();
+        // Default addresses use process-unique local UDP ports (see `local_network_address`).
         let network_publickey = key_config.primary_network_public_key();
         node_info.p2p_info.primary.network_key = network_publickey.clone();
         node_info.p2p_info.primary.network_address = self
             .external_primary_addr
             .as_ref()
-            .map_or_else(|| local_network_address(&mut sockets), |addr| Ok(addr.clone()))?
+            .map_or_else(local_network_address, |addr| Ok(addr.clone()))?
             .with_p2p(network_publickey.into())
             .map_err(|_| {
                 eyre::eyre!("Primary address already contains a different P2P protocol")
@@ -213,7 +217,7 @@ impl KeygenArgs {
                     .external_worker_addrs
                     .as_ref()
                     .and_then(|addrs| addrs.get(usize::from(worker_id)))
-                    .map_or_else(|| local_network_address(&mut sockets), |addr| Ok(addr.clone()))?
+                    .map_or_else(local_network_address, |addr| Ok(addr.clone()))?
                     .with_p2p(network_key.clone().into())
                     .map_err(|_| {
                         eyre::eyre!("worker {worker_id} address already contains a different P2P protocol")
@@ -290,7 +294,7 @@ impl KeygenArgs {
     pub fn execute<TND: TelcoinDirs>(
         &self,
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for full validator node");
         self.validate()?;
@@ -308,7 +312,7 @@ impl KeygenArgs {
     pub fn execute_insecure<TND: TelcoinDirs>(
         &self,
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for node with INSECURE test KDF");

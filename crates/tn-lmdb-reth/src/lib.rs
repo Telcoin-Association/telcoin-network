@@ -1,4 +1,4 @@
-//! reth's database API (`reth-db-api`, reth v1.11.3) on the tn-lmdb engine.
+//! reth's database API (`reth-db-api`, the vendored reth, v1.11.4) on the tn-lmdb engine.
 //!
 //! [`TnLmdbEnv`] is a reth [`Database`](reth_db_api::database::Database) whose transactions and
 //! cursors behave as reth's MDBX ones do, and report MDBX's error codes (below), so reth code and

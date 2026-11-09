@@ -54,8 +54,9 @@ adiri = [
     "tn-storage/adiri",
     "tn-types/adiri",
 ]
-# Opt back in to reth's RocksDB storage backend; tn-node has no rocksdb code of its own.
-rocksdb = ["tn-reth/rocksdb"]
+# Serve JavaScript tracers in `debug_trace*`; tn-node has no RPC code of its own. See
+# crates/tn-reth/js-tracer.md.
+js-tracer = ["tn-reth/js-tracer"]
 # Run the reth execution database on tn-lmdb; tn-node has no backend code of its own.
 tn-lmdb = ["tn-reth/tn-lmdb"]
 
