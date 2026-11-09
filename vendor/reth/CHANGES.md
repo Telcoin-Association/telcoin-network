@@ -476,6 +476,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   result is identical by construction (the index is a `BTreeMap` keyed by `max_block`).
   *Upstream*: n/a (upstream commit).
 
+- **TN-0040** — Backport 7839f3d87: keep one `.csoff` reader per loaded changeset jar.
+  *Kind*: backport.
+  *Files*: `crates/static-file/types/src/{changeset_offsets.rs, lib.rs}` (the reader reads with
+  `read_exact_at` through `&self`; the module is `unix`-only), `crates/storage/provider/src/
+  providers/static_file/{mod.rs, jar.rs, writer.rs, writer_tests.rs}` (`LoadedJar` opens the
+  sidecar once, the jar provider uses it).
+  *Why*: every changeset lookup (each storage v2 historical read that resolves through a
+  changeset, and each changeset walk) did a `stat` and an `open` of the sidecar. The reader is
+  now opened when the jar is loaded, which `update_index` redoes after each commit, so its length
+  is the committed one, as before. A changeset jar whose header counts offsets but has no sidecar
+  now fails at load instead of reading as "no offsets". Read path only: the bytes read are the
+  same, so it cannot change execution or what is written. TN builds for Linux and macOS only,
+  both `unix`. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
