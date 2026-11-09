@@ -40,9 +40,14 @@
 //! `tn-lmdb.dat`). The `db_*` and `sf_*` fields are reth's own split of each persist, from the
 //! timings `DatabaseProvider` records in its metrics: `db_write` is the database writes of
 //! `save_blocks` (the static-file writes, `sf_write`, run beside them on another thread),
-//! `sf_commit` the static files' commit and sync, and `db_commit` the database commit after it;
-//! `db` is `db_write + db_commit`, the engine's part. The run goes under a local metrics recorder
-//! to read them, as a node started with `--metrics` runs under its own. After each mode the bench
+//! `sf_commit` the static files' commit (their index updates), and `db_commit` the database
+//! commit after it; `db` is `db_write + db_commit`, the engine's part. The run goes under a local
+//! metrics recorder to read them, as a node started with `--metrics` runs under its own.
+//! `sf_sync` is the slowest segment's syncs inside `sf_write` (data, offsets and `.csoff` syncs
+//! and the `.conf` freeze, one after another in its thread), and `sf_sync_concurrent` what it
+//! would be with each segment's data, offsets and `.csoff` syncs issued at once, from
+//! [`RethEnv::take_static_file_sync_stats`]: when `sf_write` is longer than `db_write`, the
+//! difference is what that change could save a persist. After each mode the bench
 //! reads the last block number, a slot written by the last block and an account created by it
 //! back from the database tables.
 //!
@@ -68,9 +73,9 @@
 //!   its commit's dirty pages and its meta page. Runs from before tn-lmdb synced mapped pages by
 //!   `msync` on macOS flattered it: its scattered commits took a plain `fsync`, which leaves some
 //!   of those pages unwritten there. The durable verdict stays Linux's.
-//! - reth's static-file writes (`save_blocks` appends, and the commit syncs them with
-//!   `File::sync_all` whatever the database's sync mode) are the same code in both builds and add
-//!   the same cost to both, so they narrow the ratio between the engines.
+//! - reth's static-file writes (`save_blocks` appends and syncs them, a plain `fsync` on macOS,
+//!   whatever the database's sync mode) are the same code in both builds and add the same cost to
+//!   both, so they narrow the ratio between the engines.
 //! - The run prints its temp dir (on Linux with its file system) and stops if that is a tmpfs or
 //!   ramfs, where syncs cost nothing: set `TMPDIR` to a directory on a real disk, for the bench
 //!   command only.
@@ -331,13 +336,20 @@ struct Split {
     db_commit: Duration,
     /// The static-file writes of `save_blocks`, on their own thread.
     sf_write: Duration,
-    /// The static files' commit (`finalize`, which syncs them), before the database commit.
+    /// The static files' commit (`finalize`: since vendored TN-0051 only the index updates),
+    /// before the database commit.
     sf_commit: Duration,
+    /// The slowest segment's syncs in `sf_write`: data, offsets and `.csoff` syncs and the
+    /// `.conf` freeze, one after another in its thread (`RethEnv::take_static_file_sync_stats`).
+    sf_sync: Duration,
+    /// `sf_sync` if each segment issued its data, offsets and `.csoff` syncs concurrently: the
+    /// slowest segment's longest of the three plus its `.conf` freeze (an estimate, not a run).
+    sf_sync_concurrent: Duration,
 }
 
 impl Split {
-    /// The split one persist recorded, read (and cleared) from `snapshotter`.
-    fn take(snapshotter: &Snapshotter) -> Self {
+    /// The split one persist recorded, read (and cleared) from `snapshotter` and `reth_env`.
+    fn take(snapshotter: &Snapshotter, reth_env: &RethEnv) -> Self {
         let snapshot = snapshotter.snapshot().into_vec();
         let seconds = |name: &str| {
             let name = format!("storage.providers.database.{name}");
@@ -351,11 +363,28 @@ impl Split {
             assert_eq!(values.len(), 1, "one {name} per persist");
             Duration::from_secs_f64(values[0].into_inner())
         };
+        let syncs = reth_env.take_static_file_sync_stats();
+        let segments = || syncs.iter().map(|(_, s)| s);
+        let sf_sync = segments()
+            .map(|s| {
+                s.data_sync.total + s.offsets_sync.total + s.csoff_sync.total + s.conf_freeze.total
+            })
+            .max()
+            .unwrap_or_default();
+        let sf_sync_concurrent = segments()
+            .map(|s| {
+                s.data_sync.total.max(s.offsets_sync.total).max(s.csoff_sync.total)
+                    + s.conf_freeze.total
+            })
+            .max()
+            .unwrap_or_default();
         Self {
             db_write: seconds("save_blocks_mdbx"),
             db_commit: seconds("save_blocks_commit_mdbx"),
             sf_write: seconds("save_blocks_sf"),
             sf_commit: seconds("save_blocks_commit_sf"),
+            sf_sync,
+            sf_sync_concurrent,
         }
     }
 
@@ -467,7 +496,7 @@ fn run_mode(
         let start = Instant::now();
         reth_env.persist_executed_output(&blocks).expect("persist");
         let elapsed = start.elapsed();
-        let split = Split::take(snapshotter);
+        let split = Split::take(snapshotter, &reth_env);
 
         if commit >= WARMUP_COMMITS {
             commits.push(elapsed);
@@ -522,6 +551,8 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
     let db_commit = sorted(run.splits.iter().map(|s| s.db_commit));
     let sf_write = sorted(run.splits.iter().map(|s| s.sf_write));
     let sf_commit = sorted(run.splits.iter().map(|s| s.sf_commit));
+    let sf_sync = sorted(run.splits.iter().map(|s| s.sf_sync));
+    let sf_sync_concurrent = sorted(run.splits.iter().map(|s| s.sf_sync_concurrent));
     let total: Duration = persist.iter().sum();
     let us = |d: Duration| d.as_micros();
     let blocks = persist.len() * per_commit;
@@ -530,7 +561,8 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
          txs={} median_us={} p90_us={} p99_us={} max_us={} mean_us={} total_ms={} \
          blocks_per_s={:.1} db_median_us={} db_p99_us={} db_write_median_us={} \
          db_commit_median_us={} db_commit_p99_us={} sf_write_median_us={} sf_commit_median_us={} \
-         sf_commit_p99_us={} db_bytes={} db_alloc_bytes={}",
+         sf_commit_p99_us={} sf_sync_median_us={} sf_sync_concurrent_median_us={} db_bytes={} \
+         db_alloc_bytes={}",
         knobs.sync_name(),
         persist.len(),
         knobs.txs,
@@ -549,6 +581,8 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
         us(rank(&sf_write, 0.5)),
         us(rank(&sf_commit, 0.5)),
         us(rank(&sf_commit, 0.99)),
+        us(rank(&sf_sync, 0.5)),
+        us(rank(&sf_sync_concurrent, 0.5)),
         run.db_bytes,
         run.db_alloc_bytes,
     );

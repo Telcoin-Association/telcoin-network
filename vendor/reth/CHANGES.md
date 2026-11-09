@@ -567,3 +567,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
   tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
   semantics.
+
+- **TN-0052** — Per-segment timings of the static-file syncs, for benches. *Kind*: TN feature
+  (instrumentation).
+  *Files*: `crates/storage/provider/src/providers/static_file/sync_stats.rs` (new:
+  `StaticFileSyncStats`, `SegmentSyncStats`, `SyncPhaseStats`), `.../static_file/{mod.rs,
+  manager.rs, writer.rs}` (the provider's `sync_stats`, `take_sync_stats`, `record_sync`; the
+  writer times its syncs; test `sync_stats_record_each_phase_per_segment`),
+  `crates/storage/provider/src/providers/mod.rs` (re-exports),
+  `crates/storage/nippy-jar/src/writer.rs` (`sync_data` split out of `sync_all`, and
+  `commit_offsets` made public, so the two syncs are timed apart).
+  *Why*: reth's metrics time the static-file arm of `save_blocks` and the static-file part of
+  the commit as wholes, so nothing showed which sync of which segment a persist waits on.
+  `StaticFileProvider::take_sync_stats` returns, per segment, the calls, total and longest time
+  of five phases since the last take: the data file's write-out and `fsync`, the offsets'
+  append and `fsync`, the `.csoff` `fsync`, the `.conf` freeze (TN-0051) and the index update.
+  Each provider keeps its own under a mutex (about ten uncontended locks a persist), so tests
+  never share them. TN reads them through `RethEnv::take_static_file_sync_stats` (test-utils).
+  Nothing written or synced changes, so this cannot reach execution or storage. *Tests*:
+  `sync_stats_record_each_phase_per_segment` (each phase once per segment, `.csoff` only for a
+  changeset segment, a take drains them; fails when a phase is not recorded) and tn-reth's
+  `test_persist_reports_static_file_sync_stats`. *Upstream*: no.

@@ -1,5 +1,6 @@
 use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
+    SyncPhase,
 };
 use crate::providers::static_file::metrics::StaticFileProviderOperation;
 use alloy_consensus::BlockHeader;
@@ -544,13 +545,22 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Write the final block's offset and sync the sidecar for changeset segments
         self.flush_current_changeset_offset()?;
         if let Some(writer) = &mut self.changeset_offsets {
+            let start = Instant::now();
             writer.sync().map_err(ProviderError::other)?;
+            let elapsed = start.elapsed();
             // Update the header with the actual number of offsets written
             self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
+            self.record_sync(SyncPhase::Csoff, elapsed);
         }
 
         if self.writer.is_dirty() {
-            self.writer.sync_all().map_err(ProviderError::other)?;
+            // TN(TN-0052): `NippyJarWriter::sync_all`'s two halves, timed apart.
+            let start = Instant::now();
+            self.writer.sync_data().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::Data, start.elapsed());
+            let start = Instant::now();
+            self.writer.commit_offsets().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::Offsets, start.elapsed());
         }
         self.synced = true;
         Ok(())
@@ -572,7 +582,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     pub fn sync_and_freeze(&mut self) -> ProviderResult<()> {
         self.sync_all()?;
         if self.writer.is_dirty() {
+            let start = Instant::now();
             self.writer.finalize().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::ConfFreeze, start.elapsed());
             self.index_pending = true;
         }
         // Everything appended so far is durable; rows appended after this make the writer dirty
@@ -603,7 +615,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.sync_all()?;
             }
 
+            let start = Instant::now();
             self.writer.finalize().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::ConfFreeze, start.elapsed());
             self.index_pending = true;
         }
         // TN(TN-0051): also after `sync_and_freeze`, which wrote the configuration already.
@@ -756,7 +770,18 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 .then(|| self.writer.user_header().expected_block_start() - 1)
             });
 
-        self.reader().update_index(self.writer.user_header().segment(), segment_max_block)
+        let start = Instant::now();
+        self.reader().update_index(self.writer.user_header().segment(), segment_max_block)?;
+        self.record_sync(SyncPhase::UpdateIndex, start.elapsed());
+        Ok(())
+    }
+
+    /// TN(TN-0052): records a sync phase of this writer's segment in its provider's
+    /// [`StaticFileSyncStats`](super::StaticFileSyncStats), if the provider is still alive.
+    fn record_sync(&self, phase: SyncPhase, elapsed: std::time::Duration) {
+        if let Some(reader) = self.reader.upgrade() {
+            reader.record_sync(self.writer.user_header().segment(), phase, elapsed);
+        }
     }
 
     /// Ensures that the writer is positioned at the specified block number.

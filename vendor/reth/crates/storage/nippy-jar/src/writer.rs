@@ -369,11 +369,20 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// This does NOT commit the configuration. Call [`Self::finalize`] after to write the
     /// configuration and mark the writer as clean.
     pub fn sync_all(&mut self) -> Result<(), NippyJarError> {
+        self.sync_data()?;
+        self.commit_offsets()?;
+        Ok(())
+    }
+
+    /// Flushes and syncs the data file, the first half of [`Self::sync_all`];
+    /// [`Self::commit_offsets`] is the second.
+    ///
+    /// TN(TN-0052): split out, and `commit_offsets` made public, so the static-file writer can
+    /// time the two syncs apart.
+    pub fn sync_data(&mut self) -> Result<(), NippyJarError> {
         self.data_file.flush()?;
         // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and at every sync below.
         reth_fs_util::fsync_file(self.data_file.get_ref())?;
-
-        self.commit_offsets()?;
         Ok(())
     }
 
@@ -406,7 +415,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     }
 
     /// Flushes offsets to disk.
-    pub(crate) fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
+    pub fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
         self.commit_offsets_inner()?;
         reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
 

@@ -1,6 +1,7 @@
 use super::{
     metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
-    StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
+    StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileSyncStats,
+    SyncPhase,
 };
 use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
@@ -427,10 +428,30 @@ pub struct StaticFileProviderInner<N> {
     _lock_file: Option<StorageLock>,
     /// Genesis block number, default is 0;
     genesis_block_number: u64,
+    /// TN(TN-0052): sync timings since the last [`StaticFileProvider::take_sync_stats`].
+    sync_stats: parking_lot::Mutex<StaticFileSyncStats>,
     #[cfg(test)]
     before_cache_insert: BeforeCacheInsertHook,
     #[cfg(test)]
     after_cache_validation: BeforeCacheInsertHook,
+}
+
+impl<N> StaticFileProviderInner<N> {
+    /// TN(TN-0052): returns the per-segment sync timings recorded since the last call and starts
+    /// a new period. A bench calls it after each persist's commit for that persist's split.
+    pub fn take_sync_stats(&self) -> StaticFileSyncStats {
+        std::mem::take(&mut *self.sync_stats.lock())
+    }
+
+    /// TN(TN-0052): records one sync phase of `segment`.
+    pub(crate) fn record_sync(
+        &self,
+        segment: StaticFileSegment,
+        phase: SyncPhase,
+        elapsed: std::time::Duration,
+    ) {
+        self.sync_stats.lock().record(segment, phase, elapsed);
+    }
 }
 
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
@@ -459,6 +480,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             blocks_per_file,
             _lock_file,
             genesis_block_number: 0,
+            sync_stats: Default::default(),
             #[cfg(test)]
             before_cache_insert: Default::default(),
             #[cfg(test)]
@@ -3572,6 +3594,48 @@ mod tests {
         assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
         assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
         assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
+        Ok(())
+    }
+
+    /// TN(TN-0052): a persist records each sync phase once for its segment, `.csoff` only for
+    /// changeset segments, and a take drains what was recorded.
+    #[test]
+    fn sync_stats_record_each_phase_per_segment() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+        let mut changesets = static_files.latest_writer(StaticFileSegment::AccountChangeSets)?;
+        // Opening a writer runs its heal, which updates the index; start after it.
+        let _ = static_files.take_sync_stats();
+
+        headers.append_header(&Header::default(), &B256::ZERO)?;
+        headers.sync_and_freeze()?;
+        headers.finalize()?;
+        changesets.append_account_changeset(Vec::new(), 0)?;
+        changesets.sync_and_freeze()?;
+        changesets.finalize()?;
+
+        let stats = static_files.take_sync_stats();
+        assert_eq!(
+            stats.iter().map(|(segment, _)| segment).collect::<Vec<_>>(),
+            [StaticFileSegment::Headers, StaticFileSegment::AccountChangeSets]
+        );
+        for segment in [StaticFileSegment::Headers, StaticFileSegment::AccountChangeSets] {
+            let s = stats.segment(segment);
+            for (phase, phase_stats) in [
+                ("data", s.data_sync),
+                ("offsets", s.offsets_sync),
+                ("conf", s.conf_freeze),
+                ("update_index", s.update_index),
+            ] {
+                assert_eq!(phase_stats.calls, 1, "{segment:?} {phase}");
+                assert!(phase_stats.max <= phase_stats.total, "{segment:?} {phase}");
+            }
+        }
+        assert_eq!(stats.segment(StaticFileSegment::Headers).csoff_sync.calls, 0);
+        assert_eq!(stats.segment(StaticFileSegment::AccountChangeSets).csoff_sync.calls, 1);
+        assert!(static_files.take_sync_stats().is_empty(), "a take drains the stats");
         Ok(())
     }
 }

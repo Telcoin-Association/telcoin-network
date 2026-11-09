@@ -12,6 +12,10 @@ pub use writer::{StaticFileProviderRW, StaticFileProviderRWRefMut};
 
 mod metrics;
 
+mod sync_stats;
+pub(crate) use sync_stats::SyncPhase;
+pub use sync_stats::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
+
 #[cfg(test)]
 mod writer_tests;
 
