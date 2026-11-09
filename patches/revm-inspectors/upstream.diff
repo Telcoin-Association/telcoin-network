@@ -1,0 +1,83 @@
+diff --git upstream/.gitignore upstream/.gitignore
+deleted file mode 100644
+index b23d7d652d5ff02efd4b57054c1df5bf66ed2adc..0000000000000000000000000000000000000000
+--- upstream/.gitignore
++++ /dev/null
+@@ -1,5 +0,0 @@
+-/target
+-Cargo.lock
+-.vscode
+-.idea
+-.DS_Store
+\ No newline at end of file
+diff --git upstream/src/tracing/js/mod.rs patched/src/tracing/js/mod.rs
+index 95b43c7369d59f63bce2c68c2733a0fee051d7e2..616c80ee209e108871f340e3e4a99e94fc65a14f 100644
+--- upstream/src/tracing/js/mod.rs
++++ patched/src/tracing/js/mod.rs
+@@ -48,7 +48,12 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
+ /// The recursion limit for function calls.
+ ///
+ /// Once exceeded, the function will throw an error.
+-pub const RECURSION_LIMIT: usize = 10_000;
++///
++/// TN: lowered from 10,000 to 128 as upstream did in #548 (a5638ca, released in 0.44.2). A
++/// recursive getter or setter re-enters the interpreter natively, so each level also uses native
++/// stack, and at 10,000 a tracer could overflow the 2 MiB stack of a tokio blocking thread and
++/// abort the node. See patches/revm-inspectors/PATCH.md.
++pub const RECURSION_LIMIT: usize = 128;
+ 
+ /// A javascript inspector that will delegate inspector functions to javascript functions
+ ///
+@@ -712,6 +717,52 @@ mod tests {
+         assert!(result.is_err());
+     }
+ 
++    /// TN: builds the inspector on a thread with the 2 MiB stack of a tokio blocking thread, where
++    /// the node builds it for `debug_trace*`.
++    fn new_on_blocking_sized_stack(code: &'static str) -> Result<(), String> {
++        std::thread::Builder::new()
++            .stack_size(2 * 1024 * 1024)
++            .spawn(move || {
++                JsInspector::new(code.to_string(), serde_json::Value::Null)
++                    .map(|_| ())
++                    .map_err(|err| err.to_string())
++            })
++            .unwrap()
++            .join()
++            .unwrap()
++    }
++
++    /// TN: a recursive getter is stopped by the recursion limit with a script error. With a limit
++    /// of 10,000 the native stack overflowed first and the process aborted.
++    #[test]
++    fn test_recursive_getter_is_stopped_by_recursion_limit() {
++        let res = new_on_blocking_sized_stack(
++            "{ setup: function() { var o = { get x() { return this.x; } }; return o.x; }, \
++             fault: function() {}, result: function() { return null; } }",
++        );
++        assert!(res.unwrap_err().contains("setup"));
++    }
++
++    /// TN: as above, through a setter.
++    #[test]
++    fn test_recursive_setter_is_stopped_by_recursion_limit() {
++        let res = new_on_blocking_sized_stack(
++            "{ setup: function() { var o = { set x(v) { this.x = v; } }; o.x = 1; }, \
++             fault: function() {}, result: function() { return null; } }",
++        );
++        assert!(res.unwrap_err().contains("setup"));
++    }
++
++    /// TN: a tracer that recurses less deeply than the limit still works.
++    #[test]
++    fn test_recursion_below_limit_is_allowed() {
++        new_on_blocking_sized_stack(
++            "{ setup: function() { function f(n) { return n == 0 ? 0 : f(n - 1); } f(100); }, \
++             fault: function() {}, result: function() { return null; } }",
++        )
++        .unwrap();
++    }
++
+     #[test]
+     fn test_fault_fn_not_callable() {
+         let code = r#"

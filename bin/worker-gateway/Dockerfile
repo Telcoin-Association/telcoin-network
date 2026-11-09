@@ -60,6 +60,8 @@ COPY tn-contracts/ ./tn-contracts/
 # Cargo.toml; cargo cannot load the workspace without them, even for -p.
 COPY examples/ ./examples/
 COPY patches/ ./patches/
+# The vendored reth: the root Cargo.toml's reth-* dependencies are paths into it.
+COPY vendor/ ./vendor/
 
 # Build only the gateway binary, then move it out of the cache mount so the
 # runtime stage can COPY it. --locked makes the build fail instead of resolving

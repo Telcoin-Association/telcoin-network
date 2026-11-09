@@ -607,6 +607,9 @@ pub struct ConsensusBusAppInner {
     new_epoch_votes: QueChannel<EpochVote>,
     /// Watch channel to communicate the current epoch record to the vote collector.
     tx_epoch_record: watch::Sender<Option<EpochRecord>>,
+    /// The newest epoch for which the record collector stored a downloaded, certified epoch
+    /// record (`None` until it stores one).
+    tx_certified_record_epoch: watch::Sender<Option<Epoch>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
@@ -801,6 +804,7 @@ impl ConsensusBusApp {
         let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
+        let (tx_certified_record_epoch, _) = watch::channel(None);
 
         let (epoch_request_queue_tx, epochs_rx) =
             tokio::sync::mpsc::channel(EPOCH_REQUEST_QUEUE_CAPACITY);
@@ -822,6 +826,7 @@ impl ConsensusBusApp {
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
+                tx_certified_record_epoch,
                 primary_network_events: QueChannel::new_always_subscribed_held(
                     crate::network::gap_policy::primary_event_gap_policy(),
                 ),
@@ -956,6 +961,10 @@ impl ConsensusBusApp {
 
     /// Update the last published consensus epoch, number and hash if number is greater than current
     /// value. Return true if it was updated.
+    ///
+    /// This is the gossip path: f+1 validator signatures move the watch forward and never back. A
+    /// certified epoch record is stronger evidence and uses
+    /// [`Self::publish_certified_consensus_num_hash`].
     pub fn publish_consensus_num_hash_if_newer(
         &self,
         epoch: Epoch,
@@ -967,6 +976,37 @@ impl ConsensusBusApp {
                 state.0 = epoch;
                 state.1 = number;
                 state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Publish the `final_consensus` of a CERTIFIED epoch record to the last-published watch.
+    ///
+    /// A certificate is stronger evidence than f+1 gossip signatures (issue #1771). This moves
+    /// the watch forward like [`Self::publish_consensus_num_hash_if_newer`], and it also REPLACES
+    /// a stored value that cannot be a real consensus output given the record. Epochs and
+    /// consensus numbers advance together, so a stored `(epoch, number)` agrees with the record
+    /// only when `stored.epoch <= epoch` and `stored.number <= number` are both true or both
+    /// false, and the same `(epoch, number)` must carry the same hash. A stored value that fails
+    /// either rule is a gossip pin that f+1 signers fabricated; the certified value replaces it
+    /// so gossip-driven tip tracking resumes. Return true if the watch changed.
+    pub fn publish_certified_consensus_num_hash(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> bool {
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            let (stored_epoch, stored_number, stored_hash) = *state;
+            let newer = number > stored_number;
+            let impossible = (stored_epoch <= epoch) != (stored_number <= number);
+            let same_slot_other_hash =
+                stored_epoch == epoch && stored_number == number && stored_hash != hash;
+            if newer || impossible || same_slot_other_hash {
+                *state = (epoch, number, hash);
                 true
             } else {
                 false
@@ -1055,6 +1095,29 @@ impl ConsensusBusApp {
     /// The epoch vote collector observes this to know when a new epoch starts.
     pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
         &self.inner.tx_epoch_record
+    }
+
+    /// Watch carrying the newest epoch for which the record collector stored a downloaded,
+    /// certified [`EpochRecord`].
+    ///
+    /// The epoch manager wakes on it to check whether such a record shows that the epoch it runs
+    /// already closed on the network. It is a wake-up only: the epoch manager decides from the
+    /// epoch store, never from this value.
+    pub fn certified_record_epoch(&self) -> &watch::Sender<Option<Epoch>> {
+        &self.inner.tx_certified_record_epoch
+    }
+
+    /// Publish that the record collector stored a certified record for `epoch`.
+    /// Return true if `epoch` is the newest so far; watchers are woken only then.
+    pub fn set_certified_record_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.certified_record_epoch().send_if_modified(|state| {
+            if state.is_none_or(|stored| epoch > stored) {
+                *state = Some(epoch);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Provide a subscriber (Receiver) for new_epoch_votes.
@@ -1709,7 +1772,7 @@ mod tests {
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
         EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError, TrySendOutcome,
-        CHANNEL_CAPACITY,
+        B256, CHANNEL_CAPACITY,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
@@ -2108,6 +2171,70 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(1));
         assert_eq!(rx.try_recv(), Ok(2));
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A consensus header digest that differs per `byte`.
+    fn digest(byte: u8) -> ConsensusHeaderDigest {
+        ConsensusHeaderDigest::from(B256::repeat_byte(byte))
+    }
+
+    /// The issue #1771 pin: f+1 gossip signers set a number near `u64::MAX`, and the next
+    /// certified epoch record replaces it even though its number is lower.
+    #[tokio::test]
+    async fn certified_publish_replaces_gossip_pin() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(0, u64::MAX - 1, digest(1)));
+        assert!(
+            bus.publish_certified_consensus_num_hash(3, 100, digest(3)),
+            "a certified record must replace a pin its epoch proves impossible"
+        );
+        assert_eq!(bus.published_consensus_num_hash(), (3, 100, digest(3)));
+    }
+
+    /// A tip that agrees with a certified record is kept: a later epoch at a greater number is
+    /// what honest gossip produces after the record's epoch closed.
+    #[tokio::test]
+    async fn certified_publish_keeps_consistent_later_tip() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(5, 1000, digest(5)));
+        assert!(
+            !bus.publish_certified_consensus_num_hash(4, 900, digest(4)),
+            "a consistent later tip must not move back to an older certified record"
+        );
+        assert_eq!(bus.published_consensus_num_hash(), (5, 1000, digest(5)));
+    }
+
+    /// From the initial state a certified record moves the watch forward exactly like the gossip
+    /// path, and publishing the same record again changes nothing.
+    #[tokio::test]
+    async fn certified_publish_moves_forward_once() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_certified_consensus_num_hash(2, 50, digest(2)));
+        assert_eq!(bus.published_consensus_num_hash(), (2, 50, digest(2)));
+        assert!(
+            !bus.publish_certified_consensus_num_hash(2, 50, digest(2)),
+            "the same certified value must not report a change"
+        );
+    }
+
+    /// A stored claim of a later epoch at a number the certified record proves belongs to its own
+    /// epoch is replaced: consensus numbers never stand still across an epoch boundary.
+    #[tokio::test]
+    async fn certified_publish_replaces_later_epoch_at_record_number() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(9, 100, digest(9)));
+        assert!(bus.publish_certified_consensus_num_hash(4, 100, digest(4)));
+        assert_eq!(bus.published_consensus_num_hash(), (4, 100, digest(4)));
+    }
+
+    /// A stored value at the certified record's own `(epoch, number)` but with another hash is
+    /// replaced by the certified hash.
+    #[tokio::test]
+    async fn certified_publish_replaces_same_slot_other_hash() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(4, 100, digest(7)));
+        assert!(bus.publish_certified_consensus_num_hash(4, 100, digest(4)));
+        assert_eq!(bus.published_consensus_num_hash(), (4, 100, digest(4)));
     }
 
     /// A gap test message: whether the test policy holds it, and its byte weight.

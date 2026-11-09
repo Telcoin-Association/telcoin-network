@@ -33,12 +33,8 @@ use crate::metrics::{
 };
 use alloy::primitives::{keccak256, map::AddressSet, B256};
 use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
-use reth::transaction_pool::{
-    blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
-    TransactionValidationTaskExecutor,
-};
 use reth_chainspec::ChainSpec;
-use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
+use reth_node_core::{cli::config::RethTransactionPoolConfig, node_config::NodeConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
@@ -47,13 +43,15 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore,
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
         PoolError, PoolTransactionError,
     },
-    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
-    PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
-    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    AddedTransactionOutcome, BestTransactions, BlockInfo as RethBlockInfo, CanonicalStateUpdate,
+    EthPooledTransaction, EthTransactionPool, PoolSize, PoolTransaction, PoolUpdateKind,
+    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
+    TransactionValidationTaskExecutor, ValidPoolTransaction,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -63,8 +61,8 @@ use std::{
 };
 use tn_types::{
     gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
-    EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner,
-    TransactionSigned, TxHash, U256,
+    Decodable2718 as _, EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError,
+    TaskSpawner, TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
@@ -1160,6 +1158,30 @@ pub fn recover_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> 
     Ok(recovered.into_inner())
 }
 
+/// Decode bytes into a signed transaction without signer recovery.
+///
+/// The decode rules and errors match [`recover_signed_transaction`]. Empty input fails, and
+/// trailing bytes fail. This function does not check the signature. Call
+/// [`verify_transaction_signature`] before you trust the transaction.
+pub fn decode_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> {
+    if tx.is_empty() {
+        Err(crate::EthApiError::EmptyRawTransactionData.into())
+    } else {
+        TransactionSigned::decode_2718_exact(tx)
+            .map_err(|_| crate::EthApiError::FailedToDecodeSignedTransaction.into())
+    }
+}
+
+/// Verify the signature of a signed transaction by signer recovery.
+///
+/// The recovery applies the EIP-2 rule for the `s` value. This function discards the recovered
+/// signer. A bad signature returns the same error as [`recover_signed_transaction`].
+pub fn verify_transaction_signature(tx: &TransactionSigned) -> TnRethResult<()> {
+    tx.recover_signer()
+        .map(|_| ())
+        .map_err(|_| crate::EthApiError::InvalidTransactionSignature.into())
+}
+
 /// Recover a pooled transaction.
 pub fn recover_pooled_transaction(
     tx: &[u8],
@@ -1912,7 +1934,8 @@ mod tests {
         let task_manager = TaskManager::default();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         // 1,000 wei cap: a 21,000-gas transfer at 7 wei/gas costs at most 147,000 wei.
-        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain.clone(),
             tmp_dir.path(),

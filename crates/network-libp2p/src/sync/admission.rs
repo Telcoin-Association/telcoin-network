@@ -22,6 +22,10 @@
 //! has in flight. A [`PeerSlot`] is held for the whole life of a stream and frees its count when
 //! it drops.
 //!
+//! A [`HoldBudget`] bounds the permit-hold time of one BLS key over a window. A [`HoldLease`]
+//! charges the time it was held when it drops, the charge leaks away over the window, and a key
+//! at its budget is refused a new lease until enough of its charge has leaked.
+//!
 //! No call in this module waits: a budget that is full refuses at once, so the caller can shed
 //! the stream with a `Deny` frame instead of queueing it.
 
@@ -29,9 +33,13 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::Duration,
 };
 use tn_types::BlsPublicKey;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 
 /// The admission tier of a peer, decided by its BLS key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +215,114 @@ impl Drop for PeerSlot {
     }
 }
 
+/// A per-key budget of permit-hold time that refills over a window.
+///
+/// Each BLS key may hold permits for at most `budget` in the long run per `window`: the hold
+/// time it is charged leaks away at `budget / window` per second, and a key whose charged time
+/// has not leaked below `budget` is refused a new lease. A lease is admitted only while the key
+/// has at least `hold` of its budget left, so every admitted hold can run to the hold limit
+/// inside the budget and a key never gets two full holds back to back. A key can exceed the
+/// budget only by the slack a hold runs past `hold`. A clone shares the same ledger.
+/// (GHSA-pg7j-w22m-3qj5)
+#[derive(Clone, Debug)]
+pub struct HoldBudget {
+    /// The hold time on the books for each key, as of the instant it was last brought up to date.
+    /// A key whose time has fully leaked has no entry.
+    ledger: Arc<Mutex<HashMap<BlsPublicKey, HoldUse>>>,
+    /// The longest hold one lease covers: a lease is admitted only with this much budget left.
+    hold: Duration,
+    /// The hold time a key may use in one window.
+    budget: Duration,
+    /// The window the budget refills over.
+    window: Duration,
+}
+
+/// The hold time charged to one key, as of the instant it was last brought up to date.
+#[derive(Clone, Copy, Debug)]
+struct HoldUse {
+    /// The charged hold time that had not leaked away at `at`.
+    used: Duration,
+    /// The instant `used` was brought up to date.
+    at: Instant,
+}
+
+impl HoldUse {
+    /// The charged time left at `now`, after leaking at `budget / window` since `at`.
+    fn left_at(self, now: Instant, budget: Duration, window: Duration) -> Duration {
+        self.used.saturating_sub(leak(now.saturating_duration_since(self.at), budget, window))
+    }
+}
+
+/// The hold time that leaks away over `elapsed` at `budget / window`, in whole nanoseconds.
+fn leak(elapsed: Duration, budget: Duration, window: Duration) -> Duration {
+    let nanos = elapsed.as_nanos().saturating_mul(budget.as_nanos()) / window.as_nanos().max(1);
+    u64::try_from(nanos).map_or(Duration::MAX, Duration::from_nanos)
+}
+
+impl HoldBudget {
+    /// Create a budget that admits `budget` of hold time per `window` for each key, where one
+    /// lease covers a hold of at most `hold`.
+    pub fn new(hold: Duration, budget: Duration, window: Duration) -> Self {
+        Self { ledger: Arc::default(), hold, budget, window }
+    }
+
+    /// The hold time `peer` may still use at `now`: the budget less the charged time that has
+    /// not leaked away. A key with no entry has its whole budget.
+    pub fn remaining(&self, peer: &BlsPublicKey, now: Instant) -> Duration {
+        let used = self
+            .ledger
+            .lock()
+            .get(peer)
+            .map_or(Duration::ZERO, |hold| hold.left_at(now, self.budget, self.window));
+        self.budget.saturating_sub(used)
+    }
+
+    /// Try to lease hold time for `peer` from `now`, without waiting.
+    ///
+    /// Returns `None` when the key has less than one full hold of budget left. The lease charges
+    /// the time it was held to the key when it drops.
+    pub fn try_lease(&self, peer: BlsPublicKey, now: Instant) -> Option<HoldLease> {
+        (self.remaining(&peer, now) >= self.hold).then(|| HoldLease {
+            ledger: self.ledger.clone(),
+            budget: self.budget,
+            window: self.window,
+            peer,
+            since: now,
+        })
+    }
+}
+
+/// One hold of permit time that a key has leased from a [`HoldBudget`].
+///
+/// When the lease drops, it charges the time since it was taken to the key, so the charge is
+/// known only when the hold ends. A key fully refilled at that instant leaves the ledger.
+#[derive(Debug)]
+pub struct HoldLease {
+    /// The shared ledger of the [`HoldBudget`] that issued this lease.
+    ledger: Arc<Mutex<HashMap<BlsPublicKey, HoldUse>>>,
+    /// The hold time a key may use in one window.
+    budget: Duration,
+    /// The window the budget refills over.
+    window: Duration,
+    /// The key this lease charges.
+    peer: BlsPublicKey,
+    /// The instant the lease was taken.
+    since: Instant,
+}
+
+impl Drop for HoldLease {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let held = now.saturating_duration_since(self.since);
+        let mut ledger = self.ledger.lock();
+        let carried = ledger
+            .get(&self.peer)
+            .map_or(Duration::ZERO, |hold| hold.left_at(now, self.budget, self.window));
+        ledger.insert(self.peer, HoldUse { used: carried.saturating_add(held), at: now });
+        ledger.retain(|_, hold| hold.left_at(now, self.budget, self.window) > Duration::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +478,76 @@ mod tests {
         assert_eq!(reserved.tier(&next), PeerTier::Committee);
         assert_eq!(reserved.tier(&outsider), PeerTier::Public);
         assert_eq!(ReservedPeers::default().tier(&current), PeerTier::Public);
+    }
+
+    /// The budget and window of the public batch-serve hold budget.
+    const BUDGET: Duration = Duration::from_secs(60);
+    const WINDOW: Duration = Duration::from_secs(300);
+
+    /// A lease is admitted only while the key has a full hold of budget left. A hold of 58 s
+    /// leaves 2 s, so the next lease is refused until the charge has leaked back to a full hold,
+    /// 290 s later, and a key never gets two full holds back to back. Once the charge has fully
+    /// leaked the key has its whole budget and the next drop removes its entry.
+    #[tokio::test(start_paused = true)]
+    async fn hold_budget_reserves_a_full_hold_at_admission() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let peer = key(1);
+        let first = budget.try_lease(peer, Instant::now());
+        assert!(first.is_some());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        drop(first);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(2));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // 289 s later, 57.8 s of the charge has leaked: 59.8 s left is still short of a full hold
+        tokio::time::advance(Duration::from_secs(289)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_millis(59_800));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // one more second and the whole hold is back
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        let second = budget.try_lease(peer, Instant::now());
+        assert!(second.is_some());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        drop(second);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(2));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        // 58 s leaks away in 290 s: the key has its whole budget and the next drop clears it
+        tokio::time::advance(Duration::from_secs(290)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        drop(budget.try_lease(peer, Instant::now()));
+        assert!(budget.ledger.lock().is_empty());
+    }
+
+    /// One key at its budget does not affect another key.
+    #[tokio::test(start_paused = true)]
+    async fn hold_budget_is_per_key() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let (spent, fresh) = (key(1), key(2));
+        let lease = budget.try_lease(spent, Instant::now());
+        tokio::time::advance(BUDGET).await;
+        drop(lease);
+        assert!(budget.try_lease(spent, Instant::now()).is_none());
+        assert_eq!(budget.remaining(&fresh, Instant::now()), BUDGET);
+        assert!(budget.try_lease(fresh, Instant::now()).is_some());
+    }
+
+    /// A lease charges only the time it was held: 5 s held leaves 55 s of the budget. That is
+    /// short of a full hold, so the key is refused until the 5 s has leaked, 25 s later.
+    #[tokio::test(start_paused = true)]
+    async fn hold_lease_charges_only_the_held_time() {
+        let budget = HoldBudget::new(BUDGET, BUDGET, WINDOW);
+        let peer = key(1);
+        let lease = budget.try_lease(peer, Instant::now());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(lease);
+        assert_eq!(budget.remaining(&peer, Instant::now()), Duration::from_secs(55));
+        assert!(budget.try_lease(peer, Instant::now()).is_none());
+
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(budget.remaining(&peer, Instant::now()), BUDGET);
+        assert!(budget.try_lease(peer, Instant::now()).is_some());
     }
 }

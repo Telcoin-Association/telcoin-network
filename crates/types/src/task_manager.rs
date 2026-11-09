@@ -911,4 +911,44 @@ mod test {
         task_manager.abort_all_tasks();
         task_manager.wait_for_task_shutdown().await;
     }
+
+    /// Regression: each spawn subscribes to the manager's shutdown notifier (a reth task three
+    /// times, a reth blocking task twice), and the notifier used to keep every Noticer until the
+    /// manager shut down. A node's manager lives as long as the node and reth spawns through it
+    /// for blocking RPC calls and subscriptions, so the list grew with RPC traffic: these 300
+    /// finished tasks left 600 entries. Finished tasks must leave no live Noticer behind, and the
+    /// list must stay bounded however many tasks have run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_tasks_release_their_shutdown_noticers() {
+        use crate::notifier::MIN_PRUNE_LEN;
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        const N: usize = 100;
+        let manager = TaskManager::new("noticers");
+        let spawner = manager.get_spawner();
+        for _ in 0..N {
+            RethTaskSpawner::spawn_task(&spawner, Box::pin(async {})).await.expect("task joins");
+            RethTaskSpawner::spawn_blocking_task(&spawner, Box::pin(async {}))
+                .await
+                .expect("blocking task joins");
+            let (ran_tx, ran_rx) = tokio::sync::oneshot::channel();
+            manager.spawn_task("finished", async move {
+                let _ = ran_tx.send(());
+                Ok(())
+            });
+            ran_rx.await.expect("task ran");
+        }
+        // A reth join handle resolves when the task signals its end, which can be just before
+        // the task finishes and drops its Noticers, so give the last ones a moment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while manager.local_shutdown.live_noticers() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.local_shutdown.live_noticers(), 0, "finished tasks left live noticers");
+        let registered = manager.local_shutdown.registered_len();
+        assert!(
+            registered <= MIN_PRUNE_LEN,
+            "{registered} entries left by {} finished tasks",
+            3 * N
+        );
+    }
 }

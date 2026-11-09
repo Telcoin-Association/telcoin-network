@@ -3,7 +3,7 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, both test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the three test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
 
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
@@ -20,12 +20,15 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `vendor-reth-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
 | runs on | a maintainer's machine | GitHub runners |
-| on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test` and `adiri-test` skipped for a draft or a maintainer-authored PR |
+| on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test`, `adiri-test` and `vendor-reth-test` skipped for a draft or a maintainer-authored PR |
+
+`vendor-reth-test` runs reth's own tests for the vendored crates in `vendor/reth`, and the opt-in `js-tracer` build (`etc/ci-lanes.sh test-vendor-reth`); the root lanes cannot reach either.
+The carried patch crates under `patches/` that sit outside the workspace get a job each (`connection-limits-patch`, `quinn-proto-patch`, `gossipsub-patch`, `revm-inspectors-patch`) for the same reason.
 
 The queue builds a temporary `gh-readonly-queue/main/...` branch and fires a `merge_group` event against it.
 Three consequences worth remembering:
@@ -35,11 +38,11 @@ Three consequences worth remembering:
   ejects the PR. `pr.yaml` triggers on both events, and `CI Success` is the only required
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
-- **The maintainer and draft skips cover the two test lanes only, and never apply in the queue.**
-  On a pull request, `ci-scope` skips `test` and `adiri-test` for a draft or a maintainer-authored PR.
+- **The maintainer and draft skips cover the three test lanes only, and never apply in the queue.**
+  On a pull request, `ci-scope` skips `test`, `adiri-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
   `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
   In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
-  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the two test lanes only, and only when `ci-scope` asked for it.
+  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the three test lanes only, and only when `ci-scope` asked for it.
 - **The attestation is checked on the pull request only, never in the queue.** GitHub
   creates the merge group's commit seconds before CI starts, so no local run could have
   covered it and nothing can attest it; a lane that demanded one would hang the queue until
@@ -90,7 +93,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that rocksdb stays out of the default feature graph, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the three carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -186,8 +189,11 @@ Nothing stops either route beforehand.
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for the three test lanes: default and adiri features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
+rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
+The lanes' times with the vendored reth have not yet been measured on a GitHub runner.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 `main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push that the queue did not make it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
 Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.
@@ -200,7 +206,7 @@ The `observations` job in `quic-observations.yaml` keys its own entry too and ne
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-All fifteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, three in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
+All sixteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, four in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
 Three of its properties shape all of this.
 They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 
