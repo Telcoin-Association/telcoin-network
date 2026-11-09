@@ -33,7 +33,8 @@ use crate::{
         decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
         CONSENSUS_REGISTRY_ADDRESS,
     },
-    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
+    traits::TelcoinNode,
+    ExecutedBlock, NewCanonicalChain, RethConfig, RethDb, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
     consensus::{
@@ -49,11 +50,14 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
+use reth_db_common::init::init_genesis_with_settings;
 use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
 use reth_primitives_traits::{crypto::secp256k1::sign_message, SignerRecoverable};
 use reth_provider::{
+    providers::{RocksDBProvider, StaticFileProvider},
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
+    DatabaseProviderFactory as _, ProviderFactory, StateProviderBox, StateProviderFactory,
+    StorageSettings, StorageSettingsCache as _,
 };
 use reth_revm::{
     context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
@@ -94,6 +98,37 @@ pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
 /// Typedef for a complex type to make clippy happy (and be a bit more readable?).
 pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<StateProviderBox>>>;
+
+/// Write genesis into the new, empty datadir that `reth_config` names, through `database`, in the
+/// reth storage layout `settings`.
+///
+/// An existing datadir opens in the layout its genesis stored (`init_genesis` only warns on a
+/// mismatch), so the [`RethEnv`] opened over this datadir next, directly or through
+/// [`SnapshotRestorer::open`](crate::snapshot::SnapshotRestorer::open), runs `settings`. Test seam
+/// for storage v2 datadirs while the env builds every new datadir in one layout; refuses a datadir
+/// that already holds a genesis, since its layout would win.
+pub fn init_genesis_with_storage_settings(
+    reth_config: &RethConfig,
+    database: &RethDb,
+    settings: StorageSettings,
+) -> eyre::Result<()> {
+    let node_config = &reth_config.0;
+    let datadir = node_config.datadir();
+    let factory = ProviderFactory::<TelcoinNode>::new(
+        Arc::clone(database),
+        Arc::clone(&node_config.chain),
+        StaticFileProvider::read_write(datadir.static_files())?,
+        RocksDBProvider::new(datadir.data_dir())?,
+        reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?,
+    )?;
+    init_genesis_with_settings(&factory, settings)?;
+    let running = factory.cached_storage_settings();
+    eyre::ensure!(
+        running == settings,
+        "the datadir already holds a genesis in storage layout {running:?}, not {settings:?}"
+    );
+    Ok(())
+}
 
 // methods for tests
 impl RethEnv {

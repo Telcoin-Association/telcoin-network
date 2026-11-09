@@ -452,9 +452,10 @@ impl RethEnv {
         // but TN has no stage pipeline to unwind MDBX, so refuse to start instead of serving a
         // datadir whose backends disagree.
         //
-        // If TN ever adopts reth's storage v2 settings, re-verify snapshot-restored datadirs
-        // against this check first: v2 adds checked segments (transaction senders) that the
-        // restore scaffold must leave exactly at the stage checkpoints, or startup refuses here.
+        // Under reth's storage v2 layout the check also covers the transaction senders and both
+        // changeset segments. A snapshot restore must leave each exactly at the stage
+        // checkpoints, or startup refuses here: `SnapshotRestorer::import_chain_scaffold` advances
+        // them (`snapshot_restores_across_storage_layouts` reopens a restored v2 datadir).
         let (rocksdb_unwind, static_file_unwind) = provider_factory.check_consistency()?;
         [("RocksDB", rocksdb_unwind), ("the static files", static_file_unwind)]
             .into_iter()

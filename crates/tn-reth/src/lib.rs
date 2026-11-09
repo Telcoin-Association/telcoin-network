@@ -168,6 +168,9 @@ pub use types::*;
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
 
+#[cfg(test)]
+mod storage_layout_tests;
+
 /// True when this binary was compiled with the `faucet` cargo feature.
 ///
 /// The faucet feature replaces the TEL precompile's timelocked, governance-only
