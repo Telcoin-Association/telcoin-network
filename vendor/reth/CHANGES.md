@@ -673,6 +673,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   more; the default (and every running node) is unchanged. Pool plumbing only.
   *Tests*: upstream's `txpool_max_batch_size_must_be_nonzero`. *Upstream*: n/a (upstream commit).
 
+- **TN-0062** — Backport 5b6863039: a call with a gas price and no `gas` field stays within
+  `--rpc.gascap`. *Kind*: backport.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`prepare_call_env`),
+  `crates/rpc/rpc/src/eth/core.rs` (upstream's test `call_allowance_respects_rpc_gas_cap`, with a
+  `build_test_eth_api_with_gas_cap` helper the vendored tests lacked).
+  *Why*: `prepare_call_env` first clamps an omitted gas limit to the RPC cap, then, for a priced
+  call, replaces it with the caller's allowance clamped only to the block gas limit, so an operator
+  cap below the block limit did not hold for `eth_call`, `eth_estimateGas`, `eth_createAccessList`
+  and the trace calls (review R24). The allowance is now clamped to the cap as well. TN's defaults
+  (cap 50M above the 30M block limit) were unaffected; a lower `--rpc.gascap` now means what it
+  says. RPC only.
+  *Tests*: upstream's `call_allowance_respects_rpc_gas_cap`; TN-0057's `call_many_budget_tests`.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
