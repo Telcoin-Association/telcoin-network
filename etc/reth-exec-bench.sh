@@ -24,9 +24,12 @@
 #                    busy-readers  TN_EXEC_BENCH_READERS=4
 #                    peak          TN_EXEC_BENCH_BATCHES=20 TN_EXEC_BENCH_GAS=30000000
 #                    busy-metrics  TN_EXEC_BENCH_METRICS=prom TN_EXEC_BENCH_READERS=4
-#                  and two more, run only when named:
+#                  and three more, run only when named:
 #                    busy-epoch    TN_EXEC_BENCH_EPOCH_EVERY=50 (an epoch close every 50 outputs)
 #                    busy-export   TN_EXEC_BENCH_EXPORT=1 (a state-pack export beside the writer)
+#                    busy-history  TN_EXEC_BENCH_READERS=4 TN_EXEC_BENCH_READ_MIX=history (balances
+#                                  and storage at past blocks, transactions by hash, beside the
+#                                  writer)
 #   EXEC_ALLOW_CARGO=1  time the runs even while rustc/cargo processes run (the report says so)
 #   EXEC_SYS_SAMPLE=1  Linux only (refused elsewhere): a sampler beside each run, started just
 #                    before the binary and killed right after it (and on any exit), which never
@@ -73,10 +76,13 @@
 # a profile whose runs differ is marked CHAINS DIFFER and makes the script exit 1 after the report.
 #
 # The report has the host, the knobs each run's JSON header records, the binaries, one line per run,
-# and per profile: each side's page size (as requested and as its database has it), each side's
-# median over the rounds of the total's p50, p90, p99 and mean, each stage's mean, Mgas/s, tx/s and
-# the database growth per output (allocated and logical); with readers on, the writer's total mean
-# with them on over off and each read's p50 and p99; with epoch closes, the closing and normal
+# and per profile: each side's page size and storage layout (as requested and as its database has
+# them), each side's median over the rounds of the total's p50, p90, p99 and mean, each stage's mean,
+# Mgas/s, tx/s, the database growth per output (allocated and logical), the closed database's and
+# each static-file segment's allocated MiB, and each static-file sync phase's ms per output once the
+# bench measures them; with readers on, the writer's total mean with them on over off and each
+# read's p50 and p99; with a differential (TN_EXEC_BENCH_DIFF), its errors and, compared against an
+# earlier run's (TN_EXEC_BENCH_DIFF_AGAINST), its mismatches; with epoch closes, the closing and normal
 # outputs' total means; with an export, its duration, the database growth while it held its read and
 # the writer's total mean beside it over without; each pair's B/A ratio of those; and the median
 # ratio with its spread (min..max). On macOS both backends' durable commits are msync (libmdbx its
@@ -131,7 +137,7 @@ set -euo pipefail
 die() { echo "$*" >&2; exit 1; }
 # The bench's JSON_REPORT_VERSION: the only report version the report reads. The bench of each
 # build must write it (checked before the builds).
-report_version=5
+report_version=6
 # The report's per-profile sections. Std-lib Python, read from stdin and run isolated (-I), so
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
 # of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
@@ -218,6 +224,13 @@ def metrics(doc):
     # logical growth (table bytes) compares the backends
     out += [("db growth/output KiB", kib(sizes.get("db_growth_per_output_bytes"))),
             ("db logical growth/output KiB", kib(sizes.get("db_logical_growth_per_output_bytes")))]
+    # the closed clone's allocated bytes: the database's file, then each static-file segment's
+    closed = sizes.get("closed") or {}
+    out.append(("db closed alloc MiB", mib(closed.get("db_allocated_bytes"))))
+    for name, segment in (sizes.get("static_file_segments") or {}).items():
+        out.append((f"  sf {name} alloc MiB", mib(segment.get("total_allocated_bytes"))))
+    for phase in (doc.get("sf_sync") or {}).get("phases", []):  # once the provider times them
+        out.append((f"sf sync {phase['segment']}.{phase['phase']} ms", phase.get("mean_ms")))
     side = doc.get("side_load")  # readers and the submitter beside the writer
     if side:
         out.append(("writer total on/off", split(side, "mean_ratio")))
@@ -230,6 +243,12 @@ def metrics(doc):
         total = closes.get("writer", {}).get("total", {})
         out += [("closing total mean ms", (total.get("closing") or {}).get("mean_ms")),
                 ("normal total mean ms", (total.get("normal") or {}).get("mean_ms"))]
+    differential = doc.get("differential")  # with TN_EXEC_BENCH_DIFF
+    if differential:
+        out.append(("diff errors", differential.get("errors")))
+        against = differential.get("against") or {}
+        if against:
+            out.append(("diff mismatches", against.get("mismatches")))
     export = doc.get("export")
     if export:
         out += [("export s", export.get("duration_s")),
@@ -241,6 +260,10 @@ def metrics(doc):
 
 def kib(value):
     return None if value is None else value / 1024
+
+
+def mib(value):
+    return None if value is None else value / (1 << 20)
 
 
 def split(section, ratio):
@@ -287,9 +310,16 @@ def ratio(over, under):
 
 
 def knob_text(knobs):
-    # the page size is each backend's own (EXEC_PAGE_SIZE_*), printed per side: not a load knob
+    # the page size is each backend's own (EXEC_PAGE_SIZE_*) and the layout each side's, both
+    # printed per side; the differential's files are each run's own: none is a load knob
     return " ".join(f"{k}={v}" for k, v in knobs.items()
-                    if k not in ("report", "cache_dir", "page_size"))
+                    if k not in ("report", "cache_dir", "page_size", "layout", "diff",
+                                 "diff_against"))
+
+
+def layout_text(header):
+    return (f"{header.get('layout', '-')} "
+            f"(requested {header.get('knobs', {}).get('layout', '-')})")
 
 
 def page_text(header):
@@ -673,11 +703,14 @@ for profile in profiles:
               f"metrics={first.get('metrics')} pacing={first.get('pacing')}")
         print(f"{side} knobs: {knob_text(first.get('knobs', {}))}")
         print(f"{side} page size: {page_text(first)}")
+        print(f"{side} storage layout: {layout_text(first)}")
         for rnd, header in headers[1:]:
             if knob_text(header.get("knobs", {})) != knob_text(first.get("knobs", {})):
                 print(f"{side} round {rnd} KNOBS DIFFER: {knob_text(header.get('knobs', {}))}")
             if page_text(header) != page_text(first):
                 print(f"{side} round {rnd} PAGE SIZE DIFFERS: {page_text(header)}")
+            if layout_text(header) != layout_text(first):
+                print(f"{side} round {rnd} LAYOUT DIFFERS: {layout_text(header)}")
     sides_knobs = {knob_text(doc["header"].get("knobs", {})) for doc in docs.values()}
     if len(sides_knobs) > 1:
         print(f"KNOBS DIFFER between runs of {profile}: the ratios compare different loads")
@@ -814,6 +847,7 @@ profile_settings() { # <profile>: prints the profile's TN_EXEC_BENCH_* assignmen
         busy-metrics) echo "TN_EXEC_BENCH_METRICS=prom TN_EXEC_BENCH_READERS=4" ;;
         busy-epoch) echo "TN_EXEC_BENCH_EPOCH_EVERY=50" ;;
         busy-export) echo "TN_EXEC_BENCH_EXPORT=1" ;;
+        busy-history) echo "TN_EXEC_BENCH_READERS=4 TN_EXEC_BENCH_READ_MIX=history" ;;
         *) return 1 ;;
     esac
 }
@@ -821,7 +855,7 @@ read -r -a profiles <<<"${EXEC_PROFILES:-busy busy-readers peak busy-metrics}"
 [ "${#profiles[@]}" -gt 0 ] || die "EXEC_PROFILES is empty"
 for profile in "${profiles[@]}"; do
     profile_settings "$profile" >/dev/null \
-        || die "unknown profile '$profile' (busy, busy-readers, peak, busy-metrics, busy-epoch, busy-export)"
+        || die "unknown profile '$profile' (busy, busy-readers, peak, busy-metrics, busy-epoch, busy-export, busy-history)"
 done
 command -v python3 >/dev/null || die "python3 is needed for the report"
 sys_sample="${EXEC_SYS_SAMPLE:-0}"
