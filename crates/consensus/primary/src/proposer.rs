@@ -62,7 +62,8 @@ impl OurDigestMessage {
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
         let OurDigestMessage { digest, worker_id, ack_channel } = self;
-        let digest = ProposerDigest { digest, worker_id, received: Instant::now() };
+        let digest =
+            ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false };
         (ack_channel, digest)
     }
 }
@@ -80,6 +81,11 @@ struct ProposerDigest {
     /// the header that carried it was not committed. The `header proposed` line and
     /// `tn_primary_digest_wait_seconds` measure the oldest digest's wait from here.
     pub received: Instant,
+    /// Whether this digest was re-queued at least once, so `received` marks its latest re-queue
+    /// rather than its arrival from the worker. The `header proposed` line counts these as
+    /// `requeued`, which splits headers whose digest wait may be cut short by a re-queue from the
+    /// rest.
+    pub requeued: bool,
 }
 
 #[cfg(test)]
@@ -399,6 +405,7 @@ impl<DB: Database> Proposer<DB> {
             reason = trigger.reason.as_str(),
             digests = %HeaderDigests(&digests),
             oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
+            requeued = digests.iter().filter(|d| d.requeued).count(),
             pending_before = trigger.pending_before,
             "header proposed"
         );
@@ -1372,7 +1379,7 @@ impl fmt::Display for HeaderDigests<'_> {
 }
 
 /// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
-/// each stamped as queued at `requeued_at`.
+/// each stamped as queued at `requeued_at` and marked as re-queued.
 ///
 /// The proposer keeps no arrival time for a digest already in a header, so a re-queued digest's
 /// wait restarts at `requeued_at`.
@@ -1386,6 +1393,7 @@ fn push_payload(
             digest: *digest,
             worker_id: *worker_id,
             received: requeued_at,
+            requeued: true,
         });
     });
 }

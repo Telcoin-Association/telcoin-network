@@ -1334,7 +1334,7 @@ async fn test_epoch_start_proposes_round_one_on_genesis_parents() {
 
 /// A digest of `worker_id` that arrived from its worker just now.
 fn queued(digest: BlockHash, worker_id: WorkerId) -> ProposerDigest {
-    ProposerDigest { digest, worker_id, received: Instant::now() }
+    ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false }
 }
 
 /// A [`ProposalTrigger`] for tests that read neither the proposal's reason nor its counter.
@@ -1364,14 +1364,15 @@ fn test_propose_reason_names_each_condition_branch() {
 
 /// A proposal carries the reason `propose_next_header` was given to its `header proposed` line and
 /// to the `headers_proposed_total` counter of that reason. The line also reports the header's own
-/// creation time, its digests as 0x-prefixed hex in payload order, the oldest digest's wait and
-/// the queue depth before the header took its share; the oldest wait is also a
-/// `digest_wait_seconds` sample.
+/// creation time, its digests as 0x-prefixed hex in payload order, the oldest digest's wait, how
+/// many of its digests were re-queued and the queue depth before the header took its share; the
+/// oldest wait is also a `digest_wait_seconds` sample.
 ///
 /// Catches: a reason dropped or replaced on its way to the spawned proposal, a counter of the wrong
 /// reason, a digest wait measured from the newest digest or from the proposal instead of the
-/// digest's arrival, `pending_before` read after the drain, and digests printed in any other form
-/// than the hex the stage tool joins on.
+/// digest's arrival, a `requeued` count taken over the queue instead of the header,
+/// `pending_before` read after the drain, and digests printed in any other form than the hex the
+/// stage tool joins on.
 #[tokio::test]
 async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
     use crate::log_capture::LogCapture;
@@ -1404,13 +1405,15 @@ async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
     let delay = Duration::from_millis(80);
     let mut headers = Vec::new();
     for reason in ProposeReason::ALL {
-        // twelve digests on one worker: the oldest arrived `delay` ago, and the header takes ten
+        // twelve digests on one worker: the oldest arrived `delay` ago, and the header takes ten.
+        // the second and the last were re-queued, and only the second rides this header
         let delayed = Instant::now().checked_sub(delay).expect("the clock runs past the delay");
         let queue: VecDeque<_> = (0..12)
             .map(|i| ProposerDigest {
                 digest: B256::random(),
                 worker_id: 0,
                 received: if i == 0 { delayed } else { Instant::now() },
+                requeued: i == 1 || i == 11,
             })
             .collect();
         proposer.digests = BTreeMap::from([(0, queue)]);
@@ -1431,6 +1434,7 @@ async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
         assert_eq!(line.u64_field("round"), Some(u64::from(header.round())));
         assert_eq!(line.u64_field("num_batches"), Some(10));
         assert_eq!(line.u64_field("pending_before"), Some(12), "queue depth before the drain");
+        assert_eq!(line.u64_field("requeued"), Some(1), "re-queued digests in this header only");
         assert_eq!(line.u64_field("created_at_ms"), Some(header.created_at_ms().as_millis()));
         let wait = line.u64_field("oldest_digest_wait_ms").expect("oldest digest wait");
         assert!(wait >= 80, "{} waited {wait} ms, less than the oldest digest", reason.as_str());
@@ -1471,12 +1475,13 @@ async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
 }
 
 /// Re-queuing the digests of an uncommitted own header logs one `digests resent` line with the
-/// number of digests, the oldest re-queued header's round and the proposer's round, and restarts
-/// the re-queued digests' wait. An uncommitted header without digests re-sends nothing and logs
-/// nothing.
+/// number of digests, the oldest re-queued header's round and the proposer's round, restarts the
+/// re-queued digests' wait and marks them as re-queued. An uncommitted header without digests
+/// re-sends nothing and logs nothing.
 ///
-/// Catches: a missing or per-digest line, a count or round off the re-queued headers, and a
-/// re-queued digest keeping a stale or zero arrival time.
+/// Catches: a missing or per-digest line, a count or round off the re-queued headers, a re-queued
+/// digest keeping a stale or zero arrival time, and one the next `header proposed` line would not
+/// count as re-queued.
 #[tokio::test]
 async fn test_digests_resent_line_on_requeue() {
     use crate::log_capture::LogCapture;
@@ -1511,6 +1516,7 @@ async fn test_digests_resent_line_on_requeue() {
     let requeued: Vec<_> = proposer.digests.values().flatten().collect();
     assert_eq!(requeued.iter().map(|d| d.digest).collect::<Vec<_>>(), [d3, d4a, d4b]);
     assert!(requeued.iter().all(|d| d.received >= before), "the wait restarts at the re-queue");
+    assert!(requeued.iter().all(|d| d.requeued), "a re-queued digest is marked as one");
 
     // round 7 commits: only the empty round-6 header falls behind, so nothing is re-sent
     proposer.digests.clear();
