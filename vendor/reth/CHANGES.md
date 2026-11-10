@@ -551,6 +551,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   root), no change in results. *Tests*: reth-trie's `forward_cursor` tests and as TN-0102.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0105** — Backport 0a21d223a: the state root reuses one storage trie cursor and one
+  hashed storage cursor for every account. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/trie.rs` (`StateRoot::calculate` keeps the two storage cursors
+  across accounts and repositions them with `set_hashed_address`; new
+  `StorageRoot::calculate_with_cursors`, `calculate_with_cursor` and `StorageRootCalculation`;
+  the factories no longer need `Clone`). It merged with the pin's `instrument` attribute on
+  `StorageRoot::calculate`, which the pin and upstream's parent spell differently.
+  *Why*: the state root built a fresh `StorageRoot`, and so two fresh cursor stacks, for every
+  account with changed storage. Under TN's output overlay each stack is one boxed layer per run
+  plus the database cursors and `OverlayStorageCursor` (`crates/tn-reth/src/env/output_overlay/`),
+  so a peak output rebuilt hundreds of them. TN's cursor types implement `set_hashed_address` by
+  passing it down every layer (`RunHashedCursor`, `RunTrieCursor`, `OverlayStorageCursor`, which
+  also switches its own address), and reth's overlay cursors reset their position and their
+  in-memory view for the new account. Execution path (state root): the same walk over the same
+  entries, only the cursors are reused. *Tests*: as TN-0102; TN's `trie_overlay` differential
+  tests compare the layered root against a flattened reference over several accounts with
+  storage, so a cursor that kept the previous account's position or overlay would fail them.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
