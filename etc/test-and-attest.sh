@@ -144,6 +144,21 @@ cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
+# The reth database migration and rebuild suites (`reth_db_migration`, `resync`): a committee
+# starts on the MDBX build, and a validator moves onto the default (tn-lmdb) build in place, which
+# migrates its reth database and keeps storage layout v1; `resync` then rebuilds it from genesis in
+# layout v2 and compares it with a validator still on MDBX. Both skip without an MDBX previous
+# binary (TN_BIN_PATH_PREV, with the TN_E2E_TN_LMDB_BIN marker), which the run above does not set,
+# so they run here through their make targets: those build the MDBX e2e binary (`mdbx-e2e/` under
+# the same target root) and pass both, so each lane has one definition.
+# The rolling-upgrade suite (`make test-upgrade`) stays manual. Its previous binary has to be the
+# release the network runs, and since #1788 changed node records that release (v0.16.0-adiri) and
+# this tree do not peer: an upgraded validator migrates both databases and then cannot resolve its
+# peers (crates/tn-reth/README.md, "Upgrade every node together"). It joins this script once a
+# release that peers with this tree is the previous binary.
+make test-e2e-reth-migration
+make test-e2e-resync
+
 echo "all checks passed - submitting attestation on-chain..."
 
 #
