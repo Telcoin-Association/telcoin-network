@@ -658,7 +658,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - A wiped account's pre-existing slots are not in the reverts. v1 reads them from
     `PlainStorageState`; v2 has no plain state. The new check fails `save_blocks` if a wiped
     account had storage before the wipe (in `HashedStorages` before the batch, or changed by an
-    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen; the check makes
+    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen from execution
+    (TN-0116 corrects the argument and refuses the genesis alloc that could); the check makes
     that an error instead of a silent gap.
   - The history unwinds run in both layouts.
   - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
@@ -710,19 +711,27 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `.../providers/database/mod.rs` (the `#[cfg(test)]` module line).
   *Why*: the oracle for TN-0041 to TN-0044. A seeded generator builds blocks 1 to 12 with
   transactions, account creations and updates, accounts whose only change is storage (an info
-  revert of `DoNothing`), slots changed in several blocks, slots cleared, and the empty bytecode
-  in a bundle's contracts. The chain is saved with `save_blocks` into a v1 and a v2 factory in
+  revert of `DoNothing`), slots changed in several blocks, slots cleared, the empty bytecode
+  in a bundle's contracts, and an account without storage that block 7 destroys and re-creates
+  with one slot set to 7 (a storage wipe whose slot revert is `Destroyed`, inside a multi-block
+  batch). The chain is saved with `save_blocks` into a v1 and a v2 factory in
   single- and multi-block batches. `v2_matches_v1_on_a_generated_chain` checks that v2 writes
   the three ex-`RocksDB` tables, that they, the changesets and `Bytecodes` equal v1's row for
   row, that every historical account and storage read at the start of each block equals v1's
-  answer and the generator's state, and that every transaction is found by hash.
+  answer and the generator's state, that the re-created slot reads 7 after the wipe block (its
+  only history entry), and that every transaction is found by hash.
   `v2_history_unwind_round_trip` removes blocks with `remove_block_and_execution_above` in both
   layouts, compares the tables and reads with a save of the shorter chain, then saves the removed
-  blocks again and compares with a full save. Three tests cover the fail-closed paths of
-  TN-0043: a v2 wipe of an account with committed storage, and of storage written earlier in the
-  same batch, fail (a wipe of an account without storage saves), and `update_history_indices`
-  refuses blocks whose static-file changesets are not committed yet while re-indexing committed
-  ones to what `save_blocks` wrote. Each test fails with the change it guards undone.
+  blocks again and compares with a full save. `v2_history_covers_the_tip_state` walks
+  `HashedAccounts` and `HashedStorages`, in both layouts, after a full save, an unwind to before
+  the wipe block and a re-save, and requires a history shard for every key: a key without one
+  reads as never written at every block, which no read reports as an error. Three tests cover
+  the fail-closed paths of TN-0043: a v2 wipe of an account with committed storage, and of
+  storage written earlier in the same batch, fail (a wipe of an account without storage saves),
+  and `update_history_indices` refuses blocks whose static-file changesets are not committed yet
+  while re-indexing committed ones to what `save_blocks` wrote. Each test fails with the change
+  it guards undone; dropping a wiped account's slots in `HistoryTransitions::from_reverts`
+  fails the differential, the unwind round trip, the re-index check and the history check.
   *Upstream*: n/a.
 - **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
   only).
@@ -750,7 +759,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/storage/provider/src/providers/static_file/writer.rs` (new
   `StaticFileProviderRW::sync_and_freeze`, the `index_pending` flag that `finalize` and `commit`
   honour), `crates/storage/provider/src/providers/static_file/manager.rs` (`write_segment` calls
-  it; test `frozen_rows_stay_unindexed_until_finalize`),
+  it; tests `frozen_rows_stay_unindexed_until_finalize`,
+  `commit_publishes_rows_frozen_by_sync_and_freeze` and
+  `finalize_syncs_rows_appended_after_sync_and_freeze`),
   `crates/storage/provider/src/providers/database/provider.rs` (a comment in
   `DatabaseProvider::commit`; tests `test_save_blocks_without_db_commit_heals_v{1,2}`).
   *Why*: `DatabaseProvider::commit` wrote every dirty segment's `.conf` one after another on the
@@ -780,7 +791,14 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   miss after the freeze loads the longer jar, reads by number still stop at the index tip, and
   `finalize` publishes the rows). They fail if the configuration is not written in the
   segment thread, if it is published before `finalize`, or if `finalize` skips the index
-  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last. TN's
+  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last.
+  `commit_publishes_rows_frozen_by_sync_and_freeze` (a commit of every writer after the freeze,
+  the path `DatabaseProvider::commit` takes in unwind order or with an unwind queued, publishes
+  the rows) fails
+  without `commit`'s `index_pending` branch, and
+  `finalize_syncs_rows_appended_after_sync_and_freeze` (a row appended after the freeze gets its
+  own data and offsets syncs, counted by TN-0052's stats) fails if `sync_and_freeze` leaves the
+  writer marked synced. TN's
   `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
   tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
   semantics.
@@ -848,3 +866,52 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
   effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
   yes.
+
+- **TN-0115** — Tests: storage v2 across static-file boundaries. *Kind*: test.
+  *Files*: `crates/storage/provider/src/test_utils/mod.rs` (new
+  `create_test_provider_factory_with_blocks_per_file`),
+  `.../providers/database/tn_v2_tests.rs` (`Chain::across_static_files`,
+  `v2_matches_v1_across_static_files`, `v2_history_unwind_round_trip_across_static_files`),
+  `.../providers/database/provider.rs` (`run_save_blocks_without_db_commit_heals` takes a
+  blocks-per-file setting; `test_save_blocks_without_db_commit_heals_across_files_v2`).
+  *Why*: every v2 test held its chain in one static file per segment (500k blocks per file
+  against a 12-block chain), so nothing exercised a v2 changeset lookup in a later file, an
+  unwind or heal that deletes files, or a save that rotates files in the segment threads
+  (TN-0051). The TN-0045 differential and unwind round trip now also run with 4 blocks per file
+  (four files; the `5..=9` and `10..=12` batches each cross into a new one); the unwind must
+  delete the later files, leave two, and read the shorter chain, and the re-save must rebuild the
+  full chain's tables. The aborted save of TN-0051 runs with 2 blocks per file under v2: blocks
+  1 to 3 rotate every segment into a new file with a new `.csoff`; the heal on reopen must delete
+  the new files with every satellite file and shorten the old ones to genesis, and the blocks
+  must save again. A rotation commits the filled file during the save (`increment_block`), so
+  the reader index reaches block 1 before the database commit; the test pins that (it is the
+  index's state, not the new file's). *Tests*: the across-files differential and unwind fail when
+  `SegmentHeader::changeset_offset_index` ignores the file's first block (the single-file ones
+  pass), the unwind when `truncate_changesets` stops deleting files, and the aborted save when
+  `NippyJar::delete` leaves a file's configuration behind. *Upstream*: n/a.
+
+- **TN-0116** — A storage v2 genesis refuses an account with storage but no code; the wipe
+  check's rationale is corrected. *Kind*: fix (genesis init, v2 only) and docs.
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`, new
+  `InitStorageError::GenesisStorageWithoutCode`; test `v2_genesis_refuses_storage_without_code`;
+  `v2_genesis_storage_reads_after_genesis` gives its account code),
+  `crates/storage/provider/src/providers/database/provider.rs` (the doc of
+  `ensure_wiped_accounts_had_no_storage`).
+  *Why*: TN-0043's check documented that a wipe of an account with storage cannot happen since
+  Cancun because EIP-7610 refuses a create at an address with storage. revm does not apply that
+  rule: its create collision check looks at the code hash and the nonce only. The argument that
+  holds: revm wipes storage when it self-destructs an account (since EIP-6780 only one created in
+  the same transaction, which revm allows only at an address with no code and a zero nonce) or
+  deletes a touched empty account (EIP-161: no code, zero nonce, zero balance). Execution never
+  leaves storage at an address with no code and a zero nonce: only code running at an address
+  writes its storage, a created contract gets nonce 1 even with empty runtime code, and an
+  EIP-7702 authorization bumps the delegating account's nonce. (A native precompile writing its
+  own storage needs code in genesis; TN's TEL precompile has `0xfe`.) The one source left is a
+  genesis alloc, so under v2 `init_genesis_with_settings` now refuses an account with storage
+  and no code (absent or empty) before it writes anything, rather than letting a later block
+  halt the chain. TN's testnet and mainnet genesis files and the precompile configuration have no
+  such account (checked 2026-11-09); v1 genesis is unchanged. It cannot change execution: it only
+  refuses a genesis v2 could not store faithfully. *Tests*:
+  `v2_genesis_refuses_storage_without_code` (absent and empty code: v2 refuses with nothing
+  written, v1 writes it; fails with the check removed). *Upstream*: maybe (upstream's v2 has the
+  same wipe gap, TN-0043).

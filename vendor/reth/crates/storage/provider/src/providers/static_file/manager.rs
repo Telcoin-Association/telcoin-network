@@ -3786,4 +3786,60 @@ mod tests {
         assert!(static_files.take_sync_stats().is_empty(), "a take drains the stats");
         Ok(())
     }
+
+    /// TN(TN-0051): after `sync_and_freeze` the writer is clean, so a commit of every writer
+    /// (`StaticFileWriters::commit`, which `DatabaseProvider::commit` runs instead of `finalize`
+    /// in unwind order or with an unwind queued) has nothing to write, but must still publish
+    /// the frozen rows.
+    #[test]
+    fn commit_publishes_rows_frozen_by_sync_and_freeze() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let segment = StaticFileSegment::Headers;
+        let hashes = [0x30, 0x31, 0x32].map(|byte| B256::from([byte; 32]));
+        {
+            let mut writer = static_files.latest_writer(segment)?;
+            writer.append_header(&Header::default(), &hashes[0])?;
+            writer.commit()?;
+            for number in 1..=2u64 {
+                let header = Header { number, ..Default::default() };
+                writer.append_header(&header, &hashes[number as usize])?;
+            }
+            writer.sync_and_freeze()?;
+        }
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(0));
+
+        static_files.commit()?;
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
+        assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
+        Ok(())
+    }
+
+    /// TN(TN-0051): `sync_and_freeze` leaves the writer unsynced, so `finalize` syncs the rows
+    /// appended after it before it writes their configuration.
+    #[test]
+    fn finalize_syncs_rows_appended_after_sync_and_freeze() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let segment = StaticFileSegment::Headers;
+        let mut writer = static_files.latest_writer(segment)?;
+        // Opening a writer runs its heal, which updates the index; start after it.
+        let _ = static_files.take_sync_stats();
+
+        writer.append_header(&Header::default(), &B256::ZERO)?;
+        writer.sync_and_freeze()?;
+        writer.append_header(&Header { number: 1, ..Default::default() }, &B256::ZERO)?;
+        writer.finalize()?;
+        drop(writer);
+
+        let stats = static_files.take_sync_stats();
+        let stats = stats.segment(segment);
+        assert_eq!(stats.data_sync.calls, 2, "the second row's data sync");
+        assert_eq!(stats.offsets_sync.calls, 2, "the second row's offsets sync");
+        assert_eq!(stats.conf_freeze.calls, 2);
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(1));
+        Ok(())
+    }
 }

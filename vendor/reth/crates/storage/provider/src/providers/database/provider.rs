@@ -1386,9 +1386,21 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     /// v1 records the slots such a wipe removes by reading them from `PlainStorageState`
     /// (`write_state_reverts`). Storage v2 has no plain state and builds its changesets and history
     /// from the reverts alone, which list only the slots the block itself touched, so those slots
-    /// would be missing from both. Since Cancun this cannot happen: `SELFDESTRUCT` clears only an
-    /// account created in the same transaction, and EIP-7610 refuses to create an account at an
-    /// address that has storage. This makes that argument a check rather than a silent gap.
+    /// would be missing from both.
+    ///
+    /// TN(TN-0116): execution cannot reach the error. revm wipes an account's storage when it
+    /// self-destructs the account, or deletes it as an empty account a transaction touched
+    /// (EIP-161). Since Cancun (EIP-6780) `SELFDESTRUCT` deletes only an account created in the
+    /// same transaction, and revm creates an account only at an address with no code and a zero
+    /// nonce (it checks just those two, not EIP-7610's storage rule); an empty account has no code
+    /// and a zero nonce too. So the wiped account had storage only if an address with no code and a
+    /// zero nonce held storage, and execution never leaves one: only code running at an address
+    /// writes its storage, a contract keeps its code and gets nonce 1 at creation (even with empty
+    /// runtime code), and an EIP-7702 authorization bumps the nonce of the account it delegates.
+    /// (A native precompile that writes its own storage, such as TN's TEL precompile, needs code in
+    /// genesis for this to hold; TN's has `0xfe`.) Only a genesis alloc can set storage without
+    /// code, and `init_genesis_with_settings` refuses that under v2. This check turns the argument
+    /// into an error instead of a silent gap.
     ///
     /// Must run before the batch's hashed state is written, while `HashedStorages` still holds the
     /// storage from before the batch. A slot changed by an earlier block of the same batch counts
@@ -5241,21 +5253,25 @@ mod tests {
     /// `save_blocks` returned) leaves the static files it wrote durably ahead of the database.
     /// The reader index must not show those rows, and the next open must prune them back to the
     /// database checkpoints, after which the same blocks save and commit again.
-    fn run_save_blocks_without_db_commit_heals(mode: StorageMode) {
+    ///
+    /// TN(TN-0115): with `blocks_per_file`, the save crosses into a new file of every segment.
+    fn run_save_blocks_without_db_commit_heals(mode: StorageMode, blocks_per_file: Option<u64>) {
         use crate::{
-            providers::RocksDBBuilder, test_utils::MockNodeTypesWithDB, MetadataWriter,
-            ProviderFactory,
+            providers::{RocksDBBuilder, StaticFileProviderBuilder},
+            test_utils::{create_test_provider_factory_with_blocks_per_file, MockNodeTypesWithDB},
+            MetadataWriter, ProviderFactory,
         };
         use alloy_primitives::map::HashMap;
         use reth_nippy_jar::NippyJar;
         use reth_static_file_types::SegmentHeader;
 
-        // The configuration's block end on disk for the file holding block 3, if it exists.
+        // The configuration's block end on disk for the file holding `block`, if it exists.
         fn on_disk_end(
             static_files: &StaticFileProvider<reth_ethereum_primitives::EthPrimitives>,
             segment: StaticFileSegment,
+            block: BlockNumber,
         ) -> Option<Option<BlockNumber>> {
-            let range = static_files.find_fixed_range(segment, 3);
+            let range = static_files.find_fixed_range(segment, block);
             let path = static_files.path().join(segment.filename(&range));
             path.exists()
                 .then(|| NippyJar::<SegmentHeader>::load(&path).unwrap().user_header().block_end())
@@ -5265,7 +5281,12 @@ mod tests {
             StorageMode::V1 => StorageSettings::v1(),
             StorageMode::V2 => StorageSettings::v2(),
         };
-        let factory = create_test_provider_factory();
+        let factory = match blocks_per_file {
+            Some(blocks_per_file) => {
+                create_test_provider_factory_with_blocks_per_file(blocks_per_file)
+            }
+            None => create_test_provider_factory(),
+        };
         factory.set_storage_settings_cache(settings);
 
         let genesis = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
@@ -5341,27 +5362,33 @@ mod tests {
         }
 
         let static_files = factory.static_file_provider();
+        // The first block of the file holding block 3. A save that fills a file commits it when
+        // it opens the next (`increment_block`), which publishes that file's rows at once, so
+        // with a file boundary the index may reach the block before this one.
+        let last_file_start = static_files.find_fixed_range(StaticFileSegment::Headers, 3).start();
+        let published = last_file_start.saturating_sub(1);
+        assert_eq!(last_file_start > 0, blocks_per_file.is_some());
         let provider_rw = factory.provider_rw().unwrap();
         provider_rw.save_blocks(blocks.clone(), SaveBlocksMode::Full).unwrap();
         // Dropped without `commit`: the database transaction aborts.
         drop(provider_rw);
 
         // Every segment the save wrote has its configuration on disk at block 3, but the reader
-        // index still ends at genesis, so readers cannot see the rows.
+        // index does not reach the file holding it, so readers cannot see its rows.
         for segment in StaticFileSegment::iter() {
-            let on_disk = on_disk_end(&static_files, segment);
+            let on_disk = on_disk_end(&static_files, segment, 3);
             if expected.contains(&segment) {
                 assert_eq!(on_disk, Some(Some(3)), "{segment:?}: configuration frozen at block 3");
             }
             if on_disk == Some(Some(3)) {
                 assert_eq!(
                     static_files.get_highest_static_file_block(segment),
-                    Some(0),
+                    Some(published),
                     "{segment:?}: the index must not publish rows before the commit"
                 );
             }
         }
-        assert!(static_files.header_by_number(1).unwrap().is_none());
+        assert!(static_files.header_by_number(published + 1).unwrap().is_none());
 
         // Reopen over the same database and static files, as the next start does.
         let db = factory.db_ref().clone();
@@ -5370,10 +5397,16 @@ mod tests {
         let rocksdb_path = static_files_path.parent().unwrap().join("rocksdb");
         drop(static_files);
         drop(factory);
+        let static_files = match blocks_per_file {
+            Some(blocks_per_file) => StaticFileProviderBuilder::read_write(&static_files_path)
+                .with_blocks_per_file(blocks_per_file)
+                .build(),
+            None => StaticFileProvider::read_write(&static_files_path),
+        };
         let factory = ProviderFactory::<MockNodeTypesWithDB>::new_checked(
             db,
             chain_spec,
-            StaticFileProvider::read_write(&static_files_path).unwrap(),
+            static_files.unwrap(),
             RocksDBBuilder::new(&rocksdb_path).with_default_tables().build().unwrap(),
             reth_tasks::Runtime::test(),
         )
@@ -5382,11 +5415,23 @@ mod tests {
 
         let static_files = factory.static_file_provider();
         for segment in StaticFileSegment::iter() {
-            let on_disk = on_disk_end(&static_files, segment);
             if expected.contains(&segment) {
+                let on_disk = on_disk_end(&static_files, segment, 0);
                 assert_eq!(on_disk, Some(Some(0)), "{segment:?}: healed back to genesis");
             }
+            let on_disk = on_disk_end(&static_files, segment, 3);
             assert_ne!(on_disk, Some(Some(3)), "{segment:?}: still ahead of the database");
+            // A file the save opened is deleted with its offsets, configuration and `.csoff`.
+            if last_file_start > 0 {
+                let range = static_files.find_fixed_range(segment, 3);
+                let name = segment.filename(&range);
+                let left: Vec<_> = std::fs::read_dir(static_files.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|file| file.starts_with(&name))
+                    .collect();
+                assert!(left.is_empty(), "{segment:?}: {left:?} left after the heal");
+            }
         }
 
         let provider_rw = factory.provider_rw().unwrap();
@@ -5400,16 +5445,27 @@ mod tests {
                 assert_eq!(static_files.storage_changeset(number).unwrap().len(), 1);
             }
         }
+        for segment in &expected {
+            assert_eq!(on_disk_end(&static_files, *segment, 3), Some(Some(3)), "{segment:?}");
+        }
     }
 
     #[test]
     fn test_save_blocks_without_db_commit_heals_v1() {
-        run_save_blocks_without_db_commit_heals(StorageMode::V1);
+        run_save_blocks_without_db_commit_heals(StorageMode::V1, None);
     }
 
     #[test]
     fn test_save_blocks_without_db_commit_heals_v2() {
-        run_save_blocks_without_db_commit_heals(StorageMode::V2);
+        run_save_blocks_without_db_commit_heals(StorageMode::V2, None);
+    }
+
+    /// TN(TN-0115): the save crosses a file boundary (two blocks per file): every segment
+    /// rotates in its thread, the changeset segments open a new `.csoff`, and the heal deletes
+    /// the new files and shortens the old ones.
+    #[test]
+    fn test_save_blocks_without_db_commit_heals_across_files_v2() {
+        run_save_blocks_without_db_commit_heals(StorageMode::V2, Some(2));
     }
 
     #[test]

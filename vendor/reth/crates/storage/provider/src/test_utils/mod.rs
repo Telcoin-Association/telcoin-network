@@ -1,5 +1,8 @@
 use crate::{
-    providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBBuilder, StaticFileProvider},
+    providers::{
+        NodeTypesForProvider, ProviderNodeTypes, RocksDBBuilder, StaticFileProvider,
+        StaticFileProviderBuilder,
+    },
     HashingWriter, ProviderFactory, TrieWriter,
 };
 use alloy_primitives::B256;
@@ -68,6 +71,32 @@ pub fn create_test_provider_factory_with_node_types<N: NodeTypesForProvider>(
         chain_spec,
         StaticFileProvider::read_write(static_files_path).expect("static file provider"),
         RocksDBBuilder::new(&rocksdb_path)
+            .with_default_tables()
+            .build()
+            .expect("failed to create test RocksDB provider"),
+        reth_tasks::Runtime::test(),
+    )
+    .expect("failed to create test provider factory")
+}
+
+/// TN(TN-0115): creates a test provider factory with mainnet chain spec whose static files hold
+/// `blocks_per_file` blocks each, so a short chain spans several files.
+pub fn create_test_provider_factory_with_blocks_per_file(
+    blocks_per_file: u64,
+) -> ProviderFactory<MockNodeTypesWithDB> {
+    let datadir_path = reth_db::test_utils::tempdir_path();
+    let static_files_path = datadir_path.join("static_files");
+    std::fs::create_dir_all(&static_files_path).expect("failed to create static_files dir");
+    let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir_path);
+
+    ProviderFactory::new(
+        db,
+        MAINNET.clone(),
+        StaticFileProviderBuilder::read_write(static_files_path)
+            .with_blocks_per_file(blocks_per_file)
+            .build()
+            .expect("static file provider"),
+        RocksDBBuilder::new(datadir_path.join("rocksdb"))
             .with_default_tables()
             .build()
             .expect("failed to create test RocksDB provider"),

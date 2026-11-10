@@ -64,6 +64,33 @@ get separate servers on shifted ports, and `worker_rpc_server_args`
 CORS headers and the other workers' do not. That fails closed (browsers are refused), so it is
 not a security issue; the fix is to mirror the carry into `http_corsdomain`.
 
+## Storage v2 corner cases with no TN caller, or a halt behind them
+
+Known and left alone, because TN never takes these paths or stops the node first. Each needs its
+own change if that stops being true.
+
+- **`take_block_and_execution_above` returns the wrong post-state under v2.** It calls
+  `unwind_trie_state_from` first, which reverts `HashedAccounts` and `HashedStorages`, and then
+  `take_state_above`, which under v2 reads the blocks' present values from those same tables
+  (`populate_bundle_state_hashed`; v1 reads the plain state, which is still unreverted). So the
+  returned `Chain` holds the pre-unwind values as its present state. The tables it leaves are
+  right; only the returned `Chain` is wrong. TN never calls it: its unwinds go through
+  `remove_block_and_execution_above`, which returns nothing (TN-0045's round trip covers that).
+  A fix reads the present state before the hashed tables are unwound, or unwinds them after.
+- **A file rotation publishes rows before the database commit.** When a save fills a static
+  file, `increment_block` commits it (`StaticFileProviderRW::commit`) and the reader index names
+  its rows at once, while `save_blocks` is still running. If the database arm then fails, the
+  headers tip (TN's `last_block_number`) reads ahead of the database until the node halts; the
+  restart prunes the rows back (`check_consistency`), and re-execution writes the same ones.
+  `test_save_blocks_without_db_commit_heals_across_files_v2` (TN-0115) pins this state.
+- **A cache miss after a failed save can cache uncommitted rows.** Since TN-0051 every segment
+  writes its `.conf` in its own thread, so after a database-arm failure in `save_blocks` the
+  `.conf` files on disk name rows the database never committed. A jar loaded on a cache miss
+  then holds them until restart. Reads by number or transaction route by the index, and
+  `DatabaseProvider`'s range reads clamp to it; only a direct
+  `StaticFileProvider::fetch_range_with_predicate` past the index tip returns them. TN has no
+  such caller, and a failed save halts the node.
+
 ## RocksDB stubs and storage-v2 plumbing
 
 RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-factory field and

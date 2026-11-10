@@ -1,22 +1,28 @@
 //! TN(TN-0045): storage v2 without `RocksDB`, checked against v1 on the same generated chain.
 //!
-//! Each test generates one chain of executed blocks with transactions, account changes and slots
-//! that change in several blocks. It saves the chain with `save_blocks` into a v1 and a v2
-//! factory, in the same batches, and compares what the two layouts answer. Every historical
-//! answer is also checked against the state the generator tracked, so a fault both layouts share
-//! fails too.
+//! Each test generates one chain of executed blocks with transactions, account changes, slots
+//! that change in several blocks, and an account a block destroys and re-creates. It saves the
+//! chain with `save_blocks` into a v1 and a v2 factory, in the same batches, and compares what the
+//! two layouts answer. Every historical answer is also checked against the state the generator
+//! tracked, so a fault both layouts share fails too.
 
 use crate::{
-    test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
+    test_utils::{
+        create_test_provider_factory, create_test_provider_factory_with_blocks_per_file,
+        MockNodeTypesWithDB,
+    },
     BlockExecutionWriter, ChangeSetReader, HistoricalStateProviderRef, HistoryWriter,
-    ProviderFactory, SaveBlocksMode, StorageChangeSetReader, TransactionsProvider,
+    ProviderFactory, SaveBlocksMode, StaticFileProviderFactory, StorageChangeSetReader,
+    TransactionsProvider,
 };
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{map::HashMap, Address, BlockNumber, Bytes, TxHash, TxNumber, B256, U256};
+use alloy_primitives::{
+    keccak256, map::HashMap, Address, BlockNumber, Bytes, TxHash, TxNumber, B256, U256,
+};
 use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_db_api::{
     cursor::DbCursorRO,
-    models::StorageSettings,
+    models::{storage_sharded_key::StorageShardedKey, ShardedKey, StorageSettings},
     table::{Table, TableRow},
     tables,
     transaction::DbTx,
@@ -24,10 +30,11 @@ use reth_db_api::{
 use reth_ethereum_primitives::{Block, Receipt, TransactionSigned};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::{Account, BlockBody as _, SealedBlock, SealedHeader};
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{AccountReader, DBProvider, StateProvider, StorageSettingsCache};
 use reth_testing_utils::generators::{self, random_block, BlockParams};
 use reth_trie::{HashedPostState, KeccakKeyHasher};
-use revm_database::BundleState;
+use revm_database::{AccountStatus, BundleState, RevertToSlot};
 use revm_state::{AccountInfo, Bytecode};
 use std::{collections::BTreeMap, fmt::Debug, ops::RangeInclusive, sync::Arc};
 
@@ -44,6 +51,18 @@ const SLOTS: u64 = 5;
 const TIP: BlockNumber = 12;
 /// The `save_blocks` calls, so the chain has single and multi-block saves.
 const BATCHES: [RangeInclusive<BlockNumber>; 4] = [1..=3, 4..=4, 5..=9, 10..=12];
+/// Blocks per static file in the tests across static files: the chain spans four files, and the
+/// batches `5..=9` and `10..=12` each cross into a new one.
+const BLOCKS_PER_FILE: u64 = 4;
+/// An account, by last address byte, that block 2 creates without storage and block
+/// [`RECREATED_AT`] destroys and re-creates with [`RECREATED_SLOT`] set to 7: a storage wipe
+/// with a slot revert of `Destroyed`. `address(ACCOUNTS)` is the account nothing touches.
+const RECREATED: u8 = ACCOUNTS + 1;
+/// The block that destroys and re-creates [`RECREATED`], inside the batch `5..=9`.
+const RECREATED_AT: BlockNumber = 7;
+/// The re-created account's slot. The reads cover it, but the generator never writes it, so the
+/// wipe block is its only history entry.
+const RECREATED_SLOT: U256 = U256::from_limbs([SLOTS + 1, 0, 0, 0]);
 
 fn address(i: u8) -> Address {
     Address::with_last_byte(0x40 + i)
@@ -76,6 +95,9 @@ struct Chain {
     blocks: Vec<ExecutedBlock>,
     states: Vec<Snapshot>,
     txs: Vec<(TxHash, TxNumber, TransactionSigned)>,
+    /// Blocks per static file of the factories [`Self::save`] makes; `None` for reth's default,
+    /// which holds the whole chain in one file per segment.
+    blocks_per_file: Option<u64>,
 }
 
 impl Chain {
@@ -176,11 +198,53 @@ impl Chain {
                     }
                 }
             }
-            blocks.push(executed(block, builder.build()));
+            let recreated = address(RECREATED);
+            if number == 2 {
+                let info = AccountInfo { nonce: 1, balance: U256::from(2), ..Default::default() };
+                builder = builder
+                    .state_present_account_info(recreated, info.clone())
+                    .revert_account_info(number, recreated, Some(None));
+                state.accounts.insert(recreated, info);
+            }
+            if number == RECREATED_AT {
+                let before = state.accounts[&recreated].clone();
+                let info = AccountInfo { nonce: 1, balance: U256::from(7), ..Default::default() };
+                builder = builder
+                    .state_original_account_info(recreated, before.clone())
+                    .state_present_account_info(recreated, info.clone())
+                    .state_storage(
+                        recreated,
+                        HashMap::from_iter([(RECREATED_SLOT, (U256::ZERO, U256::from(7)))]),
+                    )
+                    .revert_account_info(number, recreated, Some(Some(before)))
+                    .revert_storage(number, recreated, vec![(RECREATED_SLOT, U256::ZERO)]);
+                state.accounts.insert(recreated, info);
+                state.storage.insert((recreated, RECREATED_SLOT), U256::from(7));
+            }
+            let mut bundle = builder.build();
+            if number == RECREATED_AT {
+                // TN(TN-0043): what revm leaves for an account destroyed and re-created in the
+                // block, which the builder cannot express.
+                bundle.state.get_mut(&recreated).unwrap().status = AccountStatus::DestroyedChanged;
+                let revert = bundle.reverts[0]
+                    .iter_mut()
+                    .find_map(|(address, revert)| (*address == recreated).then_some(revert))
+                    .unwrap();
+                revert.wipe_storage = true;
+                revert.storage.insert(RECREATED_SLOT, RevertToSlot::Destroyed);
+            }
+            blocks.push(executed(block, bundle));
             states.push(state.clone());
         }
 
-        Self { blocks, states, txs }
+        Self { blocks, states, txs, blocks_per_file: None }
+    }
+
+    /// TN(TN-0115): the same chain, saved into factories with [`BLOCKS_PER_FILE`] blocks per
+    /// static file.
+    const fn across_static_files(mut self) -> Self {
+        self.blocks_per_file = Some(BLOCKS_PER_FILE);
+        self
     }
 
     /// The blocks of one batch.
@@ -190,7 +254,12 @@ impl Chain {
 
     /// A factory with genesis and the batches that end at or below `tip`.
     fn save(&self, settings: StorageSettings, tip: BlockNumber) -> Factory {
-        let factory = create_test_provider_factory();
+        let factory = match self.blocks_per_file {
+            Some(blocks_per_file) => {
+                create_test_provider_factory_with_blocks_per_file(blocks_per_file)
+            }
+            None => create_test_provider_factory(),
+        };
         factory.set_storage_settings_cache(settings);
         self.save_batches(&factory, 0..=0);
         for range in BATCHES.iter().filter(|range| *range.end() <= tip) {
@@ -248,7 +317,7 @@ fn historical_reads(factory: &Factory, chain: &Chain, tip: BlockNumber) -> Vec<H
     for block in 1..=tip + 1 {
         let state = HistoricalStateProviderRef::new(&provider, block);
         let expected = &chain.states[block as usize - 1];
-        for i in 0..ACCOUNTS + 1 {
+        for i in 0..=RECREATED {
             let address = address(i);
             let account = state.basic_account(&address).unwrap();
             assert_eq!(account, expected.account(address), "account {address} at block {block}");
@@ -267,6 +336,44 @@ fn historical_reads(factory: &Factory, chain: &Chain, tip: BlockNumber) -> Vec<H
         }
     }
     answers
+}
+
+/// Every account and slot of the state at the tip has a history shard. A key without one reads
+/// as never written at every block (`HistoryInfo::NotYetWritten`), not as an error, so a missing
+/// history entry fails no read on its own. The keys come from the tip state, not from the
+/// generator, whose preimages only name them.
+fn assert_history_covers_tip_state(factory: &Factory) {
+    let provider = factory.provider().unwrap();
+    let tx = provider.tx_ref();
+    let addresses: HashMap<B256, Address> =
+        (0..=RECREATED).map(address).map(|address| (keccak256(address), address)).collect();
+    let slots: HashMap<B256, B256> = (1..=SLOTS + 1)
+        .map(|s| B256::from(U256::from(s)))
+        .map(|slot| (keccak256(slot), slot))
+        .collect();
+
+    let mut history = tx.cursor_read::<tables::AccountsHistory>().unwrap();
+    let mut accounts = 0;
+    for entry in tx.cursor_read::<tables::HashedAccounts>().unwrap().walk(None).unwrap() {
+        let address = addresses[&entry.unwrap().0];
+        let shard = history.seek(ShardedKey::new(address, 0)).unwrap();
+        assert!(shard.is_some_and(|(key, _)| key.key == address), "{address}: no history");
+        accounts += 1;
+    }
+
+    let mut history = tx.cursor_read::<tables::StoragesHistory>().unwrap();
+    let mut storage = 0;
+    for entry in tx.cursor_dup_read::<tables::HashedStorages>().unwrap().walk(None).unwrap() {
+        let (hashed_address, entry) = entry.unwrap();
+        let (address, slot) = (addresses[&hashed_address], slots[&entry.key]);
+        let shard = history.seek(StorageShardedKey::new(address, slot, 0)).unwrap();
+        assert!(
+            shard.is_some_and(|(key, _)| key.address == address && key.sharded_key.key == slot),
+            "slot {slot} of {address}: no history"
+        );
+        storage += 1;
+    }
+    assert!(accounts > 0 && storage > 0, "{accounts} accounts, {storage} slots at the tip");
 }
 
 /// Each block's changesets, sorted, for a v1/v2 comparison.
@@ -300,11 +407,44 @@ fn assert_tx_lookups(factory: &Factory, chain: &Chain, tip: BlockNumber) {
     }
 }
 
+/// The files of `segment` that hold blocks `0..=tip`, each of which must be on disk.
+fn segment_files(factory: &Factory, segment: StaticFileSegment, tip: BlockNumber) -> usize {
+    let static_files = factory.static_file_provider();
+    let mut ranges: Vec<_> =
+        (0..=tip).map(|block| static_files.find_fixed_range(segment, block)).collect();
+    ranges.dedup();
+    for range in &ranges {
+        let path = static_files.path().join(segment.filename(range));
+        assert!(path.exists(), "{segment:?}: no {}", path.display());
+    }
+    ranges.len()
+}
+
 /// The three ex-`RocksDB` tables are written under v2, identical to v1's, and every historical
-/// read, changeset and transaction lookup agrees with v1 and with the generated state.
+/// read, changeset and transaction lookup agrees with v1 and with the generated state, including
+/// those of an account whose storage a block wiped.
 #[test]
 fn v2_matches_v1_on_a_generated_chain() {
-    let chain = Chain::generate();
+    assert_v2_matches_v1(&Chain::generate());
+}
+
+/// TN(TN-0115): the same with the chain spread over several static files, so the v2 history reads
+/// resolve their changesets in different files.
+#[test]
+fn v2_matches_v1_across_static_files() {
+    let chain = Chain::generate().across_static_files();
+    let v2 = assert_v2_matches_v1(&chain);
+    for segment in [
+        StaticFileSegment::Headers,
+        StaticFileSegment::AccountChangeSets,
+        StaticFileSegment::StorageChangeSets,
+    ] {
+        assert_eq!(segment_files(&v2, segment, TIP), 4, "{segment:?}");
+    }
+}
+
+/// Saves `chain` into a v1 and a v2 factory and compares them; returns the v2 factory.
+fn assert_v2_matches_v1(chain: &Chain) -> Factory {
     let v1 = chain.save(StorageSettings::v1(), TIP);
     let v2 = chain.save(StorageSettings::v2(), TIP);
 
@@ -320,9 +460,19 @@ fn v2_matches_v1_on_a_generated_chain() {
     assert_eq!(bytecodes.len(), 1, "v2 Bytecodes: {bytecodes:?}");
     assert_eq!(bytecodes, rows::<tables::Bytecodes>(&v1), "Bytecodes differ between v1 and v2");
     assert_eq!(changesets(&v2, TIP), changesets(&v1, TIP), "changesets differ between v1 and v2");
-    assert_eq!(historical_reads(&v2, &chain, TIP), historical_reads(&v1, &chain, TIP));
-    assert_tx_lookups(&v1, &chain, TIP);
-    assert_tx_lookups(&v2, &chain, TIP);
+    assert_eq!(historical_reads(&v2, chain, TIP), historical_reads(&v1, chain, TIP));
+    assert_tx_lookups(&v1, chain, TIP);
+    assert_tx_lookups(&v2, chain, TIP);
+
+    // TN(TN-0043): the wipe block is the re-created slot's only history entry, so a read after
+    // it finds the value only if the wiped account's slot revert made it into the history.
+    for factory in [&v1, &v2] {
+        let provider = factory.provider().unwrap();
+        let state = HistoricalStateProviderRef::new(&provider, RECREATED_AT + 1);
+        let slot = state.storage(address(RECREATED), B256::from(RECREATED_SLOT)).unwrap();
+        assert_eq!(slot, Some(U256::from(7)), "the re-created slot after the wipe");
+    }
+    v2
 }
 
 /// Removing blocks with `remove_block_and_execution_above` leaves the tables a save of the
@@ -330,7 +480,17 @@ fn v2_matches_v1_on_a_generated_chain() {
 /// again rebuilds the full chain's tables, in both layouts.
 #[test]
 fn v2_history_unwind_round_trip() {
-    let chain = Chain::generate();
+    assert_unwind_round_trip(&Chain::generate());
+}
+
+/// TN(TN-0115): the same with the chain spread over several static files, so the unwind deletes
+/// whole files and shortens another, and the re-save opens new files again.
+#[test]
+fn v2_history_unwind_round_trip_across_static_files() {
+    assert_unwind_round_trip(&Chain::generate().across_static_files());
+}
+
+fn assert_unwind_round_trip(chain: &Chain) {
     let keep = 4;
     for settings in [StorageSettings::v1(), StorageSettings::v2()] {
         let full = chain.save(settings, TIP);
@@ -342,16 +502,54 @@ fn v2_history_unwind_round_trip() {
 
         assert_eq!(index_tables(&full), index_tables(&short), "{settings:?}: unwound tables");
         assert_eq!(changesets(&full, keep), changesets(&short, keep), "{settings:?}");
-        historical_reads(&full, &chain, keep);
-        assert_tx_lookups(&full, &chain, keep);
+        historical_reads(&full, chain, keep);
+        assert_tx_lookups(&full, chain, keep);
+        if chain.blocks_per_file.is_some() {
+            let static_files = full.static_file_provider();
+            let mut segments = vec![StaticFileSegment::Headers];
+            if settings.storage_v2 {
+                segments.extend([
+                    StaticFileSegment::AccountChangeSets,
+                    StaticFileSegment::StorageChangeSets,
+                ]);
+            }
+            for segment in segments {
+                let last = static_files
+                    .path()
+                    .join(segment.filename(&static_files.find_fixed_range(segment, TIP)));
+                assert!(!last.exists(), "{settings:?} {segment:?}: {} kept", last.display());
+                assert_eq!(segment_files(&full, segment, keep), 2, "{settings:?} {segment:?}");
+                assert_eq!(static_files.get_highest_static_file_block(segment), Some(keep));
+            }
+        }
 
         for range in BATCHES.iter().filter(|range| *range.start() > keep) {
             chain.save_batches(&full, range.clone());
         }
         let rebuilt = chain.save(settings, TIP);
         assert_eq!(index_tables(&full), index_tables(&rebuilt), "{settings:?}: re-saved tables");
-        historical_reads(&full, &chain, TIP);
-        assert_tx_lookups(&full, &chain, TIP);
+        historical_reads(&full, chain, TIP);
+        assert_tx_lookups(&full, chain, TIP);
+    }
+}
+
+/// TN(TN-0043): in both layouts every key of the tip state has history: after a full save, after
+/// an unwind to just before the wipe block, and after a re-save of the rest in one batch.
+#[test]
+fn v2_history_covers_the_tip_state() {
+    let chain = Chain::generate();
+    let keep = RECREATED_AT - 1;
+    for settings in [StorageSettings::v1(), StorageSettings::v2()] {
+        let factory = chain.save(settings, TIP);
+        assert_history_covers_tip_state(&factory);
+
+        let provider_rw = factory.unwind_provider_rw().unwrap();
+        provider_rw.remove_block_and_execution_above(keep).unwrap();
+        provider_rw.commit().unwrap();
+        assert_history_covers_tip_state(&factory);
+
+        chain.save_batches(&factory, keep + 1..=TIP);
+        assert_history_covers_tip_state(&factory);
     }
 }
 
