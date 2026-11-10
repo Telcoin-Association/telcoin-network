@@ -6,7 +6,10 @@ use metrics::Counter;
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
@@ -249,6 +252,41 @@ struct Inner {
     epoch_boundary: TimestampSec,
     /// Prometheus metrics for consensus output assembly.
     metrics: ExecutorMetrics,
+    /// Outputs whose leader's execution block was below the restored-state floor, since the last
+    /// output whose block was checked.
+    below_floor: UncheckedBelowFloor,
+}
+
+/// A run of outputs whose leader's execution block is below this node's restored-state floor, so
+/// [`Subscriber::wait_for_leader_execution`] could not check it.
+///
+/// After a restart with a backlog every output can be one, so a run logs two warnings at most: one
+/// at its first output, and one with its length at the first output whose block is checked again.
+/// The outputs in between log at debug. The first warning keeps a run visible when the subscriber
+/// ends before any output is checked again (an epoch boundary, a fork, a shutdown or a demotion).
+/// A run follows the order in which the checks finish, not consensus order, so near the floor one
+/// run can split into several. Updated only from the subscriber's own task.
+#[derive(Debug, Default)]
+struct UncheckedBelowFloor {
+    /// The outputs in the current run.
+    outputs: AtomicU64,
+    /// The floor the latest of them was below.
+    floor: AtomicU64,
+}
+
+impl UncheckedBelowFloor {
+    /// Count an output whose leader's block is below `floor`; returns the run's length so far.
+    fn record(&self, floor: u64) -> u64 {
+        self.floor.store(floor, Ordering::Relaxed);
+        self.outputs.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// End the run at an output whose block was checked: its length and floor, `None` when no
+    /// output went unchecked since the last call.
+    fn take(&self) -> Option<(u64, u64)> {
+        let outputs = self.outputs.swap(0, Ordering::Relaxed);
+        (outputs > 0).then(|| (outputs, self.floor.load(Ordering::Relaxed)))
+    }
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -275,6 +313,7 @@ pub fn spawn_subscriber<DB: Database>(
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
             metrics: ExecutorMetrics::default(),
+            below_floor: UncheckedBelowFloor::default(),
         }),
     };
     match mode {
@@ -1157,9 +1196,12 @@ impl<DB: Database> Subscriber<DB> {
     /// makes.
     ///
     /// Returns [`SubscriberError::ExecutionFork`] only when this node holds a different block at
-    /// the leader's number. A block below this node's restored-state floor cannot be checked here:
-    /// it is logged at warn and the output goes on, because the voters that certified the leader
-    /// checked it against their own chains.
+    /// the leader's number. A block below this node's restored-state floor cannot be checked here
+    /// and the output goes on, because the voters that certified the leader checked it against
+    /// their own chains. After a restart with a backlog that can be every output for a while, so
+    /// a run of them warns at its first output and again, with its length, at the first output
+    /// whose block is checked again; the outputs in between log at debug (see
+    /// [`UncheckedBelowFloor`]).
     async fn wait_for_leader_execution(
         &self,
         sub_dag: &CommittedSubDag,
@@ -1189,16 +1231,44 @@ impl<DB: Database> Subscriber<DB> {
             );
         }
         match checked {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some((unchecked_outputs, floor)) = self.inner.below_floor.take() {
+                    warn!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        unchecked_outputs,
+                        "outputs whose leader's execution block was below the restored-state floor were not checked; checked again from this output"
+                    );
+                }
+                Ok(())
+            }
             Err(ExecutionCheckError::BelowFloor { floor }) => {
-                warn!(
-                    target: "subscriber",
-                    number,
-                    leader_round = sub_dag.leader_round(),
-                    base_block = base.number,
-                    floor,
-                    "leader's execution block is below the restored-state floor; not checked"
-                );
+                let unchecked_outputs = self.inner.below_floor.record(floor);
+                if unchecked_outputs == 1 {
+                    // warn at a run's first output: the subscriber can end before any output is
+                    // checked again
+                    warn!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        "leader's execution block is below the restored-state floor; not checked, and outputs below it log at debug until one is checked again"
+                    );
+                } else {
+                    debug!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        unchecked_outputs,
+                        "leader's execution block is below the restored-state floor; not checked"
+                    );
+                }
                 Ok(())
             }
             Err(ExecutionCheckError::Fork) => Err(SubscriberError::ExecutionFork {
@@ -1703,7 +1773,7 @@ impl RejoinLogThrottle {
 mod tests {
     use super::{
         classify_sync_output, drain_pending_on_shutdown, save_consensus, Inner, Subscriber,
-        SyncContinuity,
+        SyncContinuity, UncheckedBelowFloor,
     };
     use crate::{metrics::ExecutorMetrics, SubscriberError};
     use futures::{future, stream::FuturesOrdered};
@@ -1782,6 +1852,7 @@ mod tests {
                 consensus_chain,
                 epoch_boundary: u64::MAX,
                 metrics: ExecutorMetrics::default(),
+                below_floor: UncheckedBelowFloor::default(),
             }),
         }
     }
@@ -2204,7 +2275,7 @@ mod tests {
     }
 
     mod f1_commit_lag {
-        use super::*;
+        use super::{f3_rejoin::SubscriberLines, *};
         use crate::subscriber::next_wait_floor;
         use tn_types::{
             Batch, BlockNumHash, ConsensusNumHash, EpochSeedChainValue, ExecHeader, Notifier,
@@ -2308,18 +2379,6 @@ mod tests {
         /// fails the check (SEC-6).
         #[tokio::test]
         async fn fetch_batches_assembles_below_the_restore_floor() {
-            /// A restored execution database whose floor is block 3, attesting this node's
-            /// blocks from there on.
-            struct RestoredAt3;
-            impl tn_types::CanonicalExecutionReader for RestoredAt3 {
-                fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
-                    (number >= 3).then(|| local_hash(number))
-                }
-                fn restored_state_floor(&self) -> Option<u64> {
-                    Some(3)
-                }
-            }
-
             let (fixture, _temp_dir, chain, bus) = setup().await;
             (2..=5).for_each(|number| execute(&bus, number));
             bus.set_canonical_reader(Arc::new(RestoredAt3));
@@ -2332,6 +2391,78 @@ mod tests {
             let at_floor = led_at(&fixture, BlockNumHash::new(3, forked_hash()), false);
             let result = subscriber.fetch_batches(at_floor, B256::ZERO.into(), 2, 3).await;
             assert!(matches!(result, Err(SubscriberError::ExecutionFork { base_block: 3, .. })));
+        }
+
+        /// A restored execution database whose floor is block 3, attesting this node's blocks
+        /// from there on.
+        struct RestoredAt3;
+
+        impl tn_types::CanonicalExecutionReader for RestoredAt3 {
+            fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
+                (number >= 3).then(|| local_hash(number))
+            }
+            fn restored_state_floor(&self) -> Option<u64> {
+                Some(3)
+            }
+        }
+
+        /// Outputs whose leader's block is below the restore floor form a run: its first output
+        /// warns, the next one logs at debug, and the first output checked again warns with the
+        /// run's length. The next checked output logs neither warning.
+        #[tokio::test]
+        async fn below_floor_run_warns_when_it_starts_and_when_checking_resumes() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            (2..=5).for_each(|number| execute(&bus, number));
+            bus.set_canonical_reader(Arc::new(RestoredAt3));
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+
+            for (number, base) in [(1, 1), (2, 2)] {
+                // a hash the ring does not hold, so the check reaches the restored floor
+                let below = led_at(&fixture, BlockNumHash::new(base, forked_hash()), false);
+                subscriber.fetch_batches(below, B256::ZERO.into(), number, base).await.unwrap();
+            }
+            for (number, base) in [(3, 3), (4, 4)] {
+                let checked = led_at(&fixture, BlockNumHash::new(base, local_hash(base)), false);
+                subscriber.fetch_batches(checked, B256::ZERO.into(), number, base).await.unwrap();
+            }
+
+            let logged = |message: &str, expected: &[(&str, &str)]| {
+                let found = lines.with_message(message);
+                assert_eq!(found.len(), 1, "one `{message}` line: {found:?}");
+                for (key, value) in expected {
+                    assert_eq!(found[0].get(*key).map(String::as_str), Some(*value), "{found:?}");
+                }
+            };
+            // warn: the run starts at output 1
+            logged(
+                "leader's execution block is below the restored-state floor; not checked, and outputs below it log at debug until one is checked again",
+                &[("number", "1"), ("base_block", "1"), ("floor", "3")],
+            );
+            // debug: output 2 only counts
+            logged(
+                "leader's execution block is below the restored-state floor; not checked",
+                &[("number", "2"), ("floor", "3"), ("unchecked_outputs", "2")],
+            );
+            // warn: output 3 is checked again and reports the run; output 4 finds no run
+            logged(
+                "outputs whose leader's execution block was below the restored-state floor were not checked; checked again from this output",
+                &[("number", "3"), ("base_block", "3"), ("floor", "3"), ("unchecked_outputs", "2")],
+            );
+        }
+
+        /// A run's length and floor are taken once, and a new run counts from one.
+        #[test]
+        fn unchecked_below_floor_takes_each_run_once() {
+            let run = UncheckedBelowFloor::default();
+            assert_eq!(run.take(), None);
+            assert_eq!(run.record(3), 1);
+            assert_eq!(run.record(3), 2);
+            assert_eq!(run.take(), Some((2, 3)));
+            assert_eq!(run.take(), None);
+            assert_eq!(run.record(4), 1);
+            assert_eq!(run.take(), Some((1, 4)));
         }
 
         /// A sub-dag with no batches gets the same fork check: its output is not returned before
@@ -2529,6 +2660,7 @@ mod tests {
                     consensus_chain,
                     epoch_boundary: u64::MAX,
                     metrics,
+                    below_floor: UncheckedBelowFloor::default(),
                 }),
             }
         }
@@ -3205,11 +3337,11 @@ mod tests {
         /// Records the `subscriber` events of the threads it is the default subscriber for. The
         /// paused-clock tests run the catch-up loop on the test's own thread.
         #[derive(Clone, Default)]
-        struct SubscriberLines(Arc<std::sync::Mutex<Vec<Line>>>);
+        pub(super) struct SubscriberLines(Arc<std::sync::Mutex<Vec<Line>>>);
 
         impl SubscriberLines {
             /// The fields of every captured line with `message`, in the order logged.
-            fn with_message(&self, message: &str) -> Vec<BTreeMap<String, String>> {
+            pub(super) fn with_message(&self, message: &str) -> Vec<BTreeMap<String, String>> {
                 let lines = self.0.lock().unwrap();
                 lines
                     .iter()
@@ -3366,6 +3498,7 @@ mod tests {
                     consensus_chain: chain.clone(),
                     epoch_boundary: u64::MAX,
                     metrics: ExecutorMetrics::default(),
+                    below_floor: UncheckedBelowFloor::default(),
                 }),
                 ..subscriber
             };
@@ -3755,6 +3888,7 @@ mod worker_fanout_tests {
                 consensus_chain,
                 epoch_boundary: u64::MAX,
                 metrics: ExecutorMetrics::default(),
+                below_floor: UncheckedBelowFloor::default(),
             }),
         };
 
