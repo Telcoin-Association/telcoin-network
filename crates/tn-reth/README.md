@@ -443,8 +443,17 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
 
 - **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
   `init_db` with `with_metrics`. The tn-lmdb build maps the `--db.*` flags, writes or checks reth's
-  `database.version` file as reth's `create_db` does, opens `TnLmdbEnv`, creates reth's tables and
-  records the client version in `VersionHistory` as reth's `record_client_version` does.
+  `database.version` file as reth's `create_db` does but with its own version, opens `TnLmdbEnv`,
+  creates reth's tables and records the client version in `VersionHistory` as reth's
+  `record_client_version` does.
+- **Version file** (`init_db_version_file`, tn-lmdb build): `db/database.version` holds
+  `TN_LMDB_DB_VERSION` (1002: reth's version 2 plus 1000), never reth's own. It is a rollback
+  tripwire: a binary that runs reth on MDBX alone (`v0.16.0-adiri`) checks the file before it opens
+  anything and stops with "breaking database change detected: your database version (v1002) is
+  incompatible with the latest database version (v2)", where it would otherwise create an empty
+  `mdbx.dat` beside `tn-lmdb.dat` and prune the static files down to it. A missing file, or one
+  holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or one the migration just moved), is
+  rewritten atomically at the next open; any other content is refused.
 - **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
@@ -529,7 +538,8 @@ one of reth's: its rows are not copied (reth does not read them either).
   the copy, and the synced file against the engine's full check. Then it renames the file to
   `db/tn-lmdb.dat` (the commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker
   `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
-  reth's static files and `database.version` file are not touched. The copy needs no case of its own
+  reth's static files and `database.version` file are not touched (the open after it writes the
+  tn-lmdb version into the latter, above). The copy needs no case of its own
   for the dup-sort tables' forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
   table, also when they span the copy's commits
@@ -685,12 +695,18 @@ refuses to start while a `.partial` directory is there, and running the command 
   `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. Once the
   rebuilt node is healthy and no rollback is wanted, delete `execution-reset-*` to free the space.
 - **To `v0.16.0-adiri`:** restore the backup taken before the upgrade, then start the old binary.
-  Without a backup there is no safe way back for a validator. The old binary cannot open a tn-lmdb
-  `db/` and has no backend guard: it creates an empty MDBX database beside `tn-lmdb.dat` and prunes
-  the static files down to it (a silent resync from genesis). Its consensus database is gone too:
-  the old binary recreates it empty and forgets the votes this validator cast in the current epoch,
-  so it could equivocate (#1558). Keep such a validator stopped until the network has closed the
-  epoch it was in, then start the old binary on a fresh datadir.
+  There is no automatic rollback, and without a backup no safe way back for a validator. The old
+  binary cannot open a tn-lmdb `db/` and has no backend guard; what stops it is the version file:
+  it refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything ("breaking
+  database change detected: your database version (v1002) is incompatible with the latest
+  database version (v2)"), so `db/` and `static_files/` are left as they were and the new binary
+  still runs on them. Do not edit or delete the file to get past it: the old binary would then
+  create an empty MDBX database beside `tn-lmdb.dat`, prune the static files down to it, and fail
+  at genesis. The old binary opens the reth database before the consensus database, so it stops
+  before it reaches `consensus-db/` either, which the new binary moved to tndb (one-way, #1558). On
+  a fresh datadir the old binary starts with an empty consensus database and forgets the votes this
+  validator cast in the current epoch, so it could equivocate: keep such a validator stopped until
+  the network has closed the epoch it was in, then start the old binary on a fresh datadir.
 
 ### Persist benchmark
 
