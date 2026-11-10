@@ -113,6 +113,23 @@ The earlier release would find no MDBX data and start with no record of the vote
 The last rollback point for each node is before it first starts this release.
 Fix any problem found after that forward, with a later release.
 
+The same release moves the execution (reth) database from MDBX to tn-lmdb, also one-way.
+On its first start the node copies `db/mdbx.dat` into `db/tn-lmdb.dat`, verifies the copy against it, makes it durable, and then deletes the MDBX files.
+It needs free disk for the database's live pages plus a quarter plus 1 GiB while it copies, and refuses to start, with nothing changed, when there is less.
+The migrated datadir keeps reth's storage layout v1; only a new datadir gets layout v2.
+
+There is no automatic rollback for either migration.
+An earlier release refuses the migrated execution database before it changes anything, at the version file `db/database.version`; do not edit or remove that file to get past the refusal.
+To go back, stop the node and restore the backup of the whole datadir taken, with the node stopped, before its first start on this release.
+Without that backup there is no safe way back for a validator.
+
+Upgrade every node in place first: since #1788 this release and the previous one cannot peer, so a mixed committee stalls.
+Once every node runs this release, an existing datadir moves to layout v2 only by rebuilding its execution database from genesis.
+With the node stopped, `telcoin-network db reset-execution --datadir <datadir>` shows what it would move, and with `--force` it moves `db/`, `static_files/` and any `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`; the next start re-executes the chain from genesis.
+It renames and never deletes, so moving those entries back (after moving the new ones out) undoes it.
+An observer can rebuild in place.
+On a five-validator committee with a quorum of four, one validator out for a whole rebuild leaves no margin, so a validator syncs an observer on this release in a fresh datadir instead, stops it cleanly at the tip, and copies its `db/` and `static_files/` into the validator's datadir after `db reset-execution --force` (never its `consensus-db/` or keys); the validator is down only for the swap.
+
 For an emergency patch, name an incident owner, a release owner, and an independent verifier.
 Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signature and digest checks, and record each validator's completion.
 A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.

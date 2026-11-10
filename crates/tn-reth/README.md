@@ -597,7 +597,8 @@ one of reth's: its rows are not copied (reth does not read them either).
 reth has two storage layouts (`StorageSettings`). **v1** keeps change sets, transaction senders and
 the history indices in database tables, and plain state beside hashed state. **v2** (here without
 RocksDB) moves change sets and senders into static files and keeps only hashed state; its storage
-history is keyed by the hashed slot. v2 runs only on tn-lmdb. Nothing converts a datadir from one
+change sets and history are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0044).
+v2 runs only on tn-lmdb. Nothing converts a datadir from one
 layout to the other: flipping the recorded layout alone would misread every history index, so a
 datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 
@@ -790,8 +791,8 @@ from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`:
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
 The script's header lists its settings and everything it writes. On macOS both backends' durable
 commits are `msync` (libmdbx its used span, tn-lmdb its dirty pages), and neither flushes the
-drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` once the env can select it, in
-`StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
+drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` on tn-lmdb only,
+through `StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
 every opened datadir; `TN_EXEC_BENCH_READ_MIX=history` (the `busy-history` profile) has the readers
 read balances and storage at past blocks and transactions by hash; and `TN_EXEC_BENCH_DIFF` writes
 a seeded sample of past-block and by-hash reads with their answers, which `TN_EXEC_BENCH_DIFF_AGAINST`
