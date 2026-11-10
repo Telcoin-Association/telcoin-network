@@ -891,6 +891,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   submitters over all three submit paths drain through two workers); TN-0074's capacity test.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0076** — Backport 43a7452b0: the `eth_getLogs` retry range leaves out the block that
+  overflowed the limit.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`get_logs_in_block_range_inner`'s
+  `QueryExceedsMaxResults` error and its debug line; upstream's test
+  `test_log_limit_retry_range_excludes_overflow_block` on the vendored `EthFilter::new` form;
+  TN-0058's `test_range_scan_across_windows` asserts the new bound).
+  *Why*: when a range query passed `--rpc.max-logs-per-response`, the error's suggested retry
+  range ended at the block whose logs pushed the count over the cap, so a client that retried
+  with exactly that range failed again with the same error. The retry range now ends at the
+  block before it (or at `fromBlock` when the first block alone overflows, which the
+  single-block rule then serves in full). Same logs, same limit; only the hint in the error
+  changes. RPC only.
+  *Tests*: `test_log_limit_retry_range_excludes_overflow_block` (three blocks with one log each
+  and a limit of two: the error names blocks 100 to 101), `test_range_scan_across_windows`
+  (the error names blocks 0 to 1,199). *Upstream*: n/a (upstream commit).
 
 ## TN fixes (not from an upstream commit)
 
@@ -1072,10 +1088,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   least 1,000 matching headers in it) and its batches hold at most 256 blocks; other windows go
   one block at a time through the receipt cache. Same logs in the same order. Kept from the
   vendored copy: `append_matching_block_logs`'s signature and the retry range in the
-  `QueryExceedsMaxResults` error (upstream's 43a7452b0 narrows it; a separate pick). RPC only.
+  `QueryExceedsMaxResults` error (TN-0076 narrows it as upstream's 43a7452b0 does). RPC only.
   *Tests*: `test_range_scan_across_windows` (2,501 blocks, three with logs, every window fetched
-  in parallel; a limit of one log ends the scan in the second window), with its retry-range
-  assertion on the vendored semantics; TN-0035's permit tests. *Upstream*: n/a (upstream commit).
+  in parallel; a limit of one log ends the scan in the second window; its retry-range
+  assertion follows TN-0076); TN-0035's permit tests. *Upstream*: n/a (upstream commit).
 
 - **TN-0061** — `--rpc-cache.max-concurrent-db-requests` takes 1 up to a semaphore's capacity.
   *Kind*: fix.
