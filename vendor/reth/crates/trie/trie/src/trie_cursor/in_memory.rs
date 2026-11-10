@@ -166,6 +166,20 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
         self.last_key = next_key;
     }
 
+    /// TN(TN-0106): repositions this layer for a seek behind its last key, or after it ran out.
+    ///
+    /// Upstream rewinds with `reset`, on a base without storage wipe markers. Here `reset` would
+    /// also clear a deleted storage trie's [`DbCursorState::Wiped`] and that of every layer
+    /// below, so the database's nodes would show through. This rewinds the in-memory nodes and
+    /// lets the layer below be seeked again, which its next operation does, and keeps a wipe.
+    fn rewind(&mut self) {
+        self.in_memory_cursor.reset();
+        if !matches!(self.db_cursor_state, DbCursorState::Wiped) {
+            self.db_cursor_state = DbCursorState::NeedsPosition;
+        }
+        self.last_key = None;
+    }
+
     /// Positions the DB cursor state using the underlying cursor when needed.
     fn cursor_seek(&mut self, key: Nibbles) -> Result<(), DatabaseError> {
         // Only seek if:
@@ -250,6 +264,11 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        // Forward scans can reuse cursor positions; backward seeks and exhausted cursors cannot.
+        // TN(TN-0106): `rewind`, not upstream's `reset`: this base still has deleted-trie wipes.
+        if self.last_key.is_none_or(|last| key < last) {
+            self.rewind();
+        }
         let mem_entry = self.in_memory_cursor.seek(&key);
 
         if let Some((mem_key, entry_inner)) = mem_entry &&
@@ -293,6 +312,11 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        // Forward scans can reuse cursor positions; backward seeks and exhausted cursors cannot.
+        // TN(TN-0106): `rewind`, not upstream's `reset`: this base still has deleted-trie wipes.
+        if self.last_key.is_none_or(|last| key < last) {
+            self.rewind();
+        }
         let mem_entry = self.in_memory_cursor.seek(&key);
 
         if let Some((mem_key, Some(node))) = mem_entry &&
@@ -802,6 +826,79 @@ mod tests {
 
         cursor.next().unwrap();
         assert_eq!(cursor.current().unwrap(), Some(Nibbles::from_nibbles([0x3])));
+    }
+
+    fn node(state_mask: u16) -> BranchNodeCompact {
+        BranchNodeCompact::new(state_mask, state_mask, 0, vec![], None)
+    }
+
+    fn db_trie_cursor(keys: &[u8]) -> MockTrieCursor {
+        let nodes = keys.iter().map(|k| (Nibbles::from_nibbles([*k]), node(*k as u16))).collect();
+        MockTrieCursor::new(Arc::new(nodes), Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Seeks `from`, then walks to the end; returns the first nibble of each key.
+    fn walk_trie<C: TrieCursor>(cursor: &mut C, from: u8) -> Vec<u8> {
+        let mut keys = Vec::new();
+        let mut entry = cursor.seek(Nibbles::from_nibbles([from])).unwrap();
+        while let Some((key, _)) = entry {
+            keys.push(key.get_unchecked(0));
+            entry = cursor.next().unwrap();
+        }
+        keys
+    }
+
+    fn storage_trie_updates(keys: &[u8], is_deleted: bool) -> TrieUpdatesSorted {
+        let storage_nodes =
+            keys.iter().map(|k| (Nibbles::from_nibbles([*k]), Some(node(*k as u16)))).collect();
+        let mut storage_tries = alloy_primitives::map::B256Map::default();
+        storage_tries.insert(
+            B256::ZERO,
+            reth_trie_common::updates::StorageTrieUpdatesSorted { is_deleted, storage_nodes },
+        );
+        TrieUpdatesSorted::new(Vec::new(), storage_tries)
+    }
+
+    /// TN(TN-0106): `seek` and `seek_exact` behind the last returned key, or after the cursor
+    /// ran out, rewind the overlay and reposition the database below it (upstream 5868ee478).
+    #[test]
+    fn backward_seek_rewinds() {
+        let updates = storage_trie_updates(&[1, 3], false);
+        let mut cursor =
+            InMemoryTrieCursor::new_storage(db_trie_cursor(&[2, 4]), &updates, B256::ZERO);
+
+        assert_eq!(walk_trie(&mut cursor, 3), [3, 4]);
+        assert_eq!(walk_trie(&mut cursor, 1), [1, 2, 3, 4], "seek after the cursor ran out");
+        assert_eq!(walk_trie(&mut cursor, 4), [4]);
+        assert_eq!(walk_trie(&mut cursor, 2), [2, 3, 4]);
+
+        let exact = |cursor: &mut InMemoryTrieCursor<'_, MockTrieCursor>, k: u8| {
+            cursor.seek_exact(Nibbles::from_nibbles([k])).unwrap().map(|(key, _)| key)
+        };
+        assert_eq!(exact(&mut cursor, 3), Some(Nibbles::from_nibbles([3])));
+        assert_eq!(exact(&mut cursor, 2), Some(Nibbles::from_nibbles([2])), "behind the last key");
+        assert_eq!(exact(&mut cursor, 1), Some(Nibbles::from_nibbles([1])), "behind again");
+    }
+
+    /// TN(TN-0106): rewinding keeps a deleted storage trie deleted, in the seeking layer and in
+    /// every layer below, so the database's nodes stay hidden. Upstream's `reset` would not: its
+    /// base has no wipe markers.
+    #[test]
+    fn rewind_keeps_deleted_storage_trie_deleted() {
+        let deleted = storage_trie_updates(&[3], true);
+        let newer = storage_trie_updates(&[4], false);
+
+        // The deletion in the layer below the seeking one.
+        let lower = InMemoryTrieCursor::new_storage(db_trie_cursor(&[1, 5]), &deleted, B256::ZERO);
+        let mut cursor = InMemoryTrieCursor::new_storage(lower, &newer, B256::ZERO);
+        assert_eq!(walk_trie(&mut cursor, 0), [3, 4]);
+        assert_eq!(walk_trie(&mut cursor, 0), [3, 4], "after a rewind");
+
+        // The deletion in the seeking layer.
+        let mut cursor =
+            InMemoryTrieCursor::new_storage(db_trie_cursor(&[1, 5]), &deleted, B256::ZERO);
+        assert_eq!(walk_trie(&mut cursor, 0), [3]);
+        assert_eq!(walk_trie(&mut cursor, 0), [3], "after a rewind");
     }
 
     #[test]

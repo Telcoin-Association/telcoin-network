@@ -570,6 +570,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   storage, so a cursor that kept the previous account's position or overlay would fail them.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0106** — Backport 5868ee478: overlay cursors rewind on a seek behind their last key.
+  *Kind*: backport, adapted.
+  *Files*: `crates/trie/trie/src/hashed_cursor/post_state.rs` (`HashedPostStateCursor::seek`,
+  new `rewind`, tests `backward_seek_rewinds`, `rewind_keeps_wiped_storage_wiped`),
+  `crates/trie/trie/src/trie_cursor/in_memory.rs` (`InMemoryTrieCursor::seek_exact` and `seek`,
+  new `rewind`, tests `backward_seek_rewinds`, `rewind_keeps_deleted_storage_trie_deleted`).
+  *Why*: the in-memory entries are walked by a forward-only cursor, so a seek behind the last
+  returned key, or after the cursor ran out (no last key), skipped the overlay entries in between
+  and could keep a stale database position. reth's `StateRoot` walks forward only, but TN's output
+  overlay stacks these cursors (`crates/tn-reth/src/env/output_overlay/`), so any other walk over
+  it would read wrong state. Adapted: upstream rewinds with `reset`, on a base where c9b466c13 had
+  removed storage wipe markers. Here `reset` also turns a wiped storage (or deleted storage trie)
+  back into a live one, in the seeking layer and, through the inner `reset`, in every layer below;
+  the clean pick did that on the first seek of every storage cursor and failed reth-trie-db's
+  `wiped_storage_is_discarded`. `rewind` instead rewinds the layer's in-memory entries, marks the
+  layer below to be seeked again unless it is wiped, and clears the last key; the layer below
+  needs no reset, since its next operation is that seek and it rewinds itself if it is a
+  backward one. Execution path (state root): a forward walk takes the same steps as before except
+  after a cursor returned nothing, when the next seek repositions the database cursor instead of
+  reusing its position. *Tests*: the four above (with upstream's `reset` in place of `rewind` the
+  two wipe tests fail; without the rewind all four fail), reth-trie, reth-trie-db and as TN-0102.
+  *Upstream*: n/a (upstream commit; the adaptation is moot upstream, which has no wipe markers).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
