@@ -6,11 +6,11 @@ use crate::common::{
     assert_nodes_agree_on_commit_times, call_rpc, epoch_seconds_remaining, get_balance,
     get_balance_above_with_retry, get_block, get_block_number, get_key,
     get_latest_consensus_header_number, get_node_info, get_node_mode,
-    get_positive_balance_with_retry, network_advancing, node_log_path, scrape_metric_value,
-    scrape_metrics, send_and_confirm, send_tel, start_observer, start_validator,
-    start_validator_with_args, start_validator_with_env, strip_ansi, wait_for_epoch_at_least,
-    wait_for_node_mode, wait_for_rpc, walk_block_commit_times, EVM_TIMESTAMP_CLAMPED_SERIES,
-    WEI_PER_TEL,
+    get_positive_balance_with_retry, log_field, log_line_matches, network_advancing,
+    node_log_lines, node_log_path, plain_log_lines, scrape_metric_value, scrape_metrics,
+    send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
+    start_validator_with_env, wait_for_epoch_at_least, wait_for_node_log_line, wait_for_node_mode,
+    wait_for_rpc, walk_block_commit_times, EVM_TIMESTAMP_CLAMPED_SERIES, WEI_PER_TEL,
 };
 use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
 use e2e_tests::{
@@ -1303,54 +1303,6 @@ fn test_restarts_store_failure_stops_the_node_mid_epoch() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Node `instance`'s stdout log of run `run` of `test`, as lines without ANSI escapes.
-///
-/// Read lossily: the node may be mid-write, and a torn multi-byte character must not fail the read.
-fn node_log_lines(test: &str, instance: usize, run: u32) -> eyre::Result<Vec<String>> {
-    plain_log_lines(&node_log_path(test, instance, run, false))
-}
-
-/// The lines of the node log at `path` without ANSI escapes, read lossily (see
-/// [`node_log_lines`]).
-fn plain_log_lines(path: &Path) -> eyre::Result<Vec<String>> {
-    let bytes = std::fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
-    Ok(strip_ansi(&String::from_utf8_lossy(&bytes)).lines().map(str::to_owned).collect())
-}
-
-/// Whether the node log `line` contains `text` and carries every `name=value` in `fields` as a
-/// whole token, so `epoch=6` does not match `epoch=60`.
-fn log_line_matches(line: &str, text: &str, fields: &[String]) -> bool {
-    line.contains(text)
-        && fields.iter().all(|field| line.split_whitespace().any(|token| token == field.as_str()))
-}
-
-/// Poll node `instance`'s run-`run` log of `test` until a line matches `text` and `fields` (see
-/// [`log_line_matches`]), for up to `timeout`.
-async fn wait_for_node_log_line(
-    test: &str,
-    instance: usize,
-    run: u32,
-    text: &str,
-    fields: &[String],
-    timeout: Duration,
-) -> eyre::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if node_log_lines(test, instance, run)?
-            .iter()
-            .any(|line| log_line_matches(line, text, fields))
-        {
-            return Ok(());
-        }
-        eyre::ensure!(
-            Instant::now() < deadline,
-            "test_logs/{test}/node{instance}-run{run}.log has no `{text}` line with {fields:?} \
-             after {timeout:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 /// What each validator's run-`run` logs of `test` show of a restart that stopped making progress:
 /// the first DAG restore after the record rebuild (the new epoch's primary), how many vote requests
 /// peers refused with [`INVALID_EPOCH_LOG`], and the fatal error the process exited with, if any.
@@ -2008,23 +1960,6 @@ fn check_rejoin_held(node: &str, metrics_addr: &str, test: &str, run: u32) -> ey
          certs, {own_certificates} own certificates after the promotion, {grace_holds} rejoin \
          grace holds, primed (primary_round, newest_round) {primed:?}"
     ))
-}
-
-/// The number in the `name=value` field of a plain node log line.
-fn log_field(line: &str, name: &str) -> Option<u64> {
-    line.split_whitespace()
-        .find_map(|token| token.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
-}
-
-/// A field is read only as a whole `name=` token, so `round` does not read `header_round`.
-#[test]
-fn test_log_field_reads_whole_fields() {
-    let line = "WARN primary::proposer: reproposing header current_round=752 header_round=5 \
-                newest_round=750 header=Header { round: 5 }";
-    assert_eq!(log_field(line, "header_round"), Some(5));
-    assert_eq!(log_field(line, "newest_round"), Some(750));
-    assert_eq!(log_field(line, "round"), None);
-    assert_eq!(log_field(line, "committed_round"), None);
 }
 
 /// Node whose execution [`test_slow_execution_stays_active`] slows.

@@ -13,7 +13,7 @@ use e2e_tests::{
     create_validator_info, setup_log_dir, FleetOverrides, NodeEndpoints, NodeOverrides, TestBinary,
 };
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
-use eyre::Report;
+use eyre::{Report, WrapErr as _};
 use jsonrpsee::{
     core::{client::ClientT as _, DeserializeOwned},
     http_client::HttpClientBuilder,
@@ -574,6 +574,71 @@ pub(crate) fn strip_ansi(text: &str) -> String {
         }
     }
     plain
+}
+
+/// Node `instance`'s stdout log of run `run` of `test`, as lines without ANSI escapes.
+///
+/// Read lossily: the node may be mid-write, and a torn multi-byte character must not fail the read.
+pub(crate) fn node_log_lines(test: &str, instance: usize, run: u32) -> eyre::Result<Vec<String>> {
+    plain_log_lines(&node_log_path(test, instance, run, false))
+}
+
+/// The lines of the node log at `path` without ANSI escapes, read lossily (see
+/// [`node_log_lines`]).
+pub(crate) fn plain_log_lines(path: &Path) -> eyre::Result<Vec<String>> {
+    let bytes = std::fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+    Ok(strip_ansi(&String::from_utf8_lossy(&bytes)).lines().map(str::to_owned).collect())
+}
+
+/// Whether the node log `line` contains `text` and carries every `name=value` in `fields` as a
+/// whole token, so `epoch=6` does not match `epoch=60`.
+pub(crate) fn log_line_matches(line: &str, text: &str, fields: &[String]) -> bool {
+    line.contains(text)
+        && fields.iter().all(|field| line.split_whitespace().any(|token| token == field.as_str()))
+}
+
+/// Poll node `instance`'s run-`run` log of `test` until a line matches `text` and `fields` (see
+/// [`log_line_matches`]), for up to `timeout`.
+pub(crate) async fn wait_for_node_log_line(
+    test: &str,
+    instance: usize,
+    run: u32,
+    text: &str,
+    fields: &[String],
+    timeout: Duration,
+) -> eyre::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if node_log_lines(test, instance, run)?
+            .iter()
+            .any(|line| log_line_matches(line, text, fields))
+        {
+            return Ok(());
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "test_logs/{test}/node{instance}-run{run}.log has no `{text}` line with {fields:?} \
+             after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The number in the `name=value` field of a plain node log line.
+pub(crate) fn log_field(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
+/// A field is read only as a whole `name=` token, so `round` does not read `header_round`.
+#[test]
+fn test_log_field_reads_whole_fields() {
+    let line = "WARN primary::proposer: reproposing header current_round=752 header_round=5 \
+                newest_round=750 header=Header { round: 5 }";
+    assert_eq!(log_field(line, "header_round"), Some(5));
+    assert_eq!(log_field(line, "newest_round"), Some(750));
+    assert_eq!(log_field(line, "round"), None);
+    assert_eq!(log_field(line, "committed_round"), None);
 }
 
 /// Advertise a validator's JSON-RPC endpoint on its worker record.
