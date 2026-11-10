@@ -524,6 +524,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   state-root tests, TN's `trie_overlay` tests and the exec-bench chain differential (TN-0106).
   *Upstream*: n/a (upstream commit).
 
+- **TN-0103** — Backport 75c327ee5: the hashed post-state cursor and the in-memory trie
+  cursor's `seek` skip the database seek on an exact overlay hit. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/hashed_cursor/post_state.rs` (`HashedPostStateCursor`: the same
+  `DbCursorState` as TN-0102; `seek` returns an exact non-deleted in-memory hit without touching
+  the database cursor), `crates/trie/trie/src/trie_cursor/in_memory.rs` (`seek` does the same for a
+  present node).
+  *Why*: TN-0102 covered the trie cursor's `seek_exact` only. The state root also seeks the
+  hashed accounts and storages through `HashedPostStateCursor`, which TN stacks per run of the
+  output overlay (`RunHashedCursor`) with the current block's on top; at a peak output that is
+  about 125k `HashedStorages` seeks. An exact hit with a value is the first entry at or after the
+  key, so the lower layers are seeked lazily, by the next `next`. Execution path (state root):
+  same entries in the same order. *Tests*: as TN-0102; upstream added cursor tests that an exact
+  hit leaves the database untouched until `next` and that a stale database position is
+  re-seeked. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
