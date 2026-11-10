@@ -510,14 +510,16 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
   passed. The patch crate's own tests (18) pass.
 - Gates: `vendor.py ledger` (155 files), `vendor.py check`, `lockfile.py check` (now also proves
   the patch is resolved), `etc/rocksdb-gate.sh`, `etc/ci-lanes.sh fmt` all pass.
-- Not finished: `etc/ci-lanes.sh test-vendor-reth`, nested clippy, root clippy (chained in one
-  background run). The lane rebuilt the nested test profile in 104 min, then nextest's listing
+- Lanes, after a `syspolicyd` restart: `etc/ci-lanes.sh test-vendor-reth` passes (lockfile check,
+  nested workspace 1600 tests passed and 1 skipped, reth-db 38, 73, and tn-reth 478); nested clippy
+  `--workspace --lib --tests -D warnings` clean; `etc/ci-lanes.sh clippy` clean. The first attempt
+  had not finished: the lane rebuilt the nested test profile in 104 min, then nextest's listing
   step hung: ten test binaries sat 6 to 8 hours at 0% CPU inside dyld, blocked in the `fcntl`
   that registers `libstd-*.dylib`'s code signature, and `syspolicyd` was in uninterruptible wait
   with no new log lines. A fresh exec of a never-run test binary still blocks after the run was
   killed, while already-assessed binaries (cargo, git, python) run. This is the macOS
-  first-launch assessment (SentinelOne/syspolicyd) wedged on the machine, not a test; it needs
-  `syspolicyd` restarted or a reboot, then the three lanes rerun. The nested clippy stall earlier
+  first-launch assessment (SentinelOne/syspolicyd) wedged on the machine, not a test; it needed
+  `syspolicyd` restarted (`sudo killall -9 syspolicyd`), after which the lanes ran normally. The nested clippy stall earlier
   in the session (drivers asleep at 0% CPU) was most likely the same thing.
 - Open issues O1 to O11 are unchanged except: O3 gained R11 and the two T2-1 notes; O6 now
   reads TN-0079/TN-0080/TN-0085; O10's `cargo.sh --config` line is now `.cargo/config.toml`.
