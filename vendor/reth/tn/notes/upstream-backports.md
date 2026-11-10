@@ -83,6 +83,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 074bf32ef | TN-0070 | `trace_filter` with no `fromBlock` starts at the latest block, not genesis, so an empty filter no longer fails the range check | upstream test |
 | 6d117042f | TN-0071 | `trace_replayBlockTransactions` fills `vmTrace.code` as the single-transaction replay does; adapted to revm-inspectors 0.34 (no `into_trace_results_with_state_parts`) | upstream test |
 | 4e1a5574e | TN-0072 | `trace_replayBlockTransactions` fails with `-32001` on an unknown block instead of answering `null` | upstream smoke test |
+| 0c8b1c187 | TN-0073 | transactions a parked insertion promotes to pending are announced to the pool's listeners (review R20) | upstream tests |
 
 ## Open
 

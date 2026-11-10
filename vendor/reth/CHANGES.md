@@ -832,6 +832,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `replay_block_vmtrace_includes_root_and_callcode_bytecode` covers the known-block path.
   *Upstream*: n/a (upstream commit).
 
+- **TN-0073** — Backport 0c8b1c187: a parked insertion's promotions reach the listeners.
+  *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/pool/txpool.rs` (`AddedTransaction::Parked` carries the
+  transactions the insertion promoted), `crates/transaction-pool/src/pool/mod.rs`
+  (`on_added_transaction` notifies them; upstream's three tests and their helpers in the `tests`
+  module, without the base test `all_transactions_by_sender_across_reclassification`, which comes
+  from an upstream commit TN does not carry, and reading the subpools through a `sender_nonces`
+  helper where upstream calls `all_transactions_by_sender`, which that commit added to the trait).
+  *Why*: validation can see newer account state than the pool has applied, and inserting a
+  transaction then rechecks its sender's others against that state, so lower-nonce transactions
+  can become pending while the inserted one stays parked. Those promotions were dropped on the
+  floor: no pending-transaction listener, full-transaction listener or event stream heard of them
+  until some later pool maintenance (review R20). They are now sent as their own notifications,
+  once, subject to the usual propagation filter. Pool notifications only: block validity and
+  what a worker proposes do not change.
+  *Tests*: upstream's `queued_insertion_notifies_older_promotions`,
+  `queued_insertion_promotions_respect_propagation_filter` and
+  `pending_insertion_notifies_older_promotions`. *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 
