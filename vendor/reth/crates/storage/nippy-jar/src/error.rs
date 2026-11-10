@@ -92,4 +92,27 @@ pub enum NippyJarError {
     /// A specified file is missing.
     #[error("Missing file: {}", .0.display())]
     MissingFile(PathBuf),
+
+    /// TN(TN-0120): a value of a checksummed jar does not match its checksum: the data or offsets
+    /// file is damaged.
+    #[error(
+        "static file {} is damaged: the value at row {row}, column {column} fails its checksum",
+        path.display()
+    )]
+    ChecksumMismatch {
+        /// The jar's data file, which names the segment and its block range.
+        path: PathBuf,
+        /// The row within the jar.
+        row: u64,
+        /// The column within the row.
+        column: usize,
+    },
+
+    /// TN(TN-0120): a checksummed jar's configuration file does not match its checksum.
+    #[error("static file configuration {} is damaged: it fails its checksum", .0.display())]
+    ConfigChecksumMismatch(PathBuf),
+
+    /// TN(TN-0120): the configuration names a format version this build does not read.
+    #[error("unsupported static file format version {0}")]
+    UnsupportedVersion(usize),
 }

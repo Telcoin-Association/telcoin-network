@@ -915,3 +915,43 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `v2_genesis_refuses_storage_without_code` (absent and empty code: v2 refuses with nothing
   written, v1 writes it; fails with the check removed). *Upstream*: maybe (upstream's v2 has the
   same wipe gap, TN-0043).
+
+- **TN-0120** — NippyJar format version 2: a CRC32 on every value and on the configuration.
+  *Kind*: feature (storage integrity; static files of storage-v2 datadirs only).
+  *Files*: `Cargo.toml` (workspace `crc32fast` 1.5.0, already in TN's root lockfile, so only
+  dependency edges are added), `crates/storage/nippy-jar/{Cargo.toml, src/lib.rs, src/writer.rs,
+  src/cursor.rs, src/error.rs}` (`NippyJar::with_checksums`, `has_checksums`, `value_checksum`,
+  `CHECKSUM_SIZE`; `NippyJarWriter::has_checksums`; errors `ChecksumMismatch`,
+  `ConfigChecksumMismatch`, `UnsupportedVersion`; tests).
+  *Why*: NippyJar had no checksum anywhere, and under storage v2 the account and storage
+  changesets, which back every historical state read (TN's pinned committee and epoch reads
+  included), live in static files: a flipped bit read back as a plausible wrong value, a silent
+  local fork, where tn-lmdb's page CRCs turn the same damage into an error under v1. Format:
+  a version-2 jar keeps the version-1 configuration encoding (bincode) and appends a CRC32 of
+  it, which `load` verifies before decoding the rest (a damaged row count or block range would
+  otherwise be believed, and the writer's heal truncates to the row count). Each value is
+  stored as its bytes (compressed if the jar compresses) followed by
+  `crc32(row u64 LE || column u32 LE || stored bytes)`, the row being the jar's own 0-based row
+  index; offsets include the four bytes, so the open-time heal, `prune_rows`, rotation and
+  deletion, which work on lengths only, keep the framing. `NippyJarCursor::read_value`, the one
+  path every value read takes, verifies the checksum before any decompression or decoding and
+  hands out the value without it; a mismatch is `NippyJarError::ChecksumMismatch` naming the data
+  file, row and column, never a panic, `None` or a default. A heal never acts on a mismatch: it
+  checks lengths only, and a damaged value stays an error on every read. Binding the position
+  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
+  written and read exactly as before (byte-identical files); `load` now refuses a version other
+  than 1 or 2 (upstream only ever wrote 1). A jar's own configuration decides its format, so a
+  datadir can mix both. It cannot reach execution: the stored values are unchanged, and nothing
+  creates a version-2 jar until the provider's policy (TN-0122) asks for one, which only storage
+  v2 does. *Tests*: `test_checksummed_jar_round_trip` (plain and LZ4, whole rows and single
+  columns; sizes: four bytes a value, and an unchecked jar's files keep upstream's sizes),
+  `test_checksummed_config_serialization` (version 2 and the trailer, byte for byte),
+  `test_checksummed_config_damage_is_refused` (every byte of the configuration flipped, a cut
+  file, an unknown version), `test_checksum_detects_damaged_value` (first, middle, last stored
+  byte and a checksum byte, plain and LZ4: only that value fails, its row's other column still
+  reads), `test_checksum_detects_offset_moved_to_another_value` (offsets moved onto the next
+  row's value fail; an unchecked jar returns the wrong value; a value shorter than a checksum
+  fails), `test_checksummed_jar_heal_and_prune` (an uncommitted append healed away, a prune of
+  committed and uncommitted rows, appends after each: every row verifies). Mutation-checked: no
+  verification in the cursor, no row in the checksum, no configuration check, a wrong row index
+  in the writer. *Upstream*: maybe (a format change upstream would want behind its own version).

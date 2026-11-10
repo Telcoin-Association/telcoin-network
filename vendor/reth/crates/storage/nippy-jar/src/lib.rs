@@ -53,6 +53,15 @@ pub use consistency::NippyJarChecker;
 
 /// The version number of the Nippy Jar format.
 const NIPPY_JAR_VERSION: usize = 1;
+/// The version of a jar whose values, configuration and changeset offsets carry checksums.
+///
+/// TN(TN-0120): a version-1 jar is upstream's format, byte for byte. A version-2 jar has the same
+/// configuration encoding followed by a CRC32 of it, stores every value as its bytes followed by
+/// [`value_checksum`], and its `.csoff` sidecar uses checksummed records
+/// (`reth_static_file_types::ChangesetOffsetReader`).
+const NIPPY_JAR_VERSION_CHECKSUMS: usize = 2;
+/// Size in bytes of the checksum that follows each value of a checksummed jar.
+pub const CHECKSUM_SIZE: usize = 4;
 /// The file extension used for index files.
 const INDEX_FILE_EXTENSION: &str = "idx";
 /// The file extension used for offsets files.
@@ -61,6 +70,18 @@ const OFFSETS_FILE_EXTENSION: &str = "off";
 pub const CONFIG_FILE_EXTENSION: &str = "conf";
 /// The file extension used for changeset offset sidecar files.
 pub const CHANGESET_OFFSETS_FILE_EXTENSION: &str = "csoff";
+
+/// TN(TN-0120): the checksum stored after a value of a checksummed jar: a CRC32 of the row index
+/// within the jar (u64 LE), the column index (u32 LE) and the value's stored bytes (compressed, if
+/// the jar compresses). The position binds the value to its place, so an offset that points at
+/// another value's start fails as well as a changed byte.
+pub fn value_checksum(row: u64, column: usize, stored: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&row.to_le_bytes());
+    hasher.update(&(column as u32).to_le_bytes());
+    hasher.update(stored);
+    hasher.finalize()
+}
 
 /// A [`RefRow`] is a list of column value slices pointing to either an internal buffer or a
 /// memory-mapped file.
@@ -170,6 +191,21 @@ impl<H: NippyJarHeader> NippyJar<H> {
         self
     }
 
+    /// Makes this a checksummed jar (format version 2): every value, the configuration and the
+    /// changeset offsets sidecar carry a CRC32 that every read verifies.
+    ///
+    /// TN(TN-0120): only for a jar that has no data yet. A jar's own configuration decides how it
+    /// is written and read, so an existing jar keeps its format.
+    pub const fn with_checksums(mut self) -> Self {
+        self.version = NIPPY_JAR_VERSION_CHECKSUMS;
+        self
+    }
+
+    /// Whether the jar's values, configuration and changeset offsets carry checksums.
+    pub const fn has_checksums(&self) -> bool {
+        self.version == NIPPY_JAR_VERSION_CHECKSUMS
+    }
+
     /// Gets a reference to the user header.
     pub const fn user_header(&self) -> &H {
         &self.user_header
@@ -205,21 +241,67 @@ impl<H: NippyJarHeader> NippyJar<H> {
             .inspect_err(|e| {
                 warn!(?path, %e, "Failed to load static file jar");
             })
-            .map_err(|err| reth_fs_util::FsPathError::open(err, config_path))?;
+            .map_err(|err| reth_fs_util::FsPathError::open(err, &config_path))?;
 
-        let mut obj = Self::load_from_reader(io::BufReader::new(config_file))?;
+        // TN(TN-0120): the whole file, so a checksummed configuration is verified before it is
+        // decoded.
+        let mut bytes = Vec::new();
+        io::BufReader::new(config_file).read_to_end(&mut bytes)?;
+        let mut obj = Self::decode_config(&bytes, &config_path)?;
         obj.path = path.to_path_buf();
         Ok(obj)
     }
 
     /// Deserializes an instance of [`Self`] from a [`Read`] type.
-    pub fn load_from_reader<R: Read>(reader: R) -> Result<Self, NippyJarError> {
-        Ok(bincode::deserialize_from(reader)?)
+    ///
+    /// A [`NippyJarError::ConfigChecksumMismatch`] from here names an empty path.
+    pub fn load_from_reader<R: Read>(mut reader: R) -> Result<Self, NippyJarError> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Self::decode_config(&bytes, Path::new(""))
     }
 
     /// Serializes an instance of [`Self`] to a [`Write`] type.
-    pub fn save_to_writer<W: Write>(&self, writer: W) -> Result<(), NippyJarError> {
-        Ok(bincode::serialize_into(writer, self)?)
+    pub fn save_to_writer<W: Write>(&self, mut writer: W) -> Result<(), NippyJarError> {
+        if !self.has_checksums() {
+            return Ok(bincode::serialize_into(writer, self)?)
+        }
+
+        // TN(TN-0120): a checksummed jar's configuration is followed by a CRC32 of its bytes.
+        let mut bytes = bincode::serialize(self)?;
+        let checksum = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Decodes a configuration file's bytes.
+    ///
+    /// TN(TN-0120): the first field is the version, a `u64` LE in bincode's encoding. A
+    /// checksummed configuration's trailing CRC32 is verified before the rest is decoded, so a
+    /// damaged length or row count is an error rather than a plausible configuration. A
+    /// version-1 configuration decodes as upstream's does; any other version is refused.
+    fn decode_config(bytes: &[u8], config_path: &Path) -> Result<Self, NippyJarError> {
+        let version = bytes.get(..8).map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")));
+        let body = if version == Some(NIPPY_JAR_VERSION_CHECKSUMS as u64) {
+            let checksummed = bytes
+                .len()
+                .checked_sub(CHECKSUM_SIZE)
+                .map(|len| bytes.split_at(len))
+                .filter(|(body, stored)| crc32fast::hash(body).to_le_bytes() == **stored);
+            let Some((body, _)) = checksummed else {
+                return Err(NippyJarError::ConfigChecksumMismatch(config_path.to_path_buf()))
+            };
+            body
+        } else {
+            bytes
+        };
+
+        let jar: Self = bincode::deserialize(body)?;
+        if jar.version != NIPPY_JAR_VERSION && jar.version != NIPPY_JAR_VERSION_CHECKSUMS {
+            return Err(NippyJarError::UnsupportedVersion(jar.version))
+        }
+        Ok(jar)
     }
 
     /// Returns the path for the data file
@@ -1237,6 +1319,310 @@ mod tests {
 
         // runs the consistency check.
         let _ = NippyJarWriter::new(nippy).unwrap();
+    }
+
+    /// Freezes `col1` and `col2` into a checksummed jar at `path`, LZ4-compressed if `lz4`.
+    fn freeze_checksummed(path: &Path, col1: &ColumnValues, col2: &ColumnValues, lz4: bool) {
+        let mut nippy = NippyJar::new_without_header(2, path).with_checksums();
+        if lz4 {
+            nippy = nippy.with_lz4();
+        }
+        nippy
+            .freeze(vec![clone_with_result(col1), clone_with_result(col2)], col1.len() as u64)
+            .unwrap();
+    }
+
+    /// Reads every row of the jar at `path` with every column, and with each column alone.
+    fn read_all_rows(path: &Path) -> Vec<Result<(), NippyJarError>> {
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        (0..nippy.rows)
+            .map(|row| {
+                cursor.row_by_number(row)?.expect("row exists");
+                cursor.row_by_number_with_cols(row, 0b01)?.expect("row exists");
+                cursor.row_by_number_with_cols(row, 0b10)?.expect("row exists");
+                Ok(())
+            })
+            .collect()
+    }
+
+    /// XORs `mask` into the byte at `pos` of `path`.
+    fn flip_byte(path: &Path, pos: u64, mask: u8) {
+        let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut byte = [0u8];
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        file.write_all(&[byte[0] ^ mask]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Overwrites the offset at `index` (row * columns + column) of the jar at `path`.
+    fn write_offset(path: &Path, index: usize, offset: u64) {
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let mut file = OpenOptions::new().write(true).open(nippy.offsets_path()).unwrap();
+        file.seek(SeekFrom::Start(1 + 8 * index as u64)).unwrap();
+        file.write_all(&offset.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// TN(TN-0120): a checksummed jar reads back exactly what was written, plain and compressed,
+    /// whole rows and single columns, and stores four more bytes per value than an unchecked jar
+    /// whose files keep upstream's layout.
+    #[test]
+    fn test_checksummed_jar_round_trip() {
+        let (col1, col2) = test_data(Some(7));
+        let values_len = col1.iter().chain(&col2).map(Vec::len).sum::<usize>() as u64;
+        let values = (col1.len() * 2) as u64;
+
+        for lz4 in [false, true] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            freeze_checksummed(file.path(), &col1, &col2, lz4);
+
+            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            assert!(nippy.has_checksums());
+            assert_eq!(nippy.version, NIPPY_JAR_VERSION_CHECKSUMS);
+            assert_eq!(nippy.max_row_size, col1[0].len() + col2[0].len());
+            let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+            for row in 0..col1.len() {
+                let values = cursor.row_by_number(row).unwrap().unwrap();
+                assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
+                let second = cursor.row_by_number_with_cols(row, 0b10).unwrap().unwrap();
+                assert_eq!(second, [col2[row].as_slice()]);
+            }
+            assert!(cursor.row_by_number(col1.len()).unwrap().is_none());
+
+            let data_len = std::fs::metadata(file.path()).unwrap().len();
+            if !lz4 {
+                assert_eq!(data_len, values_len + CHECKSUM_SIZE as u64 * values);
+            }
+        }
+
+        // An unchecked jar: upstream's version, and the data file is the values alone.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        NippyJar::new_without_header(2, file.path())
+            .freeze(vec![clone_with_result(&col1), clone_with_result(&col2)], col1.len() as u64)
+            .unwrap();
+        let nippy = NippyJar::load_without_header(file.path()).unwrap();
+        assert!(!nippy.has_checksums());
+        assert_eq!(nippy.version, NIPPY_JAR_VERSION);
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), values_len);
+        assert_eq!(std::fs::metadata(nippy.offsets_path()).unwrap().len(), 1 + 8 * (values + 1));
+    }
+
+    /// TN(TN-0120): the configuration of a checksummed jar is upstream's encoding with version 2,
+    /// followed by a CRC32 of it.
+    #[test]
+    fn test_checksummed_config_serialization() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let jar = NippyJar::new_without_header(23, file.path()).with_lz4().with_checksums();
+        jar.freeze_config().unwrap();
+
+        let buf = std::fs::read(jar.config_path()).unwrap();
+        let body = [
+            2, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(buf[..37], body);
+        assert_eq!(buf[37..], crc32fast::hash(&body).to_le_bytes());
+
+        let mut read_jar = NippyJar::load_from_reader(&buf[..]).unwrap();
+        read_jar.path = file.path().to_path_buf();
+        assert_eq!(jar, read_jar);
+    }
+
+    /// TN(TN-0120): any byte of a checksummed configuration that changes, or a configuration cut
+    /// short, fails to load; so does an unknown format version.
+    #[test]
+    fn test_checksummed_config_damage_is_refused() {
+        let (col1, col2) = test_data(Some(8));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        freeze_checksummed(file.path(), &col1, &col2, true);
+        let config_path = file.path().with_extension(CONFIG_FILE_EXTENSION);
+        let config = std::fs::read(&config_path).unwrap();
+
+        for pos in 0..config.len() {
+            let mut damaged = config.clone();
+            damaged[pos] ^= 0x10;
+            std::fs::write(&config_path, &damaged).unwrap();
+            let err = NippyJar::load_without_header(file.path()).unwrap_err();
+            if pos < 8 {
+                // The version itself, now one this build does not read.
+                let version = 2 ^ (0x10 << (8 * pos));
+                assert!(
+                    matches!(err, NippyJarError::UnsupportedVersion(v) if v == version),
+                    "{pos}: {err}"
+                );
+            } else {
+                assert!(
+                    matches!(&err, NippyJarError::ConfigChecksumMismatch(path) if *path == config_path),
+                    "{pos}: {err}"
+                );
+            }
+        }
+
+        std::fs::write(&config_path, &config[..config.len() - 1]).unwrap();
+        assert!(matches!(
+            NippyJar::load_without_header(file.path()),
+            Err(NippyJarError::ConfigChecksumMismatch(_))
+        ));
+
+        // An unchecked configuration with an unknown version.
+        let mut unchecked = Vec::new();
+        NippyJar::new_without_header(2, file.path()).save_to_writer(&mut unchecked).unwrap();
+        unchecked[0] = 3;
+        assert!(matches!(
+            NippyJar::<()>::load_from_reader(&unchecked[..]),
+            Err(NippyJarError::UnsupportedVersion(3))
+        ));
+
+        std::fs::write(&config_path, &config).unwrap();
+        assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+    }
+
+    /// TN(TN-0120): a changed byte anywhere in a value or its checksum fails that value's read
+    /// with an error naming the jar, row and column, plain or compressed (before the
+    /// decompressor sees it), while every other value still reads.
+    #[test]
+    fn test_checksum_detects_damaged_value() {
+        let (col1, col2) = test_data(Some(9));
+        for lz4 in [false, true] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            freeze_checksummed(file.path(), &col1, &col2, lz4);
+            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            let reader = nippy.open_data_reader().unwrap();
+
+            let (row, column) = (37, 1);
+            let start = reader.offset(row * 2 + column).unwrap();
+            let end = reader.offset(row * 2 + column + 1).unwrap();
+            drop(reader);
+
+            // The first, a middle and the last stored byte, and a byte of the checksum.
+            for pos in [start, (start + end) / 2, end - 5, end - 1] {
+                flip_byte(file.path(), pos, 0x01);
+                let results = read_all_rows(file.path());
+                for (r, result) in results.iter().enumerate() {
+                    if r == row {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(NippyJarError::ChecksumMismatch { path, row: 37, column: 1 })
+                                    if path == file.path()
+                            ),
+                            "lz4 {lz4}, pos {pos}: {result:?}"
+                        );
+                    } else {
+                        assert!(result.is_ok(), "lz4 {lz4}, row {r}: {result:?}");
+                    }
+                }
+                // Column 0 of the damaged row is intact and still reads on its own.
+                let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+                assert_eq!(
+                    cursor.row_by_number_with_cols(row, 0b01).unwrap().unwrap(),
+                    [col1[row].as_slice()]
+                );
+                flip_byte(file.path(), pos, 0x01);
+            }
+            assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+        }
+    }
+
+    /// TN(TN-0120): offsets moved onto another value read that value with its own valid
+    /// checksum; the row and column in the checksum fail it. An unchecked jar returns the other
+    /// value as if it were this one.
+    #[test]
+    fn test_checksum_detects_offset_moved_to_another_value() {
+        let (col1, col2) = test_data(Some(10));
+        for checksums in [true, false] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            if checksums {
+                freeze_checksummed(file.path(), &col1, &col2, false);
+            } else {
+                NippyJar::new_without_header(2, file.path())
+                    .freeze(
+                        vec![clone_with_result(&col1), clone_with_result(&col2)],
+                        col1.len() as u64,
+                    )
+                    .unwrap();
+            }
+            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            let reader = nippy.open_data_reader().unwrap();
+            // Row 5, column 0 now spans exactly row 6, column 0.
+            let (other_start, other_end) = (reader.offset(12).unwrap(), reader.offset(13).unwrap());
+            drop(reader);
+            write_offset(file.path(), 10, other_start);
+            write_offset(file.path(), 11, other_end);
+
+            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+            let read = cursor.row_by_number_with_cols(5, 0b01);
+            if checksums {
+                assert!(
+                    matches!(read, Err(NippyJarError::ChecksumMismatch { row: 5, column: 0, .. })),
+                    "{read:?}"
+                );
+                // A value shorter than a checksum fails too, rather than slicing out of range.
+                write_offset(file.path(), 11, other_start + 3);
+                let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+                assert!(matches!(
+                    cursor.row_by_number_with_cols(5, 0b01),
+                    Err(NippyJarError::ChecksumMismatch { row: 5, column: 0, .. })
+                ));
+            } else {
+                assert_eq!(read.unwrap().unwrap(), [col1[6].as_slice()]);
+            }
+        }
+    }
+
+    /// TN(TN-0120): the heal and prune keep a checksummed jar's framing: after an append that
+    /// was never committed, a heal, a prune of committed and uncommitted rows, and appends after
+    /// each, every row reads and verifies, including the appended ones at their new row indexes.
+    #[test]
+    fn test_checksummed_jar_heal_and_prune() {
+        let (col1, col2) = test_data(Some(11));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path();
+        freeze_checksummed(path, &col1, &col2, false);
+        let rows = col1.len();
+
+        // Rows written but not committed, as a crash leaves them: the heal drops them.
+        {
+            let nippy = NippyJar::load_without_header(path).unwrap();
+            let mut writer = NippyJarWriter::new(nippy).unwrap();
+            append_row(&mut writer, &col1, &col2, 0);
+            append_row(&mut writer, &col1, &col2, 1);
+            writer.data_file().flush().unwrap();
+            writer.commit_offsets().unwrap();
+        }
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        assert_eq!(nippy.rows, rows);
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        assert_eq!(writer.rows(), rows);
+        assert!(read_all_rows(path).iter().all(Result::is_ok));
+
+        // A prune of uncommitted and committed rows, then appends at the new row indexes.
+        append_row(&mut writer, &col1, &col2, 0);
+        writer.prune_rows(3).unwrap();
+        assert_eq!(writer.rows(), rows - 2);
+        append_row(&mut writer, &col1, &col2, 2);
+        append_row(&mut writer, &col1, &col2, 3);
+        writer.commit().unwrap();
+        drop(writer);
+
+        assert!(read_all_rows(path).iter().all(Result::is_ok));
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        NippyJarChecker::new(NippyJar::load_without_header(path).unwrap())
+            .check_consistency()
+            .unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        assert_eq!(nippy.rows, rows);
+        for (row, expected) in [(rows - 3, rows - 3), (rows - 2, 2), (rows - 1, 3)] {
+            let values = cursor.row_by_number(row).unwrap().unwrap();
+            assert_eq!(
+                (values[0], values[1]),
+                (col1[expected].as_slice(), col2[expected].as_slice())
+            );
+        }
     }
 
     fn append_row(writer: &mut NippyJarWriter, col1: &[Vec<u8>], col2: &[Vec<u8>], row: usize) {

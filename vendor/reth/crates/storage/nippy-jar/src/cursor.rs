@@ -1,6 +1,6 @@
 use crate::{
     compression::{Compression, Compressors, Zstd},
-    DataReader, NippyJar, NippyJarError, NippyJarHeader, RefRow,
+    value_checksum, DataReader, NippyJar, NippyJarError, NippyJarHeader, RefRow, CHECKSUM_SIZE,
 };
 use std::{ops::Range, sync::Arc};
 use zstd::bulk::Decompressor;
@@ -164,7 +164,27 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             return Err(NippyJarError::InconsistentState)
         }
 
-        let column_offset_range = value_offset..next_value_offset;
+        let mut column_offset_range = value_offset..next_value_offset;
+
+        // TN(TN-0120): a checksummed jar's value ends with its checksum, which is verified here,
+        // before anything decompresses or decodes the value, and not handed out.
+        if self.jar.has_checksums() {
+            let damaged = || NippyJarError::ChecksumMismatch {
+                path: self.jar.data_path().to_path_buf(),
+                row: self.row,
+                column,
+            };
+            if column_offset_range.len() < CHECKSUM_SIZE {
+                return Err(damaged())
+            }
+            let stored_end = column_offset_range.end - CHECKSUM_SIZE;
+            let stored = self.reader.data(column_offset_range.start..stored_end);
+            let checksum = self.reader.data(stored_end..column_offset_range.end);
+            if value_checksum(self.row, column, stored).to_le_bytes() != checksum {
+                return Err(damaged())
+            }
+            column_offset_range.end = stored_end;
+        }
 
         if let Some(compression) = self.jar.compressor() {
             let from = self.internal_buffer.len();

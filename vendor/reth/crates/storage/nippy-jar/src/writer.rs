@@ -1,6 +1,6 @@
 use crate::{
-    compression::Compression, ColumnResult, NippyJar, NippyJarChecker, NippyJarError,
-    NippyJarHeader,
+    compression::Compression, value_checksum, ColumnResult, NippyJar, NippyJarChecker,
+    NippyJarError, NippyJarHeader, CHECKSUM_SIZE,
 };
 use std::{
     fs::{File, OpenOptions},
@@ -24,6 +24,9 @@ pub(crate) const OFFSET_SIZE_BYTES: u8 = 8;
 ///
 /// ## Data file layout
 /// The data file is represented just as a sequence of bytes of data without any delimiters
+///
+/// TN(TN-0120): in a checksummed jar ([`NippyJar::with_checksums`]) each value is followed by its
+/// [`value_checksum`], and the offsets count those bytes as part of the value.
 #[derive(Debug)]
 pub struct NippyJarWriter<H: NippyJarHeader = ()> {
     /// Associated [`NippyJar`], containing all necessary configurations for data
@@ -116,6 +119,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Gets total writer rows in jar.
     pub const fn rows(&self) -> usize {
         self.jar.rows()
+    }
+
+    /// Whether the jar's values, configuration and changeset offsets carry checksums
+    /// ([`NippyJar::has_checksums`]).
+    pub const fn has_checksums(&self) -> bool {
+        self.jar.has_checksums()
     }
 
     /// Consumes the writer and returns the associated [`NippyJar`].
@@ -227,14 +236,22 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Writes column to data file. If it's the last column of the row, call `finalize_row()`
     fn write_column(&mut self, value: &[u8]) -> Result<usize, NippyJarError> {
         self.uncompressed_row_size += value.len();
-        let len = if let Some(compression) = &self.jar.compressor {
+        let (stored, len) = if let Some(compression) = &self.jar.compressor {
             let before = self.tmp_buf.len();
             let len = compression.compress_to(value, &mut self.tmp_buf)?;
-            self.data_file.write_all(&self.tmp_buf[before..before + len])?;
-            len
+            (&self.tmp_buf[before..before + len], len)
         } else {
-            self.data_file.write_all(value)?;
-            value.len()
+            (value, value.len())
+        };
+        self.data_file.write_all(stored)?;
+
+        // TN(TN-0120): `jar.rows` counts the uncommitted rows too, so it is this row's index.
+        let len = if self.jar.has_checksums() {
+            let checksum = value_checksum(self.jar.rows as u64, self.column, stored);
+            self.data_file.write_all(&checksum.to_le_bytes())?;
+            len + CHECKSUM_SIZE
+        } else {
+            len
         };
 
         self.column += 1;
