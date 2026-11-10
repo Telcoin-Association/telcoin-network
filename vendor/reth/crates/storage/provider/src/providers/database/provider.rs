@@ -3962,6 +3962,8 @@ impl<TX: Send, N: NodeTypes> StorageSettingsCache for DatabaseProvider<TX, N> {
 
     fn set_storage_settings_cache(&self, settings: StorageSettings) {
         *self.storage_settings.write() = settings;
+        // TN(TN-0122): new static-file jars carry checksums in a storage v2 datadir.
+        self.static_file_provider.set_jar_checksums(settings.is_v2());
     }
 }
 

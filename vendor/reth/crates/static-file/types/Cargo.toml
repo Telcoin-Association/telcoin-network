@@ -23,6 +23,8 @@ reth-stages-types.workspace = true
 strum = { workspace = true, features = ["derive"] }
 # TN(TN-0050): `fsync_file` for the `.csoff` sidecar's syncs (std only, like the sidecar).
 reth-fs-util = { workspace = true, optional = true }
+# TN(TN-0121): the checksummed `.csoff` records (std only, like the sidecar).
+crc32fast = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-nippy-jar.workspace = true
@@ -43,5 +45,7 @@ std = [
     "dep:tracing",
     "tracing?/std",
     "dep:reth-fs-util",
+    "dep:crc32fast",
+    "crc32fast?/std",
 ]
 clap = ["dep:clap"]

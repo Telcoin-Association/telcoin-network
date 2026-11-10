@@ -31,7 +31,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
-use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
+use reth_nippy_jar::{NippyJar, NippyJarChecker, NippyJarError, CONFIG_FILE_EXTENSION};
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{
     dashmap::DashMap, AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader,
@@ -54,7 +54,7 @@ use std::{
     ops::{Bound, Deref, Range, RangeBounds, RangeInclusive},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
 };
@@ -132,6 +132,8 @@ pub struct StaticFileProviderBuilder<P> {
     blocks_per_file: StaticFileMap<u64>,
     path: P,
     genesis_block_number: u64,
+    /// TN(TN-0122): whether the jars the provider creates carry checksums.
+    jar_checksums: bool,
 }
 
 impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
@@ -143,6 +145,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             blocks_per_file: Default::default(),
             use_metrics: false,
             genesis_block_number: 0,
+            jar_checksums: false,
         }
     }
 
@@ -154,6 +157,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             blocks_per_file: Default::default(),
             use_metrics: false,
             genesis_block_number: 0,
+            jar_checksums: false,
         }
     }
 
@@ -219,6 +223,13 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
         self
     }
 
+    /// TN(TN-0122): makes the jars the provider creates carry checksums
+    /// ([`StaticFileProviderInner::set_jar_checksums`]).
+    pub const fn with_jar_checksums(mut self, enabled: bool) -> Self {
+        self.jar_checksums = enabled;
+        self
+    }
+
     /// Builds the final [`StaticFileProvider`] and initializes the index.
     pub fn build<N: NodePrimitives>(self) -> ProviderResult<StaticFileProvider<N>> {
         let mut provider = StaticFileProviderInner::new(self.path, self.access)?;
@@ -230,6 +241,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             provider.blocks_per_file.insert(segment, blocks_per_file);
         }
         provider.genesis_block_number = self.genesis_block_number;
+        provider.jar_checksums = AtomicBool::new(self.jar_checksums);
 
         let provider = StaticFileProvider(Arc::new(provider));
         provider.initialize_index()?;
@@ -442,6 +454,8 @@ pub struct StaticFileProviderInner<N> {
     genesis_block_number: u64,
     /// TN(TN-0052): sync timings since the last [`StaticFileProvider::take_sync_stats`].
     sync_stats: parking_lot::Mutex<StaticFileSyncStats>,
+    /// TN(TN-0122): whether the jars this provider creates carry checksums.
+    jar_checksums: AtomicBool,
     #[cfg(test)]
     before_cache_insert: BeforeCacheInsertHook,
     #[cfg(test)]
@@ -463,6 +477,38 @@ impl<N> StaticFileProviderInner<N> {
         elapsed: std::time::Duration,
     ) {
         self.sync_stats.lock().record(segment, phase, elapsed);
+    }
+
+    /// TN(TN-0122): sets whether the jars this provider creates from now on carry checksums
+    /// (`reth_nippy_jar::NippyJar::with_checksums`), for the segments [`checksummed_segment`]
+    /// names. [`ProviderFactory`](crate::ProviderFactory) sets it from the datadir's storage
+    /// settings: on for storage v2, off for v1, whose files stay upstream's format byte for byte.
+    /// A jar that exists keeps its own format, which its configuration records, for reads and
+    /// appends alike.
+    pub fn set_jar_checksums(&self, enabled: bool) {
+        self.jar_checksums.store(enabled, Ordering::Relaxed);
+    }
+
+    /// TN(TN-0122): whether a jar of `segment` this provider creates now carries checksums.
+    pub fn jar_checksums(&self, segment: StaticFileSegment) -> bool {
+        self.jar_checksums.load(Ordering::Relaxed) && checksummed_segment(segment)
+    }
+}
+
+/// TN(TN-0122): the segments whose new jars carry checksums when the provider's checksums are on
+/// (storage v2). The changesets are mandatory: every historical state read below the tip resolves
+/// through them, TN's pinned committee and epoch reads included. The others are checked too, as
+/// long as the read cost stays below the benches' noise.
+pub const fn checksummed_segment(segment: StaticFileSegment) -> bool {
+    match segment {
+        // Mandatory.
+        StaticFileSegment::AccountChangeSets |
+        StaticFileSegment::StorageChangeSets |
+        // The default for the rest; a segment leaves this list if its reads show the cost.
+        StaticFileSegment::Headers |
+        StaticFileSegment::Transactions |
+        StaticFileSegment::Receipts |
+        StaticFileSegment::TransactionSenders => true,
     }
 }
 
@@ -493,6 +539,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             _lock_file,
             genesis_block_number: 0,
             sync_stats: Default::default(),
+            jar_checksums: Default::default(),
             #[cfg(test)]
             before_cache_insert: Default::default(),
             #[cfg(test)]
@@ -2292,6 +2339,22 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     }
                     None => {
                         if retrying {
+                            // TN(TN-0121): a number inside the jar's own range has a row: the
+                            // range and the row count come from one configuration. Without one
+                            // the jar is damaged; outside it the data ends (or starts later).
+                            let header = provider.user_header();
+                            let jar_range = if segment.is_tx_based() {
+                                header.tx_range()
+                            } else {
+                                header.block_range()
+                            };
+                            if jar_range.is_some_and(|range| range.contains(number)) {
+                                return Err(ProviderError::other(NippyJarError::Custom(format!(
+                                    "static file {} has no row for {number}, inside its range \
+                                     {jar_range:?}",
+                                    provider.data_path().display()
+                                ))))
+                            }
                             return Ok(result);
                         }
                         // There is a very small chance of hitting a deadlock if two consecutive
@@ -2591,11 +2654,12 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
 
             for i in offset.changeset_range() {
-                if let Some(change) =
-                    cursor.get_one::<reth_db::static_file::AccountChangesetMask>(i.into())?
-                {
-                    changeset.push(change)
-                }
+                // TN(TN-0121): a row missing inside the block's range is damage, not a shorter
+                // changeset.
+                let change = cursor
+                    .get_one::<reth_db::static_file::AccountChangesetMask>(i.into())?
+                    .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+                changeset.push(change)
             }
             Ok(changeset)
         } else {
@@ -2624,36 +2688,8 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         let mut cursor = provider.cursor()?;
         let range = offset.changeset_range();
-        let mut low = range.start;
-        let mut high = range.end;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if let Some(change) =
-                cursor.get_one::<reth_db::static_file::AccountChangesetMask>(mid.into())?
-            {
-                if change.address < address {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            } else {
-                // This is not expected but means we are out of the range / file somehow, and can't
-                // continue
-                debug!(
-                    target: "providers::static_file",
-                    ?low,
-                    ?mid,
-                    ?high,
-                    ?range,
-                    ?block_number,
-                    ?address,
-                    "Cannot continue binary search for account changeset fetch"
-                );
-                low = range.end;
-                break;
-            }
-        }
+        // TN(TN-0124): an account change's stored value starts with its address.
+        let low = changeset_lower_bound(&mut cursor, range.clone(), address.as_slice())?;
 
         if low < range.end &&
             let Some(change) = cursor
@@ -2663,6 +2699,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             return Ok(Some(change));
         }
 
+        changeset_lookup_missed(&mut cursor, range, address.as_slice())?;
         Ok(None)
     }
 
@@ -2680,13 +2717,17 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::AccountChangeSets) {
             for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::AccountChangeSets.filename(block_range))
-                    .with_extension("csoff");
+                let data_path =
+                    self.path.join(StaticFileSegment::AccountChangeSets.filename(block_range));
+                let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    // TN(TN-0121): the jar's configuration says whether its records carry
+                    // checksums.
+                    let checksums = NippyJar::<SegmentHeader>::load(&data_path)
+                        .map_err(ProviderError::other)?
+                        .has_checksums();
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {
@@ -2698,6 +2739,68 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         Ok(count)
     }
+}
+
+/// TN(TN-0124): the first row of a block's changeset `range` whose key is not below `key`, the
+/// key being the leading bytes of the stored value (`AccountBeforeTx` and `StorageBeforeTx` encode
+/// the address, then the plain slot, first and raw, so byte order is key order).
+///
+/// The probes compare the stored bytes without verifying or decoding them; the caller reads the
+/// row it settles on through a verified read and compares its decoded key, so a damaged probe can
+/// only end the search at a row that does not match: not found, which every history caller turns
+/// into an error (`AccountChangesetNotFound` / `StorageChangesetNotFound`). To report the damage
+/// itself, [`changeset_lookup_missed`] reruns the search verifying every probe.
+pub(crate) fn changeset_lower_bound(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+) -> ProviderResult<u64> {
+    changeset_search(cursor, range, key, false)
+}
+
+/// TN(TN-0124): a point lookup that found no row reruns its search with every probe verified,
+/// when the jar has checksums, so a damaged probe that misdirected it is reported as the checksum
+/// error rather than as a missing change. A true miss returns `Ok(())`.
+fn changeset_lookup_missed(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+) -> ProviderResult<()> {
+    if cursor.jar().has_checksums() {
+        changeset_search(cursor, range, key, true)?;
+    }
+    Ok(())
+}
+
+fn changeset_search(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+    verify: bool,
+) -> ProviderResult<u64> {
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        // `read_changeset_offset` checked the range against the jar's rows, so every probe has a
+        // row; a stored value shorter than the key is damage.
+        let below = if verify {
+            let row =
+                cursor.get(mid.into(), 0b1)?.ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+            row[0].get(..key.len()).ok_or(ProviderError::CorruptedChangeSetStaticFile)? < key
+        } else {
+            let stored = cursor
+                .unverified_value(mid as usize, 0)
+                .map_err(ProviderError::other)?
+                .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+            stored.get(..key.len()).ok_or(ProviderError::CorruptedChangeSetStaticFile)? < key
+        };
+        if below {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(low)
 }
 
 impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
@@ -2720,15 +2823,16 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
 
             for i in offset.changeset_range() {
-                if let Some(change) = cursor.get_one::<StorageChangesetMask>(i.into())? {
-                    let block_address = BlockNumberAddress((block_number, change.address));
-                    // TN(TN-0044): static-file storage changesets hold plain slots.
-                    let entry = ChangesetEntry {
-                        key: StorageSlotKey::plain(change.key),
-                        value: change.value,
-                    };
-                    changeset.push((block_address, entry));
-                }
+                // TN(TN-0121): a row missing inside the block's range is damage, not a shorter
+                // changeset.
+                let change = cursor
+                    .get_one::<StorageChangesetMask>(i.into())?
+                    .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+                let block_address = BlockNumberAddress((block_number, change.address));
+                // TN(TN-0044): static-file storage changesets hold plain slots.
+                let entry =
+                    ChangesetEntry { key: StorageSlotKey::plain(change.key), value: change.value };
+                changeset.push((block_address, entry));
             }
             Ok(changeset)
         } else {
@@ -2758,32 +2862,11 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
 
         let mut cursor = provider.cursor()?;
         let range = offset.changeset_range();
-        let mut low = range.start;
-        let mut high = range.end;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if let Some(change) = cursor.get_one::<StorageChangesetMask>(mid.into())? {
-                match (change.address, change.key).cmp(&(address, storage_key)) {
-                    std::cmp::Ordering::Less => low = mid + 1,
-                    _ => high = mid,
-                }
-            } else {
-                debug!(
-                    target: "providers::static_file",
-                    ?low,
-                    ?mid,
-                    ?high,
-                    ?range,
-                    ?block_number,
-                    ?address,
-                    ?storage_key,
-                    "Cannot continue binary search for storage changeset fetch"
-                );
-                low = range.end;
-                break;
-            }
-        }
+        // TN(TN-0124): a storage change's stored value starts with its address and plain slot.
+        let mut key = [0u8; 52];
+        key[..20].copy_from_slice(address.as_slice());
+        key[20..].copy_from_slice(storage_key.as_slice());
+        let low = changeset_lower_bound(&mut cursor, range.clone(), &key)?;
 
         if low < range.end &&
             let Some(change) = cursor
@@ -2797,6 +2880,7 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             }));
         }
 
+        changeset_lookup_missed(&mut cursor, range, &key)?;
         Ok(None)
     }
 
@@ -2814,13 +2898,17 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::StorageChangeSets) {
             for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::StorageChangeSets.filename(block_range))
-                    .with_extension("csoff");
+                let data_path =
+                    self.path.join(StaticFileSegment::StorageChangeSets.filename(block_range));
+                let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    // TN(TN-0121): the jar's configuration says whether its records carry
+                    // checksums.
+                    let checksums = NippyJar::<SegmentHeader>::load(&data_path)
+                        .map_err(ProviderError::other)?
+                        .has_checksums();
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {
