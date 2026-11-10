@@ -32,7 +32,7 @@
 //! consensus output holding one block per batch. Each mode prints one line,
 //!
 //! ```text
-//! persist_bench backend=tn-lmdb sync=nosync per_commit=1 n=400 blocks=400 txs=200 median_us=..
+//! persist_bench backend=tn-lmdb sync=nosync layout=v2 per_commit=1 n=400 blocks=400 txs=200 ..
 //! ```
 //!
 //! with the per-commit median, p90, p99 (nearest rank) and max, the total, blocks per second of
@@ -59,6 +59,9 @@
 //! - `TN_PERSIST_BENCH_PER_COMMIT` (4): blocks per commit in the second mode.
 //! - `TN_PERSIST_BENCH_ACCOUNTS` (10000): prefilled accounts, and as many prefilled slots in the
 //!   writer contract.
+//! - `TN_PERSIST_BENCH_LAYOUT` (this build's layout for new datadirs,
+//!   [`StorageLayout::for_new_datadirs`]): `v1` or `v2`, the storage layout each mode's fresh
+//!   datadir gets. v2 runs on tn-lmdb only; the MDBX build refuses it at the open.
 //! - `TN_PERSIST_BENCH_SYNC` (`nosync`): `nosync` or `durable` (`--db.sync-mode durable`). On MDBX
 //!   `nosync` is `--db.sync-mode safe-no-sync`. On tn-lmdb that flag adds automatic syncs (each
 //!   second or 64 MiB: `tn_lmdb_args`), so the no-sync rows would time some syncs; the tn-lmdb
@@ -91,6 +94,7 @@ use crate::{
         TransactionFactory,
     },
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethCommand, RethConfig,
+    StorageLayout,
 };
 use alloy::primitives::keccak256;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -144,6 +148,7 @@ struct Knobs {
     per_commit: usize,
     accounts: usize,
     durable: bool,
+    layout: StorageLayout,
 }
 
 impl Knobs {
@@ -155,12 +160,19 @@ impl Knobs {
             Ok("durable") => true,
             Ok(other) => panic!("TN_PERSIST_BENCH_SYNC must be durable or nosync, got {other}"),
         };
+        let layout = match std::env::var("TN_PERSIST_BENCH_LAYOUT").as_deref() {
+            Err(_) => StorageLayout::for_new_datadirs(),
+            Ok("v1") => StorageLayout::V1,
+            Ok("v2") => StorageLayout::V2,
+            Ok(other) => panic!("TN_PERSIST_BENCH_LAYOUT must be v1 or v2, got {other}"),
+        };
         Self {
             blocks: knob("TN_PERSIST_BENCH_BLOCKS", 400),
             txs,
             per_commit: knob("TN_PERSIST_BENCH_PER_COMMIT", 4),
             accounts: knob("TN_PERSIST_BENCH_ACCOUNTS", 10_000),
             durable,
+            layout,
         }
     }
 
@@ -435,7 +447,8 @@ fn run_mode(
         txpool: TxPoolArgs::default(),
         db: DatabaseArgs { sync_mode, ..Default::default() },
     };
-    let reth_config = RethConfig::new(command, None, datadir, false, chain.clone());
+    let reth_config = RethConfig::new(command, None, datadir, false, chain.clone())
+        .with_new_datadir_layout(knobs.layout);
     let db_dir = datadir.join("db");
     let task_manager = TaskManager::new("persist bench");
     let database = RethEnv::new_database(&reth_config, &db_dir).expect("open the database");
@@ -553,13 +566,14 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
     let us = |d: Duration| d.as_micros();
     let blocks = persist.len() * per_commit;
     println!(
-        "persist_bench backend={BACKEND} sync={} per_commit={per_commit} n={} blocks={blocks} \
-         txs={} median_us={} p90_us={} p99_us={} max_us={} mean_us={} total_ms={} \
+        "persist_bench backend={BACKEND} sync={} layout={} per_commit={per_commit} n={} \
+         blocks={blocks} txs={} median_us={} p90_us={} p99_us={} max_us={} mean_us={} total_ms={} \
          blocks_per_s={:.1} db_median_us={} db_p99_us={} db_write_median_us={} \
          db_commit_median_us={} db_commit_p99_us={} sf_write_median_us={} sf_commit_median_us={} \
          sf_commit_p99_us={} sf_sync_median_us={} sf_sync_concurrent_median_us={} db_bytes={} \
          db_alloc_bytes={}",
         knobs.sync_name(),
+        knobs.layout,
         persist.len(),
         knobs.txs,
         us(rank(&persist, 0.5)),

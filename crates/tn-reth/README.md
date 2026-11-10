@@ -756,8 +756,9 @@ new and existing accounts) and contract writes (new and existing slots) over a p
 persisted one block per commit and several per commit (production persists once per consensus
 output). It also reports reth's own split of each persist (`save_blocks_mdbx`, the database's
 writes, and `save_blocks_commit_mdbx`, its commit, against the static files' write and commit; reth
-keeps these names whatever the engine), so the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment. Run each
-build from its own target directory:
+keeps these names whatever the engine), so the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment;
+`TN_PERSIST_BENCH_LAYOUT=v1` or `v2` compares the storage layouts on one build. Run each build from
+its own target directory:
 
 ```sh
 mkdir -p target/persist-bench-tmp
