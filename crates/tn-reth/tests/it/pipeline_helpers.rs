@@ -15,16 +15,18 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 #[cfg(not(feature = "faucet"))]
 use tn_reth::mintCall;
 use tn_reth::{
+    error::TnRethResult,
     payload::TNPayload,
     system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
-    totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
+    totalSupplyCall, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
-    test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
-    TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
+    test_genesis, Address, Batch, BlsSignature, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeader, ConsensusOutput, GenesisAccount, Recovered, ReputationScores,
+    SealedHeader, SignatureVerificationState, TaskManager, TransactionSigned,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 
 // --- Concurrency limiter ---
@@ -276,6 +278,31 @@ impl PipelineTestEnv {
         txs: Vec<Vec<u8>>,
         timestamp: u64,
     ) -> eyre::Result<ExecutedBlock> {
+        self.build_and_persist(timestamp, |reth_env, payload, overlay| {
+            reth_env.build_block_from_batch_payload(payload, &txs, overlay)
+        })
+    }
+
+    /// Execute a block from transactions whose signers are already recovered (one batch's entry
+    /// of `RethEnv::recover_output_signers`), the way the engine builds blocks, then persist it
+    /// like [`Self::execute_block`].
+    pub(crate) fn execute_recovered_block(
+        &mut self,
+        recovered: Vec<Recovered<TransactionSigned>>,
+    ) -> eyre::Result<ExecutedBlock> {
+        self.build_and_persist(self.block_timestamp, |reth_env, payload, overlay| {
+            reth_env
+                .build_block_from_recovered_payload(payload, recovered, overlay)
+                .map(|(block, _timings)| block)
+        })
+    }
+
+    /// Build one block at `timestamp` with `build`, then chain and persist it.
+    fn build_and_persist(
+        &mut self,
+        timestamp: u64,
+        build: impl FnOnce(&RethEnv, TNPayload, &mut OutputTrieOverlay) -> TnRethResult<ExecutedBlock>,
+    ) -> eyre::Result<ExecutedBlock> {
         // 1. Create consensus output with controlled timestamp
         let output =
             consensus_output_for_test(self.subdag_index as u32, 0, self.subdag_index, timestamp);
@@ -285,11 +312,7 @@ impl PipelineTestEnv {
 
         // 3. Build and execute block. Each block persists in step 5 before the next build,
         // so a fresh empty overlay per block is exact (#1301).
-        let block = self.reth_env.build_block_from_batch_payload(
-            payload,
-            &txs,
-            &mut tn_reth::OutputTrieOverlay::new(),
-        )?;
+        let block = build(&self.reth_env, payload, &mut OutputTrieOverlay::new())?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -435,6 +458,41 @@ pub(crate) fn consensus_output_for_test(
         false,
         VecDeque::new(),
         Vec::new(),
+    )
+}
+
+/// Wrap `consensus_output_for_test`'s sub-DAG in an output with one certificate per entry of
+/// `certificates`, each carrying one batch per entry of its own (each the batch's encoded
+/// transactions), with the digests in flattened order (certificate, then batch).
+///
+/// For signer recovery only: the batches carry default beneficiaries, base fees and epochs, and
+/// certificate `i` is attributed to `Address::with_last_byte(i)`.
+pub(crate) fn consensus_output_with_batches(
+    subdag_index: u64,
+    timestamp: u64,
+    certificates: Vec<Vec<Vec<Vec<u8>>>>,
+) -> ConsensusOutput {
+    let base = consensus_output_for_test(subdag_index as u32, 0, subdag_index, timestamp);
+    let certified: Vec<CertifiedBatch> = certificates
+        .into_iter()
+        .enumerate()
+        .map(|(i, batches)| CertifiedBatch {
+            address: Address::with_last_byte(i as u8),
+            batches: batches
+                .into_iter()
+                .map(|transactions| Batch { transactions, ..Default::default() })
+                .collect(),
+        })
+        .collect();
+    let digests =
+        certified.iter().flat_map(|cert| cert.batches.iter()).map(Batch::digest).collect();
+    ConsensusOutput::new(
+        base.sub_dag().clone(),
+        ConsensusHeader::default().digest(),
+        subdag_index,
+        false,
+        digests,
+        certified,
     )
 }
 
