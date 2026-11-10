@@ -356,6 +356,15 @@ impl KeyConfig {
         // Without a wrapped file only a passphrase-less read falls back to the cleartext file: a
         // supplied passphrase means the key is expected wrapped, so its absence is an error.
         let passphrase = if key_file_exists(&keys_dir.join(BLS_WRAPPED_KEYFILE))? {
+            // A passphrase-less read loads the cleartext file; with only the wrapped one on disk
+            // say so here rather than fail on the missing cleartext file without a path.
+            if passphrase.is_none() && !key_file_exists(&keys_dir.join(BLS_KEYFILE))? {
+                return Err(eyre::eyre!(
+                    "no BLS key passphrase was supplied but the BLS key is encrypted in {} and \
+                     there is no cleartext {BLS_KEYFILE}; a passphrase source is needed to unlock it",
+                    keys_dir.join(BLS_WRAPPED_KEYFILE).display()
+                ));
+            }
             passphrase
         } else if passphrase.is_some() {
             let cleartext = keys_dir.join(BLS_KEYFILE);
@@ -1181,6 +1190,30 @@ mod tests {
         assert!(msg.contains("no key files found"), "{msg}");
         assert!(msg.contains(BLS_WRAPPED_KEYFILE) && msg.contains(BLS_KEYFILE), "{msg}");
         assert!(!msg.contains("refusing to load the cleartext"), "{msg}");
+    }
+
+    /// The mirror case: an encrypted key with no passphrase and no cleartext file names the
+    /// encrypted file and asks for a passphrase source, instead of failing on the missing
+    /// `bls.key` with a bare "No such file or directory". The passphrase still unlocks it.
+    #[test]
+    fn read_config_without_passphrase_and_only_wrapped_key_asks_for_a_passphrase() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let pp = Some(Zeroizing::new("passphrase".to_string()));
+        let generated = KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1)
+            .expect("generate wrapped key");
+        let wrapped = datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE);
+        assert!(wrapped.exists());
+        assert!(!datadir.node_keys_path().join(BLS_KEYFILE).exists());
+
+        let err = KeyConfig::read_config(&datadir, None).expect_err("no passphrase");
+        let msg = err.to_string();
+        assert!(msg.contains(&wrapped.display().to_string()), "{msg}");
+        assert!(msg.contains("encrypted"), "{msg}");
+        assert!(msg.contains("passphrase source is needed"), "{msg}");
+
+        let loaded = KeyConfig::read_config(&datadir, pp).expect("wrapped read");
+        assert_eq!(loaded.primary_public_key(), generated.primary_public_key());
     }
 
     /// An unreadable keys directory is reported as an error on that directory, not as a missing

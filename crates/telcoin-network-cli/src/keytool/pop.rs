@@ -71,6 +71,12 @@ impl PopArgs {
                      hint: the BLS key is stored unencrypted (bls.key) - rerun with \
                      `--bls-passphrase-source no-passphrase` to use it"
                 ),
+                // only the encrypted bls.kw exists, and nothing was given to unlock it
+                (Ok(true), Ok(false)) if !passphrase_given => eyre::eyre!(
+                    "could not read existing BLS keys from {shown}: {e}\n\
+                     hint: the BLS key is encrypted (bls.kw) - supply its passphrase through \
+                     `--bls-passphrase-source`"
+                ),
                 (Ok(false), Ok(false)) => eyre::eyre!(
                     "no BLS keys found at {shown}: {e}\n\
                      hint: generate keys first with `keytool generate validator|observer`"

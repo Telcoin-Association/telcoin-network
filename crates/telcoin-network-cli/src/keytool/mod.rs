@@ -1287,6 +1287,26 @@ mod tests {
             .expect("the cleartext key loads without a passphrase");
     }
 
+    /// An encrypted-only key dir read without a passphrase names the encrypted file and points
+    /// at the passphrase source, not at a wrong passphrase or at key generation.
+    #[tokio::test]
+    async fn test_generate_pop_encrypted_key_without_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None)
+            .execute(&path, Some(Zeroizing::new("correct".to_string())))
+            .expect("generate keys with passphrase");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect_err("the encrypted key needs its passphrase");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bls.kw"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source"), "got: {msg}");
+        assert!(!msg.contains("verify the BLS passphrase is correct"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+    }
+
     /// When `node-keys/` cannot be searched, `generate pop` points at the directory's access
     /// rather than saying that no keys exist and should be generated, with or without a
     /// passphrase.
