@@ -533,6 +533,40 @@
       "description": "Certificates that wait for their parents, and certificates fetched from peers."
     },
     {
+      "id": 65,
+      "type": "timeseries",
+      "title": "Digests Re-queued by Cause /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, cause) (rate(tn_primary_digests_requeued_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{instance}} {{cause}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Rate of batch digests the proposer put back at the front of its queue, by cause. canceled: a newer own header cancelled the vote collection of the header that carried them. committed: an own header at a later round was committed while the header that carried them was not."
+    },
+    {
       "id": 16,
       "type": "row",
       "title": "Execution",
@@ -541,7 +575,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 42
       }
     },
     {
@@ -556,7 +590,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "targets": [
         {
@@ -590,7 +624,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 35
+        "y": 43
       },
       "targets": [
         {
@@ -643,7 +677,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 35
+        "y": 43
       },
       "targets": [
         {
@@ -679,7 +713,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "targets": [
         {
@@ -713,7 +747,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 43
+        "y": 51
       },
       "targets": [
         {
@@ -765,7 +799,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 43
+        "y": 51
       },
       "targets": [
         {
@@ -805,7 +839,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 59
       }
     },
     {
@@ -820,7 +854,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -872,7 +906,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -924,7 +958,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -967,7 +1001,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 60
+        "y": 68
       },
       "targets": [
         {
@@ -1007,7 +1041,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 60
+        "y": 68
       },
       "targets": [
         {
@@ -1050,7 +1084,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 60
+        "y": 68
       },
       "targets": [
         {
@@ -1090,7 +1124,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 76
       }
     },
     {
@@ -1105,7 +1139,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "targets": [
         {
@@ -1139,7 +1173,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 69
+        "y": 77
       },
       "targets": [
         {
@@ -1174,7 +1208,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 69
+        "y": 77
       },
       "targets": [
         {
@@ -1217,7 +1251,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 77
+        "y": 85
       },
       "targets": [
         {
@@ -1260,7 +1294,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 77
+        "y": 85
       },
       "targets": [
         {
@@ -1295,7 +1329,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 77
+        "y": 85
       },
       "targets": [
         {
@@ -1327,7 +1361,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 93
       }
     },
     {
@@ -1342,7 +1376,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 86
+        "y": 94
       },
       "targets": [
         {
@@ -1382,7 +1416,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 86
+        "y": 94
       },
       "targets": [
         {
@@ -1425,7 +1459,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 86
+        "y": 94
       },
       "targets": [
         {
@@ -1477,7 +1511,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "targets": [
         {
@@ -1511,7 +1545,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 94
+        "y": 102
       },
       "targets": [
         {
@@ -1551,7 +1585,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 94
+        "y": 102
       },
       "targets": [
         {
@@ -1594,7 +1628,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "targets": [
         {
@@ -1628,7 +1662,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 102
+        "y": 110
       },
       "targets": [
         {
@@ -1659,7 +1693,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 110
+        "y": 118
       },
       "panels": []
     },
@@ -1676,7 +1710,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 111
+        "y": 119
       },
       "fieldConfig": {
         "defaults": {
@@ -1721,7 +1755,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 111
+        "y": 119
       },
       "fieldConfig": {
         "defaults": {
@@ -1766,7 +1800,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -1819,7 +1853,7 @@
         "h": 8,
         "w": 4,
         "x": 8,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -1867,7 +1901,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -1930,7 +1964,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 127
+        "y": 135
       },
       "fieldConfig": {
         "defaults": {
@@ -2043,7 +2077,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 127
+        "y": 135
       },
       "fieldConfig": {
         "defaults": {
@@ -2110,7 +2144,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 135
+        "y": 143
       },
       "panels": []
     },
@@ -2127,7 +2161,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -2180,7 +2214,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -2243,7 +2277,7 @@
         "h": 8,
         "w": 4,
         "x": 16,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -2290,7 +2324,7 @@
         "h": 8,
         "w": 4,
         "x": 20,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -2337,7 +2371,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 144
+        "y": 152
       },
       "fieldConfig": {
         "defaults": {
@@ -2386,7 +2420,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 152
+        "y": 160
       },
       "panels": []
     },
@@ -2403,7 +2437,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 153
+        "y": 161
       },
       "fieldConfig": {
         "defaults": {
@@ -2465,7 +2499,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 153
+        "y": 161
       },
       "fieldConfig": {
         "defaults": {
@@ -2518,7 +2552,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 161
+        "y": 169
       },
       "fieldConfig": {
         "defaults": {
@@ -2580,7 +2614,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 161
+        "y": 169
       },
       "fieldConfig": {
         "defaults": {
