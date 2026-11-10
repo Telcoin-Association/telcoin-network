@@ -18,6 +18,8 @@ pub use static_file::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 pub use static_file::checksummed_segment;
 // TN(TN-0133): a gap between a segment's jars.
 pub use static_file::StaticFileGapError;
+// TN(TN-0135): a jar without checksums in a storage-v2 datadir.
+pub use static_file::UncheckedJarError;
 
 mod state;
 pub use state::{

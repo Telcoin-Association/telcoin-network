@@ -1038,8 +1038,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `set_storage_settings_cache`, which TN's `layout::settle` calls before genesis writes the first
   jar. New jars of every segment carry checksums under v2 (`checksummed_segment`; the changesets
   are mandatory, the others stay while the read cost is below the benches' noise); v1 datadirs
-  create upstream's format byte for byte. An existing jar keeps its own format for reads and
-  appends, so a v2 datadir written before this change keeps its unchecked jars until they rotate.
+  create upstream's format byte for byte. An existing jar is read and appended in its own format;
+  TN-0135 refuses a checksummed segment's jar without checksums in a v2 datadir.
   It cannot reach execution: the values stored are unchanged; v1 files are unchanged.
   *Tests*: TN-0123. *Upstream*: no.
 
@@ -1056,9 +1056,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   allocation holds: an error, not a short changeset or an abort), `checksummed_sidecar_heal`
   (a torn and uncommitted tail cut in 20-byte records; a damaged committed record stops the open
   and nothing is cut), `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` (an interrupted
-  prune is healed and published at once; a gap is refused), `rotation_prune_and_mixed_formats`
-  (unchecked jars keep their format while new jars are checksummed; prune and appends across
-  rotations keep verifying), `missing_row_inside_a_range_is_an_error`,
+  prune is healed and published at once; a gap is refused), `rotation_prune_and_appends`
+  (prune and appends across rotations keep verifying; it mixed unchecked jars in until TN-0135),
+  `missing_row_inside_a_range_is_an_error`,
   `damaged_probe_key_is_an_error_not_another_row` (TN-0124), and in `database/tn_v2_tests.rs`
   `v2_history_read_without_its_changeset_jar_fails_closed` (a v2 datadir missing the changeset
   files of blocks 4 to 7: every history read that resolves to them is `*ChangesetNotFound`,
@@ -1240,3 +1240,28 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `test_record_seed_high_half`, `test_get_range_past_the_file_is_an_error` (a count of 2^60
   records). Mutation-checked: each change reverted, each seed's high-half term and the column
   term removed. *Upstream*: partly (the cursor `expect`s and the reservation are upstream's).
+
+- **TN-0135** — A storage-v2 datadir refuses a jar of a checksummed segment without checksums.
+  *Kind*: fix (static-file integrity, policy).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
+  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at every jar
+  load: the cache fill and its reload, `prepare_index_update`, `update_index`,
+  `check_segment_consistency`; tests), `crates/storage/provider/src/providers/mod.rs`.
+  *Why*: the format is the configuration's version (TN-0120), and two flipped bits turn version 2
+  into version 1. A checksummed jar read as version 1 hands out its values with the checksum
+  appended (a storage changeset's `U256` reads wrong without an error) and its 20-byte `.csoff`
+  records at a 16-byte stride. A byte pattern cannot tell that from a real version-1 jar, but the
+  datadir's layout can: under storage v2 (the provider's `jar_checksums`, set from the stored
+  settings before any read, TN-0122) every new jar of a checksummed segment is version 2, so a
+  version-1 jar there is refused (`UncheckedJarError`) wherever a jar loads for reading, writing or
+  the startup check. Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
+  open: accepted, as storage v2 was never released and development datadirs are recreated.
+  Version-1 datadirs are unaffected (checksums off). Read-only providers opened without a
+  `ProviderFactory` do not know the layout and keep reading a jar in its own format. It cannot
+  reach execution: valid v1 and v2 datadirs read as before. *Tests*:
+  `storage_v2_refuses_jars_without_checksums` (unchecked jars under a checksums-on provider:
+  changeset, header and writer opens refused, a checksums-off reader reads them; a checksummed
+  jar's configuration turned into version 1: its reads refused, the other segment's still answer),
+  `rotation_prune_and_appends` (TN-0123's `rotation_prune_and_mixed_formats`, which mixed the
+  formats in one datadir, now without the unchecked jars). Mutation-checked: no refusal.
+  *Upstream*: no.

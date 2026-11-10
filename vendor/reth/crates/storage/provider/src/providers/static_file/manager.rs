@@ -483,8 +483,9 @@ impl<N> StaticFileProviderInner<N> {
     /// (`reth_nippy_jar::NippyJar::with_checksums`), for the segments [`checksummed_segment`]
     /// names. [`ProviderFactory`](crate::ProviderFactory) sets it from the datadir's storage
     /// settings: on for storage v2, off for v1, whose files stay upstream's format byte for byte.
-    /// A jar that exists keeps its own format, which its configuration records, for reads and
-    /// appends alike.
+    /// A jar that exists is read and appended in its own format, which its configuration records;
+    /// with checksums on, a checksummed segment's jar without them is refused (TN-0135,
+    /// [`Self::load_jar`]).
     pub fn set_jar_checksums(&self, enabled: bool) {
         self.jar_checksums.store(enabled, Ordering::Relaxed);
     }
@@ -493,7 +494,52 @@ impl<N> StaticFileProviderInner<N> {
     pub fn jar_checksums(&self, segment: StaticFileSegment) -> bool {
         self.jar_checksums.load(Ordering::Relaxed) && checksummed_segment(segment)
     }
+
+    /// TN(TN-0135): loads the configuration of `segment`'s jar at `path`. Under storage v2 (the
+    /// provider's checksums on) every jar of a checksummed segment must carry checksums: a
+    /// version-1 jar there is refused, since two flipped bits turn a version-2 configuration into
+    /// a version-1 one, whose values would then read with their checksums appended and whose
+    /// 20-byte `.csoff` records at a 16-byte stride. A storage-v2 datadir from before checksums
+    /// is refused the same way (storage v2 was never released).
+    pub(crate) fn load_jar(
+        &self,
+        segment: StaticFileSegment,
+        path: &Path,
+    ) -> ProviderResult<NippyJar<SegmentHeader>> {
+        let jar = NippyJar::<SegmentHeader>::load(path).map_err(ProviderError::other)?;
+        if self.jar_checksums(segment) && !jar.has_checksums() {
+            tracing::error!(
+                target: "reth::static_file",
+                %segment,
+                path = %path.display(),
+                "Static file without checksums in a storage v2 datadir"
+            );
+            return Err(ProviderError::other(UncheckedJarError { path: path.to_path_buf() }))
+        }
+        Ok(jar)
+    }
 }
+
+/// TN(TN-0135): a jar of a checksummed segment without checksums, in a storage-v2 datadir
+/// ([`StaticFileProviderInner::load_jar`]).
+#[derive(Debug)]
+pub struct UncheckedJarError {
+    /// The jar's data file.
+    pub path: PathBuf,
+}
+
+impl core::fmt::Display for UncheckedJarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "static file {} has no checksums, but every jar of its segment in a storage v2 \
+             datadir must (its configuration is damaged, or it predates checksums)",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for UncheckedJarError {}
 
 /// TN(TN-0122): the segments whose new jars carry checksums when the provider's checksums are on
 /// (storage v2). The changesets are mandatory: every historical state read below the tip resolves
@@ -1218,7 +1264,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             let generation = self.cache_generation.load(Ordering::Acquire);
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Creating jar from scratch");
             let path = self.path.join(segment.filename(fixed_block_range));
-            let jar = NippyJar::load(&path).map_err(ProviderError::other)?;
+            // TN(TN-0135): through the storage-v2 format check, here and at every jar load below.
+            let jar = self.load_jar(segment, &path)?;
             let loaded = LoadedJar::new(jar)?;
             #[cfg(test)]
             self.before_cache_insert.fire(segment);
@@ -1237,7 +1284,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     } else {
                         trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Reloading jar after cache invalidation");
                         drop(loaded);
-                        LoadedJar::new(NippyJar::load(&path).map_err(ProviderError::other)?)?
+                        LoadedJar::new(self.load_jar(segment, &path)?)?
                     };
                     #[cfg(test)]
                     self.after_cache_validation.fire(segment);
@@ -1329,8 +1376,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             );
             (fixed_range, index.is_none_or(|index| segment_max_block > index.max_block))
         };
-        let jar = NippyJar::<SegmentHeader>::load(&self.path.join(segment.filename(&fixed_range)))
-            .map_err(ProviderError::other)?;
+        let jar = self.load_jar(segment, &self.path.join(segment.filename(&fixed_range)))?;
         let header = jar.user_header().clone();
         let loaded = LoadedJar::new(jar)?;
         let jar = if grows {
@@ -1387,10 +1433,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 let (header, unpublished) = match prepared {
                     Some(PreparedIndexUpdate { header, jar, .. }) => (header, jar),
                     None => {
-                        let jar = NippyJar::<SegmentHeader>::load(
-                            &self.path.join(segment.filename(&fixed_range)),
-                        )
-                        .map_err(ProviderError::other)?;
+                        let jar = self
+                            .load_jar(segment, &self.path.join(segment.filename(&fixed_range)))?;
                         (jar.user_header().clone(), Some(LoadedJar::new(jar)?))
                     }
                 };
@@ -1926,7 +1970,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .join(segment.filename(&self.find_fixed_range(segment, latest_block)));
             debug!(target: "reth::providers::static_file", ?file_path, latest_block, "Loading NippyJar for consistency check");
 
-            let jar = NippyJar::<SegmentHeader>::load(&file_path).map_err(ProviderError::other)?;
+            let jar = self.load_jar(segment, &file_path)?;
             debug!(target: "reth::providers::static_file", "NippyJar loaded, checking consistency");
 
             NippyJarChecker::new(jar).check_consistency().map_err(ProviderError::other)?;

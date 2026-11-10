@@ -414,22 +414,16 @@ fn sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap() {
     assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
 }
 
-/// Rotation, prune and appends keep every checksummed jar verifying; a datadir whose old jars are
-/// unchecked keeps reading and appending them as they are, and its new jars are checksummed.
+/// Rotation, prune and appends keep every checksummed jar verifying.
 #[test]
-fn rotation_prune_and_mixed_formats() {
+fn rotation_prune_and_appends() {
     let (dir, _) = create_test_static_files_dir();
-    let unchecked = provider(dir.path(), false, 2);
-    write_changesets(&unchecked, 0..3);
-    drop(unchecked);
-
-    // Checksums on: block 3 goes to the existing unchecked jar 2..=3, blocks 4.. to new jars.
     let provider = provider(dir.path(), true, 2);
-    write_changesets(&provider, 3..7);
-    for (block, checksummed) in [(0, false), (2, false), (4, true), (6, true)] {
+    write_changesets(&provider, 0..7);
+    for block in [0, 2, 4, 6] {
         for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
         {
-            assert_eq!(load(&jar_path(&provider, segment, block)).has_checksums(), checksummed);
+            assert!(load(&jar_path(&provider, segment, block)).has_checksums());
         }
     }
     let read_all = |provider: &StaticFileProvider<EthPrimitives>, blocks: std::ops::Range<u64>| {
@@ -441,7 +435,7 @@ fn rotation_prune_and_mixed_formats() {
     };
     read_all(&provider, 0..7);
 
-    // Prune back into the checksummed jar 4..=5, then append past the rotation again.
+    // Prune back into the jar 4..=5, then append past the rotation again.
     let mut accounts = provider.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
     accounts.prune_account_changesets(4).unwrap();
     accounts.commit().unwrap();
@@ -455,6 +449,54 @@ fn rotation_prune_and_mixed_formats() {
     read_all(&provider, 0..9);
     drop(provider);
     read_all(&provider_ro(dir.path()), 0..9);
+}
+
+/// Whether `err` is TN-0135's refusal of a jar without checksums.
+fn is_unchecked_jar(err: &ProviderError) -> bool {
+    err.downcast_other_ref::<super::UncheckedJarError>().is_some()
+}
+
+/// TN(TN-0135): a provider with checksums on (storage v2) refuses a jar of a checksummed segment
+/// that has none, at every load: one written without checksums (a storage-v2 datadir from before
+/// them), and a checksummed jar whose configuration's version became 1 (its trailer dropped), which
+/// would otherwise read its values with their checksums appended. A provider with checksums off
+/// reads the unchecked jars.
+#[test]
+fn storage_v2_refuses_jars_without_checksums() {
+    // Written without checksums, opened with them.
+    let (dir, _) = create_test_static_files_dir();
+    let unchecked = provider(dir.path(), false, 2);
+    write_changesets(&unchecked, 0..3);
+    write_block_segments(&unchecked, 3);
+    drop(unchecked);
+    let opened = provider(dir.path(), true, 2);
+    assert!(is_unchecked_jar(&opened.account_block_changeset(0).unwrap_err()));
+    assert!(is_unchecked_jar(&opened.header_by_number(0).unwrap_err()));
+    let err = opened.latest_writer(StaticFileSegment::StorageChangeSets).map(drop).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    drop(opened);
+    let read_only = provider_ro(dir.path());
+    assert_eq!(read_only.account_block_changeset(0).unwrap(), account_changes(0));
+    drop(read_only);
+
+    // A checksummed jar whose configuration says version 1.
+    let (dir, _) = create_test_static_files_dir();
+    let checked = provider(dir.path(), true, 2);
+    write_changesets(&checked, 0..3);
+    let path = jar_path(&checked, StaticFileSegment::StorageChangeSets, 0);
+    drop(checked);
+    let config = path.with_extension("conf");
+    let mut bytes = std::fs::read(&config).unwrap();
+    assert_eq!(bytes[..8], 2u64.to_le_bytes());
+    bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+    bytes.truncate(bytes.len() - 4);
+    std::fs::write(&config, bytes).unwrap();
+    assert!(!load(&path).has_checksums());
+    let reopened = provider(dir.path(), true, 2);
+    let err = reopened.get_storage_before_block(0, address(0, 0), slot(3)).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    assert!(is_unchecked_jar(&reopened.storage_changeset(1).unwrap_err()));
+    assert_eq!(reopened.account_block_changeset(1).unwrap(), account_changes(1));
 }
 
 /// A range read that meets a row missing inside a jar's own range is an error, not a shorter
