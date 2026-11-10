@@ -555,7 +555,7 @@ fn test_shared_read_cache_matches_fresh_reads() -> eyre::Result<()> {
         let bundle = &fresh.execution_output.state;
         let reads = scope.reads();
         // the sender and every contract read by the block are cached at their post-block state,
-        // without code; the read cache never carries an account's code or access-list id
+        // without code; the read cache never carries an account's code or `account_id` storage hint
         assert!(reads
             .accounts
             .values()

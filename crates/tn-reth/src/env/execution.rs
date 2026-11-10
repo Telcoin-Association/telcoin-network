@@ -861,10 +861,10 @@ fn record_unrecoverable(handed: usize, recovered: usize) {
 /// - destroyed in the block (`Destroyed`, `DestroyedChanged` when recreated after the destruct,
 ///   `DestroyedAgain`) or left without info (deleted, or cleared as empty under EIP-161): the entry
 ///   is evicted with its storage, and the next read reaches the provider, which applies the wipe;
-/// - otherwise the new info without its code and access-list id (a provider read carries neither;
-///   revm loads code by hash) and each written slot's present value. A storage-known status (an
-///   account the block created) also drops the account's other cached slots, which the provider
-///   answers as zero.
+/// - otherwise the new info without its code and its `account_id` (revm's hint for faster access to
+///   the account's storage; a provider read carries neither, and revm loads code by hash) and each
+///   written slot's present value. A storage-known status (an account the block created) also drops
+///   the account's other cached slots, which the provider answers as zero.
 ///
 /// Cached bytecode is keyed by its own hash, and cached block hashes belong to blocks below the
 /// one that read them (revm asks the database only for the 256 before the current block), so
@@ -881,6 +881,7 @@ fn advance_cached_reads(reads: &mut CachedReads, bundle: &BundleState) {
                 continue;
             }
         };
+        // `copy_without_code` keeps the storage hint, which a provider read never sets
         let mut info = info.copy_without_code();
         info.account_id = None;
         let cached = reads
@@ -993,7 +994,8 @@ mod tests {
         assert!(matches!(find(PERSISTED_STORAGE_SLOTS_TOTAL), DebugValue::Counter(8)));
     }
 
-    /// Account info carrying code and an access-list id, neither of which a cache entry may keep.
+    /// Account info carrying code and an `account_id` storage hint, neither of which a cache entry
+    /// may keep.
     fn info_with_code(balance: u64, nonce: u64) -> AccountInfo {
         let code = Bytecode::new_raw(alloy::primitives::Bytes::from_static(&[0x60, 0x00]));
         AccountInfo {
@@ -1025,7 +1027,7 @@ mod tests {
 
     /// The read cache moves to the block's post-state: destroyed (also destroyed-then-changed and
     /// destroyed again), EIP-161-cleared and info-less accounts are evicted with their storage; a
-    /// changed account takes its new info without code or access-list id and its written slots
+    /// changed account takes its new info without code or `account_id` and its written slots
     /// and keeps its other cached slots; a created account keeps only the slots the block
     /// wrote; an account the cache did not hold is added; untouched accounts, code and block
     /// hashes stay as they were.
@@ -1097,7 +1099,7 @@ mod tests {
         for evicted in [destroyed, destroyed_changed, cleared, absent, destroyed_again] {
             assert!(!reads.accounts.contains_key(&evicted), "{evicted} must be evicted");
         }
-        // `AccountInfo`'s `PartialEq` ignores code and access-list id: compare every field
+        // `AccountInfo`'s `PartialEq` ignores code and `account_id`: compare every field
         let fields = |address: Address| {
             let account = &reads.accounts[&address];
             let info = account.info.as_ref().expect("cached info");
