@@ -385,6 +385,11 @@ impl ProposeReason {
 
 /// The `tn_primary_headers_proposed_total{reason}` counters, resolved once when a proposer is
 /// built so no `metrics` macro runs per header. The handles are `Arc`-backed.
+///
+/// The series register when the first [`Proposer`](crate::proposer::Proposer) is built, and the
+/// primary builds one only on a CVV. Before the `reason` label the counter was a
+/// [`PrimaryMetrics`] field and registered at zero on every node, observers included, so a rule
+/// that expects the series on an observer (an `absent()` alert, for one) now sees none there.
 #[derive(Clone, Debug)]
 pub(crate) struct HeadersProposedHandles {
     /// One counter per [`ProposeReason`], indexed by its position in [`ProposeReason::ALL`].
