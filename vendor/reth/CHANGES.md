@@ -758,7 +758,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/storage/provider/src/providers/static_file/writer.rs` (new
   `StaticFileProviderRW::sync_and_freeze`, the `index_pending` flag that `finalize` and `commit`
   honour), `crates/storage/provider/src/providers/static_file/manager.rs` (`write_segment` calls
-  it; test `frozen_rows_stay_unindexed_until_finalize`),
+  it; tests `frozen_rows_stay_unindexed_until_finalize`,
+  `commit_publishes_rows_frozen_by_sync_and_freeze` and
+  `finalize_syncs_rows_appended_after_sync_and_freeze`),
   `crates/storage/provider/src/providers/database/provider.rs` (a comment in
   `DatabaseProvider::commit`; tests `test_save_blocks_without_db_commit_heals_v{1,2}`).
   *Why*: `DatabaseProvider::commit` wrote every dirty segment's `.conf` one after another on the
@@ -788,7 +790,14 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   miss after the freeze loads the longer jar, reads by number still stop at the index tip, and
   `finalize` publishes the rows). They fail if the configuration is not written in the
   segment thread, if it is published before `finalize`, or if `finalize` skips the index
-  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last. TN's
+  update, as do `test_save_blocks_v{1,2}_table_assertions` for the last.
+  `commit_publishes_rows_frozen_by_sync_and_freeze` (a commit of every writer after the freeze,
+  the path `DatabaseProvider::commit` takes in unwind order or with an unwind queued, publishes
+  the rows) fails
+  without `commit`'s `index_pending` branch, and
+  `finalize_syncs_rows_appended_after_sync_and_freeze` (a row appended after the freeze gets its
+  own data and offsets syncs, counted by TN-0052's stats) fails if `sync_and_freeze` leaves the
+  writer marked synced. TN's
   `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
   tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
   semantics.
