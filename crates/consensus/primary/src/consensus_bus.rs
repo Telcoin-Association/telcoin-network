@@ -819,6 +819,11 @@ impl From<NodeMode> for tn_types::NodeMode {
 /// the grace never does. A failed promotion on a stalled consensus head is counted apart
 /// ([`Self::stalled_failures`]): the cap does not apply to that rule, which backs off instead.
 ///
+/// Every site keys it by the epoch of the one `ConsensusConfig` an epoch's tasks are built from:
+/// the network handler and the consensus task read it from that config, and the subscriber from
+/// the committee it cloned from that config when it was spawned. So the epoch a promotion is
+/// stamped with is the epoch the rejoin grace and every demotion read.
+///
 /// The watch lives as long as the process. A restart clears the grace, which is right because a
 /// restart is not a rejoin, and clears the failure count too, so the per-epoch cap does not span
 /// restarts.

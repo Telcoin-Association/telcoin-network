@@ -273,6 +273,8 @@ where
             // held, nor a lag past the rounds peers still keep, which no refill can recover
             let rebuild_bound = tn_types::ROUNDS_TO_KEEP
                 .saturating_sub(self.consensus_config.parameters().gc_depth);
+            // the epoch the subscriber's `promote` stamped: both come from this epoch's config
+            // (see `RejoinState`)
             let since_promotion = self
                 .consensus_bus
                 .rejoin_state()
