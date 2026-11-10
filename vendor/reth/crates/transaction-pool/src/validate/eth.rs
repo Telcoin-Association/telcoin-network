@@ -43,7 +43,6 @@ use std::{
     },
     time::{Instant, SystemTime},
 };
-use tokio::sync::Mutex;
 
 /// A [`TransactionValidator`] implementation that validates ethereum transaction.
 ///
@@ -1291,7 +1290,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             }),
         );
 
-        let to_validation_task = Arc::new(Mutex::new(tx));
+        let to_validation_task = Arc::new(tx);
 
         TransactionValidationTaskExecutor { validator: Arc::new(validator), to_validation_task }
     }
@@ -1431,7 +1430,7 @@ mod tests {
             let executor = EthTransactionValidatorBuilder::new(provider.clone(), test_evm_config())
                 .with_additional_tasks(additional_tasks)
                 .build_with_tasks(TokioTaskExecutor::default(), InMemoryBlobStore::default());
-            assert_eq!(executor.to_validation_task.lock().await.max_capacity(), expected_capacity);
+            assert_eq!(executor.to_validation_task.max_capacity(), expected_capacity);
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 executor.validate_transaction(TransactionOrigin::External, transaction.clone()),

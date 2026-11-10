@@ -868,6 +868,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   capacities 2, 4 and 18, and each executor validates a transaction). *Upstream*: n/a (upstream
   commit).
 
+- **TN-0075** — Backport fe01db183: validation submitters share the bounded channel without a
+  mutex, and a cancelled submit releases the in-flight gauge.
+  *Kind*: backport (adapted).
+  *Files*: `crates/transaction-pool/src/validate/task.rs` (`to_validation_task` is an
+  `Arc<ValidationJobSender>`; `ValidationJobSender::send` decrements `inflight_validation_jobs`
+  from a drop guard; upstream's tests `validation_send_metrics_track_cancellation_and_completion`
+  and `cloned_executors_share_bounded_queue`; its `spawn` hunk, its
+  `validation_service_error_outcomes` helper and the `SameOriginBatchValidator` tests belong to
+  upstream commits this copy does not carry and are left out),
+  `crates/transaction-pool/src/validate/eth.rs` (`build_with_tasks` builds the executor without
+  the mutex; the TN-0074 test reads the capacity directly).
+  *Why*: every submitter took one async mutex before sending into the job channel, so the
+  TN-0041 parallel workers rarely had more than one queued job, and a submit cancelled while it
+  waited for channel space never decremented `inflight_validation_jobs` (review R21). The mpsc
+  channel is multi-producer and bounded, so it gives the same backpressure without the lock;
+  the gauge is decremented when the send future ends, however it ends. Pool admission
+  throughput and a metric only: what is admitted does not change.
+  *Tests*: upstream's `validation_send_metrics_track_cancellation_and_completion` (eight
+  producers wait on a full channel, seven are cancelled, the gauge follows; both with a drained
+  slot and a closed channel) and `cloned_executors_share_bounded_queue` (64 concurrent
+  submitters over all three submit paths drain through two workers); TN-0074's capacity test.
+  *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 
