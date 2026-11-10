@@ -168,8 +168,8 @@ fn rejoin_ready(
 ///   ([`StalledHeadBlocker::Replay`]).
 ///
 /// The rejoin cap does not apply (see [`tn_types::REJOIN_STALLED_HEAD_AFTER`]). The caller still
-/// requires the header to close no epoch but the previous one (`stalled_head_epoch_is_open`,
-/// [`StalledHeadBlocker::Epoch`]).
+/// requires a known header ([`StalledHeadBlocker::NoHead`]) and the header to close no epoch but
+/// the previous one (`stalled_head_epoch_is_open`, [`StalledHeadBlocker::Epoch`]).
 fn stalled_head_ready(
     replayed_epoch: Epoch,
     replayed_number: u64,
@@ -611,11 +611,12 @@ impl<DB: Database> Subscriber<DB> {
     /// [`stalled_head_epoch_is_open`]). `check` holds what this catch-up loop tracks between
     /// checks. Returns true when it promoted.
     ///
-    /// A refused check logs `stalled head not ready` with the part that blocked it, at most once
-    /// per [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`]. A check that finds the gossiped frontier
-    /// ahead of the replayed outputs while the newest known header, or the replayed output, has
-    /// not moved for a check interval asks state sync to fetch the gap again
-    /// ([`Self::rerequest_behind_frontier`]).
+    /// A refused check logs `stalled head not ready` with the part that blocked it, `no_head` when
+    /// it knows no consensus header yet, at most once per
+    /// [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`] ([`StalledHeadCheck::log_not_ready`]). A
+    /// check that finds the gossiped frontier ahead of the replayed outputs while the newest known
+    /// header, or the replayed output, has not moved for a check interval asks state sync to fetch
+    /// the gap again ([`Self::rerequest_behind_frontier`]).
     ///
     /// A committee halted below quorum commits nothing, so without this check the freshness rule of
     /// [`rejoin_ready`] would keep this node inactive, and the committee halted, for good.
@@ -623,13 +624,21 @@ impl<DB: Database> Subscriber<DB> {
         let now = tokio::time::Instant::now();
         let newest = self.newest_header();
         let unchanged_for = check.observed_head.observe(newest.map(|newest| newest.number), now);
-        let Some(newest) = newest else {
-            return false;
-        };
         let gossiped = self.consensus_bus.published_consensus_num_hash();
         let (_, gossiped_number, _) = gossiped;
         let chain = &self.inner.consensus_chain;
         let replayed_number = chain.latest_consensus_number();
+        let Some(newest) = newest else {
+            check.log_not_ready(
+                now,
+                StalledHeadBlocker::NoHead,
+                unchanged_for,
+                None,
+                replayed_number,
+                gossiped_number,
+            );
+            return false;
+        };
         let replay_unchanged_for = check.observe_replay(replayed_number, now);
         let head_stalled = unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL;
         if gossiped_number > replayed_number
@@ -657,26 +666,18 @@ impl<DB: Database> Subscriber<DB> {
                 ready = Err(StalledHeadBlocker::Epoch);
             }
         }
-        let stall_needed_ms = u64::try_from(check.stall_needed.as_millis()).unwrap_or(u64::MAX);
         if let Err(blocked_by) = ready {
-            if rate_limit_due(
-                &mut check.not_ready_logged,
+            check.log_not_ready(
                 now,
-                REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL,
-            ) {
-                info!(
-                    target: "subscriber",
-                    unchanged_for_ms = u64::try_from(unchanged_for.as_millis()).unwrap_or(u64::MAX),
-                    stall_needed_ms,
-                    newest_number = newest.number,
-                    replayed_number,
-                    gossiped_number,
-                    blocked_by = blocked_by.as_str(),
-                    "stalled head not ready"
-                );
-            }
+                blocked_by,
+                unchanged_for,
+                Some(newest.number),
+                replayed_number,
+                gossiped_number,
+            );
             return false;
         }
+        let stall_needed_ms = u64::try_from(check.stall_needed.as_millis()).unwrap_or(u64::MAX);
         info!(
             target: "subscriber",
             head_age_ms = u64::try_from(newest.age.as_millis()).unwrap_or(u64::MAX),
@@ -1581,6 +1582,37 @@ impl StalledHeadCheck {
         }
         unchanged_for
     }
+
+    /// Log a check refused at `now` by `blocked_by` as `stalled head not ready`, at most once per
+    /// [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`]. `newest_number` is `None` while no
+    /// consensus header is known, and the line then leaves it out.
+    fn log_not_ready(
+        &mut self,
+        now: tokio::time::Instant,
+        blocked_by: StalledHeadBlocker,
+        unchanged_for: Duration,
+        newest_number: Option<u64>,
+        replayed_number: u64,
+        gossiped_number: u64,
+    ) {
+        if !rate_limit_due(
+            &mut self.not_ready_logged,
+            now,
+            REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL,
+        ) {
+            return;
+        }
+        info!(
+            target: "subscriber",
+            unchanged_for_ms = u64::try_from(unchanged_for.as_millis()).unwrap_or(u64::MAX),
+            stall_needed_ms = u64::try_from(self.stall_needed.as_millis()).unwrap_or(u64::MAX),
+            newest_number,
+            replayed_number,
+            gossiped_number,
+            blocked_by = blocked_by.as_str(),
+            "stalled head not ready"
+        );
+    }
 }
 
 /// A gap request sent for a replay stuck below a moving head
@@ -1603,10 +1635,13 @@ impl StuckReplayRequest {
     }
 }
 
-/// The first part of the stalled-head rule a catching-up CVV failed ([`stalled_head_ready`],
+/// The first part of the stalled-head rule a catching-up CVV failed
+/// ([`Subscriber::rejoin_on_stalled_head`], [`stalled_head_ready`],
 /// [`stalled_head_epoch_is_open`]): the `blocked_by` field of the `stalled head not ready` line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StalledHeadBlocker {
+    /// The node knows no consensus header yet, so there is no head to watch stall.
+    NoHead,
     /// The newest known header is younger than [`tn_types::REJOIN_STALLED_HEAD_AFTER`]: the
     /// committee may still commit, and the usual rule ([`rejoin_ready`]) handles a fresh head.
     HeadAge,
@@ -1626,6 +1661,7 @@ impl StalledHeadBlocker {
     /// The `blocked_by` value of the `stalled head not ready` line.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::NoHead => "no_head",
             Self::HeadAge => "head_age",
             Self::Stall => "stall",
             Self::Frontier => "frontier",
@@ -2984,6 +3020,7 @@ mod tests {
             );
             assert_eq!(ready(EPOCH, 8, decades, stalled, 10), Err(StalledHeadBlocker::Frontier));
             let names = [
+                StalledHeadBlocker::NoHead,
                 StalledHeadBlocker::HeadAge,
                 StalledHeadBlocker::Stall,
                 StalledHeadBlocker::Frontier,
@@ -2991,7 +3028,7 @@ mod tests {
                 StalledHeadBlocker::Epoch,
             ]
             .map(StalledHeadBlocker::as_str);
-            assert_eq!(names, ["head_age", "stall", "frontier", "replay", "epoch"]);
+            assert_eq!(names, ["no_head", "head_age", "stall", "frontier", "replay", "epoch"]);
 
             let fresh = Duration::from_millis(500);
             assert_eq!(ready(EPOCH, 9, fresh, stalled, 9), Err(StalledHeadBlocker::HeadAge));
@@ -3640,6 +3677,47 @@ mod tests {
             assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
             assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 38, frontier, 33)));
             assert!(bus.is_cvv_inactive());
+        }
+
+        /// A node that knows no consensus header has no head to watch stall: the check refuses,
+        /// and `stalled head not ready` names `no_head`, with no newest number, at most once per
+        /// 30 s. Nothing else changes: a frontier ahead of the replay is not re-requested.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_check_without_a_known_header_logs_no_head() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            assert!(bus.last_consensus_header().borrow().is_none(), "no header is known");
+            bus.last_published_consensus_num_hash().send_replace((
+                fixture.committee().epoch(),
+                5,
+                Default::default(),
+            ));
+            let rx_gap = bus.consensus_gap_request().subscribe();
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let mut check = StalledHeadCheck::new(
+                None,
+                3,
+                tokio::time::Instant::now(),
+                REJOIN_STALLED_HEAD_AFTER,
+            );
+
+            for _ in 0..2 {
+                tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+                assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            }
+            assert!(!rx_gap.has_changed().unwrap(), "no head, no re-request");
+            assert!(bus.is_cvv_inactive());
+            let refused = lines.with_message("stalled head not ready");
+            let ms = |duration: Duration| duration.as_millis().to_string();
+            let expected = BTreeMap::from([
+                ("unchanged_for_ms".to_string(), ms(REJOIN_STALLED_HEAD_CHECK_INTERVAL)),
+                ("stall_needed_ms".to_string(), ms(REJOIN_STALLED_HEAD_AFTER)),
+                ("replayed_number".to_string(), "3".to_string()),
+                ("gossiped_number".to_string(), "5".to_string()),
+                ("blocked_by".to_string(), "no_head".to_string()),
+            ]);
+            assert_eq!(refused, vec![expected], "one line per 30 s");
         }
 
         /// A replay stuck below a frontier that keeps moving asks for the gap once it has stayed
