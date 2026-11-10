@@ -12,7 +12,7 @@ use std::time::Instant;
 use tn_reth::RethEnv;
 use tn_types::{ConsensusOutput, Recovered, TaskSpawner, TransactionSigned};
 use tokio::sync::oneshot;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// The pending result of one consensus output's background signer recovery.
 ///
@@ -56,13 +56,22 @@ impl RecoveryHandle {
     /// Take the job's result, blocking the calling thread until the job has finished.
     ///
     /// Call it from a blocking context only (the execution task runs on one). If the job ended
-    /// without a result (it panicked), the signers are recovered inline from the same bytes and
-    /// `tn_engine_recovery_fallback_total` is incremented. This never fails: an error would halt
-    /// the engine, and the inline recovery yields the same signers and so the same blocks.
+    /// without a result (it panicked), the signers are recovered inline from the same bytes,
+    /// `tn_engine_recovery_fallback_total` is incremented and a warning names the output. This
+    /// never fails: an error would halt the engine, and the inline recovery yields the same
+    /// signers and so the same blocks.
     pub(crate) fn wait(self, output: &ConsensusOutput, metrics: &EngineMetrics) -> OutputSigners {
         match self.rx.blocking_recv() {
             Ok(signers) => signers,
             Err(_) => {
+                // the task manager drops a panicked non-critical job without logging it, so this
+                // line attributes the fallback counter to an output; a deterministic panic will
+                // recur in the inline recovery below, this time on the execution thread
+                warn!(
+                    target: "engine",
+                    consensus_number = output.number(),
+                    "signer recovery job ended without a result - recovering inline"
+                );
                 metrics.recovery_fallback_total.increment(1);
                 recover_signers(output, metrics)
             }
@@ -130,8 +139,18 @@ mod tests {
         debugging::{DebugValue, DebuggingRecorder},
         CompositeKey,
     };
+    use std::{
+        fmt,
+        sync::{Arc, Mutex, PoisonError},
+    };
     use tn_reth::test_utils::batches;
     use tn_types::{test_chain_spec_arc, CertifiedBatch};
+    use tracing::{
+        field::{Field, Visit},
+        span,
+        subscriber::Interest,
+        Event, Level, Metadata, Subscriber,
+    };
 
     /// An output whose single certificate carries three batches of signed transactions, the
     /// second also holding bytes that do not decode.
@@ -180,6 +199,61 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// One `engine` warning: its message and consensus number.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Warning {
+        message: String,
+        consensus_number: Option<u64>,
+    }
+
+    impl Visit for Warning {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "consensus_number" {
+                self.consensus_number = Some(value);
+            }
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Keeps every `engine` warning. Installed for one closure with
+    /// `tracing::subscriber::with_default`, so it sees the calling thread only and leaves the
+    /// global subscriber alone.
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<Mutex<Vec<Warning>>>);
+
+    impl WarnCapture {
+        /// The warnings captured so far, oldest first, emptying the store.
+        fn take(&self) -> Vec<Warning> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    impl Subscriber for WarnCapture {
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            // ask per event: the callsite cache is process-wide
+            Interest::sometimes()
+        }
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "engine" && *metadata.level() == Level::WARN
+        }
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut warning = Warning::default();
+            event.record(&mut warning);
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(warning);
+        }
+        fn enter(&self, _span: &span::Id) {}
+        fn exit(&self, _span: &span::Id) {}
+    }
+
     /// The number of `tn_engine_recover_seconds` samples recorded.
     fn recover_samples(recorded: &Recorded) -> usize {
         recorded
@@ -221,21 +295,32 @@ mod tests {
     }
 
     /// A job that ends without a result (its sender dropped, as when it panics) falls back to
-    /// recovering inline from the same bytes: the same signers, so the same blocks, and the
-    /// fallback counter reads one. Never an error.
+    /// recovering inline from the same bytes: the same signers, so the same blocks, the fallback
+    /// counter reads one and one warning names the output. Never an error.
     #[test]
     fn test_dropped_job_falls_back_to_inline_recovery() {
         let output = output_with_transactions();
+        let capture = WarnCapture::default();
         let ((signers, expected), recorded) = with_local_metrics(|metrics| {
             let (tx, rx) = oneshot::channel::<OutputSigners>();
             drop(tx);
-            (RecoveryHandle { rx }.wait(&output, metrics), RethEnv::recover_output_signers(&output))
+            let signers = tracing::subscriber::with_default(capture.clone(), || {
+                RecoveryHandle { rx }.wait(&output, metrics)
+            });
+            (signers, RethEnv::recover_output_signers(&output))
         });
 
         assert!(signers.iter().any(|batch| !batch.is_empty()), "test setup: signed transactions");
         assert_eq!(signers, expected);
         assert_eq!(fallbacks(&recorded), 1);
         assert_eq!(recover_samples(&recorded), 1, "the inline recovery is timed too");
+        assert_eq!(
+            capture.take(),
+            [Warning {
+                message: "signer recovery job ended without a result - recovering inline".into(),
+                consensus_number: Some(output.number()),
+            }]
+        );
     }
 
     /// An output dropped from the queue drops its handle; the job's send then fails and is
