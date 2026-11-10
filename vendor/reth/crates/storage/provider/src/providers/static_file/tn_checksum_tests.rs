@@ -15,7 +15,7 @@ use reth_db::{
 };
 use reth_db_api::models::StorageSettings;
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
-use reth_nippy_jar::{NippyJar, NippyJarError, NippyJarWriter};
+use reth_nippy_jar::{ColumnResult, NippyJar, NippyJarCursor, NippyJarError, NippyJarWriter};
 use reth_primitives_traits::Account;
 use reth_static_file_types::{
     changeset_offset_record_size, ChangesetOffsetChecksumMismatch, SegmentHeader, StaticFileSegment,
@@ -558,4 +558,57 @@ fn damaged_probe_key_is_an_error_not_another_row() {
         provider.get_account_before_block(0, address(0, 0)).unwrap(),
         Some(account_changes(0)[0].clone())
     );
+}
+
+/// TN(TN-0137): the changeset point lookups refuse a compressed jar with a typed error instead of
+/// comparing its compressed bytes as keys (by those bytes, a stored change reported absent, or
+/// here, values shorter than the key, a corruption error). The block reads decompress every row and
+/// still answer.
+#[test]
+fn compressed_changeset_jar_is_refused_by_the_lookups() {
+    let (dir, _) = create_test_static_files_dir();
+    let provider = provider(dir.path(), false, 1_000);
+    write_changesets(&provider, 0..3);
+    let jars = [
+        jar_path(&provider, StaticFileSegment::AccountChangeSets, 0),
+        jar_path(&provider, StaticFileSegment::StorageChangeSets, 0),
+    ];
+    drop(provider);
+
+    // Change 3 is not its block's first, so a search over compressed bytes does not land on it.
+    let provider = provider_ro(dir.path());
+    assert_eq!(
+        provider.get_account_before_block(1, address(1, 3)).unwrap(),
+        Some(account_changes(1)[3].clone())
+    );
+    assert!(provider.get_storage_before_block(1, address(1, 0), slot(3)).unwrap().is_some());
+    drop(provider);
+
+    // The same rows written again with compression; the `.csoff` sidecars still hold the blocks.
+    for path in &jars {
+        let (header, values) = {
+            let jar = load(path);
+            let mut cursor = NippyJarCursor::new(&jar).unwrap();
+            let mut values: Vec<ColumnResult<Vec<u8>>> = Vec::new();
+            while let Some(row) = cursor.next_row().unwrap() {
+                values.push(Ok(row[0].to_vec()));
+            }
+            (jar.user_header().clone(), values)
+        };
+        let rows = values.len() as u64;
+        let mut writer = NippyJarWriter::new(NippyJar::new(1, path, header).with_lz4()).unwrap();
+        writer.append_rows(vec![values], rows).unwrap();
+        writer.commit().unwrap();
+        assert!(load(path).compressor().is_some());
+    }
+
+    let provider = provider_ro(dir.path());
+    let is_compressed_jar = |err: &ProviderError| {
+        err.downcast_other_ref::<super::CompressedChangesetJarError>().is_some()
+    };
+    let err = provider.get_account_before_block(1, address(1, 3)).unwrap_err();
+    assert!(is_compressed_jar(&err), "{err}");
+    let err = provider.get_storage_before_block(1, address(1, 0), slot(3)).unwrap_err();
+    assert!(is_compressed_jar(&err), "{err}");
+    assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
 }

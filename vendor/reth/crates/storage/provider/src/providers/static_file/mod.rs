@@ -9,6 +9,8 @@ pub use manager::checksummed_segment;
 pub use manager::StaticFileGapError;
 // TN(TN-0135): a jar without checksums in a storage-v2 datadir.
 pub use manager::UncheckedJarError;
+// TN(TN-0137): a compressed changeset jar met by a point lookup.
+pub use manager::CompressedChangesetJarError;
 // TN(TN-0124): the changeset point lookups' search, for the read timing harness (TN-0100).
 #[cfg(test)]
 pub(crate) use manager::changeset_lower_bound;

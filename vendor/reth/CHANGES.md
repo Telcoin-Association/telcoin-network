@@ -1281,3 +1281,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `damaged_block_segment_value_is_an_error` (TN-0123's, extended: the hashes of a range holding
   the damaged transaction are the checksum error, a range beside it answers). Mutation-checked:
   the error dropped again. *Upstream*: yes (upstream drops the error the same way).
+
+- **TN-0137** — The changeset point lookups refuse a compressed jar before their first raw-key
+  probe. *Kind*: fix (static-file robustness).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
+  tn_checksum_tests.rs}` (`changeset_search`, `CompressedChangesetJarError`; test),
+  `crates/storage/provider/src/providers/mod.rs`.
+  *Why*: TN-0124's search for `get_account_before_block` and `get_storage_before_block` compares
+  each probe's stored bytes with the key (`unverified_value`), which is the key only in a jar
+  without compression. Nothing checked that: a compressed changeset jar (the writer compresses
+  only headers, `create_jar`, but nothing in a jar's configuration forbids one) would steer
+  the search by compressed bytes and answer a stored change as absent, or as a corruption error
+  when the compressed value is shorter than the key. The search now returns
+  `CompressedChangesetJarError` for such a jar before it probes; the verified rerun
+  (`changeset_lookup_missed`) decompresses its rows and is not restricted. The block reads
+  (`account_block_changeset`, `storage_changeset`) decompress and are unchanged. It cannot reach
+  execution: changeset jars are written uncompressed, so no lookup sees the error. *Tests*:
+  `compressed_changeset_jar_is_refused_by_the_lookups` (both changeset jars rewritten with LZ4 and
+  the same rows: the lookups return the typed error, the block read answers). Mutation-checked: no
+  refusal (the account lookup then reports a corrupted changeset). *Upstream*: no (TN-0124's
+  search is TN's).

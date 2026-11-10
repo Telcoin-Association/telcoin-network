@@ -541,6 +541,27 @@ impl core::fmt::Display for UncheckedJarError {
 
 impl core::error::Error for UncheckedJarError {}
 
+/// TN(TN-0137): a changeset jar with compression, met by a point lookup: its search compares the
+/// stored bytes as keys, and TN writes changesets uncompressed.
+#[derive(Debug)]
+pub struct CompressedChangesetJarError {
+    /// The jar's data file.
+    pub path: PathBuf,
+}
+
+impl core::fmt::Display for CompressedChangesetJarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "changeset static file {} is compressed, but its lookups need the stored keys \
+             uncompressed",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for CompressedChangesetJarError {}
+
 /// TN(TN-0122): the segments whose new jars carry checksums when the provider's checksums are on
 /// (storage v2). The changesets are mandatory: every historical state read below the tip resolves
 /// through them, TN's pinned committee and epoch reads included. The others are checked too, as
@@ -2939,6 +2960,13 @@ fn changeset_search(
     key: &[u8],
     verify: bool,
 ) -> ProviderResult<u64> {
+    // TN(TN-0137): the raw probes read the stored bytes as the key, which holds only in a jar
+    // without compression.
+    if !verify && cursor.jar().compressor().is_some() {
+        return Err(ProviderError::other(CompressedChangesetJarError {
+            path: cursor.jar().data_path().to_path_buf(),
+        }))
+    }
     let (mut low, mut high) = (range.start, range.end);
     while low < high {
         let mid = low + (high - low) / 2;
