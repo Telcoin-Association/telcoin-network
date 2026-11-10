@@ -118,6 +118,9 @@ use page_size as _;
 /// the global metrics recorder is installed, i.e. the node runs with `--metrics`).
 #[cfg(feature = "mdbx")]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
+    if reth_config.db_gap_fill() > 0 {
+        eyre::bail!("--db.gap-fill is not supported by the MDBX backend");
+    }
     check_backend(path)?;
     let db_args = &reth_config.0.db;
     let page_size = db_args.page_size.unwrap_or(default_page_size() as usize);
@@ -134,7 +137,8 @@ pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<Ret
 #[cfg(not(feature = "mdbx"))]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
     let db_args = &reth_config.0.db;
-    open_tn_lmdb(path, db_args, db_args.database_args().client_version().clone())
+    let version = db_args.database_args().client_version().clone();
+    open_tn_lmdb_with(path, db_args, reth_config.db_gap_fill(), version)
 }
 
 #[cfg(all(test, not(feature = "mdbx")))]
@@ -146,16 +150,35 @@ thread_local! {
     pub(crate) static TEST_NO_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`open_rw`] of the tn-lmdb build, with the client version to record.
-#[cfg(not(feature = "mdbx"))]
+/// [`open_rw`] of the tn-lmdb build, with the client version to record and gap fill off: the
+/// tests' open.
+#[cfg(all(test, not(feature = "mdbx")))]
 fn open_tn_lmdb(
     path: &Path,
     db_args: &DatabaseArgs,
     client_version: reth_db::ClientVersion,
 ) -> eyre::Result<RethDb> {
-    use tn_lmdb_reth::{TnLmdbEnv, TnLmdbEnvKind};
+    open_tn_lmdb_with(path, db_args, 0, client_version)
+}
 
-    let args = tn_lmdb_args(db_args)?;
+/// [`open_tn_lmdb`] with the engine's gap fill at `gap_fill` pages (`--db.gap-fill`, 0: off,
+/// [`RethConfig::db_gap_fill`]). More than the engine's `MAX_GAP_FILL` is refused here, naming the
+/// flag.
+#[cfg(not(feature = "mdbx"))]
+fn open_tn_lmdb_with(
+    path: &Path,
+    db_args: &DatabaseArgs,
+    gap_fill: u32,
+    client_version: reth_db::ClientVersion,
+) -> eyre::Result<RethDb> {
+    use tn_lmdb_reth::{TnLmdbEnv, TnLmdbEnvKind, MAX_GAP_FILL};
+
+    if gap_fill > MAX_GAP_FILL {
+        eyre::bail!(
+            "--db.gap-fill {gap_fill} is over the tn-lmdb backend's maximum of {MAX_GAP_FILL} pages"
+        );
+    }
+    let args = tn_lmdb_args(db_args)?.with_gap_fill(gap_fill);
     #[cfg(test)]
     let args = if TEST_NO_SYNC.get() {
         args.with_sync_mode(tn_lmdb_reth::SyncMode::NoSync)

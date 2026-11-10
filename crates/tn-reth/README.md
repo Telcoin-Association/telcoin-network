@@ -473,6 +473,13 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   two in 4 KiB..=64 KiB). `--db.growth-step` is the largest growth step (unset, the engine's 1
   GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
   gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
+  `--db.gap-fill <PAGES>` (TN's own flag, `RethCommand::db_gap_fill`, carried as
+  `RethConfig::db_gap_fill`; unset or 0: off, at most the engine's `MAX_GAP_FILL`, 64, else
+  refused naming the flag) is the engine's `EnvOptions::gap_fill`: a durable commit first rewrites
+  each gap of at most that many clean pages between two runs of its dirty pages with the bytes they
+  hold, so the disk takes fewer, larger writes for more bytes (`crates/tn-lmdb/README.md`, "Gap
+  fill"). For disks that cap I/Os per second (cloud block storage); not for local NVMe. The MDBX
+  build refuses it.
   `--db.sync-mode durable` (the default) is durable commits. `--db.sync-mode safe-no-sync` is the
   engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
   MiB): a commit returns before it is durable, and the first commit a second after the last durable

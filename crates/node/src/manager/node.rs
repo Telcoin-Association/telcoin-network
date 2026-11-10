@@ -2545,6 +2545,7 @@ mod tests {
                 rpc: RpcServerArgs { http_port: http_port.unwrap_or(rpc.http_port), ..rpc },
                 txpool: Default::default(),
                 db: Default::default(),
+                db_gap_fill: None,
             },
             None,
             datadir,
