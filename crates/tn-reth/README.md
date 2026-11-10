@@ -644,6 +644,26 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 - **Logs:** `new reth datadir: storage layout` or `reth datadir: storage layout` at each start, with
   the layout; an existing datadir in the other layout logs the warning `this reth datadir keeps its
   storage layout` with `layout` and `new_datadirs` instead.
+- **Static-file checksums (v2).** A v2 datadir's new static files carry a CRC-32 on every value,
+  on every `.csoff` record (which block owns which change-set rows) and on each `.conf` (vendor/reth
+  CHANGES.md TN-0120..0124; the v1 tables are covered by tn-lmdb's page CRCs, and v1 static files
+  keep upstream's format byte for byte). Every read verifies before it decodes, and the change-set
+  lookups behind the pinned committee and epoch reads verify the row they return. A mismatch is an
+  error, never a value: `static file <path> is damaged: the value at row <r>, column <c> fails
+  its checksum`, `changeset offsets <path> are damaged: record <i> fails its checksum`,
+  `static file configuration <path> is damaged: it fails its checksum`, or
+  `changeset static file is corrupted` (a `.csoff` range past its rows, or a sidecar the startup
+  heal will not cut). It reaches the epoch reads as a node-local provider fault
+  (`StateReadError::Provider`): retried briefly, then the node stops instead of using any other
+  value (`damaged_v2_changeset_fails_pinned_reads_closed`). RPC reads of the damaged rows fail;
+  others answer. Startup refuses a `.csoff` whose committed record fails its checksum rather than
+  cutting it. **Operator response:** the file is damaged on this node only (disk or memory fault,
+  or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
+  wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
+  the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
+  one damaged file usually means more. A datadir v2 wrote before these checksums keeps its
+  unchecked files until each one rotates (500k blocks); `db reset-execution` gives every file
+  checksums at once.
 
 ### Upgrading a testnet node
 

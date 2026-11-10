@@ -480,6 +480,50 @@ async fn registry_reads_at_past_headers_match_across_storage_layouts() -> eyre::
     Ok(())
 }
 
+/// A damaged storage-v2 changeset fails the consensus-critical pinned reads closed. Every value of
+/// the storage changeset file is changed (vendored TN-0120: each carries a CRC-32): the committee
+/// and epoch reads pinned below the epoch close, which resolve the registry's rewritten slots
+/// through that file, are `StateReadError::Provider` naming the checksum, and a plain storage read
+/// below a rewrite errors too, never answering with another block's value. The operator response
+/// is in the README's storage section.
+#[tokio::test]
+async fn damaged_v2_changeset_fails_pinned_reads_closed() -> eyre::Result<()> {
+    use crate::error::StateReadError;
+    use reth_provider::{StaticFileProviderFactory as _, StaticFileSegment};
+    use std::io::Write as _;
+
+    let plan = Plan::new();
+    let chain = Chain::build(&plan, StorageSettings::v2(), TIP)?;
+    let env = &chain.env;
+    let genesis = header(env, 0)?;
+    assert_eq!(env.epoch_state_at_header(&genesis)?.validators.len(), 5);
+
+    let static_files = env.blockchain_provider().static_file_provider();
+    let segment = StaticFileSegment::StorageChangeSets;
+    let path =
+        static_files.directory().join(segment.filename(&static_files.find_fixed_range(segment, 0)));
+    let damaged: Vec<u8> = std::fs::read(&path)?.into_iter().map(|byte| byte ^ 0x01).collect();
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.write_all(&damaged)?;
+    file.sync_all()?;
+
+    let checksum = |err: &dyn std::fmt::Display| err.to_string().contains("fails its checksum");
+    for number in 0..3 {
+        let header = header(env, number)?;
+        match env.epoch_state_at_header(&header) {
+            Err(err @ StateReadError::Provider(_)) => assert!(checksum(&err), "{number}: {err}"),
+            other => panic!("epoch state at {number}: {other:?}"),
+        }
+        match env.get_current_epoch_info_at_header(&header) {
+            Err(err @ StateReadError::Provider(_)) => assert!(checksum(&err), "{number}: {err}"),
+            other => panic!("epoch info at {number}: {other:?}"),
+        }
+    }
+    let err = env.state_by_block_hash(genesis.hash())?.storage(STORE, word(1)).unwrap_err();
+    assert!(checksum(&err), "{err}");
+    Ok(())
+}
+
 /// `eth_getStorageAt`, `eth_getProof`, `eth_getBalance` at the tip and at past blocks, and
 /// `eth_getTransactionByHash` and `eth_getTransactionReceipt`, answer the same in both layouts.
 #[tokio::test(flavor = "multi_thread")]
