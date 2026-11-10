@@ -908,6 +908,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   and a limit of two: the error names blocks 100 to 101), `test_range_scan_across_windows`
   (the error names blocks 0 to 1,199). *Upstream*: n/a (upstream commit).
 
+- **TN-0081** — Backport 8f5efd2b3: `TrieWalker::new` returns its first read's error.
+  *Kind*: backport (adapted).
+  *Files*: `crates/trie/trie/src/walker.rs` (`state_trie`, `storage_trie` and `new` return
+  `Result`; a TN-written test module holding only upstream's two new tests, since upstream's
+  module postdates v1.11.4), `crates/trie/trie/src/trie.rs`, `crates/trie/trie/src/proof/mod.rs`
+  and `crates/trie/trie/src/node_iter.rs` (callers propagate or unwrap),
+  `crates/trie/db/tests/walker.rs` and `crates/trie/sparse/src/parallel.rs` (test callers unwrap).
+  *Why*: the walker's constructor seeked the trie root with `unwrap()`, so an MDBX read error on
+  that first read (a reader slot the 5-minute timeout killed, a damaged page) panicked the
+  engine's blocking thread inside the state root computation instead of returning an error the
+  engine can classify; reached once per state root and per account storage root, and from the
+  snapshot import (review R15). The error now propagates as `DatabaseError`.
+  *Execution path*: yes (`crates/trie`), and the change can not alter a root: every root the old
+  code computed, the new code computes identically; the only new behaviour is an error where the
+  old code panicked. No manifest or feature change (`graph.py diff` clean).
+  *Tests*: upstream's `state_trie_initial_read_timeout_returns_error` and
+  `storage_trie_initial_read_timeout_returns_error`; the trie crates' suites.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

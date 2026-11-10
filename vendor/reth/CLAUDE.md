@@ -58,6 +58,7 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0073 to TN-0075 |
 | RPC and CLI fixes backported after v1.11.4 (review R8, R9, R13, R22, R24, R26) | TN-0059, TN-0060, TN-0062 to TN-0072 |
 | static files and nippy-jar backports | TN-0023 |
+| trie backports (review R15) | TN-0081 |
 
 CHANGES.md is ordered by section, then by id, newest last within a section.
 

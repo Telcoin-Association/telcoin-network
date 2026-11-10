@@ -87,6 +87,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 0a1d3e761 | TN-0074 | the validation job channel holds two jobs per worker instead of one (review R21); applied in `build_with_tasks`, the vendored path | upstream test, adapted |
 | fe01db183 | TN-0075 | validation submitters send into the bounded channel without a producer mutex; a cancelled submit no longer leaks `inflight_validation_jobs` (review R21); hand port, no `spawn` in this copy | upstream tests |
 | 43a7452b0 | TN-0076 | the `eth_getLogs` retry range in `QueryExceedsMaxResults` ends before the block that overflowed the limit (TN-0058 follow-up) | upstream test; TN-0058 test asserts the new bound |
+| 8f5efd2b3 | TN-0081 | `TrieWalker::new` returns its first read's error instead of panicking the state root computation (review R15); roots unchanged | upstream tests; trie suites |
 
 ## Open
 
