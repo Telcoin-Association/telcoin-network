@@ -133,6 +133,10 @@ enum WakeSource {
     Ack,
     /// The fill delay armed by a transaction arriving at an idle builder
     /// ([`BATCH_WAKE_FILL_DELAY`]).
+    ///
+    /// A tick or canonical update that lands inside the fill-delay window builds at once under
+    /// its own label and spends the armed delay, so the `wake=arrival` share of built batches is
+    /// a lower bound on the builds an arrival prompted, not the exact share.
     Arrival,
 }
 
