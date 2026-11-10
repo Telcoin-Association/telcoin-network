@@ -502,6 +502,15 @@ impl ModeTransitionReason {
 
 /// Count a node mode change in `tn_node_mode_transitions_total{to, reason}`.
 ///
+/// Only the in-epoch demotions and rejoins listed in [`ModeTransitionReason`] call this. The role
+/// the node chooses from its committee and epoch records is written to the mode watch without it,
+/// at two sites in the node crate: `identify_node_mode` at each epoch start (the `send_modify`
+/// after `node mode identified`) and `seed_node_mode_on_startup` at node startup (the
+/// `send_if_modified` on a changed mode). Those are where an observer joins the committee or a
+/// validator leaves it at an epoch boundary, so the series is not a complete record of mode
+/// changes. The `tn_node_mode` gauge follows the watch and shows the current mode whichever site
+/// set it.
+///
 /// `previous` is the mode the watch held before the change, the value `send_replace` returns. A
 /// change to the mode the node already holds is not counted, so two tasks that decide on the same
 /// demotion at once count it once. Mode changes are rare, so the handle is resolved per call.
