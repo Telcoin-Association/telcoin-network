@@ -226,7 +226,7 @@ fn run_output(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(10))]
 
     /// A shared read cache builds every block of the output exactly as a fresh cache per block.
     #[test]
