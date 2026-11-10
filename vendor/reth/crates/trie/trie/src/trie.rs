@@ -18,6 +18,7 @@ use alloy_rlp::{BufMut, Encodable};
 use alloy_trie::proof::AddedRemovedKeys;
 use reth_execution_errors::{StateRootError, StorageRootError};
 use reth_primitives_traits::Account;
+use std::sync::Arc;
 use tracing::{debug, instrument, trace, Span};
 
 /// The default updates after which root algorithms should return intermediate progress rather than
@@ -26,6 +27,16 @@ const DEFAULT_INTERMEDIATE_THRESHOLD: u64 = 100_000;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::{StateRootMetrics, TrieRootMetrics};
+
+/// TN(TN-0139): storage roots computed outside the account walk (TN computes those of the accounts
+/// with changed storage on other threads while the walk runs). See
+/// [`StateRoot::with_storage_roots`].
+pub trait StorageRootSource: Send + Sync + core::fmt::Debug {
+    /// The storage root, hashed entries walked and storage trie updates of `hashed_address`,
+    /// exactly as [`StorageRoot::root_with_updates`] returns them over this state root's cursors
+    /// and prefix set, or `None` to have the state root compute them itself.
+    fn storage_root(&self, hashed_address: B256) -> Option<(B256, usize, StorageTrieUpdates)>;
+}
 
 /// `StateRoot` is used to compute the root node of a state trie.
 #[derive(Debug)]
@@ -40,6 +51,8 @@ pub struct StateRoot<T, H> {
     previous_state: Option<IntermediateStateRootState>,
     /// The number of updates after which the intermediate progress should be returned.
     threshold: u64,
+    /// TN(TN-0139): storage roots to take instead of computing them.
+    storage_roots: Option<Arc<dyn StorageRootSource>>,
     #[cfg(feature = "metrics")]
     /// State root metrics.
     metrics: StateRootMetrics,
@@ -58,6 +71,7 @@ impl<T, H> StateRoot<T, H> {
             prefix_sets: TriePrefixSets::default(),
             previous_state: None,
             threshold: DEFAULT_INTERMEDIATE_THRESHOLD,
+            storage_roots: None,
             #[cfg(feature = "metrics")]
             metrics: StateRootMetrics::default(),
         }
@@ -87,6 +101,13 @@ impl<T, H> StateRoot<T, H> {
         self
     }
 
+    /// TN(TN-0139): take each account's storage root from `source` when it has one, and compute
+    /// it as before otherwise. A resumed in-progress storage root is always computed here.
+    pub fn with_storage_roots(mut self, source: Arc<dyn StorageRootSource>) -> Self {
+        self.storage_roots = Some(source);
+        self
+    }
+
     /// Set the hashed cursor factory.
     pub fn with_hashed_cursor_factory<HF>(self, hashed_cursor_factory: HF) -> StateRoot<T, HF> {
         StateRoot {
@@ -95,6 +116,7 @@ impl<T, H> StateRoot<T, H> {
             prefix_sets: self.prefix_sets,
             threshold: self.threshold,
             previous_state: self.previous_state,
+            storage_roots: self.storage_roots,
             #[cfg(feature = "metrics")]
             metrics: self.metrics,
         }
@@ -108,6 +130,7 @@ impl<T, H> StateRoot<T, H> {
             prefix_sets: self.prefix_sets,
             threshold: self.threshold,
             previous_state: self.previous_state,
+            storage_roots: self.storage_roots,
             #[cfg(feature = "metrics")]
             metrics: self.metrics,
         }
@@ -284,26 +307,35 @@ where
                             Some(self.trie_cursor_factory.storage_trie_cursor(hashed_address)?);
                     }
 
-                    let storage_result = StorageRoot::<T, H>::calculate_with_cursors(
-                        StorageRootCalculation {
-                            hashed_address,
-                            prefix_set: self
-                                .prefix_sets
-                                .storage_prefix_sets
-                                .get(&hashed_address)
-                                .cloned()
-                                .unwrap_or_default(),
-                            previous_state: None,
-                            threshold: remaining_threshold,
-                            retain_updates,
-                        },
-                        storage_trie_cursor.as_mut().expect("storage trie cursor is initialized"),
-                        hashed_storage_cursor
-                            .as_mut()
-                            .expect("hashed storage cursor is initialized"),
-                        #[cfg(feature = "metrics")]
-                        &self.metrics.storage_trie,
-                    )?;
+                    // TN(TN-0139): a storage root computed elsewhere, when the source has it.
+                    let precomputed =
+                        self.storage_roots.as_ref().and_then(|s| s.storage_root(hashed_address));
+                    let storage_result = if let Some((root, walked, updates)) = precomputed {
+                        StorageRootProgress::Complete(root, walked, updates)
+                    } else {
+                        StorageRoot::<T, H>::calculate_with_cursors(
+                            StorageRootCalculation {
+                                hashed_address,
+                                prefix_set: self
+                                    .prefix_sets
+                                    .storage_prefix_sets
+                                    .get(&hashed_address)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                previous_state: None,
+                                threshold: remaining_threshold,
+                                retain_updates,
+                            },
+                            storage_trie_cursor
+                                .as_mut()
+                                .expect("storage trie cursor is initialized"),
+                            hashed_storage_cursor
+                                .as_mut()
+                                .expect("hashed storage cursor is initialized"),
+                            #[cfg(feature = "metrics")]
+                            &self.metrics.storage_trie,
+                        )?
+                    };
                     if let Some(storage_state) = storage_ctx.process_storage_root_result(
                         storage_result,
                         hashed_address,

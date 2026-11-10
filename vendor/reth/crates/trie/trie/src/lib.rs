@@ -43,7 +43,7 @@ pub mod changesets;
 
 /// The implementation of the Merkle Patricia Trie.
 mod trie;
-pub use trie::{StateRoot, StorageRoot, TrieType};
+pub use trie::{StateRoot, StorageRoot, StorageRootSource, TrieType};
 
 /// Utilities for state root checkpoint progress.
 mod progress;
