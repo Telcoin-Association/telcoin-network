@@ -216,3 +216,21 @@ async fn replay_checkpoint_does_not_promote_to_an_unreplayed_pack_tip() -> eyre:
     manager.consensus_chain.clone().close().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn replay_checkpoint_refuses_missing_output_of_another_epoch() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, _, _) = imported_manager(&temp, 2, 2).await?;
+    // Execution stopped inside epoch 0, but the node enters epoch 1: the missing epoch-0 output
+    // must be refused, not replayed under the wrong committee and not skipped.
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let err = manager
+        .replay_missed_consensus(fixture.committee().advance_epoch_for_test(1), &to_engine)
+        .await
+        .err()
+        .expect("missing output of epoch 0 must be refused on entry to epoch 1");
+    assert!(err.to_string().contains("Crossed epoch boundary"), "unexpected error: {err}");
+    assert!(engine_rx.try_recv().is_err(), "nothing may reach the engine");
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
