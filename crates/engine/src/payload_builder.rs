@@ -40,9 +40,12 @@ use tracing::{debug, error, field, info, info_span, trace, warn};
 /// the builder. The skipped empty path does not log it.
 ///
 /// This entry point recovers the output's signers inline, on the calling thread, before the
-/// first block. The engine's run loop instead starts that recovery on a background job when the
-/// output is queued and executes through `execute_consensus_output_with_signers`; both build the
-/// same blocks.
+/// first block. No production code calls it: the engine's run loop starts that recovery on a
+/// background job when the output is queued and executes through
+/// `execute_consensus_output_with_signers`, and production recovers inline only through the
+/// fallback in `RecoveryHandle::wait`. It is kept as the differential oracle for the recovered
+/// path (`test_queued_recovery_matches_inline_recovery` pins that both build the same blocks);
+/// every caller is a test.
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
