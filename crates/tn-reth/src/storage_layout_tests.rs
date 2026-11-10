@@ -524,6 +524,79 @@ async fn damaged_v2_changeset_fails_pinned_reads_closed() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The format version of each static-file jar in `env`'s datadir, by segment: the first field of a
+/// jar's configuration (`<jar>.conf`), a `u64` LE (`NippyJar::decode_config`). Version 1 is
+/// upstream's format, version 2 the checksummed one (TN-0120).
+fn jar_versions(
+    env: &RethEnv,
+) -> eyre::Result<BTreeMap<reth_provider::StaticFileSegment, Vec<u64>>> {
+    use reth_provider::{StaticFileProviderFactory as _, StaticFileSegment};
+
+    let mut versions = BTreeMap::<_, Vec<u64>>::new();
+    for entry in std::fs::read_dir(env.blockchain_provider().static_file_provider().directory())? {
+        let path = entry?.path();
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned());
+        // the data file's name; its configuration, offsets and sidecar files have extensions
+        let Some((segment, _)) = name.as_deref().and_then(StaticFileSegment::parse_filename) else {
+            continue;
+        };
+        let conf = std::fs::read(path.with_extension("conf"))?;
+        let version = conf.get(..8).ok_or_else(|| eyre::eyre!("{} is short", path.display()))?;
+        versions.entry(segment).or_default().push(u64::from_le_bytes(version.try_into()?));
+    }
+    Ok(versions)
+}
+
+/// A new datadir writes every static-file jar in its layout's format: version 1 in storage v1, for
+/// the segments it keeps in static files (headers, transactions, receipts), and version 2
+/// (checksummed) in storage v2, for every segment: those, senders and both changesets. Checked
+/// after genesis and after blocks persisted into every segment. Storage v2 also refuses a
+/// version-1 jar of a checksummed segment at load (TN-0135); this reads the files themselves.
+#[tokio::test]
+async fn new_datadirs_write_every_jar_in_their_layout_format() -> eyre::Result<()> {
+    use reth_provider::{StaticFileProviderFactory as _, StaticFileSegment};
+
+    let plan = Plan::new();
+    for settings in layouts() {
+        let (version, segments) = if settings.is_v2() {
+            (2, StaticFileSegment::iter().collect::<Vec<_>>())
+        } else {
+            (
+                1,
+                vec![
+                    StaticFileSegment::Headers,
+                    StaticFileSegment::Transactions,
+                    StaticFileSegment::Receipts,
+                ],
+            )
+        };
+        let tasks = TaskManager::new("storage layout jar formats");
+        let datadir = Datadir::new(plan.chain.clone(), settings)?;
+        let env = datadir.open(&tasks, settings)?;
+        let static_files = env.blockchain_provider().static_file_provider();
+        for (when, tip) in [("genesis", 0), ("blocks", TIP)] {
+            if tip > 0 {
+                plan.execute(&env, 1, tip)?;
+            }
+            let versions = jar_versions(&env)?;
+            let label = format!("{} after {when}", name(settings));
+            assert_eq!(versions.keys().copied().collect::<Vec<_>>(), segments, "{label}");
+            for (segment, found) in versions {
+                assert!(
+                    found.iter().all(|found| *found == version),
+                    "{label}: {segment} {found:?}"
+                );
+                assert_eq!(
+                    static_files.get_highest_static_file_block(segment),
+                    Some(tip),
+                    "{label}: {segment}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `eth_getStorageAt`, `eth_getProof`, `eth_getBalance` at the tip and at past blocks, and
 /// `eth_getTransactionByHash` and `eth_getTransactionReceipt`, answer the same in both layouts.
 #[tokio::test(flavor = "multi_thread")]
