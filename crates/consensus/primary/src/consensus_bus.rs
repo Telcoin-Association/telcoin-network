@@ -245,8 +245,9 @@ struct GapState<T> {
     /// message, so the item cap also caps the entries.
     authors: std::collections::HashMap<GapAuthor, usize>,
     /// The newest message of each author kept apart from the queue in this gap. The next consumer
-    /// gets them on subscribe, after the queued ones. The map is sorted by author, so the delivery
-    /// order does not depend on a hash: by rank, then by author.
+    /// gets them on subscribe, after the queued ones, once the ones that the last consumer left
+    /// queued have gone through the same rule. The map is sorted by author, so the delivery order
+    /// does not depend on a hash: by rank, then by author.
     newest: std::collections::BTreeMap<GapAuthor, GapNewest<T>>,
     /// Bytes of the newest messages kept in this gap.
     newest_bytes: usize,
@@ -404,31 +405,45 @@ impl<T> GapHold<T> {
     /// Start the turn of a new consumer.
     ///
     /// Discard the queued messages that the policy does not hold: the requests, errors and
-    /// streams that the previous consumer left. Put the held ones back in order, then queue the
-    /// kept newest messages by rank, mark the consumer present and reset the gap counters. Write
-    /// one log with what the gap dropped and what this discards. A held message sent while this
-    /// runs can land ahead of the held ones and the newest ones. A message queued for the new
-    /// consumer lands after them. The consumer of `epoch` sets the epoch of the next gap. With
-    /// `None` the epoch does not change.
+    /// streams that the previous consumer left. Put the held ones back in order. A queued message
+    /// of which the policy keeps only the newest of each author goes through the same rule as the
+    /// ones kept in this gap, with the same caps and counts. Then queue the kept newest messages
+    /// by rank, mark the consumer present and reset the gap counters. So the new consumer gets
+    /// at most the newest of each author, after the held ones. Write one log with what the gap
+    /// dropped and what this discards. A held message sent while this runs can land ahead of the
+    /// held ones and the newest ones. A message queued for the new consumer lands after them.
+    /// The consumer of `epoch` sets the epoch of the next gap. With `None` the epoch does not
+    /// change.
     fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>, epoch: Option<Epoch>) {
         let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         // Use the epoch of the gap in which the messages arrived, not the epoch of the new
         // consumer, so the held messages of the last gap stay held.
         let gap_epoch = self.state.lock().epoch;
+        let mut ranked = Vec::new();
         let (kept, discarded) =
             queued.into_iter().fold((0_usize, 0_usize), |(kept, discarded), value| {
-                if (self.policy.hold)(&value, gap_epoch).is_some() {
-                    // The queue was just drained, so it has room for the held messages. Count
-                    // one that it still refuses as discarded.
-                    tx.try_send(value).map_or((kept, discarded.saturating_add(1)), |()| {
-                        (kept.saturating_add(1), discarded)
-                    })
-                } else {
-                    (kept, discarded.saturating_add(1))
+                match (self.policy.hold)(&value, gap_epoch) {
+                    Some(weight) => match weight.rank {
+                        Some(rank) => {
+                            ranked.push((weight, rank, value));
+                            (kept, discarded)
+                        }
+                        // The queue was just drained, so it has room for the held messages.
+                        // Count one that it still refuses as discarded.
+                        None => {
+                            tx.try_send(value).map_or((kept, discarded.saturating_add(1)), |()| {
+                                (kept.saturating_add(1), discarded)
+                            })
+                        }
+                    },
+                    None => (kept, discarded.saturating_add(1)),
                 }
             });
         let mut state = self.state.lock();
         let mut gap = std::mem::replace(&mut *state, GapState::with_consumer(epoch.or(gap_epoch)));
+        ranked.into_iter().for_each(|(weight, rank, value)| {
+            gap.keep_newest(weight, rank, value, &self.policy);
+        });
         // Queue the newest messages under the lock: a sender that finds the consumer present
         // waits for the lock, so its message lands after them.
         let (kept, discarded) =
@@ -540,8 +555,9 @@ impl<T> QueChannel<T> {
     /// which `policy` keeps only the newest of each author wait apart from the queue, and one that
     /// does not replace the kept message of its author also reports over budget. While a consumer
     /// holds the receiver, the channel queues every message with no extra cap. Each subscribe
-    /// discards the queued messages that `policy` does not hold, keeps the held ones in order and
-    /// queues the kept newest ones after them.
+    /// discards the queued messages that `policy` does not hold and keeps the held ones in order.
+    /// It passes the queued messages of which `policy` keeps only the newest through the same
+    /// rule as the kept ones, and queues the newest of each author after the held ones.
     pub(crate) fn new_always_subscribed_held(policy: GapPolicy<T>) -> Self {
         Self::build(CHANNEL_CAPACITY, true, Some(Arc::new(GapHold::new(policy))))
     }
@@ -2941,6 +2957,27 @@ mod tests {
 
         assert_eq!(outcome((Some(1), 3, 10)), queued, "a lower rank than the last gap's");
         assert_eq!(outcome((Some(1), 4, 15)), queued);
+    }
+
+    /// The ranked messages that a consumer leaves queued go through the rule of the kept newest
+    /// messages on the next subscribe: the next consumer gets the held ones in order, then at most
+    /// the newest of each author, within the author cap, by rank.
+    #[test]
+    fn leftover_ranked_messages_keep_only_the_newest_of_each_author() {
+        let channel = QueChannel::new_always_subscribed_held(ranked_policy());
+        let outcome = |message: Ranked| channel.try_send_outcome(message).ok();
+        let queued = Some(TrySendOutcome::Queued);
+
+        // The consumer leaves these queued.
+        let rx = channel.subscribe();
+        [(Some(5), 1, 10), (None, 1, 10), (Some(6), 1, 10), (Some(1), 2, 10), (Some(1), 3, 10)]
+            .into_iter()
+            .for_each(|message| assert_eq!(outcome(message), queued));
+        drop(rx);
+
+        let mut rx = channel.subscribe();
+        let kept: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(kept, [(None, 1, 10), (Some(1), 2, 10), (Some(6), 1, 10)]);
     }
 
     /// A newest message that a consumer subscribed after the weighing of goes back to the
