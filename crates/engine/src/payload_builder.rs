@@ -18,7 +18,7 @@ use tn_types::{
     EngineUpdate, Hash as _, SealedHeader, B256,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, field, info, info_span, warn};
+use tracing::{debug, error, field, info, info_span, trace, warn};
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -60,6 +60,14 @@ pub fn execute_consensus_output(
     let consensus_num_hash = output.num_hash();
     let batches = output.flatten_batches();
     let batch_count = batches.len();
+    // transactions handed to the block builder across every batch of the output (before any
+    // unrecoverable or invalid transaction is dropped)
+    let tx_count: usize = output
+        .batches()
+        .iter()
+        .flat_map(|cert| cert.batches.iter())
+        .map(|b| b.transactions.len())
+        .sum();
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
         consensus_number = output.number(),
@@ -71,7 +79,17 @@ pub fn execute_consensus_output(
         batches = batches.len(),
     );
     let _guard = span.enter();
-    debug!(target: "engine", ?output, "executing output");
+    // the whole output (every batch's raw transaction bytes) is a trace-only dump: at debug it
+    // was formatted on the executing thread for every output, so the debug line carries the
+    // output's shape only
+    trace!(target: "engine::dump", ?output, "executing output");
+    debug!(
+        target: "engine",
+        consensus_number = output.number(),
+        batches = batch_count,
+        txs = tx_count,
+        "executing output"
+    );
 
     // The flattened batches and the batch-digest deque share one flat index space:
     // `get_batch_digest(i)` reads the deque while the transactions come from the batch vectors, and
@@ -369,7 +387,7 @@ fn execute_payload(
     // execute
     let next_canonical_block =
         reth_env.build_block_from_batch_payload(payload, transactions, output_overlay)?;
-    debug!(target: "engine", ?next_canonical_block, "block executed");
+    trace!(target: "engine::dump", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();

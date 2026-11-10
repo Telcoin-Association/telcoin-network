@@ -36,7 +36,7 @@ use reth_revm::{
     Database, Inspector,
 };
 use tn_types::Address;
-use tracing::debug;
+use tracing::trace;
 
 /// The handler that executes TN evm types.
 ///
@@ -129,7 +129,7 @@ where
         let unused_gas = gas_limit.saturating_sub(gas_used);
         let refund_amount = unused_gas.saturating_sub(penalty_gas);
 
-        debug!(target: "engine", ?unused_gas, ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
+        trace!(target: "engine::evm", ?unused_gas, ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
 
         // return gas to caller (minus penalty)
         if refund_amount > 0 {
@@ -178,7 +178,7 @@ where
 
         // send the base fee portion to a basefee account for later processing
         // (offchain).
-        debug!(target: "engine", ?basefee, ?gas_used, "allocating basefees {}", basefee.saturating_mul(gas_used));
+        trace!(target: "engine::evm", ?basefee, ?gas_used, "allocating basefees {}", basefee.saturating_mul(gas_used));
         context
             .journal_mut()
             .load_account_mut(self.basefee_address)?
