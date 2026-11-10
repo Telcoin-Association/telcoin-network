@@ -128,12 +128,12 @@ check precedes token parsing, so a cap-denied Initial has a cap outcome without 
 Two histograms give the honest-service figures that the inbound capacity qualification
 (`docs/src/network/inbound-capacity-qualification.md`, read by `etc/quic-qualification/measure.py`)
 takes from the node. Both carry the `network` label (`primary` or `worker-{id}`), observe
-seconds, are scoped per swarm and reset on process restart. Their other label is a fixed enum.
+seconds, are scoped per swarm and reset on process restart. Their other labels are fixed enums.
 
-| Series | Label | Observation |
+| Series | Labels | Observation |
 | --- | --- | --- |
 | `tn_network_connection_established_seconds` | `direction`: `inbound`, `outbound` | The swarm's handshake time from the dial or the accept to the established event. |
-| `tn_network_outbound_request_duration_seconds` | `outcome`: `response`, `failure` | The client-side round trip of an outbound consensus request, from the send to its response or to its failure (an outbound failure or a peer disconnect). |
+| `tn_network_outbound_request_duration_seconds` | `outcome`: `response`, `failure`; `class`: `vote`, `epoch_record`, `certificate_sync`, `batch`, `gossip`, `other` | The client-side round trip of an outbound consensus request, from the send to its response or to its failure (an outbound failure or a peer disconnect). `class` is the service class that the peer serves the request under, so a vote round trip is separable from catch-up and epoch-record traffic on the same swarm. |
 
 The outbound direction is the honest dial handshake time. The honest dial success fraction
 combines the existing counters, whose direction label is spelled `out`:
@@ -151,6 +151,15 @@ The p99 handshake time of outbound connections:
 
 ```promql
 histogram_quantile(0.99, sum by (le) (rate(tn_network_connection_established_seconds_bucket{direction="outbound"}[1m])))
+```
+
+The `class` label splits each `{network, outcome}` series of the outbound request histogram into
+one series per class, so a query that wants the per-outcome shape sums `class` away with
+`sum by (network, outcome, le)`. `etc/quic-qualification/measure.py` already sums over it. The
+p99 round trip of answered outbound requests on each swarm, across all classes:
+
+```promql
+histogram_quantile(0.99, sum by (network, outcome, le) (rate(tn_network_outbound_request_duration_seconds_bucket{outcome="response"}[1m])))
 ```
 
 The process-wide histogram buckets run from 0.005 s to 30 s in 12 steps, so a p99.9 estimate
