@@ -59,10 +59,12 @@ pub(crate) struct EngineMetrics {
     // bench5 exec-split
     /// Signer recovery time of one consensus output: the duration of the background job that
     /// recovers the output's signers when it is queued (or of the inline recovery, on the
-    /// fallback and for callers without a job). The job runs off the execution thread and
-    /// overlaps earlier outputs' execution, so unlike the evm, root and finish histograms this
-    /// is not part of the output's execute time; the part the execution thread waited for is
-    /// the `output executed` line's `recover_wait_ms`.
+    /// fallback and for callers without a job), logged as `recover_ms` on the `signers
+    /// recovered` line. The job runs beside the execution thread, overlapping earlier outputs'
+    /// execution and sharing the rayon pool with their builds, so unlike the evm, root and
+    /// finish histograms it does not sum to the output's execute time, and that contention can
+    /// stretch it past what the same recovery takes alone. The part the execution thread waited
+    /// for is `recover_wait_ms` on the `output executed` line, which has no `recover_ms` field.
     pub(crate) recover_seconds: Histogram,
     /// Builder setup, pre-execution system calls and transaction loop of one consensus output,
     /// summed over its blocks.

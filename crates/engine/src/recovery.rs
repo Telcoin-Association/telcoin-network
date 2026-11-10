@@ -99,6 +99,11 @@ pub(crate) type OutputSigners = Vec<Vec<Recovered<TransactionSigned>>>;
 /// line (target `engine`) with the consensus number, the transactions handed to recovery and
 /// `recover_ms`. The background job runs this, and so do the fallback and the callers that
 /// execute an output without a job, so every recovered output logs exactly one line.
+///
+/// `recover_ms` is on this line only. `output executed` carries `recover_wait_ms` instead, the
+/// time the execution thread blocked waiting for this recovery; since the job runs beside the
+/// build, `recover_ms` is not part of that line's `execute_ms` split (see
+/// `EngineMetrics::recover_seconds`).
 pub(crate) fn recover_signers(output: &ConsensusOutput, metrics: &EngineMetrics) -> OutputSigners {
     let start = Instant::now();
     let signers = RethEnv::recover_output_signers(output);
