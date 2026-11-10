@@ -870,6 +870,15 @@ impl<DB: Database> Proposer<DB> {
     /// the certifier again and cannot be certified after its digests moved. Anything else (the
     /// commit path already re-queued it, or an unexpected report) is ignored, and the digests
     /// stay where they are.
+    ///
+    /// Each report prepends on its own, so the two re-queue paths order rounds differently. When
+    /// two reports are handled before the next header is built (the certifier's cancel lags the
+    /// proposer by a round, or the round jumps), the second report's digests land ahead of the
+    /// first's, and the certifier reports in round order, so the newer header's batches go first.
+    /// The commit path re-queues every expired header in one call and keeps them oldest first
+    /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
+    /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
+    /// does to transaction nonces.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
         let mut requeued = BTreeMap::new();
         match self.proposed_headers.get(&round) {
