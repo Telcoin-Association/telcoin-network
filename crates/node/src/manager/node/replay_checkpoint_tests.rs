@@ -1,6 +1,6 @@
 //! Regression tests for restart replay over a fully imported pack with stale slot hints.
 
-use super::*;
+use super::{start_epoch::check_replay_link, *};
 use crate::manager::node::tests::reth_config_and_db;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
@@ -290,10 +290,45 @@ async fn replay_rejects_block2_not_built_on_block1_when_nothing_executed() -> ey
     };
     assert_eq!(
         err.to_string(),
-        "restart replay is not contiguous: expected consensus 2 following 1, got 2"
+        format!(
+            "restart replay parent mismatch: consensus 2 has parent_hash {:?}, expected consensus \
+             1's digest {:?}",
+            outputs[1].parent_hash(),
+            outputs[0].consensus_header_hash(),
+        )
     );
     assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), outputs[0].consensus_header_hash());
-    assert!(engine_rx.try_recv().is_err(), "nothing past the gap may reach the engine");
+    assert!(engine_rx.try_recv().is_err(), "nothing past the mismatch may reach the engine");
     manager.consensus_chain.clone().close().await;
     Ok(())
+}
+
+/// A numbering gap keeps its own message, apart from a parent mismatch, and the block-1 anchor
+/// exemption covers only block 1's parent hash, never its number.
+#[test]
+fn replay_link_reports_a_numbering_gap_by_number() {
+    let header = |number, parent_hash: ConsensusHeaderDigest| ConsensusHeader {
+        number,
+        parent_hash,
+        ..Default::default()
+    };
+    let genesis = ConsensusHeader::default();
+    let one = header(1, B256::ZERO.into());
+    let two = header(2, one.digest());
+    let three = header(3, two.digest());
+    assert!(check_replay_link(&genesis, &one).is_ok());
+    assert!(check_replay_link(&one, &two).is_ok());
+
+    // block 3 straight after block 1, with block 2's digest as parent
+    let err = check_replay_link(&one, &three).expect_err("2 is missing");
+    assert_eq!(
+        err.to_string(),
+        "restart replay is not contiguous: expected consensus 2 following 1, got 3"
+    );
+    // with nothing executed, the replay must still start at block 1
+    let err = check_replay_link(&genesis, &two).expect_err("1 is missing");
+    assert_eq!(
+        err.to_string(),
+        "restart replay is not contiguous: expected consensus 1 following 0, got 2"
+    );
 }
