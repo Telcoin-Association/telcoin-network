@@ -1604,8 +1604,18 @@ impl RejoinBlocker {
     }
 
     /// The position of this blocker in [`Self::ALL`], for per-blocker arrays.
+    ///
+    /// The match is exhaustive, so a new blocker does not compile until it gets a slot here; give
+    /// it the next slot, append it to [`Self::ALL`] and raise [`Self::COUNT`].
     const fn index(self) -> usize {
-        self as usize
+        match self {
+            Self::EpochClosed => 0,
+            Self::AttemptsExhausted => 1,
+            Self::NoKnownHeader => 2,
+            Self::StaleHead => 3,
+            Self::EpochMismatch => 4,
+            Self::RoundGap => 5,
+        }
     }
 
     /// Classify a readiness check that failed: the first condition the check would refuse, in the
@@ -1640,10 +1650,11 @@ impl RejoinBlocker {
     }
 }
 
-// compile-time check that `ALL` lists the blockers in declaration order, so every `index` in it is
-// a valid position in the per-blocker arrays. a blocker inserted without updating `COUNT` and
-// `ALL` fails the build here. stable rust cannot count variants, so a blocker appended after
-// `RoundGap` still needs `COUNT` and `ALL` updated by hand.
+// compile-time check that `ALL` lists the blockers in slot order, so every `index` in it is a valid
+// position in the per-blocker arrays. `index` is an exhaustive match, so a new blocker fails the
+// build until it gets a slot, and a slot that moves another blocker fails here until `ALL`
+// follows. stable rust cannot count variants, so a blocker given the next free slot still needs
+// `COUNT` and `ALL` raised by hand.
 const _: () = {
     let mut position = 0;
     while position < RejoinBlocker::COUNT {
