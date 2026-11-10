@@ -12,7 +12,7 @@ use std::{
 use tempfile::TempDir;
 
 use crate::{
-    env::{Env, EnvOptions, SyncMode},
+    env::{Env, EnvOptions, SyncMode, MAX_GAP_FILL},
     meta::{Meta, Tag, MAX_WEAK_RUN, META_LEN},
     CheckReport, ReadTxn, RwTxn, Table,
 };

@@ -196,6 +196,7 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         (E::InvalidPageSize(3), Error::DecodeError),
         (E::InvalidMaxGrowth(4096), Error::DecodeError),
         (E::InvalidMapReserve(u64::MAX), Error::DecodeError),
+        (E::InvalidGapFill(65), Error::DecodeError),
         (E::KeyTooShort { len: 4, min: 5 }, Error::BadValSize),
         (E::TableKind("t".into()), Error::Incompatible),
         (E::InvalidDupOptions("packed_max must be 0".into()), Error::DecodeError),
@@ -277,6 +278,22 @@ fn with_max_growth_reaches_the_engine() {
         DatabaseError::Open(err) if err == Error::DecodeError.into()));
     assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
     let args = TnLmdbArgs::default().with_max_growth(crate::MIN_GROWTH);
+    super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
+}
+
+/// `TnLmdbArgs::with_gap_fill` reaches the engine's `EnvOptions::gap_fill`: more than
+/// `MAX_GAP_FILL` pages is refused at a read-write open (`MDBX_EINVAL`) before the file is
+/// created, and `MAX_GAP_FILL` itself opens.
+#[test]
+fn with_gap_fill_reaches_the_engine() {
+    assert_eq!(TnLmdbArgs::default().gap_fill, 0, "off by default");
+    let dir = tempfile::tempdir().unwrap();
+    let args = TnLmdbArgs::default().with_gap_fill(crate::MAX_GAP_FILL + 1);
+    assert!(matches!(
+        super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap_err(),
+        DatabaseError::Open(err) if err == Error::DecodeError.into()));
+    assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
+    let args = TnLmdbArgs::default().with_gap_fill(crate::MAX_GAP_FILL);
     super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
 }
 

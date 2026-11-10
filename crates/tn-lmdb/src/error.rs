@@ -117,6 +117,10 @@ pub enum Error {
     /// refused by [`crate::Env::open`] before it touches the file.
     #[error("tn-lmdb: invalid map reserve {0} (at most {} bytes)", isize::MAX)]
     InvalidMapReserve(u64),
+    /// An `EnvOptions::gap_fill` past [`crate::MAX_GAP_FILL`] pages, refused by
+    /// [`crate::Env::open`] before it touches the file.
+    #[error("tn-lmdb: invalid gap fill {0} (at most {} pages)", crate::MAX_GAP_FILL)]
+    InvalidGapFill(u32),
     /// Another handle (in this process or another) holds the database open: any handle, for
     /// [`crate::Env::open`]; one with a writer, for [`crate::Env::open_read_only`].
     #[error("tn-lmdb: database is locked by another handle")]
@@ -164,6 +168,7 @@ impl Error {
             | Error::InvalidPageSize(_)
             | Error::InvalidMaxGrowth(_)
             | Error::InvalidMapReserve(_)
+            | Error::InvalidGapFill(_)
             | Error::Locked
             | Error::ReadOnly
             | Error::WrongTxn => false,
@@ -213,6 +218,7 @@ mod tests {
             Error::InvalidPageSize(1),
             Error::InvalidMaxGrowth(1),
             Error::InvalidMapReserve(1),
+            Error::InvalidGapFill(65),
             Error::Locked,
             Error::ReadOnly,
             Error::WrongTxn,

@@ -155,6 +155,12 @@ pub struct TnLmdbArgs {
     /// commit that changes something writes over it, so a later open with `true` in the same boot
     /// can open at them again. Applies to read-only opens too.
     pub trust_unsynced: bool,
+    /// Gap fill, in pages (default 0: off): the engine's `EnvOptions::gap_fill`. A durable step
+    /// first rewrites each gap of at most this many clean pages between two runs of its dirty
+    /// pages with the bytes they hold, so the disk takes fewer, larger writes for more bytes: for
+    /// disks that cap I/Os per second (cloud block storage), not for local NVMe. An open refuses
+    /// more than [`tn_lmdb::MAX_GAP_FILL`] (`MDBX_EINVAL`).
+    pub gap_fill: u32,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
@@ -185,6 +191,7 @@ impl Default for TnLmdbArgs {
             sync_period: engine.sync_period,
             sync_bytes: engine.sync_bytes,
             trust_unsynced: engine.trust_unsynced,
+            gap_fill: engine.gap_fill,
             #[cfg(test)]
             nested_dup: true,
             #[cfg(test)]
@@ -239,6 +246,12 @@ impl TnLmdbArgs {
         self
     }
 
+    /// Set [`Self::gap_fill`], in pages (0: off), at most [`tn_lmdb::MAX_GAP_FILL`].
+    pub const fn with_gap_fill(mut self, gap_fill: u32) -> Self {
+        self.gap_fill = gap_fill;
+        self
+    }
+
     /// Test-only: store every dup-sort table as composite keys in a plain engine table, the
     /// nested layouts included. A file is in one form or the other: opening it with the other is
     /// refused (`MDBX_INCOMPATIBLE`).
@@ -286,6 +299,7 @@ impl TnLmdbArgs {
             sync_period: self.sync_period,
             sync_bytes: self.sync_bytes,
             trust_unsynced: self.trust_unsynced,
+            gap_fill: self.gap_fill,
             ..EnvOptions::default()
         }
     }

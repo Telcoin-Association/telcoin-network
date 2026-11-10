@@ -95,6 +95,19 @@ pub const MIN_GROWTH: u64 = 1 << 20;
 /// file grows linearly, not by doubling.
 pub(crate) const MAX_GROWTH: u64 = 1 << 30;
 
+/// What [`PageFile::read_resident`] read.
+#[derive(Debug)]
+pub(crate) enum Resident {
+    /// Every byte: the page cache held the whole range (on macOS, always: a plain `pread`).
+    Whole,
+    /// Not every byte: some page of the range is not in the page cache.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NotWhole,
+    /// The kernel or the file system refuses a read that does not wait for the disk.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unsupported(io::Error),
+}
+
 /// A reader's view of a page file's mapping that needs no lock: the mapping's base address and
 /// length, plus a length the owner has published as readable. One view, shared (`Arc`) between the
 /// file, its readers' snapshots and, in an environment, the writer, which holds a clone of its own
@@ -210,6 +223,10 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next fdatasync (see [`Self::fail_next_fsync`]).
     #[cfg(test)]
     fail_next_fsync: AtomicBool,
+    /// Test-only: [`Self::read_resident`] finds no range whole in the page cache, as a gap fill
+    /// over a file the cache does not hold would.
+    #[cfg(test)]
+    pub(crate) miss_reads: bool,
 }
 
 impl PageFile {
@@ -270,6 +287,8 @@ impl PageFile {
             fail_next_msync: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_fsync: AtomicBool::new(false),
+            #[cfg(test)]
+            miss_reads: false,
         })
     }
 
@@ -485,6 +504,92 @@ impl PageFile {
             Ok(()) => {
                 Error::Failed(format!("page file: page {pgno} lies past the end of the file"))
             }
+        }
+    }
+
+    /// Read the `buf.len()` bytes at `offset` into `buf` through the file, not the mapping, for
+    /// the gap fill (`Writer::fill_gaps`), when the page cache holds them all
+    /// ([`Self::read_cached`]). Any error but those `read_cached` maps is returned (and the caller
+    /// fails the commit). The range must lie inside the file.
+    pub(crate) fn read_resident(&self, offset: u64, buf: &mut [u8]) -> Result<Resident> {
+        self.check_poison()?;
+        self.check_inside(offset, buf.len())?;
+        #[cfg(test)]
+        if self.miss_reads {
+            return Ok(Resident::NotWhole);
+        }
+        Ok(self.read_cached(offset, buf)?)
+    }
+
+    /// Linux: one `preadv2` with `RWF_NOWAIT` (through `rustix`, so no `unsafe` here), which
+    /// copies only what the page cache holds and never waits for the disk. `Whole` once it read
+    /// every byte; `NotWhole` for a short read (a page past the first is not cached: nothing was
+    /// read from the disk) or `EAGAIN` (the first is not: the kernel starts a read of the range,
+    /// which nothing waits for, of the range alone under [`Self::advise_random_reads`]);
+    /// `Unsupported` when the kernel or the file system refuses the flag (`EOPNOTSUPP`, `EINVAL`,
+    /// `ENOSYS`). `EINTR` reissues the call.
+    #[cfg(target_os = "linux")]
+    fn read_cached(&self, offset: u64, buf: &mut [u8]) -> io::Result<Resident> {
+        use rustix::io::{preadv2, Errno, ReadWriteFlags};
+        let want = buf.len();
+        loop {
+            let flags = ReadWriteFlags::NOWAIT;
+            match preadv2(&self.file, &mut [io::IoSliceMut::new(&mut *buf)], offset, flags) {
+                Err(Errno::INTR) => {}
+                Ok(n) if n == want => return Ok(Resident::Whole),
+                Ok(_) | Err(Errno::AGAIN) => return Ok(Resident::NotWhole),
+                Err(e @ (Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS)) => {
+                    return Ok(Resident::Unsupported(e.into()))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// macOS: no read there reports what the page cache holds without new `unsafe` (`mincore` is
+    /// a raw call), so a plain `pread` (`read_exact_at`, which reissues an interrupted call):
+    /// always `Whole`, and a page not in memory costs a synchronous read.
+    #[cfg(target_os = "macos")]
+    fn read_cached(&self, offset: u64, buf: &mut [u8]) -> io::Result<Resident> {
+        use std::os::unix::fs::FileExt as _;
+        self.file.read_exact_at(buf, offset)?;
+        Ok(Resident::Whole)
+    }
+
+    /// Write `bytes` at `offset` through the file (`pwrite`, `write_all_at`), never through the
+    /// mapping: the gap fill's write of bytes [`Self::read_resident`] read from the same offset
+    /// (`Writer::fill_gaps` says why that changes no byte). The bytes reach the page cache only;
+    /// step 4's sync writes them with the commit's pages. Refused once poisoned; a failure
+    /// poisons the file. The range must lie inside the file.
+    pub(crate) fn rewrite(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.check_poison()?;
+        self.check_inside(offset, bytes.len())?;
+        self.file.write_all_at(bytes, offset).inspect_err(|_| self.poison())?;
+        Ok(())
+    }
+
+    /// `Err(Failed)` unless `[offset, offset + len)` lies inside the file.
+    fn check_inside(&self, offset: u64, len: usize) -> Result<()> {
+        if offset.checked_add(len as u64).is_some_and(|end| end <= self.len) {
+            return Ok(());
+        }
+        Err(Error::Failed(format!(
+            "page file: {len} bytes at {offset} reach past the end of the file ({})",
+            self.len
+        )))
+    }
+
+    /// Linux: advise the file's reads `POSIX_FADV_RANDOM` (through `rustix`), so a gap fill's
+    /// read that misses the page cache starts a read of its own range only, not the larger
+    /// window the kernel's readahead would add. It concerns reads through the file, never the
+    /// mapping (whose advice is [`advise_access`]'s), and the engine reads through the file only
+    /// at open and for the gap fill. A hint: a failure is logged and changes nothing else.
+    /// Elsewhere nothing: macOS's gap fill reads with a plain `pread`.
+    pub(crate) fn advise_random_reads(&self) {
+        #[cfg(target_os = "linux")]
+        if let Err(err) = rustix::fs::fadvise(&self.file, 0, None, rustix::fs::Advice::Random) {
+            tracing::warn!("tn-lmdb: POSIX_FADV_RANDOM for the gap fill's reads failed: {err}");
         }
     }
 

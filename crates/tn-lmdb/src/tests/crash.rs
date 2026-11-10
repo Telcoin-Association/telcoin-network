@@ -202,10 +202,25 @@ impl Mode {
 /// with the writer's clock moved to it, reaches it.
 const AUTO_PERIOD: Duration = Duration::from_secs(3600);
 
+thread_local! {
+    /// The `EnvOptions::gap_fill` every environment of this thread's matrix opens with
+    /// ([`open_in`]; 0, off, but under [`with_gap_fill`]).
+    static GAP_FILL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` (a matrix) with every environment it opens filling gaps of up to `pages` pages, and
+/// its dry runs checking that the crash commit's durable steps filled some.
+pub(super) fn with_gap_fill(pages: u32, f: impl FnOnce()) {
+    GAP_FILL.set(pages);
+    f();
+    GAP_FILL.set(0);
+}
+
 /// Open the file at `path` as `mode` commits.
 fn open_in(path: &Path, mode: Mode) -> Env {
     let sync_period = (mode == Mode::AutoSync).then_some(AUTO_PERIOD);
-    Env::open(path, EnvOptions { sync_period, ..options(mode.sync()) }).expect("open")
+    let gap_fill = GAP_FILL.get();
+    Env::open(path, EnvOptions { sync_period, gap_fill, ..options(mode.sync()) }).expect("open")
 }
 
 /// The crash points of a commit, in protocol order.
@@ -291,8 +306,9 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     }
     let (by_file, reused, runs) =
         env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
+    let gaps_filled = env.io_stats().gaps_filled;
     env.crash();
-    Case { path, first, durable, latest, before, slot, by_file, reused, runs }
+    Case { path, first, durable, latest, before, slot, by_file, reused, runs, gaps_filled }
 }
 
 /// What [`run_case`] left.
@@ -318,6 +334,8 @@ pub(super) struct Case {
     pub(super) reused: usize,
     /// How the writer placed the overflow runs of the case's commits.
     pub(super) runs: RunStats,
+    /// The gaps the case's durable steps filled (`EnvOptions::gap_fill`, [`with_gap_fill`]).
+    pub(super) gaps_filled: u64,
 }
 
 /// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
@@ -402,9 +420,12 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
 /// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
 /// `msync` alone covers), and the base's `layout`.
 fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
-    let Case { path, latest, by_file, reused, .. } = run_case(base, mode, by_msync, None);
+    let Case { path, latest, by_file, reused, gaps_filled, .. } =
+        run_case(base, mode, by_msync, None);
     assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{mode:?}: pages were reused");
+    let filling = GAP_FILL.get() > 0;
+    assert_eq!(gaps_filled > 0, filling, "{mode:?}: by_msync={by_msync}: gaps filled");
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;
     assert_eq!(grew, base.grows, "{mode:?}: the file grew");
@@ -456,6 +477,26 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
     }
 }
 
+/// The matrix with `EnvOptions::gap_fill` at its largest, in every environment it opens: the
+/// durable steps rewrite the gaps between the crash commit's runs before the data sync (its dry
+/// runs check that they filled some), and every cell recovers exactly as without it.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill() {
+    with_gap_fill(MAX_GAP_FILL, || matrix(&base(4096), 3));
+}
+
+/// The gap-filled matrix at two page sizes, at 4 pages and at the largest, with many random
+/// power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill_heavy() {
+    for page_size in [4096, 16384] {
+        for pages in [4, MAX_GAP_FILL] {
+            with_gap_fill(pages, || matrix(&base(page_size), 40));
+        }
+    }
+}
+
 /// The matrix of a `NoSync` commit past `EnvOptions::sync_period` ([`Mode::AutoSync`]), which
 /// runs the durable steps over its own pages and those of the two commits before it, which
 /// deferred theirs: every crash point recovers by the `Durable` rules, `L` being the last synced
@@ -464,6 +505,13 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
 #[test]
 fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows() {
     matrix_of(&base(4096), 3, &[Mode::AutoSync]);
+}
+
+/// The automatic sync's matrix with `EnvOptions::gap_fill` at its largest: the sync fills the
+/// gaps between the runs of its own pages and the deferred commits' pages.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_with_gap_fill() {
+    with_gap_fill(MAX_GAP_FILL, || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
 }
 
 /// The automatic sync's matrix at two page sizes, with many random power losses.

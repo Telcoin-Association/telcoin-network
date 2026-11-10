@@ -84,10 +84,16 @@ metas with `pwrite` (`FileExt::write_all_at`). `env::read_record` reads the meta
 (`read_exact_at`) at open step 4, before the file is mapped. Every later read and write, a
 commit's meta included (`Writer::copy_meta`), goes through the mapping. So an open reads, by
 `pread`, metas an earlier writer wrote through its mapping, perhaps a writer of this boot that
-crashed before any sync. The tests also damage files with `pwrite` and read them with `pread`
-while an environment may hold a mapping.
+crashed before any sync. With `EnvOptions::gap_fill` on, step 4's gap fill
+(`Writer::fill_gaps`) reads gap pages by `pread` (`PageFile::read_resident`) while the mapping
+holds them and writes the same bytes back by `pwrite` (`PageFile::rewrite`): it needs the `pread`
+to see what the mapping holds, and step 4's sync after it to write the pages the `pwrite` dirtied
+(a sync that left them unwritten would lose nothing: they hold the bytes the disk holds, but the
+fill would then save no write). The tests also damage files with `pwrite` and read them with
+`pread` while an environment may hold a mapping.
 
-**Linux, macOS.** One page cache: coherent.
+**Linux, macOS.** One page cache: coherent. macOS's `msync`s of `DataSync::Ranges` write the
+pages a `pwrite` dirtied inside their ranges (`a_gap_filled_scattered_commit_leaves_no_page_dirty`).
 
 ### Durable syncs of mapped pages
 
@@ -267,6 +273,22 @@ commit and slowed first writes into new space, so macOS gives no advice. A port 
 measurement (the regression bench), and `every_mapping_follows_the_readahead_option` must then
 follow it.
 
+### A read that does not wait for the disk (gap fill, performance only)
+
+**What it needs.** Nothing for correctness: `EnvOptions::gap_fill` is off by default, and a
+gap it fills keeps its bytes whichever way it was read. For speed, a read of the page cache that
+returns at once, short or with an error, when a page is not cached, without new `unsafe`.
+
+**Where.** `PageFile::read_cached` (no fallback arm: a port writes it), and
+`PageFile::advise_random_reads` at open when gap fill is on.
+
+**Linux.** `preadv2` with `RWF_NOWAIT` (since 4.14 for buffered reads), through `rustix` (a
+Linux-only dependency, `Cargo.toml`); a kernel or file system that refuses it (`EOPNOTSUPP`,
+`EINVAL`, `ENOSYS`) turns gap fill off with a warning. `posix_fadvise(POSIX_FADV_RANDOM)` keeps the
+read a miss starts to the gap. **macOS.** No such read: a plain `pread` (a page not in memory
+costs a synchronous read), so gap fill there serves tests and measurement. A port without such a
+read does the same or refuses the option.
+
 ### Errors
 
 The engine reads a few errno values. Each is a place to check on a new OS:
@@ -333,12 +355,17 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `env.rs` | `Env::open` | `macos` | `msync_range(0..len)` of the new mapping (step 8) |
 | `file.rs` | `PageFile::msync_ranges` | `macos` | `MS_ASYNC` pass, then `MS_SYNC` pass |
 | `file.rs` | `PageFile::fdatasync_all` | `macos` | `msync(MS_SYNC)` of the whole file before the `fdatasync` |
+| `file.rs` | `PageFile::read_cached` | `linux` | `preadv2` with `RWF_NOWAIT` (`rustix`): only what the page cache holds |
+| `file.rs` | `PageFile::read_cached` | `macos` | a plain `pread` (`read_exact_at`) |
+| `file.rs` | `PageFile::advise_random_reads` | `linux` | `posix_fadvise(POSIX_FADV_RANDOM)` (`rustix`); nothing elsewhere |
+| `file.rs` | `Resident::{NotWhole, Unsupported}` | `cfg_attr(not(linux))` | `allow(dead_code)`: only Linux's read returns them |
+| `Cargo.toml` | `rustix` | `cfg(target_os = "linux")` | the dependency behind both `rustix` calls |
 
-`read_boot_id` and `allocate_range` have no fallback arm. Once the `compile_error!` is lifted for
-a new OS, the build fails at both: that is deliberate, so a port must write them. For
-`x86_64-unknown-freebsd`, `cargo check -p tn-lmdb --tests --target x86_64-unknown-freebsd`
-reports exactly these: the `compile_error!` and the two missing functions; the rest of the
-library and its tests type-check there.
+`read_boot_id`, `allocate_range` and `PageFile::read_cached` have no fallback arm. Once the
+`compile_error!` is lifted for a new OS, the build fails at all three: that is deliberate, so a
+port must write them. For `x86_64-unknown-freebsd`, `cargo check -p tn-lmdb --tests --target
+x86_64-unknown-freebsd` reports exactly these: the `compile_error!` and the three missing
+functions; the rest of the library and its tests type-check there.
 
 ### In tests
 
@@ -349,6 +376,8 @@ library and its tests type-check there.
 | `file.rs` | `a_failed_msync_of_ranges_poisons_the_file` | `macos` | `msync_ranges` (macOS only) keeps the poison rule |
 | `env/tests.rs` | `dirty_pages_form_one_range_or_take_one_fdatasync` | `macos` / `not(macos)` | the expected plan for a scattered commit |
 | `env/tests.rs` | `a_scattered_durable_commit_leaves_no_page_dirty` | `macos` | by `dirty_os_pages` |
+| `env/gap_fill_tests.rs` | `a_gap_filled_scattered_commit_leaves_no_page_dirty` | `macos` | by `dirty_os_pages`: the `msync`s write the gaps a `pwrite` dirtied |
+| `env/gap_fill_tests.rs` | `a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider` | `macos` | two asserts by `dirty_os_pages`: the fill dirtied its gaps |
 | `env/tests.rs` | `a_writer_open_writes_the_pages_another_mapping_left_dirty` | `macos` | by `dirty_os_pages` |
 | `env/tests.rs` | `scattered_pages_msync_their_merged_ranges` | `macos` | `merged_ranges` |
 | `env/tests.rs` | `every_mapping_follows_the_readahead_option` | `cfg!(linux)` | the `readahead` default |
