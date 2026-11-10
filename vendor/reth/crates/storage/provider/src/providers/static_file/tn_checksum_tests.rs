@@ -5,7 +5,7 @@
 use super::manager::{StaticFileProviderBuilder, StaticFileWriter};
 use crate::{
     providers::StaticFileProvider, test_utils::create_test_provider_factory, HeaderProvider,
-    ReceiptProvider, StaticFileProviderFactory, TransactionsProvider,
+    ReceiptProvider, StaticFileProviderFactory, TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::{Header, SignableTransaction, Transaction, TxLegacy};
 use alloy_primitives::{Address, Signature, B256, U160, U256};
@@ -261,6 +261,9 @@ fn damaged_block_segment_value_is_an_error() {
     assert!(is_checksum_error(&provider.transaction_sender(1).unwrap_err()));
     assert!(is_checksum_error(&provider.headers_range(0..3).unwrap_err()));
     assert!(is_checksum_error(&provider.receipts_by_tx_range(0..3).unwrap_err()));
+    // TN(TN-0136): the hashes of a range holding the damaged transaction are an error too.
+    assert!(is_checksum_error(&provider.transaction_hashes_by_range(0..3).unwrap_err()));
+    assert_eq!(provider.transaction_hashes_by_range(2..3).unwrap().len(), 1);
     for number in [0, 2] {
         assert_eq!(provider.header_by_number(number).unwrap().unwrap().number, number);
         assert_eq!(provider.transaction_by_id(number).unwrap().unwrap().nonce(), number);

@@ -3299,7 +3299,7 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
             // the hash.
             rayon::spawn(move || {
                 let mut rlp_buf = Vec::with_capacity(128);
-                let _ = manager.fetch_range_with_predicate(
+                let fetched = manager.fetch_range_with_predicate(
                     StaticFileSegment::Transactions,
                     chunk_range,
                     |cursor, number| {
@@ -3313,6 +3313,11 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
                     },
                     |_| true,
                 );
+                // TN(TN-0136): a failed read, a checksum mismatch included, reaches the caller
+                // instead of a list missing the rest of the chunk.
+                if let Err(err) = fetched {
+                    let _ = channel_tx.send(Err(Box::new(err)));
+                }
             });
         }
 

@@ -1265,3 +1265,19 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `rotation_prune_and_appends` (TN-0123's `rotation_prune_and_mixed_formats`, which mixed the
   formats in one datadir, now without the unchecked jars). Mutation-checked: no refusal.
   *Upstream*: no.
+
+- **TN-0136** — `transaction_hashes_by_range` returns a failed read as an error, not a shorter
+  list. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
+  (`StaticFileProvider::transaction_hashes_by_range`; test).
+  *Why*: each chunk's task dropped the result of its `fetch_range_with_predicate`, so a read
+  error (a checksum mismatch, a gap between jars, TN-0133) ended that chunk's hashes early and the
+  caller got the hashes before it as the whole answer. The task now sends the error down its
+  channel, and the collecting loop returns it. Its one caller in this copy is
+  `DatabaseProvider::remove_blocks_above` (an unwind deletes the removed transactions' hash
+  entries), which would have left entries behind; TN never unwinds a persisted block (no
+  reorgs), so no TN path reaches it today. It cannot reach execution: intact files hash as
+  before. *Tests*:
+  `damaged_block_segment_value_is_an_error` (TN-0123's, extended: the hashes of a range holding
+  the damaged transaction are the checksum error, a range beside it answers). Mutation-checked:
+  the error dropped again. *Upstream*: yes (upstream drops the error the same way).
