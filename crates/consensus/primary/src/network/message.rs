@@ -254,6 +254,23 @@ impl PrimaryResponse {
         matches!(self, PrimaryResponse::Error(_))
     }
 
+    /// The reply a peer sends for an epoch-record request it cannot serve because it holds no
+    /// certified record for `epoch` (or `hash`).
+    ///
+    /// This is the error the request handler returns for the same request, encoded the way every
+    /// request error is encoded, so a requester can tell this definitive answer apart from other
+    /// error replies (such as a responder that has not resolved the requester yet). A request
+    /// naming neither gets the invalid-request reply, which is equally final.
+    pub fn unavailable_epoch_record(epoch: Option<Epoch>, hash: Option<EpochDigest>) -> Self {
+        // the precedence mirrors `RequestHandler::retrieve_epoch_record`: a digest wins
+        let error = match (epoch, hash) {
+            (_, Some(hash)) => PrimaryNetworkError::UnavailableEpochDigest(hash),
+            (Some(epoch), None) => PrimaryNetworkError::UnavailableEpoch(epoch),
+            (None, None) => PrimaryNetworkError::InvalidEpochRequest,
+        };
+        Self::into_error_ref(&error)
+    }
+
     pub(crate) fn into_error_ref(error: &PrimaryNetworkError) -> Self {
         match error {
             PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours, theirs })

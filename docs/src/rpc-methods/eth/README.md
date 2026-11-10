@@ -13,7 +13,7 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | Method | Notes |
 | --- | --- |
 | `eth_blobBaseFee` | |
-| `eth_callBundle` | Shares the tracing request limit (`--rpc.max-tracing-requests`) |
+| `eth_callBundle` | Waits for the same concurrency permit as `eth_call` |
 | `eth_callMany` | |
 | `eth_fillTransaction` | Missing fee fields are filled from the worker's epoch base fee |
 | `eth_getAccount` | |

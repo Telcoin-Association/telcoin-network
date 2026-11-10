@@ -30,10 +30,11 @@ use std::{
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
-use tn_primary::{ConsensusBus, NodeMode};
+use tn_primary::{ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{
     certificate_pack::CertificatePack,
+    consensus::ConsensusChain,
     epoch_records::EpochRecordDb,
     tables::{KadRecords, NodeBatchesCache, OurNodeBatchesCache, Votes},
 };
@@ -114,9 +115,11 @@ where
     ///    pinned to the epoch-start header and threaded into both steps as parameters.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
-    /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
-    ///    (`wait_for_epoch_boundary`), and the epoch task manager ending early (a CVV resync or a
-    ///    task error). Of these, only the boundary arm closes the epoch and writes its
+    /// 6. `tokio::select!` over the exits: node shutdown, a store failure, the epoch boundary
+    ///    (`wait_for_epoch_boundary`), the epoch task manager ending early (a CVV resync or a task
+    ///    error), and a later epoch's certified record showing this active validator's epoch
+    ///    already closed on the network (`certified_record_closed_epoch`; the next start of the
+    ///    epoch then catches up). Of these, only the boundary arm closes the epoch and writes its
     ///    [`EpochRecord`]; the replay-and-close (step 3) and leftover-drain (step 7) recovery paths
     ///    write the record on their own closes.
     /// 7. Notify consensus shutdown, abort and drain the epoch task manager, then resolve the
@@ -468,6 +471,13 @@ where
         // Resolves once a consensus DB store latches a failure. Made before the select, which
         // borrows `self` mutably for the boundary arm.
         let store_failed = store_failure(&self.consensus_db);
+        // Resolves once a certified record shows this epoch already closed on the network while
+        // this node runs it as an active validator. Made before the select for the same reason.
+        let closed_by_record = certified_record_closed_epoch(
+            self.consensus_bus.clone(),
+            self.consensus_chain.clone(),
+            current_epoch,
+        );
 
         let mut epoch_boundary_reached = false;
         tokio::select! {
@@ -530,6 +540,19 @@ where
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
+            },
+
+            // Leave an epoch the network already closed: no committee member votes in it any
+            // more, so neither its boundary nor a peer's certificate would end it. The mode is
+            // left alone: the next start of this epoch decides it from the record (catch-up).
+            record = closed_by_record => {
+                warn!(
+                    target: "epoch-manager",
+                    running_epoch = current_epoch,
+                    record_epoch = record.epoch,
+                    "a certified epoch record shows the running epoch already closed on the \
+                     network; leaving it to catch up",
+                );
             },
 
             // return any errors
@@ -1221,6 +1244,66 @@ fn store_failure<DB: TNDatabase>(
     }
 }
 
+/// Whether `record`, a certified epoch record, shows that the epoch a node runs already closed on
+/// the network without it.
+///
+/// A record closes its epoch, so a certified record for an epoch after `running_epoch` proves the
+/// network finished `running_epoch` and at least the next one. The running epoch's own record is
+/// not enough: it reaches the slowest validator routinely while that validator still closes the
+/// epoch itself, because the record collector asks for the running epoch's record every few
+/// seconds. A validator exactly one epoch behind is demoted by the certificate branch of the
+/// primary network handler's behind-consensus check once the next epoch's certificates pass its
+/// activity window (about forty rounds), or sooner by a consensus result that skips ahead. Only an
+/// active validator acts on it: an inactive one is already catching up and an observer follows
+/// the network anyway.
+fn certified_record_closes_running_epoch(
+    mode: NodeMode,
+    running_epoch: Epoch,
+    record: &EpochRecord,
+) -> bool {
+    matches!(mode, NodeMode::CvvActive) && record.epoch > running_epoch
+}
+
+/// Resolve with the certified epoch record showing that `running_epoch` already closed on the
+/// network while this node runs it as an active validator; never resolve otherwise.
+///
+/// Without this an active validator that started an epoch the network had already finished (a
+/// restart whose startup record sync came back short, issue #1792) stays in it: its peers refuse
+/// its votes and the certificate path cannot place their later epochs' certificates.
+///
+/// The record collector is a node-lifetime task, so its wake-up
+/// ([`ConsensusBusApp::certified_record_epoch`]) reaches whichever epoch is running, including one
+/// that started after the record was stored: the record of the epoch this node just closed
+/// normally arrives after it moved on, and the running epoch's own record while this node still
+/// closes it. Each wake-up therefore re-reads the epoch store and applies
+/// [`certified_record_closes_running_epoch`] to this epoch, and a wake-up without a qualifying
+/// record is ignored. The first check runs at once, which covers a record stored between the mode
+/// decision and this subscription. `'static`, so it holds no borrow of the manager.
+async fn certified_record_closed_epoch(
+    consensus_bus: ConsensusBusApp,
+    consensus_chain: ConsensusChain,
+    running_epoch: Epoch,
+) -> EpochRecord {
+    let mut stored = consensus_bus.certified_record_epoch().subscribe();
+    stored.mark_changed();
+    // the bus owns the sender and outlives this future, so the watch never closes
+    while stored.changed().await.is_ok() {
+        let Some(record) =
+            super::newest_certified_record(consensus_chain.epochs(), running_epoch).await
+        else {
+            continue;
+        };
+        if certified_record_closes_running_epoch(
+            consensus_bus.current_node_mode(),
+            running_epoch,
+            &record,
+        ) {
+            return record;
+        }
+    }
+    std::future::pending().await
+}
+
 /// Seal this epoch's certificate pack once the consensus task that saved into it has ended.
 ///
 /// The pack reports a certificate save that failed in the background, and a failed final flush,
@@ -1489,6 +1572,92 @@ mod tests {
         let mode =
             finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, Some(pack)).await?;
         assert!(matches!(mode, RunEpochMode::ModeChange), "a healthy pack seals: {mode:?}");
+        Ok(())
+    }
+
+    /// A certified record ends only an active validator's epoch, and only when it is for a later
+    /// epoch: the running epoch's own record reaches the slowest validator while it still closes
+    /// the epoch itself, and the previous epoch's arrives after every node moved on.
+    #[test]
+    fn certified_record_closes_only_an_active_validators_epoch_from_a_later_one() {
+        let record = |epoch| EpochRecord { epoch, ..Default::default() };
+        [
+            (NodeMode::CvvActive, 3, record(4), true),
+            (NodeMode::CvvActive, 3, record(7), true),
+            (NodeMode::CvvActive, 3, record(3), false),
+            (NodeMode::CvvActive, 3, record(2), false),
+            (NodeMode::CvvInactive, 3, record(4), false),
+            (NodeMode::Observer, 3, record(4), false),
+        ]
+        .into_iter()
+        .for_each(|(mode, running, record, expected)| {
+            assert_eq!(
+                certified_record_closes_running_epoch(mode, running, &record),
+                expected,
+                "{mode:?} running {running}, record {}",
+                record.epoch,
+            );
+        });
+    }
+
+    /// A wake-up without a record that closes the running epoch (the previous epoch's record,
+    /// arriving after this node moved on, and the running epoch's own) leaves the epoch running; a
+    /// certified record for a later epoch ends it (issue #1792).
+    #[tokio::test]
+    async fn certified_record_wait_ignores_a_wake_up_without_a_closing_record() -> eyre::Result<()>
+    {
+        let fixture = tn_test_utils_committee::CommitteeFixture::builder(
+            tn_storage::mem_db::MemDatabase::default,
+        )
+        .build();
+        let committee = fixture.committee();
+        let temp = TempDir::with_prefix("certified_record_wait")?;
+        let chain = ConsensusChain::new_for_test(temp.path().to_owned(), committee.clone()).await?;
+        let keys: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+        let mut records = Vec::new();
+        let mut parent_hash = EpochDigest::default();
+        for epoch in 0..4 {
+            let mut record = EpochRecord {
+                epoch,
+                committee: keys.clone(),
+                next_committee: keys.clone(),
+                parent_hash,
+                ..Default::default()
+            };
+            record.final_consensus.number = u64::from(epoch + 1) * 10;
+            parent_hash = record.digest();
+            records.push(record);
+        }
+        let certified = |record: &EpochRecord| tn_types::EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: tn_types::BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        for record in &records[..3] {
+            chain.epochs().save(record.clone(), certified(record)).await?;
+        }
+        let bus = ConsensusBusApp::new();
+        bus.node_mode().send_replace(NodeMode::CvvActive);
+
+        let wait = certified_record_closed_epoch(bus.clone(), chain.clone(), 2);
+        tokio::pin!(wait);
+        assert!(bus.set_certified_record_epoch_if_newer(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err(),
+            "the previous epoch's record must not end the running epoch",
+        );
+
+        // the running epoch's own record, stored while this node still closes the epoch itself
+        assert!(bus.set_certified_record_epoch_if_newer(2));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err(),
+            "the running epoch's own record must not end it",
+        );
+
+        chain.epochs().save(records[3].clone(), certified(&records[3])).await?;
+        assert!(bus.set_certified_record_epoch_if_newer(3));
+        let record = tokio::time::timeout(Duration::from_secs(5), wait).await?;
+        assert_eq!(record.epoch, 3);
         Ok(())
     }
 

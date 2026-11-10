@@ -9,12 +9,14 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 .DEFAULT: help
 
-# Image repository for every image this Makefile builds or pushes.
-GHCR_IMAGE := ghcr.io/telcoin-association/telcoin-network
+# Image repository of the ad-hoc images that docker-adiri, docker-devnet and docker-push
+# build or push. Release images have their own packages, ghcr.io/telcoin-association/tn-mainnet
+# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and only
+# etc/release.sh writes them (release-build pushes the tag, release-publish moves the alias).
+GHCR_IMAGE := ghcr.io/telcoin-association/tn-dev
 
 # Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the
-# 12-character commit. Release tags and the latest/adiri aliases are written only by
-# release-build and release-publish. The release-* targets take TAG as a release tag
+# 12-character commit. The release-* targets take TAG as a release tag
 # (vX.Y.Z[-adiri][-rcN]); see docs/src/maintainers/releasing.md.
 TAG ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 
@@ -69,6 +71,11 @@ help:
 	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
 	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
 	@echo ;
+	@echo "make test-upgrade" ;
+	@echo "    :::> Run the rolling upgrade test: four validators upgraded in place from TN_BIN_PATH_PREV to this tree's binary." ;
+	@echo "    :::> TN_BIN_PATH_PREV defaults to the binary build-e2e-bin-prev leaves behind; run that first or export another path." ;
+	@echo "    :::> To check an upgrade, build the release the network runs: make build-e2e-bin-prev TN_PREV_REF=<release>. The default ref is not a release." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -86,13 +93,13 @@ help:
 	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
 	@echo ;
 	@echo "make docker-adiri" ;
-	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
+	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io/telcoin-association/tn-dev as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
 	@echo ;
 	@echo "make docker-devnet" ;
-	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io as dev-devnet-<TAG>." ;
+	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io/telcoin-association/tn-dev as dev-devnet-<TAG>." ;
 	@echo ;
 	@echo "make docker-push" ;
-	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io." ;
+	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io/telcoin-association/tn-dev." ;
 	@echo ;
 	@echo "make docker-builder" ;
 	@echo "    :::> Create docker builder for building telcoin-network binary container images." ;
@@ -125,7 +132,7 @@ help:
 	@echo "    :::> Create and push the GPG-signed release tag on the origin/main tip." ;
 	@echo ;
 	@echo "make release-build TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Build the linux/amd64 image and tarball, push the image and upload the assets to the draft release." ;
+	@echo "    :::> Build the linux/amd64 image and tarball, push the image to tn-mainnet or tn-testnet by the tag's network, and upload the assets to the draft release." ;
 	@echo ;
 	@echo "make release-sign TAG=vX.Y.Z[-adiri][-rcN]" ;
 	@echo "    :::> Add this maintainer's GPG signature over SHA256SUMS to the draft release." ;
@@ -367,6 +374,21 @@ test-sigkill: build-e2e-bin
 test-epochs: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
+# The previous binary test-upgrade runs: an exported TN_BIN_PATH_PREV wins, otherwise the one
+# build-e2e-bin-prev leaves at E2E_BIN_PREV.
+TN_BIN_PATH_PREV ?= $(E2E_BIN_PREV)
+
+# run the mixed-binary (rolling upgrade) test: four validators start on TN_BIN_PATH_PREV and are
+# upgraded in place, one at a time, to this tree's binary (tests/it/upgrade.rs). Both binaries get
+# the same fork pins. The previous binary is not built here, because which ref to compare against
+# is the caller's choice; without one the target stops rather than letting the test skip. Before an
+# upgrade, compare against the release the network runs (make build-e2e-bin-prev
+# TN_PREV_REF=<release>): TN_PREV_REF's default is the commit the sub-second timestamp tests need.
+.PHONY: test-upgrade
+test-upgrade: build-e2e-bin
+	@test -x "$(TN_BIN_PATH_PREV)" || { echo "no previous node binary at $(TN_BIN_PATH_PREV): run make build-e2e-bin-prev TN_PREV_REF=<release> or export TN_BIN_PATH_PREV" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(TN_BIN_PATH_PREV)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_upgrade ;
+
 # run e2e tests
 test-e2e: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
@@ -411,7 +433,7 @@ test-e2e-forked:
 # All five sibling fork variables are pinned explicitly rather than left to the build: an adiri
 # build compiles DIFFERENT fork epochs for every one of them than a default build, which has
 # all five active from genesis (adiri: seed-signature 383, multi-workers 570, PREVRANDAO 574,
-# leader-seeded ordering 567, sub-second timestamps u32::MAX). Forwarding the same values the
+# leader-seeded ordering 567, sub-second timestamps 747). Forwarding the same values the
 # lanes above use overrides those compiled constants and is what keeps this lane differing from
 # `test-epochs` in exactly one dimension — the governance-Safe fork. (adiri also compiles in
 # CONSENSUS_REGISTRY_FORK_EPOCH = 407 and ADIRI_DUP_BATCH_EPOCH = 160; the first is far outside a
@@ -432,7 +454,7 @@ coverage-html:
 
 # format using the nightly toolchain pinned in rust-nightly
 fmt:
-	cargo +$(NIGHTLY) fmt ;
+	cargo +$(NIGHTLY) fmt --all ;
 
 # clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
 clippy:
@@ -455,7 +477,7 @@ docker-adiri:
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
-# push the local ad-hoc adiri image to ghcr.io
+# push the local ad-hoc adiri image to $(GHCR_IMAGE)
 docker-push:
 	docker push "$(GHCR_IMAGE):dev-adiri-$(TAG)" ;
 

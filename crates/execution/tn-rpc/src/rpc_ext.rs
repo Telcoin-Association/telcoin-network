@@ -2,7 +2,7 @@
 
 use crate::{
     error::{TNRpcError, TelcoinNetworkRpcResult},
-    ConsensusStorageError, EngineToPrimary, RpcNodeInfo,
+    ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo,
 };
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
@@ -138,6 +138,16 @@ pub trait TelcoinNetworkRpcExtApi {
     /// transient modes such as `CvvInactive` while a restarted node catches up.
     #[method(name = "nodeMode")]
     async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode>;
+    /// Return the node's admission snapshot: for each swarm, its connection admission status and
+    /// every BLS key it tracks, with the key's slots, addresses and whether its PeerId is in the
+    /// swarm's authorized set.
+    ///
+    /// Host firewall tooling reads this to keep its P2P allowlist a superset of the peers the node
+    /// admits. Listing a key grants it nothing; `admitted` reports whether the key's PeerId is in
+    /// the authorized set that `Closed` admission enforces, whatever the effective mode.
+    /// Returns "Not Found." until the node's networks have started.
+    #[method(name = "admissionSnapshot")]
+    async fn admission_snapshot(&self) -> TelcoinNetworkRpcResult<RpcAdmissionSnapshot>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -490,6 +500,11 @@ where
     async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode> {
         Ok(self.inner_node_network.node_mode())
     }
+
+    async fn admission_snapshot(&self) -> TelcoinNetworkRpcResult<RpcAdmissionSnapshot> {
+        self.inner_node_network.admission_snapshot().await.ok_or(TNRpcError::NotFound)
+    }
+
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
@@ -1020,7 +1035,13 @@ fn is_real_header(requested: BlockId, header: &SealedHeader, real_header_floor: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonrpsee::core::{to_json_value, JsonValue};
+    use crate::{
+        RpcAdmissionEntry, RpcAdmissionFallback, RpcAdmissionMode, RpcAdmissionSlot,
+        RpcAdmissionStatus, RpcEntrySource, RpcSwarmAdmission,
+    };
+    use jsonrpsee::core::{server::MethodsError, to_json_value, EmptyServerParams, JsonValue};
+    use jsonrpsee_types::ErrorObjectOwned;
+    use serde::de::DeserializeOwned;
     use std::{
         collections::{BTreeMap, BTreeSet},
         future::Future as _,
@@ -1033,9 +1054,9 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
-        test_chain_spec_arc, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeaderDigest, EpochSeedChainValue, ExecHeader, ReputationScores,
-        SignatureVerificationState, TaskManager,
+        hex, test_chain_spec_arc, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
+        ConsensusHeaderDigest, EpochSeedChainValue, ExecHeader, NetworkKeypair, NetworkPublicKey,
+        ReputationScores, SignatureVerificationState, TaskManager,
     };
 
     /// Fixed keypair so nothing here depends on an RNG. `[7u8; 32]` is a valid BLS12-381 scalar
@@ -1379,6 +1400,9 @@ mod tests {
         thread_gate: Option<Arc<ThreadGate>>,
         /// Read counters, shared with the test.
         reads: Arc<Reads>,
+        /// Returned by `admission_snapshot`; `None` until a test sets one, as on a node whose
+        /// networks have not started.
+        snapshot: Option<RpcAdmissionSnapshot>,
     }
 
     impl FakePrimary {
@@ -1396,6 +1420,7 @@ mod tests {
                 pack_gate: None,
                 thread_gate: None,
                 reads: Arc::default(),
+                snapshot: None,
             }
         }
 
@@ -1448,6 +1473,10 @@ mod tests {
 
         fn node_mode(&self) -> NodeMode {
             unreachable!("node mode is not exercised by these tests")
+        }
+
+        async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
+            self.snapshot.clone()
         }
     }
 
@@ -2037,5 +2066,341 @@ mod tests {
         );
         assert_eq!(BlockTimestampMillis::deserialize(full_json).expect("round-trips"), full);
         assert_eq!(BlockTimestampMillis::deserialize(genesis_json).expect("round-trips"), genesis);
+    }
+
+    /// The 96-byte compressed BLS public key of the fixed scalar `[seed; 32]`.
+    fn bls_key(seed: u8) -> Bytes {
+        let keypair = BlsKeypair::from_bytes(&[seed; 32])
+            .expect("a small repeated byte is a valid bls private key scalar");
+        Bytes::from(keypair.public().to_bytes().to_vec())
+    }
+
+    /// The ed25519 network key of the fixed seed `[seed; 32]`.
+    fn network_key(seed: u8) -> NetworkPublicKey {
+        NetworkKeypair::ed25519_from_bytes([seed; 32])
+            .expect("a 32-byte array is a valid ed25519 secret seed")
+            .public()
+            .into()
+    }
+
+    /// An entry the swarm resolved from the signed record of the validator with key seed `seed`,
+    /// published at `record_timestamp` with the single address `address`.
+    fn record_entry(
+        seed: u8,
+        slots: &[RpcAdmissionSlot],
+        address: &str,
+        record_timestamp: u64,
+        admitted: bool,
+    ) -> RpcAdmissionEntry {
+        let network_pubkey = network_key(seed);
+        RpcAdmissionEntry {
+            bls_pubkey: bls_key(seed),
+            slots: slots.to_vec(),
+            peer_id: Some(network_pubkey.to_peer_id().to_string()),
+            network_pubkey: Some(network_pubkey),
+            multiaddrs: vec![address.to_string()],
+            record_multiaddrs: None,
+            record_timestamp: Some(record_timestamp),
+            source: RpcEntrySource::Record,
+            admitted,
+        }
+    }
+
+    /// The schema's example snapshot: a `Closed` primary swarm at epoch 42 tracking a current
+    /// committee member it admits and an eligible validator it does not, in key order.
+    fn schema_example_snapshot() -> RpcAdmissionSnapshot {
+        RpcAdmissionSnapshot::new(
+            Some(42),
+            vec![RpcSwarmAdmission {
+                network: "primary".to_string(),
+                worker_id: None,
+                available: true,
+                tracked_epoch: Some(42),
+                admission: Some(RpcAdmissionStatus {
+                    configured: RpcAdmissionMode::Closed,
+                    effective: RpcAdmissionMode::Closed,
+                    epoch: Some(42),
+                    fallback: None,
+                    resolved_current: 4,
+                    required_current: 3,
+                    connected_current: 3,
+                    contradicted: 0,
+                }),
+                entries: vec![
+                    record_entry(
+                        7,
+                        &[RpcAdmissionSlot::Current, RpcAdmissionSlot::Eligible],
+                        "/ip4/203.0.113.10/udp/49590/quic-v1",
+                        1_793_750_400,
+                        true,
+                    ),
+                    record_entry(
+                        9,
+                        &[RpcAdmissionSlot::Eligible],
+                        "/ip4/198.51.100.7/udp/49590/quic-v1",
+                        1_793_736_000,
+                        false,
+                    ),
+                ],
+            }],
+        )
+    }
+
+    /// The JSON the schema documents for [`record_entry`]'s entry: the BLS key as `0x` hex, the
+    /// PeerId in base58, the network key in the base58 protobuf encoding `tn_info` uses, lowercase
+    /// slot and source names, and no `record_multiaddrs`.
+    fn record_entry_json(
+        seed: u8,
+        slots: &[&str],
+        address: &str,
+        record_timestamp: u64,
+        admitted: bool,
+    ) -> JsonValue {
+        let network_pubkey = network_key(seed);
+        json_object([
+            ("bls_pubkey", to_json(hex::encode_prefixed(bls_key(seed)))),
+            ("slots", to_json(slots)),
+            ("peer_id", to_json(network_pubkey.to_peer_id().to_string())),
+            ("network_pubkey", to_json(network_pubkey.to_string())),
+            ("multiaddrs", to_json([address])),
+            ("record_timestamp", to_json(record_timestamp)),
+            ("source", to_json("record")),
+            ("admitted", to_json(admitted)),
+        ])
+    }
+
+    /// The keys of JSON object `value`.
+    fn keys(value: &JsonValue) -> BTreeSet<&str> {
+        value.as_object().expect("a json object").keys().map(String::as_str).collect()
+    }
+
+    /// `tn_admissionSnapshot` serves the node's snapshot as the schema documents it, key for key:
+    /// snake_case names, `0x` hex BLS keys of 96 bytes, capitalised mode names, a `null`
+    /// fallback, and no `record_multiaddrs` while no launch address replaces a record's
+    /// addresses. The response parses back into the snapshot the node returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_snapshot_serves_the_schema_example() {
+        pin_forks();
+        let snapshot = schema_example_snapshot();
+        let entries = &snapshot.swarms[0].entries;
+        assert!(entries[0].bls_pubkey < entries[1].bls_pubkey, "swarms list entries in key order");
+        let mut primary = FakePrimary::new(ConsensusHeader::default(), Vec::new());
+        primary.snapshot = Some(snapshot.clone());
+        let rpc = TestRpc::new("admission-snapshot", primary);
+        let module = rpc.ext.into_rpc();
+
+        let response: JsonValue = module
+            .call("tn_admissionSnapshot", EmptyServerParams::new())
+            .await
+            .expect("a node with started networks serves its snapshot");
+
+        let swarm = &response["swarms"][0];
+        let entry = &swarm["entries"][0];
+        assert_eq!(keys(&response), BTreeSet::from(["version", "epoch", "swarms"]));
+        assert_eq!(
+            keys(swarm),
+            BTreeSet::from([
+                "network",
+                "worker_id",
+                "available",
+                "tracked_epoch",
+                "admission",
+                "entries"
+            ])
+        );
+        assert_eq!(
+            keys(&swarm["admission"]),
+            BTreeSet::from([
+                "configured",
+                "effective",
+                "epoch",
+                "fallback",
+                "resolved_current",
+                "required_current",
+                "connected_current",
+                "contradicted",
+            ])
+        );
+        assert_eq!(
+            keys(entry),
+            BTreeSet::from([
+                "bls_pubkey",
+                "slots",
+                "peer_id",
+                "network_pubkey",
+                "multiaddrs",
+                "record_timestamp",
+                "source",
+                "admitted",
+            ])
+        );
+        let bls_hex = entry["bls_pubkey"].as_str().expect("bls_pubkey is a string");
+        let bls_bytes =
+            hex::decode(bls_hex.strip_prefix("0x").expect("bls_pubkey has a 0x prefix"))
+                .expect("bls_pubkey is hex");
+        assert_eq!(bls_bytes.len(), 96, "a compressed bls public key");
+        assert_eq!(bls_hex, bls_hex.to_ascii_lowercase());
+
+        let expected = json_object([
+            ("version", to_json(1)),
+            ("epoch", to_json(42)),
+            (
+                "swarms",
+                to_json([json_object([
+                    ("network", to_json("primary")),
+                    ("worker_id", JsonValue::Null),
+                    ("available", to_json(true)),
+                    ("tracked_epoch", to_json(42)),
+                    (
+                        "admission",
+                        json_object([
+                            ("configured", to_json("Closed")),
+                            ("effective", to_json("Closed")),
+                            ("epoch", to_json(42)),
+                            ("fallback", JsonValue::Null),
+                            ("resolved_current", to_json(4)),
+                            ("required_current", to_json(3)),
+                            ("connected_current", to_json(3)),
+                            ("contradicted", to_json(0)),
+                        ]),
+                    ),
+                    (
+                        "entries",
+                        to_json([
+                            record_entry_json(
+                                7,
+                                &["current", "eligible"],
+                                "/ip4/203.0.113.10/udp/49590/quic-v1",
+                                1_793_750_400,
+                                true,
+                            ),
+                            record_entry_json(
+                                9,
+                                &["eligible"],
+                                "/ip4/198.51.100.7/udp/49590/quic-v1",
+                                1_793_736_000,
+                                false,
+                            ),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        assert_eq!(response, expected);
+        assert_eq!(RpcAdmissionSnapshot::deserialize(response).expect("round-trips"), snapshot);
+    }
+
+    /// Before the node's networks start, `tn_admissionSnapshot` answers the `tn` namespace's
+    /// not-found error rather than an empty snapshot, which a caller would read as a swarm
+    /// tracking nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_snapshot_is_not_found_before_the_networks_start() {
+        pin_forks();
+        let rpc = TestRpc::new(
+            "admission-snapshot-none",
+            FakePrimary::new(ConsensusHeader::default(), Vec::new()),
+        );
+        let module = rpc.ext.into_rpc();
+
+        let result =
+            module.call::<_, JsonValue>("tn_admissionSnapshot", EmptyServerParams::new()).await;
+
+        let expected = ErrorObjectOwned::from(TNRpcError::NotFound);
+        assert!(
+            matches!(&result, Err(MethodsError::JsonRpc(error)) if *error == expected),
+            "{result:?}"
+        );
+    }
+
+    /// A swarm that did not answer is listed with `available: false` and a `null` admission and
+    /// keeps every other field of the schema, so a parser finds the same keys on every swarm.
+    #[test]
+    fn unavailable_swarm_serializes_a_null_admission() {
+        let swarm = RpcSwarmAdmission {
+            network: "worker-0".to_string(),
+            worker_id: Some(0),
+            available: false,
+            tracked_epoch: None,
+            admission: None,
+            entries: Vec::new(),
+        };
+
+        let json = to_json(&swarm);
+
+        assert_eq!(
+            json,
+            json_object([
+                ("network", to_json("worker-0")),
+                ("worker_id", to_json(0)),
+                ("available", to_json(false)),
+                ("tracked_epoch", JsonValue::Null),
+                ("admission", JsonValue::Null),
+                ("entries", to_json(Vec::<JsonValue>::new())),
+            ])
+        );
+        assert_eq!(RpcSwarmAdmission::deserialize(json).expect("round-trips"), swarm);
+    }
+
+    /// An entry lists `record_multiaddrs` only while a configured launch address replaces the
+    /// signed record's addresses in `multiaddrs`.
+    #[test]
+    fn record_addresses_are_listed_only_when_a_launch_address_replaces_them() {
+        let launch = "/ip4/192.0.2.1/udp/49590/quic-v1";
+        let record = "/ip4/203.0.113.10/udp/49590/quic-v1";
+        let mut entry = record_entry(7, &[RpcAdmissionSlot::Current], record, 1_793_750_400, true);
+        assert!(to_json(&entry).get("record_multiaddrs").is_none());
+
+        entry.source = RpcEntrySource::Stub;
+        entry.multiaddrs = vec![launch.to_string()];
+        entry.record_multiaddrs = Some(vec![record.to_string()]);
+        let json = to_json(&entry);
+
+        assert_eq!(json["multiaddrs"], to_json([launch]));
+        assert_eq!(json["record_multiaddrs"], to_json([record]));
+        assert_eq!(json["source"], to_json("stub"));
+        assert_eq!(RpcAdmissionEntry::deserialize(json).expect("round-trips"), entry);
+    }
+
+    /// Modes and fallbacks serialize by their capitalised names, slots and sources in lowercase:
+    /// the strings the schema documents, each of which parses back to its variant.
+    #[test]
+    fn admission_names_serialize_as_the_schema_documents() {
+        /// Assert every `(variant, name)` pair serializes to `name` and parses back.
+        fn assert_names<T>(names: &[(T, &str)])
+        where
+            T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            for (variant, name) in names {
+                assert_eq!(to_json(variant), to_json(name), "{variant:?}");
+                assert_eq!(&T::deserialize(to_json(name)).expect("a documented name"), variant);
+            }
+        }
+
+        assert_names(&[
+            (RpcAdmissionMode::Open, "Open"),
+            (RpcAdmissionMode::Grace, "Grace"),
+            (RpcAdmissionMode::Closed, "Closed"),
+        ]);
+        assert_names(&[
+            (RpcAdmissionFallback::Missing, "Missing"),
+            (RpcAdmissionFallback::Stale, "Stale"),
+            (RpcAdmissionFallback::Contradictory, "Contradictory"),
+            (RpcAdmissionFallback::Unresolved, "Unresolved"),
+        ]);
+        assert_names(&[
+            (RpcAdmissionSlot::Previous, "previous"),
+            (RpcAdmissionSlot::Current, "current"),
+            (RpcAdmissionSlot::Next, "next"),
+            (RpcAdmissionSlot::Scheduled, "scheduled"),
+            (RpcAdmissionSlot::Eligible, "eligible"),
+            (RpcAdmissionSlot::Trusted, "trusted"),
+            (RpcAdmissionSlot::Bootstrap, "bootstrap"),
+        ]);
+        assert_names(&[
+            (RpcEntrySource::Record, "record"),
+            (RpcEntrySource::Config, "config"),
+            (RpcEntrySource::Stub, "stub"),
+            (RpcEntrySource::Unresolved, "unresolved"),
+        ]);
     }
 }

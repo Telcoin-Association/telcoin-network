@@ -24,21 +24,41 @@ tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
 
-reth = { workspace = true }
+# TN takes reth's individual crates, not the `reth` umbrella crate (see the root
+# `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
+# them to, with three exceptions. jemalloc only matters to a binary that installs jemalloc as its
+# `#[global_allocator]`, which the umbrella's `reth` binary does and TN's binaries do not.
+# otlp and otlp-logs only fed reth's own OTLP exporters, which are removed (vendor/reth
+# CHANGES.md TN-0029); TN wires its own. js-tracer is this crate's opt-in `js-tracer` feature
+# (see `[features]` and js-tracer.md). Enabled: keccak-cache-global (reth-node-core); asm-keccak
+# (reth-node-core, revm); min-debug-logs (reth-node-core, which caps `tracing` at debug in
+# release builds).
+# TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
+# reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
-reth-node-core = { workspace = true }
-reth-node-ethereum = { workspace = true }
+reth-node-core = { workspace = true, features = [
+    "keccak-cache-global",
+    "asm-keccak",
+    "min-debug-logs",
+] }
 reth-chainspec = { workspace = true }
-reth-chain-state = { workspace = true }
+reth-chain-state = { workspace = true, features = ["rayon"] }
 reth-cli-util = { workspace = true }
-reth-primitives = { workspace = true }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
-reth-revm = { workspace = true }
+reth-revm = { workspace = true, features = ["optional-balance-check"] }
+# Direct dependencies only for their features, which reth-node-ethereum and reth-engine-tree
+# used to enable before TN stopped depending on them (vendor/reth/ROADMAP.md, Phase 1). revm's
+# precompile backends (secp256k1, blst, c-kzg) and asm-keccak are consensus-relevant: they pick
+# the ecrecover, BLS12-381, KZG and keccak implementations. trie-sparse's std selects its
+# parallel paths. `tn/graph.py diff` against the previous graph must stay empty for these.
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "asm-keccak"] }
+reth-trie-sparse = { workspace = true, features = ["std", "metrics"] }
 reth-evm = { workspace = true }
-reth-node-builder = { workspace = true }
+reth-node-types = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-provider = { workspace = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
@@ -46,14 +66,21 @@ reth-stages-types = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
+reth-ethereum-engine-primitives = { workspace = true }
 
 reth-errors = { workspace = true }
+reth-rpc = { workspace = true }
+reth-rpc-api = { workspace = true }
+reth-rpc-builder = { workspace = true }
 reth-rpc-eth-api = { workspace = true }
 reth-rpc-eth-types = { workspace = true }
-reth-network-peers = { workspace = true }
+# `secp256k1` provides `Enr` and `NodeRecord::from_secret_key` for the worker's network stub;
+# reth-rpc enabled it before its admin module went (vendor/reth CHANGES.md TN-0021).
+reth-network-peers = { workspace = true, features = ["secp256k1"] }
 reth-network-api = { workspace = true }
-reth-discv4 = { workspace = true }
-reth-eth-wire = { workspace = true }
+reth-eth-wire-types = { workspace = true }
+# `enr::secp256k1::SecretKey` is the key type reth-network-api's `local_enr` names.
+enr = { workspace = true }
 reth-tasks = { workspace = true }
 reth-tokio-util = { workspace = true }
 reth-tracing = { workspace = true }
@@ -70,7 +97,8 @@ eyre = { workspace = true }
 # `json-rpc` exposes the request/response packet types the size-capped forwarder transport
 # implements `Service` over (issue #1275).
 # `rpc-types-mev` exposes the signed-bundle request and response types used by the epoch-fee adapter.
-alloy = { workspace = true, features = ["genesis", "json-rpc", "rpc-types-mev"] }
+# `rpc-types-engine`: `traits.rs` and `rpc_server_args.rs` use `alloy::rpc::types::engine`.
+alloy = { workspace = true, features = ["genesis", "json-rpc", "rpc-types-engine", "rpc-types-mev"] }
 alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
@@ -112,11 +140,11 @@ test-utils = ["dep:secp256k1"]
 # Expose the production sorted-run accumulator to the allocation benchmark.
 bench-internals = []
 adiri = ["faucet", "tn-types/adiri"]
-# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
-# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
-# zero-size stub and the 332-translation-unit native compile is skipped entirely.
-# Required before any storage-v2 / `StorageSettings` experimentation.
-rocksdb = ["reth/rocksdb"]
+# Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles
+# boa, a JavaScript engine, and lets a debug-namespace caller run scripts on the node. Without
+# it, a JS tracer request gets "JS Tracer is not enabled" and the built-in tracers still work.
+# reth-rpc forwards it to reth-rpc-eth-api and reth-rpc-eth-types. See js-tracer.md.
+js-tracer = ["reth-rpc/js-tracer"]
 
 [[bench]]
 name = "output_overlay"

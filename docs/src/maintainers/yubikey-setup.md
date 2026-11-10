@@ -275,7 +275,8 @@ gpg --verify t.asc t
 
 ## Registry access on the build server
 
-`make release-build` and `make release-publish` push to `ghcr.io/telcoin-association/telcoin-network`, which needs a classic personal access token with only the `write:packages` scope.
+`make release-build` and `make release-publish` push to the release packages, `ghcr.io/telcoin-association/tn-mainnet` for mainnet tags and `ghcr.io/telcoin-association/tn-testnet` for Adiri tags, which needs a classic personal access token with only the `write:packages` scope.
+The scope lets the token write only to packages its account can write, and the [one-time setup](releasing.md#one-time-setup) gives write access on the release packages to the release maintainer account alone, so create the token on that account.
 Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-build-server` with a 90-day expiry.
 That link selects `write:packages` alone; ticking the scope by hand on the token page also selects `repo`, which this token must not have.
 Then, on the build server:

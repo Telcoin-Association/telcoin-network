@@ -21,7 +21,7 @@ use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
-    sync_num_workers_from_chain, EngineToPrimaryRpc,
+    sync_num_workers_from_chain, AdmissionSnapshotSource, EngineToPrimaryRpc,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -41,8 +41,8 @@ use tn_reth::{
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use tn_rpc::{
-    ConsensusStorageError, EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt,
-    TelcoinNetworkRpcExtApiServer as _,
+    ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo,
+    TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
 };
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
@@ -275,6 +275,10 @@ impl EngineToPrimary for NoopEngineToPrimary {
     }
 
     fn node_mode(&self) -> tn_types::NodeMode {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
 }
@@ -604,6 +608,7 @@ fn engine_to_primary_rpc(
             primary_external_address: Multiaddr::empty(),
             worker_external_address: Multiaddr::empty(),
         },
+        AdmissionSnapshotSource::default(),
     )
 }
 

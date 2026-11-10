@@ -249,8 +249,10 @@ impl WorkerMetrics {
     }
 
     /// Record a batch request to `peer` that failed for any reason other than `Deny`
-    /// (open error, unsupported protocol, timeout, protocol error); the peer is skipped for
-    /// the rest of the `request_batches` call.
+    /// (open error, unsupported protocol, a deadline before any batch arrived, protocol error,
+    /// or `Ack` then `End` with none of the requested batches); the peer is skipped for the
+    /// rest of the `request_batches` call. A stream cut by a deadline after some batches
+    /// arrived keeps them and is not counted here.
     pub(crate) fn record_batch_request_failed(&self, peer: &BlsPublicKey) {
         self.with_batch_request_counters(peer, |counters| counters.failed.increment(1));
     }

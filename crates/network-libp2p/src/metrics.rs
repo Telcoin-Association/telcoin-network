@@ -1477,6 +1477,8 @@ struct PeerManagerMetricHandles {
     /// Unique current committee members (by BLS key) with at least one established
     /// connection on this network; members of only the previous committee are not counted.
     committee_peers_connected: Gauge,
+    /// Signed records retained for scheduled and eligible keys outside the committee cache.
+    tracked_records: Gauge,
     /// Connections closed (all directions).
     connections_closed_total: Counter,
     /// Failed dial attempts.
@@ -1504,6 +1506,11 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// The swarm's network label: `primary`, or `worker-N` for worker `N`.
+    pub(crate) fn network(&self) -> &str {
+        &self.network
+    }
+
     /// Timestamp the swarm's latest authoritative resolution observation.
     pub(crate) fn mark_committee_observed(&self) {
         let observed = std::time::SystemTime::now()
@@ -1525,6 +1532,28 @@ impl PeerManagerMetrics {
             .set(count(expected));
         metrics::gauge!("tn_network.committee_unresolved_members", "network" => self.network.clone(), "slot" => slot)
             .set(count(unresolved));
+    }
+
+    /// Publish one tracked slot, `scheduled` or `eligible`, scoped to this configured swarm: the
+    /// keys it holds other than the local identity, and how many of them lack a signed record.
+    ///
+    /// Kept apart from the three committee slots of `set_committee_resolution`, whose label set
+    /// dashboards sum over.
+    pub(crate) fn set_tracked_resolution(
+        &self,
+        slot: &'static str,
+        required: usize,
+        unresolved: usize,
+    ) {
+        metrics::gauge!("tn_network.tracked_required_members", "network" => self.network.clone(), "slot" => slot)
+            .set(Self::gauge_value(required));
+        metrics::gauge!("tn_network.tracked_unresolved_members", "network" => self.network.clone(), "slot" => slot)
+            .set(Self::gauge_value(unresolved));
+    }
+
+    /// Publish the number of signed records retained for tracked keys.
+    pub(crate) fn set_tracked_records(&self, records: usize) {
+        self.handles.tracked_records.set(Self::gauge_value(records));
     }
 
     /// Publish admission inputs independently of connections and node consensus readiness.

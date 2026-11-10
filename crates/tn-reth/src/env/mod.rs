@@ -23,16 +23,16 @@ use std::{
     sync::Arc,
 };
 
-use reth::rpc::builder::config::RethRpcServerConfig as _;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
-use reth_node_builder::NodeConfig;
+use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     ProviderError, ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
 };
 use reth_revm::{database::StateProviderDatabase, State};
+use reth_rpc_builder::config::RethRpcServerConfig as _;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
@@ -679,6 +679,33 @@ mod tests {
         execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
         assert_eq!(env2.last_block_number()?, 2, "block 2 must commit after the heal");
 
+        Ok(())
+    }
+
+    /// A new datadir is written with reth's storage v1 layout, and a restart keeps it.
+    ///
+    /// The layout decides where receipts, change sets and history indices live, and historical
+    /// reads (including consensus-registry reads at past blocks) depend on the history indices.
+    /// A node on v2 would write no MDBX history indices and disagree with v1 nodes on those
+    /// reads. TN pins v1 through one vendored line, `StorageSettings::base()` (TN-0014), which
+    /// `init_genesis` writes into a new datadir; upstream main returns v2 there, so an upstream
+    /// sync that takes that line would silently switch new nodes. This test fails instead.
+    #[tokio::test]
+    async fn test_new_datadir_uses_storage_v1() -> eyre::Result<()> {
+        use reth_provider::{MetadataProvider as _, StorageSettings, StorageSettingsCache as _};
+
+        assert_eq!(StorageSettings::base(), StorageSettings::v1());
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().expect("create temp dir");
+        for run in ["new datadir", "reopened datadir"] {
+            let tm = TaskManager::new(run);
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+            let provider = env.blockchain_provider().database_provider_ro()?;
+            assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
+            assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
+        }
         Ok(())
     }
 }

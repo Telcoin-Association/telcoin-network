@@ -1196,12 +1196,12 @@ mod tests {
         MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv,
     };
     use alloy::{eips::eip7685::EMPTY_REQUESTS_HASH, primitives::aliases::U184};
-    use reth::{args::DatadirArgs, builder::NodeConfig};
     use reth_db::{
         cursor::{DbCursorRW, DbDupCursorRO},
         tables::{HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState},
         transaction::{DbTx, DbTxMut},
     };
+    use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,

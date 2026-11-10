@@ -23,6 +23,10 @@
 # files; rustfmt and clippy read the nearest config above each crate, so those match at
 # any depth. The root Cargo.toml stays out: every dependency bump would need an owner,
 # and [workspace.lints] there can do no more than an #![allow] in a crate root.
+#
+# The test-vendor-reth lane runs vendor/reth/tn/cargo.sh and the tools' tests beside it, and
+# the nested workspace's .config/nextest.toml configures its nextest runs, so both are owned
+# like etc/ and .config/. The vendored crates themselves are not.
 
 /.github/          @grantkee @sstanfield @MavenRain @Huwonk
 /etc/              @grantkee @sstanfield @MavenRain @Huwonk
@@ -31,6 +35,8 @@
 /.config/          @grantkee @sstanfield @MavenRain @Huwonk
 /rust-toolchain*   @grantkee @sstanfield @MavenRain @Huwonk
 /rust-nightly      @grantkee @sstanfield @MavenRain @Huwonk
+/vendor/reth/tn/   @grantkee @sstanfield @MavenRain @Huwonk
+/vendor/reth/.config/ @grantkee @sstanfield @MavenRain @Huwonk
 rustfmt.toml       @grantkee @sstanfield @MavenRain @Huwonk
 .rustfmt.toml      @grantkee @sstanfield @MavenRain @Huwonk
 clippy.toml        @grantkee @sstanfield @MavenRain @Huwonk

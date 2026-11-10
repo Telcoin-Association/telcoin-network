@@ -21,5 +21,6 @@ mod sigkill;
 mod staking;
 mod state_export_import;
 mod sync;
+mod upgrade;
 
 fn main() {}
