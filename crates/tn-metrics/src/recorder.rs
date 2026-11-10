@@ -25,8 +25,13 @@ const SECONDS_BUCKETS: &[f64] =
 /// voter's fast vote stages (`tn_primary_vote_stage_seconds`), the engine's queue wait
 /// (`tn_engine_queue_wait_seconds`) and the worker's in-process batch report to its primary
 /// (`tn_worker_batch_report_seconds`, `tn_executor_consensus_pack_persist_seconds`) normally finish
-/// in that range. This layout adds sub-ms bounds below [`SECONDS_BUCKETS`] and keeps all of its
-/// bounds, so a query that pins one of them (for example `le="0.005"`) still finds its series.
+/// in that range. So do the engine's per-output stage histograms at light load: signer recovery
+/// (`tn_engine_recover_seconds`, which runs beside execution) and the evm, state-root and finish
+/// laps summed over the output's blocks (`tn_engine_evm_seconds`, `tn_engine_root_seconds`,
+/// `tn_engine_finish_seconds`). Under load they reach hundreds of milliseconds, which the bounds
+/// above 5 ms still resolve. This layout adds sub-ms bounds below [`SECONDS_BUCKETS`] and keeps
+/// all of its bounds, so a query that pins one of them (for example `le="0.005"`) still finds its
+/// series.
 const SUB_MS_SECONDS_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0, 30.0,
@@ -168,6 +173,24 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
             Matcher::Full("tn_engine_forward_wait_seconds".to_string()),
             SUB_MS_SECONDS_BUCKETS,
         )?
+        // full matchers, not a `tn_engine_` prefix, so the engine's other `_seconds` histograms
+        // (execution_duration, persist_duration) keep their layout
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_recover_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_evm_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_root_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_finish_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
         .set_buckets_for_metric(
             Matcher::Full("tn_worker_batch_report_seconds".to_string()),
             SUB_MS_SECONDS_BUCKETS,
@@ -269,6 +292,7 @@ impl Recorder for TnPrefixRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tn_types::{max_batch_gas, Epoch, MAX_HEADER_NUM_OF_BATCHES};
 
     /// Minimum gas of a transaction (the intrinsic cost of a plain transfer).
@@ -496,5 +520,58 @@ mod tests {
         ]
         .into_iter()
         .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
+    }
+
+    // ---- bench6 bench6-obs ----
+
+    /// The engine's per-output stage histograms take the sub-ms layout through their `Full`
+    /// matchers. A 100 us lap sits on the first bound, which `le` includes; a 2 ms lap lands
+    /// between 1 ms and 2.5 ms; a loaded output's 300 ms lap lands between 250 ms and 500 ms. The
+    /// engine's execution and persist durations, which a `tn_engine_` prefix matcher would also
+    /// catch, keep [`SECONDS_BUCKETS`].
+    #[test]
+    fn test_engine_stage_histograms_render_sub_ms_buckets() {
+        let inner = build_prometheus_recorder().expect("recorder builds");
+        let handle = inner.handle();
+        let recorder = TnPrefixRecorder { inner };
+        let stages = ["recover", "evm", "root", "finish"];
+        let fast = Duration::from_micros(100);
+        let laps = [fast, Duration::from_millis(2), Duration::from_millis(300)];
+
+        metrics::with_local_recorder(&recorder, || {
+            stages.into_iter().for_each(|stage| {
+                let histogram = metrics::histogram!(format!("tn_engine.{stage}_seconds"));
+                laps.into_iter().for_each(|lap| histogram.record(lap));
+            });
+            metrics::histogram!("tn_engine.execution_duration_seconds").record(fast);
+            metrics::histogram!("tn_engine.persist_duration_seconds").record(fast);
+        });
+
+        let rendered = handle.render();
+        stages
+            .into_iter()
+            .flat_map(|stage| {
+                [
+                    ("le=\"0.0001\"", 1),
+                    ("le=\"0.001\"", 1),
+                    ("le=\"0.0025\"", 2),
+                    ("le=\"0.25\"", 2),
+                    ("le=\"0.5\"", 3),
+                    ("le=\"30\"", 3),
+                ]
+                .map(|(le, count)| format!("tn_engine_{stage}_seconds_bucket{{{le}}} {count}\n"))
+            })
+            .chain(stages.map(|stage| format!("tn_engine_{stage}_seconds_count 3\n")))
+            .chain([
+                "tn_engine_execution_duration_seconds_bucket{le=\"0.005\"} 1\n".to_string(),
+                "tn_engine_persist_duration_seconds_bucket{le=\"0.005\"} 1\n".to_string(),
+            ])
+            .for_each(|line| assert!(rendered.contains(&line), "missing {line:?} in {rendered}"));
+        ["tn_engine_execution_duration_seconds", "tn_engine_persist_duration_seconds"]
+            .into_iter()
+            .for_each(|name| {
+                let first = format!("{name}_bucket{{le=\"0.0001\"}}");
+                assert!(!rendered.contains(&first), "{name} took the sub-ms layout: {rendered}");
+            });
     }
 }
