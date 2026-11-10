@@ -779,7 +779,17 @@ Without a commit it builds this checkout twice, MDBX (`--features tn-reth/mdbx`)
 refuses identical binaries; with a commit it compares that commit (which must have the bench)
 against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`), each side built with
 the flags its own manifest needs for it (a commit from before 2026-11-09 selects tn-lmdb with a
-`tn-lmdb` feature). It runs the profiles in
+`tn-lmdb` feature). `etc/reth-exec-bench.sh --layout <bench dir>` builds this checkout once on
+tn-lmdb (storage v2 is tn-lmdb only) and runs that one binary on storage layout v1 (A,
+`TN_EXEC_BENCH_LAYOUT=v1`) against v2 (B, `TN_EXEC_BENCH_LAYOUT=v2`); its bases, one per layout,
+share `cache/` with backend mode's. Each layout-mode run also records the bench's differential
+(`TN_EXEC_BENCH_DIFF`, to `reports/<run>.diff`), and each round's second run compares its own to
+the first's (`TN_EXEC_BENCH_DIFF_AGAINST`; with the alternating order, v2's in odd rounds and
+v1's in even ones): the report lists each comparison and their total mismatches above the
+profile's table, and a mismatch fails the run. In commit mode `EXEC_LAYOUT_BEFORE` and
+`EXEC_LAYOUT_AFTER` (`v1` or `v2`) set one side's layout, and the before commit's bench may write
+report version 5, from before the layout knob: such a bench refuses the knob, so for it set only
+`EXEC_LAYOUT_AFTER`. It runs the profiles in
 `EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch`,
 `busy-export` and `busy-history` when named) as interleaved pairs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
@@ -811,12 +821,13 @@ each as the run's mean, first third and last third, ending with the commit's ms 
 (tn-lmdb: per `tn_lmdb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
 grows at the same ms per page writes more pages, one that grows per page writes the same pages
 slower. Each profile also prints each side's chain, the genesis, aged-tip and final-tip hashes in
-its runs' JSON headers: execution is deterministic, so in backend mode a difference is marked
-`CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
+its runs' JSON headers: execution is deterministic, so in backend and layout modes a difference
+is marked `CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
 dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
-runs. The script reads one JSON report version, the bench's `JSON_REPORT_VERSION`: it refuses a
-directory without `runs.tsv` or with a report of another version, and refuses before building a
-bench (in commit mode, the before commit's too) that writes another. On Linux,
+runs. The script reads JSON report versions 6 (the bench's `JSON_REPORT_VERSION`) and 5 (6 only
+added fields, which a version 5 run renders as `-`): it refuses a directory without `runs.tsv` or
+with a report of another version, and refuses before building this checkout's bench when it
+writes another than 6, and commit mode's before bench when it writes neither. On Linux,
 `EXEC_SYS_SAMPLE=1` runs a sampler beside each run (every second: `/proc/meminfo`'s Dirty and
 Writeback, the `/proc/diskstats` line of the whole disk under the bench directory and the drive's
 temperature; `filefrag`'s extent count of the data file when it appears and every 30 s, when
