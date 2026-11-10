@@ -1104,3 +1104,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `tn-reth/src/rpc_server_args.rs` (review R14). RPC configuration only.
   *Tests*: tn-reth's `permit_flags_are_bounded` parses all three flags through TN's CLI.
   *Upstream*: yes.
+
+- **TN-0077** — `trace_filter` replays as many blocks at once as the permits it holds.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/trace.rs` (`TRACE_FILTER_PERMITS`, `trace_filter`'s chunk loop).
+  *Why*: the filter took two tracing permits and then traced every block of a chunk at once,
+  up to `--rpc.max-tracing-requests` blocks, each in a blocking task of its own without a
+  permit. The permits bounded the number of requests, not the replays: about half the permit
+  count in requests, each replaying up to the permit count in blocks, could run at once (review
+  R10). The chunk's traces now go through an ordered stream buffered to the two permits the
+  request holds, so a `trace_filter` request occupies two tracing threads, as the permits say.
+  Same traces in the same order; the chunking by `--rpc.max-tracing-requests` still bounds the
+  blocks fetched at once. RPC only.
+  *Tests*: `trace_filter_defaults_to_latest` and the TN-0038 permit tests run the filter over
+  several blocks with a two-permit guard; the bound itself is the stream's buffer.
+  *Upstream*: candidate (reth main has the same fan-out).

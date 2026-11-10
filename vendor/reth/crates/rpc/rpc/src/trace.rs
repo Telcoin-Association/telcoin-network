@@ -16,6 +16,7 @@ use alloy_rpc_types_trace::{
     tracerequest::TraceCallRequest,
 };
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_evm::ConfigureEvm;
@@ -41,6 +42,10 @@ use revm_inspectors::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
+
+/// TN(TN-0038, TN-0077): the tracing permits one `trace_filter` request holds, and so the
+/// blocks it replays at once.
+const TRACE_FILTER_PERMITS: u32 = 2;
 
 /// `trace` API implementation.
 ///
@@ -421,7 +426,7 @@ where
             self.inner
                 .blocking_task_guard
                 .clone()
-                .acquire_many_owned(2)
+                .acquire_many_owned(TRACE_FILTER_PERMITS)
                 .await
                 .map_err(|_| EthApiError::InternalEthError)?,
         );
@@ -471,8 +476,14 @@ where
                 block_traces.push(traces);
             }
 
+            // TN(TN-0077): a block trace runs on a blocking thread of its own, so the chunk
+            // replays as many blocks at once as the request holds permits, not the whole chunk
+            // (review R10). The stream keeps the blocks' order.
             #[allow(clippy::iter_with_drain)]
-            let block_traces = futures::future::try_join_all(block_traces.drain(..)).await?;
+            let block_traces: Vec<_> = futures::stream::iter(block_traces.drain(..))
+                .buffered(TRACE_FILTER_PERMITS as usize)
+                .try_collect()
+                .await?;
             all_traces.extend(block_traces.into_iter().flatten().flat_map(|traces| {
                 traces.into_iter().flatten().flat_map(|traces| traces.into_iter())
             }));
@@ -924,7 +935,7 @@ mod trace_permit_tests {
         /// The permits the method takes: `trace_filter` takes two, as upstream's handler did.
         const fn permits(self) -> usize {
             match self {
-                Self::Filter => 2,
+                Self::Filter => TRACE_FILTER_PERMITS as usize,
                 _ => 1,
             }
         }
