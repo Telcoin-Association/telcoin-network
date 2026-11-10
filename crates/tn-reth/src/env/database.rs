@@ -1,9 +1,10 @@
 //! The engine under TN's reth execution database.
 //!
-//! The default build runs reth's database on MDBX (`reth_db::DatabaseEnv`, `<db>/mdbx.dat`). The
-//! `tn-lmdb` feature runs it on the tn-lmdb engine instead (`tn_lmdb_reth::TnLmdbEnv`,
-//! `<db>/tn-lmdb.dat`). Every difference between the two builds lives in this module: the rest of
-//! the crate names [`RethDbEnv`] and [`RethDb`], never either engine.
+//! The default build runs reth's database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`,
+//! `<db>/tn-lmdb.dat`). The `mdbx` feature runs it on MDBX instead (`reth_db::DatabaseEnv`,
+//! `<db>/mdbx.dat`), the legacy backend kept for tests of that path until testnet has resynced.
+//! Every difference between the two builds lives in this module: the rest of the crate names
+//! [`RethDbEnv`] and [`RethDb`], never either engine.
 //!
 //! [`open_rw`] opens (or creates) the read-write database a node runs on. Both builds first run
 //! [`check_backend`]: the MDBX build refuses a database directory that holds tn-lmdb's file or a
@@ -19,17 +20,17 @@ use reth_node_core::args::DatabaseArgs;
 
 use crate::RethConfig;
 
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 mod migrate;
 #[cfg(test)]
 mod tests;
 
 /// The database environment reth runs on: MDBX's `DatabaseEnv`.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub type RethDbEnv = reth_db::DatabaseEnv;
 
 /// The database environment reth runs on: tn-lmdb's `TnLmdbEnv`.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub type RethDbEnv = tn_lmdb_reth::TnLmdbEnv;
 
 /// Type wrapper for a Reth DB.
@@ -37,13 +38,12 @@ pub type RethDbEnv = tn_lmdb_reth::TnLmdbEnv;
 pub type RethDb = Arc<RethDbEnv>;
 
 /// MDBX's data file inside the database directory.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const MDBX_DATA_FILE: &str = "mdbx.dat";
 
-/// tn-lmdb's data file inside the database directory: `tn_lmdb_reth::DATA_FILE`, which the MDBX
-/// build does not compile in.
-#[cfg(not(feature = "tn-lmdb"))]
-const TN_LMDB_DATA_FILE: &str = "tn-lmdb.dat";
+/// tn-lmdb's data file inside the database directory, which the MDBX build refuses.
+#[cfg(feature = "mdbx")]
+use tn_lmdb_reth::DATA_FILE as TN_LMDB_DATA_FILE;
 
 /// The marker a finished MDBX to tn-lmdb migration leaves in the database directory. The tn-lmdb
 /// build refuses an `mdbx.dat` beside it (written after the migration); the MDBX build refuses
@@ -85,7 +85,7 @@ pub(crate) fn temp_chain_db_args() -> DatabaseArgs {
 ///
 /// The MDBX build's is reth's own default: the OS page size clamped to 4 KiB..=64 KiB (16 KiB on
 /// Apple Silicon, 4 KiB on x86 Linux), which `open_rw` passes to MDBX explicitly.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn default_page_size() -> u32 {
     /// The smallest page size reth gives MDBX: smaller pages may not hold reth's largest rows.
     const MIN: usize = 4096;
@@ -101,14 +101,14 @@ pub fn default_page_size() -> u32 {
 ///
 /// The tn-lmdb build's is the adapter's default (`tn_lmdb_reth::TnLmdbArgs::default()`, 4 KiB),
 /// which `tn_lmdb_args` starts from.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn default_page_size() -> u32 {
     tn_lmdb_reth::TnLmdbArgs::default().page_size
 }
 
 // The MDBX build's `default_page_size` reads the OS page size through `page_size`, as reth's own
 // default does; the tn-lmdb build does not.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 use page_size as _;
 
 /// Open (or create) the read-write reth database in directory `path`, after [`check_backend`].
@@ -116,7 +116,7 @@ use page_size as _;
 /// The MDBX build opens through reth's `init_db`, a new file with `--db.page-size` or else
 /// [`default_page_size`], and records per-operation latency metrics (`with_metrics`; a noop unless
 /// the global metrics recorder is installed, i.e. the node runs with `--metrics`).
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
     check_backend(path)?;
     let db_args = &reth_config.0.db;
@@ -131,13 +131,13 @@ pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<Ret
 /// before anything is read or written, and its [`check_backend`] migrates an MDBX database onto
 /// tn-lmdb with them. It then opens as reth's `init_db` does: the database version file, every one
 /// of reth's tables, and the client version.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
     let db_args = &reth_config.0.db;
     open_tn_lmdb(path, db_args, db_args.database_args().client_version().clone())
 }
 
-#[cfg(all(test, feature = "tn-lmdb"))]
+#[cfg(all(test, not(feature = "mdbx")))]
 thread_local! {
     /// Test-only: the tn-lmdb databases this thread opens through [`open_tn_lmdb`] commit with the
     /// engine's `NoSync` and no automatic syncs, which no CLI flag gives (`--db.sync-mode
@@ -147,7 +147,7 @@ thread_local! {
 }
 
 /// [`open_rw`] of the tn-lmdb build, with the client version to record.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn open_tn_lmdb(
     path: &Path,
     db_args: &DatabaseArgs,
@@ -185,13 +185,13 @@ fn open_tn_lmdb(
 /// (the marker [`MIGRATED_MARKER`] alone). It warns of a stopped migration's temp directory
 /// ([`MIGRATING_DIR`], a partial copy beside an unchanged MDBX database), naming it and its size,
 /// and never removes it.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 fn check_backend(path: &Path) -> eyre::Result<()> {
     let tn_lmdb = path.join(TN_LMDB_DATA_FILE);
     if file_exists(&tn_lmdb)? {
         eyre::bail!(
             "the reth database at {} is a tn-lmdb database ({} exists), but this build runs \
-             reth on MDBX: run a build with the `tn-lmdb` feature, or start from a fresh datadir \
+             reth on MDBX: run a build without the `mdbx` feature, or start from a fresh datadir \
              (or `db load-state`)",
             path.display(),
             tn_lmdb.display(),
@@ -202,8 +202,8 @@ fn check_backend(path: &Path) -> eyre::Result<()> {
         eyre::bail!(
             "the reth database at {} was migrated from MDBX to tn-lmdb ({} exists), but {} is \
              missing, and this build runs reth on MDBX: it does not create a new database beside \
-             the datadir's static files in its place; restore the file and run a build with the \
-             `tn-lmdb` feature, or start from a fresh datadir (or `db load-state`)",
+             the datadir's static files in its place; restore the file and run a build without \
+             the `mdbx` feature, or start from a fresh datadir (or `db load-state`)",
             path.display(),
             marker.display(),
             tn_lmdb.display(),
@@ -221,7 +221,7 @@ fn check_backend(path: &Path) -> eyre::Result<()> {
 }
 
 /// The bytes of the files directly in `dir`: a migration's temp directory holds no directories.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
     std::fs::read_dir(dir)?
         .try_fold(0u64, |sum, entry| Ok(sum.saturating_add(entry?.metadata()?.len())))
@@ -240,7 +240,7 @@ fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
 /// refuses an `mdbx.dat` written after a migration or beside a `tn-lmdb.dat` no migration left (or
 /// a migrated database whose `tn-lmdb.dat` is missing), and removes a stopped migration's temp
 /// directory.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn check_backend(path: &Path, args: tn_lmdb_reth::TnLmdbArgs) -> eyre::Result<()> {
     migrate::migrate_from_mdbx(path, args)
 }
@@ -251,7 +251,7 @@ fn check_backend(path: &Path, args: tn_lmdb_reth::TnLmdbArgs) -> eyre::Result<()
 ///
 /// The MDBX build never migrates, so it refuses nothing here: its open refuses a tn-lmdb or
 /// migrated directory before creating anything.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
     let _ = path;
     Ok(())
@@ -264,7 +264,7 @@ pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
 /// The tn-lmdb build refuses a directory holding MDBX's data file (`mdbx.dat`), whatever its
 /// database holds: the open would migrate it, or finish a stopped migration, which removes MDBX's
 /// files.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
     let mdbx = path.join(MDBX_DATA_FILE);
     if file_exists(&mdbx)? {
@@ -300,7 +300,7 @@ pub struct DbTableStat {
 /// The tn-lmdb build cannot: its read-only open is refused while another handle holds the database
 /// with write access, so a caller holds the datadir lock for the report, and a node starting
 /// meanwhile is refused at that lock rather than at its database open.
-pub const DB_TABLE_STATS_NEEDS_STOPPED_NODE: bool = cfg!(feature = "tn-lmdb");
+pub const DB_TABLE_STATS_NEEDS_STOPPED_NODE: bool = !cfg!(feature = "mdbx");
 
 /// The figures of each of reth's tables in the database in directory `path`, sorted by name. A
 /// table the database lacks is skipped, so an older database whose schema predates a table later
@@ -309,7 +309,7 @@ pub const DB_TABLE_STATS_NEEDS_STOPPED_NODE: bool = cfg!(feature = "tn-lmdb");
 /// The MDBX build opens read-only through reth's `open_db_read_only`, which works while a node
 /// runs. It first refuses a directory holding a tn-lmdb database, or a migrated one, as the
 /// backend guard does.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
     use reth_db::{
         mdbx::{open_db_read_only, DatabaseArguments},
@@ -377,7 +377,7 @@ fn mdbx_table_stat(
 /// (the node's open runs it), or, beside a finished migration's marker or a `tn-lmdb.dat` no
 /// migration left, as the node's open refuses it. With neither `mdbx.dat` nor `tn-lmdb.dat` there
 /// is no reth database at `path`.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
     use reth_db::{mdbx::Error as MdbxError, DatabaseError};
     use tn_lmdb_reth::{TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
@@ -473,7 +473,7 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 ///   minimum (`MIN_GROWTH`, 1 MiB) is refused here.
 /// - `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers` and `--db.log-level`
 ///   have no tn-lmdb equivalent and are refused when set.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
     use reth_db::mdbx::SyncMode as MdbxSyncMode;
     use tn_lmdb_reth::{SyncMode, TnLmdbArgs, MIN_GROWTH};
@@ -552,7 +552,7 @@ fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
 /// meta's copy), and the pages commits free wait at most about one of these, and a commit, before
 /// they are reused. Checked at commit: commits that then stop wait for the next commit or the
 /// close.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const SAFE_NO_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// `--db.sync-mode safe-no-sync`'s automatic sync by size on tn-lmdb (the engine's `sync_bytes`): a
@@ -561,13 +561,13 @@ const SAFE_NO_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(
 /// (a crash of the process alone, none, but inside a meta's copy), and the pages commits free wait
 /// at most about one of these, and a commit, before they are reused, so they hold at most about
 /// this beyond the live pages.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const SAFE_NO_SYNC_BYTES: u64 = 64 << 20;
 
 /// Create or check reth's database version file in `path`, as reth's `create_db` does: an absent
 /// or empty directory is created and gets the file; otherwise the file must hold reth's version,
 /// and a missing one is written.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn init_db_version_file(path: &Path) -> eyre::Result<()> {
     use reth_db::version::{check_db_version_file, create_db_version_file, DatabaseVersionError};
 
@@ -587,7 +587,7 @@ fn init_db_version_file(path: &Path) -> eyre::Result<()> {
 
 /// Whether the database directory `path` is absent or empty: reth's `is_database_empty`, except
 /// that a stat or listing error is an error, never "empty".
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn database_is_empty(path: &Path) -> eyre::Result<bool> {
     if !file_exists(path)? {
         return Ok(true);
@@ -600,7 +600,7 @@ fn database_is_empty(path: &Path) -> eyre::Result<bool> {
 /// Record the client version that opens the database with write access, as reth's
 /// `DatabaseEnv::record_client_version` does: a new `VersionHistory` row, keyed by the time in
 /// seconds, when `version` differs from the last row. An empty version records nothing.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 fn record_client_version<DB: reth_db::Database>(
     db: &DB,
     version: reth_db::ClientVersion,

@@ -27,9 +27,9 @@ fn config(db: DatabaseArgs) -> RethConfig {
 }
 
 /// This build's data file, and the other build's.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const OWN_AND_OTHER_DATA_FILE: (&str, &str) = ("mdbx.dat", TN_LMDB_DATA_FILE);
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const OWN_AND_OTHER_DATA_FILE: (&str, &str) = (tn_lmdb_reth::DATA_FILE, MDBX_DATA_FILE);
 
 /// A database directory holding the other engine's data file is refused before anything is
@@ -48,9 +48,9 @@ fn open_rw_refuses_the_other_engines_database() {
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
     assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     assert!(msg.contains("fresh datadir"), "says what the operator can do: {msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     {
         assert!(msg.contains("migration") && msg.contains("unchanged"), "says why: {msg}");
         assert_eq!(std::fs::read(path.join(other)).expect("read"), b"planted", "MDBX unchanged");
@@ -73,9 +73,9 @@ fn check_backend_fails_on_a_stat_error() {
     std::fs::write(&file, b"not a directory").expect("file");
     let path = file.join("db");
 
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     let checked = check_backend(&path);
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     let checked = check_backend(&path, tn_lmdb_reth::TnLmdbArgs::default());
     let err = checked.expect_err("a stat error fails the guard");
     let msg = format!("{err:#}");
@@ -163,9 +163,9 @@ fn db_table_stats_lists_populated_tables() {
 fn db_table_stats_skips_tables_the_database_lacks() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     drop(reth_db::create_db(&path, test_db_args().database_args()).expect("create"));
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     drop(
         tn_lmdb_reth::TnLmdbEnv::open(
             &path,
@@ -186,9 +186,9 @@ fn db_table_stats_skips_tables_the_database_lacks() {
 fn db_table_stats_refuses_the_other_engines_database() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     write_stats_rows(&path);
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     std::fs::create_dir(&path).expect("db dir");
     std::fs::write(path.join(OWN_AND_OTHER_DATA_FILE.1), b"planted").expect("plant");
 
@@ -196,9 +196,9 @@ fn db_table_stats_refuses_the_other_engines_database() {
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
     assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     assert!(msg.contains("pending or unfinished") && msg.contains("start the node"), "{msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     assert!(!path.join(OWN_AND_OTHER_DATA_FILE.0).try_exists().expect("stat"), "nothing made");
 }
 
@@ -229,9 +229,9 @@ fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
 
     std::fs::write(path.join("mdbx.dat"), b"an MDBX database").expect("plant");
     let checked = refuse_pending_migration(&path);
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     checked.expect("the MDBX build never migrates");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     {
         let msg = format!("{:#}", checked.expect_err("the open would migrate it"));
         assert!(msg.contains(&path.join("mdbx.dat").display().to_string()), "names it: {msg}");
@@ -241,7 +241,7 @@ fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
 }
 
 /// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 mod mdbx {
     use super::*;
 
@@ -259,7 +259,7 @@ mod mdbx {
             let msg = format!("{err:#}");
             let marker = path.join(MIGRATED_MARKER).display().to_string();
             assert!(msg.contains(&marker), "names the marker: {msg}");
-            assert!(msg.contains("is missing") && msg.contains("`tn-lmdb` feature"), "{msg}");
+            assert!(msg.contains("is missing") && msg.contains("`mdbx` feature"), "{msg}");
         };
         refused(open_rw(&config(test_db_args()), &path).expect_err("the marker alone"));
         refused(db_table_stats(&path).expect_err("the stats refuse it too"));
@@ -292,7 +292,7 @@ mod mdbx {
     }
 }
 
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 mod tn_lmdb {
     use super::*;
     use reth_db::{cursor::DbCursorRO as _, mdbx::SyncMode as MdbxSyncMode, ClientVersion};

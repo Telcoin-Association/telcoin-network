@@ -431,11 +431,14 @@ caller's trust decision (the window is validated upstream against consensus data
 
 ## Database backend
 
-TN's reth execution database lives in `<datadir>/db`. The default build runs it on MDBX
-(`reth_db::DatabaseEnv`, `db/mdbx.dat`). The `tn-lmdb` feature (forwarded by `tn-node`,
-`telcoin-network-cli` and `telcoin-network`) runs it on the tn-lmdb engine instead
-(`tn_lmdb_reth::TnLmdbEnv`, `db/tn-lmdb.dat`). reth is not patched: it is generic over the database on
-every path TN uses, and MDBX stays compiled in both builds. Every backend difference lives in
+TN's reth execution database lives in `<datadir>/db`. The default build runs it on the tn-lmdb
+engine (`tn_lmdb_reth::TnLmdbEnv`, `db/tn-lmdb.dat`); every release, mainnet's included, is this
+build. The opt-in `mdbx` feature (forwarded by `tn-node`, `telcoin-network-cli` and
+`telcoin-network`) runs it on MDBX instead (`reth_db::DatabaseEnv`, `db/mdbx.dat`): the legacy
+backend, kept until testnet has resynced, for the tests of that path (`./etc/ci-lanes.sh test-mdbx`)
+and as the previous binary of the migration e2e lanes. reth is not patched: it is generic over the
+database on every path TN uses, and MDBX stays compiled in both builds (reth's crates require it,
+and the default build reads an MDBX database to migrate it). Every backend difference lives in
 `src/env/database.rs`; other code names `RethDbEnv` and `RethDb` (`Arc<RethDbEnv>`).
 
 - **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
@@ -447,10 +450,10 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   would create an empty database beside the datadir's static files, and reth's
   `check_consistency` would then prune the static files back to the empty database's tip. The
   checks use `try_exists`, so a stat error fails the open. The MDBX build's error names the
-  directory and both engines; the operator runs the matching build or starts from a fresh datadir
+  directory and both engines; the operator runs the default build or starts from a fresh datadir
   (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
-  missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a tn-lmdb
-  build, rather than create a new database in its place. It warns of a stopped migration's temp
+  missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a build
+  without `mdbx`, rather than create a new database in its place. It warns of a stopped migration's temp
   directory (`db/tn-lmdb-migrating/`, a partial copy beside an unchanged MDBX database), naming it
   and its size, and never removes it.
 - **MDBX to tn-lmdb migration** (`src/env/database/migrate.rs`, tn-lmdb build): the first open of a
@@ -500,8 +503,8 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   (`AccountChangeSets`, `StorageChangeSets`), appended by block and read by range, are composite keys (`key ‖ subkey`) in plain engine tables. A
   table's form is part of the file's format: the open refuses a file holding one in the other
   form (`MDBX_INCOMPATIBLE`, naming the table and both forms). No tn-lmdb file in the other form
-  exists outside tests (the backend is pre-release and off by default), so there is no migration
-  between the forms.
+  existed outside tests before tn-lmdb became the default (it was pre-release and off by default
+  until then), so there is no migration between the forms.
 - **What differs on tn-lmdb:**
   - no per-operation latency metrics (MDBX's `with_metrics`). The sampled gauges keep MDBX's
     names (`db.table_size` and the rest), so dashboards and the e2e `reth_db_table_size` check
@@ -512,7 +515,7 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
 
 ### Migrating from MDBX
 
-A build with the `tn-lmdb` feature that finds an MDBX reth database (`db/mdbx.dat`) migrates it at
+The default (tn-lmdb) build that finds an MDBX reth database (`db/mdbx.dat`) migrates it at
 the node's first start, when `RethEnv::new_database` opens the database and before reth reads
 anything. The module docs of `src/env/database/migrate.rs` have the states and steps. The node
 logs `mdbx.dat`'s size, the live bytes of reth's tables in it and the free space, each table's
@@ -620,7 +623,7 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 ### Upgrading a testnet node
 
 A testnet node on `v0.16.0-adiri` runs MDBX for both databases, in storage layout v1. The first
-start of this release's binary built with `tn-lmdb`:
+start of this release's binary (the default build, tn-lmdb):
 
 1. migrates the consensus database from MDBX to tndb and removes the MDBX environments (one-way,
    #1558);
@@ -703,9 +706,9 @@ build from its own target directory:
 ```sh
 mkdir -p target/persist-bench-tmp
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
-  cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+  cargo test --release -p tn-reth --features mdbx --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
-  cargo test --release -p tn-reth --features tn-lmdb --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+  cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 ```
 
 Mac results, 2026-10-27 (release, default knobs: 400 blocks of 200 transactions over 10000
@@ -740,10 +743,12 @@ sets before it opens the database), so its rows time no sync.
 `etc/reth-exec-bench.sh <bench dir> [before-commit]` runs `tn-engine`'s busy-node execution bench
 (`exec_bench` in `crates/engine/tests/exec_bench/main.rs`, `#[ignore]`d, its knobs in the module
 docs), which times `execute_consensus_output` per output and splits each output's time by stage.
-Without a commit it builds this checkout twice, MDBX (the default features) and tn-lmdb
-(`--features tn-reth/tn-lmdb`), each into its own target directory under the bench directory, and
+Without a commit it builds this checkout twice, MDBX (`--features tn-reth/mdbx`) and tn-lmdb
+(the default features), each into its own target directory under the bench directory, and
 refuses identical binaries; with a commit it compares that commit (which must have the bench)
-against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`). It runs the profiles in
+against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`), each side built with
+the flags its own manifest needs for it (a commit from before 2026-11-09 selects tn-lmdb with a
+`tn-lmdb` feature). It runs the profiles in
 `EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch`,
 `busy-export` and `busy-history` when named) as interleaved pairs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
@@ -1034,7 +1039,7 @@ From `crates/tn-reth/Cargo.toml`:
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
 | `js-tracer` | Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles boa, a JavaScript engine (35 packages). Without it a JS tracer request gets error `-32603` `JS Tracer is not enabled`, and the built-in tracers work as before. Forwarded by `tn-node` and the `telcoin-network` binary. See [js-tracer.md](js-tracer.md). |
-| `tn-lmdb` | Run the reth execution database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`) instead of MDBX. Off by default. A node's first open on it migrates an MDBX database; see "Database backend". |
+| `mdbx` | Run the reth execution database on MDBX (`reth_db::DatabaseEnv`), the legacy backend, instead of the default tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`). Off by default, and off in every release: kept for the tests of the legacy path until testnet has resynced. The default build's first open migrates an MDBX database; see "Database backend". |
 
 The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
 them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). Three of

@@ -24,7 +24,7 @@
 use crate::RethDb;
 
 /// MDBX's counter names, in the order of [`DbCounters`]'s values: libmdbx's `PageOps` fields.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const MDBX_NAMES: [&str; 12] = [
     "mdbx_newly",
     "mdbx_cow",
@@ -46,17 +46,17 @@ const MDBX_NAMES: [&str; 12] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DbCounters {
     /// libmdbx's page-operation statistics, in [`MDBX_NAMES`]'s order.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     values: [u64; MDBX_NAMES.len()],
     /// tn-lmdb's I/O and allocation counters.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     io: tn_lmdb_reth::IoStats,
 }
 
 impl DbCounters {
     /// What happened between `earlier` and `self`, two reads of one database (`earlier` first):
     /// each counter's difference, saturating, so a pair from two databases does not wrap.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     pub fn since(&self, earlier: &Self) -> Self {
         Self { values: std::array::from_fn(|i| self.values[i].saturating_sub(earlier.values[i])) }
     }
@@ -64,19 +64,19 @@ impl DbCounters {
     /// What happened between `earlier` and `self`, two reads of one database (`earlier` first):
     /// tn-lmdb's `IoStats::since`, each counter's saturating difference except
     /// `tn_lmdb_max_gate_lag`, a maximum since the open, which is `self`'s.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     pub fn since(&self, earlier: &Self) -> Self {
         Self { io: self.io.since(&earlier.io) }
     }
 
     /// The counters as `(name, value)`, in this build's fixed order (see the module docs).
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     pub fn entries(&self) -> Vec<(&'static str, u64)> {
         MDBX_NAMES.into_iter().zip(self.values).collect()
     }
 
     /// The counters as `(name, value)`, in this build's fixed order (see the module docs).
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     pub fn entries(&self) -> Vec<(&'static str, u64)> {
         // Destructured whole, so a counter the engine adds fails to compile here until it is named.
         let tn_lmdb_reth::IoStats {
@@ -149,7 +149,7 @@ impl DbCounters {
 
 /// The open database `db`'s cumulative counters (see the module docs for what they count and what
 /// a read costs).
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
     let ops = db.info()?.page_ops();
     Ok(DbCounters {
@@ -172,7 +172,7 @@ pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
 
 /// The open database `db`'s cumulative counters (see the module docs for what they count and what
 /// a read costs). Never fails on tn-lmdb.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
     Ok(DbCounters { io: db.io_stats() })
 }
@@ -180,14 +180,14 @@ pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
 /// The page size, in bytes, of the open database `db`: the one its file was created with, which
 /// a later `--db.page-size` does not change. On MDBX one environment stat, a read transaction
 /// over the table catalog: read it once per open, not per output.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn db_page_size(db: &RethDb) -> eyre::Result<u32> {
     Ok(db.stat()?.page_size())
 }
 
 /// The page size, in bytes, of the open database `db`: the one its file was created with, which
 /// a later `--db.page-size` does not change.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn db_page_size(db: &RethDb) -> eyre::Result<u32> {
     Ok(db.page_size())
 }
@@ -237,12 +237,12 @@ mod tests {
         // pages were added and reached the disk: reth maps MDBX writable, so its durable commit
         // syncs the map (`msync`) or the file (`fsync`) rather than writing (`wops`)
         let count = |name: &str| delta.get(name).expect("a counter of this build");
-        #[cfg(not(feature = "tn-lmdb"))]
+        #[cfg(feature = "mdbx")]
         let moved = [
             ("pages added", count("mdbx_newly")),
             ("syncs", count("mdbx_msync") + count("mdbx_fsync")),
         ];
-        #[cfg(feature = "tn-lmdb")]
+        #[cfg(not(feature = "mdbx"))]
         let moved = [
             ("commits", count("tn_lmdb_commits")),
             ("pages synced", count("tn_lmdb_pages_synced")),

@@ -65,7 +65,7 @@ pub(crate) const TN_LAYOUT_VERSION: u32 = 1;
 pub(crate) const RETH_SETTINGS_KEY: &str = "storage_settings";
 
 /// Whether this build can run the v2 layout: only on tn-lmdb.
-const V2_SUPPORTED: bool = cfg!(feature = "tn-lmdb");
+const V2_SUPPORTED: bool = !cfg!(feature = "mdbx");
 
 /// The storage layout of a reth execution datadir.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +219,7 @@ fn refuse_unsupported(layout: StorageLayout, what: &str) -> eyre::Result<()> {
     if layout == StorageLayout::V2 && !V2_SUPPORTED {
         eyre::bail!(
             "storage layout v2 for {what} needs the tn-lmdb backend, and this build runs reth on \
-             MDBX: run a build with the `tn-lmdb` feature"
+             MDBX: run a build without the `mdbx` feature"
         );
     }
     Ok(())
@@ -401,7 +401,7 @@ mod tests {
         let chain = chain();
         let tmp = TempDir::new()?;
         let layout = StorageLayout::for_new_datadirs();
-        if !cfg!(feature = "tn-lmdb") {
+        if cfg!(feature = "mdbx") {
             assert_eq!(layout, StorageLayout::V1, "the MDBX build gives v1");
         }
         for run in ["new", "reopened"] {
@@ -428,7 +428,7 @@ mod tests {
     }
 
     /// The tn-lmdb build creates a v2 datadir, and a reopen asked for v1 keeps v2.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     #[tokio::test]
     async fn tn_lmdb_creates_a_v2_datadir_and_keeps_it() -> eyre::Result<()> {
         let chain = chain();
@@ -443,7 +443,7 @@ mod tests {
 
     /// The MDBX build refuses to create a v2 datadir, and leaves it new: a v1 open then creates
     /// it as v1.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     #[tokio::test]
     async fn mdbx_refuses_to_create_a_v2_datadir() -> eyre::Result<()> {
         let chain = chain();
@@ -456,7 +456,7 @@ mod tests {
     }
 
     /// The MDBX build refuses a datadir whose rows say v2.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     #[tokio::test]
     async fn mdbx_refuses_a_v2_datadir() -> eyre::Result<()> {
         let chain = chain();
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// A v2 datadir without TN's marker was not written by a TN build: refused.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     #[tokio::test]
     async fn a_v2_datadir_without_the_marker_is_refused() -> eyre::Result<()> {
         let chain = chain();

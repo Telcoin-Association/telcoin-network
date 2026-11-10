@@ -1119,7 +1119,7 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 ///
 /// ```text
 /// TN_RETH_MIGRATE_SRC=/path/to/datadir/db TMPDIR=/path/on/a/real/disk \
-///   cargo nextest run -p tn-reth --features tn-lmdb --run-ignored only --no-capture \
+///   cargo nextest run -p tn-reth --run-ignored only --no-capture \
 ///   -E 'test(migrates_a_copy_of_a_real_database)'
 /// ```
 ///

@@ -137,10 +137,10 @@ zeroize = "1.8.2"
 # `rocksdb`/`edge` features and the `rocksdb` crate removed (vendor/reth CHANGES.md TN-0014),
 # and etc/rocksdb-gate.sh fails if a rocksdb package ever enters Cargo.lock again.
 #
-# The off-by-default `tn-lmdb` feature on tn-reth / tn-node / telcoin-network-cli /
-# telcoin-network swaps TN's reth database from MDBX to the tn-lmdb engine (`tn-lmdb-reth`,
-# which also needs reth-db-api, reth-storage-errors and reth-trie-common); MDBX stays compiled
-# either way.
+# TN's reth database runs on the tn-lmdb engine (`tn-lmdb-reth`, which also needs reth-db-api,
+# reth-storage-errors and reth-trie-common). The off-by-default `mdbx` feature on tn-reth /
+# tn-node / telcoin-network-cli / telcoin-network selects MDBX, the legacy backend, instead; MDBX
+# stays compiled either way (the default build migrates an MDBX database at its first open).
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }

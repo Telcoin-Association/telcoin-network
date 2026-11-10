@@ -14,12 +14,12 @@
 //!    and called (contract storage), value transfers go around a ring of accounts, and a light
 //!    transfer load runs through validator-1 to validator-3 for the whole run, while at least three
 //!    epochs close (each closing block runs the `ConsensusRegistry` system calls).
-//! 2. In-place upgrade: validator-4 stops and starts on `TN_BIN_PATH` (the `tn-lmdb` build) over
-//!    the same datadir. Its reth database must move MDBX to tn-lmdb, and its consensus database
-//!    MDBX to tndb when `TN_BIN_PATH_PREV` is a release from before tndb (`migrate_from_mdbx` in
-//!    `tn_reth` and `tn_storage`; a `TN_BIN_PATH_PREV` built after tndb has nothing to move there).
-//!    It must record TN's storage layout marker (layout v1) in the existing reth datadir and follow
-//!    the chain again.
+//! 2. In-place upgrade: validator-4 stops and starts on `TN_BIN_PATH` (the default, tn-lmdb, build)
+//!    over the same datadir. Its reth database must move MDBX to tn-lmdb, and its consensus
+//!    database MDBX to tndb when `TN_BIN_PATH_PREV` is a release from before tndb
+//!    (`migrate_from_mdbx` in `tn_reth` and `tn_storage`; a `TN_BIN_PATH_PREV` built after tndb has
+//!    nothing to move there). It must record TN's storage layout marker (layout v1) in the existing
+//!    reth datadir and follow the chain again.
 //! 3. Reset: validator-4 stops, `db reset-execution` runs on its datadir, first as a dry run
 //!    (nothing moves), then with `--force` (the execution entries move into `execution-reset-*`).
 //! 4. Rebuild: validator-4 starts on `TN_BIN_PATH` again. It must create a new reth datadir (layout
@@ -31,7 +31,7 @@
 //!    receipts by hash.
 //!
 //! **Binaries and lane.** As in `reth_db_migration`, the test runs only with the marker
-//! `TN_E2E_TN_LMDB_BIN` set (`TN_BIN_PATH` is the `tn-lmdb` build) and skips with a message
+//! `TN_E2E_TN_LMDB_BIN` set (`TN_BIN_PATH` is the default, tn-lmdb, build) and skips with a message
 //! without it or without `TN_BIN_PATH_PREV`. `make test-e2e-resync` passes all three. The files
 //! prove the roles: validator-4's datadir holds MDBX files before the upgrade and the migrated
 //! layout after it, and validator-1's reth database is still MDBX at the end.

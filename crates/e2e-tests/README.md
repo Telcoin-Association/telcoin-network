@@ -130,16 +130,16 @@ instead of waiting on a silent first test.
 
 `reth_db_migration::test_restart_migrates_reth_db_to_tn_lmdb` needs two binaries and skips (with a
 warning) in the run above. `make test-e2e-reth-migration` builds both and runs it: the committee
-starts on the default binary (`TN_BIN_PATH_PREV`, reth database on MDBX), and each validator
-restarts on the `tn-lmdb` binary (`TN_BIN_PATH`), migrates its reth database and follows the chain.
-The target also sets `TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the `tn-lmdb` build.
+starts on the MDBX binary (`TN_BIN_PATH_PREV`, built with the `mdbx` feature by
+`make build-e2e-bin-mdbx`), and each validator restarts on the default binary (`TN_BIN_PATH`, reth
+database on tn-lmdb), migrates its reth database and follows the chain. The target also sets
+`TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the tn-lmdb build.
+`make test-e2e-resync` uses the same two binaries.
 
-`make test-e2e-tn-lmdb` runs the restart, epoch and sigkill suites on a node binary built with the
-`tn-lmdb` feature (`make build-e2e-bin-tn-lmdb`), so each spawned node keeps its reth database on
-tn-lmdb, then `make test-e2e-reth-migration`, stopping at the first that fails.
-`make test-restarts-tn-lmdb`, `make test-epochs-tn-lmdb` and `make test-sigkill-tn-lmdb` run one
-suite each. The test binaries themselves build without `tn-lmdb`: they never open a spawned node's
-reth database.
+The node binary of every other e2e target (`make build-e2e-bin`) runs its reth database on
+tn-lmdb, the default backend, so `make test-restarts`, `make test-epochs` and `make test-sigkill`
+are the crash and restart cycles for that engine. MDBX is the legacy backend, kept until testnet
+has resynced: no e2e target runs those suites on it.
 
 ## Test Log Output
 

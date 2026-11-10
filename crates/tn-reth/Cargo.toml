@@ -110,7 +110,9 @@ tower = { workspace = true }
 tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
-tn-lmdb-reth = { workspace = true, optional = true }
+# The engine under TN's reth execution database (`tn_lmdb_reth::TnLmdbEnv`), unless the `mdbx`
+# feature selects MDBX. The MDBX build reads its data-file name to refuse a tn-lmdb database.
+tn-lmdb-reth = { workspace = true }
 # The OS page size, as reth reads it for MDBX's default page size (`default_page_size`).
 page_size = "0.6.0"
 
@@ -148,10 +150,11 @@ adiri = ["faucet", "tn-types/adiri"]
 # it, a JS tracer request gets "JS Tracer is not enabled" and the built-in tracers still work.
 # reth-rpc forwards it to reth-rpc-eth-api and reth-rpc-eth-types. See js-tracer.md.
 js-tracer = ["reth-rpc/js-tracer"]
-# Run TN's reth execution database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`) instead of
-# MDBX. Off by default. MDBX stays compiled: reth's crates require it. See the README's
-# "Database backend" section.
-tn-lmdb = ["dep:tn-lmdb-reth"]
+# Run TN's reth execution database on MDBX (`reth_db::DatabaseEnv`), the legacy backend, instead
+# of the default tn-lmdb engine. Off by default: it is kept for tests of the legacy path until
+# testnet has resynced. MDBX stays compiled either way: reth's crates require it, and the default
+# build reads an MDBX database to migrate it. See the README's "Database backend" section.
+mdbx = []
 
 [[bench]]
 name = "output_overlay"

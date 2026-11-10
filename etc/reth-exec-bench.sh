@@ -12,10 +12,13 @@
 #                    is there. The runs are reports/runs.tsv's (the script's last runs in that
 #                    dir); a dir without it is refused, and so is a JSON report of another
 #                    version than the bench's JSON_REPORT_VERSION (report_version below), by name.
-#   Backend mode (no commit): this checkout (uncommitted changes included) built twice, MDBX (the
-#                    default features) against tn-lmdb (`--features tn-reth/tn-lmdb`).
+#   Backend mode (no commit): this checkout (uncommitted changes included) built twice, MDBX
+#                    (`--features tn-reth/mdbx`) against tn-lmdb (the default features).
 #   Commit mode (a before-commit): one backend, the commit against this checkout. The commit must
-#                    have the bench (`crates/engine/tests/exec_bench/main.rs`).
+#                    have the bench (`crates/engine/tests/exec_bench/main.rs`). Each side is built
+#                    with the flags its own tn-reth manifest needs for the backend: an `mdbx`
+#                    feature (tn-lmdb the default, since 2026-11-09) or a `tn-lmdb` one (MDBX the
+#                    default, before), so a before commit from either side of that change works.
 #   EXEC_BACKEND=tn-lmdb  commit mode's backend: `mdbx` or `tn-lmdb` (the default)
 #   EXEC_ROUNDS=2    pairs per profile; round 1 runs A then B, round 2 B then A, and so on (the
 #                    default 2 is A B B A, 1 is A B), where A is mdbx or before and B tn-lmdb or after
@@ -924,14 +927,36 @@ for dir in "$src_before" "$tmp_dir"; do
     fi
 done
 
+# tn-reth's manifest, whose features say how a tree selects each backend.
+tn_reth_manifest="crates/tn-reth/Cargo.toml"
+
+# <manifest text> <backend>: prints the cargo flags that build a tree with that tn-reth manifest on
+# <backend> (mdbx or tn-lmdb), or an error and fails. Since 2026-11-09 tn-lmdb is the default and
+# an opt-in `mdbx` feature selects MDBX; before, MDBX was the default and an opt-in `tn-lmdb`
+# feature selected tn-lmdb; before that there was no tn-lmdb.
+backend_flags() {
+    local opt_in=""
+    if grep -q '^mdbx = ' <<<"$1"; then
+        opt_in="mdbx"
+    elif grep -q '^tn-lmdb = ' <<<"$1"; then
+        opt_in="tn-lmdb"
+    elif [ "$2" = tn-lmdb ]; then
+        echo "its tn-reth has no tn-lmdb backend"
+        return 1
+    fi
+    if [ "$2" = "$opt_in" ]; then
+        echo "--features tn-reth/$2"
+    fi
+}
+
 if [ -z "$before" ]; then
     mode="backend"
     side_a="mdbx"
     side_b="tn-lmdb"
     tree_a="$repo"
     tree_b="$repo"
-    flags_a=""
-    flags_b="--features tn-reth/tn-lmdb"
+    flags_a="$(backend_flags "$(cat "$repo/$tn_reth_manifest")" mdbx)" || die "$flags_a"
+    flags_b="$(backend_flags "$(cat "$repo/$tn_reth_manifest")" tn-lmdb)" || die "$flags_b"
     page_a="$(page_size_of mdbx)"
     page_b="$(page_size_of tn-lmdb)"
     target_a="$bench_dir/target-mdbx"
@@ -942,11 +967,13 @@ else
     mode="commit"
     backend="${EXEC_BACKEND:-tn-lmdb}"
     case "$backend" in
-        mdbx) flags_a="" ;;
-        tn-lmdb) flags_a="--features tn-reth/tn-lmdb" ;;
+        mdbx | tn-lmdb) ;;
         *) die "EXEC_BACKEND must be mdbx or tn-lmdb, not '$backend'" ;;
     esac
     git -C "$repo" cat-file -e "$before^{commit}" 2>/dev/null || die "no commit $before"
+    flags_a="$(backend_flags "$(git -C "$repo" show "$before:$tn_reth_manifest")" "$backend")" \
+        || die "$before: $flags_a"
+    flags_b="$(backend_flags "$(cat "$repo/$tn_reth_manifest")" "$backend")" || die "$flags_b"
     git -C "$repo" cat-file -e "$before:$bench_file" 2>/dev/null \
         || die "$before has no $bench_file: commit mode needs a commit that has the bench"
     written="$(git -C "$repo" show "$before:$bench_file" | bench_report_version)"
@@ -957,7 +984,6 @@ else
     side_b="after"
     tree_a="$src_before"
     tree_b="$repo"
-    flags_b="$flags_a"
     page_a="$(page_size_of "$backend")"
     page_b="$page_a"
     target_a="$bench_dir/target-before-$before_key-$backend"
@@ -1042,7 +1068,7 @@ kv "bench dir" "$bench_dir"
     echo "### CONFIG"
 } >>"$report"
 if [ "$mode" = backend ]; then
-    kv mode "backend: mdbx (A, default features) against tn-lmdb (B, --features tn-reth/tn-lmdb)"
+    kv mode "backend: mdbx (A, --features tn-reth/mdbx) against tn-lmdb (B, default features)"
     kv checkout "$(describe_checkout)"
 else
     kv mode "commit: before (A) against after (B), backend $backend"

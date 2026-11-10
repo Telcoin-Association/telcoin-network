@@ -29,8 +29,8 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>
-#        etc/ci-lanes.sh <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-mdbx|test-vendor-reth|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-mdbx|test-vendor-reth> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
 # the four test lanes and nothing else, and it is the only option there is: no flag passes
@@ -63,8 +63,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>" >&2
-    echo "       $0 <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-mdbx|test-vendor-reth|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-mdbx|test-vendor-reth> --build-only" >&2
     exit 2
 }
 
@@ -105,17 +105,45 @@ lane_clippy() {
     #    When the lane built libraries only, test code that did not compile reached main
     #    (2026-10-29). crates/tn-reth's output_overlay bench needs `bench-internals`, and
     #    no lane compiled it before.
+    # 3. The same, with every feature but `mdbx`. `--all-features` includes tn-reth's opt-in
+    #    `mdbx` feature, which swaps the reth execution database to MDBX, so pass 2 lints the
+    #    MDBX arms and never the default backend's (tn-lmdb's) test and test-utils code: the
+    #    `#[cfg(not(feature = "mdbx"))]` test arms, the MDBX migration's tests among them.
+    #    The release graph pass lints only their library code. `mdbx` adds no dependency, so
+    #    this pass reuses pass 2's dependencies and re-lints only what depends on tn-reth.
     #
-    # Neither pass lints code that compiles only under default features outside the release
-    # graph, test code and its `#[cfg(not(feature = ...))]` arms included. lane_test_default
-    # compiles it under the same RUSTFLAGS wherever it runs (the merge queue, and pull
-    # requests that are neither drafts nor a maintainer's), and the attested run compiles
-    # it before a maintainer's PR can be queued. A third pass, --all-targets under default
-    # features, compiled exactly the targets nextest compiles under the same feature
+    # No pass lints code that compiles only under default features outside the release
+    # graph, test code and its other `#[cfg(not(feature = ...))]` arms included.
+    # lane_test_default compiles it under the same RUSTFLAGS wherever it runs (the merge
+    # queue, and pull requests that are neither drafts nor a maintainer's), and the attested
+    # run compiles it before a maintainer's PR can be queued. A pass with --all-targets under
+    # default features compiled exactly the targets nextest compiles under the same feature
     # resolution, and was dropped for that reason.
     run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network -p tn-worker-gateway -p tn-node-record-api -- -D warnings
     run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
-    echo "clippy passed: release graph, workspace all targets with all features"
+    # A separate assignment, so a failed `cargo metadata` stops the lane (set -e) instead of
+    # leaving an empty list, which would lint default features only.
+    local features
+    features=$(workspace_features_but_mdbx)
+    [[ -n $features ]] || { echo "clippy: no workspace features read" >&2; exit 1; }
+    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --features "$features" \
+        -- -D warnings
+    echo "clippy passed: release graph, workspace all targets with all features and with all but mdbx"
+}
+
+# Every feature of every workspace member except `default` and `mdbx`, package-qualified and
+# comma-separated, from the manifests: clippy's third pass, `--all-features` without the opt-in
+# MDBX backend. Read from cargo, so a feature added later joins the pass with no edit here.
+workspace_features_but_mdbx() {
+    cargo metadata --locked --no-deps --format-version 1 | python3 -B -I -c '
+import json, sys
+meta = json.load(sys.stdin)
+members = set(meta["workspace_members"])
+print(",".join(sorted(
+    pkg["name"] + "/" + feature
+    for pkg in meta["packages"] if pkg["id"] in members
+    for feature in pkg["features"] if feature not in ("default", "mdbx")
+)))'
 }
 
 # Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
@@ -218,20 +246,20 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
-lane_test_tn_lmdb() {
-    # lane_test_default runs every reth database on MDBX, the default backend, so it never
-    # runs reth on tn-lmdb. This is the same workspace run with tn-reth's `tn-lmdb` feature:
-    # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
-    # the CLI and every test built on them) to tn-lmdb, so between the two lanes each of those
-    # tests runs once against each engine. The feature changes only tn-reth (it adds tn-lmdb-reth
-    # as tn-reth's dependency, with no feature change on any other package), so a package with no
-    # dependency path to tn-reth, dev-dependencies included (`cargo tree --workspace -i tn-reth
-    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's and
-    # the adapter's suites are such packages and are excluded. Every other package reaches
-    # tn-reth, if only through a dev-dependency, and reruns here (tn-utils, with no path either,
-    # holds a single test).
+lane_test_mdbx() {
+    # lane_test_default runs every reth database on tn-lmdb, the default backend, so it never
+    # runs reth on MDBX. This is the same workspace run with tn-reth's opt-in `mdbx` feature,
+    # the legacy backend kept until testnet has resynced: feature unification switches every
+    # crate that opens a reth database (tn-reth, tn-node, the CLI and every test built on them)
+    # to MDBX, so between the two lanes each of those tests runs once against each engine. The
+    # feature changes only tn-reth's own code (it adds no dependency and changes no feature of
+    # any other package), so a package with no dependency path to tn-reth, dev-dependencies
+    # included (`cargo tree --workspace -i tn-reth -e normal,build,dev`), builds and tests the
+    # same as in lane_test_default. The engine's and the adapter's suites are such packages and
+    # are excluded. Every other package reaches tn-reth, if only through a dev-dependency, and
+    # reruns here (tn-utils, with no path either, holds a single test).
     run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
-        --features tn-reth/tn-lmdb "${run_mode[@]}"
+        --features tn-reth/mdbx "${run_mode[@]}"
 }
 
 lane_test_vendor_reth() {
@@ -260,7 +288,7 @@ case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri | test-tn-lmdb | test-vendor-reth) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-mdbx | test-vendor-reth) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -272,14 +300,14 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
-test-tn-lmdb) lane_test_tn_lmdb ;;
+test-mdbx) lane_test_mdbx ;;
 test-vendor-reth) lane_test_vendor_reth ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
-    lane_test_tn_lmdb
+    lane_test_mdbx
     lane_test_vendor_reth
     ;;
 *) usage ;;

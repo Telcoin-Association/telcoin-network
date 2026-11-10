@@ -20,7 +20,7 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `tn-lmdb-test`, `vendor-reth-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `mdbx-test`, `vendor-reth-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
@@ -39,7 +39,7 @@ Three consequences worth remembering:
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
 - **The maintainer and draft skips cover the four test lanes only, and never apply in the queue.**
-  On a pull request, `ci-scope` skips `test`, `adiri-test`, `tn-lmdb-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
+  On a pull request, `ci-scope` skips `test`, `adiri-test`, `mdbx-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
   `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
   In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
   `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the four test lanes only, and only when `ci-scope` asked for it.
@@ -93,7 +93,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the four test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and the three `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the four test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -189,7 +189,7 @@ Nothing stops either route beforehand.
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for the four test lanes: default, adiri and tn-lmdb features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for the three clippy passes, the release graph and every target under `--all-features` and under every feature but `mdbx`, under the nightly pin) and `test-cache` (dependencies for the four test lanes: default, adiri and mdbx features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
 rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
@@ -247,8 +247,9 @@ After a heavy dependency bump, with only a partial cache to fall back on, clippy
 Those clippy figures, and the 2026-09-30 cold one below, were measured when the lane compiled libraries only, before it gained `--all-targets`.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
 The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
-The clippy lane has been timed cold once since, in the three-pass form that came before the current two passes: it compiled for 16.5 min (7m32s, 1m15s and 7m19s; `librocksdb-sys` under `--all-features` is the long pole).
+The clippy lane has been timed cold once since, in the three-pass form that came before the two-pass one: it compiled for 16.5 min (7m32s, 1m15s and 7m19s; `librocksdb-sys` under `--all-features` is the long pole).
 The two-pass lane was timed cold on 2026-10-29, with no entry to restore: 10 m 21 s, 5 m 21 s for the release graph and 5 m 00 s for every target under `--all-features`, in a `clippy` job of 10 m 44 s.
+A third pass, every target under every feature but `mdbx`, joined on 2026-11-09 when tn-lmdb became the default reth backend and `--all-features` came to mean MDBX; it reuses the second pass's dependencies and re-lints only what depends on tn-reth (not yet timed in CI).
 The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
 Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
 The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.

@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [test-default, test-adiri, test-tn-lmdb]
+        lane: [test-default, test-adiri, test-mdbx]
     # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
     # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
     # toolchains installed before the cache step, in lockstep with that file.

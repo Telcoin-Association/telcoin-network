@@ -18,11 +18,11 @@ use tn_storage::disk::{drop_cached_pages, fsync_file};
 use tn_types::{gas_accumulator::GasAccumulator, TaskManager};
 
 /// This build's database data file inside the database directory.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const DATA_FILE: &str = "mdbx.dat";
 
 /// This build's database data file inside the database directory.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const DATA_FILE: &str = tn_lmdb_reth::DATA_FILE;
 
 /// Open the reth env in `datadir` (database in `datadir/db`) as the node opens it: the `--db.*`
@@ -580,7 +580,7 @@ mod tests {
             assert_eq!(StorageLayout::of(&env)?, StorageLayout::V1, "{run}");
         }
         let v2 = tmp.path().join("v2");
-        if cfg!(feature = "tn-lmdb") {
+        if !cfg!(feature = "mdbx") {
             for run in ["new", "reopened"] {
                 let tasks = TaskManager::new(run);
                 let (env, _db) = open_production_env_with_layout(

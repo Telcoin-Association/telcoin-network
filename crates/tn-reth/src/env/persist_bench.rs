@@ -7,11 +7,11 @@
 //! ```text
 //! mkdir -p target/persist-bench-tmp
 //! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
+//!     cargo test --release -p tn-reth --features mdbx --lib \
+//!     env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+//! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
 //!     cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- \
 //!     --ignored --exact --nocapture
-//! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
-//!     cargo test --release -p tn-reth --features tn-lmdb --lib \
-//!     env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 //! ```
 //!
 //! **What it measures.** A chain on production `--db.*` settings (`DatabaseArgs::default()` with
@@ -422,12 +422,12 @@ fn run_mode(
 ) -> ModeRun {
     init_reth_defaults();
     let chain = chain(knobs.accounts);
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     let sync_mode = Some(if knobs.durable { SyncMode::Durable } else { SyncMode::SafeNoSync });
     // On tn-lmdb `--db.sync-mode safe-no-sync` syncs each second or 64 MiB, so `nosync` reaches
     // the engine's `NoSync` with no automatic syncs through the test-only `TEST_NO_SYNC`, read by
     // the open on this thread.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     let sync_mode = {
         super::database::TEST_NO_SYNC.set(!knobs.durable);
         knobs.durable.then_some(SyncMode::Durable)
@@ -441,7 +441,7 @@ fn run_mode(
     let db_dir = datadir.join("db");
     let task_manager = TaskManager::new("persist bench");
     let database = RethEnv::new_database(&reth_config, &db_dir).expect("open the database");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     super::database::TEST_NO_SYNC.set(false);
     let reth_env =
         RethEnv::new(&reth_config, &task_manager, database, None, GasAccumulator::default())

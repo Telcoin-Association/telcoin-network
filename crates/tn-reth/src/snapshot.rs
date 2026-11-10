@@ -14,7 +14,7 @@
 //! transactions to keep the free list from stalling, and a full-state export can easily run longer
 //! than that. Disabling the guard exempts *only this one transaction* — it does not touch any
 //! env-wide configuration, so other readers and the writer keep their normal safety limits. On
-//! tn-lmdb (the `tn-lmdb` feature) the call does nothing: the engine has no reader timeout. A long
+//! tn-lmdb (the default build) the call does nothing: the engine has no reader timeout. A long
 //! export only holds back page reuse while it runs, and the adapter (`tn_lmdb_reth`) logs a
 //! long-reader warning, at most once a minute, while a reader has held a superseded snapshot for
 //! over a minute.
