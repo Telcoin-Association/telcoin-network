@@ -10037,6 +10037,7 @@ dependencies = [
  "eyre",
  "futures",
  "indexmap 2.13.0",
+ "lru",
  "metrics",
  "metrics-util",
  "parking_lot",

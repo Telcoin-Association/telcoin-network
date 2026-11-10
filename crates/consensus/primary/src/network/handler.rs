@@ -1,16 +1,19 @@
 //! Handle specific request types received from the network.
 
-use super::{PrimaryResponse, SyncServeOutcome};
+use super::{PendingGossip, PrimaryResponse, SyncServeOutcome};
 use crate::{
+    consensus::gc_round,
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
 use futures::AsyncWriteExt as _;
+use lru::LruCache;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -49,6 +52,13 @@ const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 /// number of frames and a slow reader are not, so this backstops the whole serve
 /// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Capacity of the cache of certificate digests this node verified recently (#1772).
+///
+/// 4096 digests are enough for a committee of 64 across a 64-round GC window. A replay found
+/// in the cache is ignored without a second aggregate check. When the cache is full, a new
+/// digest replaces the oldest one.
+const RECENTLY_VERIFIED_CERTIFICATES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4095);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -126,6 +136,13 @@ pub(crate) struct RequestHandler<DB> {
     /// in the same branch, so this keeps the warning to once per author per round. Only headers
     /// whose author passed committee validation get that far, so every key is a committee member.
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
+    /// Digests of certificates this node verified recently, bounded by
+    /// [`RECENTLY_VERIFIED_CERTIFICATES`].
+    ///
+    /// The certificate gossip arm checks it before the aggregate verify, so a replay of a
+    /// certificate that is not in storage yet is ignored without a second verify (#1772). A hit
+    /// never reports Accept: the digest covers the header, not the signature.
+    recent_verified_certs: Arc<Mutex<LruCache<HeaderDigest, ()>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -156,8 +173,18 @@ where
             consensus_certs: Default::default(),
             epoch_votes_seen: Default::default(),
             deferred_vote_warned: Default::default(),
+            recent_verified_certs: Arc::new(Mutex::new(LruCache::new(
+                RECENTLY_VERIFIED_CERTIFICATES,
+            ))),
             consensus_chain,
         }
+    }
+
+    /// The garbage-collection round. Certificates below it are no longer needed.
+    ///
+    /// It uses the same committed round and GC depth as the state-sync certificate validator.
+    fn gc_round(&self) -> Round {
+        gc_round(self.consensus_bus.committed_round(), self.consensus_config.parameters().gc_depth)
     }
 
     /// Expose the handlers consensus chain- useful for testing.
@@ -330,12 +357,34 @@ where
         guard.insert(key, next_seq);
     }
 
+    /// Process gossip with no ticket to report, for direct handler calls in tests.
+    #[cfg(test)]
+    pub(crate) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+        let mut pending = PendingGossip::detached();
+        self.process_gossip_with(msg, &mut pending).await
+    }
+
     /// Process gossip from the committee.
     ///
     /// Peers gossip the HeaderDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+    ///
+    /// The handler reports `Accept` on `pending` right after the signature check and before any
+    /// downstream work (#1772). A failed check returns an error and leaves the ticket pending, so
+    /// the caller settles it with `PendingGossip::settle_error`. Gossip that cannot be verified, or
+    /// that is a duplicate, returns `Ok(())` with the ticket pending, and dropping the ticket
+    /// reports `Ignore`. A certificate for an earlier epoch is ignored before any verification.
+    /// Observers and ExEx get those certificates through epoch-pack sync. A certificate this node
+    /// already holds or verified recently, or one below the GC round, is ignored before the
+    /// aggregate check and is never forwarded. Only a current-epoch certificate whose aggregate
+    /// fails is a fault. A next-epoch certificate that fails is ignored, because the provisional
+    /// next committee can differ from the committee that signed it.
+    pub(crate) async fn process_gossip_with(
+        &self,
+        msg: &GossipMessage,
+        pending: &mut PendingGossip,
+    ) -> PrimaryNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, topic, .. } = msg;
 
@@ -354,11 +403,49 @@ where
                 cert.validate_received().map_err(CertManagerError::from)?;
 
                 let epoch = cert.header().epoch();
+                let current_epoch = self.consensus_config.committee().epoch();
+                // A certificate for an earlier epoch is ignored before any verification. The
+                // ticket stays pending, so it reports Ignore, is not forwarded and charges no
+                // peer. Observers and ExEx get earlier-epoch certificates through epoch-pack sync.
+                if epoch < current_epoch {
+                    debug!(
+                        target: "primary",
+                        epoch,
+                        current_epoch,
+                        "certificate for an earlier epoch, ignoring"
+                    );
+                    return Ok(());
+                }
+                // Cheap known-certificate check before the aggregate verify (#1772 review).
+                // Only current and later epochs reach it. A replay of a certificate this node
+                // already holds or verified recently, or one below the GC round, returns with
+                // the ticket pending, so it reports Ignore and is not forwarded. It is never
+                // accepted here: the digest covers the header, not the signature. After this
+                // check only a current-epoch certificate whose aggregate fails is a fault. A
+                // next-epoch failure is ignored, because the provisional next committee can
+                // differ from the committee that signed it.
+                let digest = cert.digest();
+                let known_in_epoch = epoch == current_epoch
+                    && (cert.round() < self.gc_round()
+                        || matches!(
+                            self.consensus_config.node_storage().contains(&digest),
+                            Ok(true)
+                        ));
+                if known_in_epoch || self.recent_verified_certs.lock().contains(&digest) {
+                    debug!(target: "primary", ?digest, "known or garbage-collected certificate, ignoring replay");
+                    return Ok(());
+                }
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
                 if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
+                            // Record the digest before the accept, so a racing replay is caught.
+                            self.recent_verified_certs.lock().put(digest, ());
+                            // Report Accept right after the signature check and before downstream
+                            // work, so gossipsub forwards only verified
+                            // certificates (#1772).
+                            pending.accept().await;
                             if self.consensus_bus.is_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round(), None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
@@ -383,7 +470,23 @@ where
                                 self.consensus_bus.notify_exex_certificate(&cert);
                             }
                         }
-                        Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
+                        Err(e) => {
+                            // A failed aggregate in the current epoch is the author's fault: the
+                            // caller reports Reject and charges the author (#1772).
+                            if epoch == current_epoch {
+                                warn!(target: "primary", "Recieved invalid cert {e}");
+                                return Err(CertManagerError::from(e).into());
+                            }
+                            // The next committee is provisional until its epoch starts, so it can
+                            // differ from the committee that signed. Ignore with no charge.
+                            debug!(
+                                target: "primary",
+                                %e,
+                                epoch,
+                                "next-epoch certificate failed against the provisional committee, ignoring"
+                            );
+                            return Ok(());
+                        }
                     }
                 } else {
                     // If we can't find this cert's committee then it's bogus or we are
@@ -440,18 +543,20 @@ where
                         if past_certified_record {
                             debug!(target: "primary", epoch, number, ?final_number, "consensus result numbered past its certified epoch record, ignoring (issue #1771)");
                         }
-                        let guard = self.consensus_certs.lock();
-                        if past_certified_record
-                            || guard
+                        // Bind only the result so no lock guard is alive at the verdict await
+                        // below.
+                        let seen = past_certified_record
+                            || self
+                                .consensus_certs
+                                .lock()
                                 .get(&consensus_result_hash)
                                 .and_then(|tally| tally.signers.get(&key))
-                                .is_some()
-                        {
+                                .is_some();
+                        if seen {
                             // We have already counted this signature, or the number is impossible
                             // for its epoch, so ignore.
                             return Ok(());
                         }
-                        drop(guard);
                         // Drop the lock for the expensive verify op. If a dup gets through the Set
                         // will still only count it once.
                         ensure!(
@@ -459,6 +564,8 @@ where
                                 .verify_secure(&to_intent_message(consensus_result_hash), &key),
                             PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
                         );
+                        // The signature is valid: report Accept before downstream work (#1772).
+                        pending.accept().await;
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
@@ -606,6 +713,8 @@ where
                             vote.check_signature(),
                             PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
                         );
+                        // The signature is valid: report Accept before downstream work (#1772).
+                        pending.accept().await;
                         // Record only AFTER a valid signature so a bad-signature vote cannot
                         // poison the dedup slot for the real author.
                         self.record_epoch_vote(vote.public_key, vote.epoch);

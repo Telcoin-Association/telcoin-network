@@ -136,6 +136,18 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::ConsensusChainError(_) => false,
         }
     }
+
+    /// Whether this fault puts a resolved author's gossip on the local cooldown (#1772).
+    ///
+    /// True for every author content fault whose penalty is `Fatal`: a forged certificate
+    /// aggregate, a forged epoch vote, [`Self::Decode`] and [`Self::InvalidTopic`]. Also true for
+    /// [`Self::UnknownConsensusHeaderCert`], a consensus result with a bad signature. Its penalty
+    /// stays `Mild` because `crates/network-libp2p/src/peers/penalty.md` pins it.
+    pub(crate) fn strikes_gossip_author(&self) -> bool {
+        self.is_author_content_fault()
+            && (matches!(self, Self::UnknownConsensusHeaderCert(_))
+                || matches!(Option::<Penalty>::from(self), Some(Penalty::Fatal)))
+    }
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -418,5 +430,35 @@ mod tests {
         assert!(!relayer_fault.is_author_content_fault());
         assert!(author_penalty(&relayer_fault).is_none());
         assert!(matches!(Option::<Penalty>::from(&relayer_fault), Some(Penalty::Medium)));
+    }
+
+    /// The strike class is every author content fault with a fatal penalty, plus a consensus
+    /// result with a bad signature. A mild certificate fault, a forged epoch digest, a
+    /// non-committee signer and a fault with no penalty strike no one (#1772).
+    #[test]
+    fn strike_class_is_fatal_author_faults_and_forged_consensus_results() {
+        let cert_fault = |e: CertificateError| {
+            PrimaryNetworkError::Certificate(CertManagerError::Certificate(e))
+        };
+        // strike
+        assert!(cert_fault(CertificateError::InvalidSignature).strikes_gossip_author());
+        assert!(
+            PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor).strikes_gossip_author()
+        );
+        assert!(PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default())
+            .strikes_gossip_author());
+        // no strike
+        assert!(!cert_fault(CertificateError::TooOld(tn_types::HeaderDigest::default(), 1, 2))
+            .strikes_gossip_author());
+        assert!(!PrimaryNetworkError::InvalidEpochVote(
+            0,
+            EpochDigest::default(),
+            EpochDigest::default()
+        )
+        .strikes_gossip_author());
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
+        let signer = *tn_types::BlsKeypair::generate(&mut rng).public();
+        assert!(!PrimaryNetworkError::PeerNotInCommittee(Box::new(signer)).strikes_gossip_author());
+        assert!(!PrimaryNetworkError::UnknownConsensusOutput(0).strikes_gossip_author());
     }
 }

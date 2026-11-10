@@ -14,6 +14,7 @@ edition = "2021"
 eyre = { workspace = true }
 backoff = { workspace = true }
 futures = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 rand_chacha = { workspace = true }

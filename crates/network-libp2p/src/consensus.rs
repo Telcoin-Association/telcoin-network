@@ -20,9 +20,9 @@ use crate::{
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
-        EpochPosition, GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
-        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
-        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        EpochPosition, GossipPayload, GossipValidation, KadQuery, NetworkCommand, NetworkEvent,
+        NetworkHandle, NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult,
+        NetworkType, NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -44,6 +44,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use lru::LruCache;
+use rand::seq::SliceRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
@@ -1616,14 +1617,16 @@ where
             }
             NetworkCommand::ConnectedPeers { reply } => {
                 let peer_manager = &self.swarm.behaviour().peer_manager;
-                // current-committee members first (stable order), so a caller that tries
-                // peers in order reaches the peers most likely to hold consensus data first
+                // current-committee members first, so a caller that tries peers in order
+                // reaches the peers most likely to hold consensus data first; each tier is
+                // shuffled per request, so no peer keeps a fixed early place in every
+                // caller's order (#1773)
                 let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
                     .flat_map(|id| peer_manager.peer_to_bls(id))
                     .partition(|bls| peer_manager.is_current_committee_member(bls));
-                let peers: Vec<_> = committee.into_iter().chain(others).collect();
+                let peers = order_connected_peers(committee, others, &mut rand::rng());
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
@@ -1704,6 +1707,18 @@ where
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
                     bounded_warn!(Command, target: "peer-manager", ?peer, "unable to assess penalty for peer");
+                }
+            }
+            NetworkCommand::ReportGossipValidation { message_id, propagation_source, verdict } => {
+                // the consumer's deferred verdict for a held gossip message (#1772)
+                let reported =
+                    self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        verdict.into(),
+                    );
+                if !reported {
+                    bounded_error!(Gossip, target: "network", ?propagation_source, ?message_id, ?verdict, "gossip validation verdict for an expired message");
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
@@ -1958,12 +1973,16 @@ where
                 let msg_acceptance = self.verify_gossip(&message);
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
-                // report message validation results to propagate valid messages
-                if !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                    &message_id,
-                    &propagation_source,
-                    msg_acceptance.into(),
-                ) {
+                // Report a reject now. An accepted message stays held in gossipsub until the
+                // consumer reports its verdict through the `GossipValidation` ticket (#1772), so
+                // nothing is forwarded before the application verifies it.
+                let reject_unreported = matches!(msg_acceptance, GossipAcceptance::Reject(_))
+                    && !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        msg_acceptance.into(),
+                    );
+                if reject_unreported {
                     bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, "error reporting message validation result");
                 }
 
@@ -2001,11 +2020,20 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
+                        // Gossipsub holds the message until the consumer reports a verdict
+                        // through this ticket (#1772). The primary accepts only after the
+                        // signature check, so this node never forwards a forged message.
+                        let validation = GossipValidation::new(
+                            message_id.clone(),
+                            propagation_source,
+                            self.handle.clone(),
+                        );
                         // forward gossip to handler; a full queue or a queue with no
-                        // subscriber counts as shed
-                        let forwarded = self
-                            .event_stream
-                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        // subscriber counts as shed. A failed forward drops the event, and
+                        // its dropped ticket reports `Ignore`.
+                        let forwarded = self.event_stream.try_send_outcome(accepted_gossip_event(
+                            message, relayer, author, validation,
+                        ));
                         self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
                         if forwarded.inspect_err(|e| {
                             bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
@@ -3793,10 +3821,60 @@ fn resolve_response<Res: TNMessage>(
 /// and dropping an unresolved-relayer message would lose it permanently because
 /// gossipsub has already cached its `message_id`. The relayer is carried so the
 /// consumer can attribute a penalty only when the identity is known.
+///
+/// `validation` is the deferred verdict ticket for the held message (#1772): the consumer
+/// accepts or rejects it, and an event that is dropped reports `Ignore`.
 fn accepted_gossip_event<Req, Res>(
     message: GossipMessage,
     relayer: Option<BlsPublicKey>,
     author: Option<BlsPublicKey>,
-) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
+    validation: GossipValidation<Req, Res>,
+) -> NetworkEvent<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author, validation }))
+}
+
+/// Order the connected peers for a `ConnectedPeers` answer: the current committee
+/// first, then every other peer, with each tier shuffled by `rng`.
+///
+/// The tier boundary is stable, so a caller that walks the list in order still
+/// reaches the committee first; the order inside a tier changes per request, so
+/// a peer that stalls its exchanges cannot keep a fixed early place in every
+/// caller's order (#1773).
+fn order_connected_peers<T, R: rand::Rng>(
+    mut committee: Vec<T>,
+    mut others: Vec<T>,
+    rng: &mut R,
+) -> Vec<T> {
+    committee.shuffle(rng);
+    others.shuffle(rng);
+    committee.into_iter().chain(others).collect()
+}
+
+#[cfg(test)]
+mod order_connected_peers_tests {
+    use super::order_connected_peers;
+    use std::collections::BTreeSet;
+
+    /// The committee tier stays ahead of the public tier whatever the shuffle.
+    #[test]
+    fn committee_tier_stays_first() {
+        let ordered = order_connected_peers(vec![1u8, 2, 3], vec![4u8, 5], &mut rand::rng());
+        let (head, tail) = ordered.split_at(3);
+        assert_eq!(head.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([1, 2, 3]));
+        assert_eq!(tail.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([4, 5]));
+    }
+
+    /// Repeated requests do not pin one peer to the front of its tier.
+    #[test]
+    fn tier_order_varies_per_request() {
+        let firsts: BTreeSet<u8> = (0..64)
+            .map(|_| order_connected_peers((0u8..8).collect(), Vec::new(), &mut rand::rng()))
+            .filter_map(|ordered| ordered.first().copied())
+            .collect();
+        assert!(firsts.len() > 1, "64 shuffles of 8 peers put the same peer first every time");
+    }
 }

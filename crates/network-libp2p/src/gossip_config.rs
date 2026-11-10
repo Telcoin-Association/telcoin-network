@@ -128,6 +128,21 @@ pub(crate) const GOSSIP_MAX_IHAVE_IDS: usize =
     (GOSSIP_CONTROL_SIZE - GOSSIP_IHAVE_FRAMING_BOUND - GOSSIP_TOPIC_BOUND)
         / (2 + GOSSIP_MESSAGE_ID_BOUND);
 
+/// The gossipsub `history_length`: the heartbeats for which gossipsub holds a message in its
+/// message cache.
+///
+/// With `validate_messages()`, gossipsub keeps an unvalidated message in its message cache for
+/// this many heartbeats and forwards it only after an accept verdict. A deferred verdict (issue
+/// #1772) can land after the primary's epoch gap. In a gap the primary event queue holds only
+/// epoch votes (#1786), so the window covers the verdicts of the epoch votes held through the gap.
+/// Certificate and consensus-output gossip that arrives in a gap is shed, its ticket reports
+/// `Ignore`, and this node does not relay it. The author's flood publish and the committee dials
+/// still deliver it to the committee. 12 heartbeats at 1 s hold a message for about 12 s, against
+/// the library default of 5. `history_gossip` stays at the library default
+/// of 3, so each `IHAVE` still lists the ids of the last three heartbeats. The message cache
+/// cost is linear in this value: the cache holds the message bodies of that many heartbeats.
+pub(crate) const GOSSIP_HISTORY_LENGTH: usize = 12;
+
 /// The gossipsub behaviour of the consensus network, with the [`RejectGossipKey`] transform.
 pub(crate) type GossipBehaviour = gossipsub::Behaviour<RejectGossipKey>;
 
@@ -213,6 +228,8 @@ pub fn gossipsub_config(chain_id: u64) -> Result<gossipsub::Config, ConfigBuilde
     gossipsub::ConfigBuilder::default()
         // explicitly set default
         .heartbeat_interval(Duration::from_secs(1))
+        // Hold an unvalidated message long enough for a deferred verdict (issue #1772).
+        .history_length(GOSSIP_HISTORY_LENGTH)
         // explicitly set default
         .validation_mode(gossipsub::ValidationMode::Strict)
         // TN specific: filter against authorized_publishers for certain topics

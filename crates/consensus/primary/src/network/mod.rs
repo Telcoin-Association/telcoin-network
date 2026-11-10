@@ -3,7 +3,15 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
@@ -11,7 +19,9 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp,
 };
-use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
+use futures::{
+    AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryStreamExt as _,
+};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
@@ -23,10 +33,10 @@ use tn_network_libp2p::{
     error::NetworkError,
     read_frame,
     types::{
-        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, IntoResponse as _, NetworkCommand, NetworkEvent,
+        NetworkHandle, NetworkResponseMessage, NetworkResult,
     },
-    write_frame, AdmissionShed, DenyReason, GossipMessage, PeerSlot, PeerSlots, PeerTier, Penalty,
+    write_frame, AdmissionShed, DenyReason, PeerSlot, PeerSlots, PeerTier, Penalty,
     PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream,
     StreamError, SyncFrame, SyncFrameError,
 };
@@ -142,6 +152,236 @@ pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
 /// Prevents a single malicious peer from filling all global slots.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
+/// Maximum number of gossip messages from a single peer in signature verification at once
+/// (#1772).
+///
+/// The honest peak per author is one certificate per round plus a consensus result and an
+/// epoch vote. Four leaves headroom for a burst after a reconnect.
+pub const MAX_PENDING_GOSSIP_PER_PEER: usize = 4;
+
+/// How long this node ignores gossip from an author after its first strike in an epoch (#1772).
+///
+/// A strike is a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]), for
+/// example a certificate whose aggregate signature fails. It counts only for a frame that the
+/// author delivered itself while the ticket was pending (see [`gossip_author_to_strike`]). A
+/// forged certificate is dropped at the first hop and honest nodes never relay it, so the
+/// forger's own delivery is still struck. The gossipsub envelope is signed, so the author is
+/// accountable. Each further strike in the epoch doubles the hold, up to
+/// [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+///
+/// The peer manager exempts committee keys from every penalty (`docs/src/network/peers.md`, test
+/// `committee_members_are_exempt_from_all_penalties`). The `Fatal` is then recorded with
+/// `outcome=exempt`, and this local cooldown is the cost that the author pays. The slots are
+/// rebuilt with the primary network each epoch, which clears the strikes.
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_BASE: Duration = Duration::from_secs(10);
+
+/// Upper bound on the gossip cooldown of an author after repeated strikes in one epoch (#1772).
+///
+/// See [`GOSSIP_AUTHOR_COOLDOWN_BASE`].
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_MAX: Duration = Duration::from_secs(160);
+
+/// Guard for one gossip message in signature verification (#1772).
+///
+/// It holds a per-peer slot, or a permit from the shared bucket for gossip whose author and
+/// relayer are both unresolved. Dropping the guard frees the slot.
+pub(crate) enum GossipSlot {
+    /// A slot keyed by the author, or by the relayer when the author is unresolved.
+    Peer {
+        /// The per-peer slot. It frees on drop.
+        ///
+        /// Boxed: the slot is far larger than the shared permit (clippy `large_enum_variant`).
+        _slot: Box<PeerSlot>,
+    },
+    /// A permit from the shared bucket for gossip with no resolved author or relayer.
+    Shared {
+        /// The shared permit. It returns to the bucket on drop.
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+/// Per-peer bound on gossip in signature verification (#1772).
+///
+/// A message takes a slot keyed by its author when the author is resolved, else by its relayer.
+/// Gossip with neither identity resolved shares one bucket with the same cap.
+///
+/// An author struck for a fault of the strike class
+/// ([`PrimaryNetworkError::strikes_gossip_author`]) gets no slot for a cooldown that starts at
+/// [`GOSSIP_AUTHOR_COOLDOWN_BASE`] and doubles per strike up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+/// The strike applies only to a frame that the author delivered itself while the ticket was
+/// pending (see [`gossip_author_to_strike`]).
+#[derive(Clone, Debug)]
+pub(crate) struct GossipSlots {
+    /// Slots keyed by the author or relayer BLS key.
+    peers: PeerSlots,
+    /// Shared bucket for gossip whose author and relayer are both unresolved.
+    unresolved: Arc<Semaphore>,
+    /// Cooldowns of struck authors. The slots are rebuilt each epoch, which clears them.
+    cooldowns: Arc<Mutex<HashMap<BlsPublicKey, AuthorCooldown>>>,
+}
+
+/// The gossip cooldown of one struck author in this epoch (#1772).
+#[derive(Clone, Copy, Debug)]
+struct AuthorCooldown {
+    /// Strikes against the author in this epoch.
+    strikes: u32,
+    /// The author's gossip gets no slot until this instant.
+    until: Instant,
+}
+
+impl GossipSlots {
+    /// Create the slots with `cap` messages per peer and `cap` messages in the shared bucket.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            peers: PeerSlots::new(cap),
+            unresolved: Arc::new(Semaphore::new(cap)),
+            cooldowns: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Take a slot for gossip from `author`, else `relayer`, else the shared bucket.
+    ///
+    /// Returns `None` when that peer or the shared bucket is at the cap, or when `author` is in a
+    /// cooldown.
+    pub(crate) fn take(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<GossipSlot> {
+        self.take_at(author, relayer, Instant::now())
+    }
+
+    /// [`Self::take`] at the instant `now`.
+    fn take_at(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+        now: Instant,
+    ) -> Option<GossipSlot> {
+        let cooling = author
+            .and_then(|a| self.cooldowns.lock().get(&a).copied())
+            .is_some_and(|c| c.until > now);
+        if cooling {
+            return None;
+        }
+        author.or(relayer).map_or_else(
+            || {
+                Arc::clone(&self.unresolved)
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| GossipSlot::Shared { _permit: permit })
+            },
+            |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: Box::new(slot) }),
+        )
+    }
+
+    /// Strike `author` for a fault of the strike class on its own delivery (#1772).
+    ///
+    /// The caller picks the author with [`gossip_author_to_strike`]: the fault is one where
+    /// [`PrimaryNetworkError::strikes_gossip_author`] holds, and the author delivered the frame
+    /// itself while the ticket was pending.
+    ///
+    /// Its gossip gets no slot for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubled for each earlier
+    /// strike in this epoch, up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+    pub(crate) fn strike(&self, author: BlsPublicKey) {
+        self.strike_at(author, Instant::now())
+    }
+
+    /// [`Self::strike`] at the instant `now`.
+    fn strike_at(&self, author: BlsPublicKey, now: Instant) {
+        let mut guard = self.cooldowns.lock();
+        let strikes = guard.get(&author).map_or(1, |c| c.strikes.saturating_add(1));
+        let hold = GOSSIP_AUTHOR_COOLDOWN_BASE
+            .saturating_mul(1u32 << strikes.saturating_sub(1).min(4))
+            .min(GOSSIP_AUTHOR_COOLDOWN_MAX);
+        guard.insert(author, AuthorCooldown { strikes, until: now + hold });
+    }
+
+    /// The end of the cooldown of `author`, if it was struck in this epoch.
+    #[cfg(test)]
+    pub(crate) fn cooldown_until(&self, author: &BlsPublicKey) -> Option<Instant> {
+        self.cooldowns.lock().get(author).map(|c| c.until)
+    }
+
+    /// Admit one gossip message for signature verification.
+    ///
+    /// Returns `None` when no slot is free. The ticket then drops and reports `Ignore`.
+    pub(crate) fn admit(
+        &self,
+        validation: GossipValidation<Req, Res>,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<PendingGossip> {
+        self.take(author, relayer).map(|slot| PendingGossip::new(validation, slot))
+    }
+}
+
+/// The author that a failed gossip message strikes, if any (#1772).
+///
+/// This is the same by-author rule that the network layer applies on its reject path
+/// (GHSA-vw36): any peer that once held the frame can deliver it again. The author is struck
+/// only for a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]) on a
+/// frame that the author delivered itself while the ticket was pending. A relayed forged frame
+/// is still rejected and never forwarded, but it strikes no one. A frame whose ticket was
+/// already settled (a fault after Accept) strikes no one.
+pub(crate) fn gossip_author_to_strike(
+    e: &PrimaryNetworkError,
+    was_pending: bool,
+    author: Option<BlsPublicKey>,
+    relayer: Option<BlsPublicKey>,
+) -> Option<BlsPublicKey> {
+    author.filter(|a| was_pending && relayer == Some(*a) && e.strikes_gossip_author())
+}
+
+/// One gossip message in signature verification: its verdict ticket and its slot (#1772).
+pub(crate) struct PendingGossip {
+    /// The deferred verdict ticket for gossipsub.
+    validation: GossipValidation<Req, Res>,
+    /// The verification slot. The first verdict frees it, so downstream work does not hold it.
+    slot: Option<GossipSlot>,
+}
+
+impl PendingGossip {
+    /// Pair a ticket with the slot it was admitted under.
+    pub(crate) fn new(validation: GossipValidation<Req, Res>, slot: GossipSlot) -> Self {
+        Self { validation, slot: Some(slot) }
+    }
+
+    /// A message with no ticket to report and no slot, for direct handler calls in tests.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self { validation: GossipValidation::detached(), slot: None }
+    }
+
+    /// Free the slot and report `Accept`, so gossipsub forwards the message.
+    ///
+    /// Call it right after the signature check and before any downstream work.
+    pub(crate) async fn accept(&mut self) {
+        drop(self.slot.take());
+        self.validation.accept().await;
+    }
+
+    /// Free the slot and report `Reject`, so gossipsub drops the message as invalid.
+    pub(crate) async fn reject(&mut self) {
+        drop(self.slot.take());
+        self.validation.reject().await;
+    }
+
+    /// Whether the ticket still waits for a verdict.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.validation.is_pending()
+    }
+
+    /// Settle the ticket after the handler failed with `e`.
+    ///
+    /// An author content fault reports `Reject` while the ticket is pending. Any other error
+    /// drops the ticket, which reports `Ignore`.
+    pub(crate) async fn settle_error(mut self, e: &crate::error::PrimaryNetworkError) {
+        if e.is_author_content_fault() && self.is_pending() {
+            self.reject().await;
+        }
+    }
+}
+
 /// Maximum number of concurrent shed tasks for denied inbound sync streams.
 ///
 /// A denied stream still gets a short-lived task that writes
@@ -225,6 +465,33 @@ const SYNC_REQUEST_WRITE_TIMEOUT: Duration = PUBLIC_SYNC_REQUEST_READ_TIMEOUT;
 /// bound rather than a hard compatibility limit.
 const MAX_SYNC_REQUEST_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
+/// Every `SYNC_PREFERENCE_EXPLORE_EVERY`-th probe walk is an exploration walk
+/// (`PrimaryNetworkHandle::exploration_walk`, #1787): it probes the holder of the probe-first
+/// preference (`last_sync_server`) last, behind every other peer, marked peers included
+/// (`order_probe_peers`), and the first peer that serves it at the target takes the preference
+/// and bumps the slot's generation (`record_sync_served`, `SyncPreference`).
+///
+/// The serve rule alone never displaces a holder that serves at exactly the target rate. On an
+/// exploration walk any other peer that serves at the target takes the slot, and the generation
+/// bump fences every walk that started under the old holder, so a serve by the old holder that
+/// completes afterwards does not put it back. The holder keeps the slot through an exploration
+/// walk only when no other peer serves that walk at the target. Once per
+/// `SYNC_PREFERENCE_EXPLORE_EVERY` walks an honest fast holder is probed last and may yield the
+/// slot to another peer that serves at the target. A peer cut at the target on
+/// an exploration walk is marked for the epoch and sorts behind the fresh peers afterwards, so
+/// each slow peer costs that at most once per epoch.
+pub(crate) const SYNC_PREFERENCE_EXPLORE_EVERY: u64 = 16;
+
+/// How many distinct peers one probe walk must see cut at the target rate before the requester
+/// concludes that its own link, not the peers, is below the target (Gap 4 of #1787). The walk
+/// stops its target pass at that cut, reads the rest of the walk at the floor, and sets
+/// `PrimaryNetworkHandle::floor_only_this_epoch`, so every later walk of the node epoch reads
+/// every peer at the floor. One cut is one slow peer; two in one walk are the requester's own
+/// link. The cost is about two target-cut probes, around one `SYNC_RATE_WINDOW` each on a slow
+/// link, once per node epoch, after which the requester syncs at the floor as the parent always
+/// did.
+const LINK_BELOW_TARGET_CUTS: usize = 2;
+
 /// The outcome of an epoch-pack fetch attempt over the typed sync protocol.
 enum EpochPackAttempt {
     /// The peer served and the pack was imported into the consensus chain.
@@ -294,6 +561,53 @@ struct ConsensusOutputSyncRequest<'a> {
     expected_hash: ConsensusHeaderDigest,
     /// Chain holding the epoch's committee, used to stream-decode and verify.
     consensus_chain: &'a ConsensusChain,
+}
+
+/// The verdict of one sync probe, as `walk_probes` folds it (#1787).
+enum ProbeVerdict<T> {
+    /// The peer served; the walk stops here.
+    Served(T),
+    /// The reader cut this peer for falling below the target bound
+    /// (`SyncServeMeter::cut_at_target`), so the peer is worth a floor retry in the same walk
+    /// (`walk_with_floor_fallback`).
+    CutAtTarget,
+    /// Any other failure, or the peer did not answer the sync protocol.
+    Missed,
+}
+
+/// The outcome of one pass of `walk_probes` over a probe plan (#1787).
+enum WalkOutcome<T> {
+    /// A peer served; no peer past it was probed.
+    Served(T),
+    /// No peer served.
+    Unserved {
+        /// The peers the reader cut for falling below the target bound in this pass, in probe
+        /// order; `walk_with_floor_fallback` probes them again at the floor.
+        cut_at_target: Vec<BlsPublicKey>,
+    },
+    /// The pass stopped at the second distinct peer the reader cut at the target
+    /// (`LINK_BELOW_TARGET_CUTS`): two peers below the target in one walk mean the requester's
+    /// own link is below it, so no further peer was read at the target (Gap 4 of #1787).
+    LinkBelowTarget {
+        /// The peers cut at the target, in probe order.
+        cut_at_target: Vec<BlsPublicKey>,
+        /// The peers of the plan past the second cut, not probed in this pass, in plan order.
+        unprobed: Vec<BlsPublicKey>,
+    },
+}
+
+/// Why `walk_probes` stopped before the end of its plan: the `Err` of its fold (#1787).
+enum WalkStop<T> {
+    /// A peer served.
+    Served(T),
+    /// A second distinct peer was cut at the target; `next` indexes the first plan entry not
+    /// probed.
+    LinkBelowTarget {
+        /// The peers cut at the target, in probe order.
+        cut_at_target: Vec<BlsPublicKey>,
+        /// Index into the plan of the first entry not probed.
+        next: usize,
+    },
 }
 
 /// RAII guard for one admitted in-flight request holding a global concurrency permit
@@ -745,6 +1059,41 @@ async fn serve_sync_request<DB: Database>(
     }
 }
 
+/// The probe-first sync preference behind a generation fence (#1787).
+///
+/// `peer` is the last peer that served at the target rate. `generation` counts the
+/// displacements of the slot: a serve on an exploration walk and a rotation clear each bump it
+/// (`displace`). A probe walk reads both when it starts, and its serve records its peer only
+/// while the generation it read is still current ([`PrimaryNetworkHandle::record_sync_served`]),
+/// so a walk that started under the old holder, or before the rotation, cannot put the old
+/// holder back after it was displaced.
+#[derive(Clone, Copy, Debug, Default)]
+struct SyncPreference {
+    /// The last peer that served at the target rate, if any.
+    peer: Option<BlsPublicKey>,
+    /// Bumped by every exploration serve and every rotation clear.
+    generation: u64,
+}
+
+impl SyncPreference {
+    /// Move the slot to `peer` and fence every walk that started under the old holder.
+    fn displace(&mut self, peer: Option<BlsPublicKey>) {
+        self.peer = peer;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+/// What a probe walk read from the preference slot when it started (#1787), threaded through
+/// the `probe_*` functions to [`PrimaryNetworkHandle::record_sync_served`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProbeWalk {
+    /// The slot generation at walk start; a serve records its peer only while this is current.
+    generation: u64,
+    /// Whether this is an exploration walk (`exploration_walk`): its target serve takes the slot
+    /// unconditionally and bumps the generation.
+    explore: bool,
+}
+
 /// Primary network specific handle.
 #[derive(Clone, Debug)]
 pub struct PrimaryNetworkHandle {
@@ -761,28 +1110,49 @@ pub struct PrimaryNetworkHandle {
     /// [`Self::clear_sync_capability`] so a peer upgraded over the rotation boundary
     /// is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
-    /// Per-peer memory of the last epoch a sync probe to that peer failed, timed out, or served
-    /// below the target rate ([`SyncServeSpeed::Slow`]).
+    /// Per-(peer, epoch) marks: a sync probe to the peer for that fetched epoch failed, timed
+    /// out, was cut by the reader, or served below the target rate ([`SyncServeSpeed::Slow`]).
     ///
-    /// The probe loops shuffle their candidate peers and then move any peer whose recorded epoch
-    /// equals the epoch being fetched to the BACK: a peer that failed once for this epoch is
-    /// probed after every fresh peer (de-prioritised, not skipped) on the retries for the same
-    /// epoch, so a "drip"/slow peer or a Byzantine peer in stable `HashMap` order can no longer
-    /// stall the front of every attempt. Stale entries for older epochs are ignored (the compare
-    /// is against the current epoch) and the whole map is cleared on rotation via
-    /// [`Self::clear_sync_capability`].
-    epoch_sync_failed: Arc<Mutex<HashMap<BlsPublicKey, Epoch>>>,
-    /// The last peer that served a full pack, a partial pack or a verified consensus output at
-    /// the target rate.
+    /// The probe walks shuffle their candidate peers, move every peer marked for the epoch
+    /// being fetched to the BACK (`order_probe_peers`), and read a marked peer at the floor
+    /// (`probe_bound`): a peer that failed once for an epoch is probed after every fresh peer
+    /// (de-prioritised, not skipped) on the retries for that epoch, so a drip or slow peer, or
+    /// a Byzantine peer in stable `HashMap` order, cannot stall the front of every attempt.
     ///
-    /// The probe loops try this peer first unless it already failed a probe for the epoch being
-    /// fetched, so the header-by-header output walk returns to the peer that just served instead
-    /// of reshuffling across the whole peer set for every number. Set only by a pack import that
-    /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe, and only
-    /// by a serve at the target rate ([`SyncServeSpeed::Target`]): a floor-rate serve never sets
-    /// it, so the preference cannot be captured by a slow peer.
-    /// [`Self::clear_sync_capability`] deliberately leaves it in place.
-    last_sync_server: Arc<Mutex<Option<BlsPublicKey>>>,
+    /// A mark is keyed by the peer AND the fetched epoch (#1787), so a walk on another epoch
+    /// never overwrites or clears it: a peer slow on epoch 3 stays at the floor for epoch 3
+    /// while it is read at the target for epoch 4. The set is cleared at rotation by
+    /// [`Self::clear_sync_capability`], so it holds at most one mark per peer for each epoch
+    /// probed within one node epoch.
+    epoch_sync_failed: Arc<Mutex<HashSet<(BlsPublicKey, Epoch)>>>,
+    /// The probe-first preference ([`SyncPreference`]): the last peer that served a full pack, a
+    /// partial pack or a verified consensus output at the target rate, behind a generation
+    /// fence.
+    ///
+    /// The probe walks try this peer first unless it is marked for the epoch being fetched, so
+    /// the header-by-header output walk returns to the peer that just served instead of
+    /// reshuffling across the whole peer set for every number. Set only by a pack import that
+    /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe, and
+    /// only by a serve at the target rate ([`SyncServeSpeed::Target`]): a floor-rate serve
+    /// never sets it, so the preference cannot be captured by a slow peer.
+    ///
+    /// A hold is bounded (#1787): every `SYNC_PREFERENCE_EXPLORE_EVERY`-th walk probes the
+    /// holder last (`exploration_walk`), so a holder that serves at exactly the target is
+    /// displaced by the first other peer that serves that walk at the target, and
+    /// [`Self::clear_sync_capability`] drops it at rotation. Each displacement and each
+    /// rotation bumps the slot's generation, and a serve records its peer only while the
+    /// generation its walk read at its start is still current
+    /// ([`Self::record_sync_served`]), so a walk that started under the old holder, or before
+    /// the rotation, cannot put the old holder back.
+    last_sync_server: Arc<Mutex<SyncPreference>>,
+    /// Count of the probe walks started on this handle and its clones: the counter behind
+    /// `exploration_walk` (#1787).
+    probe_walks: Arc<AtomicU64>,
+    /// Whether this node's own link was found below the target rate in this node epoch (Gap 4
+    /// of #1787): one probe walk saw `LINK_BELOW_TARGET_CUTS` distinct peers cut at the target.
+    /// While set, `walk_with_floor_fallback` plans every peer at the floor and reads nothing at
+    /// the target. Reset at rotation by [`Self::clear_sync_capability`].
+    floor_only_this_epoch: Arc<AtomicBool>,
 }
 
 // Test-only conversion that defaults the chain id to 0. Gated to tests so the only
@@ -796,8 +1166,10 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             handle,
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
-            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
-            last_sync_server: Arc::new(Mutex::new(None)),
+            epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
+            probe_walks: Arc::new(AtomicU64::new(0)),
+            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -809,8 +1181,10 @@ impl PrimaryNetworkHandle {
             handle,
             chain_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
-            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
-            last_sync_server: Arc::new(Mutex::new(None)),
+            epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
+            probe_walks: Arc::new(AtomicU64::new(0)),
+            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -820,57 +1194,108 @@ impl PrimaryNetworkHandle {
             handle: NetworkHandle::new(sender),
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
-            epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
-            last_sync_server: Arc::new(Mutex::new(None)),
+            epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
+            probe_walks: Arc::new(AtomicU64::new(0)),
+            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Clear the per-peer epoch-pack sync-capability cache.
+    /// Clear the per-peer epoch-pack sync-capability cache, the per-(peer, epoch) failure
+    /// marks, the probe-first preference and the floor-only flag.
     ///
-    /// Called at each epoch boundary: committees rotate and binaries are upgraded
-    /// there, so a peer that did not answer the sync protocol last epoch is
-    /// re-probed for it this epoch. The last peer that served a sync request stays
-    /// preferred: a peer that served the previous epoch very likely serves this one,
-    /// and a wrong guess costs one probe, after which the preference is dropped
-    /// (see `forget_sync_server`). The preference can safely survive rotation because only a
-    /// target-rate serve sets it.
+    /// Called at each epoch boundary: committees rotate and binaries are upgraded there, so a
+    /// peer that did not answer the sync protocol last epoch is re-probed for it this epoch.
+    /// The preference is dropped at rotation too, and the slot's generation is bumped
+    /// (`SyncPreference::displace`), so a serve in flight at the clear, whose walk read the old
+    /// generation when it started, does not re-install its peer in the new epoch (#1787).
+    /// Within the epoch the holder-last exploration order (`exploration_walk`) displaces a
+    /// holder that serves at exactly the target rate. The floor-only flag
+    /// (`floor_only_this_epoch`) is reset, so the new epoch's walks read fresh peers at the
+    /// target again until two distinct peers are cut at the target in one walk.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
+        self.last_sync_server.lock().displace(None);
+        self.floor_only_this_epoch.store(false, Ordering::Relaxed);
     }
 
-    /// Record that `peer` served a full pack, a partial pack or a verified consensus output at
-    /// the target rate ([`SyncServeSpeed::Target`]).
+    /// Record that `peer` served a full pack, a partial pack or a verified consensus output for
+    /// `epoch` at the target rate ([`SyncServeSpeed::Target`]) on `walk`.
     ///
-    /// The peer is cached sync-capable, any failure it recorded this epoch is cleared so a peer
-    /// that recovered is no longer de-prioritised, and it becomes the peer the next probe walk
-    /// tries first. The preference lasts until another peer serves or until `peer` fails a
-    /// probe (`forget_sync_server`), so a peer that served once and then stalls does not stay
-    /// at the front of every later walk.
-    fn record_sync_served(&self, peer: BlsPublicKey) {
+    /// The peer is cached sync-capable and its mark for `epoch` is cleared so a peer that
+    /// recovered is no longer de-prioritised for that epoch (a mark for another epoch stays,
+    /// #1787). The probe-first preference is fenced by the slot's generation
+    /// ([`SyncPreference`]): a serve on an exploration walk takes the slot and bumps the
+    /// generation, which fences every walk that started under the old holder; a serve on any
+    /// other walk takes the slot only while the generation the walk read at its start is still
+    /// current, so a walk older than the last displacement or rotation cannot put its peer
+    /// back. The preference lasts until another peer takes it, until `peer` fails a probe
+    /// (`forget_sync_server`), or until rotation (`clear_sync_capability`), so a peer that
+    /// served once and then stalls does not stay at the front of every later walk.
+    pub(crate) fn record_sync_served(&self, peer: BlsPublicKey, epoch: Epoch, walk: ProbeWalk) {
         self.sync_capability.lock().insert(peer, true);
-        self.epoch_sync_failed.lock().remove(&peer);
-        *self.last_sync_server.lock() = Some(peer);
+        self.epoch_sync_failed.lock().remove(&(peer, epoch));
+        let mut preference = self.last_sync_server.lock();
+        if walk.explore {
+            preference.displace(Some(peer));
+        } else if preference.generation == walk.generation {
+            preference.peer = Some(peer);
+        }
     }
 
-    /// Record that `peer` served a valid pack or a verified output, but below the target rate
-    /// ([`SyncServeSpeed::Slow`]).
+    /// Record that `peer` served a valid pack or a verified output for `epoch`, but below the
+    /// target rate ([`SyncServeSpeed::Slow`]).
     ///
-    /// The peer stays sync-capable, sorts behind every fresh peer for the rest of the epoch
-    /// (`order_probe_peers`), and never holds or keeps the probe-first preference, so a peer that
-    /// serves at the floor cannot capture the walk (GHSA-8fj9-xc3h-gmxm).
-    fn record_sync_served_slowly(&self, peer: BlsPublicKey, epoch: Epoch) {
+    /// The peer stays sync-capable, is marked for `epoch` so it sorts behind every fresh peer
+    /// and is read at the floor for the rest of the epoch (`order_probe_peers`,
+    /// `probe_bound`), and never holds or keeps the probe-first preference, so a peer that
+    /// serves at the floor cannot capture the walk (GHSA-8fj9-xc3h-gmxm). The bookkeeping is
+    /// that of `mark_sync_failed`.
+    pub(crate) fn record_sync_served_slowly(&self, peer: BlsPublicKey, epoch: Epoch) {
+        self.mark_sync_failed(peer, epoch);
+    }
+
+    /// Record that a sync exchange with `peer` for `epoch` failed after the peer answered the
+    /// protocol (#1787).
+    ///
+    /// The peer stays sync-capable, is marked for `epoch` so later walks for that epoch probe
+    /// it last and at the floor, and loses the probe-first preference (`forget_sync_server`).
+    pub(crate) fn mark_sync_failed(&self, peer: BlsPublicKey, epoch: Epoch) {
         self.sync_capability.lock().insert(peer, true);
-        self.epoch_sync_failed.lock().insert(peer, epoch);
+        self.epoch_sync_failed.lock().insert((peer, epoch));
         self.forget_sync_server(peer);
+    }
+
+    /// The rate bound a probe of `peer` for `epoch` reads at (#1787): the floor when `peer` is
+    /// marked for `epoch`, the target otherwise. A mark for another epoch does not lower it.
+    pub(crate) fn probe_bound(&self, peer: BlsPublicKey, epoch: Epoch) -> SyncRateBound {
+        SyncRateBound::for_probe(self.epoch_sync_failed.lock().contains(&(peer, epoch)))
+    }
+
+    /// Count one probe walk and report whether it is an exploration walk (#1787): the last
+    /// walk of every run of `SYNC_PREFERENCE_EXPLORE_EVERY` probes the holder of the probe-first
+    /// preference last in `order_probe_peers`, and its target serve takes the slot and bumps
+    /// the generation (`record_sync_served`).
+    pub(crate) fn exploration_walk(&self) -> bool {
+        self.probe_walks.fetch_add(1, Ordering::Relaxed) % SYNC_PREFERENCE_EXPLORE_EVERY
+            == SYNC_PREFERENCE_EXPLORE_EVERY - 1
     }
 
     /// Forget `peer` as the preferred sync server when it is the one on record. Every probe of
     /// `peer` that does not serve calls this, so a peer that served once and then stalls or fails
-    /// does not stay at the front of every later walk.
+    /// does not stay at the front of every later walk. The slot's generation is NOT bumped: a
+    /// walk whose preferred peer failed its probe stays current, so it can still record the
+    /// next peer that serves it (#1787).
     fn forget_sync_server(&self, peer: BlsPublicKey) {
-        let mut preferred = self.last_sync_server.lock();
-        *preferred = (*preferred).filter(|recorded| *recorded != peer);
+        let mut preference = self.last_sync_server.lock();
+        preference.peer = preference.peer.filter(|recorded| *recorded != peer);
+    }
+
+    /// Whether `peer` is cached as not speaking the sync protocol this epoch
+    /// (`sync_capability` holds `false`), so the probe walks skip it.
+    fn is_known_unsyncable(&self, peer: &BlsPublicKey) -> bool {
+        self.sync_capability.lock().get(peer) == Some(&false)
     }
 
     /// Return a reference to the inner handle.
@@ -1094,105 +1519,244 @@ impl PrimaryNetworkHandle {
         // Resolve the committee-selecting epoch once and bundle the request so every probe hop
         // carries the chain and the verified hash needed to stream-decode + verify in place.
         let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
-        // Shuffle, put the last peer that served first, and de-prioritise peers that already
-        // failed a probe for this epoch (same ordering as the full-pack path). A preferred peer
-        // that does not serve a probe loses the preference (`forget_sync_server`), and every
-        // probe's opening write is bounded by `SYNC_REQUEST_WRITE_TIMEOUT`, so a peer that
-        // served once and then stalls costs one bounded probe, not the walk. The preference is
-        // read in its own statement so its lock guard never overlaps the failure map's. Only a
-        // serve at the target rate sets the preference; a slower one de-prioritises the
-        // peer for the epoch (`record_sync_served_slowly`).
-        let preferred = *self.last_sync_server.lock();
+        // Shuffle, put the last peer that served first, or last on an exploration walk
+        // (`exploration_walk`), and put the peers marked for this epoch last (same ordering as
+        // the full-pack path, `order_probe_peers`). `walk_with_floor_fallback` then probes one
+        // peer at a time, each at its own bound (a marked peer at the floor, a fresh one at the
+        // target, every peer at the floor once a walk of this node epoch found this node's own
+        // link below the target), stops at the first VERIFIED output, and probes the peers the
+        // first pass cut at the target again at the floor (#1787). A peer that does not serve
+        // loses the preference (`forget_sync_server`), and every probe's opening write is
+        // bounded by `SYNC_REQUEST_WRITE_TIMEOUT`. The preference and its generation are read
+        // in one statement, whose guard drops before any await, and the failure set's guard
+        // drops at the end of the ordering statement, before any probe.
+        let SyncPreference { peer: preferred, generation } = *self.last_sync_server.lock();
+        let walk = ProbeWalk { generation, explore: self.exploration_walk() };
         let peers = order_probe_peers(
             peers,
             &self.epoch_sync_failed.lock(),
             epoch,
             preferred,
+            walk.explore,
             &mut rand::rng(),
         );
-
-        // Probe candidate peers one at a time (the async analog of a short-circuiting
-        // fold): `filter` drops peers cached unsyncable for free, `then` runs each exchange
-        // and records its verdict, and `filter_map` + `next` stop at the first peer that
-        // serves a VERIFIED output (so no peer past the first success is probed, and a
-        // wrong-hash peer is skipped).
-        let probes = futures::stream::iter(peers)
-            .filter(move |peer| {
-                let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
-                futures::future::ready(!known_unsyncable)
-            })
-            .then(move |peer| async move {
-                // Read a peer already de-prioritised this epoch at the floor and a fresh one at
-                // the target rate; the failure map's guard drops at the end of the statement.
-                let deprioritised = self.epoch_sync_failed.lock().get(&peer) == Some(&epoch);
-                let bound = SyncRateBound::for_probe(deprioritised);
-                let meter = SyncServeMeter::default();
-                let started = tokio::time::Instant::now();
-                match self
-                    .sync_consensus_output_from_peer(peer, request, bound, meter.clone())
-                    .await
-                {
-                    ConsensusOutputAttempt::Fetched(output) => {
-                        let elapsed = started.elapsed();
-                        let speed = meter.speed(elapsed);
-                        match speed {
-                            SyncServeSpeed::Target => self.record_sync_served(peer),
-                            SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
-                        }
-                        debug!(
-                            target: "primary::network",
-                            %peer,
-                            number,
-                            bytes = meter.bytes(),
-                            elapsed_ms = elapsed.as_millis(),
-                            ?speed,
-                            "fetched verified consensus output over sync protocol"
-                        );
-                        Some(output)
-                    }
-                    ConsensusOutputAttempt::Unsupported => {
-                        // Ambiguous: the peer may serve full epoch packs but not decode
-                        // this newer `ConsensusOutput` variant, so do NOT cache `false`
-                        // and hide it from the full-pack path. It did not serve, so it
-                        // loses the probe-first preference if it held it.
-                        self.forget_sync_server(peer);
-                        debug!(
-                            target: "primary::network",
-                            %peer,
-                            number,
-                            "peer did not answer consensus output sync; skipping this probe"
-                        );
-                        None
-                    }
-                    ConsensusOutputAttempt::Failed(e) => {
-                        // the peer speaks sync but this exchange failed; keep it
-                        // sync-capable, drop its probe-first preference, and try the
-                        // next peer
-                        self.sync_capability.lock().insert(peer, true);
-                        self.epoch_sync_failed.lock().insert(peer, epoch);
-                        self.forget_sync_server(peer);
-                        warn!(
-                            target: "primary::network",
-                            %peer,
-                            number,
-                            ?e,
-                            "consensus output sync exchange failed; trying next peer"
-                        );
-                        None
-                    }
-                }
-            })
-            .filter_map(futures::future::ready);
-
-        // `next` needs the stream `Unpin`, which the `then(async move { .. })`
-        // combinator is not, so pin the probe chain on the stack before pulling the
-        // first success.
-        let mut probes = std::pin::pin!(probes);
-        probes.next().await.ok_or_else(|| {
+        self.walk_with_floor_fallback(peers, epoch, move |peer, bound| {
+            self.probe_consensus_output(peer, request, bound, walk)
+        })
+        .await
+        .ok_or_else(|| {
             NetworkError::RPCError(
                 "no peer served the consensus output over the sync protocol".to_string(),
             )
         })
+    }
+
+    /// Probe `peer` once for the consensus output `request` names, reading it at `bound`, and
+    /// classify the exchange for `walk_probes` (#1787).
+    ///
+    /// A serve records the peer by its measured speed for `request.epoch` on `walk`
+    /// (`record_sync_served` or `record_sync_served_slowly`) and is `Served`. A peer that does
+    /// not answer is NOT cached (an ambiguous `Unsupported`; see `ConsensusOutputAttempt`) and
+    /// is `Missed`. A failed exchange marks the peer for the epoch (`mark_sync_failed`) and is
+    /// `CutAtTarget` when the reader cut the peer for falling below the target bound, else
+    /// `Missed`.
+    async fn probe_consensus_output(
+        &self,
+        peer: BlsPublicKey,
+        request: ConsensusOutputSyncRequest<'_>,
+        bound: SyncRateBound,
+        walk: ProbeWalk,
+    ) -> ProbeVerdict<ConsensusOutput> {
+        let ConsensusOutputSyncRequest { number, epoch, .. } = request;
+        let meter = SyncServeMeter::default();
+        let started = tokio::time::Instant::now();
+        match self.sync_consensus_output_from_peer(peer, request, bound, meter.clone()).await {
+            ConsensusOutputAttempt::Fetched(output) => {
+                let elapsed = started.elapsed();
+                let speed = meter.speed(elapsed);
+                match speed {
+                    SyncServeSpeed::Target => self.record_sync_served(peer, epoch, walk),
+                    SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
+                }
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    number,
+                    bytes = meter.bytes(),
+                    elapsed_ms = elapsed.as_millis(),
+                    ?speed,
+                    "fetched verified consensus output over sync protocol"
+                );
+                ProbeVerdict::Served(output)
+            }
+            ConsensusOutputAttempt::Unsupported => {
+                // Ambiguous: the peer may serve full epoch packs but not decode
+                // this newer `ConsensusOutput` variant, so do NOT cache `false`
+                // and hide it from the full-pack path. It did not serve, so it
+                // loses the probe-first preference if it held it.
+                self.forget_sync_server(peer);
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    number,
+                    "peer did not answer consensus output sync; skipping this probe"
+                );
+                ProbeVerdict::Missed
+            }
+            ConsensusOutputAttempt::Failed(e) => {
+                // the peer speaks sync but this exchange failed; keep it
+                // sync-capable, mark it for this epoch, drop its probe-first
+                // preference, and try the next peer
+                self.mark_sync_failed(peer, epoch);
+                warn!(
+                    target: "primary::network",
+                    %peer,
+                    number,
+                    ?e,
+                    "consensus output sync exchange failed; trying next peer"
+                );
+                if meter.cut_at_target() {
+                    ProbeVerdict::CutAtTarget
+                } else {
+                    ProbeVerdict::Missed
+                }
+            }
+        }
+    }
+
+    /// Walk `plan` one peer at a time, reading each peer at its planned bound, and stop at the
+    /// first peer that serves, so no peer past it is probed, or at the second distinct peer the
+    /// reader cuts at the target (`LINK_BELOW_TARGET_CUTS`), so no further peer is read at a
+    /// bound this node's own link cannot meet (#1787).
+    ///
+    /// A peer cached unsyncable (`is_known_unsyncable`) is skipped. The check runs as the walk
+    /// reaches the peer, so a peer that an earlier probe in the same walk cached unsyncable is
+    /// skipped too. Returns the served value, the peers the reader cut at the target in probe
+    /// order, or, after the second cut, those peers plus the peers of the plan not yet probed.
+    async fn walk_probes<T, F, Fut>(
+        &self,
+        plan: Vec<(BlsPublicKey, SyncRateBound)>,
+        probe: F,
+    ) -> WalkOutcome<T>
+    where
+        F: Fn(BlsPublicKey, SyncRateBound) -> Fut,
+        Fut: Future<Output = ProbeVerdict<T>>,
+    {
+        let walked = futures::stream::iter(plan.iter().copied().enumerate())
+            .filter(|(_, (peer, _))| futures::future::ready(!self.is_known_unsyncable(peer)))
+            .then(|(index, (peer, bound))| {
+                probe(peer, bound).map(move |verdict| match verdict {
+                    ProbeVerdict::Served(served) => Err(WalkStop::Served(served)),
+                    ProbeVerdict::CutAtTarget => Ok((index, Some(peer))),
+                    ProbeVerdict::Missed => Ok((index, None)),
+                })
+            })
+            // `Err` short-circuits the fold: a serve, so no peer past it is probed, or the
+            // second distinct peer cut at the target, so the rest of the plan is left for a
+            // floor pass. `Ok` carries the peers cut at the target so far, in probe order.
+            .try_fold(Vec::new(), |cut: Vec<BlsPublicKey>, (index, cut_peer)| {
+                let cut_at_target: Vec<BlsPublicKey> = cut
+                    .into_iter()
+                    .filter(|earlier| Some(*earlier) != cut_peer)
+                    .chain(cut_peer)
+                    .collect();
+                futures::future::ready(if cut_at_target.len() < LINK_BELOW_TARGET_CUTS {
+                    Ok(cut_at_target)
+                } else {
+                    Err(WalkStop::LinkBelowTarget { cut_at_target, next: index + 1 })
+                })
+            })
+            .await;
+        walked.map_or_else(
+            |stop| match stop {
+                WalkStop::Served(served) => WalkOutcome::Served(served),
+                WalkStop::LinkBelowTarget { cut_at_target, next } => {
+                    let unprobed = plan.iter().skip(next).map(|(peer, _)| *peer).collect();
+                    WalkOutcome::LinkBelowTarget { cut_at_target, unprobed }
+                }
+            },
+            |cut_at_target| WalkOutcome::Unserved { cut_at_target },
+        )
+    }
+
+    /// Walk `peers` in the given order with a floor retry (#1787).
+    ///
+    /// Pass 1 reads every peer at its own bound (`probe_bound`: the floor for a peer marked for
+    /// `epoch`, the target otherwise). When no peer serves, pass 2 probes again, at the floor
+    /// and with no sleep, the peers that pass 1 cut at the target, so one peer cut at the
+    /// target costs the walk one floor retry rather than a failure.
+    ///
+    /// Two distinct peers cut at the target in one pass mean this node's own link, not the
+    /// peers, is below the target (Gap 4 of #1787): pass 1 stops at the second cut
+    /// (`LINK_BELOW_TARGET_CUTS`), the rest of this walk (the cut peers, then the peers not yet
+    /// probed) is read at the floor, and `floor_only_this_epoch` is set, so every later walk of
+    /// this node epoch plans every peer at the floor and reads nothing at the target. The flag
+    /// is reset at rotation (`clear_sync_capability`). A slow requester therefore pays about two
+    /// target-cut probes, around one `SYNC_RATE_WINDOW` each, once per node epoch, and then
+    /// syncs at the floor as the parent always did. A floor read that completes at the target
+    /// speed takes the preference and one that does not is marked slow, as for any serve
+    /// (`probe_consensus_output`, `probe_epoch_pack`). Returns the first served value, or
+    /// `None` when no pass serves.
+    async fn walk_with_floor_fallback<T, F, Fut>(
+        &self,
+        peers: Vec<BlsPublicKey>,
+        epoch: Epoch,
+        probe: F,
+    ) -> Option<T>
+    where
+        F: Fn(BlsPublicKey, SyncRateBound) -> Fut,
+        Fut: Future<Output = ProbeVerdict<T>>,
+    {
+        let floor_only = self.floor_only_this_epoch.load(Ordering::Relaxed);
+        let plan = peers
+            .into_iter()
+            .map(|peer| {
+                let bound =
+                    if floor_only { SyncRateBound::Floor } else { self.probe_bound(peer, epoch) };
+                (peer, bound)
+            })
+            .collect();
+        match self.walk_probes(plan, &probe).await {
+            WalkOutcome::Served(served) => Some(served),
+            WalkOutcome::Unserved { cut_at_target } if cut_at_target.is_empty() => None,
+            WalkOutcome::Unserved { cut_at_target } => {
+                info!(
+                    target: "primary::network",
+                    epoch,
+                    peers = cut_at_target.len(),
+                    "no peer served at the target rate; probing the peers cut at the target \
+                     again at the floor"
+                );
+                self.walk_floor_pass(cut_at_target, &probe).await
+            }
+            WalkOutcome::LinkBelowTarget { cut_at_target, unprobed } => {
+                self.floor_only_this_epoch.store(true, Ordering::Relaxed);
+                info!(
+                    target: "primary::network",
+                    epoch,
+                    cut = cut_at_target.len(),
+                    unprobed = unprobed.len(),
+                    "two peers cut at the target rate in one walk, so this node's link is below \
+                     the target; reading every peer at the floor for the rest of the epoch"
+                );
+                let rest: Vec<BlsPublicKey> = cut_at_target.into_iter().chain(unprobed).collect();
+                self.walk_floor_pass(rest, &probe).await
+            }
+        }
+    }
+
+    /// Read `peers` at the floor, in order, and return the first served value (#1787). A floor
+    /// pass has nothing left to retry, so any unserved outcome is `None`.
+    async fn walk_floor_pass<T, F, Fut>(&self, peers: Vec<BlsPublicKey>, probe: F) -> Option<T>
+    where
+        F: Fn(BlsPublicKey, SyncRateBound) -> Fut,
+        Fut: Future<Output = ProbeVerdict<T>>,
+    {
+        let plan = peers.into_iter().map(|peer| (peer, SyncRateBound::Floor)).collect();
+        match self.walk_probes(plan, probe).await {
+            WalkOutcome::Served(served) => Some(served),
+            WalkOutcome::Unserved { .. } | WalkOutcome::LinkBelowTarget { .. } => None,
+        }
     }
 
     /// Run one consensus-output sync exchange against `peer`, flattening the classified
@@ -1487,118 +2051,129 @@ impl PrimaryNetworkHandle {
     /// reaches `Ack` is penalty-exempt; an import fault after `Ack` that is attributable
     /// to the peer's bytes is penalised. Every phase of a probe is bounded (stream open,
     /// the opening request write under `SYNC_REQUEST_WRITE_TIMEOUT`, the `Ack` read, and
-    /// the reader's per-frame timeout plus throughput floor after it), and the last peer
+    /// the reader's per-frame timeout plus throughput bound after it), and the last peer
     /// that served is probed first only until it fails a probe, so one stalled peer costs
-    /// one bounded probe per walk rather than the walk. Only a serve at the target rate makes a
-    /// peer the preferred server; a slower completed serve de-prioritises it for the epoch
-    /// (`record_sync_served_slowly`), so a peer that serves at the floor cannot capture the walk.
+    /// one bounded probe per walk rather than the walk. Only a serve at the target rate makes
+    /// a peer the preferred server; a slower completed serve marks it for the epoch
+    /// (`record_sync_served_slowly`), so a peer that serves at the floor cannot capture the
+    /// walk. Every `SYNC_PREFERENCE_EXPLORE_EVERY`-th walk probes the preferred peer last, and
+    /// when no peer serves, the peers the reader cut at the target are probed again at the
+    /// floor (`walk_with_floor_fallback`, #1787).
     async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
-        let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
+        let EpochPackSyncRequest { epoch, .. } = sync;
         let peers = self.handle.connected_peers().await?;
-        // Shuffle, put the last peer that served first, and de-prioritise peers that already
-        // failed a probe for this epoch: a peer that failed once for this epoch is probed after
-        // every fresh peer, so a Byzantine peer fixed in stable `HashMap` order cannot stall the
-        // front of every one of state-sync's retries for the same epoch (see
-        // `order_probe_peers`). A preferred peer that does not serve a probe loses the
-        // preference (`forget_sync_server`), and every probe's opening write is bounded by
-        // `SYNC_REQUEST_WRITE_TIMEOUT`. The preference is read in its own statement so its
-        // lock guard never overlaps the failure map's. Only a serve at
-        // the target rate sets the preference; a slower one de-prioritises the peer for the epoch
-        // (`record_sync_served_slowly`).
-        let preferred = *self.last_sync_server.lock();
+        // Shuffle, put the last peer that served first, or last on an exploration walk
+        // (`exploration_walk`), and put the peers marked for this epoch last: a peer that
+        // failed once for this epoch is probed after every fresh peer, so a Byzantine peer
+        // fixed in stable `HashMap` order cannot stall the front of every one of state-sync's
+        // retries for the same epoch (see `order_probe_peers`). `walk_with_floor_fallback` then
+        // probes one peer at a time, each at its own bound, stops at the first pack that
+        // imports, and probes the peers the first pass cut at the target again at the floor
+        // (#1787). A peer that does not serve loses the preference (`forget_sync_server`), and
+        // every probe's opening write is bounded by `SYNC_REQUEST_WRITE_TIMEOUT`. The
+        // preference and its generation are read in one statement, whose guard drops before
+        // any await, and the failure set's guard drops at the end of the ordering statement,
+        // before any probe.
+        let SyncPreference { peer: preferred, generation } = *self.last_sync_server.lock();
+        let walk = ProbeWalk { generation, explore: self.exploration_walk() };
         let peers = order_probe_peers(
             peers,
             &self.epoch_sync_failed.lock(),
             epoch,
             preferred,
+            walk.explore,
             &mut rand::rng(),
         );
-
-        // Probe candidate peers one at a time (the async analog of a short-circuiting
-        // fold): `filter` drops peers cached unsyncable this epoch for free, `then` runs
-        // each exchange and records its verdict in the capability cache, and `any` stops
-        // at the first peer whose pack imports (so no peer past the first success is
-        // probed).
-        let imported = futures::stream::iter(peers)
-            .filter(move |peer| {
-                let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
-                futures::future::ready(!known_unsyncable)
-            })
-            .then(move |peer| async move {
-                // Read a peer already de-prioritised this epoch at the floor and a fresh one at
-                // the target rate; the failure map's guard drops at the end of the statement.
-                let deprioritised = self.epoch_sync_failed.lock().get(&peer) == Some(&epoch);
-                let bound = SyncRateBound::for_probe(deprioritised);
-                let meter = SyncServeMeter::default();
-                let started = tokio::time::Instant::now();
-                match self.sync_epoch_pack_from_peer(peer, sync, bound, meter.clone()).await {
-                    EpochPackAttempt::Imported => {
-                        let elapsed = started.elapsed();
-                        let speed = meter.speed(elapsed);
-                        match speed {
-                            SyncServeSpeed::Target => self.record_sync_served(peer),
-                            SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
-                        }
-                        info!(
-                            target: "primary::network",
-                            %peer,
-                            epoch,
-                            bytes = meter.bytes(),
-                            elapsed_ms = elapsed.as_millis(),
-                            ?speed,
-                            "streamed epoch pack file over sync protocol"
-                        );
-                        true
-                    }
-                    EpochPackAttempt::Unsupported => {
-                        // Only a FULL-pack `Unsupported` authoritatively proves the peer
-                        // does not speak `/tn-primary-sync`. A PARTIAL `Unsupported` is
-                        // ambiguous: the peer may be on an earlier item that serves full
-                        // packs but cannot decode the newer `EpochPackPartial` variant, so
-                        // it must not cache `false` and hide that peer from full-pack sync.
-                        // (Partial still honors a `false` a full probe wrote and caches
-                        // `true` on success, so it dedups without poisoning.)
-                        if last_consensus_number.is_none() {
-                            self.sync_capability.lock().insert(peer, false);
-                        }
-                        // it did not serve, so it loses the probe-first preference if it held it
-                        self.forget_sync_server(peer);
-                        debug!(
-                            target: "primary::network",
-                            %peer,
-                            partial = last_consensus_number.is_some(),
-                            "peer did not answer epoch pack sync; skipping this probe"
-                        );
-                        false
-                    }
-                    EpochPackAttempt::Failed(e) => {
-                        // the peer speaks sync but this exchange failed; keep it
-                        // sync-capable, drop its probe-first preference, and try the
-                        // next peer
-                        self.sync_capability.lock().insert(peer, true);
-                        // Remember it failed THIS epoch so the retries for the same epoch probe it
-                        // last (a drip/slow peer no longer starves every attempt).
-                        self.epoch_sync_failed.lock().insert(peer, epoch);
-                        self.forget_sync_server(peer);
-                        warn!(
-                            target: "primary::network",
-                            %peer,
-                            epoch,
-                            ?e,
-                            "epoch pack sync exchange failed; trying next peer"
-                        );
-                        false
-                    }
-                }
-            })
-            .any(futures::future::ready)
-            .await;
-
-        imported.then_some(()).ok_or_else(|| {
+        self.walk_with_floor_fallback(peers, epoch, move |peer, bound| {
+            self.probe_epoch_pack(peer, sync, bound, walk)
+        })
+        .await
+        .ok_or_else(|| {
             NetworkError::RPCError(
                 "no peer served the epoch pack over the sync protocol".to_string(),
             )
         })
+    }
+
+    /// Probe `peer` once for the epoch pack `sync` names, reading it at `bound`, and classify
+    /// the exchange for `walk_probes` (#1787).
+    ///
+    /// An import records the peer by its measured speed for `sync.epoch` on `walk`
+    /// (`record_sync_served` or `record_sync_served_slowly`) and is `Served`. A peer that does
+    /// not answer is cached unsyncable only for a full pack and is `Missed`. A failed exchange
+    /// marks the peer for the epoch (`mark_sync_failed`) and is `CutAtTarget` when the reader
+    /// cut the peer for falling below the target bound, else `Missed`.
+    async fn probe_epoch_pack(
+        &self,
+        peer: BlsPublicKey,
+        sync: EpochPackSyncRequest<'_>,
+        bound: SyncRateBound,
+        walk: ProbeWalk,
+    ) -> ProbeVerdict<()> {
+        let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
+        let meter = SyncServeMeter::default();
+        let started = tokio::time::Instant::now();
+        match self.sync_epoch_pack_from_peer(peer, sync, bound, meter.clone()).await {
+            EpochPackAttempt::Imported => {
+                let elapsed = started.elapsed();
+                let speed = meter.speed(elapsed);
+                match speed {
+                    SyncServeSpeed::Target => self.record_sync_served(peer, epoch, walk),
+                    SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
+                }
+                info!(
+                    target: "primary::network",
+                    %peer,
+                    epoch,
+                    bytes = meter.bytes(),
+                    elapsed_ms = elapsed.as_millis(),
+                    ?speed,
+                    "streamed epoch pack file over sync protocol"
+                );
+                ProbeVerdict::Served(())
+            }
+            EpochPackAttempt::Unsupported => {
+                // Only a FULL-pack `Unsupported` authoritatively proves the peer
+                // does not speak `/tn-primary-sync`. A PARTIAL `Unsupported` is
+                // ambiguous: the peer may be on an earlier item that serves full
+                // packs but cannot decode the newer `EpochPackPartial` variant, so
+                // it must not cache `false` and hide that peer from full-pack sync.
+                // (Partial still honors a `false` a full probe wrote and caches
+                // `true` on success, so it dedups without poisoning.)
+                if last_consensus_number.is_none() {
+                    self.sync_capability.lock().insert(peer, false);
+                }
+                // it did not serve, so it loses the probe-first preference if it held it
+                self.forget_sync_server(peer);
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    partial = last_consensus_number.is_some(),
+                    "peer did not answer epoch pack sync; skipping this probe"
+                );
+                ProbeVerdict::Missed
+            }
+            EpochPackAttempt::Failed(e) => {
+                // the peer speaks sync but this exchange failed; keep it
+                // sync-capable, drop its probe-first preference, and try the
+                // next peer. Remember it failed THIS epoch so the retries for the
+                // same epoch probe it last and at the floor (a drip/slow peer no
+                // longer starves every attempt).
+                self.mark_sync_failed(peer, epoch);
+                warn!(
+                    target: "primary::network",
+                    %peer,
+                    epoch,
+                    ?e,
+                    "epoch pack sync exchange failed; trying next peer"
+                );
+                if meter.cut_at_target() {
+                    ProbeVerdict::CutAtTarget
+                } else {
+                    ProbeVerdict::Missed
+                }
+            }
+        }
     }
 
     /// Run one epoch-pack sync exchange against `peer`, flattening the classified
@@ -1977,29 +2552,44 @@ where
 }
 
 /// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then stably
-/// sort them into four groups, each keeping its shuffled order: the `preferred` peer (the last one
-/// that served) if it is fresh, the other fresh peers, the `preferred` peer if it already
-/// failed, timed out, or served below the target rate on a probe for THIS `epoch`, and the
-/// other peers that failed this epoch. A `preferred` peer that is not in `peers` changes
-/// nothing. Pure so it is unit-testable with a seeded rng.
+/// sort them into groups, each keeping its shuffled order. On an ordinary walk the groups are:
+/// the `preferred` peer (the last one that served) if it is fresh, the other fresh peers, the
+/// `preferred` peer if it is marked for THIS `epoch` in `failed` (it failed, timed out, was cut,
+/// or served below the target rate on a probe for this epoch), and the other peers marked for
+/// this epoch. On an exploration walk (`explore`, see `SYNC_PREFERENCE_EXPLORE_EVERY`) the
+/// holder goes last: the other fresh peers, the other marked peers, then the `preferred` peer,
+/// so the holder is probed only after every other peer, marked peers included, failed to serve
+/// (#1787). A mark for another epoch does not count. A `preferred` peer that is not in `peers`
+/// changes nothing. Pure so it is unit-testable with a seeded rng.
 ///
-/// The shuffle defeats the stable-`HashMap`-order starvation (a Byzantine peer fixed at the front
-/// of every walk), and the de-prioritisation keeps a slow/drip peer that failed one call from being
-/// probed first again on the retries for the same epoch — without dropping it (a small network
-/// whose only peer had a transient failure is still retried, just last). A stale `preferred` peer
-/// costs at most one probe per walk until another peer serves and takes the preference; once a
-/// probe to it fails it also sorts behind every fresh peer for the rest of the epoch.
+/// The shuffle defeats the stable-`HashMap`-order starvation (a Byzantine peer fixed at the
+/// front of every walk), and the de-prioritisation keeps a slow/drip peer that failed one call
+/// from being probed first again on the retries for the same epoch, without dropping it (a
+/// small network whose only peer had a transient failure is still retried, just last). A stale
+/// `preferred` peer costs at most one probe per walk until another peer serves and takes the
+/// preference; once a probe to it fails it also sorts behind every fresh peer for the rest of
+/// the epoch. The holder-last exploration order means a holder cannot keep the front of every
+/// walk by being the only unmarked peer: an exploration walk reaches the marked peers before it.
 fn order_probe_peers(
     mut peers: Vec<BlsPublicKey>,
-    failed_this_epoch: &HashMap<BlsPublicKey, Epoch>,
+    failed: &HashSet<(BlsPublicKey, Epoch)>,
     epoch: Epoch,
     preferred: Option<BlsPublicKey>,
+    explore: bool,
     rng: &mut impl Rng,
 ) -> Vec<BlsPublicKey> {
     peers.shuffle(rng);
-    // `sort_by_key` is stable and `false < true`, so the groups come out as fresh preferred,
-    // fresh, failed preferred, failed, each keeping its shuffled order.
-    peers.sort_by_key(|p| (failed_this_epoch.get(p) == Some(&epoch), Some(*p) != preferred));
+    // `sort_by_key` is stable and `false < true`. On an ordinary walk the groups come out as
+    // fresh preferred, fresh, marked preferred, marked; on an exploration walk as fresh, marked,
+    // preferred, each keeping its shuffled order.
+    peers.sort_by_key(|p| {
+        let (marked, held) = (failed.contains(&(*p, epoch)), Some(*p) == preferred);
+        if explore {
+            (held, marked)
+        } else {
+            (marked, !held)
+        }
+    });
     peers
 }
 
@@ -2027,6 +2617,9 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Per-peer cap on in-flight inbound sync streams across every phase, at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`]. A slot is held for the whole life of the stream task.
     sync_peer_slots: PeerSlots,
+    /// Per-peer cap on gossip in signature verification, at [`MAX_PENDING_GOSSIP_PER_PEER`]
+    /// (#1772). A slot is held from admission until the handler's verdict.
+    gossip_slots: GossipSlots,
     /// BLS keys of the current and the next committee, captured when the network is built for
     /// the epoch. A peer in this set may take the committee reserve of every sync budget.
     reserved_peers: ReservedPeers,
@@ -2088,6 +2681,7 @@ where
             ),
             sync_serve: SyncServePools::new(),
             sync_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            gossip_slots: GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER),
             reserved_peers,
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
@@ -2139,7 +2733,7 @@ where
                 }
             },
             NetworkEvent::Gossip(gossip) => {
-                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
+                self.process_gossip(*gossip);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -2280,38 +2874,83 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(
-        &self,
-        msg: GossipMessage,
-        relayer: Option<BlsPublicKey>,
-        author: Option<BlsPublicKey>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let relayer_label =
-            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
-        let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
-        // spawn task to process gossip
-        self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg).await {
-                warn!(target: "primary::network", ?e, "process_gossip");
-                // Charge the accountable peer, and only once its BLS identity has resolved. A
-                // content-determined fault (malformed payload / mis-topic) is the message
-                // author's: the network layer forwarded it after a shallow check, so an honest
-                // relayer could not have screened it, and banning the relayer lets a Byzantine
-                // author partition the mesh (issues #801/#819). Every other fault is the relaying
-                // peer's, as before. `zip` skips the penalty when that peer is unresolved or the
-                // error carries no penalty.
-                let charged = if e.is_author_content_fault() { author } else { relayer };
-                if let Some((peer, penalty)) = charged.zip((&e).into()) {
-                    network_handle.report_penalty(peer, penalty).await;
-                }
-                Err(e.into())
-            } else {
-                Ok(())
-            }
-        });
+    ///
+    /// Each message first takes a verification slot keyed by its author, else its relayer, else
+    /// one shared bucket for gossip with neither identity resolved, at
+    /// [`MAX_PENDING_GOSSIP_PER_PEER`] per key (#1772). With no free slot the message is not
+    /// processed: its ticket drops and reports `Ignore`, and no peer is charged. The slot is held
+    /// only through decode, the committee lookup and the signature check, and the handler frees it
+    /// at the verdict. Downstream work on verified gossip is not bounded here. That is safe because
+    /// only signed messages from committee members, and certificates signed by a quorum of the
+    /// committee, reach it.
+    ///
+    /// A fault of the strike class on a frame that the author delivered itself also strikes the
+    /// author in [`GossipSlots`] (see [`gossip_author_to_strike`]): that author's
+    /// gossip is ignored for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubling per strike up to
+    /// [`GOSSIP_AUTHOR_COOLDOWN_MAX`], because the peer manager exempts committee keys from
+    /// penalties and the cooldown is the cost the author pays.
+    fn process_gossip(&self, gossip: GossipPayload<Req, Res>) {
+        let GossipPayload { message: msg, relayer, author, validation } = gossip;
+        self.gossip_slots.admit(validation, author, relayer).map_or_else(
+            || {
+                debug!(
+                    target: "primary::network",
+                    ?author,
+                    ?relayer,
+                    "gossip verification slots exhausted, ignoring"
+                );
+            },
+            |mut pending| {
+                // clone for spawned tasks
+                let request_handler = self.request_handler.clone();
+                let network_handle = self.network_handle.clone();
+                let gossip_slots = self.gossip_slots.clone();
+                let relayer_label = relayer
+                    .as_ref()
+                    .map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+                let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
+                // spawn task to process gossip
+                self.task_spawner.spawn_task(task_name, async move {
+                    if let Err(e) = request_handler.process_gossip_with(&msg, &mut pending).await {
+                        warn!(target: "primary::network", ?e, "process_gossip");
+                        // Read before the settle, which consumes the ticket.
+                        let was_pending = pending.is_pending();
+                        // Report Reject for an author content fault while the ticket is pending.
+                        // Any other error drops the ticket, which reports Ignore (#1772).
+                        pending.settle_error(&e).await;
+                        // The peer manager exempts committee keys from every penalty, so a fault
+                        // of the strike class on the author's own delivery also cools down the
+                        // author's gossip here. A relayed frame strikes no one (GHSA-vw36).
+                        gossip_author_to_strike(&e, was_pending, author, relayer)
+                            .into_iter()
+                            .for_each(|struck| {
+                                gossip_slots.strike(struck);
+                                debug!(
+                                    target: "primary::network",
+                                    author = %struck,
+                                    "author content fault on the author's own delivery, cooling down the author's gossip"
+                                );
+                            });
+                        // Charge the accountable peer, and only once its BLS identity has resolved.
+                        // A content-determined fault (malformed payload /
+                        // mis-topic) is the message author's: the network
+                        // layer forwarded it after a shallow check, so an honest
+                        // relayer could not have screened it, and banning the relayer lets a
+                        // Byzantine author partition the mesh (issues
+                        // #801/#819). Every other fault is the relaying
+                        // peer's, as before. `zip` skips the penalty when that peer is unresolved
+                        // or the error carries no penalty.
+                        let charged = if e.is_author_content_fault() { author } else { relayer };
+                        if let Some((peer, penalty)) = charged.zip(Option::<Penalty>::from(&e)) {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                        Err(e.into())
+                    } else {
+                        Ok(())
+                    }
+                });
+            },
+        );
     }
 
     /// Process an inbound sync stream.
@@ -2511,14 +3150,16 @@ mod clip_peer_error_tests {
 #[cfg(test)]
 mod sync_admission_tests {
     use super::{
-        admit_and_serve_sync_stream, opening_read_bound, write_frame, PrimaryNetworkError,
-        PrimaryNetworkHandle, Req, Res, ServeHoldLimit, SyncAdmission, SyncClass, SyncFrame,
-        SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
-        COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
-        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
+        admit_and_serve_sync_stream, gossip_author_to_strike, opening_read_bound, write_frame,
+        GossipSlots, PrimaryNetworkError, PrimaryNetworkHandle, Req, Res, ServeHoldLimit,
+        SyncAdmission, SyncClass, SyncFrame, SyncServeOutcome, SyncServePools,
+        COMMITTEE_RESERVED_OPENING_READS, COMMITTEE_RESERVED_SYNC_STREAMS,
+        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONCURRENT_OPENING_READS, MAX_PENDING_GOSSIP_PER_PEER,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
         PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
         SYNC_REQUEST_READ_TIMEOUT,
     };
+    use crate::error::CertManagerError;
     use futures::{io::Cursor, AsyncRead, AsyncWrite, StreamExt as _};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
@@ -2530,13 +3171,15 @@ mod sync_admission_tests {
             Arc,
         },
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tn_network_libp2p::{
         types::NetworkCommand, PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers,
         ReservedPool,
     };
-    use tn_types::{BlsKeypair, BlsPublicKey};
+    use tn_types::{
+        error::CertificateError, BlsKeypair, BlsPublicKey, ConsensusHeaderDigest, HeaderDigest,
+    };
     use tokio::{sync::mpsc, task::JoinHandle};
 
     /// Every serve class.
@@ -2963,6 +3606,61 @@ mod sync_admission_tests {
         assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
+    /// A struck author gets no gossip slot during its cooldown, the hold doubles per strike, and
+    /// it stops at the cap. Other authors are not affected (#1772).
+    #[test]
+    fn gossip_author_cooldown_ignores_struck_author() {
+        let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        slots.strike_at(key(1), t0);
+        assert!(slots.take_at(Some(key(1)), None, t0).is_none());
+        // a resolved relayer does not give a struck author a slot
+        assert!(slots.take_at(Some(key(1)), Some(key(2)), t0).is_none());
+        assert!(slots.take_at(Some(key(2)), None, t0).is_some());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(9)).is_none());
+        // the first hold is over
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(10)).is_some());
+        // the second strike holds for 20 s
+        slots.strike_at(key(1), t0 + s(10));
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(29)).is_none());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(30)).is_some());
+        // more strikes stop at the cap
+        (0..5).for_each(|_| slots.strike_at(key(1), t0 + s(30)));
+        assert_eq!(slots.cooldown_until(&key(1)), Some(t0 + s(30) + s(160)));
+    }
+
+    /// Only the author's own delivery of a pending frame strikes the author, and only for a fault
+    /// of the strike class. A relayed frame, an unresolved relayer and a settled ticket strike no
+    /// one (#1772, GHSA-vw36).
+    #[test]
+    fn gossip_author_strike_needs_own_pending_delivery() {
+        let (author, relayer) = (key(40), key(41));
+        let strike = |e: &PrimaryNetworkError, was_pending: bool, from: Option<BlsPublicKey>| {
+            gossip_author_to_strike(e, was_pending, Some(author), from)
+        };
+        let forged = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::InvalidSignature,
+        ));
+        // own delivery
+        assert_eq!(strike(&forged, true, Some(author)), Some(author));
+        // relayed
+        assert_eq!(strike(&forged, true, Some(relayer)), None);
+        // unresolved relayer
+        assert_eq!(strike(&forged, true, None), None);
+        // already settled
+        assert_eq!(strike(&forged, false, Some(author)), None);
+        // a consensus result with a bad signature strikes, though its penalty is mild
+        let forged_result =
+            PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default());
+        assert_eq!(strike(&forged_result, true, Some(author)), Some(author));
+        // a mild certificate fault does not strike
+        let too_old = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::TooOld(HeaderDigest::default(), 1, 2),
+        ));
+        assert_eq!(strike(&too_old, true, Some(author)), None);
+    }
+
     /// Silent streams hold only the opening-read budget, and only until the opening read for
     /// their tier times out (one second for a public peer, five for the committee peer). The
     /// serve pools stay whole, each stream frees its opening permit and its peer slot at its own
@@ -3309,10 +4007,11 @@ mod sync_request_write_tests {
 /// served is probed first only until it fails a probe.
 #[cfg(test)]
 mod sync_server_preference_tests {
-    use super::{order_probe_peers, PrimaryNetworkHandle};
+    use super::{order_probe_peers, PrimaryNetworkHandle, ProbeVerdict, ProbeWalk, SyncRateBound};
+    use parking_lot::Mutex;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::collections::HashMap;
-    use tn_types::{BlsKeypair, BlsPublicKey};
+    use std::{collections::HashSet, sync::atomic::Ordering};
+    use tn_types::{BlsKeypair, BlsPublicKey, Epoch};
     use tokio::sync::mpsc;
 
     /// A deterministic BLS public key for `seed`.
@@ -3326,23 +4025,91 @@ mod sync_server_preference_tests {
         PrimaryNetworkHandle::new_for_test(sender)
     }
 
+    /// The context of an ordinary (non-exploration) walk that starts now on `handle`: it reads
+    /// the preference slot's current generation, so its serve is current.
+    fn walk(handle: &PrimaryNetworkHandle) -> ProbeWalk {
+        ProbeWalk { generation: handle.last_sync_server.lock().generation, explore: false }
+    }
+
+    /// The context of an exploration walk that starts now on `handle`.
+    fn exploration(handle: &PrimaryNetworkHandle) -> ProbeWalk {
+        ProbeWalk { explore: true, ..walk(handle) }
+    }
+
+    /// The preferred sync server on record.
+    fn preferred(handle: &PrimaryNetworkHandle) -> Option<BlsPublicKey> {
+        handle.last_sync_server.lock().peer
+    }
+
+    /// Whether `handle` reads every peer at the floor for the rest of the epoch.
+    fn floor_only(handle: &PrimaryNetworkHandle) -> bool {
+        handle.floor_only_this_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The scripted verdict of one probe for the `walk_with_floor_fallback` tests: a probe
+    /// listed in `serves` serves, a peer listed in `cut` and read at the target is cut at the
+    /// target, and every other probe misses.
+    fn scripted(
+        serves: &[(BlsPublicKey, SyncRateBound)],
+        cut: &[BlsPublicKey],
+        peer: BlsPublicKey,
+        bound: SyncRateBound,
+    ) -> ProbeVerdict<()> {
+        if serves.contains(&(peer, bound)) {
+            ProbeVerdict::Served(())
+        } else if cut.contains(&peer) && bound == SyncRateBound::Target {
+            ProbeVerdict::CutAtTarget
+        } else {
+            ProbeVerdict::Missed
+        }
+    }
+
+    /// Run `walk_with_floor_fallback` over `peers` for `epoch` with the `scripted` probe and no
+    /// network; returns the walk result and every probe in the order it ran.
+    async fn scripted_walk(
+        handle: &PrimaryNetworkHandle,
+        peers: Vec<BlsPublicKey>,
+        epoch: Epoch,
+        serves: &[(BlsPublicKey, SyncRateBound)],
+        cut: &[BlsPublicKey],
+    ) -> (Option<()>, Vec<(BlsPublicKey, SyncRateBound)>) {
+        let calls = Mutex::new(Vec::new());
+        let served = handle
+            .walk_with_floor_fallback(peers, epoch, |peer, bound| {
+                let calls = &calls;
+                async move {
+                    calls.lock().push((peer, bound));
+                    scripted(serves, cut, peer, bound)
+                }
+            })
+            .await;
+        (served, calls.into_inner())
+    }
+
     /// Forgetting a peer other than the recorded one keeps the preference; forgetting the
-    /// recorded one clears it, and forgetting with nothing on record stays empty.
+    /// recorded one clears it, and forgetting with nothing on record stays empty. Forgetting does
+    /// not bump the generation, so the walk whose preferred peer failed can still record the next
+    /// peer that serves it (#1787).
     #[test]
     fn forget_sync_server_drops_only_the_recorded_peer() {
         let handle = handle();
         let (served, other) = (key(1), key(2));
-        handle.record_sync_served(served);
-        assert_eq!(*handle.last_sync_server.lock(), Some(served));
+        let current = walk(&handle);
+        handle.record_sync_served(served, 0, current);
+        assert_eq!(preferred(&handle), Some(served));
 
         handle.forget_sync_server(other);
-        assert_eq!(*handle.last_sync_server.lock(), Some(served));
+        assert_eq!(preferred(&handle), Some(served));
 
         handle.forget_sync_server(served);
-        assert_eq!(*handle.last_sync_server.lock(), None);
+        assert_eq!(preferred(&handle), None);
 
         handle.forget_sync_server(served);
-        assert_eq!(*handle.last_sync_server.lock(), None);
+        assert_eq!(preferred(&handle), None);
+
+        assert_eq!(handle.last_sync_server.lock().generation, current.generation);
+        handle.record_sync_served(other, 0, current);
+        assert_eq!(preferred(&handle), Some(other));
     }
 
     /// With a preference the preferred peer leads the walk; without one the walk is the seeded
@@ -3351,23 +4118,36 @@ mod sync_server_preference_tests {
     fn order_probe_peers_puts_no_peer_first_without_a_preference() {
         let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
         let preferred = key(3);
-        let failed = HashMap::new();
+        let failed = HashSet::new();
 
         let with_preference = order_probe_peers(
             peers.clone(),
             &failed,
             0,
             Some(preferred),
+            false,
             &mut StdRng::seed_from_u64(7),
         );
         assert_eq!(with_preference.first(), Some(&preferred));
         assert_eq!(with_preference.len(), peers.len());
         assert!(peers.iter().all(|p| with_preference.contains(p)));
 
-        let without =
-            order_probe_peers(peers.clone(), &failed, 0, None, &mut StdRng::seed_from_u64(7));
-        let shuffle_only =
-            order_probe_peers(peers.clone(), &failed, 0, None, &mut StdRng::seed_from_u64(7));
+        let without = order_probe_peers(
+            peers.clone(),
+            &failed,
+            0,
+            None,
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
+        let shuffle_only = order_probe_peers(
+            peers.clone(),
+            &failed,
+            0,
+            None,
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
         assert_eq!(without, shuffle_only);
         assert_eq!(without.len(), peers.len());
         assert!(peers.iter().all(|p| without.contains(p)));
@@ -3379,22 +4159,23 @@ mod sync_server_preference_tests {
     fn record_sync_served_slowly_demotes_and_forgets_the_peer() {
         let handle = handle();
         let peer = key(1);
-        handle.record_sync_served(peer);
+        handle.record_sync_served(peer, 3, walk(&handle));
         handle.record_sync_served_slowly(peer, 3);
-        assert_eq!(*handle.last_sync_server.lock(), None);
-        assert_eq!(handle.epoch_sync_failed.lock().get(&peer), Some(&3));
+        assert_eq!(preferred(&handle), None);
+        assert!(handle.epoch_sync_failed.lock().contains(&(peer, 3)));
         assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
     }
 
-    /// A later target-rate serve clears a slow mark and restores the preference.
+    /// A later target-rate serve for the same epoch clears a slow mark and restores the
+    /// preference.
     #[test]
     fn record_sync_served_clears_a_slow_mark() {
         let handle = handle();
         let peer = key(1);
         handle.record_sync_served_slowly(peer, 3);
-        handle.record_sync_served(peer);
-        assert_eq!(*handle.last_sync_server.lock(), Some(peer));
-        assert_eq!(handle.epoch_sync_failed.lock().get(&peer), None);
+        handle.record_sync_served(peer, 3, walk(&handle));
+        assert_eq!(preferred(&handle), Some(peer));
+        assert!(!handle.epoch_sync_failed.lock().contains(&(peer, 3)));
     }
 
     /// A slow server marked for the epoch sorts behind every fresh peer even while it holds the
@@ -3403,10 +4184,265 @@ mod sync_server_preference_tests {
     fn order_probe_peers_puts_a_slow_server_behind_fresh_peers() {
         let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
         let slow = key(3);
-        let failed = HashMap::from([(slow, 3)]);
-        let ordered =
-            order_probe_peers(peers.clone(), &failed, 3, Some(slow), &mut StdRng::seed_from_u64(7));
+        let failed = HashSet::from([(slow, 3)]);
+        let ordered = order_probe_peers(
+            peers.clone(),
+            &failed,
+            3,
+            Some(slow),
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
         assert_eq!(ordered.last(), Some(&slow));
         assert_eq!(ordered.len(), peers.len());
+    }
+
+    /// A target-rate serve for epoch 4 sets the preference but keeps the slow mark for epoch 3:
+    /// the peer is read at the floor and probed last for epoch 3, and read at the target and
+    /// probed first for epoch 4 (#1787).
+    #[test]
+    fn a_serve_on_another_epoch_keeps_this_epochs_floor() {
+        let handle = handle();
+        let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
+        let peer = key(3);
+        handle.record_sync_served_slowly(peer, 3);
+        handle.record_sync_served(peer, 4, walk(&handle));
+        assert_eq!(handle.probe_bound(peer, 3), SyncRateBound::Floor);
+        assert_eq!(handle.probe_bound(peer, 4), SyncRateBound::Target);
+        assert_eq!(preferred(&handle), Some(peer));
+
+        let held = preferred(&handle);
+        let failed = handle.epoch_sync_failed.lock();
+        let on_three = order_probe_peers(
+            peers.clone(),
+            &failed,
+            3,
+            held,
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
+        let on_four =
+            order_probe_peers(peers, &failed, 4, held, false, &mut StdRng::seed_from_u64(7));
+        assert_eq!(on_three.last(), Some(&peer));
+        assert_eq!(on_four.first(), Some(&peer));
+    }
+
+    /// Rotation drops the probe-first preference with the capability cache and the marks, bumps
+    /// the slot's generation and resets the floor-only flag (#1787).
+    #[test]
+    fn clear_sync_capability_drops_the_preference() {
+        let handle = handle();
+        let (served, slow) = (key(1), key(2));
+        handle.record_sync_served(served, 3, walk(&handle));
+        handle.record_sync_served_slowly(slow, 3);
+        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        let before = handle.last_sync_server.lock().generation;
+        handle.clear_sync_capability();
+        assert_eq!(preferred(&handle), None);
+        assert_eq!(handle.last_sync_server.lock().generation, before.wrapping_add(1));
+        assert!(handle.epoch_sync_failed.lock().is_empty());
+        assert!(handle.sync_capability.lock().is_empty());
+        assert!(!floor_only(&handle));
+    }
+
+    /// A serve that lands after an exploration serve, from a walk that started under the old
+    /// holder, keeps the explorer: the exploration serve bumped the generation, so the stale
+    /// walk's serve is fenced. A walk started after the displacement records as usual (#1787).
+    #[test]
+    fn a_stale_walks_serve_after_an_exploration_serve_keeps_the_explorer() {
+        let handle = handle();
+        let (holder, explorer, next) = (key(1), key(2), key(3));
+        handle.record_sync_served(holder, 3, walk(&handle));
+        // a walk starts under the holder; then another peer serves an exploration walk
+        let stale = walk(&handle);
+        handle.record_sync_served(explorer, 3, exploration(&handle));
+        assert_eq!(preferred(&handle), Some(explorer));
+        // the holder serves the stale walk afterwards: it does not take the slot back
+        handle.record_sync_served(holder, 3, stale);
+        assert_eq!(preferred(&handle), Some(explorer));
+        assert_eq!(handle.sync_capability.lock().get(&holder), Some(&true));
+        // a walk that started after the displacement records as usual
+        handle.record_sync_served(next, 3, walk(&handle));
+        assert_eq!(preferred(&handle), Some(next));
+    }
+
+    /// A serve that completes after rotation, from a walk that started before it, does not set
+    /// the slot: the clear bumped the generation. A walk started in the new epoch records as
+    /// usual (#1787).
+    #[test]
+    fn a_serve_that_completes_after_rotation_does_not_set_the_slot() {
+        let handle = handle();
+        let peer = key(1);
+        let before_rotation = walk(&handle);
+        handle.clear_sync_capability();
+        handle.record_sync_served(peer, 3, before_rotation);
+        assert_eq!(preferred(&handle), None);
+        assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+        handle.record_sync_served(peer, 3, walk(&handle));
+        assert_eq!(preferred(&handle), Some(peer));
+    }
+
+    /// Rotation resets the floor-only flag, so the new epoch reads fresh peers at the target
+    /// again (#1787, Gap 4).
+    #[test]
+    fn clear_sync_capability_resets_the_floor_only_flag() {
+        let handle = handle();
+        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        assert!(floor_only(&handle));
+        handle.clear_sync_capability();
+        assert!(!floor_only(&handle));
+    }
+
+    /// Exactly the last walk of every run of `SYNC_PREFERENCE_EXPLORE_EVERY` is an exploration
+    /// walk (#1787).
+    #[test]
+    fn exploration_walk_fires_every_nth_walk() {
+        let handle = handle();
+        let fired: Vec<bool> = (0..32).map(|_| handle.exploration_walk()).collect();
+        let fired_at: Vec<usize> =
+            fired.iter().enumerate().filter_map(|(walk, hit)| hit.then_some(walk)).collect();
+        assert_eq!(fired_at, vec![15, 31]);
+    }
+
+    /// An exploration walk puts the holder last and keeps the seeded shuffle for every other
+    /// peer: with the same seed the other peers come out exactly as on a walk with no preference
+    /// (#1787).
+    #[test]
+    fn order_probe_peers_exploration_walk_puts_the_holder_last() {
+        let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
+        let holder = key(3);
+        let failed = HashSet::new();
+        let exploring = order_probe_peers(
+            peers.clone(),
+            &failed,
+            0,
+            Some(holder),
+            true,
+            &mut StdRng::seed_from_u64(7),
+        );
+        let unpreferred =
+            order_probe_peers(peers, &failed, 0, None, false, &mut StdRng::seed_from_u64(7));
+        let others_then_holder: Vec<BlsPublicKey> =
+            unpreferred.into_iter().filter(|p| *p != holder).chain(Some(holder)).collect();
+        assert_eq!(exploring, others_then_holder);
+    }
+
+    /// On an exploration walk the holder is probed last even when every other peer is marked for
+    /// the epoch, so a holder cannot keep the front of every walk by being the only fresh peer;
+    /// on an ordinary walk the same holder leads (#1787).
+    #[test]
+    fn order_probe_peers_exploration_walk_puts_the_holder_behind_marked_peers() {
+        let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
+        let holder = key(3);
+        let failed: HashSet<(BlsPublicKey, Epoch)> =
+            peers.iter().filter(|p| **p != holder).map(|p| (*p, 3)).collect();
+        let exploring = order_probe_peers(
+            peers.clone(),
+            &failed,
+            3,
+            Some(holder),
+            true,
+            &mut StdRng::seed_from_u64(7),
+        );
+        assert_eq!(exploring.last(), Some(&holder));
+        assert_eq!(exploring.len(), peers.len());
+        let ordinary = order_probe_peers(
+            peers,
+            &failed,
+            3,
+            Some(holder),
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
+        assert_eq!(ordinary.first(), Some(&holder));
+    }
+
+    /// A peer the first pass cut at the target is probed again at the floor, after every peer
+    /// of the first pass, and its floor serve ends the walk (#1787).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_reprobes_target_cut_peers_at_the_floor() {
+        let handle = handle();
+        let (a, b) = (key(1), key(2));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b], 0, &[(a, SyncRateBound::Floor)], &[a]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (a, SyncRateBound::Floor),]
+        );
+        assert!(!floor_only(&handle), "one cut must not set the floor-only flag");
+    }
+
+    /// The first serve ends the walk: no peer past it is probed and no floor pass runs, even
+    /// when an earlier peer was cut at the target (#1787).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_stops_at_the_first_serve() {
+        let handle = handle();
+        let (a, b, c) = (key(1), key(2), key(3));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c], 0, &[(b, SyncRateBound::Target)], &[a]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
+    }
+
+    /// A peer marked for the epoch is read at the floor from its first probe (#1787).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_reads_a_marked_peer_at_the_floor() {
+        let handle = handle();
+        let (a, b) = (key(1), key(2));
+        handle.record_sync_served_slowly(a, 5);
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b], 5, &[(a, SyncRateBound::Floor)], &[]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls.first(), Some(&(a, SyncRateBound::Floor)));
+        assert_eq!(calls, vec![(a, SyncRateBound::Floor)]);
+    }
+
+    /// With every probe missed and no peer cut at the target, the walk fails after one pass
+    /// (#1787).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_returns_none_when_nothing_is_cut() {
+        let handle = handle();
+        let (a, b) = (key(1), key(2));
+        let (served, calls) = scripted_walk(&handle, vec![a, b], 0, &[], &[]).await;
+        assert_eq!(served, None);
+        assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
+    }
+
+    /// Two distinct peers cut at the target in one walk stop the target pass there: the rest of
+    /// the walk (the cut peers, then the peers not yet probed) is read at the floor, and the
+    /// handle reads every peer at the floor for the rest of the epoch (#1787, Gap 4).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_stops_the_target_pass_at_the_second_cut() {
+        let handle = handle();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c, d], 0, &[(c, SyncRateBound::Floor)], &[a, b])
+                .await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![
+                (a, SyncRateBound::Target),
+                (b, SyncRateBound::Target),
+                (a, SyncRateBound::Floor),
+                (b, SyncRateBound::Floor),
+                (c, SyncRateBound::Floor),
+            ]
+        );
+        assert!(floor_only(&handle), "two cuts in one walk must set the floor-only flag");
+    }
+
+    /// Once the floor-only flag is set, the next walk plans every peer at the floor and reads
+    /// nothing at the target, a fresh peer included (#1787, Gap 4).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_plans_every_peer_at_the_floor_once_the_link_is_slow() {
+        let handle = handle();
+        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        let (a, b) = (key(1), key(2));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b], 0, &[(b, SyncRateBound::Floor)], &[a]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(a, SyncRateBound::Floor), (b, SyncRateBound::Floor)]);
     }
 }
