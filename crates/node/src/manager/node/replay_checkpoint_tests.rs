@@ -60,12 +60,12 @@ async fn observer_manager(
     Ok((manager, fixture))
 }
 
-/// Import six outputs, save only a prefix, and point execution at an independently chosen
-/// output. This recreates the split between pack tip, saved slot and execution tip on disk.
-async fn imported_manager(
+/// Import an epoch-0 pack of six outputs from a peer, with output 1 built on `block1_parent`, and
+/// save only a prefix. Execution stays at genesis.
+async fn imported_epoch0_manager(
     temp: &TempDir,
+    block1_parent: ConsensusHeaderDigest,
     saved: usize,
-    executed: usize,
 ) -> eyre::Result<(
     EpochManager<PathBuf, DatabaseType>,
     CommitteeFixture<MemDatabase>,
@@ -84,7 +84,7 @@ async fn imported_manager(
         next_committee: committee.bls_keys().iter().copied().collect(),
         ..Default::default()
     };
-    let mut parent = ConsensusHeader::default().digest();
+    let mut parent = block1_parent;
     let mut outputs = Vec::new();
     for number in 1..=6 {
         let output = output_at(&fixture, 0, number, parent);
@@ -108,6 +108,24 @@ async fn imported_manager(
         manager.consensus_chain.save_consensus_output(output.clone()).await?;
     }
     manager.consensus_chain.persist_current().await?;
+    source.close().await;
+    Ok((manager, fixture, outputs, record))
+}
+
+/// Import six outputs, save only a prefix, and point execution at an independently chosen
+/// output. This recreates the split between pack tip, saved slot and execution tip on disk.
+async fn imported_manager(
+    temp: &TempDir,
+    saved: usize,
+    executed: usize,
+) -> eyre::Result<(
+    EpochManager<PathBuf, DatabaseType>,
+    CommitteeFixture<MemDatabase>,
+    Vec<ConsensusOutput>,
+    EpochRecord,
+)> {
+    let (manager, fixture, outputs, record) =
+        imported_epoch0_manager(temp, ConsensusHeader::default().digest(), saved).await?;
     let executed_output = &outputs[executed - 1];
     manager.consensus_bus.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
@@ -127,7 +145,6 @@ async fn imported_manager(
             )),
         );
     });
-    source.close().await;
     Ok((manager, fixture, outputs, record))
 }
 
@@ -274,6 +291,35 @@ async fn replay_anchors_block1_on_its_own_parent_when_nothing_executed() -> eyre
     }
     assert!(engine_rx.try_recv().is_err());
     assert_eq!(manager.consensus_chain.latest_consensus_number(), 3);
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
+/// Issue #1790, the import path: a node that imported the epoch-0 pack from a peer and restarted
+/// before executing any of it must replay the pack, though block 1 is not built on the default
+/// header's digest. From block 2 on the replay checks each parent link up to the epoch close. The
+/// importer refuses a pack whose block 2 does not build on block 1, so this path cannot carry the
+/// mis-parented case `replay_rejects_block2_not_built_on_block1_when_nothing_executed` covers.
+#[tokio::test]
+async fn replay_anchors_imported_block1_on_its_own_parent_before_execution() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let anchor: ConsensusHeaderDigest = B256::ZERO.into();
+    assert_ne!(anchor, ConsensusHeader::default().digest());
+    let (mut manager, fixture, outputs, _) = imported_epoch0_manager(&temp, anchor, 0).await?;
+    assert!(
+        state_sync::last_executed_consensus_block(&manager.consensus_bus, &manager.consensus_chain)
+            .await?
+            .is_none(),
+        "the fixture must leave execution at genesis"
+    );
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let mut replay = manager.replay_missed_consensus(fixture.committee(), &to_engine).await?;
+    assert_eq!(replay.take_epoch_close_hash(), Some(outputs[5].consensus_header_hash()));
+    for expected in &outputs {
+        assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), expected.consensus_header_hash());
+    }
+    assert!(engine_rx.try_recv().is_err());
+    assert_eq!(manager.consensus_chain.latest_consensus_number(), 6);
     manager.consensus_chain.clone().close().await;
     Ok(())
 }
