@@ -10,7 +10,11 @@ use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{
-    collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
+    collections::BTreeMap,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::Arc,
     thread::available_parallelism,
 };
 use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
@@ -308,11 +312,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
-        // A `db reset-execution` stopped between its moves leaves part of the execution database
-        // in its staging directory: refuse before the open creates a database beside the rest.
-        crate::db::refuse_interrupted_reset(&tn_datadir)?;
         // create dbs to survive between sync state transitions
-        let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
+        let reth_db = open_execution_database(&node_config, &tn_datadir)?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
             .with_state_export_keep(state_export_keep)
             // the two flags conflict, so at most one of them is set
@@ -325,6 +326,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
+}
+
+/// Open the node's reth execution database in `tn_datadir`, after refusing an unfinished
+/// `db reset-execution` there: one stopped between its moves leaves part of the execution database
+/// in its staging directory, and the open would create a database beside the rest.
+fn open_execution_database(
+    node_config: &RethConfig,
+    tn_datadir: &Path,
+) -> eyre::Result<tn_reth::RethDb> {
+    crate::db::refuse_interrupted_reset(tn_datadir)?;
+    tn_reth::RethEnv::new_database(node_config, tn_datadir.to_path_buf().reth_db_path())
 }
 
 /// Refuse to run a faucet-compiled binary against canonical Telcoin mainnet.
@@ -373,6 +385,29 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
+
+    /// The node refuses to open its execution database while a `db reset-execution` there is
+    /// unfinished (an `execution-reset-*.partial` directory), and creates nothing; once the reset
+    /// directory has its final name, the node opens a new database.
+    #[test]
+    fn the_node_refuses_an_interrupted_reset_before_opening_its_database() -> eyre::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let datadir = tmp.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        std::fs::create_dir_all(partial.join("db"))?;
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config =
+            RethConfig::new(RethCommand::try_parse_from(["tn-reth"])?, None, &datadir, true, chain);
+
+        let err = open_execution_database(&config, &datadir).expect_err("an unfinished reset");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(!datadir.reth_db_path().try_exists()?, "no database is created");
+
+        std::fs::rename(&partial, datadir.join("execution-reset-20261109T000000Z"))?;
+        drop(open_execution_database(&config, &datadir)?);
+        assert!(datadir.reth_db_path().try_exists()?, "a finished reset: a new database");
+        Ok(())
+    }
 
     /// The removed observer flag is rejected and absent from both help views.
     #[test]
