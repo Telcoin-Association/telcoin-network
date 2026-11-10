@@ -165,6 +165,10 @@ impl Fixture {
 /// Build `blocks` as one unpersisted output after the fixture's setup block, with a fresh read
 /// cache per block and with one shared scope, calling `check` after each block with the
 /// environment, both builds and the shared scope.
+///
+/// Every block must include all of its transactions, and every one but a factory call (which
+/// reverts when its child exists) must succeed, so a generator out of step with the senders'
+/// nonces fails here instead of comparing empty blocks.
 fn run_output(
     blocks: &[Vec<Op>],
     mut check: impl FnMut(
@@ -178,12 +182,27 @@ fn run_output(
     let mut fixture = Fixture::new().map_err(fail)?;
     let mut overlay = OutputTrieOverlay::new();
     let mut scope = OutputBuildScope::new();
-    for ops in blocks {
+    for (number, ops) in blocks.iter().enumerate() {
         let txs: Vec<Vec<u8>> = ops.iter().map(|op| fixture.encode(op)).collect();
         let (fresh, shared) = fixture
             .env
             .build_unpersisted_fresh_and_shared(&txs, &mut overlay, &mut scope)
             .map_err(fail)?;
+        prop_assert_eq!(
+            fresh.recovered_block.transaction_count(),
+            ops.len(),
+            "block {} left out a transaction",
+            number + 1
+        );
+        for (index, op) in ops.iter().enumerate() {
+            prop_assert!(
+                matches!(op, Op::Create { .. }) || fixture.env.tx_succeeded(&fresh, index),
+                "block {} tx {} failed: {:?}",
+                number + 1,
+                index,
+                op
+            );
+        }
         check(&fixture.env, &fresh, &shared, &scope)?;
     }
     Ok(())
