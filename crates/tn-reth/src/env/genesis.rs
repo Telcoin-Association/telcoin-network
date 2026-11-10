@@ -91,6 +91,48 @@ use crate::{
     RethConfig, RethEnv, StorageLayout, TxForwardConfig, BLS_G1_PRECOMPILE_ADDRESS,
 };
 
+/// The environment variable that picks the storage layout of a new temp chain datadir in a test
+/// build: `v1` or `v2`. Unset, temp chains get [`StorageLayout::for_new_datadirs`].
+///
+/// Test-only: it is read only when tn-reth is built for tests (`cfg(test)` or the `test-utils`
+/// feature, which no release graph enables), and only by the temp chain constructors
+/// ([`RethEnv::new_for_temp_chain`] and the seams built on it), never by [`RethConfig::new`] or
+/// [`RethConfig::from_node_config`], which the node and `db load-state` open their datadirs with.
+/// `./etc/ci-lanes.sh test-default` sets it to `v1` for a second run of tn-reth's and tn-engine's
+/// suites, so layout v1 on tn-lmdb (every migrated testnet datadir) keeps the coverage it had
+/// before new datadirs moved to v2.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) const TEST_NEW_DATADIR_LAYOUT_VAR: &str = "TN_TEST_NEW_DATADIR_LAYOUT";
+
+/// The layout a new temp chain datadir gets: the one [`TEST_NEW_DATADIR_LAYOUT_VAR`] names in a
+/// test build, else [`StorageLayout::for_new_datadirs`]. A value other than `v1` or `v2` is an
+/// error, so a mistyped lane fails instead of running the default.
+pub(crate) fn temp_chain_new_datadir_layout() -> eyre::Result<StorageLayout> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(layout) = test_layout_override(std::env::var(TEST_NEW_DATADIR_LAYOUT_VAR))? {
+        return Ok(layout);
+    }
+    Ok(StorageLayout::for_new_datadirs())
+}
+
+/// The layout a read of [`TEST_NEW_DATADIR_LAYOUT_VAR`] names: `None` when it is unset.
+#[cfg(any(test, feature = "test-utils"))]
+fn test_layout_override(
+    value: Result<String, std::env::VarError>,
+) -> eyre::Result<Option<StorageLayout>> {
+    match value {
+        Ok(value) => match value.as_str() {
+            "v1" => Ok(Some(StorageLayout::V1)),
+            "v2" => Ok(Some(StorageLayout::V2)),
+            _ => eyre::bail!(
+                "{TEST_NEW_DATADIR_LAYOUT_VAR}={value:?}: expected `v1` or `v2`, or unset"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => eyre::bail!("{TEST_NEW_DATADIR_LAYOUT_VAR}: {e}"),
+    }
+}
+
 impl RethEnv {
     /// Create a new temp RethEnv using a specified chain spec.
     pub fn new_for_temp_chain<P: AsRef<Path>>(
@@ -167,7 +209,7 @@ impl RethEnv {
             rewards,
             rpc,
             tx_forward,
-            StorageLayout::for_new_datadirs(),
+            temp_chain_new_datadir_layout()?,
         )
     }
 
@@ -553,6 +595,21 @@ mod tests {
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tn_types::{generate_proof_of_possession_bls_for_test, BlsKeypair, NodeP2pInfo};
+
+    /// The temp chains' layout override names v1 or v2, is absent when unset, and refuses
+    /// anything else, so a mistyped lane fails rather than runs the default layout.
+    #[test]
+    fn the_test_layout_override_reads_v1_v2_or_nothing() {
+        use std::env::VarError;
+        let read = |value: &str| test_layout_override(Ok(value.to_string()));
+        assert_eq!(read("v1").expect("v1"), Some(StorageLayout::V1));
+        assert_eq!(read("v2").expect("v2"), Some(StorageLayout::V2));
+        assert_eq!(test_layout_override(Err(VarError::NotPresent)).expect("unset"), None);
+        for bad in ["", "V1", "1", "v3"] {
+            let err = read(bad).expect_err(bad).to_string();
+            assert!(err.contains(TEST_NEW_DATADIR_LAYOUT_VAR), "{bad:?}: {err}");
+        }
+    }
 
     /// Regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
     ///

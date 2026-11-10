@@ -290,6 +290,8 @@ Together the β values are about 345 bytes per transaction.
 Both are measured on the benchmark mix, whose average transaction is about 190 bytes in a batch (188 on c3, about 190 on e2) [^b-txbytes].
 Both fleets agree to within 3%.
 β_reth is a lower bound because the execution database file `db/mdbx.dat` kept the same 4.3 GB size from node start to teardown in every run: MDBX allocates that file in large steps, so growth inside it did not show, and only static-file growth was counted.
+These runs predate this release's execution database: it runs on tn-lmdb (`db/tn-lmdb.dat`, which grows in steps of at most 1 GiB, `--db.growth-step`, and gives back its unused tail at a clean close), and a new datadir uses reth's storage layout v2, which moves change sets and transaction senders out of the database into static files.
+β_reth has not been measured on that combination yet.
 The [storage growth planning](#storage-growth-planning) table applies the formula to other loads.
 
 Execution reads state on its single thread, so random-read latency adds directly to execution time.

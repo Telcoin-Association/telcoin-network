@@ -770,6 +770,12 @@ impl DbLoadStateArgs {
         }
         let _pid_lock = PidLock::acquire(&datadir)?;
 
+        // An unfinished `db reset-execution` holds part of the execution database in its staging
+        // directory: a restore beside it would leave the datadir holding two, and the reset's rerun
+        // would then refuse to finish. Refused before anything is read or written, as the node
+        // does.
+        refuse_interrupted_reset(&datadir)?;
+
         // A restore never migrates the reth database. `SnapshotRestorer::open` refuses a datadir
         // holding chain data only once the database is open, and on a build whose open first moves
         // an MDBX database onto tn-lmdb that open would already have migrated it: such a datadir is
@@ -1733,6 +1739,25 @@ mod tests {
             .execute(datadir)
             .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+    }
+
+    /// `db load-state` refuses a datadir holding an unfinished `db reset-execution` (an
+    /// `execution-reset-*.partial` directory), before it reads the config or creates anything.
+    #[test]
+    fn db_load_state_refuses_an_interrupted_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        fs::create_dir_all(partial.join("db")).unwrap();
+
+        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
+            .execute(datadir.clone())
+            .expect_err("an unfinished reset");
+        assert!(err.to_string().contains("did not finish"), "the reset's refusal: {err:#}");
+        let mut entries: Vec<_> =
+            fs::read_dir(&datadir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        entries.retain(|name| name != "telcoin.pid" && name != partial.file_name().unwrap());
+        assert!(entries.is_empty(), "nothing else is made in the datadir: {entries:?}");
     }
 
     /// `db load-state` never migrates the reth database: on a build whose open first moves an MDBX

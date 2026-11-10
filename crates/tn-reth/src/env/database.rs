@@ -564,25 +564,75 @@ const SAFE_NO_SYNC_PERIOD: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(not(feature = "mdbx"))]
 const SAFE_NO_SYNC_BYTES: u64 = 64 << 20;
 
-/// Create or check reth's database version file in `path`, as reth's `create_db` does: an absent
-/// or empty directory is created and gets the file; otherwise the file must hold reth's version,
-/// and a missing one is written.
+/// The version the tn-lmdb build records in reth's `database.version` file: reth's schema version
+/// (`reth_db::version::DB_VERSION`, 2) plus 1000, so never a version reth itself writes.
+///
+/// It is a rollback tripwire. A binary that runs reth on MDBX alone (`v0.16.0-adiri`, whose reth
+/// `create_db` checks this file before it opens anything) refuses any version but reth's
+/// ("breaking database change detected: your database version (v1002) ..."). Without it such a
+/// binary, started over a tn-lmdb `db/`, creates an empty `mdbx.dat` beside `tn-lmdb.dat`, and
+/// reth's consistency check prunes the static files down to that empty database before the start
+/// fails. The MDBX build of this tree refuses a tn-lmdb `db/` by its data file first
+/// (`check_backend`), and writes reth's own version.
+#[cfg(not(feature = "mdbx"))]
+pub(crate) const TN_LMDB_DB_VERSION: u64 = 1000 + reth_db::version::DB_VERSION;
+
+/// Create or check reth's database version file in `path` for tn-lmdb, as reth's `create_db` does
+/// but with [`TN_LMDB_DB_VERSION`]: an absent or empty directory is created and gets the file;
+/// otherwise the file must hold that version. A missing file, or one holding reth's own version (a
+/// tn-lmdb database written before the tripwire, or an MDBX database the migration has just moved:
+/// it leaves the file as MDBX had it), is rewritten with it. Any other version, or a file that does
+/// not parse, is refused.
 #[cfg(not(feature = "mdbx"))]
 fn init_db_version_file(path: &Path) -> eyre::Result<()> {
-    use reth_db::version::{check_db_version_file, create_db_version_file, DatabaseVersionError};
+    use reth_db::version::{get_db_version, DatabaseVersionError, DB_VERSION};
 
     if database_is_empty(path)? {
         std::fs::create_dir_all(path)
             .wrap_err_with(|| format!("could not create database directory {}", path.display()))?;
-        create_db_version_file(path)?;
-    } else {
-        match check_db_version_file(path) {
-            Ok(()) => (),
-            Err(DatabaseVersionError::MissingFile) => create_db_version_file(path)?,
-            Err(err) => return Err(err.into()),
-        }
+        return write_db_version_file(path);
     }
-    Ok(())
+    match get_db_version(path) {
+        Ok(TN_LMDB_DB_VERSION) => Ok(()),
+        Ok(DB_VERSION) | Err(DatabaseVersionError::MissingFile) => {
+            write_db_version_file(path)?;
+            tracing::info!(target: "tn::reth", path = %path.display(), version = TN_LMDB_DB_VERSION, "recorded the tn-lmdb database version, which a binary running reth on MDBX alone refuses");
+            Ok(())
+        }
+        Ok(version) => eyre::bail!(
+            "the reth database at {} is at database version {version} ({}), and this build reads \
+             tn-lmdb's version {TN_LMDB_DB_VERSION} (or reth's {DB_VERSION} from before it): another \
+             binary wrote this datadir. Run that binary, or rebuild the execution database \
+             (`telcoin-network db reset-execution`)",
+            path.display(),
+            reth_db::version::db_version_file_path(path).display(),
+        ),
+        Err(err) => Err(eyre::Report::new(err).wrap_err(format!(
+            "failed to read the reth database version file in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Write [`TN_LMDB_DB_VERSION`] into reth's database version file in `path` atomically: a temp
+/// file, fsync, rename, fsync of the directory. A torn file would stop this build too (it does not
+/// parse), so the file is never rewritten in place.
+#[cfg(not(feature = "mdbx"))]
+fn write_db_version_file(path: &Path) -> eyre::Result<()> {
+    use std::io::Write as _;
+    use tn_storage::disk::{fsync_directory, fsync_file};
+
+    let file = reth_db::version::db_version_file_path(path);
+    let tmp = path.join(format!("{}.tmp", reth_db::version::DB_VERSION_FILE_NAME));
+    let write = || -> std::io::Result<()> {
+        let mut out = std::fs::File::create(&tmp)?;
+        out.write_all(TN_LMDB_DB_VERSION.to_string().as_bytes())?;
+        fsync_file(&out)?;
+        drop(out);
+        std::fs::rename(&tmp, &file)?;
+        fsync_directory(path)
+    };
+    write().wrap_err_with(|| format!("failed to write {}", file.display()))
 }
 
 /// Whether the database directory `path` is absent or empty: reth's `is_database_empty`, except

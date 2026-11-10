@@ -443,8 +443,17 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
 
 - **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
   `init_db` with `with_metrics`. The tn-lmdb build maps the `--db.*` flags, writes or checks reth's
-  `database.version` file as reth's `create_db` does, opens `TnLmdbEnv`, creates reth's tables and
-  records the client version in `VersionHistory` as reth's `record_client_version` does.
+  `database.version` file as reth's `create_db` does but with its own version, opens `TnLmdbEnv`,
+  creates reth's tables and records the client version in `VersionHistory` as reth's
+  `record_client_version` does.
+- **Version file** (`init_db_version_file`, tn-lmdb build): `db/database.version` holds
+  `TN_LMDB_DB_VERSION` (1002: reth's version 2 plus 1000), never reth's own. It is a rollback
+  tripwire: a binary that runs reth on MDBX alone (`v0.16.0-adiri`) checks the file before it opens
+  anything and stops with "breaking database change detected: your database version (v1002) is
+  incompatible with the latest database version (v2)", where it would otherwise create an empty
+  `mdbx.dat` beside `tn-lmdb.dat` and prune the static files down to it. A missing file, or one
+  holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or one the migration just moved), is
+  rewritten atomically at the next open; any other content is refused.
 - **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
@@ -529,7 +538,8 @@ one of reth's: its rows are not copied (reth does not read them either).
   the copy, and the synced file against the engine's full check. Then it renames the file to
   `db/tn-lmdb.dat` (the commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker
   `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
-  reth's static files and `database.version` file are not touched. The copy needs no case of its own
+  reth's static files and `database.version` file are not touched (the open after it writes the
+  tn-lmdb version into the latter, above). The copy needs no case of its own
   for the dup-sort tables' forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
   table, also when they span the copy's commits
@@ -587,7 +597,8 @@ one of reth's: its rows are not copied (reth does not read them either).
 reth has two storage layouts (`StorageSettings`). **v1** keeps change sets, transaction senders and
 the history indices in database tables, and plain state beside hashed state. **v2** (here without
 RocksDB) moves change sets and senders into static files and keeps only hashed state; its storage
-history is keyed by the hashed slot. v2 runs only on tn-lmdb. Nothing converts a datadir from one
+change sets and history are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0044).
+v2 runs only on tn-lmdb. Nothing converts a datadir from one
 layout to the other: flipping the recorded layout alone would misread every history index, so a
 datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 
@@ -597,11 +608,16 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   separate transaction-hash index) takes the next version, and an older binary refuses it rather
   than misread it.
 - **A new datadir** gets `StorageLayout::for_new_datadirs()`: always v1 on the MDBX build, and
-  `NEW_DATADIR_LAYOUT_TN_LMDB` on the tn-lmdb build (v1 until the v2 write path writes the history
-  indices and the transaction-hash index; that constant is the one line that moves new datadirs to
-  v2). Benches and tests pick a layout with `RethConfig::with_new_datadir_layout`. The marker
-  commits before genesis, and genesis writes `storage_settings` with the layout
-  (`init_genesis_with_settings`).
+  `NEW_DATADIR_LAYOUT_TN_LMDB`, v2, on the tn-lmdb build (the v2 write path keeps the history
+  indices and the transaction-hash index in the database: vendor/reth CHANGES.md TN-0042..0044).
+  `the_default_build_gives_new_datadirs_v2` pins both, through the node's own config, and
+  `etc/backend-gate.sh` (run by `./etc/ci-lanes.sh test-default`) fails if any crate turns the
+  `mdbx` feature on in the release graphs or that lane. Benches and tests pick a layout with
+  `RethConfig::with_new_datadir_layout`; in test builds `TN_TEST_NEW_DATADIR_LAYOUT=v1` (or `v2`)
+  picks it for every temp chain (`TEST_NEW_DATADIR_LAYOUT_VAR`), which `test-default` uses to run
+  tn-reth's and tn-engine's suites a second time on v1, the layout migrated datadirs keep; the
+  node's own path never reads it. The marker commits before genesis, and genesis writes
+  `storage_settings` with the layout (`init_genesis_with_settings`).
 - **An existing datadir** opens in its stored layout, never flipped. When it differs from the layout
   new datadirs get, every start logs a warning naming `db reset-execution`; the node runs as before.
   A datadir from before the marker (every one is v1) gets the marker at its first open.
@@ -615,10 +631,19 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   | a marker whose layout disagrees with `storage_settings` | the row was changed without converting the data |
   | a v2 datadir without the marker | no TN build wrote it |
   | a v1 datadir whose static files hold a segment only v2 writes (senders, change sets) | another datadir's static files: a half-done swap |
+  | a v2 datadir whose static files hold headers but no senders segment, which v2 writes from genesis | a v1 datadir's static files: the other half-done swap; v2's consistency check would prune them to this database |
   | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
 
+  One state beside a database without a chain is healed instead: a creation stopped inside
+  genesis's commit. Genesis finalizes its static files before it commits the database, so a stop
+  between the two leaves TN's marker (committed first) and no `storage_settings` row in the
+  database, beside static files holding only this chain's genesis block. The open removes those
+  static files (headers last, so a stop part way is found again) and creates the datadir anew
+  (`holds_only_genesis`). With no marker, or anything past genesis, it refuses as above.
+
 - **Logs:** `new reth datadir: storage layout` or `reth datadir: storage layout` at each start, with
-  the layout.
+  the layout; an existing datadir in the other layout logs the warning `this reth datadir keeps its
+  storage layout` with `layout` and `new_datadirs` instead.
 
 ### Upgrading a testnet node
 
@@ -685,12 +710,18 @@ refuses to start while a `.partial` directory is there, and running the command 
   `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. Once the
   rebuilt node is healthy and no rollback is wanted, delete `execution-reset-*` to free the space.
 - **To `v0.16.0-adiri`:** restore the backup taken before the upgrade, then start the old binary.
-  Without a backup there is no safe way back for a validator. The old binary cannot open a tn-lmdb
-  `db/` and has no backend guard: it creates an empty MDBX database beside `tn-lmdb.dat` and prunes
-  the static files down to it (a silent resync from genesis). Its consensus database is gone too:
-  the old binary recreates it empty and forgets the votes this validator cast in the current epoch,
-  so it could equivocate (#1558). Keep such a validator stopped until the network has closed the
-  epoch it was in, then start the old binary on a fresh datadir.
+  There is no automatic rollback, and without a backup no safe way back for a validator. The old
+  binary cannot open a tn-lmdb `db/` and has no backend guard; what stops it is the version file:
+  it refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything ("breaking
+  database change detected: your database version (v1002) is incompatible with the latest
+  database version (v2)"), so `db/` and `static_files/` are left as they were and the new binary
+  still runs on them. Do not edit or delete the file to get past it: the old binary would then
+  create an empty MDBX database beside `tn-lmdb.dat`, prune the static files down to it, and fail
+  at genesis. The old binary opens the reth database before the consensus database, so it stops
+  before it reaches `consensus-db/` either, which the new binary moved to tndb (one-way, #1558). On
+  a fresh datadir the old binary starts with an empty consensus database and forgets the votes this
+  validator cast in the current epoch, so it could equivocate: keep such a validator stopped until
+  the network has closed the epoch it was in, then start the old binary on a fresh datadir.
 
 ### Persist benchmark
 
@@ -760,8 +791,8 @@ from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`:
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
 The script's header lists its settings and everything it writes. On macOS both backends' durable
 commits are `msync` (libmdbx its used span, tn-lmdb its dirty pages), and neither flushes the
-drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` once the env can select it, in
-`StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
+drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` on tn-lmdb only,
+through `StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
 every opened datadir; `TN_EXEC_BENCH_READ_MIX=history` (the `busy-history` profile) has the readers
 read balances and storage at past blocks and transactions by hash; and `TN_EXEC_BENCH_DIFF` writes
 a seeded sample of past-block and by-hash reads with their answers, which `TN_EXEC_BENCH_DIFF_AGAINST`

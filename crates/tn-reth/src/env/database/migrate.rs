@@ -5,8 +5,9 @@
 //! directory: the backend guard calls [`migrate_from_mdbx`]. The copy is raw: each of reth's
 //! tables is walked on MDBX as its encoded keys and compressed values (`RawTable`) and appended to
 //! tn-lmdb unchanged, so no row is decoded. reth's static files and its `database.version` file are
-//! not touched; the open that follows checks the version file and records the client version as
-//! on any open, after the `VersionHistory` rows the copy brought over.
+//! not touched; the open that follows rewrites the version file with tn-lmdb's version (the
+//! rollback tripwire, `TN_LMDB_DB_VERSION`) and records the client version as on any open, after
+//! the `VersionHistory` rows the copy brought over.
 //!
 //! **States.** The directory's files decide what an open does. Each is looked for with
 //! `try_exists`, so a stat error fails the open:

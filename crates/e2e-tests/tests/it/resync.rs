@@ -18,17 +18,19 @@
 //!    over the same datadir. Its reth database must move MDBX to tn-lmdb, and its consensus
 //!    database MDBX to tndb when `TN_BIN_PATH_PREV` is a release from before tndb
 //!    (`migrate_from_mdbx` in `tn_reth` and `tn_storage`; a `TN_BIN_PATH_PREV` built after tndb has
-//!    nothing to move there). It must record TN's storage layout marker (layout v1) in the existing
-//!    reth datadir and follow the chain again.
+//!    nothing to move there). The migrated reth datadir must keep its storage layout, v1, with TN's
+//!    layout marker (recorded on this open when `TN_BIN_PATH_PREV` predates it), and log that it
+//!    stays v1 although new datadirs get v2. It must follow the chain again.
 //! 3. Reset: validator-4 stops, `db reset-execution` runs on its datadir, first as a dry run
 //!    (nothing moves), then with `--force` (the execution entries move into `execution-reset-*`).
-//! 4. Rebuild: validator-4 starts on `TN_BIN_PATH` again. It must create a new reth datadir (layout
-//!    v1), execute the chain from genesis to the tip, return to `CvvActive`, take a round of
-//!    transactions through its own worker, and close an epoch with the others.
-//! 5. Compare validator-4 with validator-1, which never moved and still runs `TN_BIN_PATH_PREV`:
-//!    every block from genesis (hash, stateRoot, receiptsRoot), balances, `ConsensusRegistry` and
-//!    token storage and token `eth_call`s at past blocks, and the recorded transactions and their
-//!    receipts by hash.
+//! 4. Rebuild: validator-4 starts on `TN_BIN_PATH` again. It must create a new reth datadir in
+//!    storage layout v2 (change sets and senders in static files), execute the chain from genesis
+//!    to the tip, return to `CvvActive`, take a round of transactions through its own worker, and
+//!    close an epoch with the others.
+//! 5. Compare validator-4 (now v2) with validator-1, which never moved and still runs
+//!    `TN_BIN_PATH_PREV` (v1 on MDBX): every block from genesis (hash, stateRoot, receiptsRoot),
+//!    balances, `ConsensusRegistry` and token storage and token `eth_call`s at past blocks, and the
+//!    recorded transactions and their receipts by hash.
 //!
 //! **Binaries and lane.** As in `reth_db_migration`, the test runs only with the marker
 //! `TN_E2E_TN_LMDB_BIN` set (`TN_BIN_PATH` is the default, tn-lmdb, build) and skips with a message
@@ -132,9 +134,16 @@ const ERC1967_IMPLEMENTATION_SLOT: B256 =
 const LAYOUT_MARKER_RECORDED_LOG: &str =
     "recorded TN's storage layout marker in an existing reth datadir";
 const NEW_DATADIR_LOG: &str = "new reth datadir: storage layout";
-/// Logged on every open of an existing reth datadir (a substring of [`NEW_DATADIR_LOG`] too, so it
-/// is only looked for in a run that opened an existing one).
+/// Logged on an open of an existing reth datadir in the layout new datadirs get (a substring of
+/// [`NEW_DATADIR_LOG`] too, so it is only looked for in a run that opened an existing one).
 const EXISTING_DATADIR_LOG: &str = "reth datadir: storage layout";
+/// Logged instead of [`EXISTING_DATADIR_LOG`] on an open of an existing reth datadir in the other
+/// layout: a migrated v1 datadir under a binary that gives new datadirs v2.
+const KEEPS_LAYOUT_LOG: &str = "this reth datadir keeps its storage layout";
+
+/// The name prefix of the static files of the account change set segment, which only storage
+/// layout v2 writes (v1 keeps change sets in database tables).
+const V2_SEGMENT_PREFIX: &str = "static_file_account-change-sets_";
 
 /// The prefix of the directory `db reset-execution` moves the execution entries into.
 const RESET_DIR_PREFIX: &str = "execution-reset-";
@@ -184,8 +193,13 @@ fn log_lines(instance: usize, run: u32, needle: &str) -> eyre::Result<Vec<String
 }
 
 /// The one line of run `run` of validator `instance` that contains `needle`, which must also
-/// report `layout=v1`.
-fn layout_log_line(instance: usize, run: u32, needle: &str) -> eyre::Result<String> {
+/// report each of `fields` (`layout=v1`, `new_datadirs=v2`).
+fn layout_log_line(
+    instance: usize,
+    run: u32,
+    needle: &str,
+    fields: &[&str],
+) -> eyre::Result<String> {
     let lines = log_lines(instance, run, needle)?;
     let path = node_log_path(TEST, instance, run, false);
     let [line] = lines.as_slice() else {
@@ -195,12 +209,18 @@ fn layout_log_line(instance: usize, run: u32, needle: &str) -> eyre::Result<Stri
             lines.len()
         );
     };
-    eyre::ensure!(
-        line.contains("layout=v1"),
-        "{}: `{line}` does not report layout=v1",
-        path.display()
-    );
+    for field in fields {
+        eyre::ensure!(line.contains(field), "{}: `{line}` does not report {field}", path.display());
+    }
     Ok(line.clone())
+}
+
+/// The static files in `datadir` of a segment only storage layout v2 writes.
+fn v2_segment_files(datadir: &Path) -> eyre::Result<Vec<String>> {
+    Ok(root_entries(&datadir.join("static_files"))?
+        .into_iter()
+        .filter(|name| name.starts_with(V2_SEGMENT_PREFIX))
+        .collect())
 }
 
 /// Assert a stopped validator's consensus database is the previous release's MDBX one:
@@ -435,11 +455,20 @@ async fn run_resync(
         );
         progress(format!("{phase}: TN_BIN_PATH_PREV already wrote the layout marker"));
     } else {
-        let line =
-            layout_log_line(RESET, RUN_UPGRADED, LAYOUT_MARKER_RECORDED_LOG).wrap_err(phase)?;
+        let line = layout_log_line(RESET, RUN_UPGRADED, LAYOUT_MARKER_RECORDED_LOG, &["layout=v1"])
+            .wrap_err(phase)?;
         progress(format!("{phase}: {line}"));
     }
-    let open_line = layout_log_line(RESET, RUN_UPGRADED, EXISTING_DATADIR_LOG).wrap_err(phase)?;
+    // the migrated datadir stays v1 although this binary gives new datadirs v2
+    let open_line =
+        layout_log_line(RESET, RUN_UPGRADED, KEEPS_LAYOUT_LOG, &["layout=v1", "new_datadirs=v2"])
+            .wrap_err(phase)?;
+    let same_layout = log_lines(RESET, RUN_UPGRADED, EXISTING_DATADIR_LOG)?;
+    eyre::ensure!(
+        same_layout.is_empty(),
+        "{phase}: the upgraded run opened its datadir in the layout new datadirs get: \
+         {same_layout:?}"
+    );
     progress(format!("{phase}: {open_line}"));
     tokio::task::block_in_place(|| {
         wait_until_blocking(
@@ -457,6 +486,11 @@ async fn run_resync(
     let receipts = workload.round(reset_url, &chain).await.wrap_err(phase)?;
     record(&mut recorded, &receipts, ring);
     let closed = close_epoch(reference, phase).await?;
+    let v2_files = v2_segment_files(&dir)?;
+    eyre::ensure!(
+        v2_files.is_empty(),
+        "{phase}: the migrated v1 datadir wrote v2-only static files: {v2_files:?}"
+    );
     progress(format!(
         "{phase}: validator-4 migrated, passed block {tip_at_stop}, is CvvActive; epoch {closed} \
          closed with it"
@@ -546,8 +580,9 @@ async fn run_resync(
     tokio::task::block_in_place(|| wait_for_started_rpc(guard, RESET, reset_url, RUN_REBUILT))
         .wrap_err(phase)?;
     let head_at_rpc = get_block_number(reset_url)?;
-    let new_line = layout_log_line(RESET, RUN_REBUILT, NEW_DATADIR_LOG).wrap_err(phase)?;
-    for absent in [MIGRATED_LOG, LAYOUT_MARKER_RECORDED_LOG] {
+    let new_line =
+        layout_log_line(RESET, RUN_REBUILT, NEW_DATADIR_LOG, &["layout=v2"]).wrap_err(phase)?;
+    for absent in [MIGRATED_LOG, LAYOUT_MARKER_RECORDED_LOG, KEEPS_LAYOUT_LOG] {
         let lines = log_lines(RESET, RUN_REBUILT, absent)?;
         eyre::ensure!(lines.is_empty(), "{phase}: the rebuilt run logged {lines:?}");
     }
@@ -581,6 +616,13 @@ async fn run_resync(
     let receipts = workload.round(reset_url, &chain).await.wrap_err(phase)?;
     record(&mut recorded, &receipts, ring);
     let closed = close_epoch(reference, phase).await?;
+    let v2_files = v2_segment_files(&dir)?;
+    eyre::ensure!(
+        !v2_files.is_empty(),
+        "{phase}: the rebuilt datadir has no {V2_SEGMENT_PREFIX}* static files: it is not storage \
+         layout v2"
+    );
+    progress(format!("{phase}: v2 change set static files {v2_files:?}"));
     let endpoints: Vec<NodeEndpoints> = [reference, reset_url]
         .into_iter()
         .map(|url| NodeEndpoints {
