@@ -84,6 +84,12 @@ pub struct ValidationJobSender {
 }
 
 impl ValidationJobSender {
+    /// TN(TN-0074): the channel's capacity, for the test of the vendored `build_with_tasks`.
+    #[cfg(test)]
+    pub(crate) fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
     /// Sends the given job to the validation task.
     pub async fn send(
         &self,

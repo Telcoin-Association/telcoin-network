@@ -1266,7 +1266,13 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
         let additional_tasks = self.additional_tasks;
         let validator = self.build::<Tx, S>(blob_store);
 
-        let (tx, task) = ValidationTask::new();
+        // Buffer two jobs per worker so workers can dequeue without waiting for
+        // a producer to refill the channel after every handoff.
+        // TN(TN-0074): upstream 0a1d3e761 sizes the channel in
+        // `TransactionValidationTaskExecutor::spawn`, which this copy predates; this builder is
+        // the vendored path that spawns the workers.
+        let (tx, task) =
+            ValidationTask::with_capacity(additional_tasks.saturating_add(1).saturating_mul(2));
 
         // Spawn validation tasks, they are blocking because they perform db lookups
         for _ in 0..additional_tasks {
@@ -1407,6 +1413,33 @@ mod tests {
         let tx = PooledTransactionVariant::decode_2718(&mut data.as_ref()).unwrap();
 
         EthPooledTransaction::from_pooled(tx.try_into_recovered().unwrap())
+    }
+
+    /// TN(TN-0074): upstream 0a1d3e761's `configured_workers_have_bounded_handoff_capacity`, on
+    /// the vendored `build_with_tasks` path.
+    #[tokio::test]
+    async fn configured_workers_have_bounded_handoff_capacity() {
+        use reth_tasks::TokioTaskExecutor;
+
+        let transaction = get_transaction();
+        let provider = MockEthProvider::default().with_genesis_block();
+        provider.add_account(
+            transaction.sender(),
+            ExtendedAccount::new(transaction.nonce(), U256::MAX),
+        );
+        for (additional_tasks, expected_capacity) in [(0, 2), (1, 4), (8, 18)] {
+            let executor = EthTransactionValidatorBuilder::new(provider.clone(), test_evm_config())
+                .with_additional_tasks(additional_tasks)
+                .build_with_tasks(TokioTaskExecutor::default(), InMemoryBlobStore::default());
+            assert_eq!(executor.to_validation_task.lock().await.max_capacity(), expected_capacity);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                executor.validate_transaction(TransactionOrigin::External, transaction.clone()),
+            )
+            .await
+            .expect("configured validation workers must process jobs");
+            assert!(outcome.is_valid(), "{outcome:?}");
+        }
     }
 
     // <https://github.com/paradigmxyz/reth/issues/5178>

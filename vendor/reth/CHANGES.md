@@ -851,6 +851,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `queued_insertion_promotions_respect_propagation_filter` and
   `pending_insertion_notifies_older_promotions`. *Upstream*: n/a (upstream commit).
 
+- **TN-0074** — Backport 0a1d3e761: the validation channel holds two jobs per worker.
+  *Kind*: backport (adapted).
+  *Files*: `crates/transaction-pool/src/validate/eth.rs` (`build_with_tasks` sizes the channel;
+  upstream's test `configured_workers_have_bounded_handoff_capacity` in its `tests` module, on
+  this path), `crates/transaction-pool/src/validate/task.rs` (a test-only `max_capacity` accessor
+  on `ValidationJobSender`; upstream's `spawn`, which the commit changes, is not in this copy).
+  *Why*: the channel from submitters to the validation workers held one job, so with several
+  workers each handoff waited for a producer to refill it and the workers idled between jobs
+  (review R21). The channel now holds two jobs per worker (`2 * (additional_tasks + 1)`), as
+  upstream has it. Upstream made the change in `TransactionValidationTaskExecutor::spawn`,
+  added after v1.11.4; the vendored path that spawns the workers is
+  `EthTransactionValidatorBuilder::build_with_tasks`, which `tn-reth` calls, so the change lands
+  there. Pool admission throughput only: what is admitted does not change.
+  *Tests*: `configured_workers_have_bounded_handoff_capacity` (0, 1 and 8 extra workers give
+  capacities 2, 4 and 18, and each executor validates a transaction). *Upstream*: n/a (upstream
+  commit).
+
 
 ## TN fixes (not from an upstream commit)
 
