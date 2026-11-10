@@ -43,12 +43,10 @@ use tracing::{info, warn};
 
 use crate::traits::TelcoinNode;
 
-/// The layout the tn-lmdb build gives a new datadir: the one line that moves new datadirs to v2.
-///
-/// v1 while the vendored v2 write path is incomplete: it does not yet write the history indices or
-/// the transaction-hash index. The MDBX build always gives v1
-/// ([`StorageLayout::for_new_datadirs`]).
-const NEW_DATADIR_LAYOUT_TN_LMDB: StorageLayout = StorageLayout::V1;
+/// The layout the tn-lmdb build gives a new datadir: v2, with the history indices and the
+/// transaction-hash index in the database (vendor/reth CHANGES.md TN-0042..0044). The MDBX build
+/// always gives v1 ([`StorageLayout::for_new_datadirs`]); an existing datadir keeps its own.
+const NEW_DATADIR_LAYOUT_TN_LMDB: StorageLayout = StorageLayout::V2;
 
 /// The `Metadata` key of TN's layout marker ([`LayoutMarker`]).
 pub(crate) const TN_LAYOUT_KEY: &str = "tn_storage_layout";

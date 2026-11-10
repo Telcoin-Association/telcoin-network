@@ -1316,7 +1316,7 @@ mod tests {
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,
-        StorageChangeSetReader,
+        StorageChangeSetReader, StorageSettingsCache as _,
     };
     use std::{cell::Cell, collections::BTreeMap, path::Path, rc::Rc, sync::Arc};
     use tempfile::TempDir;
@@ -2385,23 +2385,32 @@ mod tests {
                 "import must write NO storage change sets for block B"
             );
 
-            // the plain/hashed tables, in contrast, are fully populated. the exact storage-row
+            // the state tables, in contrast, are fully populated: the hashed ones in both storage
+            // layouts, the plain ones in v1 only (v2 keeps no plain state). the exact storage-row
             // count also includes `test_genesis`'s own system-contract slots (dumped by the
-            // exporter), so assert the meaningful invariant — plain and hashed hold the same number
-            // of rows — plus a floor of the whale slots and the contract's two slots.
-            assert!(tx.entries::<PlainAccountState>()? >= 6, "plain accounts must be populated");
+            // exporter), so assert a floor of the whale slots and the contract's two slots, and in
+            // v1 that plain and hashed hold the same number of rows.
             assert!(tx.entries::<HashedAccounts>()? >= 6, "hashed accounts must be populated");
-            let plain_storage_rows = tx.entries::<PlainStorageState>()?;
+            let hashed_storage_rows = tx.entries::<HashedStorages>()?;
             assert!(
-                plain_storage_rows >= MULTI_CHUNK_SLOTS as usize + 2,
-                "plain storage must hold at least the whale slots plus the contract's two slots \
-                 (got {plain_storage_rows})"
+                hashed_storage_rows >= MULTI_CHUNK_SLOTS as usize + 2,
+                "hashed storage must hold at least the whale slots plus the contract's two slots \
+                 (got {hashed_storage_rows})"
             );
-            assert_eq!(
-                tx.entries::<HashedStorages>()?,
-                plain_storage_rows,
-                "hashed storage rows must match plain storage rows exactly"
-            );
+            if provider.cached_storage_settings().is_v2() {
+                assert_eq!(tx.entries::<PlainAccountState>()?, 0, "v2 writes no plain accounts");
+                assert_eq!(tx.entries::<PlainStorageState>()?, 0, "v2 writes no plain storage");
+            } else {
+                assert!(
+                    tx.entries::<PlainAccountState>()? >= 6,
+                    "plain accounts must be populated"
+                );
+                assert_eq!(
+                    tx.entries::<PlainStorageState>()?,
+                    hashed_storage_rows,
+                    "plain storage rows must match hashed storage rows exactly"
+                );
+            }
 
             // spot-check the hashed tables directly: the whale's deep probe slot lives under
             // keccak256(address)/keccak256(slot) with its value, exactly as a whole-account import
@@ -2592,7 +2601,10 @@ mod tests {
 
         let dst_dir = TempDir::new()?;
         let dst_tm = TaskManager::new("RPC History Restored");
+        // v1: the persisted execution below is modelled with storage v1's tables (plain state and
+        // the database change sets). The floor itself is the env's, the same in both layouts.
         let (reth_config, db) = temp_config_and_db(chain, dst_dir.path())?;
+        let reth_config = reth_config.with_new_datadir_layout(crate::StorageLayout::V1);
         let restorer = SnapshotRestorer::open(&reth_config, db.clone(), &dst_tm)?;
         restorer.import_chain_scaffold(&window, final_state)?;
         let mut pack = ExecStatePackReader::open(pack_dir.path())?;
