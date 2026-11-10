@@ -23,6 +23,7 @@ tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
+fixed-cache = { workspace = true }
 
 # TN takes reth's individual crates, not the `reth` umbrella crate (see the root
 # `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded

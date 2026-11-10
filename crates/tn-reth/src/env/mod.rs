@@ -52,6 +52,7 @@ use crate::{
 
 pub(crate) mod database;
 mod epoch;
+mod exec_cache;
 mod execution;
 // The fixtures are tn-lmdb datadirs, and storage v2 runs on the tn-lmdb build only.
 #[cfg(all(test, not(feature = "mdbx")))]
@@ -64,6 +65,7 @@ mod output_overlay;
 mod persist_bench;
 mod rpc;
 
+pub use exec_cache::ExecutionCacheStats;
 pub use layout::StorageLayout;
 pub use output_overlay::OutputTrieOverlay;
 
@@ -112,6 +114,10 @@ struct RethEnvInner {
     /// Built once and shared by every worker's RPC server (`get_rpc_server`), so all lanes use
     /// one ordered target list, one connection pool per target and one metrics set.
     tx_forwarder: Option<Arc<TxForwarder>>,
+    /// The cross-block execution cache between block builds (`env/exec_cache.rs`): checked out
+    /// by each block build and saved back, anchored at the built block's hash, only when the
+    /// build succeeds.
+    execution_cache: parking_lot::Mutex<exec_cache::ExecutionCacheSlot>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -223,6 +229,7 @@ impl RethEnv {
                 task_spawner,
                 restored_state_floor,
                 tx_forwarder,
+                execution_cache: parking_lot::Mutex::new(exec_cache::ExecutionCacheSlot::new()),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
