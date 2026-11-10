@@ -374,8 +374,12 @@ where
     /// downstream work (#1772). A failed check returns an error and leaves the ticket pending, so
     /// the caller settles it with `PendingGossip::settle_error`. Gossip that cannot be verified, or
     /// that is a duplicate, returns `Ok(())` with the ticket pending, and dropping the ticket
-    /// reports `Ignore`. A certificate this node already holds or verified recently, or one
-    /// below the GC round, is ignored before the aggregate check and is never forwarded.
+    /// reports `Ignore`. A certificate for an earlier epoch is ignored before any verification.
+    /// Observers and ExEx get those certificates through epoch-pack sync. A certificate this node
+    /// already holds or verified recently, or one below the GC round, is ignored before the
+    /// aggregate check and is never forwarded. Only a current-epoch certificate whose aggregate
+    /// fails is a fault. A next-epoch certificate that fails is ignored, because the provisional
+    /// next committee can differ from the committee that signed it.
     pub(crate) async fn process_gossip_with(
         &self,
         msg: &GossipMessage,
@@ -399,13 +403,28 @@ where
                 cert.validate_received().map_err(CertManagerError::from)?;
 
                 let epoch = cert.header().epoch();
-                // Cheap known-certificate check before the aggregate verify (#1772 review).
-                // A replay of a certificate this node already holds or verified recently, or
-                // one below the GC round, returns with the ticket pending, so it reports Ignore
-                // and is not forwarded. It is never accepted here: the digest covers the
-                // header, not the signature.
-                let digest = cert.digest();
                 let current_epoch = self.consensus_config.committee().epoch();
+                // A certificate for an earlier epoch is ignored before any verification. The
+                // ticket stays pending, so it reports Ignore, is not forwarded and charges no
+                // peer. Observers and ExEx get earlier-epoch certificates through epoch-pack sync.
+                if epoch < current_epoch {
+                    debug!(
+                        target: "primary",
+                        epoch,
+                        current_epoch,
+                        "certificate for an earlier epoch, ignoring"
+                    );
+                    return Ok(());
+                }
+                // Cheap known-certificate check before the aggregate verify (#1772 review).
+                // Only current and later epochs reach it. A replay of a certificate this node
+                // already holds or verified recently, or one below the GC round, returns with
+                // the ticket pending, so it reports Ignore and is not forwarded. It is never
+                // accepted here: the digest covers the header, not the signature. After this
+                // check only a current-epoch certificate whose aggregate fails is a fault. A
+                // next-epoch failure is ignored, because the provisional next committee can
+                // differ from the committee that signed it.
+                let digest = cert.digest();
                 let known_in_epoch = epoch == current_epoch
                     && (cert.round() < self.gc_round()
                         || matches!(
@@ -452,10 +471,21 @@ where
                             }
                         }
                         Err(e) => {
-                            warn!(target: "primary", "Recieved invalid cert {e}");
-                            // A failed aggregate is the author's fault: the caller reports Reject
-                            // and charges the author (#1772).
-                            return Err(CertManagerError::from(e).into());
+                            // A failed aggregate in the current epoch is the author's fault: the
+                            // caller reports Reject and charges the author (#1772).
+                            if epoch == current_epoch {
+                                warn!(target: "primary", "Recieved invalid cert {e}");
+                                return Err(CertManagerError::from(e).into());
+                            }
+                            // The next committee is provisional until its epoch starts, so it can
+                            // differ from the committee that signed. Ignore with no charge.
+                            debug!(
+                                target: "primary",
+                                %e,
+                                epoch,
+                                "next-epoch certificate failed against the provisional committee, ignoring"
+                            );
+                            return Ok(());
                         }
                     }
                 } else {

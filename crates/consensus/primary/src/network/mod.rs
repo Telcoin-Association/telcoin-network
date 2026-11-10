@@ -156,9 +156,12 @@ pub const MAX_PENDING_GOSSIP_PER_PEER: usize = 4;
 
 /// How long this node ignores gossip from an author after its first strike in an epoch (#1772).
 ///
-/// A strike is a provable author content fault with a fatal penalty, for example a certificate
-/// from a resolved author whose aggregate signature fails. The gossipsub envelope is signed, so
-/// the author is accountable. Each further strike in the epoch doubles the hold, up to
+/// A strike is a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]), for
+/// example a certificate whose aggregate signature fails. It counts only for a frame that the
+/// author delivered itself while the ticket was pending (see [`gossip_author_to_strike`]). A
+/// forged certificate is dropped at the first hop and honest nodes never relay it, so the
+/// forger's own delivery is still struck. The gossipsub envelope is signed, so the author is
+/// accountable. Each further strike in the epoch doubles the hold, up to
 /// [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
 ///
 /// The peer manager exempts committee keys from every penalty (`docs/src/network/peers.md`, test
@@ -196,8 +199,11 @@ pub(crate) enum GossipSlot {
 /// A message takes a slot keyed by its author when the author is resolved, else by its relayer.
 /// Gossip with neither identity resolved shares one bucket with the same cap.
 ///
-/// An author struck for a fatal author content fault gets no slot for a cooldown that starts at
+/// An author struck for a fault of the strike class
+/// ([`PrimaryNetworkError::strikes_gossip_author`]) gets no slot for a cooldown that starts at
 /// [`GOSSIP_AUTHOR_COOLDOWN_BASE`] and doubles per strike up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+/// The strike applies only to a frame that the author delivered itself while the ticket was
+/// pending (see [`gossip_author_to_strike`]).
 #[derive(Clone, Debug)]
 pub(crate) struct GossipSlots {
     /// Slots keyed by the author or relayer BLS key.
@@ -263,7 +269,11 @@ impl GossipSlots {
         )
     }
 
-    /// Strike `author` for a fatal author content fault (#1772).
+    /// Strike `author` for a fault of the strike class on its own delivery (#1772).
+    ///
+    /// The caller picks the author with [`gossip_author_to_strike`]: the fault is one where
+    /// [`PrimaryNetworkError::strikes_gossip_author`] holds, and the author delivered the frame
+    /// itself while the ticket was pending.
     ///
     /// Its gossip gets no slot for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubled for each earlier
     /// strike in this epoch, up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
@@ -298,6 +308,23 @@ impl GossipSlots {
     ) -> Option<PendingGossip> {
         self.take(author, relayer).map(|slot| PendingGossip::new(validation, slot))
     }
+}
+
+/// The author that a failed gossip message strikes, if any (#1772).
+///
+/// This is the same by-author rule that the network layer applies on its reject path
+/// (GHSA-vw36): any peer that once held the frame can deliver it again. The author is struck
+/// only for a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]) on a
+/// frame that the author delivered itself while the ticket was pending. A relayed forged frame
+/// is still rejected and never forwarded, but it strikes no one. A frame whose ticket was
+/// already settled (a fault after Accept) strikes no one.
+pub(crate) fn gossip_author_to_strike(
+    e: &PrimaryNetworkError,
+    was_pending: bool,
+    author: Option<BlsPublicKey>,
+    relayer: Option<BlsPublicKey>,
+) -> Option<BlsPublicKey> {
+    author.filter(|a| was_pending && relayer == Some(*a) && e.strikes_gossip_author())
 }
 
 /// One gossip message in signature verification: its verdict ticket and its slot (#1772).
@@ -2481,7 +2508,8 @@ where
     /// only signed messages from committee members, and certificates signed by a quorum of the
     /// committee, reach it.
     ///
-    /// A fatal author content fault also strikes the author in [`GossipSlots`]: that author's
+    /// A fault of the strike class on a frame that the author delivered itself also strikes the
+    /// author in [`GossipSlots`] (see [`gossip_author_to_strike`]): that author's
     /// gossip is ignored for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubling per strike up to
     /// [`GOSSIP_AUTHOR_COOLDOWN_MAX`], because the peer manager exempts committee keys from
     /// penalties and the cooldown is the cost the author pays.
@@ -2509,9 +2537,24 @@ where
                 self.task_spawner.spawn_task(task_name, async move {
                     if let Err(e) = request_handler.process_gossip_with(&msg, &mut pending).await {
                         warn!(target: "primary::network", ?e, "process_gossip");
+                        // Read before the settle, which consumes the ticket.
+                        let was_pending = pending.is_pending();
                         // Report Reject for an author content fault while the ticket is pending.
                         // Any other error drops the ticket, which reports Ignore (#1772).
                         pending.settle_error(&e).await;
+                        // The peer manager exempts committee keys from every penalty, so a fault
+                        // of the strike class on the author's own delivery also cools down the
+                        // author's gossip here. A relayed frame strikes no one (GHSA-vw36).
+                        gossip_author_to_strike(&e, was_pending, author, relayer)
+                            .into_iter()
+                            .for_each(|struck| {
+                                gossip_slots.strike(struck);
+                                debug!(
+                                    target: "primary::network",
+                                    author = %struck,
+                                    "author content fault on the author's own delivery, cooling down the author's gossip"
+                                );
+                            });
                         // Charge the accountable peer, and only once its BLS identity has resolved.
                         // A content-determined fault (malformed payload /
                         // mis-topic) is the message author's: the network
@@ -2522,17 +2565,7 @@ where
                         // peer's, as before. `zip` skips the penalty when that peer is unresolved
                         // or the error carries no penalty.
                         let charged = if e.is_author_content_fault() { author } else { relayer };
-                        if let Some((peer, penalty)) = charged.zip((&e).into()) {
-                            // The peer manager exempts committee keys from every penalty, so a
-                            // fatal author fault also cools down the author's gossip here.
-                            if e.is_author_content_fault() && matches!(penalty, Penalty::Fatal) {
-                                gossip_slots.strike(peer);
-                                debug!(
-                                    target: "primary::network",
-                                    author = %peer,
-                                    "fatal author fault, cooling down the author's gossip"
-                                );
-                            }
+                        if let Some((peer, penalty)) = charged.zip(Option::<Penalty>::from(&e)) {
                             network_handle.report_penalty(peer, penalty).await;
                         }
                         Err(e.into())
@@ -2741,14 +2774,16 @@ mod clip_peer_error_tests {
 #[cfg(test)]
 mod sync_admission_tests {
     use super::{
-        admit_and_serve_sync_stream, opening_read_bound, write_frame, GossipSlots,
-        PrimaryNetworkError, PrimaryNetworkHandle, Req, Res, ServeHoldLimit, SyncAdmission,
-        SyncClass, SyncFrame, SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
-        COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
-        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_GOSSIP_PER_PEER, MAX_PENDING_REQUESTS_PER_PEER,
-        MAX_SYNC_REQUEST_FRAME_SIZE, PUBLIC_EPOCH_PACK_SERVE_TIMEOUT,
-        PUBLIC_SYNC_REQUEST_READ_TIMEOUT, SYNC_REQUEST_READ_TIMEOUT,
+        admit_and_serve_sync_stream, gossip_author_to_strike, opening_read_bound, write_frame,
+        GossipSlots, PrimaryNetworkError, PrimaryNetworkHandle, Req, Res, ServeHoldLimit,
+        SyncAdmission, SyncClass, SyncFrame, SyncServeOutcome, SyncServePools,
+        COMMITTEE_RESERVED_OPENING_READS, COMMITTEE_RESERVED_SYNC_STREAMS,
+        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONCURRENT_OPENING_READS, MAX_PENDING_GOSSIP_PER_PEER,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
+        PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
+        SYNC_REQUEST_READ_TIMEOUT,
     };
+    use crate::error::CertManagerError;
     use futures::{io::Cursor, AsyncRead, AsyncWrite, StreamExt as _};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
@@ -2766,7 +2801,9 @@ mod sync_admission_tests {
         types::NetworkCommand, PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers,
         ReservedPool,
     };
-    use tn_types::{BlsKeypair, BlsPublicKey};
+    use tn_types::{
+        error::CertificateError, BlsKeypair, BlsPublicKey, ConsensusHeaderDigest, HeaderDigest,
+    };
     use tokio::{sync::mpsc, task::JoinHandle};
 
     /// Every serve class.
@@ -3215,6 +3252,37 @@ mod sync_admission_tests {
         // more strikes stop at the cap
         (0..5).for_each(|_| slots.strike_at(key(1), t0 + s(30)));
         assert_eq!(slots.cooldown_until(&key(1)), Some(t0 + s(30) + s(160)));
+    }
+
+    /// Only the author's own delivery of a pending frame strikes the author, and only for a fault
+    /// of the strike class. A relayed frame, an unresolved relayer and a settled ticket strike no
+    /// one (#1772, GHSA-vw36).
+    #[test]
+    fn gossip_author_strike_needs_own_pending_delivery() {
+        let (author, relayer) = (key(40), key(41));
+        let strike = |e: &PrimaryNetworkError, was_pending: bool, from: Option<BlsPublicKey>| {
+            gossip_author_to_strike(e, was_pending, Some(author), from)
+        };
+        let forged = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::InvalidSignature,
+        ));
+        // own delivery
+        assert_eq!(strike(&forged, true, Some(author)), Some(author));
+        // relayed
+        assert_eq!(strike(&forged, true, Some(relayer)), None);
+        // unresolved relayer
+        assert_eq!(strike(&forged, true, None), None);
+        // already settled
+        assert_eq!(strike(&forged, false, Some(author)), None);
+        // a consensus result with a bad signature strikes, though its penalty is mild
+        let forged_result =
+            PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default());
+        assert_eq!(strike(&forged_result, true, Some(author)), Some(author));
+        // a mild certificate fault does not strike
+        let too_old = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::TooOld(HeaderDigest::default(), 1, 2),
+        ));
+        assert_eq!(strike(&too_old, true, Some(author)), None);
     }
 
     /// Silent streams hold only the opening-read budget, and only until the opening read for

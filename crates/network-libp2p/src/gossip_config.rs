@@ -133,8 +133,12 @@ pub(crate) const GOSSIP_MAX_IHAVE_IDS: usize =
 ///
 /// With `validate_messages()`, gossipsub keeps an unvalidated message in its message cache for
 /// this many heartbeats and forwards it only after an accept verdict. A deferred verdict (issue
-/// #1772) can land after the primary's epoch gap. 12 heartbeats at 1 s hold a message for
-/// about 12 s, against the library default of 5. `history_gossip` stays at the library default
+/// #1772) can land after the primary's epoch gap. In a gap the primary event queue holds only
+/// epoch votes (#1786), so the window covers the verdicts of the epoch votes held through the gap.
+/// Certificate and consensus-output gossip that arrives in a gap is shed, its ticket reports
+/// `Ignore`, and this node does not relay it. The author's flood publish and the committee dials
+/// still deliver it to the committee. 12 heartbeats at 1 s hold a message for about 12 s, against
+/// the library default of 5. `history_gossip` stays at the library default
 /// of 3, so each `IHAVE` still lists the ids of the last three heartbeats. The message cache
 /// cost is linear in this value: the cache holds the message bodies of that many heartbeats.
 pub(crate) const GOSSIP_HISTORY_LENGTH: usize = 12;

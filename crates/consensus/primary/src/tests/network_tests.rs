@@ -3,6 +3,7 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
+        gossip_author_to_strike,
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
         try_admit_epoch_record, try_admit_shed, GossipSlots, MissingCertificatesRequest,
         PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
@@ -4220,6 +4221,113 @@ async fn unknown_committee_certificate_ignores_without_penalty() {
         next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
         "a ticket dropped without a verdict must report Ignore"
     );
+}
+
+/// A certificate for an earlier epoch is ignored before any verification: the handler returns
+/// `Ok(())` with the ticket pending, so no peer is charged, and the dropped ticket reports
+/// Ignore. Its aggregate does not verify, so a verify would have returned an error (#1772).
+#[tokio::test]
+async fn earlier_epoch_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types_at_epoch(temp_dir.path(), 1).await;
+    // A second committee at epoch 0 signs with keys that the handler's committee does not hold.
+    let earlier = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let cert = earlier.certificate(&earlier.header_from_last_authority());
+    assert_eq!(cert.epoch(), 0, "the certificate must be for an earlier epoch than the handler's");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("earlier-epoch");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an earlier-epoch certificate is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "an earlier-epoch certificate must not get a verdict");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "an earlier-epoch certificate must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A consensus result with a bad signature from a committee key is an author content fault of
+/// the strike class. Its penalty stays Mild, its ticket reports Reject, and the author's own
+/// delivery strikes the author (#1772).
+#[tokio::test]
+async fn forged_consensus_result_strikes_its_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let auth = committee.first_authority();
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let key = key_config.public_key();
+    // The committee key signs another hash, so the signature does not cover the gossiped result.
+    let other_hash = ConsensusHeaderDigest::from(B256::random());
+    let signed = ConsensusResult::digest_data(epoch, round, number, other_hash);
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(signed)));
+    let result = ConsensusResult { epoch, round, number, hash, validator: key, signature };
+    let topic =
+        TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    let (validation, mut verdicts) = gossip_ticket("forged-consensus-result");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a forged consensus result must strike: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Mild)),
+        "a forged consensus result keeps its mild penalty: {err:?}"
+    );
+    assert_eq!(gossip_author_to_strike(&err, true, Some(key), Some(key)), Some(key));
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    slots.strike(key);
+    assert!(slots.take(Some(key), None).is_none(), "a struck author must be cooled down");
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a forged consensus result must report Reject"
+    );
+}
+
+/// A relayed forged certificate strikes no one, because any peer that once held the frame can
+/// deliver it again. The author's own delivery of the same frame strikes the author (#1772,
+/// GHSA-vw36).
+#[tokio::test]
+async fn relayed_forged_certificate_does_not_strike_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("relayed-bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a bad aggregate must strike: {err:?}");
+
+    let author = other.last_authority().primary_public_key();
+    let relayer = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, relayer, "the fixture committee has more than one authority");
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    // relayed: the frame is rejected, but no one is struck
+    assert_eq!(gossip_author_to_strike(&err, true, Some(author), Some(relayer)), None);
+    assert!(slots.take(Some(author), None).is_some(), "a relayed frame must not strike its author");
+    // own delivery: the author is struck
+    let struck = gossip_author_to_strike(&err, true, Some(author), Some(author));
+    assert_eq!(struck, Some(author));
+    struck.into_iter().for_each(|a| slots.strike(a));
+    assert!(slots.take(Some(author), None).is_none(), "the author's own delivery must strike it");
 }
 
 /// With MAX_PENDING_GOSSIP_PER_PEER messages from one author in verification, the next message
