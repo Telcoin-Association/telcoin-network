@@ -140,7 +140,11 @@ pub(crate) struct RethEnvMetrics {
     /// Counted at recovery: in the bytes build per block, before the builder is set up (a build
     /// that then fails still counts its drops), and in `recover_output_signers` per consensus
     /// output, which the engine runs when the output is queued, ahead of its blocks (an output
-    /// dropped from the queue at shutdown and replayed after a restart counts twice).
+    /// dropped from the queue at shutdown and replayed after a restart counts twice). Counting
+    /// ahead of the blocks also counts drops for blocks never built: an output dropped from the
+    /// queue unexecuted (the max-round return, or an earlier output's execution error) has
+    /// already counted its drops, and when one of an output's blocks fails, the counter already
+    /// holds the drops of the batches after it.
     ///
     /// Alert on any nonzero value. A certified sub-DAG is fixed and identical on every honest
     /// node, so an unrecoverable transaction is dropped rather than halting the network (see
