@@ -1692,14 +1692,40 @@ mod tests {
         }
     }
 
-    /// TN(TN-0120): pins what the open-time heal does to committed rows. Its prune-direction
-    /// arms trust the offsets file's length and its final offset: an offsets file one row short,
-    /// or a final offset past the data, cuts committed rows and rewrites the configuration,
-    /// without an error, in a checksummed jar too (the heal reads no value, so no checksum sees
-    /// it). The rows it keeps stay framed and verify. The cut leaves the static files behind the
-    /// database's stage checkpoints, which TN refuses at startup.
+    /// The data, offsets and configuration files of the jar at `path`.
+    fn jar_files(path: &Path) -> [Vec<u8>; 3] {
+        [
+            std::fs::read(path).unwrap(),
+            std::fs::read(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap(),
+            std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap(),
+        ]
+    }
+
+    /// Writes `files` ([`jar_files`]) as the jar at `path`.
+    fn write_jar_files(path: &Path, files: &[Vec<u8>; 3]) {
+        std::fs::write(path, &files[0]).unwrap();
+        std::fs::write(path.with_extension(OFFSETS_FILE_EXTENSION), &files[1]).unwrap();
+        std::fs::write(path.with_extension(CONFIG_FILE_EXTENSION), &files[2]).unwrap();
+    }
+
+    /// Freezes `col1` and `col2` into a jar at `path`, checksummed if `checksums`.
+    fn freeze_version(path: &Path, col1: &ColumnValues, col2: &ColumnValues, checksums: bool) {
+        if checksums {
+            freeze_checksummed(path, col1, col2, false);
+        } else {
+            NippyJar::new_without_header(2, path)
+                .freeze(vec![clone_with_result(col1), clone_with_result(col2)], col1.len() as u64)
+                .unwrap();
+        }
+    }
+
+    /// TN(TN-0130): files shorter than their configuration's committed rows: one row's offsets
+    /// missing, or a final offset past the data (one flipped high bit). A prune commits the
+    /// configuration before it cuts the files, so in a checksummed jar this is damage: the open
+    /// fails and every file is left as it was. A plain jar keeps upstream's heal, which cuts the
+    /// row, since it may hold an interrupted prune of an older build (which cut the files first).
     #[test]
-    fn test_heal_cuts_committed_rows_by_offsets_alone() {
+    fn test_heal_of_files_shorter_than_the_config() {
         let (col1, col2) = test_data(Some(15));
         let rows = col1.len();
         let damages: [fn(&Path); 2] = [
@@ -1716,15 +1742,88 @@ mod tests {
                 flip_byte(&offsets, len - 1, 0x80);
             },
         ];
-        for damage in damages {
-            let file = tempfile::NamedTempFile::new().unwrap();
-            freeze_checksummed(file.path(), &col1, &col2, false);
-            damage(file.path());
-            drop(NippyJarWriter::new(NippyJar::load_without_header(file.path()).unwrap()).unwrap());
+        for (damage, file) in damages.into_iter().zip(["offsets", "data"]) {
+            // Checksummed: refused, nothing cut.
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, true);
+            damage(jar.path());
+            let damaged = jar_files(jar.path());
+            let err = NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&err, NippyJarError::CommittedRowsMissing { path, file: short }
+                    if path == jar.path() && *short == file),
+                "{err}"
+            );
+            assert_eq!(jar_files(jar.path()), damaged);
 
-            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            // Plain: upstream's heal cuts the row, and the rows it keeps read.
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, false);
+            damage(jar.path());
+            drop(NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap());
+            let nippy = NippyJar::load_without_header(jar.path()).unwrap();
             assert_eq!(nippy.rows, rows - 1);
-            assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+            let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+            for row in 0..rows - 1 {
+                let values = cursor.row_by_number(row).unwrap().unwrap();
+                assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
+            }
+        }
+    }
+
+    /// TN(TN-0130): a prune stopped at any point leaves a state the next open heals to either the
+    /// jar before the prune or the finished prune, byte for byte, in both formats. A prune whose
+    /// configuration cannot be written (a directory where its temporary file goes) has cut
+    /// nothing; the configuration written but no file cut yet, or only the offsets cut, heals to
+    /// the finished prune. Fails if a prune cuts a file before it commits the configuration.
+    #[test]
+    fn test_interrupted_prune_heals_at_every_point() {
+        let (col1, col2) = test_data(Some(16));
+        let rows = col1.len();
+        for checksums in [false, true] {
+            for prune in [1, 3, rows] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                let before = jar_files(path);
+
+                // The configuration cannot be written: the prune fails, nothing is cut.
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                let blocker = path.with_extension("tmp");
+                std::fs::create_dir(&blocker).unwrap();
+                assert!(writer.prune_rows(prune).is_err());
+                drop(writer);
+                std::fs::remove_dir(&blocker).unwrap();
+                drop(NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap());
+                assert_eq!(jar_files(path), before, "checksums {checksums}, prune {prune}");
+
+                // The finished prune.
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                writer.prune_rows(prune + 1).unwrap();
+                drop(writer);
+                let after = jar_files(path);
+                assert_jar_rows(path, &col1, &col2, rows - prune);
+
+                // Stopped after the configuration, before any cut; and after the offsets cut.
+                let [data, offsets, config] = after.clone();
+                for stopped in [
+                    [before[0].clone(), before[1].clone(), config.clone()],
+                    [before[0].clone(), offsets.clone(), config.clone()],
+                ] {
+                    write_jar_files(path, &stopped);
+                    drop(
+                        NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap(),
+                    );
+                    assert_eq!(jar_files(path), after, "checksums {checksums}, prune {prune}");
+                }
+                assert_eq!(data, after[0]);
+                assert!(read_all_rows(path).iter().all(Result::is_ok));
+            }
         }
     }
 

@@ -264,6 +264,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     }
 
     /// Prunes rows from data and offsets file and updates its configuration on disk
+    ///
+    /// TN(TN-0130): the configuration with the new row count is committed before either file
+    /// shrinks, so a prune stopped part way leaves files longer than their configuration: an
+    /// uncommitted tail, which the open-time heal cuts as it cuts an interrupted append. Files
+    /// shorter than their configuration are then damage, which a checksummed jar's heal refuses
+    /// ([`NippyJarChecker`]). A finished prune leaves the files it left before.
     pub fn prune_rows(&mut self, num_rows: usize) -> Result<(), NippyJarError> {
         self.dirty = true;
 
@@ -277,14 +283,18 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         let offsets_prune_count = num_offsets.min(self.offsets.len().saturating_sub(1)); // last element is the expected size of the data file
         let remaining_to_prune = num_offsets.saturating_sub(offsets_prune_count);
 
+        // TN(TN-0130): the lengths the files are cut to once the configuration is committed.
+        let mut data_len = None;
+        let mut offsets_len = None;
+
         // Prune in-memory offsets if needed
         if offsets_prune_count > 0 {
             // Determine new length based on the offset to prune up to
             let new_len = self.offsets[(self.offsets.len() - 1) - offsets_prune_count]; // last element is the expected size of the data file
             self.offsets.truncate(self.offsets.len() - offsets_prune_count);
 
-            // Truncate the data file to the new length
-            self.data_file.get_mut().set_len(new_len)?;
+            // The data file is cut to the new length
+            data_len = Some(new_len);
         }
 
         // Prune from on-disk offset list if there are still rows left to prune
@@ -314,8 +324,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
                     // file size = 0). This maintains the same structure as when
                     // a file is initially created.
                     // See `NippyJarWriter::create_or_open_files` for the initial file format.
-                    self.offsets_file.get_mut().set_len(1 + OFFSET_SIZE_BYTES as u64)?;
-                    self.data_file.get_mut().set_len(0)?;
+                    offsets_len = Some(1 + OFFSET_SIZE_BYTES as u64);
+                    data_len = Some(0);
                 } else {
                     // Calculate the new length for the on-disk offset list
                     let new_len = 1 + new_num_offsets * OFFSET_SIZE_BYTES as u64;
@@ -327,9 +337,9 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
                     self.offsets_file.get_ref().read_exact(&mut last_offset)?;
                     let last_offset = u64::from_le_bytes(last_offset);
 
-                    // Update the lengths of both the offsets and data files
-                    self.offsets_file.get_mut().set_len(new_len)?;
-                    self.data_file.get_mut().set_len(last_offset)?;
+                    // The lengths of both the offsets and data files
+                    offsets_len = Some(new_len);
+                    data_len = Some(last_offset);
                 }
             } else {
                 return Err(NippyJarError::InvalidPruning(0, remaining_to_prune as u64))
@@ -338,27 +348,37 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
         if remaining_to_prune > 0 {
             // Every uncommitted row was pruned, so the remaining in-memory offset (the previous
-            // data file end) is stale: the on-disk prune shrank the data file below it.
+            // data file end) is stale: the on-disk prune shrinks the data file below it.
             self.offsets.clear();
         } else {
             // The config written below counts the uncommitted rows that were not pruned, so their
-            // offsets must be on disk too. If we crash before the config is written, the offsets
-            // file is longer than the config expects and the checker heals it as an interrupted
-            // append.
+            // offsets and data must be on disk first. If we crash before the config is written,
+            // the offsets file is longer than the config expects and the checker heals it as an
+            // interrupted append.
             self.commit_offsets_inner()?;
+            reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+            reth_fs_util::fsync_file(self.data_file.get_ref())?;
         }
-
-        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
-        reth_fs_util::fsync_file(self.data_file.get_ref())?;
-
-        self.offsets_file.seek(SeekFrom::End(0))?;
-        self.data_file.seek(SeekFrom::End(0))?;
 
         self.jar.rows = self.jar.rows.saturating_sub(num_rows);
         if self.jar.rows == 0 {
             self.jar.max_row_size = 0;
         }
         self.jar.freeze_config()?;
+
+        // TN(TN-0130): the files shrink only now, after the configuration that no longer counts
+        // the pruned rows.
+        if let Some(len) = offsets_len {
+            self.offsets_file.get_mut().set_len(len)?;
+        }
+        if let Some(len) = data_len {
+            self.data_file.get_mut().set_len(len)?;
+        }
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
+
+        self.offsets_file.seek(SeekFrom::End(0))?;
+        self.data_file.seek(SeekFrom::End(0))?;
 
         Ok(())
     }

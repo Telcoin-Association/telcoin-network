@@ -29,9 +29,9 @@ use std::{
 };
 
 /// Changes a block holds in each changeset segment.
-const CHANGES: u64 = 5;
+pub(super) const CHANGES: u64 = 5;
 
-fn provider(
+pub(super) fn provider(
     dir: &Path,
     checksums: bool,
     blocks_per_file: u64,
@@ -43,7 +43,7 @@ fn provider(
         .unwrap()
 }
 
-fn address(block: u64, change: u64) -> Address {
+pub(super) fn address(block: u64, change: u64) -> Address {
     Address::from(U160::from(block * 1_000 + change + 1))
 }
 
@@ -51,7 +51,7 @@ fn slot(change: u64) -> B256 {
     B256::with_last_byte(change as u8 + 1)
 }
 
-fn account_changes(block: u64) -> Vec<AccountBeforeTx> {
+pub(super) fn account_changes(block: u64) -> Vec<AccountBeforeTx> {
     (0..CHANGES)
         .map(|change| AccountBeforeTx {
             address: address(block, change),
@@ -71,7 +71,10 @@ fn storage_changes(block: u64) -> Vec<StorageBeforeTx> {
 }
 
 /// Appends both changeset segments' blocks `blocks`.
-fn write_changesets(provider: &StaticFileProvider<EthPrimitives>, blocks: std::ops::Range<u64>) {
+pub(super) fn write_changesets(
+    provider: &StaticFileProvider<EthPrimitives>,
+    blocks: std::ops::Range<u64>,
+) {
     let mut accounts = provider.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
     for block in blocks.clone() {
         accounts.append_account_changeset(account_changes(block), block).unwrap();
@@ -120,7 +123,7 @@ fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u6
 }
 
 /// The data file of `segment`'s jar holding `block`.
-fn jar_path(
+pub(super) fn jar_path(
     provider: &StaticFileProvider<EthPrimitives>,
     segment: StaticFileSegment,
     block: u64,
@@ -128,7 +131,7 @@ fn jar_path(
     provider.directory().join(segment.filename(&provider.find_fixed_range(segment, block)))
 }
 
-fn load(path: &Path) -> NippyJar<SegmentHeader> {
+pub(super) fn load(path: &Path) -> NippyJar<SegmentHeader> {
     NippyJar::<SegmentHeader>::load(path).unwrap()
 }
 
@@ -364,7 +367,7 @@ fn checksummed_sidecar_heal() {
     );
 }
 
-fn provider_rw(dir: &Path) -> StaticFileProvider<EthPrimitives> {
+pub(super) fn provider_rw(dir: &Path) -> StaticFileProvider<EthPrimitives> {
     StaticFileProviderBuilder::read_write(dir).with_blocks_per_file(1_000).build().unwrap()
 }
 

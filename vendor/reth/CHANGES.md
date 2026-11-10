@@ -973,12 +973,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   size and implementation; aarch64 M1 Max: crc32fast 4-9 ns from 20 to 176 B). Mutation-checked:
   no verification in the cursor, no row in the seed, no configuration check, a wrong row index in
   the writer. *Upstream*: maybe (a format change upstream would want behind its own version).
-  `test_heal_cuts_committed_rows_by_offsets_alone` pins a gap the checksums do not close: the
-  open-time heal's prune-direction arms (`consistency.rs`) trust the offsets file's length and
-  final offset, so an offsets file one row short, or a flipped high bit in the final offset, cuts
-  a committed row and rewrites the configuration without an error. The static files then lag the
-  database's stage checkpoints, which TN refuses at startup, so it fails closed, but destructively;
-  left for a separate decision (`tn/notes/open-issues.md`).
+  The checksums alone did not close one gap: the open-time heal's prune-direction arms
+  (`consistency.rs`) trusted the offsets file's length and final offset, so an offsets file one
+  row short, or a flipped high bit in the final offset, cut a committed row and rewrote the
+  configuration without an error. TN-0130 refuses that in checksummed jars.
 
 - **TN-0121** — Checksummed `.csoff` records, and the changeset read paths fail closed on
   damage. *Kind*: feature (storage integrity) and fix (static-file read paths).
@@ -1089,3 +1087,39 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   intact row of another key: the checksum error, never that row; real misses stay `None`; fails
   without the rerun), and every changeset lookup test of the crate (TN-0045, TN-0115, TN-0123).
   *Upstream*: maybe (the raw probe; the rerun needs TN-0120).
+
+- **TN-0130** — A prune commits its configuration before it shrinks a file, and a checksummed
+  jar shorter than its configuration is refused. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, consistency.rs, error.rs, lib.rs}`
+  (`NippyJarWriter::prune_rows`, the checker's prune-direction arms,
+  `NippyJarError::CommittedRowsMissing`, tests),
+  `crates/storage/provider/src/providers/static_file/{writer.rs, mod.rs, tn_checksum_tests.rs,
+  tn_crash_tests.rs (new)}` (`truncate_changesets`, `heal_changeset_sidecar`; tests).
+  *Why*: a prune cut the data and offsets files (and the provider the `.csoff` sidecar) first and
+  wrote the shrunk `.conf` last, so an interrupted prune and a damaged file left the same state,
+  files shorter than the `.conf` counts, and the open-time heal had to cut committed rows to match
+  whatever the files held, damage included. Now `prune_rows` writes the `.conf` with the new row
+  count (durably, `atomic_write_file`) before it cuts either file, and `truncate_changesets` gives
+  the segment header its final form (block range, `changeset_offsets_len`) before `prune_rows`
+  writes it and commits before it cuts the sidecar. A prune stopped at any point leaves files
+  longer than the `.conf`, an uncommitted tail, which the existing append-direction heal cuts.
+  In a checksummed jar (TN-0120, version 2) files shorter than the `.conf` are then damage: the
+  checker returns `CommittedRowsMissing` (offsets missing, or a final offset past the data) and
+  cuts nothing, and the sidecar heal returns `CorruptedChangeSetStaticFile` for a sidecar shorter
+  than the header or a committed record past the rows. Version-1 jars keep upstream's heal,
+  since they may hold an interrupted prune of an older build. A finished prune writes the files
+  it wrote before, byte for byte, in both versions (checked: eight prune and commit steps, both
+  versions, all files identical to the old order), so version-1 datadirs are unchanged and an
+  older build opens a jar this one pruned, finished or interrupted. Not reachable on TN's write
+  path: TN never prunes at runtime; the prunes are the startup checkpoint heal's and `db
+  reset-execution`'s. It cannot reach execution: the values stored and read are unchanged.
+  *Tests*: `test_heal_of_files_shorter_than_the_config` (both damages: checksummed refused with
+  every file unchanged, plain healed as before), `test_interrupted_prune_heals_at_every_point`
+  (prunes of 1, 3 and every row with an uncommitted row, both versions: a failed `.conf` write
+  cuts nothing; stopped after the `.conf`, or after the offsets cut, heals to the finished prune
+  byte for byte), `changeset_prune_commits_the_header_before_it_cuts` (the same for a changeset
+  prune through the provider, of rows and of blocks without changes, so the sidecar alone
+  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (rows cut by an older
+  build's order, a sidecar one record short, a sidecar gone). Mutation-checked: the `.conf`
+  written after the cuts, the sidecar cut before the commit, each of the three refusals removed.
+  *Upstream*: maybe (the order is an upstream bug; the refusal needs TN-0120's versions).

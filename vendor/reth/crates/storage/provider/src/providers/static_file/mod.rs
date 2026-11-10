@@ -24,6 +24,8 @@ pub use sync_stats::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 #[cfg(test)]
 mod tn_checksum_tests;
 #[cfg(test)]
+mod tn_crash_tests;
+#[cfg(test)]
 mod writer_tests;
 
 use reth_nippy_jar::NippyJar;
