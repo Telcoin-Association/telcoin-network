@@ -98,6 +98,12 @@ const REFUSAL_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// while no build is in flight and no refusal backoff holds the gate. After a failed or empty
 /// build, arrivals arm nothing until the next tick or a mined batch, so a retry keeps the tick
 /// cadence and peers that just rejected a batch are not asked again one fill delay later.
+///
+/// An admission into any subpool arms it, so a queued (nonce-gap) or parked arrival does too;
+/// when that delay expires with nothing pending, the loop pushes the tick out by one period.
+/// This cannot strand a transaction: an idle builder pushes the tick out only while nothing is
+/// pending, so a transaction that becomes pending is built on the next wake at an open gate,
+/// one tick later at the latest.
 const BATCH_WAKE_FILL_DELAY: Duration = Duration::from_millis(40);
 
 /// Live refusal-backoff state, present exactly while the last seal attempt was refused.
@@ -666,17 +672,20 @@ impl BatchBuilder {
                     failed_hold = false;
                 }
 
-                // the fill delay armed by an arrival has passed: build what landed meanwhile
+                // the fill delay armed by an arrival has passed: build whatever is pending by now,
+                // which may be nothing if only queued or parked transactions arrived
                 Some(()) = OptionFuture::from(self.fill_delay.as_mut()), if self.fill_delay.is_some() => {
                     self.fill_delay = None;
                     wake = WakeSource::Arrival;
                 }
 
-                // a transaction entered the pool; polled while a build is in flight too, so the
-                // pool's bounded listener channel never fills, and drained so a burst is one wake
+                // a transaction entered any subpool (pending, queued or parked); polled while a
+                // build is in flight too, so the pool's bounded listener channel never fills, and
+                // drained so a burst is one wake
                 Some(()) = self.arrivals.0.next() => {
                     self.arrivals.drain();
-                    // the build waits for the fill delay so the rest of a burst lands in it
+                    // every admission defers, pending or not: the build waits for the fill delay
+                    // so the rest of a burst lands in it
                     defer_build = true;
                     // arm only at an idle, open gate: one batch in flight per worker, a live
                     // refusal backoff keeps its own cadence (issue #1145) and a failed or empty
