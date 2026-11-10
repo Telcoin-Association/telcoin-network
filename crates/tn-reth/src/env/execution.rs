@@ -17,7 +17,9 @@
 //! database transaction with the current block's deltas layered over the overlay.
 //! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
 //! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
-//! cost bound. All other state reads still resolve through reth's memory overlay.
+//! cost bound. All other state reads go through the cross-block execution cache
+//! (`exec_cache.rs`: values at the parent block, kept across blocks and outputs) and, on a miss,
+//! reth's memory overlay.
 //!
 //! # Deliberate transaction drops (fork safety)
 //!
@@ -84,6 +86,7 @@ use crate::{
 };
 
 use super::{
+    exec_cache::CachedStateProvider,
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
     RethEnv,
 };
@@ -118,7 +121,7 @@ impl RethEnv {
     /// cursors: current block's sorted deltas over the accumulated overlay over the
     /// database, prefix sets from the current block only (see
     /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
-    /// still resolve through reth's memory overlay, unchanged.
+    /// go through the cross-block execution cache, then reth's memory overlay on a miss.
     ///
     /// For `N` blocks with at most `M` delta entries each, sorting remains
     /// `O(M log M)` per block. Equal-level sorted runs compact with cumulative
@@ -138,10 +141,16 @@ impl RethEnv {
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
+        let parent_hash = parent_header.hash();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(parent_hash)?;
+        // Cross-block read cache (`env/exec_cache.rs`): the saved cache when it is anchored at
+        // this block's parent, else an empty one. Checked out for the whole build and checked in
+        // only at the end of a successful one, so any error below drops it. The state root keeps
+        // the plain provider: it reads the trie, not values.
+        let exec_cache = self.check_out_execution_cache(parent_hash);
+        let cached_provider = CachedStateProvider::new(&state_provider, &exec_cache);
+        let state = StateProviderDatabase::new(&cached_provider);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
@@ -252,6 +261,9 @@ impl RethEnv {
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
             BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+        // end the build's borrows of the execution cache before it is checked in below
+        drop(db);
+        let block_hash = block.hash();
         let (sorted_hashed_state, sorted_trie_updates) =
             rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
         let computed_trie_data = ComputedTrieData::without_trie_input(
@@ -264,6 +276,9 @@ impl RethEnv {
         // `ComputedTrieData`, so nothing is recomputed.
         overlay.extend_from_block(&computed_trie_data);
         RETH_METRICS.block_overlay_extend_seconds.record(finish_ended.elapsed());
+        // The bundle the cache takes is the one persistence writes (`save_blocks` reads
+        // `execution_output.state`); last step, after everything fallible.
+        self.check_in_execution_cache(exec_cache, block_hash, &block_execution_output.state);
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
@@ -325,6 +340,13 @@ impl RethEnv {
     /// boundary is a function boundary rather than an error-classification exercise
     /// (issue #1090).
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
+        // The cache is anchored at the last built block, whose state the failed commit did not
+        // make durable; the blocks are rebuilt or the node stops, so start the next build empty.
+        self.persist_blocks(blocks).inspect_err(|_| self.clear_execution_cache())
+    }
+
+    /// The body of [`Self::persist_executed_output`], with its error contract.
+    fn persist_blocks(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(feature = "test-utils", test))]

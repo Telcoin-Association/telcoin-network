@@ -10128,6 +10128,7 @@ dependencies = [
  "dirs-next",
  "enr",
  "eyre",
+ "fixed-cache",
  "futures",
  "jsonrpsee",
  "metrics",
