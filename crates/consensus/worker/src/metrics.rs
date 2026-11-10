@@ -77,6 +77,9 @@ struct WorkerMetricHandles {
     batch_report_retries_total: Counter,
     /// Batches received from peers that failed validation.
     batch_validation_failures_total: Counter,
+    /// Reported batches refused because the reporter is at its bound of uncommitted stored
+    /// batches (issue #1794).
+    batch_reports_over_quota_total: Counter,
     /// Time to fetch all missing batches for a consensus output.
     batch_fetch_duration_seconds: Histogram,
 }
@@ -141,6 +144,12 @@ impl WorkerMetrics {
     /// Record a peer batch that failed validation.
     pub(crate) fn record_batch_validation_failure(&self) {
         self.handles.batch_validation_failures_total.increment(1);
+    }
+
+    /// Record a reported batch refused because the reporter is at its bound of uncommitted
+    /// stored batches.
+    pub(crate) fn record_batch_report_over_quota(&self) {
+        self.handles.batch_reports_over_quota_total.increment(1);
     }
 
     /// Record batches recovered while fetching payloads for the primary.
@@ -214,6 +223,7 @@ mod tests {
             metrics.record_quorum_failure(&QuorumWaiterError::Timeout);
             metrics.record_batch_report_retry();
             metrics.record_batch_validation_failure();
+            metrics.record_batch_report_over_quota();
             metrics.record_batches_fetched("local", 3);
             metrics.record_batches_fetched("remote", 0); // no-op, no series
             metrics.record_batch_fetch_duration(Duration::from_millis(80));
@@ -249,6 +259,7 @@ mod tests {
         find("tn_worker.quorum_wait_seconds");
         find("tn_worker.batch_report_retries_total");
         find("tn_worker.batch_validation_failures_total");
+        find("tn_worker.batch_reports_over_quota_total");
         find("tn_worker.batch_fetch_duration_seconds");
 
         let (key, _, _, value) = find("tn_worker.forwarded_txns_dropped_total");

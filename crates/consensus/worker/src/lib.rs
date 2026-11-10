@@ -16,7 +16,7 @@ pub mod quorum_waiter;
 pub use crate::{
     network::{
         error::WorkerNetworkError,
-        handler::RequestHandler,
+        handler::{RequestHandler, MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER},
         message::{WorkerGossip, WorkerRPCError},
     },
     worker::{new_worker, Worker, CHANNEL_CAPACITY},

@@ -123,7 +123,9 @@ impl WorkerResponse {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::StdIo(_) => {
+            | WorkerNetworkError::StdIo(_)
+            // the reporter is at its uncommitted-batch bound; commits free it (issue #1794)
+            | WorkerNetworkError::ReporterOverQuota { .. } => {
                 Self::RecoverableError(WorkerRPCError(error.to_string()))
             }
             // permanent rejections - an identical request would be rejected the
@@ -191,6 +193,21 @@ mod tests {
     #[test]
     fn transient_internal_error_is_recoverable() {
         let err = WorkerNetworkError::Internal("failed to write to batch store".to_string());
+        assert!(matches!(
+            WorkerResponse::into_error_ref(&err),
+            WorkerResponse::RecoverableError(_)
+        ));
+    }
+
+    /// A reporter at its bound of uncommitted stored batches is a transient condition
+    /// (commits free the bound), so the requester must retry instead of treating the
+    /// refusal as a rejection (issue #1794).
+    #[test]
+    fn reporter_over_quota_is_recoverable() {
+        let err = WorkerNetworkError::ReporterOverQuota {
+            peer: tn_types::BlsPublicKey::default(),
+            digest: tn_types::B256::ZERO,
+        };
         assert!(matches!(
             WorkerResponse::into_error_ref(&err),
             WorkerResponse::RecoverableError(_)

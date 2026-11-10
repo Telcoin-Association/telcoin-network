@@ -53,8 +53,9 @@ pub struct BatchValidator {
     ///
     /// The transaction hash covers the signature bytes, so one hash has one validity. The batch
     /// beneficiary is not validated, so a peer can resend the same signed transactions under a
-    /// fresh digest. The cache lets each resend skip recovery. The node builds a new validator
-    /// for each epoch, so the cache lives for one epoch. Clones share the cache.
+    /// fresh digest. The cache lets each resend skip recovery. The worker bounds the stored
+    /// copies per reporter (issue #1794). The node builds a new validator for each epoch, so the
+    /// cache lives for one epoch. Clones share the cache.
     verified_signatures: Arc<Mutex<LruCache<TxHash, ()>>>,
     /// Count of the signer recoveries that this validator performed.
     ///

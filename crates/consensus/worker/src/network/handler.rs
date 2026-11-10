@@ -13,7 +13,7 @@ use futures::AsyncWriteExt as _;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
     time::Duration,
@@ -56,6 +56,24 @@ pub(crate) const SEND_STREAM_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// oldest one, and a later repeat of the dropped digest is validated again.
 pub(crate) const REJECTED_BATCH_DIGESTS_CAPACITY: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1023);
+
+/// Maximum number of reported batches from one committee reporter that this worker keeps in
+/// [`NodeBatchesCache`] while they are not yet committed (issue #1794).
+///
+/// The value is the product of two protocol ceilings, [`tn_types::MAX_GC_DEPTH`] (50 rounds) and
+/// [`tn_types::MAX_HEADER_NUM_OF_BATCHES`] (10 batches per header): one author's headers
+/// reference at most that many batches per round, and a certificate older than the
+/// garbage-collection depth leaves the DAG, so an honest reporter never has more than this many
+/// batches between its report and the commit that evicts them from the cache. These are the same
+/// two ceilings the consensus-pack reader derives its reconstruction bound from
+/// (`Parameters::validate` in `crates/config/src/node.rs`). The unit test
+/// `reporter_quota_matches_protocol_ceilings` ties the literal to the ceilings.
+///
+/// Without this bound, one committee key (exempt from peer scoring) can store distinct valid
+/// batches on every peer until the disk is full: the batch beneficiary is not validated, so every
+/// copy of the same signed transactions gets a fresh digest, and rows leave the cache only when a
+/// commit evicts them or the epoch closes.
+pub const MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER: usize = 500;
 
 /// Whether a batch validation failure proves that the batch body itself is invalid.
 ///
@@ -171,6 +189,19 @@ pub struct RequestHandler<DB> {
     /// into a later epoch. It is shared across clones through `Arc` and holds at most
     /// [`REJECTED_BATCH_DIGESTS_CAPACITY`] digests.
     rejected_batches: Arc<Mutex<LruCache<B256, ()>>>,
+    /// Digests of reported batches that this worker stored for each committee reporter and that
+    /// may still be uncommitted (issue #1794).
+    ///
+    /// [`Self::process_report_batch`] refuses a new digest from a reporter whose set holds
+    /// [`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER`] digests that are still in
+    /// [`NodeBatchesCache`]. A commit evicts committed batches from the cache
+    /// (`evict_committed_batches` in `crates/node/src/manager/node/run_epoch.rs`), so a digest
+    /// that is no longer in the cache is dropped from the set the next time the reporter is at
+    /// the bound (see [`Self::admit_reported_batch`]). Only committee keys enter the map (the
+    /// committee check runs first), so the map holds at most committee size times the bound
+    /// digests. Like `rejected_batches` it is built once per epoch and shared across clones
+    /// through `Arc`.
+    reported_batches: Arc<Mutex<HashMap<BlsPublicKey, HashSet<B256>>>>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -194,6 +225,7 @@ where
             in_flight_prefetch: Arc::new(Mutex::new(HashSet::new())),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GOSSIP_PREFETCHES)),
             rejected_batches: Arc::new(Mutex::new(LruCache::new(REJECTED_BATCH_DIGESTS_CAPACITY))),
+            reported_batches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -384,8 +416,10 @@ where
     /// Without these checks, any committee member (through a bug or on purpose) can make every
     /// peer redo full validation for each repeat it sends, and a database write for each repeat
     /// of a valid batch, with no penalty, because committee members are exempt from peer
-    /// scoring. The checks cover exact repeats only. They do not limit a flood of distinct
-    /// batches.
+    /// scoring. The checks cover exact repeats only. Distinct batches are bounded per reporter: a
+    /// reporter with [`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER`] stored batches that are
+    /// not yet committed gets a retryable refusal until a commit evicts some of them (issue
+    /// #1794, see [`Self::admit_reported_batch`]).
     pub(super) async fn process_report_batch(
         &self,
         peer: &BlsPublicKey,
@@ -425,7 +459,11 @@ where
             // in this epoch is refused without validating it again
             let already_rejected = self.rejected_batches.lock().contains(&digest);
             ensure!(!already_rejected, WorkerNetworkError::RejectedBatchRepeat(digest));
-            self.validate_and_cache_reported_batch(sealed_batch)?;
+            // bound the uncommitted batches one reporter can store, before the validation and
+            // the store write (issue #1794); a batch that is not stored gives its slot back
+            self.admit_reported_batch(peer, digest)?;
+            self.validate_and_cache_reported_batch(sealed_batch)
+                .inspect_err(|_| self.release_reported_batch(peer, &digest))?;
         }
 
         // notify primary for payload store
@@ -435,6 +473,67 @@ where
             .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Count `digest` against the bound of uncommitted stored batches of `peer` (issue #1794).
+    ///
+    /// The digest joins the reporter's set in `reported_batches`. A digest already in the set is
+    /// admitted again at no cost: it was counted when it was first admitted. When the set holds
+    /// [`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER`] digests, the set is pruned first: a
+    /// digest that is no longer in [`NodeBatchesCache`] was evicted by a commit
+    /// (`evict_committed_batches` in `crates/node/src/manager/node/run_epoch.rs`) and no longer
+    /// counts. A store read error keeps the digest, which is the conservative side. The prune
+    /// runs only when the reporter is at the bound and costs at most the bound in store key
+    /// reads. The per-peer report slots (`MAX_PENDING_REQUESTS_PER_PEER` concurrent reports per
+    /// key, taken before this handler runs) bound how often one key can trigger it.
+    ///
+    /// Returns [`WorkerNetworkError::ReporterOverQuota`] when the pruned set is still at the
+    /// bound. The condition is transient (the quota frees as commits evict rows), so the
+    /// requester gets a retryable response and the reporter gets no penalty.
+    fn admit_reported_batch(&self, peer: &BlsPublicKey, digest: B256) -> WorkerNetworkResult<()> {
+        let mut ledger = self.reported_batches.lock();
+        let reported = ledger.entry(*peer).or_default();
+        let already_counted = reported.contains(&digest);
+        if !already_counted && reported.len() >= MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER {
+            // a commit evicted the committed batches from the cache: those no longer count
+            let store = self.consensus_config.node_storage();
+            reported.retain(|d| store.contains_key::<NodeBatchesCache>(d).unwrap_or(true));
+        }
+        let at_bound = reported.len() >= MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER;
+        match () {
+            () if already_counted => Ok(()),
+            () if at_bound => {
+                debug!(
+                    target: "worker:network",
+                    %peer,
+                    ?digest,
+                    bound = MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+                    "refusing a reported batch: the reporter is at its bound of uncommitted reported batches"
+                );
+                self.metrics.record_batch_report_over_quota();
+                Err(WorkerNetworkError::ReporterOverQuota { peer: *peer, digest })
+            }
+            () => {
+                reported.insert(digest);
+                Ok(())
+            }
+        }
+    }
+
+    /// Give back the slot that [`Self::admit_reported_batch`] took for `digest` from `peer`.
+    ///
+    /// Called when the admitted batch was not stored (a validation failure or a failed store
+    /// write), so such a batch consumes no quota. A set that becomes empty is removed, so the map
+    /// keeps no entry for a reporter with nothing stored.
+    fn release_reported_batch(&self, peer: &BlsPublicKey, digest: &B256) {
+        let mut ledger = self.reported_batches.lock();
+        let now_empty = ledger.get_mut(peer).is_some_and(|reported| {
+            reported.remove(digest);
+            reported.is_empty()
+        });
+        if now_empty {
+            ledger.remove(peer);
+        }
     }
 
     /// Validate a reported batch, then cache it with the time it was received.
@@ -592,6 +691,21 @@ where
         batch: &Batch,
     ) -> WorkerNetworkResult<()> {
         self.validate_and_cache_prefetched_batch(digest, batch)
+    }
+}
+
+#[cfg(test)]
+mod reporter_quota_tests {
+    use super::MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER;
+    use tn_types::{MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES};
+
+    /// The bound is the product of the two protocol ceilings. A change to either ceiling must
+    /// re-derive the bound (issue #1794).
+    #[test]
+    fn reporter_quota_matches_protocol_ceilings() {
+        let derived = usize::try_from(MAX_GC_DEPTH)
+            .map_or(0, |depth| depth.saturating_mul(MAX_HEADER_NUM_OF_BATCHES));
+        assert_eq!(MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER, derived);
     }
 }
 

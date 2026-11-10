@@ -1218,9 +1218,10 @@ fn epoch_tasks_ended(
 ///
 /// A latch is this node's own storage failing (a failed write or sync, a stopped writer, or damage
 /// a read found on disk): a peer's bad record is refused before it is written and latches nothing.
-/// One known exception predates tndb and is tracked separately: a committee member can flood
-/// distinct valid batches into [`NodeBatchesCache`], which keeps them until they are committed or
-/// the epoch closes, so the flood can fill the disk and latch the cache store. Without this, a
+/// A committee member that floods distinct valid batches into [`NodeBatchesCache`] is bounded by
+/// the worker before the write (`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER` uncommitted
+/// batches per reporter, issue #1794), so the flood cannot fill the disk and latch the cache
+/// store. Without this, a
 /// latched peer-record or batch-cache store would go unnoticed until the epoch ends (an observer's
 /// following stalls meanwhile).
 fn store_failure<DB: TNDatabase>(

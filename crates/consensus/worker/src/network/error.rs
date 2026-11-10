@@ -1,6 +1,6 @@
 //! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch, B256};
+use tn_types::{BatchValidationError, BcsError, BlockHash, BlsPublicKey, Epoch, B256};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -76,6 +76,19 @@ pub enum WorkerNetworkError {
     /// The worker refuses the repeat without validating it again (issue #1774).
     #[error("batch {0} was already rejected in this epoch")]
     RejectedBatchRepeat(B256),
+    /// A committee peer reported a new batch while this worker already stores its bound of
+    /// uncommitted reported batches (issue #1794).
+    ///
+    /// The bound is `MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER` in the request handler. The
+    /// condition clears as commits evict the reporter's batches from the cache, so the response
+    /// is retryable and there is no penalty.
+    #[error("reporter {peer} is at its bound of uncommitted reported batches, refusing {digest}")]
+    ReporterOverQuota {
+        /// The committee key that reported the batch.
+        peer: BlsPublicKey,
+        /// The digest of the refused batch.
+        digest: B256,
+    },
 }
 
 impl WorkerNetworkError {
@@ -140,6 +153,9 @@ impl WorkerNetworkError {
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
+            // transient: the reporter is at its uncommitted-batch bound, which clears as commits
+            // evict its batches, and an honest reporter can reach it during a commit stall
+            WorkerNetworkError::ReporterOverQuota { .. } => None,
         }
     }
 
@@ -193,7 +209,8 @@ impl WorkerNetworkError {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::BatchEpochMismatch(_, _) => false,
+            | WorkerNetworkError::BatchEpochMismatch(_, _)
+            | WorkerNetworkError::ReporterOverQuota { .. } => false,
         }
     }
 }

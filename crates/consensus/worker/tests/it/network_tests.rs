@@ -27,7 +27,7 @@ use tn_types::{
 };
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
-    WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS,
+    WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS, MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
 };
 use tokio::sync::mpsc;
 
@@ -852,4 +852,192 @@ async fn test_semaphore_exhaustion_denies_admission() {
         semaphore.clone().try_acquire_owned().is_err(),
         "semaphore should be exhausted after {MAX_CONCURRENT_BATCH_STREAMS} acquires"
     );
+}
+
+// ============================================================================
+// Reporter Quota Tests (issue #1794)
+// ============================================================================
+
+/// A batch with the default body and a beneficiary derived from `index`. The beneficiary is
+/// covered by the digest and never validated, so every index gives a distinct valid digest from
+/// the same transactions (the shape of the flood in issue #1794).
+fn distinct_batch(index: u64) -> Batch {
+    let bytes: Vec<u8> = [0u8; 12].into_iter().chain(index.to_be_bytes()).collect();
+    Batch { beneficiary: Address::from_slice(&bytes), ..Batch::default() }
+}
+
+/// The per-reporter bound as a batch index.
+fn reporter_quota() -> u64 {
+    u64::try_from(MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER).expect("bound fits in u64")
+}
+
+/// Report the distinct batches of `indices` from `reporter`, one after the other. Returns each
+/// digest with the outcome of its report, in order.
+async fn report_distinct_batches(
+    handler: &RequestHandler<MemDatabase>,
+    reporter: &BlsPublicKey,
+    indices: std::ops::Range<u64>,
+) -> Vec<(B256, Result<(), WorkerNetworkError>)> {
+    futures::stream::iter(indices)
+        .then(|index| async move {
+            let batch = distinct_batch(index);
+            let digest = batch.digest();
+            (digest, handler.pub_process_report_batch(reporter, batch.seal(digest)).await)
+        })
+        .collect()
+        .await
+}
+
+/// Assert that every report in `outcomes` was accepted.
+fn assert_all_accepted(outcomes: &[(B256, Result<(), WorkerNetworkError>)]) {
+    outcomes.iter().for_each(|(digest, outcome)| {
+        assert!(outcome.is_ok(), "batch {digest} must be accepted, got {outcome:?}");
+    });
+}
+
+/// A committee reporter at the bound of stored uncommitted batches gets its next distinct batch
+/// refused, and that batch is neither validated, stored nor acknowledged (issue #1794). The
+/// refusal carries no penalty. Without the bound the extra batch is accepted and stored, so this
+/// test fails.
+#[tokio::test]
+async fn test_report_batch_refuses_reporter_over_quota() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &reporter, 0..cap).await;
+    assert_all_accepted(&stored);
+
+    let extra = distinct_batch(cap);
+    let extra_digest = extra.digest();
+    let refused = handler.pub_process_report_batch(&reporter, extra.seal(extra_digest)).await;
+    let err = refused.expect_err("the batch over the bound must be refused");
+    assert!(
+        matches!(
+            &err,
+            WorkerNetworkError::ReporterOverQuota { peer, digest }
+                if *peer == reporter && *digest == extra_digest
+        ),
+        "expected the quota error, got {err:?}"
+    );
+    assert!(store.get::<NodeBatchesCache>(&extra_digest).expect("read store").is_none());
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+        "the refusal must happen before validation"
+    );
+    assert_eq!(
+        counters.others_reports.load(Ordering::SeqCst),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+        "a refused batch must not be acknowledged to the primary"
+    );
+    let penalty: Option<Penalty> = err.into();
+    assert!(penalty.is_none(), "the quota refusal must not penalize the reporter");
+}
+
+/// A commit evicts committed batches from the cache, and that frees the reporter's quota: after
+/// one stored digest leaves the cache, the next distinct batch is accepted and stored
+/// (issue #1794). If the bound counted digests that are no longer in the cache, the next batch
+/// would be refused, so this test fails.
+#[tokio::test]
+async fn test_report_batch_quota_frees_when_commit_evicts_a_batch() {
+    let (TestTypes { committee, handler, .. }, store, _counters) =
+        create_counting_test_types(Verdict::Accept);
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &reporter, 0..cap).await;
+    assert_all_accepted(&stored);
+    let (evicted, _) = stored.first().expect("the bound is at least one batch");
+    // what `evict_committed_batches` does for a committed batch
+    store.remove::<NodeBatchesCache>(evicted).expect("remove the committed batch");
+
+    let next = distinct_batch(cap);
+    let next_digest = next.digest();
+    let accepted = handler.pub_process_report_batch(&reporter, next.seal(next_digest)).await;
+    assert_matches!(accepted, Ok(()));
+    assert!(store.get::<NodeBatchesCache>(&next_digest).expect("read store").is_some());
+
+    // the freed slot is used up again, so one more distinct batch is refused
+    let over = distinct_batch(cap + 1);
+    let over_digest = over.digest();
+    let refused = handler.pub_process_report_batch(&reporter, over.seal(over_digest)).await;
+    assert_matches!(refused, Err(WorkerNetworkError::ReporterOverQuota { .. }));
+}
+
+/// The bound is per reporter: a second committee key reports while the first is at the bound
+/// (issue #1794). If the bound were shared, the second key's batch would be refused, so this test
+/// fails.
+#[tokio::test]
+async fn test_report_batch_quota_is_per_reporter() {
+    let (TestTypes { committee, handler, .. }, store, _counters) =
+        create_counting_test_types(Verdict::Accept);
+    let first_reporter = committee.first_authority().primary_public_key();
+    let second_reporter = committee.last_authority().primary_public_key();
+    assert!(first_reporter != second_reporter, "the fixture needs two committee keys");
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &first_reporter, 0..cap).await;
+    assert_all_accepted(&stored);
+
+    let batch = distinct_batch(cap);
+    let digest = batch.digest();
+    let accepted = handler.pub_process_report_batch(&second_reporter, batch.seal(digest)).await;
+    assert_matches!(accepted, Ok(()));
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_some());
+}
+
+/// A repeat of a digest the reporter already has in the cache is acknowledged without touching
+/// the bound (issues #1515 and #1794): the reporter at the bound still gets its repeat accepted,
+/// and the repeat is not validated again. If the bound were checked before the cache, the repeat
+/// would be refused, so this test fails.
+#[tokio::test]
+async fn test_report_batch_repeat_of_cached_digest_ignores_quota() {
+    let (TestTypes { committee, handler, .. }, _store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &reporter, 0..cap).await;
+    assert_all_accepted(&stored);
+
+    let repeat = distinct_batch(0);
+    let digest = repeat.digest();
+    let acknowledged = handler.pub_process_report_batch(&reporter, repeat.seal(digest)).await;
+    assert_matches!(acknowledged, Ok(()));
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+        "a repeat of a cached digest must not be validated again"
+    );
+    assert_eq!(
+        counters.others_reports.load(Ordering::SeqCst),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER + 1,
+        "the repeat must still be acknowledged"
+    );
+}
+
+/// An invalid batch consumes no quota: a reporter whose every batch is rejected never reaches the
+/// bound, so the report after the bound count is still refused for its body and not for the quota
+/// (issue #1794). Without the release on a validation failure the last report fails with the
+/// quota error, so this test fails.
+#[tokio::test]
+async fn test_report_batch_invalid_batch_consumes_no_quota() {
+    let (TestTypes { committee, handler, .. }, _store, counters) =
+        create_counting_test_types(Verdict::Reject);
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let outcomes = report_distinct_batches(&handler, &reporter, 0..cap + 1).await;
+    outcomes.iter().for_each(|(digest, outcome)| {
+        assert!(
+            matches!(
+                outcome,
+                Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+            ),
+            "batch {digest} must be refused for its body, got {outcome:?}"
+        );
+    });
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER + 1,
+        "every distinct invalid batch is validated"
+    );
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
 }
