@@ -750,3 +750,31 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the steps of the changeset lookup (jar, `.csoff` read, cursor, binary search). Every answer is
   compared between the passes and between the layouts. `#[ignore]`d (heavy, run with
   `--release`); test code only. *Upstream*: no.
+
+- **TN-0101** — `StaticFileProvider::update_index` loads the jar before it takes the index lock.
+  *Kind*: performance (static-file read path).
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (`update_index`, new
+  `prepare_index_update` and `PreparedIndexUpdate`; test
+  `growing_commit_waits_for_jar_readers_outside_the_index_lock`).
+  *Why*: `update_index`, which every static-file commit runs once per segment, held the write lock
+  of the segment index while it read the jar's configuration, mapped its data and offsets files,
+  opened its `.csoff`, inserted the jar into the cache (waiting for every reader of that cache
+  shard) and cleaned the cache with `DashMap::retain` (waiting for every reader of every shard).
+  Every static-file lookup of every segment takes that lock, so one reader holding a jar, such as
+  a range walk over receipts or headers, stalled all of them for as long as it held it; storage v2
+  routes each historical read that resolves to a changeset through it. Now the jar is loaded
+  before the lock; when the segment grows past the indexed tip it is published to the cache before
+  the lock too, and the stale jars above the new range are found under shared shard locks and
+  removed one by one. Publishing before the index is the state a jar loaded on a cache miss already
+  creates (TN-0051): lookups route by the index, which still ends at the old tip, and the new jar
+  holds every row the old one did. A shrinking or unchanged segment (unwind, prune) is still
+  published under the lock with the index, and if the index was re-initialized or the segment's
+  ranges moved since the load, the jar is reloaded under the lock as before. The index, the cached
+  jars and every byte read are the same once `update_index` returns, so this cannot reach
+  execution or what is written. *Tests*: `growing_commit_waits_for_jar_readers_outside_the_index_lock`
+  (a reader holds the headers jar, then another segment's, while a commit grows the headers: a
+  lookup from a third thread must not wait for it, and the new header must be readable after the
+  commit; it fails when the grown jar is published under the lock, and when the clean-up goes back
+  to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
+  effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
+  yes.
