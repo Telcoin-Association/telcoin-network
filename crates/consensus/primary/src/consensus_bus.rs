@@ -1453,9 +1453,18 @@ impl ConsensusBusApp {
     ///
     /// The executor's subscriber records each promotion of a catching-up CVV here before it flips
     /// the node mode; the network handler reads it to hold the activity-window demotion for
-    /// [`tn_types::REJOIN_DEMOTION_GRACE`] after a promotion. The network handler settles the
-    /// promotion when it demotes the node, and the subscriber settles it, if no demotion site did,
-    /// when it starts catching up again (see [`RejoinState::record_demotion`]).
+    /// [`tn_types::REJOIN_DEMOTION_GRACE`] after a promotion. The network handler, the consensus
+    /// task's restart-gap and commit-accounting checks, and the subscriber's execution fork check
+    /// each settle the promotion at the time of their demotion. The subscriber also settles it,
+    /// if no demotion site did, when its catch-up loop starts. For the execution fork and commit
+    /// accounting that loop starts only after the epoch's tasks restart, which can be past the
+    /// grace, so their own settle is what counts the failed promotion. The restart-gap check runs
+    /// before the subscriber starts in the same epoch run, so there the loop's entry would settle
+    /// it moments later, and the check's own settle only removes the dependence on when that loop
+    /// is first polled. The record veto in the node's `identify_node_mode`, which can make a
+    /// just-promoted node an inactive CVV when the epoch's tasks restart, does not settle the
+    /// promotion itself and relies on the loop's entry, which follows it in the same epoch run
+    /// (see [`RejoinState::record_demotion`]).
     pub fn rejoin_state(&self) -> &watch::Sender<RejoinState> {
         &self.inner.tx_rejoin_state
     }

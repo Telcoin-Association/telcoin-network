@@ -638,6 +638,15 @@ impl<DB: Database> Consensus<DB> {
                     NodeMode::CvvInactive,
                     ModeTransitionReason::RestartGap,
                 );
+                // settle the latest rejoin at this demotion's own time. `spawn` runs before the
+                // subscriber reads the node mode in this same epoch run, so the subscriber's
+                // catch-up loop settles it at its entry right after this anyway; settling here
+                // only removes the dependence on when that loop is first polled
+                let now = tokio::time::Instant::now();
+                consensus_bus
+                    .app()
+                    .rejoin_state()
+                    .send_if_modified(|state| state.record_demotion(current_epoch, now, false));
                 consensus_config.shutdown().notify();
                 return Ok(());
             }
@@ -828,6 +837,15 @@ impl<DB: Database> Consensus<DB> {
                         NodeMode::CvvInactive,
                         ModeTransitionReason::CommitAccounting,
                     );
+                    // settle the latest rejoin at this demotion's own time: the catch-up loop
+                    // that would otherwise settle it starts only after the epoch's tasks restart,
+                    // possibly past the grace
+                    let epoch = self.committee.epoch();
+                    let now = tokio::time::Instant::now();
+                    self.consensus_bus
+                        .app()
+                        .rejoin_state()
+                        .send_if_modified(|state| state.record_demotion(epoch, now, false));
                     self.consensus_config.shutdown().notify();
                 }
             }

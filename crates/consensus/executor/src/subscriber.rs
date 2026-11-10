@@ -458,8 +458,10 @@ impl<DB: Database> Subscriber<DB> {
         &self,
         mut rx_sync_output: impl TnReceiver<ConsensusOutput>,
     ) -> SubscriberResult<()> {
-        // every demotion restarts the epoch's tasks into this loop, so the latest promotion is
-        // settled here when the site that demoted the node did not settle it
+        // each demotion site settles the latest promotion at its own time, except the node's
+        // record veto when the epoch's tasks start, which this loop follows in the same epoch
+        // run. this settles it at the loop's entry for any demotion that did not; after a restart
+        // that entry can come past the grace, and then the promotion does not count
         let committee_epoch = self.inner.committee.epoch();
         let entry = tokio::time::Instant::now();
         self.consensus_bus
@@ -993,6 +995,14 @@ impl<DB: Database> Subscriber<DB> {
                             let previous =
                                 self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
                             self.consensus_bus.metrics().record_execution_fork_transition(previous);
+                            // settle the latest rejoin at this demotion's own time: the catch-up
+                            // loop that would otherwise settle it starts after the restart,
+                            // possibly past the grace
+                            let epoch = self.inner.committee.epoch();
+                            let now = tokio::time::Instant::now();
+                            self.consensus_bus
+                                .rejoin_state()
+                                .send_if_modified(|state| state.record_demotion(epoch, now, false));
                             self.config.shutdown().notify();
                             // not an error (that would fail this critical task) and not through
                             // the shutdown drain (that would save outputs past the fork)
@@ -2518,11 +2528,16 @@ mod tests {
 
         /// On a failed fork check `run` goes inactive, shuts the epoch down and returns `Ok`
         /// without saving the output: an `Err` would fail the critical task, and the shutdown
-        /// drain would save outputs past the fork.
+        /// drain would save outputs past the fork. A promotion before it is settled by the
+        /// demotion as a failed one.
         #[tokio::test]
         async fn run_returns_ok_after_execution_fork() {
             let (fixture, _temp_dir, chain, bus) = setup().await;
             let subscriber = sync_subscriber(&fixture, chain.clone(), &bus);
+            let epoch = subscriber.inner.committee.epoch();
+            bus.rejoin_state().send_modify(|state| {
+                state.record_promotion(epoch, tokio::time::Instant::now(), false)
+            });
             let epoch_shutdown =
                 fixture.authorities().next().unwrap().consensus_config().shutdown().subscribe();
             let (tx_sequence, rx_sequence) = mpsc::channel(4);
@@ -2543,6 +2558,11 @@ mod tests {
             assert!(bus.is_cvv_inactive(), "the node goes inactive");
             assert!(epoch_shutdown.noticed(), "the epoch shuts down");
             assert_eq!(chain.latest_consensus_number(), 0, "the forked output is not saved");
+            // settled at the demotion, inside the grace, so it counts toward the rejoin cap
+            // however late the catch-up loop starts
+            let rejoin = *bus.rejoin_state().borrow();
+            assert!(!rejoin.is_pending(epoch), "settled by the demotion, not by the catch-up loop");
+            assert_eq!(rejoin.attempts(epoch), 1, "a failed promotion");
         }
     }
 

@@ -1898,7 +1898,8 @@ async fn gate_releases_when_execution_advances() {
 }
 
 /// An active CVV whose restored DAG holds a certificate that ordering can still reach with a
-/// parent missing from the DAG goes inactive and starts no consensus task.
+/// parent missing from the DAG goes inactive and starts no consensus task. A promotion before the
+/// restart is settled by the demotion as a failed one.
 ///
 /// The pack committed leader C in a sub-dag that holds only the leader, so no other authority
 /// has a committed round, while the certificate store kept only the rounds from
@@ -1949,6 +1950,11 @@ async fn spawn_demotes_on_restored_dag_gap() {
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
     let cb = ConsensusBus::new();
+    // the restart is the one that follows a promotion
+    let epoch = config.epoch();
+    cb.app()
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(epoch, tokio::time::Instant::now(), false));
     let rx_shutdown = config.shutdown().subscribe();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
@@ -1957,6 +1963,11 @@ async fn spawn_demotes_on_restored_dag_gap() {
 
     assert!(cb.is_cvv_inactive(), "the node goes inactive");
     assert!(rx_shutdown.noticed(), "the epoch shuts down to restart in catch-up");
+    // the demotion settled the promotion at its own time, inside the grace, so it counts toward
+    // the rejoin cap however late the catch-up loop starts
+    let rejoin = *cb.app().rejoin_state().borrow();
+    assert!(!rejoin.is_pending(epoch), "settled by the demotion, not left to the catch-up loop");
+    assert_eq!(rejoin.attempts(epoch), 1, "a failed promotion");
     assert_eq!(
         cb.app().committed_round(),
         committed_round,
