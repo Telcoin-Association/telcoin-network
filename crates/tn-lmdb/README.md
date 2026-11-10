@@ -2677,11 +2677,12 @@ commits are not yet measured under the new rule (see
   `insert` (`KeyExists`); prefix steps; a cursor that rests on the follower after a delete, so a
   walk that deletes as it goes skips nothing; `KeyTail`; and the reth adapter,
   [`tn-lmdb-reth`](../tn-lmdb-reth/README.md).
-- **M3, TN's reth database:** TN runs its reth database on tn-lmdb behind the `tn-lmdb` feature,
-  migrating an MDBX one at its first open (`crates/tn-reth`'s README); dup tables as nested
-  trees with packed small sets ([Dup tables](#dup-tables)); leaf values inline up to half a page;
-  a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
-  tail ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
+- **M3, TN's reth database:** TN runs its reth database on tn-lmdb (behind a `tn-lmdb` feature
+  until it became the default backend, 2026-11-09), migrating an MDBX one at its first open
+  (`crates/tn-reth`'s README); dup tables as nested trees with packed small sets
+  ([Dup tables](#dup-tables)); leaf values inline up to half a page; a growth cap
+  (`EnvOptions::max_growth`) and a clean close that gives back the preallocated tail
+  ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
   which bound its growth and what a reboot loses, and weak metas (format version 6), so that a
   crash of the process alone loses no `NoSync` commit, trusted at open once the pages they name
   since the last sync pass a check (a volume lost in the same boot falls back to the last sync): it serves as an opt-in fast mode. On 2026-11-04 TN's reth execution bench on Linux (six load profiles,

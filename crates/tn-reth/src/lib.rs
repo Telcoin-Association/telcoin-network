@@ -169,7 +169,7 @@ pub use types::*;
 pub mod test_utils;
 
 // It compares the two layouts, and v2 runs on the tn-lmdb build only.
-#[cfg(all(test, feature = "tn-lmdb"))]
+#[cfg(all(test, not(feature = "mdbx")))]
 mod storage_layout_tests;
 
 /// True when this binary was compiled with the `faucet` cargo feature.

@@ -1,6 +1,6 @@
-//! The MDBX to tn-lmdb migration of TN's reth database, in the `tn-lmdb` build.
+//! The MDBX to tn-lmdb migration of TN's reth database, in the tn-lmdb (default) build.
 //!
-//! A node built with the `tn-lmdb` feature that finds an MDBX reth database (`<db>/mdbx.dat`)
+//! A node built without the `mdbx` feature that finds an MDBX reth database (`<db>/mdbx.dat`)
 //! moves it onto tn-lmdb when it first opens the database, before anything else reads the
 //! directory: the backend guard calls [`migrate_from_mdbx`]. The copy is raw: each of reth's
 //! tables is walked on MDBX as its encoded keys and compressed values (`RawTable`) and appended to

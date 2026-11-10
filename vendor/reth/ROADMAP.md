@@ -160,10 +160,12 @@ shellexpand, vergen-lib, and node-core itself). That is little build cost agains
 the CLI wiring operators depend on (`tn-reth/src/cli.rs`). Do the follow-up only when TN wants
 to own its configuration for its own sake.
 
-## Phase 3: tndb-b as the reth database [next; owned by the tndb-b work]
+## Phase 3: tn-lmdb as the reth database [in progress: the default backend since 2026-11-09]
 
-Vendoring lets the tndb-b work change reth's storage crates directly instead of working around
-them. Where MDBX is wired in (2026-10-30, at the 63-crate state):
+tn-lmdb was called tndb-b until 2026-11-04. It is TN's default reth backend since 2026-11-09
+(DECISIONS.md D22): every build runs reth on `tn_lmdb_reth::TnLmdbEnv`, and the opt-in `mdbx`
+feature of `tn-reth` selects MDBX, kept until testnet has resynced. Vendoring lets the tn-lmdb
+work change reth's storage crates directly instead of working around them. Where MDBX is wired in (2026-10-30, at the 63-crate state):
 
 - `reth-db`: `mdbx` is a default feature (`reth-libmdbx`, `page_size`, MDBX metrics).
 - Hard `reth-db/mdbx` enables: `reth-node-core` (its `DatabaseArgs` convert to MDBX's
@@ -172,18 +174,21 @@ them. Where MDBX is wired in (2026-10-30, at the 63-crate state):
   `providers/database/mod.rs` and `builder.rs` (`init_db`, `open_db_read_only`,
   `DatabaseArguments`), plus test utilities on `TempDatabase<DatabaseEnv>`.
 - TN's own MDBX users: `tn-storage` (feature `reth-libmdbx`, default on; the migration source
-  for TN's consensus DB) and `tndb-b-reth`'s differential tests (dev-dependency).
+  for TN's consensus DB), `tn-reth`'s MDBX to tn-lmdb migration of the reth database
+  (`src/env/database/migrate.rs`, which reads MDBX through `reth_db::mdbx`) and its opt-in `mdbx`
+  build, and `tn-lmdb-reth`'s differential tests (dev-dependency).
 
-Steps, once tndb-b is the default backend:
+Steps, now that tn-lmdb is the default backend, once testnet has resynced (MDBX and storage
+layout v1 go together then, DECISIONS.md D22):
 
 1. Gate the MDBX constructors and `impl` blocks in the vendored `reth-provider`,
    `reth-node-core` and `reth-db-common` behind an `mdbx` feature on each crate that forwards to
    `reth-db/mdbx`, and make `reth-db`'s default `[]`. TN enables `mdbx` only where it still needs
    it.
-2. When `tn-storage`'s MDBX migration path is retired, the `tndb-b` build stops compiling
-   `reth-mdbx-sys` (the C library) entirely. `vendor.py remove` `reth-libmdbx`/`reth-mdbx-sys`
+2. When `tn-storage`'s and `tn-reth`'s MDBX migration paths and the `mdbx` feature are retired,
+   TN's build stops compiling `reth-mdbx-sys` (the C library) entirely. `vendor.py remove` `reth-libmdbx`/`reth-mdbx-sys`
    only once no TN feature uses them.
-3. Decide whether static files (`reth-nippy-jar`, `StaticFileProvider`) stay or move into tndb-b.
+3. Decide whether static files (`reth-nippy-jar`, `StaticFileProvider`) stay or move into tn-lmdb.
 4. Keep the `reth_db_*` metric names, or change them together with the e2e tests and
    `tn-metrics` that assert on them.
 
@@ -209,7 +214,7 @@ Plan: drop the stub types and the field and parameters from the provider factory
 `EitherWriter`/`EitherReader` to their database and static-file arms; remove `storage_v2`'s RocksDB
 routing and `rocksdb_path`; adjust `check_consistency`'s return type and TN's call sites. This
 changes compiled storage code (state and history writes), so it needs the full test suite and the
-e2e restart/epoch suites. Coordinate with the tndb-b work: `EitherWriter` is where reth abstracts
+e2e restart/epoch suites. Coordinate with the tn-lmdb work: `EitherWriter` is where reth abstracts
 storage backends. Verify by running `etc/rocksdb-gate.sh` and grepping for `[Rr]ocks` (only
 CHANGES.md and DECISIONS.md should remain).
 
@@ -291,7 +296,7 @@ Left, with the reason:
   default) over removal for now; removal is up to a team review, and
   `crates/tn-reth/js-tracer.md` lists its steps. Native tracers (`callTracer`, `prestateTracer`,
   ...) work in both builds.
-- After the tndb-b work: notify and its helpers (5 packages; the read-only static-file watcher,
+- After MDBX is retired: notify and its helpers (5 packages; the read-only static-file watcher,
   whose switch runs through the MDBX `ProviderFactoryBuilder`), sysinfo (reth-db's storage-lock
   liveness check), and parity-scale-codec and modular-bitfield (on-disk encodings).
 - Not worth it: shellexpand and dirs (path expansion in operator-facing flags), reth-tracing's

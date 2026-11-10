@@ -315,3 +315,18 @@ builds. `crates/tn-reth/js-tracer.md` covers what the feature does, why it is of
 on, and the steps for removing it entirely. Measured on macOS arm64, a stripped release binary
 is 7.9 MB smaller without the feature (54.8 MB against 62.7 MB), and a clean release build takes
 about as long (1m50s against 1m54s on 16 cores).
+
+## D22. tn-lmdb is the default reth backend; MDBX is opt-in until testnet resyncs
+
+User decision, 2026-11-09 (storage v2 for the mainnet freeze): mainnet launches on tn-lmdb (the
+engine called tndb-b until 2026-11-04, `crates/tn-lmdb`, through `crates/tn-lmdb-reth`), in storage
+layout v2. TN's `tn-lmdb` feature, which selected it, is inverted: every build runs reth's
+database on `tn_lmdb_reth::TnLmdbEnv`, and an opt-in `mdbx` feature on `tn-reth` (forwarded by
+`tn-node`, `telcoin-network-cli` and `telcoin-network`) selects MDBX instead. MDBX stays because
+the default build migrates an MDBX datadir at its first open (`tn-reth`'s
+`src/env/database/migrate.rs` reads it through `reth_db::mdbx`), and its build keeps the legacy
+path under test (`./etc/ci-lanes.sh test-mdbx`) and serves as the previous binary of the migration
+e2e lanes. v2 refuses MDBX. MDBX and layout v1 are removed together, the vendored MDBX code
+included (ROADMAP.md, Phase 3), once testnet has resynced. No vendored file changed: reth's
+crates were already generic over the database on every path TN uses, and `reth-db`'s `mdbx`
+feature stays on, enabled by `reth-node-core`, `reth-db-common` and `reth-provider`.

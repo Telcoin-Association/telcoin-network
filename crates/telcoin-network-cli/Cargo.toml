@@ -92,5 +92,6 @@ workspace = true
 test-utils = ["tn-config/test-utils"]
 # Adiri testnet: propagate to the node graph + this crate's directly-gated fork logic.
 adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
-# Run the reth execution database on tn-lmdb: propagate to the node graph.
-tn-lmdb = ["tn-node/tn-lmdb", "tn-reth/tn-lmdb"]
+# Run the reth execution database on MDBX, the legacy backend, instead of the default tn-lmdb:
+# propagate to the node graph.
+mdbx = ["tn-node/mdbx", "tn-reth/mdbx"]

@@ -7,10 +7,11 @@ five dup-sort tables, the state tables are the engine's dup tables (each key's f
 its outer cell, more in a nested tree of their own) and the changesets composite keys in plain
 engine tables.
 
-**Status: pre-production.** TN uses it behind the off-by-default `tn-lmdb` feature of `tn-reth`
-(forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`), which runs TN's reth
-execution database on `TnLmdbEnv` instead of MDBX; the default build is still MDBX. A `tn-lmdb`
-build migrates an MDBX reth database onto `TnLmdbEnv` at its first open (every table copied raw by
+**Status: TN's default reth backend** (since 2026-11-09; mainnet launches on it). Every TN build
+runs its reth execution database on `TnLmdbEnv`, unless the opt-in `mdbx` feature of `tn-reth`
+(forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`) selects MDBX, the legacy
+backend kept until testnet has resynced. The default build migrates an MDBX reth database onto
+`TnLmdbEnv` at its first open (every table copied raw by
 appends and verified, with `TnLmdbEnv::sync` and `TnLmdbEnv::check`, before MDBX's files are removed).
 `tn-reth`'s README ("Database backend") covers the open path, the backend guard, the migration
 and how reth's `--db.*` flags map onto `TnLmdbArgs`. The adapter's comparison against MDBX on

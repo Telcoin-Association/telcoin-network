@@ -121,7 +121,7 @@ fi
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
-./etc/ci-lanes.sh test-tn-lmdb
+./etc/ci-lanes.sh test-mdbx
 ./etc/ci-lanes.sh test-vendor-reth
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at

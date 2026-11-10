@@ -8,9 +8,9 @@
 //!     --ignored --exact exec_bench --nocapture
 //! ```
 //!
-//! Add `--features tn-reth/tn-lmdb` to run the tn-lmdb backend. Run it with `--exact`: it installs
-//! the process's global metrics recorder, and a test that opened a reth env first in the same
-//! process would leave reth's metric handles bound to no recorder.
+//! It runs the default backend, tn-lmdb; add `--features tn-reth/mdbx` to run MDBX. Run it with
+//! `--exact`: it installs the process's global metrics recorder, and a test that opened a reth env
+//! first in the same process would leave reth's metric handles bound to no recorder.
 //!
 //! **Phases.**
 //!

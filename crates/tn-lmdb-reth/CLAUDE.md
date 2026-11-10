@@ -6,9 +6,9 @@ as reth's MDBX ones do and report MDBX's error codes, so reth's code and its MDB
 unchanged. Of reth's five dup-sort tables, the state tables (`PlainStorageState`,
 `HashedStorages`, `StoragesTrie`) are the engine's dup tables, each key's few rows packed in its
 outer cell (`DupOptions::packed`), more in a nested tree, and the changesets are composite keys
-(`key ‖ subkey`) in plain engine tables. It is pre-production: TN uses it behind the
-off-by-default `tn-lmdb` feature of `tn-reth` (`crates/tn-reth/src/env/database.rs` holds every
-backend difference). This is the only crate that depends on both reth and the engine; the engine
+(`key ‖ subkey`) in plain engine tables. It is TN's default reth backend: every TN build runs on
+it unless `tn-reth`'s opt-in `mdbx` feature selects the legacy MDBX backend
+(`crates/tn-reth/src/env/database.rs` holds every backend difference). This is the only crate that depends on both reth and the engine; the engine
 depends on neither reth nor `tn-storage`.
 
 **Read in this order:**
