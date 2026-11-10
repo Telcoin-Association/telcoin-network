@@ -195,7 +195,7 @@ fn stalled_head_ready(
 /// of the usual rule do not delay it: they have their own cap, and a halt should not wait for them.
 fn stalled_head_stall_needed(stalled_failures: u32) -> Duration {
     let backoff = 1_u32.checked_shl(stalled_failures).unwrap_or(u32::MAX);
-    tn_types::REJOIN_STALLED_HEAD_AFTER * backoff.min(REJOIN_STALLED_HEAD_MAX_BACKOFF)
+    tn_types::REJOIN_STALLED_HEAD_AFTER.saturating_mul(backoff.min(REJOIN_STALLED_HEAD_MAX_BACKOFF))
 }
 
 /// True when a stalled consensus head may promote this node in `current_epoch`.
