@@ -275,7 +275,8 @@ impl SyncServeOutcome {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::BatchEpochMismatch(..) => Self::Failed,
+            | WorkerNetworkError::BatchEpochMismatch(..)
+            | WorkerNetworkError::ReporterOverQuota { .. } => Self::Failed,
         }
     }
 }
