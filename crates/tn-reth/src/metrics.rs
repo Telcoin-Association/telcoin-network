@@ -7,7 +7,9 @@
 //! certified batch carried a transaction whose signer could not be recovered) and
 //! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
 //! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
-//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics.
+//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics. A third series,
+//! `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked hits of the cross-block
+//! execution cache that differed from the parent state.
 //!
 //! Six histograms in the same group time the stages of each block that function builds, one
 //! sample per block each: `tn_reth.block_execute_seconds` (with
@@ -162,6 +164,14 @@ pub(crate) struct RethEnvMetrics {
     /// issues #933 / #938); reaching that path at all means a batch carrying undecodable
     /// transaction bytes was certified, i.e. batch validation was bypassed somewhere upstream.
     pub(crate) unrecoverable_txs_dropped_total: Counter,
+
+    /// Checked hits of the cross-block execution cache that differed from the parent state.
+    ///
+    /// Alert on any nonzero value. One hit of each kind in `CHECK_ONE_HIT_IN` is re-read from
+    /// the parent state (`env/exec_cache.rs`); a stale one means an invariant of the cache failed.
+    /// The block is built again without the cache, so this node still builds the right block, but
+    /// unchecked stale hits of earlier blocks may already have forked it from its peers.
+    pub(crate) exec_cache_stale_hits_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
     ///

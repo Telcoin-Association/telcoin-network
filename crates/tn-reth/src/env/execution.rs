@@ -69,9 +69,9 @@ use reth_evm::{
 };
 use reth_provider::{
     BlockExecutionOutput, CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProviderFactory as _,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory as _,
 };
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::BundleState, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
     deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
@@ -86,10 +86,21 @@ use crate::{
 };
 
 use super::{
-    exec_cache::CachedStateProvider,
+    exec_cache::{CachedStateProvider, ExecutionCache},
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
     RethEnv,
 };
+
+/// A payload executed and finished by `RethEnv::execute_payload`, not yet sealed into an
+/// [`ExecutedBlock`].
+struct ExecutedPayload {
+    /// The block, its execution result and its state and trie deltas.
+    outcome: BlockBuilderOutcome<TNPrimitives>,
+    /// The block's bundle: the state persistence writes and the cache takes.
+    bundle: BundleState,
+    /// When `finish` returned: the start of the overlay-extend stage.
+    finish_ended: Instant,
+}
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -134,23 +145,84 @@ impl RethEnv {
     /// Callers that persist every block before building the next (tests, e2e helpers)
     /// pass a fresh empty overlay per block: the database then already holds the
     /// parent state, so the empty overlay is exact.
+    ///
+    /// # Stale cache hits
+    ///
+    /// When a checked hit of the execution cache differs from the parent state
+    /// (`env/exec_cache.rs`, "Checks"), the attempt is discarded before it touches
+    /// `overlay`, the whole cache is dropped, and the block is built once more without a
+    /// cache, so the returned block is the one a node without the cache builds. That
+    /// rebuild reads no cache, so it cannot see a stale hit; one would be a bug and fails
+    /// the build. The rebuilt block's stage timings and transaction drop counters are recorded
+    /// a second time.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
-        let parent_header = payload.parent_header.clone();
-        let parent_hash = parent_header.hash();
-        debug!(target: "engine", ?parent_header, "retrieving state for next block");
+        let parent_hash = payload.parent_header.hash();
+        debug!(target: "engine", parent_header = ?payload.parent_header, "retrieving state for next block");
         let state_provider = self.inner.blockchain_provider.state_by_block_hash(parent_hash)?;
         // Cross-block read cache (`env/exec_cache.rs`): the saved cache when it is anchored at
         // this block's parent, else an empty one. Checked out for the whole build and checked in
-        // only at the end of a successful one, so any error below drops it. The state root keeps
-        // the plain provider: it reads the trie, not values.
+        // only at the end of a successful one, so any error below drops it (its code table
+        // kept). The state root keeps the plain provider: it reads the trie, not values.
         let exec_cache = self.check_out_execution_cache(parent_hash);
-        let cached_provider = CachedStateProvider::new(&state_provider, &exec_cache);
-        let state = StateProviderDatabase::new(&cached_provider);
+        let cached_provider = CachedStateProvider::new(&state_provider, exec_cache.as_ref());
+        let executed = self.execute_payload(
+            payload.clone(),
+            transactions,
+            &state_provider,
+            &cached_provider,
+            overlay,
+        );
+        if !cached_provider.served_stale() {
+            return match executed {
+                Ok(executed) => Ok(self.seal_executed_payload(executed, overlay, exec_cache)),
+                Err(err) => {
+                    // a failed attempt says nothing against `keccak256(code) -> code`
+                    if let Some(cache) = exec_cache {
+                        self.keep_execution_cache_code(cache);
+                    }
+                    Err(err)
+                }
+            };
+        }
+
+        // A checked hit was stale, so other hits of this attempt may have been too: whatever it
+        // returned (block or error) is discarded, and the cache with it.
+        self.drop_stale_execution_cache(exec_cache);
+        error!(target: "engine", %parent_hash, "execution cache dropped after a stale hit: building the block again without it");
+        let uncached_provider = CachedStateProvider::new(&state_provider, None);
+        let executed = self.execute_payload(
+            payload,
+            transactions,
+            &state_provider,
+            &uncached_provider,
+            overlay,
+        )?;
+        if uncached_provider.served_stale() {
+            return Err(TnRethError::ExecutionCacheStaleOnRebuild(parent_hash));
+        }
+        Ok(self.seal_executed_payload(executed, overlay, None))
+    }
+
+    /// Execute `payload`'s transactions on `parent`'s state and finish the block: the body of
+    /// [`Self::build_block_from_batch_payload`] up to the state root. Reads go through
+    /// `exec_provider` (over `state_provider`, the parent state); the root runs over
+    /// `state_provider` and `overlay`. Besides the returned value it changes only the stage
+    /// metrics, the drop counters and the execution cache's fills.
+    fn execute_payload(
+        &self,
+        payload: TNPayload,
+        transactions: &Vec<Vec<u8>>,
+        state_provider: &StateProviderBox,
+        exec_provider: &CachedStateProvider<'_, &StateProviderBox>,
+        overlay: &OutputTrieOverlay,
+    ) -> TnRethResult<ExecutedPayload> {
+        let parent_header = payload.parent_header.clone();
+        let state = StateProviderDatabase::new(exec_provider);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
@@ -245,11 +317,11 @@ impl RethEnv {
         let finish_started = Instant::now();
         RETH_METRICS.block_execute_seconds.record(finish_started.duration_since(execute_started));
 
-        // Scope the wrapper so its borrows of the overlay are dropped before the
-        // overlay is extended below (`Arc::make_mut` must not see a live borrow).
-        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
+        // Scope the wrapper so its borrow of the overlay ends here; the caller extends the
+        // overlay in `seal_executed_payload` (`Arc::make_mut` must not see a live borrow).
+        let outcome = {
             let root_provider = OverlayRootStateProvider::new(
-                &state_provider,
+                state_provider,
                 overlay,
                 &self.inner.blockchain_provider,
             );
@@ -257,12 +329,26 @@ impl RethEnv {
         };
         let finish_ended = Instant::now();
         RETH_METRICS.block_finish_seconds.record(finish_ended.duration_since(finish_started));
+        Ok(ExecutedPayload { outcome, bundle: db.take_bundle(), finish_ended })
+    }
+
+    /// Seal an [`ExecutedPayload`] into the block: sort its deltas, extend `overlay` with them
+    /// and check `exec_cache` in with its bundle.
+    fn seal_executed_payload(
+        &self,
+        executed: ExecutedPayload,
+        overlay: &mut OutputTrieOverlay,
+        exec_cache: Option<ExecutionCache>,
+    ) -> ExecutedBlock {
+        let ExecutedPayload {
+            outcome: BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates },
+            bundle,
+            finish_ended,
+        } = executed;
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
-            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
-        // end the build's borrows of the execution cache before it is checked in below
-        drop(db);
+            BlockExecutionOutput { result: execution_result, state: bundle };
         let block_hash = block.hash();
         let (sorted_hashed_state, sorted_trie_updates) =
             rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
@@ -278,14 +364,10 @@ impl RethEnv {
         RETH_METRICS.block_overlay_extend_seconds.record(finish_ended.elapsed());
         // The bundle the cache takes is the one persistence writes (`save_blocks` reads
         // `execution_output.state`); last step, after everything fallible.
-        self.check_in_execution_cache(exec_cache, block_hash, &block_execution_output.state);
-        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
-            Arc::new(block),
-            Arc::new(block_execution_output),
-            computed_trie_data,
-        );
-
-        Ok(res)
+        if let Some(cache) = exec_cache {
+            self.check_in_execution_cache(cache, block_hash, &block_execution_output.state);
+        }
+        ExecutedBlock::new(Arc::new(block), Arc::new(block_execution_output), computed_trie_data)
     }
 
     /// Finalize the block (header) executed from consensus output in memory.
