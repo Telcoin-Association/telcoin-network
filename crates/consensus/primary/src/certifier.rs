@@ -754,7 +754,10 @@ impl<DB: Database> Certifier<DB> {
     /// can move the header's batch digests to its next header: only the author can aggregate the
     /// votes for its header, and the proposer never sends a header below its round again. The
     /// line counts every cancel, including the idle cancels of headers without digests that the
-    /// proposer's `digests resent` line never shows.
+    /// proposer's `digests resent` line never shows. Since #1821 it covers all three cancel paths
+    /// (superseded before the proposal started, the notice in the outer select, and the cancel arm
+    /// inside the proposal); before, only that inner arm logged it, so `reason=canceled` counts
+    /// from earlier runs are lower and not comparable with later ones.
     ///
     /// Called only where `new_proposal` ends the proposal of a header without a stored certificate,
     /// never where a proposal ends without a certificate: the identical header re-sent on the
