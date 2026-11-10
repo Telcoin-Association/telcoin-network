@@ -224,15 +224,26 @@ impl VoteStage {
     }
 
     /// The position of this stage in [`Self::ALL`], for per-stage arrays.
+    ///
+    /// The match is exhaustive, so a new stage does not build until it gets a position here.
     pub(crate) const fn index(self) -> usize {
-        self as usize
+        match self {
+            Self::Validate => 0,
+            Self::ExecWait => 1,
+            Self::Parents => 2,
+            Self::LeadSleep => 3,
+            Self::SyncBatches => 4,
+            Self::VoteStore => 5,
+            Self::Persist => 6,
+        }
     }
 }
 
-// compile-time check that `ALL` lists the stages in declaration order, so every `index` in it is
-// a valid position in the per-stage arrays. a stage inserted without updating `COUNT` and `ALL`
-// fails the build here. stable rust cannot count variants, so a stage appended after `Persist`
-// still needs `COUNT` and `ALL` updated by hand.
+// compile-time check that `ALL` holds each stage at its `index`, so the positions below `COUNT`
+// match the per-stage arrays. the exhaustive match in `index` makes a new stage a build error
+// until it gets a position. stable rust cannot count variants, so a stage given position `COUNT`
+// passes this check and still needs `COUNT` raised and `ALL` extended by hand. a stage given a
+// position another stage already holds passes it too, and would record into that stage's series.
 const _: () = {
     let mut position = 0;
     while position < VoteStage::COUNT {
