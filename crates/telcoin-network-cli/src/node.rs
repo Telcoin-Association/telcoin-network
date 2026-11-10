@@ -427,8 +427,16 @@ impl TypedValueParser for OptInValueParser {
 ///    (`config`, the chain id included) sit outside the genesis header preimage: a genesis
 ///    differing from mainnet only in such a field still computes mainnet's genesis block hash while
 ///    comparing unequal: it is the mainnet genesis under another config.
-/// 3. Chain id [`ADIRI_CHAIN_ID`] passes: that chain is faucet-intended, and the `adiri` feature
-///    guard at the call site in [`NodeCommand::execute`] covers it separately.
+/// 3. Chain id [`ADIRI_CHAIN_ID`] passes. Unlike the mainnet refusal this keys on the chain id
+///    alone: the genesis is not compared with the embedded adiri genesis. For `node`, only an
+///    `adiri` build gets here on that chain id, because the `adiri` feature guard at the call site
+///    in [`NodeCommand::execute`] refuses chain id 2017 in every other build, and `adiri` implies
+///    `faucet`, so the faucet is intended there. `db load-state` has no feature guard of its own,
+///    but a non-`adiri` build cannot start a node on the data it loads. The opt-in in step 4 is a
+///    guard against starting a faucet build by mistake, not a trust boundary, so also matching the
+///    adiri genesis hash would protect nothing. It would refuse the governance-Safe fork e2e lane
+///    (`make test-e2e-governance-safe`), which runs an `adiri` binary on chain id 2017 with a
+///    genesis generated for the test.
 /// 4. Any other chain passes only with `allow_on_this_chain` set (`--allow-faucet-on-chain`, env
 ///    `TN_ALLOW_FAUCET_ON_CHAIN`). The e2e harness passes it to its in-process nodes. The in-tree
 ///    devnets (`etc/compose.yaml`, `etc/local-testnet.sh`) build without the faucet and need
@@ -455,6 +463,7 @@ pub(crate) fn validate_faucet_build(
             "Must NOT compile with faucet feature flag when connecting to Telcoin mainnet!"
         ));
     }
+    // adiri by chain id only, not by genesis hash: see step 3 above
     if chain_id == ADIRI_CHAIN_ID || allow_on_this_chain {
         return Ok(());
     }
