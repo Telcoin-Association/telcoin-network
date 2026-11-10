@@ -646,9 +646,22 @@ impl<DB: Database> Proposer<DB> {
     /// clears it), so the first parent's round is the round of the whole set. A non-empty set of
     /// another round would build a header that voters reject with `InvalidParentRound`.
     ///
-    /// The guard checks the round, not the voting weight: the certificate aggregator sends a
-    /// round's parents to the proposer only once they reach a quorum, and later certificates of
-    /// that round only extend the set.
+    /// The guard checks the round, not the voting weight. The certificate aggregator sends a
+    /// round's certificates once they reach a quorum and never resets that round's weight, so every
+    /// later certificate of the round arrives alone. A lone certificate is safe only because it
+    /// lands on a set already at quorum: the aggregator is spawned with the proposer, so the first
+    /// message of a round is its quorum, and none of the three places that empty `last_parents`
+    /// leaves it empty at a round whose quorum message the proposer has already accepted. A
+    /// proposal takes it and a re-proposal clears it inside `Self::propose_next_header`, after it
+    /// has moved `self.round` past the set's round, so a later certificate of that round is older
+    /// than the proposer's round and ignored. The `Greater` arm of `Self::process_parents` replaces
+    /// it with the empty set of the certificate validator's empty-parents jump, which moves
+    /// `self.round` onto the jump's round rather than past it. That is safe for another reason: a
+    /// message of that round the proposer had already accepted would have raised `self.round` to
+    /// it, so the jump would not take the `Greater` arm, and the round's quorum message is still
+    /// ahead. Leaving `last_parents` empty at a round whose quorum message was already accepted
+    /// would let one lone certificate pass this guard and build a header with fewer than a quorum
+    /// of parents, which voters reject as inquorate.
     ///
     /// - Epoch start: `reset_for_epoch` and `prime_consensus` leave `primary_round` at 0 and the
     ///   epoch close cleared `LastProposed`, so the proposer starts at round 0 with the genesis
