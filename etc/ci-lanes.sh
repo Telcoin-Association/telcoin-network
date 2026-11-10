@@ -206,6 +206,12 @@ check_gateway_image_context() {
 
 lane_test_default() {
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
+    # This lane is the tn-lmdb lane, and the release is the tn-lmdb build, only while no crate
+    # turns tn-reth's `mdbx` feature on: every backend test checks "this build's engine", so a
+    # crate that did would move both onto MDBX with every test green. etc/backend-gate.sh reads
+    # the resolved features (compiles nothing); its planted-workspace tests run first.
+    run python3 -B -I -m unittest discover -s etc -p 'test_backend_gate.py'
+    run ./etc/backend-gate.sh
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
@@ -221,6 +227,17 @@ lane_test_default() {
     # `check_gateway_image_context` above covers the image's COPY list.
     run cargo build --locked -p tn-worker-gateway --bin worker-gateway
     run cargo nextest run --locked --workspace "${run_mode[@]}"
+    # New tn-lmdb datadirs are storage layout v2, so the run above gives every temp chain v2,
+    # and layout v1 on tn-lmdb, which every testnet datadir migrated from MDBX keeps until it is
+    # rebuilt, would run only in its explicit-layout tests. TN_TEST_NEW_DATADIR_LAYOUT=v1 gives
+    # temp chains v1 instead (`TEST_NEW_DATADIR_LAYOUT_VAR` in tn-reth's env/genesis.rs). It is
+    # test-only: tn-reth reads it only in test builds and only in its temp chain constructors,
+    # never on the node's or `db load-state`'s path, and `the_default_build_gives_new_datadirs_v2`
+    # checks the node's config still gives v2 under it. tn-reth's and tn-engine's suites hold
+    # the commit, startup-heal, epoch and pinned-read tests that run on temp chains. The filter
+    # keeps the workspace's feature resolution, so the binaries above are reused, not rebuilt.
+    run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked --workspace \
+        -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
 }
 
 lane_test_adiri() {

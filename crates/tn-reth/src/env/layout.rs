@@ -328,7 +328,7 @@ mod tests {
             consensus_output_for_tests, execute_payload_and_update_canonical_chain,
             test_genesis_with_consensus_registry,
         },
-        RethChainSpec, RethEnv,
+        RethChainSpec, RethConfig, RethEnv,
     };
     use reth_db::{tables, transaction::DbTxMut as _};
     use reth_provider::StaticFileWriter as _;
@@ -400,13 +400,43 @@ mod tests {
         files
     }
 
-    /// A new datadir gets the layout for new datadirs, in reth's row and TN's marker, and every
-    /// reopen keeps it.
+    /// The defaults, pinned: the default (tn-lmdb) build gives a new datadir v2, and the MDBX
+    /// build v1, both by [`StorageLayout::for_new_datadirs`] and by the config the node builds
+    /// from its parsed command ([`RethConfig::new`]). A new datadir opened the node's way
+    /// ([`RethEnv::new_database`], then [`RethEnv::new`]) records it in reth's row and TN's
+    /// marker. The node's path never reads the temp chains' test override
+    /// (`TEST_NEW_DATADIR_LAYOUT_VAR`), so this passes in the lane run that sets it to v1.
+    #[tokio::test]
+    async fn the_default_build_gives_new_datadirs_v2() -> eyre::Result<()> {
+        use clap::Parser as _;
+
+        let expected = if cfg!(feature = "mdbx") { StorageLayout::V1 } else { StorageLayout::V2 };
+        assert_eq!(StorageLayout::for_new_datadirs(), expected, "for_new_datadirs");
+        let tmp = TempDir::new()?;
+        let command = crate::RethCommand::try_parse_from(["tn-reth"])?;
+        let config = RethConfig::new(command, None, tmp.path(), true, chain());
+        assert_eq!(config.new_datadir_layout(), expected, "the node's config");
+        let tm = TaskManager::new("default layout");
+        let database = RethEnv::new_database(&config, tmp.path().join("db"))?;
+        let env = RethEnv::new(&config, &tm, database, None, Default::default())?;
+        let (stored, marker) = recorded(&env)?;
+        assert_eq!(stored, Some(expected), "reth's row");
+        assert_eq!(marker, Some(LayoutMarker::current(expected)), "TN's marker");
+        Ok(())
+    }
+
+    /// A new temp chain datadir gets the temp chains' layout for new datadirs (the default's, or
+    /// the test override's), in reth's row and TN's marker, and every reopen keeps it.
     #[tokio::test]
     async fn a_new_datadir_gets_the_layout_for_new_datadirs() -> eyre::Result<()> {
         let chain = chain();
         let tmp = TempDir::new()?;
-        let layout = StorageLayout::for_new_datadirs();
+        let layout = crate::env::genesis::temp_chain_new_datadir_layout()?;
+        match std::env::var(crate::env::genesis::TEST_NEW_DATADIR_LAYOUT_VAR) {
+            // the lane run that sets the override: temp chains must get what it names
+            Ok(named) => assert_eq!(layout.to_string(), named, "the test override"),
+            Err(_) => assert_eq!(layout, StorageLayout::for_new_datadirs(), "the default"),
+        }
         if cfg!(feature = "mdbx") {
             assert_eq!(layout, StorageLayout::V1, "the MDBX build gives v1");
         }

@@ -607,11 +607,16 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   separate transaction-hash index) takes the next version, and an older binary refuses it rather
   than misread it.
 - **A new datadir** gets `StorageLayout::for_new_datadirs()`: always v1 on the MDBX build, and
-  `NEW_DATADIR_LAYOUT_TN_LMDB` on the tn-lmdb build (v1 until the v2 write path writes the history
-  indices and the transaction-hash index; that constant is the one line that moves new datadirs to
-  v2). Benches and tests pick a layout with `RethConfig::with_new_datadir_layout`. The marker
-  commits before genesis, and genesis writes `storage_settings` with the layout
-  (`init_genesis_with_settings`).
+  `NEW_DATADIR_LAYOUT_TN_LMDB`, v2, on the tn-lmdb build (the v2 write path keeps the history
+  indices and the transaction-hash index in the database: vendor/reth CHANGES.md TN-0042..0044).
+  `the_default_build_gives_new_datadirs_v2` pins both, through the node's own config, and
+  `etc/backend-gate.sh` (run by `./etc/ci-lanes.sh test-default`) fails if any crate turns the
+  `mdbx` feature on in the release graphs or that lane. Benches and tests pick a layout with
+  `RethConfig::with_new_datadir_layout`; in test builds `TN_TEST_NEW_DATADIR_LAYOUT=v1` (or `v2`)
+  picks it for every temp chain (`TEST_NEW_DATADIR_LAYOUT_VAR`), which `test-default` uses to run
+  tn-reth's and tn-engine's suites a second time on v1, the layout migrated datadirs keep; the
+  node's own path never reads it. The marker commits before genesis, and genesis writes
+  `storage_settings` with the layout (`init_genesis_with_settings`).
 - **An existing datadir** opens in its stored layout, never flipped. When it differs from the layout
   new datadirs get, every start logs a warning naming `db reset-execution`; the node runs as before.
   A datadir from before the marker (every one is v1) gets the marker at its first open.
