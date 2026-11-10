@@ -127,7 +127,7 @@
 //! - `TN_EXEC_BENCH_REPORT` (unset): a path to also write the report to as JSON ([`json_report`]).
 //!   Its dir must exist; it is checked before the run.
 //! - `TN_EXEC_BENCH_LAYOUT` (`v1`): reth's storage layout of the bases and the run, `v1` or `v2`;
-//!   each layout has its own bases. `v2` is refused until the env can select it.
+//!   each layout has its own bases. `v2` needs the tn-lmdb build (an MDBX build refuses it).
 //! - `TN_EXEC_BENCH_READ_MIX` (`rpc`): the readers' kinds: `rpc` (balance, token balance, receipt,
 //!   logs, block, all at the tip), `history` (balances and storage slots at past blocks of the
 //!   chain and of the last epoch, an epoch being `EPOCH_EVERY` outputs, or 50 with none;
