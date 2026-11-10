@@ -670,6 +670,60 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   two flipped bits could otherwise pass a checksummed file off as an unchecked one. Recreate it,
   or `db reset-execution` and re-execute.
 
+### On-disk format versions
+
+Every format TN writes carries a version marker, and a binary refuses every version it does not
+read. A change to the bytes a marker covers bumps that marker; nothing else tells old bytes from
+new ones.
+
+| marker | covers | bump it when |
+|---|---|---|
+| `TN_LAYOUT_VERSION`, in `Metadata["tn_storage_layout"]` (`src/env/layout.rs`) | how TN stores the reth database: every table's key and value codec (reth Compact or raw, including the dup-sort subkey widths), the codecs of the static-file values (header, transaction, receipt, sender, change-set entry), which tables and static-file segments a layout writes, and how static files commit | a codec or key form changes (packed trie keys), data moves to another store (the transaction-hash index, history shards), a new static-file segment, or segment configuration moves into the database commit |
+| jar version, the first 8 bytes of each `.conf` (vendor/reth nippy-jar) | a jar's framing: value and `.csoff` checksums, the `.conf` fields with `SegmentHeader`, the compressor, the row layout | a jar's layout changes (chunked change sets, fixed-width senders): the next version, 3. `SegmentHeader` has no spare field, so a new field needs it too |
+| tn-lmdb `FORMAT_VERSION`, in the meta record, checked before its CRC (`crates/tn-lmdb/src/meta.rs`) | pages, overflow runs, catalog, free list, meta | any engine format change; never by a flag bit alone, since unknown flags read as damage |
+| `TN_LMDB_DB_VERSION`, `db/database.version` (`src/env/database.rs`) | the engine the `db` directory holds (1002: reth-on-MDBX binaries refuse it) | the backend changes |
+| `EXEC_STATE_PACK_VERSION` (`crates/storage/src/exec_state_pack.rs`) | the state-pack export peers exchange | the export's records change |
+
+- **A new static-file segment, or segment configuration moved into the database commit, bumps
+  `TN_LAYOUT_VERSION`.** An older binary silently skips the files of a segment it does not know
+  (`iter_static_files`, vendor/reth/crates/storage/db/src/static_file/mod.rs: `parse_filename`
+  gives `None`), and one that does not know configuration held in the database heals a stale
+  `.conf` and cuts rows the database committed. Only the marker, checked before any heal, stops it.
+- **reth's compiled-in zstd dictionaries** for transactions and receipts never change: a stored
+  value records that it is compressed, not with which dictionary.
+- **Two releases.** Release N reads the new format (and the old); release N+1 writes it. A
+  one-release rollback then still opens every datadir; a release that writes what its predecessor
+  refuses turns a rollback into a resync.
+
+**Format-freeze fixtures** (`src/env/format_freeze_tests.rs`). `tests/fixtures/format-freeze/`
+holds a v1 and a v2 tn-lmdb datadir built from one fixed chain (`genesis.json` and the module's
+plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions, contract creation, an account removal,
+an epoch close, a two-block output), each with its digests (`digests.txt`).
+`format_fixtures_read_back_unchanged` opens a copy of each with the current code and compares every
+table row, static-file row, provider read and the state-pack export. `format_writer_output_unchanged` builds the chain again and compares each tn-lmdb
+table's raw rows and each static file's bytes (the decompressed rows of the LZ4 headers jar), the
+version markers and the block hashes; it is ignored on the adiri build, whose fork schedule builds
+other blocks. Both run in the normal lanes in well under a second. When one fails:
+
+- an unintended change is a bug: fix the code, never the fixtures;
+- an intended format change bumps its marker, moves each old fixture to its own directory (for
+  example `v2` to `v2-layout1`) with a test of what the new binary does with it (opens, converts or
+  refuses it), and then regenerates;
+- a block-hash difference is an execution change, not a format change (check `TN_*_FORK_EPOCH` in
+  the environment first).
+
+Regenerating is explicit, on the default build:
+
+```sh
+TN_REGENERATE_FORMAT_FIXTURES=1 cargo test -p tn-reth --features test-utils --lib \
+    env::format_freeze_tests::regenerate_format_fixtures -- --ignored --exact
+```
+
+It keeps `genesis.json` (delete it to rebuild it from the current contracts) and rewrites `v1/` and
+`v2/`. `tn-lmdb.dat` differs at every run (transaction ids, boot id); everything else is
+byte-identical, so review the `digests.txt` diff: every changed line must follow from the intended
+change.
+
 ### Upgrading a testnet node
 
 A testnet node on `v0.16.0-adiri` runs MDBX for both databases, in storage layout v1. The first
@@ -1067,6 +1121,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/env/database.rs` | The database backend (`RethDbEnv`/`RethDb`, MDBX or tn-lmdb): `open_rw`, the backend guard, the `--db.*` mapping, the table stats of `db stats` (`db_table_stats`), `db load-state`'s refusal of a pending migration (`refuse_pending_migration`); see "Database backend". `src/env/database/migrate.rs`: the MDBX to tn-lmdb migration (tn-lmdb build). |
 | `src/env/epoch.rs` | Startup healing and epoch-boundary reads: `EpochState`, committees, BLS pubkeys, worker fee configs, classified registry reads (node-local vs chain-global failures). |
 | `src/env/execution.rs` | `build_block_from_batch_payload` (recover → execute → assemble), `finish_executing_output` (atomic blocks + finality markers), `finalize_block` (in-memory watches). |
+| `src/env/format_freeze_tests.rs` | Test-only: the format-freeze fixtures' generator and tests (see "On-disk format versions" under "Database backend"). |
 | `src/env/genesis.rs` | Genesis construction, including `ConsensusRegistry` account generation via a pre-genesis EVM and embedded-artifact JSON parsing; temp-chain env for tests. |
 | `src/env/helpers.rs` | Read-side accessors: headers, blocks, receipts, accounts, `read_contract*`, canonical streams and tips. |
 | `src/env/persist_bench.rs` | Test-only, `#[ignore]`d: the per-block persist benchmark (`per_block_persist`; see "Persist benchmark" under "Database backend"). |

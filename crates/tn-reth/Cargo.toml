@@ -123,6 +123,8 @@ tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
+# the format-freeze tests' digests (src/env/format_freeze_tests.rs)
+sha2 = "0.10.8"
 tn-reth = { workspace = true, features = ["test-utils"] }
 # `rt` and `test-util` back the forwarder's bound tests: they drive spawned forwards and run
 # them on a paused clock so a two-minute budget costs no wall time. `net` and `io-util` back
