@@ -557,7 +557,7 @@ async fn test_gossip_prefetch_rejects_invalid_batch() {
     let digest = batch.digest();
 
     // dropping an invalid body is not an error (it is a peer content fault, not a local one)
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
     assert_matches!(res, Ok(()));
 
     // the security property: an unvalidated body never reaches the cache the vote path trusts
@@ -578,7 +578,7 @@ async fn test_gossip_prefetch_caches_valid_batch() {
     let batch = Batch::default();
     let digest = batch.digest();
 
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
     assert_matches!(res, Ok(()));
 
     assert!(

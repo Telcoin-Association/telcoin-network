@@ -208,6 +208,32 @@ where
         }
     }
 
+    /// Validate `sealed_batch` on the blocking thread pool of the runtime, and record a failure.
+    ///
+    /// `validate_batch` is synchronous and recovers signers on the rayon pool, so an inline call
+    /// parks the tokio worker thread that runs the caller until the recovery ends. A committee
+    /// peer, which is exempt from peer scoring, could hold the worker threads that also serve
+    /// honest reports, batch sync and the vote path (issue #1795). On the blocking pool the
+    /// recovery parks a blocking thread instead. The number of validations in flight stays
+    /// bounded by the per-peer report slots, the batch serve class and the prefetch cap, so the
+    /// blocking pool cannot grow without bound. A caller that is cancelled drops the result; the
+    /// validation still runs to its end on the blocking pool.
+    ///
+    /// A validation failure is recorded (see [`Self::record_validation_failure`]) and returned.
+    /// A validation task that does not complete (the runtime is shutting down) is an internal
+    /// error, and nothing is recorded for it.
+    async fn validate_batch_blocking(&self, sealed_batch: SealedBatch) -> WorkerNetworkResult<()> {
+        let digest = sealed_batch.digest();
+        let validator = self.validator.clone();
+        tokio::task::spawn_blocking(move || validator.validate_batch(sealed_batch))
+            .await
+            .map_err(|e| {
+                WorkerNetworkError::Internal(format!("batch validation task failed: {e}"))
+            })?
+            .inspect_err(|err| self.record_validation_failure(digest, err))
+            .map_err(WorkerNetworkError::from)
+    }
+
     /// Process gossip from the committee.
     ///
     /// Workers gossip a batch digest once it is accepted so that peers which consume individual
@@ -275,7 +301,7 @@ where
                     match self.network_handle.request_batches(&mut missing, None).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
-                                self.validate_and_cache_prefetched_batch(digest, batch)?;
+                                self.validate_and_cache_prefetched_batch(digest, batch).await?;
                             }
                         }
                         Err(e) => {
@@ -308,7 +334,9 @@ where
     /// A batch for a future epoch is discarded rather than cached: the cache is
     /// cleared on epoch boundaries and storing it would let a rogue validator waste
     /// disk on batches that can never be used.
-    fn validate_and_cache_prefetched_batch(
+    ///
+    /// Validation runs off the tokio worker thread (see [`Self::validate_batch_blocking`]).
+    async fn validate_and_cache_prefetched_batch(
         &self,
         digest: &B256,
         batch: &Batch,
@@ -335,10 +363,7 @@ where
             // validating it again, like any other invalid body
             Err(WorkerNetworkError::RejectedBatchRepeat(*digest))
         } else {
-            self.validator
-                .validate_batch(batch.clone().seal(*digest))
-                .inspect_err(|err| self.record_validation_failure(*digest, err))
-                .map_err(WorkerNetworkError::from)
+            self.validate_batch_blocking(batch.clone().seal(*digest)).await
         };
         if let Err(err) = verdict {
             warn!(
@@ -385,7 +410,12 @@ where
     /// peer redo full validation for each repeat it sends, and a database write for each repeat
     /// of a valid batch, with no penalty, because committee members are exempt from peer
     /// scoring. The checks cover exact repeats only. They do not limit a flood of distinct
-    /// batches.
+    /// batches. A resend of the same transactions under a new digest is covered by the
+    /// validator instead: a transaction hash that failed signer recovery in this epoch fails the
+    /// batch before any recovery, and a verified hash skips recovery (issue #1795).
+    ///
+    /// Validation runs on the blocking thread pool of the runtime, not on the tokio worker
+    /// thread that serves the report (see [`Self::validate_batch_blocking`]).
     pub(super) async fn process_report_batch(
         &self,
         peer: &BlsPublicKey,
@@ -425,7 +455,7 @@ where
             // in this epoch is refused without validating it again
             let already_rejected = self.rejected_batches.lock().contains(&digest);
             ensure!(!already_rejected, WorkerNetworkError::RejectedBatchRepeat(digest));
-            self.validate_and_cache_reported_batch(sealed_batch)?;
+            self.validate_and_cache_reported_batch(sealed_batch).await?;
         }
 
         // notify primary for payload store
@@ -442,16 +472,15 @@ where
     /// A validation failure is recorded in metrics and returned, and the batch is not
     /// cached. When the failure is a body fault (see [`is_body_fault`]), the digest is also
     /// kept in `rejected_batches`, so [`Self::process_report_batch`] refuses a repeat of it for
-    /// the rest of the epoch without validating it again (issue #1774).
-    fn validate_and_cache_reported_batch(
+    /// the rest of the epoch without validating it again (issue #1774). Validation runs off the
+    /// tokio worker thread (see [`Self::validate_batch_blocking`]).
+    async fn validate_and_cache_reported_batch(
         &self,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         // validate batch - record a failure, and keep the digest of a body fault
         let digest = sealed_batch.digest();
-        self.validator
-            .validate_batch(sealed_batch.clone())
-            .inspect_err(|err| self.record_validation_failure(digest, err))?;
+        self.validate_batch_blocking(sealed_batch.clone()).await?;
 
         let (mut batch, _) = sealed_batch.split();
 
@@ -586,12 +615,12 @@ where
 
     /// Publicly available for tests.
     /// See [Self::validate_and_cache_prefetched_batch].
-    pub fn pub_validate_and_cache_prefetched_batch(
+    pub async fn pub_validate_and_cache_prefetched_batch(
         &self,
         digest: &B256,
         batch: &Batch,
     ) -> WorkerNetworkResult<()> {
-        self.validate_and_cache_prefetched_batch(digest, batch)
+        self.validate_and_cache_prefetched_batch(digest, batch).await
     }
 }
 
