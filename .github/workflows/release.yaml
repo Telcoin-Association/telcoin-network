@@ -67,7 +67,9 @@ on:
 
 # Everything here reads the repository; validate-tag also reads its own workflow run, and
 # draft-release alone adds the write it needs to create the draft (least privilege, CodeQL
-# actions/missing-workflow-permissions).
+# actions/missing-workflow-permissions). No job asks for `packages`, so the token cannot write
+# the release image packages, ghcr.io/telcoin-association/tn-mainnet for mainnet tags and
+# tn-testnet for adiri tags: `make release-build` pushes to them with a maintainer's own login.
 permissions:
   contents: read
 
@@ -90,7 +92,8 @@ jobs:
   # Proves: the tag is an annotated tag signed by a key in the allowlist on main; it
   # points at a commit on main whose Cargo version and CHANGELOG section match the tag;
   # and that commit's hash is in the attestation registry on adiri (hence `cast`). The
-  # step summary shows the notes the draft will carry.
+  # step summary shows the notes the draft will carry, and the log of "Check the tag" starts
+  # with the parse of the tag, whose PACKAGE is the ghcr package the image goes to.
   # Does not prove: who pushed the tag, or that it cannot be moved or deleted later.
   # That is the tag ruleset's job, a repository setting no workflow can check.
   validate-tag:
@@ -204,6 +207,8 @@ jobs:
   # tag checks, then checks the asset set and SHA256SUMS, the maintainer signatures on
   # SHA256SUMS against the allowlist on main, the image digest against the registry, and
   # that the binary in the image is the one in the tarball and reports the tagged commit.
+  # `verify` takes the image package from the tag's channel, so this job also fails when
+  # IMAGE_DIGEST names an image outside it, such as a tn-testnet image on a mainnet tag.
   # Does not prove anything in advance: the release is public before this runs, so a
   # failure is an alarm, not a gate. Keeping the release from changing after this check
   # is the job of immutable releases, a repository setting.

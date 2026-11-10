@@ -9,12 +9,14 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 .DEFAULT: help
 
-# Image repository for every image this Makefile builds or pushes.
-GHCR_IMAGE := ghcr.io/telcoin-association/telcoin-network
+# Image repository of the ad-hoc images that docker-adiri, docker-devnet and docker-push
+# build or push. Release images have their own packages, ghcr.io/telcoin-association/tn-mainnet
+# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and only
+# etc/release.sh writes them (release-build pushes the tag, release-publish moves the alias).
+GHCR_IMAGE := ghcr.io/telcoin-association/tn-dev
 
 # Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the
-# 12-character commit. Release tags and the latest/adiri aliases are written only by
-# release-build and release-publish. The release-* targets take TAG as a release tag
+# 12-character commit. The release-* targets take TAG as a release tag
 # (vX.Y.Z[-adiri][-rcN]); see docs/src/maintainers/releasing.md.
 TAG ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 
@@ -91,13 +93,13 @@ help:
 	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
 	@echo ;
 	@echo "make docker-adiri" ;
-	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
+	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io/telcoin-association/tn-dev as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
 	@echo ;
 	@echo "make docker-devnet" ;
-	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io as dev-devnet-<TAG>." ;
+	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io/telcoin-association/tn-dev as dev-devnet-<TAG>." ;
 	@echo ;
 	@echo "make docker-push" ;
-	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io." ;
+	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io/telcoin-association/tn-dev." ;
 	@echo ;
 	@echo "make docker-builder" ;
 	@echo "    :::> Create docker builder for building telcoin-network binary container images." ;
@@ -130,7 +132,7 @@ help:
 	@echo "    :::> Create and push the GPG-signed release tag on the origin/main tip." ;
 	@echo ;
 	@echo "make release-build TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Build the linux/amd64 image and tarball, push the image and upload the assets to the draft release." ;
+	@echo "    :::> Build the linux/amd64 image and tarball, push the image to tn-mainnet or tn-testnet by the tag's network, and upload the assets to the draft release." ;
 	@echo ;
 	@echo "make release-sign TAG=vX.Y.Z[-adiri][-rcN]" ;
 	@echo "    :::> Add this maintainer's GPG signature over SHA256SUMS to the draft release." ;
@@ -475,7 +477,7 @@ docker-adiri:
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
-# push the local ad-hoc adiri image to ghcr.io
+# push the local ad-hoc adiri image to $(GHCR_IMAGE)
 docker-push:
 	docker push "$(GHCR_IMAGE):dev-adiri-$(TAG)" ;
 
