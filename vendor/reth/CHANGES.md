@@ -521,7 +521,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   same entries in the same order, only fewer lower-layer seeks. *Tests*: reth-trie (the in-memory
   cursor's unit tests and `proptest_in_memory_trie_cursor`, against a reference merge; upstream
   added the assertion that an exact hit leaves the database cursor untouched), reth-trie-db's
-  state-root tests, TN's `trie_overlay` tests and the exec-bench chain differential (TN-0106).
+  state-root tests, TN's `trie_overlay` tests and the exec-bench chain differential (TN-0105).
   *Upstream*: n/a (upstream commit).
 
 - **TN-0103** — Backport 75c327ee5: the hashed post-state cursor and the in-memory trie
@@ -561,13 +561,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: the state root built a fresh `StorageRoot`, and so two fresh cursor stacks, for every
   account with changed storage. Under TN's output overlay each stack is one boxed layer per run
   plus the database cursors and `OverlayStorageCursor` (`crates/tn-reth/src/env/output_overlay/`),
-  so a peak output rebuilt hundreds of them. TN's cursor types implement `set_hashed_address` by
+  so each root opened thousands of database cursors (measured below). TN's cursor types implement `set_hashed_address` by
   passing it down every layer (`RunHashedCursor`, `RunTrieCursor`, `OverlayStorageCursor`, which
   also switches its own address), and reth's overlay cursors reset their position and their
   in-memory view for the new account. Execution path (state root): the same walk over the same
   entries, only the cursors are reused. *Tests*: as TN-0102; TN's `trie_overlay` differential
   tests compare the layered root against a flattened reference over several accounts with
   storage, so a cursor that kept the previous account's position or overlay would fail them.
+  *Measured* (TN-0102 to TN-0105 together; exec bench, tn-lmdb, storage v2, 40 outputs of 8
+  batches, prefill 50k, the same cached base, on a Mac at load ~70): the chain is identical (the
+  bench's differential, 3000 reads of headers, balances, storage, transactions and receipts, 0
+  mismatches against a run without them; the same tip hash). Per 320 state roots, counted at the
+  database trie cursors with temporary counters: `AccountsTrie` seeks 195.8k to 83.1k, `StoragesTrie` seeks 212.6k to
+  109.3k, `HashedStorages` cursors opened 1.89M to 640; hashed seeks and nexts unchanged. The
+  state root's mean fell from 100.5 to 84.7 ms on that loaded machine (a quiet run decides).
   *Upstream*: n/a (upstream commit).
 
 ## TN fixes (not from an upstream commit)

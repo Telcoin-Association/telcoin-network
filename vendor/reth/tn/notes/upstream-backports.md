@@ -48,6 +48,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | d85d9deae | TN-0034 | a `syncing` subscription ends when its client leaves (two leaked tasks per abandoned subscription, woken on every block; WS and IPC). Missed by the 2026-10-30 survey, found by the 2026-11-01 review | upstream tests (adapted); both fail without the fix |
 | 055fafc72 (partial) | TN-0035 | **security**: parallel `eth_getLogs` receipt chunks take their own blocking-IO permit, else run inline; one scan no longer occupies up to six blocking threads. The window-by-window scan rewrite in the same commit is not ported. Found by the review | 2 TN tests; the permit test fails without the fix |
 | revm-inspectors a5638ca (#548) | `patches/revm-inspectors` | **security**: Boa's recursion limit 10,000 → 128, so a recursive getter or setter in a JS tracer cannot overflow a blocking thread's stack and abort the node (`js-tracer` builds only). Carried as a patched crate, not a vendored file; see its PATCH.md. Found by the review | 3 tests; getter and setter abort the process without the fix |
+| 345fbbbfd, 75c327ee5, 0720dcd37, 0a21d223a | TN-0102 to TN-0105 | trie overlay cursors skip the database seek on exact overlay hits (`seek_exact`, then `seek` and the hashed post-state cursor), forward in-memory seeks take a fast path, and the state root reuses its storage cursors across accounts. Performance on the state-root path under TN's output overlay | reth-trie, reth-trie-db, tn-reth `trie_overlay`; exec-bench chain differential 0 mismatches; database trie seeks about halved, storage cursor opens 1.89M to 640 per 320 roots |
 
 ## Open
 
@@ -76,7 +77,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
 | 8861e2724 | notify subscribers when set_block_info promotes | transaction-pool | TN calls `set_block_info`; transactions promoted by a basefee drop never reach pending listeners. | clean |
 | 5b0120dbb | lower default block/receipt cache limits | rpc-eth-types | High default memory use unless TN sets its own limits. | clean |
-| 5868ee478 | rewind backward overlay seeks | trie | Overlay cursors skip entries on a backward seek. Not hit by current `StateRoot` callers, but this code sits under TN's output_overlay. | conflicts; hand port is about 8 lines using `reset()` |
+| 5868ee478 | rewind backward overlay seeks | trie | Overlay cursors skip entries on a backward seek. Not hit by current `StateRoot` callers, but this code sits under TN's output_overlay. | tried 2026-11-09 (312a29e1e, reverted): the clean pick is wrong here, since upstream's `reset()` follows c9b466c13 (no wipe markers) and on this base revives wiped storage (fails reth-trie-db `wiped_storage_is_discarded`); a wipe-keeping `rewind()` passes, but rewinding on any seek below the last returned key doubles the root's database hashed seeks, because `TrieNodeIter` re-seeks between the previous entry and its last `next()` result. Port later so it rewinds only below the cursor's position, or with upstream's node iterator |
 
 ### Low
 
