@@ -3378,6 +3378,63 @@ async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> e
     Ok(())
 }
 
+/// A result for the previous epoch is dropped while that epoch's record has no certificate
+/// (issue #1796). After a boundary the node stores its own closed record uncertified until the
+/// epoch votes complete, and in that window the #1771 bound was `None`: f+1 signers of the previous
+/// committee could pin the watch to any number. Now the result is dropped before the signature
+/// check and the record collector is asked for the certificate. Without the fix the first batch
+/// publishes `(1, u64::MAX)`, so the first assertion fails and the real `(1, 5)` is dropped as old.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_dropped_without_certified_record() -> eyre::Result<()>
+{
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The node's own closed record of epoch 1, stored without a certificate.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+
+    // A quorum of the epoch-1 committee signs a far-future number while the record is uncertified.
+    let far_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, u64::MAX, far_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a previous-epoch result must not publish while the epoch record is uncertified",
+    );
+    assert!(
+        *consensus_bus.requested_missing_epoch().borrow() >= 1,
+        "the dropped result must ask the record collector for the previous epoch",
+    );
+
+    // Once the certificate is stored the certified bound applies and the real final output
+    // publishes.
+    certify_epoch_record(&handler, &committee, &record).await;
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "the previous epoch's final output publishes once its record is certified",
+    );
+    Ok(())
+}
+
 /// The same validator gossiping a result repeatedly must be counted once. Replaying one
 /// signer more times than the quorum must not publish; only adding the remaining *distinct*
 /// signers may.
