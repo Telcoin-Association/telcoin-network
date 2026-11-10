@@ -12,8 +12,8 @@ use reth_db_api::models::CompactU256;
 use reth_nippy_jar::{NippyJar, NippyJarError, NippyJarWriter};
 use reth_node_types::NodePrimitives;
 use reth_static_file_types::{
-    ChangesetOffset, ChangesetOffsetReader, ChangesetOffsetWriter, SegmentHeader,
-    SegmentRangeInclusive, StaticFileSegment,
+    changeset_offset_record_size, ChangesetOffset, ChangesetOffsetReader, ChangesetOffsetWriter,
+    SegmentHeader, SegmentRangeInclusive, StaticFileSegment,
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult, StaticFileWriterError};
 use std::{
@@ -307,7 +307,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             ),
             Err(ProviderError::MissingStaticFileBlock(_, _)) => {
                 let path = static_file_provider.directory().join(segment.filename(&block_range));
-                (create_jar(segment, &path, block_range), path)
+                let checksums = static_file_provider.jar_checksums(segment);
+                (create_jar(segment, &path, block_range, checksums), path)
             }
             Err(err) => return Err(err),
         };
@@ -382,6 +383,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// - Truncates sidecar if offsets point past healed `NippyJar` data
     fn heal_changeset_sidecar(&mut self) -> ProviderResult<()> {
         let csoff_path = self.data_path.with_extension("csoff");
+        // TN(TN-0121): the jar's configuration says whether the sidecar's records carry checksums.
+        let checksums = self.writer.has_checksums();
+        let record_size = changeset_offset_record_size(checksums);
 
         // Step 1: Read all three sources of truth
         let header_claims_blocks = self.writer.user_header().changeset_offsets_len();
@@ -391,38 +395,54 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let actual_sidecar_blocks = if csoff_path.exists() {
             let file_len = reth_fs_util::metadata(&csoff_path).map_err(ProviderError::other)?.len();
             // Remove partial records from crash mid-write
-            let aligned_len = file_len - (file_len % 16);
-            aligned_len / 16
+            let aligned_len = file_len - (file_len % record_size);
+            aligned_len / record_size
         } else {
             0
         };
 
         // Fresh segment or no sidecar data - nothing to heal
         if header_claims_blocks == 0 && actual_sidecar_blocks == 0 {
-            self.changeset_offsets =
-                Some(ChangesetOffsetWriter::new(&csoff_path, 0).map_err(ProviderError::other)?);
+            self.changeset_offsets = Some(
+                ChangesetOffsetWriter::new(&csoff_path, 0, checksums)
+                    .map_err(ProviderError::other)?,
+            );
             return Ok(());
         }
 
         // Step 2: Validate sidecar offsets against actual NippyJar state
-        let valid_blocks = if actual_sidecar_blocks > 0 {
-            let reader = ChangesetOffsetReader::new(&csoff_path, actual_sidecar_blocks)
+        //
+        // TN(TN-0121): only the committed records (the header's count) are read, in one bulk
+        // read: the ones past it are cut below whatever they hold (`correct_blocks` is at most the
+        // header's count). A committed record that fails its checksum is an error, never cut.
+        let committed_blocks = actual_sidecar_blocks.min(header_claims_blocks);
+        let valid_blocks = if committed_blocks > 0 {
+            let reader = ChangesetOffsetReader::new(&csoff_path, committed_blocks, checksums)
                 .map_err(ProviderError::other)?;
+            let offsets = reader.get_range(0, committed_blocks).map_err(ProviderError::other)?;
 
             // Find last block where offset + num_changes <= actual_nippy_rows
             // This correctly handles rows=0 with offset=0, num_changes=0 (empty blocks)
-            let mut valid = 0u64;
-            for i in 0..actual_sidecar_blocks {
-                if let Some(offset) = reader.get(i).map_err(ProviderError::other)? {
-                    if offset.offset() + offset.num_changes() <= actual_nippy_rows {
-                        valid = i + 1;
-                    } else {
-                        // This block points past EOF - stop here
-                        break;
-                    }
-                }
+            let fits = |offset: &ChangesetOffset| {
+                offset.offset().saturating_add(offset.num_changes()) <= actual_nippy_rows
+            };
+            let valid = offsets.iter().position(|offset| !fits(offset)).unwrap_or(offsets.len());
+
+            // TN(TN-0121): an interrupted prune leaves a trailing run of records past the rows
+            // (offsets only grow). A record that fits again after one that does not is damage:
+            // refuse rather than cut the committed blocks after the damaged record.
+            if let Some(index) = offsets[valid..].iter().position(fits) {
+                tracing::error!(
+                    target: "reth::static_file",
+                    path = %csoff_path.display(),
+                    damaged = valid,
+                    fits_again = valid + index,
+                    actual_rows = actual_nippy_rows,
+                    "Changeset offset record points past the rows, but a later one does not"
+                );
+                return Err(ProviderError::CorruptedChangeSetStaticFile)
             }
-            valid
+            valid as u64
         } else {
             0
         };
@@ -452,7 +472,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     .write(true)
                     .open(&csoff_path)
                     .map_err(ProviderError::other)?;
-                file.set_len(correct_blocks * 16).map_err(ProviderError::other)?;
+                file.set_len(correct_blocks * record_size).map_err(ProviderError::other)?;
                 // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`).
                 reth_fs_util::fsync_file(&file).map_err(ProviderError::other)?;
 
@@ -491,7 +511,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         // Open sidecar writer with corrected count (won't error now that sizes match)
-        let csoff_writer = ChangesetOffsetWriter::new(&csoff_path, correct_blocks)
+        let csoff_writer = ChangesetOffsetWriter::new(&csoff_path, correct_blocks, checksums)
             .map_err(ProviderError::other)?;
 
         self.changeset_offsets = Some(csoff_writer);
@@ -499,6 +519,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Commit healed header if needed (after sidecar writer is set up)
         if needs_header_commit {
             self.writer.commit().map_err(ProviderError::other)?;
+            // TN(TN-0121): publish the shrunk range, or the consistency check that opened this
+            // writer reads the old tip and misses the loss until the next start.
+            self.update_index()?;
 
             tracing::info!(
                 target: "reth::static_file",
@@ -839,7 +862,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 if segment.is_change_based() {
                     let csoff_path = data_path.with_extension("csoff");
                     self.changeset_offsets = Some(
-                        ChangesetOffsetWriter::new(&csoff_path, 0).map_err(ProviderError::other)?,
+                        ChangesetOffsetWriter::new(&csoff_path, 0, self.writer.has_checksums())
+                            .map_err(ProviderError::other)?,
                     );
                 }
 
@@ -961,8 +985,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             // Read offset for the block after last_block from sidecar.
             // Use committed length from header, ignoring any uncommitted records
             // that may exist in the file after a crash.
-            let reader = ChangesetOffsetReader::new(&csoff_path, changeset_offsets_len)
-                .map_err(ProviderError::other)?;
+            let reader = ChangesetOffsetReader::new(
+                &csoff_path,
+                changeset_offsets_len,
+                self.writer.has_checksums(),
+            )
+            .map_err(ProviderError::other)?;
             if let Some(next_offset) = reader.get(blocks_to_keep).map_err(ProviderError::other)? {
                 next_offset.offset()
             } else {
@@ -1106,8 +1134,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             let new_csoff_path = data_path.with_extension("csoff");
             let committed_len = self.writer.user_header().changeset_offsets_len();
             self.changeset_offsets = Some(
-                ChangesetOffsetWriter::new(&new_csoff_path, committed_len)
-                    .map_err(ProviderError::other)?,
+                ChangesetOffsetWriter::new(
+                    &new_csoff_path,
+                    committed_len,
+                    self.writer.has_checksums(),
+                )
+                .map_err(ProviderError::other)?,
             );
         }
 
@@ -1710,12 +1742,18 @@ fn create_jar(
     segment: StaticFileSegment,
     path: &Path,
     expected_block_range: SegmentRangeInclusive,
+    checksums: bool,
 ) -> NippyJar<SegmentHeader> {
     let mut jar = NippyJar::new(
         segment.columns(),
         path,
         SegmentHeader::new(expected_block_range, None, None, segment),
     );
+
+    // TN(TN-0122): the provider's policy (`StaticFileProviderInner::jar_checksums`).
+    if checksums {
+        jar = jar.with_checksums();
+    }
 
     // Transaction and Receipt already have the compression scheme used natively in its encoding.
     // (zstd-dictionary)

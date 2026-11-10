@@ -7972,6 +7972,7 @@ name = "reth-static-file-types"
 version = "1.11.3"
 dependencies = [
  "alloy-primitives",
+ "crc32fast",
  "derive_more",
  "fixed-map",
  "reth-fs-util",

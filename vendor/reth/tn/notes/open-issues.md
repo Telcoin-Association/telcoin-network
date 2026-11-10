@@ -90,6 +90,15 @@ own change if that stops being true.
   `DatabaseProvider`'s range reads clamp to it; only a direct
   `StaticFileProvider::fetch_range_with_predicate` past the index tip returns them. TN has no
   such caller, and a failed save halts the node.
+- **The open-time heal cuts committed rows on a damaged offsets file.** `NippyJarChecker`'s
+  prune-direction arms (nippy-jar `consistency.rs`) trust the offsets file: one row's offsets
+  missing, or a final offset past the data (one flipped high bit), cuts a committed row and
+  rewrites the `.conf` without an error, in a checksummed jar too, since the heal reads no value.
+  The kept rows stay framed and verify, and the static files then lag the database's stage
+  checkpoints, which TN refuses at startup: fail closed, but the cut row is gone.
+  `test_heal_cuts_committed_rows_by_offsets_alone` (TN-0120) pins it. A fix would tell an
+  interrupted prune (rows the `.conf` still counts) from damage, e.g. by a prune intent recorded
+  before the files shrink.
 
 ## RocksDB stubs and storage-v2 plumbing
 

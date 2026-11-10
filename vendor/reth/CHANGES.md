@@ -970,3 +970,89 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   size and implementation; aarch64 M1 Max: crc32fast 4-9 ns from 20 to 176 B). Mutation-checked:
   no verification in the cursor, no row in the seed, no configuration check, a wrong row index in
   the writer. *Upstream*: maybe (a format change upstream would want behind its own version).
+  `test_heal_cuts_committed_rows_by_offsets_alone` pins a gap the checksums do not close: the
+  open-time heal's prune-direction arms (`consistency.rs`) trust the offsets file's length and
+  final offset, so an offsets file one row short, or a flipped high bit in the final offset, cuts
+  a committed row and rewrites the configuration without an error. The static files then lag the
+  database's stage checkpoints, which TN refuses at startup, so it fails closed, but destructively;
+  left for a separate decision (`tn/notes/open-issues.md`).
+
+- **TN-0121** — Checksummed `.csoff` records, and the changeset read paths fail closed on
+  damage. *Kind*: feature (storage integrity) and fix (static-file read paths).
+  *Files*: `crates/static-file/types/{Cargo.toml, src/changeset_offsets.rs, src/lib.rs}`
+  (`ChangesetOffsetWriter::new` and `ChangesetOffsetReader::new` take the jar's `checksums`;
+  `changeset_offset_record_size`, `ChangesetOffsetChecksumMismatch`; `get_range` reads chunks of
+  4096 records a `pread`; tests), `crates/storage/provider/src/providers/static_file/{mod.rs,
+  jar.rs, manager.rs, writer.rs, writer_tests.rs}`.
+  *Why*: under storage v2 the `.csoff` sidecar maps each block to its changeset rows, and a
+  damaged record sends a lookup into another block's rows, which the value checksums cannot see.
+  A checksummed jar's sidecar (TN-0120, the jar's version says which) has 20-byte records,
+  `[offset u64][num_changes u64][crc u32]`, LE, the CRC-32 (ISO-HDLC) of the first 16 bytes
+  started from `record_seed(index) = 0xC2B2AE35 ^ (index as u32) ^ ((index >> 32) as u32)
+  .rotate_left(16)` (crc32fast's convention), the index being the block's distance from the
+  file's first block; every record read verifies it, and a mismatch is an `InvalidData` I/O
+  error wrapping `ChangesetOffsetChecksumMismatch` (file, index). Plain sidecars keep upstream's
+  16-byte records. Every reader and writer is given the jar's format, from `NippyJar::
+  has_checksums` (the cached reader of TN-0040, the count functions, the heal, truncation,
+  rotation and `delete_current_and_open_previous`). The read paths around it: `StaticFileJarProvider
+  ::read_changeset_offset` checks that the block's rows lie inside the jar before any caller sizes
+  a buffer with `num_changes` or iterates `changeset_range` (a damaged count asked for an
+  allocation that aborts, and a range past the rows returned a shorter changeset), returning
+  `ProviderError::CorruptedChangeSetStaticFile`; `account_block_changeset` and
+  `storage_changeset` treat a row missing inside the block's range as that error instead of
+  skipping it (the range walks, `from_reverts` and historical storage roots read through them);
+  `fetch_range_with_predicate` errors on a row missing inside a jar's own block or transaction
+  range instead of returning the rows before it (outside the jar's range the data still ends
+  quietly, as a pruned receipts prefix needs). `heal_changeset_sidecar` reads the committed
+  records in one bulk read (it did one `pread` a block, up to 500k on the first open of a file
+  near its end), reads none past the header's count (they are cut whatever they hold), errors on
+  a committed record that fails its checksum, and keeps shrinking only a trailing run of records
+  past the rows, which an interrupted prune leaves (offsets only grow); a record that fits again
+  after one that does not is refused as damage, so a damaged middle record no longer erases the
+  committed blocks after it. After a shrink it publishes the new range (`update_index`), so the
+  startup consistency check that opened the writer sees the loss in the same boot instead of the
+  next. The point lookups' not-found result is unchanged: every history caller already maps it to
+  `AccountChangesetNotFound`/`StorageChangesetNotFound`, which TN halts on. None of this reaches
+  execution: valid files read exactly as before, and the new errors need files that disagree with
+  their own configuration. *Tests*: `test_checksummed_records`,
+  `test_checksummed_record_damage_is_an_error`, `test_checksummed_record_bound_to_its_index`,
+  `test_range_reads_across_chunks` (static-file-types), and TN-0123's provider tests.
+  Mutation-checked: no record verification, no index in the seed, the heal reading a checksummed
+  sidecar as plain, no range validation, no heal refusal, no `update_index`, no range error.
+  *Upstream*: partly (the range validation, the missing-row errors, the heal's bulk read and
+  re-index are upstream bugs).
+
+- **TN-0122** — Storage v2 datadirs create checksummed static files. *Kind*: feature (policy).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, writer.rs, mod.rs}`
+  (`StaticFileProviderInner::set_jar_checksums` and `jar_checksums`, the builder's
+  `with_jar_checksums`, `checksummed_segment`; `create_jar` takes the decision),
+  `crates/storage/provider/src/providers/{mod.rs, database/mod.rs, database/provider.rs}`
+  (`ProviderFactory::new` and both `set_storage_settings_cache` set it from
+  `StorageSettings::is_v2`).
+  *Why*: the static-file provider did not know the datadir's layout, and TN-0120's format must
+  reach every new jar of a v2 datadir and none of a v1 one. The factory pushes the decision
+  whenever it learns the settings: at construction from the stored row, and from
+  `set_storage_settings_cache`, which TN's `layout::settle` calls before genesis writes the first
+  jar. New jars of every segment carry checksums under v2 (`checksummed_segment`; the changesets
+  are mandatory, the others stay while the read cost is below the benches' noise); v1 datadirs
+  create upstream's format byte for byte. An existing jar keeps its own format for reads and
+  appends, so a v2 datadir written before this change keeps its unchecked jars until they rotate.
+  It cannot reach execution: the values stored are unchanged; v1 files are unchanged.
+  *Tests*: TN-0123. *Upstream*: no.
+
+- **TN-0123** — Tests: checksummed static files through `StaticFileProvider`. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/static_file/{tn_checksum_tests.rs (new),
+  mod.rs}`.
+  *Why*: TN-0120 to TN-0122 end to end: `policy_picks_the_jar_format` (every segment's new jar
+  and `.csoff` size with checksums on and off; senders 24 against 20 bytes a value; the factory
+  setters), `damaged_changeset_value_is_an_error` (point lookups, block reads and range walks of
+  both changeset segments; the other blocks still read), `damaged_block_segment_value_is_an_error`
+  (header, transaction, receipt and sender by number, and the range reads),
+  `damaged_changeset_offsets_are_an_error` (a record's offset and its count's high byte),
+  `unchecked_changeset_offsets_past_the_rows_are_an_error` (one past the rows and a count no
+  allocation holds: an error, not a short changeset or an abort), `checksummed_sidecar_heal`
+  (a torn and uncommitted tail cut in 20-byte records; a damaged committed record stops the open
+  and nothing is cut), `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` (an interrupted
+  prune is healed and published at once; a gap is refused), `rotation_prune_and_mixed_formats`
+  (unchecked jars keep their format while new jars are checksummed; prune and appends across
+  rotations keep verifying), `missing_row_inside_a_range_is_an_error`. *Upstream*: no.

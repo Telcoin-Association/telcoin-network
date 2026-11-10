@@ -18,7 +18,10 @@ mod segment;
 #[cfg(all(feature = "std", unix))]
 mod changeset_offsets;
 #[cfg(all(feature = "std", unix))]
-pub use changeset_offsets::{ChangesetOffsetReader, ChangesetOffsetWriter};
+pub use changeset_offsets::{
+    changeset_offset_record_size, ChangesetOffsetChecksumMismatch, ChangesetOffsetReader,
+    ChangesetOffsetWriter,
+};
 
 use alloy_primitives::BlockNumber;
 pub use compression::Compression;

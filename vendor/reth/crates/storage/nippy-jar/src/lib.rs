@@ -1669,6 +1669,42 @@ mod tests {
         }
     }
 
+    /// TN(TN-0120): pins what the open-time heal does to committed rows. Its prune-direction
+    /// arms trust the offsets file's length and its final offset: an offsets file one row short,
+    /// or a final offset past the data, cuts committed rows and rewrites the configuration,
+    /// without an error, in a checksummed jar too (the heal reads no value, so no checksum sees
+    /// it). The rows it keeps stay framed and verify. The cut leaves the static files behind the
+    /// database's stage checkpoints, which TN refuses at startup.
+    #[test]
+    fn test_heal_cuts_committed_rows_by_offsets_alone() {
+        let (col1, col2) = test_data(Some(15));
+        let rows = col1.len();
+        let damages: [fn(&Path); 2] = [
+            // The offsets file loses its final offset.
+            |path| {
+                let offsets = path.with_extension(OFFSETS_FILE_EXTENSION);
+                let len = std::fs::metadata(&offsets).unwrap().len();
+                OpenOptions::new().write(true).open(offsets).unwrap().set_len(len - 8).unwrap();
+            },
+            // The final offset's high bit flips.
+            |path| {
+                let offsets = path.with_extension(OFFSETS_FILE_EXTENSION);
+                let len = std::fs::metadata(&offsets).unwrap().len();
+                flip_byte(&offsets, len - 1, 0x80);
+            },
+        ];
+        for damage in damages {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            freeze_checksummed(file.path(), &col1, &col2, false);
+            damage(file.path());
+            drop(NippyJarWriter::new(NippyJar::load_without_header(file.path()).unwrap()).unwrap());
+
+            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            assert_eq!(nippy.rows, rows - 1);
+            assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+        }
+    }
+
     /// TN(TN-0120): both CRC implementations give the same value for every length and initial
     /// value (they take the initial value in different forms), and seed 0 is the standard CRC-32.
     #[test]

@@ -3,6 +3,8 @@ pub use manager::{
     StaticFileAccess, StaticFileProvider, StaticFileProviderBuilder, StaticFileWriteCtx,
     StaticFileWriter,
 };
+// TN(TN-0122): which segments' new jars carry checksums under storage v2.
+pub use manager::checksummed_segment;
 
 mod jar;
 pub use jar::StaticFileJarProvider;
@@ -16,6 +18,8 @@ mod sync_stats;
 pub(crate) use sync_stats::SyncPhase;
 pub use sync_stats::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 
+#[cfg(test)]
+mod tn_checksum_tests;
 #[cfg(test)]
 mod writer_tests;
 
@@ -45,7 +49,9 @@ impl LoadedJar {
                 let csoff_reader = if jar.user_header().segment().is_change_based() {
                     let csoff_path = jar.data_path().with_extension("csoff");
                     let len = jar.user_header().changeset_offsets_len();
-                    match ChangesetOffsetReader::new(&csoff_path, len) {
+                    // TN(TN-0121): the jar's configuration says whether its records carry
+                    // checksums.
+                    match ChangesetOffsetReader::new(&csoff_path, len, jar.has_checksums()) {
                         Ok(reader) => Some(reader),
                         Err(err) if err.kind() == io::ErrorKind::NotFound && len == 0 => None,
                         Err(err) => return Err(ProviderError::other(err)),

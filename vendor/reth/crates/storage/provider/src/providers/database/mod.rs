@@ -130,6 +130,8 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         )
         .storage_settings()?
         .unwrap_or(legacy_settings);
+        // TN(TN-0122): new static-file jars carry checksums in a storage v2 datadir.
+        static_file_provider.set_jar_checksums(storage_settings.is_v2());
 
         Ok(Self {
             db,
@@ -194,6 +196,8 @@ impl<N: NodeTypesWithDB> StorageSettingsCache for ProviderFactory<N> {
 
     fn set_storage_settings_cache(&self, settings: StorageSettings) {
         *self.storage_settings.write() = settings;
+        // TN(TN-0122): new static-file jars carry checksums in a storage v2 datadir.
+        self.static_file_provider.set_jar_checksums(settings.is_v2());
     }
 }
 

@@ -111,11 +111,31 @@ impl<'a, N: NodePrimitives> StaticFileJarProvider<'a, N> {
             return Ok(None);
         };
 
-        if let Some(reader) = self.jar.value().csoff_reader() {
-            reader.get(index).map_err(ProviderError::other)
-        } else {
-            Ok(None)
+        let Some(reader) = self.jar.value().csoff_reader() else { return Ok(None) };
+        let Some(offset) = reader.get(index).map_err(ProviderError::other)? else {
+            return Ok(None)
+        };
+
+        // TN(TN-0121): the block's rows must lie inside the jar before anything sizes a buffer
+        // with `num_changes` or iterates `changeset_range`. The jar's rows and the sidecar's
+        // length come from one configuration, so only damage gets here.
+        if offset
+            .offset()
+            .checked_add(offset.num_changes())
+            .is_none_or(|end| end > self.rows() as u64)
+        {
+            tracing::error!(
+                target: "providers::static_file",
+                path = %self.data_path().display(),
+                block_number,
+                offset = offset.offset(),
+                num_changes = offset.num_changes(),
+                rows = self.rows(),
+                "Changeset offset points past the jar's rows"
+            );
+            return Err(ProviderError::CorruptedChangeSetStaticFile)
         }
+        Ok(Some(offset))
     }
 
     /// Reads all changeset offsets from the sidecar file.
