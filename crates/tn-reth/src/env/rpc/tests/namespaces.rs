@@ -231,7 +231,8 @@ async fn every_namespace_serves_on_tn() -> eyre::Result<()> {
     // one entry: the pre-execution system calls are not transactions and are not traced
     assert_eq!(array_len(&block_traces)?, 1, "{block_traces}");
     assert_eq!(field::<B256>(&block_traces[0], "txHash")?, hash);
-    // genesis has no parent: reth looks up the zero parent hash and reports it missing
+    // genesis has no parent state to replay on; since TN-0064 (upstream 48df75d88) the lookup
+    // answers geth's code and message instead of a missing zero parent hash
     let (code, message) = rpc_error(
         http.call::<_, Value>(
             "debug_traceBlockByNumber",
@@ -239,8 +240,8 @@ async fn every_namespace_serves_on_tn() -> eyre::Result<()> {
         )
         .await,
     )?;
-    assert_eq!(code, -32001, "{message}");
-    assert!(message.starts_with("block not found"), "unexpected error: {message}");
+    assert_eq!(code, -32000, "{message}");
+    assert_eq!(message, "genesis is not traceable");
 
     // trace
     let tx_traces: Value = http.call("trace_transaction", rpc_params![hash]).await?;
