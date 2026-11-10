@@ -112,3 +112,14 @@
   `TraceApi` with `BlockingTaskGuard::new(1)` and calls `trace_filter` (two permits) directly
   waits forever. Upstream's handler-level permits made the same test pass there. Size the guard
   for the method's permits (two for `trace_filter`) when porting such tests.
+
+## cargo does not forward `--config` to external subcommands (2026-11-09, sls_reth_vendor2)
+
+`cargo --config patch.crates-io.x.path=... nextest run` applies the patch to cargo's own
+resolution, but cargo-nextest's inner `cargo test` never sees the flag, so the nested reth
+test lane built against the registry crate for weeks while `cargo.sh check`, `tree` and
+`metadata` showed the patch in place. Tell-tale: "Adding <crate> v<newer>" at the top of a
+nextest log for a crate the lockfile pins. Rules: put cargo configuration that must reach every
+invocation in a `.cargo/config.toml`, not in `--config` flags; and when a carried patch is meant
+to be exercised by a test lane, make a test depend on a symbol only the patch has, so a silent
+fallback to the registry fails to compile.

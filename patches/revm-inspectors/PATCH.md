@@ -38,8 +38,11 @@ JavaScript tracers, which TN builds only with the opt-in `js-tracer` feature
 (`crates/tn-reth/js-tracer.md`). The default build compiles the patched crate without Boa, and
 its code there is identical to the registry's.
 
-The nested reth workspace has no `[patch]` of its own, so `vendor/reth/tn/cargo.sh` passes this
-one with `--config`, and reth's tests run against the code TN ships.
+The nested reth workspace carries the same patch in `vendor/reth/.cargo/config.toml` (TN-0080),
+which every cargo invocation there reads, the one cargo-nextest runs included, so reth's tests run
+against the code TN ships. Until TN-0080 `tn/cargo.sh` passed the patch with `--config`, which
+cargo does not forward to external subcommands, and the `test-vendor-reth` lane tested the
+registry crate.
 
 ## Advisories
 
@@ -67,7 +70,7 @@ include) if it is not in the local registry, and run
 Remove this patch when TN's reth moves to a revm-inspectors release that contains #548 (0.44.2
 or later). Check that release's `RECURSION_LIMIT`, then delete:
 - this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;
-- the `--config` line in `vendor/reth/tn/cargo.sh`;
+- the `[patch.crates-io]` entry in `vendor/reth/.cargo/config.toml`;
 - the `revm-inspectors-patch` job in `.github/workflows/pr.yaml` and its entries in the
   `CI Success` gate (`etc/transport-patches/test_ci_gate.py` tests the gate);
 - its step in `.github/workflows/main-compiles.yaml`, and the patch-crate count in

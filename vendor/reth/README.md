@@ -117,8 +117,8 @@ into the nested lockfile; the next `cargo.sh` run overwrites it.
 `cargo.sh` seeds `vendor/reth/Cargo.lock` (git-ignored) on every run from TN's lockfile plus
 `tn/test-only.lock`, which pins the 72 packages only reth's tests need, and builds into
 `target/vendor-reth`. TN's own lockfile is never touched. TN's root manifest patches
-revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch with
-`--config`, so reth's tests run against the code TN ships.
+revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `vendor/reth/.cargo/config.toml` carries
+the same patch (TN-0080), so reth's tests run against the code TN ships.
 
 `python3 -I vendor/reth/tn/lockfile.py check`, which the `test-vendor-reth` lane runs, fails when
 the nested workspace resolves a package neither file pins, or when the vendored crates' production

@@ -49,7 +49,7 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 |---|---|
 | crates removed or cut down | TN-0005, TN-0006, TN-0008, TN-0009, TN-0011, TN-0012, TN-0028 to TN-0032 |
 | RPC surface removed (namespaces TN never serves) | TN-0010, TN-0021, TN-0033 |
-| build only (deps, build scripts, features, formatting) | TN-0002, TN-0007, TN-0020, TN-0025 to TN-0027 |
+| build only (deps, build scripts, features, formatting) | TN-0002, TN-0007, TN-0020, TN-0025 to TN-0027, TN-0080 |
 | tests only | TN-0001, TN-0003, TN-0004 |
 | RocksDB removed; storage v1 as the default | TN-0014 |
 | upstream sync to v1.11.4 | TN-0013 |
@@ -103,8 +103,8 @@ etc/ci-lanes.sh test-vendor-reth                              # what CI runs for
 etc/rocksdb-gate.sh
 ```
 
-`cargo.sh` runs cargo inside the nested workspace with the revm-inspectors patch applied and
-builds into `target/vendor-reth`; never run a bare `cargo` in `vendor/reth`. nextest there reads
+`cargo.sh` runs cargo inside the nested workspace (whose `.cargo/config.toml` applies the
+revm-inspectors patch, TN-0080) and builds into `target/vendor-reth`; never run a bare `cargo` in `vendor/reth`. nextest there reads
 `vendor/reth/.config/nextest.toml`, not the root's. TN's own `cargo` commands build the vendored crates as path
 dependencies but never run their tests, and TN's clippy lane skips them.
 

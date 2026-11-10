@@ -16,8 +16,9 @@
 # which pins the packages only reth's tests need (tn/lockfile.py). Output goes to
 # target/vendor-reth so the two workspaces' feature sets do not evict each other's artifacts.
 #
-# TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested manifest does
-# not, so the same patch is passed with --config, and reth's tests run against the code TN ships.
+# TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested workspace
+# carries the same patch in .cargo/config.toml (TN-0080), which also reaches the cargo that
+# cargo-nextest runs, so reth's tests run against the code TN ships.
 #
 # A package neither file pins is resolved against crates.io when this runs;
 # `tn/lockfile.py check`, which the test-vendor-reth lane runs, fails on one.
@@ -33,12 +34,4 @@ ROOT="$(cd "$VENDOR/../.." && pwd)"
 [[ "${TN_LOCKFILE_SEEDED:-}" == 1 ]] || python3 -I -B "$VENDOR/tn/lockfile.py" seed
 cd "$VENDOR"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/vendor-reth"
-config=(--config "patch.crates-io.revm-inspectors.path=\"$ROOT/patches/revm-inspectors\""
-    --config 'resolver.incompatible-rust-versions="fallback"')
-# a +toolchain argument has to stay first
-if [[ "${1:-}" == +* ]]; then
-    toolchain=$1
-    shift
-    exec cargo "$toolchain" "${config[@]}" "$@"
-fi
-exec cargo "${config[@]}" "$@"
+exec cargo "$@"

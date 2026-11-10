@@ -96,5 +96,5 @@ sccache or a different cache layout.
 
 The tndb-b work was written against an earlier copy of this vendoring on another branch. Rebasing
 it onto `main` meets this copy's changes: it must re-add its own workspace dependencies to the
-root `Cargo.toml`, and it meets `patches/revm-inspectors` and the `--config` patch line in
-`tn/cargo.sh`.
+root `Cargo.toml`, and it meets `patches/revm-inspectors` and the `[patch.crates-io]` entry in
+`vendor/reth/.cargo/config.toml`.

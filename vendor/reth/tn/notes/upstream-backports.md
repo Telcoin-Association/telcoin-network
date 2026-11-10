@@ -159,6 +159,9 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## TN-side hardening (not upstream fixes)
 
+- **reth's tests now build against the carried revm-inspectors (TN-0080, 2026-11-09).** cargo
+  does not forward `--config` to cargo-nextest, so the `test-vendor-reth` lane had been testing
+  the registry crate; the patch now lives in `vendor/reth/.cargo/config.toml`.
 - **A separate blocking pool for RPC (done 2026-11-06).** The root cause behind TN-0019's
   severity was that reth RPC and TN's consensus/execution shared tokio's blocking pool (512
   threads by default), and each worker's RPC server bounds its work with its own permits, so the

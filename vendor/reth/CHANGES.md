@@ -1144,3 +1144,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   transaction with a gas limit above the cap fails before it runs; the header's gas limit is
   `u64::MAX`), `check_refuses_a_gas_limit_above_what_is_left`.
   *Upstream*: candidate (reth main runs raw blocks under the caller's header too).
+
+- **TN-0080** — The nested workspace carries the revm-inspectors patch in `.cargo/config.toml`.
+  *Kind*: build only.
+  *Files*: new `.cargo/config.toml` (the `[patch.crates-io]` entry and the
+  `incompatible-rust-versions` resolver setting), `tn/cargo.sh` (no longer passes them with
+  `--config`), `README.md`, `tn/notes/open-issues.md`, `patches/revm-inspectors/PATCH.md`.
+  *Why*: `tn/cargo.sh` passed the patch as `cargo --config patch.crates-io...`, and cargo does not
+  forward `--config` to an external subcommand: `cargo nextest` ran its inner `cargo test` without
+  it, re-resolved revm-inspectors to the registry's 0.34.4 ("Adding revm-inspectors v0.34.4" at
+  the top of every nextest log) and built reth's tests against it. So `cargo.sh check`, `tree` and
+  `metadata` saw the carried 0.34.3, while every `cargo.sh nextest` run, the `test-vendor-reth`
+  lane included, tested the registry crate; the claim in README.md and PATCH.md that reth's tests
+  run against the code TN ships did not hold for them. TN's own binary was never affected: the
+  root manifest's `[patch.crates-io]` and `Cargo.lock` resolve the path crate. Found when
+  TN-0079's reth-side code failed to compile under nextest against a crate that lacked its new
+  method. A `.cargo/config.toml` in the nested workspace applies to every cargo run from that
+  directory, cargo-nextest's included; `cargo.sh` keeps the seeding and the target directory.
+  Verified by `cargo tree -i revm-inspectors` from `vendor/reth` without `cargo.sh`, by
+  `lockfile.py check`, and by TN-0079's reth-side tests compiling and passing under nextest.
+  *Tests*: n/a (build configuration; the TN-0079 tests exercise it).
+  *Upstream*: n/a.
