@@ -1119,3 +1119,28 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `trace_filter_defaults_to_latest` and the TN-0038 permit tests run the filter over
   several blocks with a two-permit guard; the bound itself is the stream's buffer.
   *Upstream*: candidate (reth main has the same fan-out).
+
+- **TN-0078** — `debug_traceBlock` bounds a raw block as a `debug_traceCallMany` request.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`debug_trace_raw_block`, `trace_block`'s `budget`
+  parameter, tests `raw_block_bound_tests`),
+  `crates/rpc/rpc-eth-types/src/call_many.rs` (`CallManyBudget::check`).
+  *Why*: the raw-block path built the EVM env from the caller's header and ran the caller's
+  transactions under it: a header with `gas_limit` `u64::MAX` and no base fee let a legacy
+  transaction with gas price 0 and a gas limit of 2^63 loop until it ended, under a tracing
+  permit the request held the whole time, and the cancel check of TN-0049 runs only between
+  transactions (review R3). The signer recovery of up to the body-size limit in transactions
+  ran inline in the async handler as well. The raw block is now bounded as the callMany
+  methods are (TN-0057): its transaction count may not exceed what `--rpc.gascap` can hold
+  (`check_call_count`, before the signer recovery), and its transactions share one
+  `CallManyBudget`: a transaction whose gas limit exceeds what is left of the budget fails the
+  request with `-32602` before it runs (`check`, the rule a block applies to its own
+  transactions), and each one's gas used is charged after it ran. Stored blocks
+  (`debug_traceBlockByHash`, `debug_traceBlockByNumber`) pass no budget: the chain bounded
+  them already. The in-transaction cancel the review suggested is not added, because the
+  budget bounds a request to the gas cap. RPC only.
+  *Tests*: `raw_block_transaction_count_is_bounded_by_the_gas_cap` (one transaction more than
+  the cap holds fails on the count), `raw_block_transaction_gas_is_bounded_by_the_gas_cap` (a
+  transaction with a gas limit above the cap fails before it runs; the header's gas limit is
+  `u64::MAX`), `check_refuses_a_gas_limit_above_what_is_left`.
+  *Upstream*: candidate (reth main runs raw blocks under the caller's header too).

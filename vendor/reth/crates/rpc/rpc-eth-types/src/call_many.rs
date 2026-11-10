@@ -36,6 +36,19 @@ impl CallManyBudget {
         Self { left: gas_limit, limit: gas_limit }
     }
 
+    /// Refuses a call whose gas limit the remaining budget cannot cover, before it runs; the
+    /// rule a block applies to its transactions. For calls whose gas limit the caller signed,
+    /// not one `prepare_call_env` capped.
+    pub fn check(&self, gas_limit: u64) -> Result<(), EthApiError> {
+        if gas_limit > self.left {
+            return Err(EthApiError::InvalidParams(format!(
+                "request exceeds the gas budget of {}",
+                self.limit
+            )))
+        }
+        Ok(())
+    }
+
     /// Charges a finished call; fails once the request has used more than its budget.
     pub fn charge(&mut self, gas_used: u64) -> Result<(), EthApiError> {
         self.left = self.left.checked_sub(gas_used).ok_or_else(|| {
@@ -56,6 +69,19 @@ mod tests {
         let err = check_call_count(50_000_000, 2_381).unwrap_err();
         assert!(
             matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the limit of 2380 calls"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_gas_limit_above_what_is_left() {
+        let mut budget = CallManyBudget::new(50_000);
+        budget.check(50_000).unwrap();
+        budget.charge(21_000).unwrap();
+        budget.check(29_000).unwrap();
+        let err = budget.check(29_001).unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
             "{err:?}"
         );
     }

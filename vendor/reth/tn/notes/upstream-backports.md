@@ -172,3 +172,6 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 - **`trace_filter` replays bounded by its permits (TN-0077, 2026-11-09).** The filter's two
   permits now also bound the blocks it replays at once (review R10); before, a chunk of up to
   `--rpc.max-tracing-requests` blocks traced in parallel on unpermitted blocking threads.
+- **Raw `debug_traceBlock` bounded like callMany (TN-0078, 2026-11-09).** The caller's header
+  and transactions are bounded by the call count and gas budget of TN-0057 (review R3); stored
+  blocks keep their chain-enforced bounds.

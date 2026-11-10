@@ -1,4 +1,4 @@
-use alloy_consensus::{transaction::TxHashRef, BlockHeader};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_eip7928::BlockAccessList;
 use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
 use alloy_evm::env::BlockEnvironment;
@@ -127,11 +127,15 @@ where
     }
 
     /// Trace the entire block asynchronously
+    ///
+    /// TN(TN-0078): `budget` bounds the gas of a block the caller supplied; a stored block
+    /// passes `None`.
     async fn trace_block(
         &self,
         block: Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>,
         evm_env: EvmEnvFor<Eth::Evm>,
         opts: GethDebugTracingOptions,
+        mut budget: Option<CallManyBudget>,
         permit: OwnedSemaphorePermit,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
         self.eth_api()
@@ -148,6 +152,9 @@ where
                         return Err(EthApiError::InternalEthError.into())
                     }
                     let tx_hash = *tx.tx_hash();
+                    if let Some(budget) = &budget {
+                        budget.check(tx.gas_limit()).map_err(Eth::Error::from_eth_err)?;
+                    }
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
                     let res = eth_api.inspect(
@@ -156,6 +163,9 @@ where
                         tx_env.clone(),
                         &mut inspector,
                     )?;
+                    if let Some(budget) = &mut budget {
+                        budget.charge(res.result.gas_used()).map_err(Eth::Error::from_eth_err)?;
+                    }
                     let result = inspector
                         .get_result(
                             Some(TransactionContext {
@@ -199,6 +209,15 @@ where
             .map_err(BlockError::RlpDecodeRawBlock)
             .map_err(Eth::Error::from_eth_err)?;
 
+        // TN(TN-0078): the header and the transactions come from the caller, so nothing the
+        // chain enforced bounds them: a header with a huge gas limit and no base fee lets a
+        // transaction with a huge gas limit run until it ends (review R3). The block is bounded
+        // as a `debug_traceCallMany` request is: a call count the gas cap can hold, which also
+        // bounds the signer recovery below, and one gas budget across its transactions.
+        let gas_budget = self.eth_api().call_gas_limit();
+        call_many::check_call_count(gas_budget, block.body().transaction_count())
+            .map_err(Eth::Error::from_eth_err)?;
+
         let evm_env = self
             .eth_api()
             .evm_config()
@@ -219,6 +238,7 @@ where
             Arc::new(block.into_recovered_with_signers(senders)),
             evm_env,
             opts,
+            Some(CallManyBudget::new(gas_budget)),
             permit,
         )
         .await
@@ -248,7 +268,7 @@ where
             return Err(EthApiError::GenesisNotTraceable.into())
         }
 
-        self.trace_block(block, evm_env, opts, permit).await
+        self.trace_block(block, evm_env, opts, None, permit).await
     }
 
     /// Trace the transaction according to the provided options.
@@ -1456,6 +1476,83 @@ mod tests {
 /// blocking task ends.
 ///
 /// Outside the `js-tracer` test module so the default build runs it too.
+/// TN(TN-0078): a raw block is bounded as a `debug_traceCallMany` request is.
+#[cfg(test)]
+mod raw_block_bound_tests {
+    use super::*;
+    use crate::permit_test_utils::MockChain;
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_primitives::TxKind;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction as TnTransaction};
+    use reth_rpc_eth_api::helpers::Call;
+    use reth_tasks::TokioTaskExecutor;
+    use reth_testing_utils::generators;
+
+    fn api(chain: &MockChain) -> DebugApi<crate::permit_test_utils::TestEthApi> {
+        DebugApi::new(
+            chain.eth_api(),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        )
+    }
+
+    /// A block 2 on the mock chain's block 1, with `gas_limits` as its transactions' gas limits
+    /// and a header no chain would accept.
+    fn raw_block(chain: &MockChain, gas_limits: impl IntoIterator<Item = u64>) -> Bytes {
+        let mut rng = generators::rng();
+        let transactions = gas_limits
+            .into_iter()
+            .map(|gas_limit| {
+                generators::sign_tx_with_random_key_pair(
+                    &mut rng,
+                    TnTransaction::Legacy(TxLegacy {
+                        gas_limit,
+                        to: TxKind::Call(Address::with_last_byte(1)),
+                        ..Default::default()
+                    }),
+                )
+            })
+            .collect();
+        let block = Block {
+            header: Header {
+                number: 2,
+                parent_hash: chain.block.hash(),
+                gas_limit: u64::MAX,
+                ..Default::default()
+            },
+            body: BlockBody { transactions, ..Default::default() },
+        };
+        alloy_rlp::encode(block).into()
+    }
+
+    #[tokio::test]
+    async fn raw_block_transaction_count_is_bounded_by_the_gas_cap() {
+        let chain = MockChain::new();
+        let api = api(&chain);
+        let max = call_many::max_calls(api.eth_api().call_gas_limit());
+        let rlp = raw_block(&chain, std::iter::repeat_n(21_000, max + 1));
+        let err = api.debug_trace_raw_block(rlp, Default::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if *m == format!("request exceeds the limit of {max} calls")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_block_transaction_gas_is_bounded_by_the_gas_cap() {
+        let chain = MockChain::new();
+        let api = api(&chain);
+        let cap = api.eth_api().call_gas_limit();
+        let rlp = raw_block(&chain, [cap + 1]);
+        let err = api.debug_trace_raw_block(rlp, Default::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if *m == format!("request exceeds the gas budget of {cap}")),
+            "{err:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod trace_permit_tests {
     use super::*;
