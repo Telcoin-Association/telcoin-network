@@ -2164,6 +2164,41 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   refusal (the account lookup then reports a corrupted changeset). *Upstream*: no (TN-0124's
   search is TN's).
 
+- **TN-0138** — A static-file segment commit syncs its data, offsets and `.csoff` files at once.
+  *Kind*: performance (storage commit path).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, lib.rs}` (new `NippyJarWriter::sync_jobs`
+  returning `DataSync` and `OffsetsSync`, the two halves of `sync_all` over disjoint parts of the
+  writer; `sync_data`, `commit_offsets` and the unsynced offsets write run through them),
+  `crates/storage/provider/src/providers/static_file/writer.rs` (`StaticFileProviderRW::sync_all`
+  and `sync_at_once`; a test-only `fail_syncs` fault hook),
+  `.../static_file/{sync_stats.rs, manager.rs}` (`SegmentSyncStats::files_sync`; test
+  `sync_stats_record_each_phase_per_segment`), `.../static_file/tn_crash_tests.rs` (tests).
+  *Why*: under storage v2 a light persist (one block an output) waits on the static files, and
+  each segment's commit ran its `.csoff`, data and offsets `fsync`s one after another before its
+  `.conf` (quaker, slow drive state: about 7-9 ms of a 24-26 ms segment sync; about 1.2 ms an
+  `fsync` on a network disk). Their order never mattered: the configuration bounds what a reopen
+  keeps (the heal cuts every file back to it), and it is written only once `sync_all` returns, so
+  only all three being durable before it does. `sync_all` now runs them on scoped threads
+  (`std::thread::scope`, the last on the calling thread, no new dependency) through the same
+  `fsync_file` helper (TN-0117), joins all of them, and returns an error if any failed: the first
+  in the old serial order (`.csoff`, data, offsets), which is the one the serial code returned.
+  So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
+  sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
+  header only after its sync succeeded, as before. A failed call has run the other syncs too (the
+  serial code stopped at the first failure), which leaves only bytes past the configuration that
+  the heal or a retried sync already handles. `commit` (prune, unwind, rotation) keeps its serial
+  syncs. The per-file timings now overlap, so `files_sync` times the span of the three, and TN's
+  persist bench reads `sf_sync` from it. It cannot reach execution: the bytes written and the
+  `.conf` rule are unchanged; only when the three syncs run changes. *Tests*:
+  `a_failed_sync_leaves_the_configuration_unwritten` (each of the three syncs failed, both
+  formats: the call returns that error after every file was written, the `.conf` is the last
+  commit's, a reopen heals back to it and the blocks append again, a retried sync commits them)
+  and `failed_syncs_return_the_first_in_the_serial_order` (a changeset and a block segment), both
+  through the fault hook; `sync_stats_record_each_phase_per_segment` (the span holds each sync);
+  the TN-0130 to TN-0137 crash and checksum tests unchanged. Mutation-checked: the error dropped
+  (both fail), the last error returned (the order test fails). *Upstream*: maybe; it keeps
+  upstream's crash semantics.
+
 - **TN-0139** — `StateRoot` can take an account's storage root from a `StorageRootSource` instead
   of computing it. *Kind*: feature (state root performance).
   *Files*: `crates/trie/trie/src/trie.rs` (trait `StorageRootSource`; `StateRoot`'s field

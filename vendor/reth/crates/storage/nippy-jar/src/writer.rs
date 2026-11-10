@@ -433,10 +433,19 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// TN(TN-0119): split out, and `commit_offsets` made public, so the static-file writer can
     /// time the two syncs apart.
     pub fn sync_data(&mut self) -> Result<(), NippyJarError> {
-        self.data_file.flush()?;
-        // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and at every sync below.
-        reth_fs_util::fsync_file(self.data_file.get_ref())?;
-        Ok(())
+        self.sync_jobs().0.run()
+    }
+
+    /// The two halves of [`Self::sync_all`], [`Self::sync_data`] and [`Self::commit_offsets`], as
+    /// jobs that borrow disjoint parts of the writer, so they can run on two threads at once.
+    ///
+    /// TN(TN-0138): the static-file writer runs them beside its `.csoff` sync. Their order does
+    /// not matter: the configuration, written only after both, bounds what a reopen keeps.
+    pub const fn sync_jobs(&mut self) -> (DataSync<'_>, OffsetsSync<'_>) {
+        (
+            DataSync { data_file: &mut self.data_file },
+            OffsetsSync { offsets_file: &mut self.offsets_file, offsets: &mut self.offsets },
+        )
     }
 
     /// Commits configuration to disk and marks the writer as clean.
@@ -469,10 +478,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Flushes offsets to disk.
     pub fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
-        self.commit_offsets_inner()?;
-        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
-
-        Ok(())
+        self.sync_jobs().1.run()
     }
 
     #[cfg(feature = "test-utils")]
@@ -485,31 +491,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// CAUTION: Does not sync the offsets file and requires a manual call to
     /// `reth_fs_util::fsync_file(self.offsets_file.get_ref())`.
     fn commit_offsets_inner(&mut self) -> Result<(), NippyJarError> {
-        // The last offset on disk can be the first offset of `self.offsets` given how
-        // `append_column()` works alongside commit. So we need to skip it.
-        let mut last_offset_ondisk = if self.offsets_file.get_ref().metadata()?.len() > 1 {
-            self.offsets_file.seek(SeekFrom::End(-(OFFSET_SIZE_BYTES as i64)))?;
-            let mut buf = [0u8; OFFSET_SIZE_BYTES as usize];
-            self.offsets_file.get_ref().read_exact(&mut buf)?;
-            Some(u64::from_le_bytes(buf))
-        } else {
-            None
-        };
-
-        self.offsets_file.seek(SeekFrom::End(0))?;
-
-        // Appends new offsets to disk
-        for offset in self.offsets.drain(..) {
-            if let Some(last_offset_ondisk) = last_offset_ondisk.take() &&
-                last_offset_ondisk == offset
-            {
-                continue
-            }
-            self.offsets_file.write_all(&offset.to_le_bytes())?;
-        }
-        self.offsets_file.flush()?;
-
-        Ok(())
+        self.sync_jobs().1.write()
     }
 
     /// Returns the maximum row size for the associated [`NippyJar`].
@@ -558,5 +540,69 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     #[cfg(any(test, feature = "test-utils"))]
     pub const fn jar(&self) -> &NippyJar<H> {
         &self.jar
+    }
+}
+
+/// The data file's half of [`NippyJarWriter::sync_all`], from [`NippyJarWriter::sync_jobs`]:
+/// writes out the buffered rows, then syncs the file.
+#[derive(Debug)]
+pub struct DataSync<'a> {
+    data_file: &'a mut BufWriter<File>,
+}
+
+impl DataSync<'_> {
+    /// Flushes and syncs the data file ([`NippyJarWriter::sync_data`]).
+    pub fn run(self) -> Result<(), NippyJarError> {
+        self.data_file.flush()?;
+        // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`), as at every sync of the
+        // writer.
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
+        Ok(())
+    }
+}
+
+/// The offsets file's half of [`NippyJarWriter::sync_all`], from [`NippyJarWriter::sync_jobs`]:
+/// appends the offsets not yet on disk, then syncs the file.
+#[derive(Debug)]
+pub struct OffsetsSync<'a> {
+    offsets_file: &'a mut BufWriter<File>,
+    offsets: &'a mut Vec<u64>,
+}
+
+impl OffsetsSync<'_> {
+    /// Appends and syncs the offsets ([`NippyJarWriter::commit_offsets`]).
+    pub fn run(mut self) -> Result<(), NippyJarError> {
+        self.write()?;
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+        Ok(())
+    }
+
+    /// Appends the offsets, draining them, and flushes the file without syncing it.
+    fn write(&mut self) -> Result<(), NippyJarError> {
+        // The last offset on disk can be the first offset of `self.offsets` given how
+        // `append_column()` works alongside commit. So we need to skip it.
+        let mut last_offset_ondisk = if self.offsets_file.get_ref().metadata()?.len() > 1 {
+            self.offsets_file.seek(SeekFrom::End(-(OFFSET_SIZE_BYTES as i64)))?;
+            let mut buf = [0u8; OFFSET_SIZE_BYTES as usize];
+            self.offsets_file.get_ref().read_exact(&mut buf)?;
+            Some(u64::from_le_bytes(buf))
+        } else {
+            None
+        };
+
+        self.offsets_file.seek(SeekFrom::End(0))?;
+
+        // Appends new offsets to disk
+        for offset in self.offsets.drain(..) {
+            if let Some(last_offset_ondisk) = last_offset_ondisk.take() &&
+                last_offset_ondisk == offset
+            {
+                continue
+            }
+            self.offsets_file.write_all(&offset.to_le_bytes())?;
+        }
+        self.offsets_file.flush()?;
+
+        Ok(())
     }
 }

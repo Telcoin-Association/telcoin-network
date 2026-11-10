@@ -46,7 +46,7 @@ mod cursor;
 pub use cursor::NippyJarCursor;
 
 mod writer;
-pub use writer::NippyJarWriter;
+pub use writer::{DataSync, NippyJarWriter, OffsetsSync};
 
 mod consistency;
 pub use consistency::NippyJarChecker;

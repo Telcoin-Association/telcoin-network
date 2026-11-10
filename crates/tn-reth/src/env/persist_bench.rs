@@ -43,11 +43,13 @@
 //! `sf_commit` the static files' commit (their index updates), and `db_commit` the database
 //! commit after it; `db` is `db_write + db_commit`, the engine's part. The run goes under a local
 //! metrics recorder to read them, as a node started with `--metrics` runs under its own.
-//! `sf_sync` is the slowest segment's syncs inside `sf_write` (data, offsets and `.csoff` syncs
-//! and the `.conf` freeze, one after another in its thread), and `sf_sync_concurrent` what it
-//! would be with each segment's data, offsets and `.csoff` syncs issued at once, from
-//! [`RethEnv::take_static_file_sync_stats`]: when `sf_write` is longer than `db_write`, the
-//! difference is what that change could save a persist. After each mode the bench
+//! `sf_sync` is the slowest segment's syncs inside `sf_write`, from
+//! [`RethEnv::take_static_file_sync_stats`]: its data, offsets and `.csoff` syncs, which run at
+//! once (vendored reth TN-0138), then its `.conf` freeze. `sf_sync_concurrent` is the slowest
+//! segment's longest single one of those three syncs plus its freeze, what `sf_sync` would be if
+//! running them at once cost nothing beyond the slowest, so the difference is that cost (thread
+//! starts, the syncs slowing each other). When `sf_write` is longer than `db_write`, the static
+//! files are on the persist's critical path. After each mode the bench
 //! reads the last block number, a slot written by the last block and an account created by it
 //! back from the database tables.
 //!
@@ -362,11 +364,11 @@ struct Split {
     /// The static files' commit (`finalize`: since vendored TN-0118 only the index updates),
     /// before the database commit.
     sf_commit: Duration,
-    /// The slowest segment's syncs in `sf_write`: data, offsets and `.csoff` syncs and the
-    /// `.conf` freeze, one after another in its thread (`RethEnv::take_static_file_sync_stats`).
+    /// The slowest segment's syncs in `sf_write`: its data, offsets and `.csoff` syncs, which run
+    /// at once, then its `.conf` freeze (`RethEnv::take_static_file_sync_stats`).
     sf_sync: Duration,
-    /// `sf_sync` if each segment issued its data, offsets and `.csoff` syncs concurrently: the
-    /// slowest segment's longest of the three plus its `.conf` freeze (an estimate, not a run).
+    /// The slowest segment's longest one of its data, offsets and `.csoff` syncs plus its `.conf`
+    /// freeze: `sf_sync` if running the three at once cost nothing beyond the slowest.
     sf_sync_concurrent: Duration,
 }
 
@@ -388,12 +390,8 @@ impl Split {
         };
         let syncs = reth_env.take_static_file_sync_stats();
         let segments = || syncs.iter().map(|(_, s)| s);
-        let sf_sync = segments()
-            .map(|s| {
-                s.data_sync.total + s.offsets_sync.total + s.csoff_sync.total + s.conf_freeze.total
-            })
-            .max()
-            .unwrap_or_default();
+        let sf_sync =
+            segments().map(|s| s.files_sync.total + s.conf_freeze.total).max().unwrap_or_default();
         let sf_sync_concurrent = segments()
             .map(|s| {
                 s.data_sync.total.max(s.offsets_sync.total).max(s.csoff_sync.total)

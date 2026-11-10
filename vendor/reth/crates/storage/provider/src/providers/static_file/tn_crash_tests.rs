@@ -1,7 +1,8 @@
 //! TN(TN-0130 to TN-0133): the crash points of the static-file prune, rotation and deletion paths
 //! through `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens
 //! as the state before it or after it, and files shorter than their committed configuration, or
-//! a jar missing between two others, are refused.
+//! a jar missing between two others, are refused. TN(TN-0138): a failed sync of a segment commit
+//! writes no configuration.
 
 use super::{
     manager::StaticFileWriter,
@@ -9,6 +10,7 @@ use super::{
         account_changes, address, jar_path, load, provider, provider_rw, write_block_segments,
         write_changesets, CHANGES,
     },
+    SyncPhase,
 };
 use crate::providers::StaticFileProvider;
 use reth_db::{models::AccountBeforeTx, test_utils::create_test_static_files_dir};
@@ -380,4 +382,123 @@ fn assert_accounts_from(provider: &StaticFileProvider<EthPrimitives>, first: u64
     }
     let walked = provider.account_changesets_range(first..6).unwrap();
     assert_eq!(walked.len() as u64, (6 - first) * CHANGES);
+}
+
+/// The lengths of the data, offsets and `.csoff` files of the jar at `path`.
+fn synced_file_lens(path: &Path) -> [u64; 3] {
+    [path.to_path_buf(), path.with_extension("off"), path.with_extension("csoff")]
+        .map(|file| std::fs::metadata(file).unwrap().len())
+}
+
+/// Whether `err` is the fault `fail_syncs` injected into `phase`.
+fn is_injected(err: &ProviderError, phase: SyncPhase) -> bool {
+    err.to_string().contains(&format!("injected {phase:?} sync fault"))
+}
+
+/// TN(TN-0138): a segment commit's `.csoff`, data and offsets syncs run at once, and its
+/// configuration is written only when all three succeeded. With any one of them failed,
+/// `sync_and_freeze` returns that error once all three ended (each file holds the new blocks),
+/// and the configuration on disk is still the last commit's. A reopen heals the files back to it
+/// (the new blocks gone, the committed ones read back, the blocks append again); the same writer,
+/// its sync retried, commits them all. Both formats. Fails if the configuration is written after
+/// a failed sync, or if the call returns before the other syncs ended.
+#[test]
+fn a_failed_sync_leaves_the_configuration_unwritten() {
+    let tip = 3;
+    for checksums in [false, true] {
+        for phase in [SyncPhase::Csoff, SyncPhase::Data, SyncPhase::Offsets] {
+            for retry in [false, true] {
+                let case = format!("checksums {checksums}, {phase:?}, retry {retry}");
+                let (dir, _) = create_test_static_files_dir();
+                let static_files = provider(dir.path(), checksums, 1_000);
+                write_accounts(&static_files, 0..tip + 1, tip + 1);
+                let path = jar_path(&static_files, ACCOUNTS, 0);
+                let config = std::fs::read(path.with_extension("conf")).unwrap();
+                let before = synced_file_lens(&path);
+
+                let mut writer = static_files.latest_writer(ACCOUNTS).unwrap();
+                for block in tip + 1..tip + 3 {
+                    writer.append_account_changeset(account_changes(block), block).unwrap();
+                }
+                writer.fail_syncs = vec![phase];
+                let err = writer.sync_and_freeze().unwrap_err();
+                assert!(is_injected(&err, phase), "{case}: {err}");
+                assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{case}");
+                let after = synced_file_lens(&path);
+                for (file, (before, after)) in
+                    ["data", "off", "csoff"].iter().zip(before.iter().zip(after))
+                {
+                    assert!(after > *before, "{case}: {file} not written");
+                }
+
+                if retry {
+                    writer.fail_syncs.clear();
+                    writer.sync_and_freeze().unwrap();
+                    writer.finalize().unwrap();
+                    drop(writer);
+                    assert_accounts(&static_files, tip + 2, tip + 3);
+                    drop(static_files);
+                    let static_files = provider(dir.path(), checksums, 1_000);
+                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
+                    assert_accounts(&static_files, tip + 2, tip + 3);
+                } else {
+                    drop(writer);
+                    drop(static_files);
+                    let static_files = provider(dir.path(), checksums, 1_000);
+                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
+                    assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config);
+                    assert_eq!(synced_file_lens(&path), before, "{case}");
+                    assert_accounts(&static_files, tip, tip + 1);
+                    write_accounts(&static_files, tip + 1..tip + 3, tip + 3);
+                    assert_accounts(&static_files, tip + 2, tip + 3);
+                }
+            }
+        }
+    }
+}
+
+/// TN(TN-0138): with several of a commit's syncs failed, the error is the first in the order the
+/// syncs used to run one after another (`.csoff`, data, offsets), the one that order returned,
+/// for a changeset segment and for a block segment (no `.csoff`); no configuration is written.
+#[test]
+fn failed_syncs_return_the_first_in_the_serial_order() {
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+
+    for (failed, expected) in [
+        (vec![SyncPhase::Offsets, SyncPhase::Data], SyncPhase::Data),
+        (vec![SyncPhase::Offsets, SyncPhase::Csoff], SyncPhase::Csoff),
+        (vec![SyncPhase::Offsets, SyncPhase::Data, SyncPhase::Csoff], SyncPhase::Csoff),
+    ] {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider_rw(dir.path());
+        write_accounts(&static_files, 0..2, 2);
+        let path = jar_path(&static_files, ACCOUNTS, 0);
+        let config = std::fs::read(path.with_extension("conf")).unwrap();
+        let mut writer = static_files.latest_writer(ACCOUNTS).unwrap();
+        writer.append_account_changeset(account_changes(2), 2).unwrap();
+        writer.fail_syncs = failed.clone();
+        let err = writer.sync_and_freeze().unwrap_err();
+        assert!(is_injected(&err, expected), "{failed:?}: {err}");
+        assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{failed:?}");
+    }
+
+    let (dir, _) = create_test_static_files_dir();
+    let static_files = provider_rw(dir.path());
+    let segment = StaticFileSegment::Headers;
+    let mut writer = static_files.latest_writer(segment).unwrap();
+    writer.append_header(&Header::default(), &B256::ZERO).unwrap();
+    writer.commit().unwrap();
+    let path = jar_path(&static_files, segment, 0);
+    let config = std::fs::read(path.with_extension("conf")).unwrap();
+    writer.append_header(&Header { number: 1, ..Default::default() }, &B256::ZERO).unwrap();
+    for (failed, expected) in [
+        (vec![SyncPhase::Offsets], SyncPhase::Offsets),
+        (vec![SyncPhase::Offsets, SyncPhase::Data], SyncPhase::Data),
+    ] {
+        writer.fail_syncs = failed.clone();
+        let err = writer.sync_and_freeze().unwrap_err();
+        assert!(is_injected(&err, expected), "headers {failed:?}: {err}");
+        assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{failed:?}");
+    }
 }

@@ -4034,7 +4034,8 @@ mod tests {
     }
 
     /// TN(TN-0119): a persist records each sync phase once for its segment, `.csoff` only for
-    /// changeset segments, and a take drains what was recorded.
+    /// changeset segments, and a take drains what was recorded. TN(TN-0138): the span of the
+    /// files' syncs, which run at once, holds each of them.
     #[test]
     fn sync_stats_record_each_phase_per_segment() -> eyre::Result<()> {
         let (static_dir, _) = create_test_static_files_dir();
@@ -4062,12 +4063,16 @@ mod tests {
             for (phase, phase_stats) in [
                 ("data", s.data_sync),
                 ("offsets", s.offsets_sync),
+                ("files", s.files_sync),
                 ("conf", s.conf_freeze),
                 ("update_index", s.update_index),
             ] {
                 assert_eq!(phase_stats.calls, 1, "{segment:?} {phase}");
                 assert!(phase_stats.max <= phase_stats.total, "{segment:?} {phase}");
             }
+            // TN(TN-0138): the files' syncs run inside the span `files_sync` times.
+            let longest = s.data_sync.total.max(s.offsets_sync.total).max(s.csoff_sync.total);
+            assert!(s.files_sync.total >= longest, "{segment:?} files");
         }
         assert_eq!(stats.segment(StaticFileSegment::Headers).csoff_sync.calls, 0);
         assert_eq!(stats.segment(StaticFileSegment::AccountChangeSets).csoff_sync.calls, 1);

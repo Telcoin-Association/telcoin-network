@@ -28,9 +28,12 @@ impl SyncPhaseStats {
     }
 }
 
-/// One segment's sync phases. `save_blocks` runs the first four in the segment's thread, beside
-/// the database writes; `DatabaseProvider::commit` runs `update_index`, before the database
-/// commit.
+/// One segment's sync phases. `save_blocks` runs all but `update_index` in the segment's thread,
+/// beside the database writes; `DatabaseProvider::commit` runs `update_index`, before the
+/// database commit.
+///
+/// TN(TN-0138): the data, offsets and `.csoff` syncs run at once, each on its own thread, so their
+/// times overlap; `files_sync` is how long the segment waited for all three.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentSyncStats {
     /// The data file: writing out the buffered rows, then its `fsync`.
@@ -39,6 +42,8 @@ pub struct SegmentSyncStats {
     pub offsets_sync: SyncPhaseStats,
     /// The `.csoff` sidecar's `fsync` (changeset segments only).
     pub csoff_sync: SyncPhaseStats,
+    /// The three syncs above together, from their start to the end of the last.
+    pub files_sync: SyncPhaseStats,
     /// The `.conf` freeze: temp file write and `fsync`, rename, directory `fsync`.
     pub conf_freeze: SyncPhaseStats,
     /// The reader index update, which reloads the jar's configuration and maps its files.
@@ -54,6 +59,8 @@ pub(crate) enum SyncPhase {
     Offsets,
     /// [`SegmentSyncStats::csoff_sync`].
     Csoff,
+    /// [`SegmentSyncStats::files_sync`].
+    Files,
     /// [`SegmentSyncStats::conf_freeze`].
     ConfFreeze,
     /// [`SegmentSyncStats::update_index`].
@@ -101,6 +108,7 @@ impl StaticFileSyncStats {
             SyncPhase::Data => &mut stats.data_sync,
             SyncPhase::Offsets => &mut stats.offsets_sync,
             SyncPhase::Csoff => &mut stats.csoff_sync,
+            SyncPhase::Files => &mut stats.files_sync,
             SyncPhase::ConfFreeze => &mut stats.conf_freeze,
             SyncPhase::UpdateIndex => &mut stats.update_index,
         };

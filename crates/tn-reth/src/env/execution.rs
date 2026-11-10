@@ -1105,8 +1105,9 @@ mod tests {
     }
 
     /// `take_static_file_sync_stats` reports one persist's static-file syncs: under storage v1
-    /// the headers, transactions and receipts segments each sync their data and offsets, freeze
-    /// their `.conf` and update the index exactly once, and a second take is empty. The first
+    /// the headers, transactions and receipts segments each sync their data and offsets (one span
+    /// of the files' syncs, which run at once), freeze their `.conf` and update the index exactly
+    /// once, and a second take is empty. The first
     /// persist only warms up: opening a segment's writer runs its heal, which updates the index.
     #[tokio::test]
     async fn test_persist_reports_static_file_sync_stats() -> eyre::Result<()> {
@@ -1136,6 +1137,7 @@ mod tests {
             for (phase, calls) in [
                 ("data", s.data_sync.calls),
                 ("offsets", s.offsets_sync.calls),
+                ("files", s.files_sync.calls),
                 ("conf", s.conf_freeze.calls),
                 ("update_index", s.update_index.calls),
             ] {
