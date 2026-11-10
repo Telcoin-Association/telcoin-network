@@ -939,8 +939,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   crc32fast's convention (`Hasher::new_with_initial`; 0 is the standard CRC), the row being the
   jar's own 0-based row index. For one input length a CRC is injective in its initial value, so
   a value read at another position fails as surely as a changed byte, and no extra bytes are
-  hashed (on x86_64 every byte below 128 B costs a serial table step in crc32fast). On x86_64,
-  values below 128 B are checksummed with the `crc` crate's slice-by-16 table, longer ones and
+  hashed (on x86_64 crc32fast's PCLMULQDQ path starts at 128 B, and below it its table path takes
+  whole 64-byte blocks slice-by-16 and the rest a serial byte at a time: all of a value below
+  64 B). On x86_64, values below 128 B are checksummed with the `crc` crate's slice-by-16 table,
+  longer ones and
   every value on aarch64 with crc32fast (PCLMULQDQ, or the CRC instructions); the two give the
   same values (`test_checksum_implementations_agree`). Offsets include the four bytes, so the open-time heal, `prune_rows`, rotation and
   deletion, which work on lengths only, keep the framing. `NippyJarCursor::read_value`, the one
@@ -1209,3 +1211,32 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   refuses). Mutation-checked: no startup
   check, no gap error in the changeset reads, in the range fetch, or in its transaction arm.
   *Upstream*: maybe (the contiguity check; upstream's history expiry keeps a contiguous suffix).
+
+- **TN-0134** — Format hardening from the checksum review: unknown versions refused before
+  decoding, no panics on a version-1 configuration's dictionary fields, a bounded `.csoff` range
+  reservation, corrected seed and CRC docs, and tests for the seed terms and a same-row column
+  move. *Kind*: fix (static-file robustness) and docs.
+  *Files*: `crates/storage/nippy-jar/src/{lib.rs, cursor.rs}` (`NippyJar::decode_config`,
+  `NippyJarCursor::read_value`, `value_seed` and `checksum` docs, tests),
+  `crates/static-file/types/src/changeset_offsets.rs` (`ChangesetOffsetReader::get_range`,
+  tests), and the TN-0120 entry's x86 sentence.
+  *Why*: `decode_config` decoded a configuration's body with bincode before it refused an unknown
+  version; it now refuses on the version field alone, before any decode. A version-1
+  configuration has no checksum, so damage can name dictionary zstd without loaded dictionaries,
+  or with fewer than the jar's columns: `read_value` `expect`ed both and indexed by column, and
+  now returns `DictionaryNotLoaded` (TN writes no such jar; a version-2 configuration naming it
+  is refused at load, TN-0120). `get_range` reserved the caller's record count before reading,
+  so a damaged header count asked for any allocation; it now reserves at most what the file
+  holds, and a count past the file ends in the read's `UnexpectedEof`. The `value_seed` doc
+  claimed two columns' seeds meet only 2^27 rows apart: for the columns 0 to 2 the segments use
+  the closest pair is 69,757,738 rows (columns 0 and 2), still more than any jar with more than
+  one column holds (headers: 500,000 rows a file). The `checksum` doc and TN-0120 said crc32fast
+  is bytewise below 128 B on x86_64; it is bytewise below 64 B and on the tail past whole 64-byte
+  blocks (TN-0124 had it right). It cannot reach execution: valid files decode and read as
+  before. *Tests*: `test_unknown_version_refused_before_decode` (versions 0, 3 and `u64::MAX`
+  with a body bincode cannot decode), `test_dictionary_zstd_without_dictionaries_is_an_error`,
+  `test_value_seed_bounds` (rows 2^32 and 2^48 apart differ in every column; the documented
+  closest collision, computed and found), `test_checksum_detects_value_moved_to_another_column`,
+  `test_record_seed_high_half`, `test_get_range_past_the_file_is_an_error` (a count of 2^60
+  records). Mutation-checked: each change reverted, each seed's high-half term and the column
+  term removed. *Upstream*: partly (the cursor `expect`s and the reservation are upstream's).

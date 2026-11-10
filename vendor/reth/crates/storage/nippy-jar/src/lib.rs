@@ -88,8 +88,11 @@ pub fn value_checksum(row: u64, column: usize, stored: &[u8]) -> u32 {
 /// standard CRC-32):
 /// `0x9E37_79B9 ^ (row as u32) ^ ((row >> 32) as u32).rotate_left(16) ^ (column as u32) *
 /// 0x85EB_CA6B` (wrapping). For rows below 2^32, two values of one column never share a seed, and
-/// values of two columns share one only if their rows differ by the XOR of the two column terms
-/// (at least 2^27 rows apart), so neighbouring values always differ.
+/// values of two columns share one only if their rows' XOR is the XOR of the two column terms.
+/// For the columns 0 to 2 that segments use, such rows are at least 69,757,738 apart (columns 0
+/// and 2; a little over 2^26), far more rows than a jar with more than one column holds (headers:
+/// one row a block, 500,000 a file), so values that can share a jar never share a seed. Rows from
+/// 2^32 on fold their high half in, so they too differ from the rows below.
 pub const fn value_seed(row: u64, column: usize) -> u32 {
     0x9E37_79B9 ^
         (row as u32) ^
@@ -98,8 +101,10 @@ pub const fn value_seed(row: u64, column: usize) -> u32 {
 }
 
 /// TN(TN-0120): the CRC-32 (ISO-HDLC) of `bytes` from the initial value `seed` (crc32fast's
-/// convention). On `x86_64` below 128 bytes crc32fast runs a byte-at-a-time loop, so these inputs
-/// take the `crc` crate's slice-by-16 table instead; both give the same value.
+/// convention). On `x86_64` crc32fast's PCLMULQDQ path starts at 128 bytes; below that its table
+/// path runs slice-by-16 on whole 64-byte blocks and a byte at a time on the rest (all of an input
+/// below 64 bytes), so these inputs take the `crc` crate's slice-by-16 table instead; both give
+/// the same value.
 pub fn checksum(seed: u32, bytes: &[u8]) -> u32 {
     if cfg!(target_arch = "x86_64") && bytes.len() < 128 {
         checksum_slice16(seed, bytes)
@@ -327,6 +332,14 @@ impl<H: NippyJarHeader> NippyJar<H> {
     /// version-1 configuration decodes as upstream's does; any other version is refused.
     fn decode_config(bytes: &[u8], config_path: &Path) -> Result<Self, NippyJarError> {
         let version = bytes.get(..8).map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")));
+        // TN(TN-0134): an unknown version is refused before anything is decoded with a layout it
+        // may not have.
+        if let Some(version) = version &&
+            version != NIPPY_JAR_VERSION as u64 &&
+            version != NIPPY_JAR_VERSION_CHECKSUMS as u64
+        {
+            return Err(NippyJarError::UnsupportedVersion(version as usize))
+        }
         let body = if version == Some(NIPPY_JAR_VERSION_CHECKSUMS as u64) {
             let checksummed = bytes
                 .len()
@@ -1955,6 +1968,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TN(TN-0134): the seed's high-half term separates rows 2^32 apart, and the closest rows of
+    /// two columns that share a seed are as far apart as `value_seed` documents (columns 0 and 2,
+    /// 69,757,738 rows).
+    #[test]
+    fn test_value_seed_bounds() {
+        for row in [0, 1, 7, 499_999, u32::MAX as u64] {
+            for column in 0..3 {
+                assert_ne!(value_seed(row, column), value_seed(row + (1 << 32), column));
+                assert_ne!(value_seed(row, column), value_seed(row + (1 << 48), column));
+            }
+        }
+        assert_eq!(value_seed(64_459_990, 0), value_seed(134_217_728, 2));
+        let term = |column: usize| (column as u32).wrapping_mul(0x85EB_CA6B);
+        let closest = |difference: u32| {
+            let top = 1u64 << (31 - difference.leading_zeros());
+            top - (difference as u64 - top)
+        };
+        let pairs = [(0, 1), (0, 2), (1, 2)];
+        let min = pairs.iter().map(|&(a, b)| closest(term(a) ^ term(b))).min().unwrap();
+        assert_eq!(min, 134_217_728 - 64_459_990);
+    }
+
+    /// TN(TN-0134): a value copied over another column's value of the same row fails that
+    /// column's read, as one moved to another row does.
+    #[test]
+    fn test_checksum_detects_value_moved_to_another_column() {
+        let (col1, col2) = test_data(Some(19));
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        let path = jar.path();
+        freeze_checksummed(path, &col1, &col2, false);
+        let row = 5;
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let reader = nippy.open_data_reader().unwrap();
+        let (first, second, end) = (
+            reader.offset(row * 2).unwrap(),
+            reader.offset(row * 2 + 1).unwrap(),
+            reader.offset(row * 2 + 2).unwrap(),
+        );
+        drop(reader);
+        assert_eq!(second - first, end - second);
+        let mut data = std::fs::read(path).unwrap();
+        let moved = data[first as usize..second as usize].to_vec();
+        data[second as usize..end as usize].copy_from_slice(&moved);
+        std::fs::write(path, data).unwrap();
+
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        for result in [
+            cursor.row_by_number(row).map(drop),
+            cursor.row_by_number_with_cols(row, 0b10).map(drop),
+        ] {
+            assert!(
+                matches!(result, Err(NippyJarError::ChecksumMismatch { row: 5, column: 1, .. })),
+                "{result:?}"
+            );
+        }
+        assert!(cursor.row_by_number_with_cols(row, 0b01).is_ok());
+    }
+
+    /// TN(TN-0134): a configuration naming an unknown version is refused as that, before its body
+    /// is decoded, whatever follows the version.
+    #[test]
+    fn test_unknown_version_refused_before_decode() {
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        for version in [0u64, 3, u64::MAX] {
+            let mut config = version.to_le_bytes().to_vec();
+            config.extend_from_slice(&[0xFF; 5]);
+            std::fs::write(jar.path().with_extension(CONFIG_FILE_EXTENSION), config).unwrap();
+            let err = NippyJar::load_without_header(jar.path()).unwrap_err();
+            assert!(
+                matches!(err, NippyJarError::UnsupportedVersion(v) if v == version as usize),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// TN(TN-0134): a version-1 configuration that names dictionary zstd without the dictionaries
+    /// (no checksum guards a version-1 configuration) makes reads fail, not panic.
+    #[test]
+    fn test_dictionary_zstd_without_dictionaries_is_an_error() {
+        let (col1, col2) = test_data(Some(20));
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        freeze_version(jar.path(), &col1, &col2, false);
+        let mut nippy = NippyJar::load_without_header(jar.path()).unwrap();
+        nippy.compressor = Some(Compressors::Zstd(compression::Zstd::new(true, 5000, 2)));
+        nippy.freeze_config().unwrap();
+
+        let nippy = NippyJar::load_without_header(jar.path()).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        let result = cursor.row_by_number(0).map(drop);
+        assert!(matches!(result, Err(NippyJarError::DictionaryNotLoaded)), "{result:?}");
     }
 
     /// TN(TN-0120): both CRC implementations give the same value for every length and initial
