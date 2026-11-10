@@ -1386,9 +1386,21 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     /// v1 records the slots such a wipe removes by reading them from `PlainStorageState`
     /// (`write_state_reverts`). Storage v2 has no plain state and builds its changesets and history
     /// from the reverts alone, which list only the slots the block itself touched, so those slots
-    /// would be missing from both. Since Cancun this cannot happen: `SELFDESTRUCT` clears only an
-    /// account created in the same transaction, and EIP-7610 refuses to create an account at an
-    /// address that has storage. This makes that argument a check rather than a silent gap.
+    /// would be missing from both.
+    ///
+    /// TN(TN-0116): execution cannot reach the error. revm wipes an account's storage when it
+    /// self-destructs the account, or deletes it as an empty account a transaction touched
+    /// (EIP-161). Since Cancun (EIP-6780) `SELFDESTRUCT` deletes only an account created in the
+    /// same transaction, and revm creates an account only at an address with no code and a zero
+    /// nonce (it checks just those two, not EIP-7610's storage rule); an empty account has no code
+    /// and a zero nonce too. So the wiped account had storage only if an address with no code and a
+    /// zero nonce held storage, and execution never leaves one: only code running at an address
+    /// writes its storage, a contract keeps its code and gets nonce 1 at creation (even with empty
+    /// runtime code), and an EIP-7702 authorization bumps the nonce of the account it delegates.
+    /// (A native precompile that writes its own storage, such as TN's TEL precompile, needs code in
+    /// genesis for this to hold; TN's has `0xfe`.) Only a genesis alloc can set storage without
+    /// code, and `init_genesis_with_settings` refuses that under v2. This check turns the argument
+    /// into an error instead of a silent gap.
     ///
     /// Must run before the batch's hashed state is written, while `HashedStorages` still holds the
     /// storage from before the batch. A slot changed by an earlier block of the same batch counts

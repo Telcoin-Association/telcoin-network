@@ -658,7 +658,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - A wiped account's pre-existing slots are not in the reverts. v1 reads them from
     `PlainStorageState`; v2 has no plain state. The new check fails `save_blocks` if a wiped
     account had storage before the wipe (in `HashedStorages` before the batch, or changed by an
-    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen; the check makes
+    earlier block of the batch). Since Cancun (TN's genesis) this cannot happen from execution
+    (TN-0116 corrects the argument and refuses the genesis alloc that could); the check makes
     that an error instead of a silent gap.
   - The history unwinds run in both layouts.
   - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
@@ -888,3 +889,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `SegmentHeader::changeset_offset_index` ignores the file's first block (the single-file ones
   pass), the unwind when `truncate_changesets` stops deleting files, and the aborted save when
   `NippyJar::delete` leaves a file's configuration behind. *Upstream*: n/a.
+
+- **TN-0116** — A storage v2 genesis refuses an account with storage but no code; the wipe
+  check's rationale is corrected. *Kind*: fix (genesis init, v2 only) and docs.
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`, new
+  `InitStorageError::GenesisStorageWithoutCode`; test `v2_genesis_refuses_storage_without_code`;
+  `v2_genesis_storage_reads_after_genesis` gives its account code),
+  `crates/storage/provider/src/providers/database/provider.rs` (the doc of
+  `ensure_wiped_accounts_had_no_storage`).
+  *Why*: TN-0043's check documented that a wipe of an account with storage cannot happen since
+  Cancun because EIP-7610 refuses a create at an address with storage. revm does not apply that
+  rule: its create collision check looks at the code hash and the nonce only. The argument that
+  holds: revm wipes storage when it self-destructs an account (since EIP-6780 only one created in
+  the same transaction, which revm allows only at an address with no code and a zero nonce) or
+  deletes a touched empty account (EIP-161: no code, zero nonce, zero balance). Execution never
+  leaves storage at an address with no code and a zero nonce: only code running at an address
+  writes its storage, a created contract gets nonce 1 even with empty runtime code, and an
+  EIP-7702 authorization bumps the delegating account's nonce. (A native precompile writing its
+  own storage needs code in genesis; TN's TEL precompile has `0xfe`.) The one source left is a
+  genesis alloc, so under v2 `init_genesis_with_settings` now refuses an account with storage
+  and no code (absent or empty) before it writes anything, rather than letting a later block
+  halt the chain. TN's testnet and mainnet genesis files and the precompile configuration have no
+  such account (checked 2026-11-09); v1 genesis is unchanged. It cannot change execution: it only
+  refuses a genesis v2 could not store faithfully. *Tests*:
+  `v2_genesis_refuses_storage_without_code` (absent and empty code: v2 refuses with nothing
+  written, v1 writes it; fails with the check removed). *Upstream*: maybe (upstream's v2 has the
+  same wipe gap, TN-0043).

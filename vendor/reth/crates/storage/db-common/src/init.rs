@@ -64,6 +64,12 @@ pub enum InitStorageError {
     /// State root doesn't match the expected one.
     #[error("state root mismatch: {_0}")]
     StateRootMismatch(GotExpected<B256>),
+    /// TN(TN-0116): a storage v2 genesis allocates storage to an account without code.
+    #[error(
+        "genesis account {_0} has storage but no code; storage v2 refuses it, because it could \
+         not record those slots if a later block wiped the account"
+    )]
+    GenesisStorageWithoutCode(Address),
 }
 
 impl From<DatabaseError> for InitStorageError {
@@ -176,10 +182,24 @@ where
 
     debug!("Writing genesis block.");
 
+    let alloc = &genesis.alloc;
+
+    // TN(TN-0116): a genesis account with storage but no code (and a zero nonce) is the only
+    // account a later block can wipe with its storage in place (EIP-161's empty-account deletion,
+    // or a `SELFDESTRUCT` after a create over it), which v2 cannot record and refuses at that block
+    // (`DatabaseProvider::ensure_wiped_accounts_had_no_storage`). Refuse it before anything is
+    // written, at genesis, instead of halting the chain later.
+    if genesis_storage_settings.storage_v2 &&
+        let Some((address, _)) = alloc.iter().find(|(_, account)| {
+            account.storage.as_ref().is_some_and(|storage| !storage.is_empty()) &&
+                account.code.as_ref().is_none_or(|code| code.is_empty())
+        })
+    {
+        return Err(InitStorageError::GenesisStorageWithoutCode(*address))
+    }
+
     // Make sure to set storage settings before anything writes
     factory.set_storage_settings_cache(genesis_storage_settings);
-
-    let alloc = &genesis.alloc;
 
     // use transaction to insert genesis header
     let provider_rw = factory.database_provider_rw()?;
@@ -638,6 +658,7 @@ mod tests {
         HOLESKY_GENESIS_HASH, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH,
     };
     use alloy_genesis::Genesis;
+    use alloy_primitives::Bytes;
     use reth_chainspec::{Chain, ChainSpec, HOLESKY, MAINNET, SEPOLIA};
     use reth_db::DatabaseEnv;
     use reth_db_api::{
@@ -792,6 +813,8 @@ mod tests {
                     address,
                     GenesisAccount {
                         balance: U256::from(1),
+                        // TN(TN-0116): v2 refuses genesis storage without code.
+                        code: Some(Bytes::from_static(&[0x00])),
                         storage: Some(BTreeMap::from([(slot, value)])),
                         ..Default::default()
                     },
@@ -835,6 +858,50 @@ mod tests {
             ));
         }
         assert_eq!(layouts[0], layouts[1], "genesis history differs between v1 and v2");
+    }
+
+    /// TN(TN-0116): a v2 genesis that allocates storage to an account without code is refused
+    /// before anything is written; v1, which can record a wipe of it, writes it.
+    #[test]
+    fn v2_genesis_refuses_storage_without_code() {
+        let address = Address::with_last_byte(3);
+        for code in [None, Some(Bytes::new())] {
+            let chain_spec = Arc::new(ChainSpec {
+                chain: Chain::from_id(1),
+                genesis: Genesis {
+                    alloc: BTreeMap::from([(
+                        address,
+                        GenesisAccount {
+                            balance: U256::from(1),
+                            code: code.clone(),
+                            storage: Some(BTreeMap::from([(B256::ZERO, B256::with_last_byte(1))])),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                hardforks: Default::default(),
+                paris_block_and_final_difficulty: None,
+                deposit_contract: None,
+                ..Default::default()
+            });
+
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+            let err = init_genesis_with_settings(&factory, StorageSettings::v2()).unwrap_err();
+            assert!(
+                matches!(err, InitStorageError::GenesisStorageWithoutCode(a) if a == address),
+                "{code:?}: {err}"
+            );
+            let static_files = factory.static_file_provider();
+            assert_eq!(
+                static_files.get_highest_static_file_block(StaticFileSegment::Headers),
+                None
+            );
+            assert_eq!(factory.storage_settings().unwrap(), None, "{code:?}: settings written");
+
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+            init_genesis_with_settings(&factory, StorageSettings::v1()).unwrap();
+        }
     }
 
     #[test]
