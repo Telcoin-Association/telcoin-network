@@ -6,12 +6,12 @@ use crate::{
     duration_ms,
     error::{EngineResult, TnEngineError},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, ProviderError,
-    RethEnv,
+    BlockBuildTimings, CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay,
+    ProviderError, RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, ConsensusOutput,
@@ -30,7 +30,12 @@ use tracing::{debug, error, field, info, info_span, trace, warn};
 /// Every output that produces blocks ends with one `output executed` debug line (target
 /// `engine`) splitting its wall time into `execute_ms` (entry to the end of the block loop),
 /// `persist_ms` (the bounded durable persist, retries included) and `announce_ms` (the
-/// post-commit announce plus the in-memory finalize). The skipped empty path does not log it.
+/// post-commit announce plus the in-memory finalize). `execute_ms` is split further into the
+/// block builds' summed laps (`recover_ms`, `evm_ms`, `root_ms`, `finish_ms`, see
+/// [`BlockBuildTimings`]) and `other_ms`, the rest of it (payload construction, in-memory chain
+/// updates, logging); `max_block_root_ms` and `max_block_evm_ms` are the slowest block's laps
+/// and `txs` counts the transactions handed to the builder. The skipped empty path does not log
+/// it.
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
@@ -127,6 +132,8 @@ pub fn execute_consensus_output(
 
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
+    // observability only: the block builds' laps, summed for the `output executed` line
+    let mut timings = OutputTimings::default();
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
     // The pre-output canonical tip. Each block eagerly advances the shared in-memory state
     // (see `execute_payload`), but the durable commit happens only after the whole output builds.
@@ -213,6 +220,8 @@ pub fn execute_consensus_output(
             &reth_env,
             &canonical_in_memory_state,
             &mut output_overlay,
+            &mut timings,
+            output.number(),
         );
         // On failure, revert the in-memory advance applied by any earlier block of this output so
         // the propagated error never leaves a phantom canonical head observable to RPC. The leader
@@ -294,6 +303,8 @@ pub fn execute_consensus_output(
                 &reth_env,
                 &canonical_in_memory_state,
                 &mut output_overlay,
+                &mut timings,
+                output.number(),
             );
             // On failure of a later block, revert the in-memory advance applied by the earlier
             // blocks of this output so the propagated (node-halting) error never leaves a phantom
@@ -322,6 +333,10 @@ pub fn execute_consensus_output(
     span.record("executed_blocks", executed_blocks.len().to_string());
     let execute_elapsed = execute_start.elapsed();
     let block_count = executed_blocks.len();
+    crate::metrics::ENGINE_METRICS.recover_seconds.record(timings.recover);
+    crate::metrics::ENGINE_METRICS.evm_seconds.record(timings.evm);
+    crate::metrics::ENGINE_METRICS.root_seconds.record(timings.root);
+    crate::metrics::ENGINE_METRICS.finish_seconds.record(timings.finish);
 
     // Durably commit the output, then announce it. The two halves are called separately
     // (rather than through `finish_executing_output`) because their failure contracts
@@ -355,6 +370,9 @@ pub fn execute_consensus_output(
     reth_env.finalize_block(canonical_header.clone())?;
     let announce_elapsed = announce_start.elapsed();
 
+    crate::metrics::ENGINE_METRICS
+        .executed_transactions_total
+        .increment(u64::try_from(tx_count).unwrap_or(u64::MAX));
     debug!(
         target: "engine",
         consensus_number = output.number(),
@@ -364,6 +382,14 @@ pub fn execute_consensus_output(
         execute_ms = duration_ms(execute_elapsed),
         persist_ms = duration_ms(persist_elapsed),
         announce_ms = duration_ms(announce_elapsed),
+        txs = tx_count,
+        recover_ms = duration_ms(timings.recover),
+        evm_ms = duration_ms(timings.evm),
+        root_ms = duration_ms(timings.root),
+        finish_ms = duration_ms(timings.finish),
+        other_ms = duration_ms(execute_elapsed.saturating_sub(timings.laps())),
+        max_block_root_ms = duration_ms(timings.max_block_root),
+        max_block_evm_ms = duration_ms(timings.max_block_evm),
         "output executed"
     );
 
@@ -371,11 +397,54 @@ pub fn execute_consensus_output(
     Ok(canonical_header)
 }
 
+/// The block builds' phase laps summed over one consensus output, plus the slowest block's
+/// root and evm laps.
+///
+/// Observability only: it feeds the `output executed` line and the `tn_engine_*_seconds`
+/// split histograms, never block contents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OutputTimings {
+    /// Summed signer-recovery laps.
+    recover: Duration,
+    /// Summed builder-setup, pre-execution and transaction-loop laps.
+    evm: Duration,
+    /// Summed state-root laps.
+    root: Duration,
+    /// Summed finish laps (the rest of `finish` plus the delta sorts and overlay extend).
+    finish: Duration,
+    /// The longest single-block state-root lap.
+    max_block_root: Duration,
+    /// The longest single-block evm lap.
+    max_block_evm: Duration,
+}
+
+impl OutputTimings {
+    /// Fold one block's laps into the output's sums and maxima.
+    fn add(&mut self, block: &BlockBuildTimings) {
+        self.recover = self.recover.saturating_add(block.recover);
+        self.evm = self.evm.saturating_add(block.evm);
+        self.root = self.root.saturating_add(block.root);
+        self.finish = self.finish.saturating_add(block.finish);
+        self.max_block_root = self.max_block_root.max(block.root);
+        self.max_block_evm = self.max_block_evm.max(block.evm);
+    }
+
+    /// The four summed laps together; `execute_ms` minus this is the line's `other_ms`.
+    fn laps(&self) -> Duration {
+        self.recover.saturating_add(self.evm).saturating_add(self.root).saturating_add(self.finish)
+    }
+}
+
 /// Execute the transaction and update canon chain in-memory.
 ///
 /// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
 /// computes this block's state root layered over it and then extends it with the block's
-/// sorted deltas for the NEXT block of the output (#1301).
+/// sorted deltas for the NEXT block of the output (#1301). The build's phase laps are added to
+/// `timings`. `consensus_number` only labels the `next block executed` line, together with the
+/// payload's batch index and digest, so each block joins back to its consensus output and batch.
+// the per-output accumulators and the log context are separate on purpose; bundling them into a
+// struct would only rename the same eight values
+#[allow(clippy::too_many_arguments)]
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
@@ -383,15 +452,29 @@ fn execute_payload(
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
     output_overlay: &mut OutputTrieOverlay,
+    timings: &mut OutputTimings,
+    consensus_number: u64,
 ) -> EngineResult<SealedHeader> {
+    // the payload moves into the build: keep its consensus ids for the log line
+    let batch_index = payload.batch_index;
+    let batch_digest = payload.batch_digest;
     // execute
-    let next_canonical_block =
-        reth_env.build_block_from_batch_payload(payload, transactions, output_overlay)?;
+    let (next_canonical_block, block_timings) =
+        reth_env.build_block_from_batch_payload_timed(payload, transactions, output_overlay)?;
+    timings.add(&block_timings);
     trace!(target: "engine::dump", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
-    info!(target: "engine", hash = canonical_header.hash().to_string(), number = canonical_header.number, "next block executed");
+    info!(
+        target: "engine",
+        hash = canonical_header.hash().to_string(),
+        number = canonical_header.number,
+        consensus_number,
+        batch_index,
+        batch_digest = %batch_digest,
+        "next block executed"
+    );
     crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
@@ -563,5 +646,28 @@ mod tests {
     #[test]
     fn test_ordinary_provider_fault_is_retryable() {
         assert!(retryable_persist_fault(&ProviderError::HeaderNotFound(0u64.into())));
+    }
+
+    /// The laps sum across an output's blocks, the maxima keep the slowest block's root and evm
+    /// laps, and `laps` is the four sums together.
+    #[test]
+    fn test_output_timings_add_sums_laps_and_keeps_block_maxima() {
+        let ms = Duration::from_millis;
+        let mut timings = OutputTimings::default();
+        timings.add(&BlockBuildTimings { recover: ms(1), evm: ms(10), root: ms(7), finish: ms(2) });
+        timings.add(&BlockBuildTimings { recover: ms(3), evm: ms(4), root: ms(9), finish: ms(5) });
+
+        assert_eq!(
+            timings,
+            OutputTimings {
+                recover: ms(4),
+                evm: ms(14),
+                root: ms(16),
+                finish: ms(7),
+                max_block_root: ms(9),
+                max_block_evm: ms(10),
+            }
+        );
+        assert_eq!(timings.laps(), ms(41));
     }
 }

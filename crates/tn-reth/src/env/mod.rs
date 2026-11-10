@@ -55,6 +55,7 @@ mod helpers;
 mod output_overlay;
 mod rpc;
 
+pub use execution::BlockBuildTimings;
 pub use output_overlay::OutputTrieOverlay;
 
 /// This is a wrapped abstraction around Reth.

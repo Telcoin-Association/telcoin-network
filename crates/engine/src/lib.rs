@@ -23,7 +23,7 @@
 mod error;
 mod metrics;
 mod payload_builder;
-use crate::metrics::ENGINE_METRICS;
+use crate::metrics::{EngineMetrics, ENGINE_METRICS};
 use error::EngineResult;
 pub use error::TnEngineError;
 use futures::{future::OptionFuture, StreamExt};
@@ -152,7 +152,9 @@ impl ExecutorEngine {
         let (tx, rx) = oneshot::channel();
 
         // pop next output in queue and execute
-        if let Some((output, queue_wait)) = take_next_queued(&mut self.queued, Instant::now()) {
+        if let Some(Dequeued { output, queue_wait, forward_wait }) =
+            take_next_queued(&mut self.queued, Instant::now())
+        {
             ENGINE_METRICS.queue_wait_seconds.record(queue_wait);
             let consensus_number = output.number();
             let reth_env = self.reth_env.clone();
@@ -181,6 +183,8 @@ impl ExecutorEngine {
                     consensus_number,
                     queue_wait_ms = duration_ms(queue_wait),
                     task_ms = duration_ms(task_elapsed),
+                    // zero for an output nothing stamped (only tests bypass the forwarder)
+                    forward_wait_ms = duration_ms(forward_wait.unwrap_or_default()),
                     "output execution task finished"
                 );
                 if let Err(e) = tx.send(result) {
@@ -288,9 +292,25 @@ impl ExecutorEngine {
                 output = self.consensus_output_stream.next(), if !consensus_closed && self.queued.len() < MAX_QUEUED_OUTPUTS => {
                     output
                         .map(|output| {
+                            let queued_at = Instant::now();
+                            // the hop from the forwarder to here, and the backlog it left in the
+                            // channel
+                            record_arrival(
+                                &ENGINE_METRICS,
+                                &output,
+                                queued_at,
+                                self.consensus_output_stream.as_ref().len(),
+                            );
                             // queue the output for local execution, stamped for the queue-wait
                             // histogram
-                            self.queued.push_back((Instant::now(), output));
+                            let consensus_number = output.number();
+                            self.queued.push_back((queued_at, output));
+                            debug!(
+                                target: "engine",
+                                consensus_number,
+                                depth = self.queued.len(),
+                                "output queued"
+                            );
                             // backlog growth means execution is falling behind consensus
                             ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
                         })
@@ -313,6 +333,11 @@ impl ExecutorEngine {
                     ENGINE_METRICS.outputs_executed_total.increment(1);
                     ENGINE_METRICS.canonical_height.set(self.parent_header.number as f64);
                     ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                    // the stream is not polled while the queue is full, so the channel depth
+                    // also refreshes here, once per executed output
+                    ENGINE_METRICS
+                        .channel_depth
+                        .set(self.consensus_output_stream.as_ref().len() as f64);
 
                     // check max_round to auto shutdown
                     #[cfg(any(test, feature = "test-utils"))]
@@ -341,15 +366,56 @@ impl std::fmt::Debug for ExecutorEngine {
     }
 }
 
-/// Pop the oldest queued consensus output and return it with the time it spent in the queue.
+/// A consensus output popped off the engine queue with the waits measured for it.
+#[derive(Debug)]
+struct Dequeued {
+    /// The output to execute.
+    output: ConsensusOutput,
+    /// Time in the engine queue, from arrival off the consensus stream to dispatch.
+    queue_wait: Duration,
+    /// Time from the forwarder's stamp to arrival off the consensus stream (see
+    /// [`forward_wait`]); `None` for an unstamped output.
+    forward_wait: Option<Duration>,
+}
+
+/// Pop the oldest queued consensus output and return it with the time it spent in the queue
+/// and, for a stamped output, the forward wait before it.
 ///
 /// FIFO exactly like the plain `pop_front` it wraps; `now` is the dispatch instant the wait is
 /// measured to. A stamp later than `now` (impossible with a monotonic clock) reads as zero.
 fn take_next_queued(
     queued: &mut VecDeque<(Instant, ConsensusOutput)>,
     now: Instant,
-) -> Option<(ConsensusOutput, Duration)> {
-    queued.pop_front().map(|(queued_at, output)| (output, now.saturating_duration_since(queued_at)))
+) -> Option<Dequeued> {
+    queued.pop_front().map(|(queued_at, output)| Dequeued {
+        forward_wait: forward_wait(&output, queued_at),
+        queue_wait: now.saturating_duration_since(queued_at),
+        output,
+    })
+}
+
+/// Record one output's arrival off the consensus stream: its forward wait (stamped outputs
+/// only) and the depth of the `to_engine` channel left behind it.
+fn record_arrival(
+    metrics: &EngineMetrics,
+    output: &ConsensusOutput,
+    arrived: Instant,
+    channel_depth: usize,
+) {
+    if let Some(wait) = forward_wait(output, arrived) {
+        metrics.forward_wait_seconds.record(wait);
+    }
+    metrics.channel_depth.set(channel_depth as f64);
+}
+
+/// Time from the forwarder's stamp on `output` to its arrival off the consensus stream.
+///
+/// The node stamps every output just before sending it to the engine
+/// (`ConsensusOutput::set_forwarded_at`), so this covers a send blocked on a full channel plus
+/// the time spent in the channel. `None` for an unstamped output (tests push outputs past the
+/// forwarder); a stamp later than `arrived` reads as zero.
+fn forward_wait(output: &ConsensusOutput, arrived: Instant) -> Option<Duration> {
+    output.forwarded_at().map(|at| arrived.saturating_duration_since(at))
 }
 
 /// Whole milliseconds in `elapsed`, saturating at `u64::MAX`, for log fields and the busy-time
@@ -361,6 +427,7 @@ pub(crate) fn duration_ms(elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     /// Build a distinguishable output: only the consensus number matters to the queue.
     fn output(number: u64) -> ConsensusOutput {
@@ -368,28 +435,32 @@ mod tests {
     }
 
     /// The stamped queue pops in arrival order and reports each output's wait up to the
-    /// dispatch instant.
+    /// dispatch instant, plus the forward wait before arrival for a forwarder-stamped output.
     #[test]
     fn test_take_next_queued_is_fifo_and_measures_queue_wait() {
         let base = Instant::now();
         let at = |ms: u64| base + Duration::from_millis(ms);
+        let mut forwarded = output(2);
+        forwarded.set_forwarded_at(at(4));
         let mut queued = VecDeque::new();
         queued.push_back((at(0), output(1)));
-        queued.push_back((at(10), output(2)));
+        queued.push_back((at(10), forwarded));
         queued.push_back((at(30), output(3)));
 
         let now = at(50);
-        let popped: Vec<(u64, Duration)> =
+        let popped: Vec<(u64, Duration, Option<Duration>)> =
             std::iter::from_fn(|| take_next_queued(&mut queued, now))
-                .map(|(output, wait)| (output.number(), wait))
+                .map(|dequeued| {
+                    (dequeued.output.number(), dequeued.queue_wait, dequeued.forward_wait)
+                })
                 .collect();
 
         assert_eq!(
             popped,
             vec![
-                (1, Duration::from_millis(50)),
-                (2, Duration::from_millis(40)),
-                (3, Duration::from_millis(20)),
+                (1, Duration::from_millis(50), None),
+                (2, Duration::from_millis(40), Some(Duration::from_millis(6))),
+                (3, Duration::from_millis(20), None),
             ]
         );
         assert!(queued.is_empty());
@@ -403,9 +474,59 @@ mod tests {
         let mut queued = VecDeque::new();
         queued.push_back((base + Duration::from_millis(5), output(7)));
 
-        let (output, wait) = take_next_queued(&mut queued, base).expect("one queued output");
-        assert_eq!(output.number(), 7);
-        assert_eq!(wait, Duration::ZERO);
+        let dequeued = take_next_queued(&mut queued, base).expect("one queued output");
+        assert_eq!(dequeued.output.number(), 7);
+        assert_eq!(dequeued.queue_wait, Duration::ZERO);
+    }
+
+    /// A saturated `to_engine` channel: the output taken off it reports the time it sat there
+    /// since the forwarder's stamp, and the depth gauge reads the backlog left behind it.
+    #[test]
+    fn test_saturated_channel_reports_depth_and_forward_wait() {
+        const CAPACITY: usize = 4;
+        let (to_engine, rx) = mpsc::channel(CAPACITY);
+        let forwarded_at = Instant::now();
+        for number in 1..=CAPACITY as u64 {
+            let mut stamped = output(number);
+            stamped.set_forwarded_at(forwarded_at);
+            to_engine.try_send(stamped).expect("channel has room");
+        }
+        assert!(to_engine.try_send(output(99)).is_err(), "test setup: channel must be full");
+        let mut stream = ReceiverStream::new(rx);
+
+        // the outputs sit in the full channel before the engine takes the first one
+        std::thread::sleep(Duration::from_millis(5));
+        let received = stream.as_mut().try_recv().expect("a queued output");
+        let arrived = Instant::now();
+        assert_eq!(received.number(), 1);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        ::metrics::with_local_recorder(&recorder, || {
+            // constructed here (not the static) so the handles bind to the local recorder
+            let metrics = EngineMetrics::new_with_labels(Vec::<::metrics::Label>::new());
+            record_arrival(&metrics, &received, arrived, stream.as_ref().len());
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let recorded = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("metric {name} not recorded"))
+        };
+        assert!(matches!(
+            recorded("tn_engine.channel_depth"),
+            DebugValue::Gauge(depth) if depth.0 == (CAPACITY - 1) as f64
+        ));
+        assert!(matches!(
+            recorded("tn_engine.forward_wait_seconds"),
+            DebugValue::Histogram(waits) if waits.len() == 1 && waits[0].0 >= 0.005
+        ));
+
+        // an output nothing stamped has no forward wait to record
+        assert_eq!(forward_wait(&output(7), arrived), None);
     }
 
     /// Millisecond conversion truncates sub-millisecond remainders.
