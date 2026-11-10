@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy clippy-fix docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -93,7 +93,9 @@ help:
 	@echo "    :::> cargo fmt (nightly toolchain pinned in rust-nightly)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
+	@echo "    :::> The CI clippy lane (./etc/ci-lanes.sh clippy): the release graph, all features, and all features but mdbx (nightly toolchain pinned in rust-nightly)." ;
+	@echo "make clippy-fix" ;
+	@echo "    :::> cargo clippy --fix over all features, then over the default features (the tn-lmdb arms)." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
@@ -518,9 +520,18 @@ coverage-html:
 fmt:
 	cargo +$(NIGHTLY) fmt --all ;
 
-# clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
+# lint what CI lints: the three passes of `./etc/ci-lanes.sh clippy` (the release graph; the
+# workspace's every target with every feature, which runs reth on MDBX; and with every feature but
+# `mdbx`, the default tn-lmdb arms), under the lane's flags (nightly toolchain pinned in
+# rust-nightly)
 clippy:
-	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
+	./etc/ci-lanes.sh clippy ;
+
+# apply clippy's fixes to the code of both reth backends: every feature (the `mdbx` arms), then
+# the default features (the tn-lmdb arms `--all-features` never compiles)
+clippy-fix:
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --fix ;
 
 # log docker in to ghcr.io as your GitHub user; docker prompts for the password:
 # paste a classic PAT with write:packages only, never the gh token
