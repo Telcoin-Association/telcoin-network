@@ -873,6 +873,11 @@ impl<DB: Database> Consensus<DB> {
                 changed = rx_recent_blocks.changed() => {
                     // the bus owns the sender, so this fails only once the bus is gone
                     changed.map_err(|_| ConsensusError::ShuttingDown)?;
+                    // the executed round is a field of the watched `recent_blocks` value: the
+                    // engine's `push_latest` sets it with the block in one `send_modify`, so the
+                    // read after a wake sees the round of the change that woke it, or a later
+                    // one. a change that leaves the round short of the bound only waits for the
+                    // next change; there is no separate round write that a wake could run ahead of
                     let executed = exec_round();
                     if commit_run_ahead_ok(leader_round, executed, self.max_run_ahead) {
                         info!(
