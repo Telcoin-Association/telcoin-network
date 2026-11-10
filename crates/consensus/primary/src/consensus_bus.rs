@@ -238,9 +238,13 @@ struct GapState<T> {
     /// Messages dropped in this gap because the policy does not hold them.
     dropped: usize,
     /// Messages that the policy holds, dropped in this gap at the item cap, the byte cap or the
-    /// cap of their author. A kept newest message that a newer one of its author replaced counts
-    /// here too.
+    /// cap of their author. A newest message counts here only when it does not fit the caps of
+    /// the kept newest messages.
     over_budget: usize,
+    /// Messages of which the policy keeps only the newest of each author, dropped in this gap
+    /// because the kept message of their author has an equal or a higher rank, or replaced by one
+    /// of a higher rank. The policy keeps only the newest, so this is no budget running out.
+    superseded: usize,
     /// Messages held in this gap, per author. An entry exists only for an author with a held
     /// message, so the item cap also caps the entries.
     authors: std::collections::HashMap<GapAuthor, usize>,
@@ -262,6 +266,7 @@ impl<T> Default for GapState<T> {
             bytes: 0,
             dropped: 0,
             over_budget: 0,
+            superseded: 0,
             authors: Default::default(),
             newest: Default::default(),
             newest_bytes: 0,
@@ -312,33 +317,45 @@ impl<T> GapState<T> {
     }
 
     /// Keep `value` of `weight` and `rank` as the newest message of its author when `rank` is
-    /// above the rank of the kept message of that author and it fits the caps of `policy`, else
-    /// count it over budget. Return whether the gap kept it.
+    /// above the rank of the kept message of that author and it fits the caps of `policy`, and
+    /// report what the gap did with it.
     ///
-    /// An author with no kept message takes a new slot only below the author cap of `policy`.
+    /// - [`tn_types::TrySendOutcome::Queued`]: the gap kept it. The kept message of its author that
+    ///   it replaced, if any, counts as superseded.
+    /// - [`tn_types::TrySendOutcome::Unsubscribed`]: the kept message of its author has an equal or
+    ///   a higher rank, so the policy does not hold this one. It counts as superseded.
+    /// - [`tn_types::TrySendOutcome::OverBudget`]: it does not fit. An author with no kept message
+    ///   takes a new slot only below the author cap of `policy`, and any message only within the
+    ///   byte cap. It counts over budget.
     fn keep_newest(
         &mut self,
         weight: GapWeight,
         rank: u64,
         value: T,
         policy: &GapPolicy<T>,
-    ) -> bool {
+    ) -> tn_types::TrySendOutcome {
         let kept = self.newest.get(&weight.author).map(|kept| (kept.rank, kept.bytes));
-        let newer =
-            kept.map_or(self.newest.len() < policy.max_newest, |(kept_rank, _)| rank > kept_rank);
         let freed = kept.map_or(0, |(_, bytes)| bytes);
         let total = self.newest_bytes.saturating_sub(freed).saturating_add(weight.bytes);
-        if newer && total <= policy.max_newest_bytes {
-            // The replaced message of the author is dropped at the cap of its author.
-            if kept.is_some() {
-                self.over_budget = self.over_budget.saturating_add(1);
+        let fits = total <= policy.max_newest_bytes
+            && (kept.is_some() || self.newest.len() < policy.max_newest);
+        match kept {
+            Some((kept_rank, _)) if rank <= kept_rank => {
+                self.superseded = self.superseded.saturating_add(1);
+                tn_types::TrySendOutcome::Unsubscribed
             }
-            self.newest_bytes = total;
-            self.newest.insert(weight.author, GapNewest { rank, bytes: weight.bytes, value });
-            true
-        } else {
-            self.over_budget = self.over_budget.saturating_add(1);
-            false
+            _ if fits => {
+                if kept.is_some() {
+                    self.superseded = self.superseded.saturating_add(1);
+                }
+                self.newest_bytes = total;
+                self.newest.insert(weight.author, GapNewest { rank, bytes: weight.bytes, value });
+                tn_types::TrySendOutcome::Queued
+            }
+            _ => {
+                self.over_budget = self.over_budget.saturating_add(1);
+                tn_types::TrySendOutcome::OverBudget
+            }
         }
     }
 
@@ -386,9 +403,15 @@ impl<T> GapHold<T> {
     }
 
     /// Keep `value` of `weight` and `rank` as the newest message of its author in this gap, and
-    /// return whether the gap kept it. Give `value` back when a consumer subscribed after
-    /// [`Self::admit`] weighed it, so the caller queues it for that consumer.
-    fn keep_newest(&self, weight: GapWeight, rank: u64, value: T) -> Result<bool, T> {
+    /// report what the gap did with it (see [`GapState::keep_newest`]). Give `value` back when a
+    /// consumer subscribed after [`Self::admit`] weighed it, so the caller queues it for that
+    /// consumer.
+    fn keep_newest(
+        &self,
+        weight: GapWeight,
+        rank: u64,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, T> {
         let mut state = self.state.lock();
         if state.present {
             Err(value)
@@ -410,7 +433,8 @@ impl<T> GapHold<T> {
     /// ones kept in this gap, with the same caps and counts. Then queue the kept newest messages
     /// by rank, mark the consumer present and reset the gap counters. So the new consumer gets
     /// at most the newest of each author, after the held ones. Write one log with what the gap
-    /// dropped and what this discards. A held message sent while this runs can land ahead of the
+    /// dropped and what this discards, which also names the superseded newest messages; those
+    /// alone write no log. A held message sent while this runs can land ahead of the
     /// held ones and the newest ones. A message queued for the new consumer lands after them.
     /// The consumer of `epoch` sets the epoch of the next gap. With `None` the epoch does not
     /// change.
@@ -453,6 +477,7 @@ impl<T> GapHold<T> {
                 })
             });
         drop(state);
+        // A superseded message is not shed: the newer one of its author is kept in its place.
         let shed = gap.dropped.saturating_add(gap.over_budget).saturating_add(discarded);
         if shed > 0 {
             warn!(
@@ -461,6 +486,7 @@ impl<T> GapHold<T> {
                 kept,
                 dropped = gap.dropped,
                 over_budget = gap.over_budget,
+                superseded = gap.superseded,
                 discarded,
                 "queue dropped messages while no consumer was subscribed"
             );
@@ -552,8 +578,9 @@ impl<T> QueChannel<T> {
     /// messages that `policy` holds, up to its item cap, its byte cap and its cap per author.
     /// `try_send_outcome` reports any other message as [`tn_types::TrySendOutcome::Unsubscribed`]
     /// and a held message past a cap as [`tn_types::TrySendOutcome::OverBudget`]. The messages of
-    /// which `policy` keeps only the newest of each author wait apart from the queue, and one that
-    /// does not replace the kept message of its author also reports over budget. While a consumer
+    /// which `policy` keeps only the newest of each author wait apart from the queue under their
+    /// own caps. One that does not replace the kept message of its author, because its rank is not
+    /// higher, reports unsubscribed like any message the policy does not hold. While a consumer
     /// holds the receiver, the channel queues every message with no extra cap. Each subscribe
     /// discards the queued messages that `policy` does not hold and keeps the held ones in order.
     /// It passes the queued messages of which `policy` keeps only the newest through the same
@@ -657,14 +684,32 @@ impl<T> QueChannel<T> {
         self.gap.as_deref().map_or(GapAdmit::Open, |gap| gap.admit(value))
     }
 
-    /// Keep `value` of `weight` and `rank` as the newest message of its author, and return whether
-    /// the gap kept it. Give `value` back when a consumer subscribed since the gap policy weighed
-    /// it, or when the channel has no gap policy.
-    fn keep_newest(&self, weight: GapWeight, rank: u64, value: T) -> Result<bool, T> {
+    /// Keep `value` of `weight` and `rank` as the newest message of its author, and report what
+    /// the gap did with it (see [`GapState::keep_newest`]). Give `value` back when a consumer
+    /// subscribed since the gap policy weighed it, or when the channel has no gap policy.
+    fn keep_newest(
+        &self,
+        weight: GapWeight,
+        rank: u64,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, T> {
         match self.gap.as_deref() {
             Some(gap) => gap.keep_newest(weight, rank, value),
             None => Err(value),
         }
+    }
+
+    /// Keep `value` like [`Self::keep_newest`], or queue it without waiting when a consumer
+    /// subscribed since the gap policy weighed it, so that consumer gets it.
+    fn try_keep_newest(
+        &self,
+        weight: GapWeight,
+        rank: u64,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, tn_types::TrySendError<T>> {
+        self.keep_newest(weight, rank, value).or_else(|value| {
+            Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
+        })
     }
 
     /// Release the hold of a message that the underlying queue did not take.
@@ -704,7 +749,7 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
             // Drop a message that the gap policy drops, as for a channel with no subscriber.
             GapAdmit::Unheld | GapAdmit::OverBudget => Ok(()),
             GapAdmit::Newest(weight, rank) => match self.keep_newest(weight, rank, value) {
-                Ok(_kept) => Ok(()),
+                Ok(_outcome) => Ok(()),
                 Err(value) => Ok(self.channel.send(value).await?),
             },
             GapAdmit::Open | GapAdmit::Held(_) => {
@@ -724,8 +769,10 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     /// policy does not hold `value`, and [`tn_types::TrySendOutcome::OverBudget`] when the gap
     /// already holds its item cap, its byte cap or the cap of the author of `value`, so the network
     /// layer counts the drop as shed instead of as forwarded. A message that the gap keeps as the
-    /// newest of its author reports [`tn_types::TrySendOutcome::Queued`], and one that does not
-    /// replace the kept message of its author reports [`tn_types::TrySendOutcome::OverBudget`].
+    /// newest of its author reports [`tn_types::TrySendOutcome::Queued`]. One that does not
+    /// replace the kept message of its author, because its rank is not higher, reports
+    /// [`tn_types::TrySendOutcome::Unsubscribed`], and one past the caps of the kept newest
+    /// messages reports [`tn_types::TrySendOutcome::OverBudget`].
     fn try_send_outcome(
         &self,
         value: T,
@@ -737,13 +784,7 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         match admit {
             GapAdmit::Unheld => Ok(tn_types::TrySendOutcome::Unsubscribed),
             GapAdmit::OverBudget => Ok(tn_types::TrySendOutcome::OverBudget),
-            GapAdmit::Newest(weight, rank) => match self.keep_newest(weight, rank, value) {
-                Ok(true) => Ok(tn_types::TrySendOutcome::Queued),
-                Ok(false) => Ok(tn_types::TrySendOutcome::OverBudget),
-                Err(value) => {
-                    Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
-                }
-            },
+            GapAdmit::Newest(weight, rank) => self.try_keep_newest(weight, rank, value),
             GapAdmit::Open | GapAdmit::Held(_) => Ok(self
                 .channel
                 .try_send(value)
@@ -2923,10 +2964,11 @@ mod tests {
         let outcome = |message: Ranked| channel.try_send_outcome(message).ok();
         let queued = Some(TrySendOutcome::Queued);
         let over = Some(TrySendOutcome::OverBudget);
+        let unsubscribed = Some(TrySendOutcome::Unsubscribed);
 
         assert_eq!(outcome((Some(5), 1, 10)), queued);
-        assert_eq!(outcome((Some(4), 1, 10)), over, "a lower rank does not replace");
-        assert_eq!(outcome((Some(5), 1, 10)), over, "an equal rank does not replace");
+        assert_eq!(outcome((Some(4), 1, 10)), unsubscribed, "a lower rank does not replace");
+        assert_eq!(outcome((Some(5), 1, 10)), unsubscribed, "an equal rank does not replace");
         assert_eq!(outcome((Some(6), 1, 10)), queued, "a higher rank replaces");
         assert_eq!(outcome((Some(1), 2, 16)), over, "26 bytes pass the byte cap");
         assert_eq!(outcome((Some(1), 2, 15)), queued);
@@ -2944,7 +2986,8 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok((Some(1), 2, 15)));
     }
 
-    /// Subscribe empties the kept newest messages, so the next gap keeps the full caps again.
+    /// Subscribe empties the kept newest messages, so the next gap keeps the full caps again and
+    /// keeps a message of an author with a lower rank than the one it kept in the last gap.
     #[test]
     fn subscribe_resets_the_newest_messages() {
         let channel = QueChannel::new_always_subscribed_held(ranked_policy());
@@ -2955,8 +2998,56 @@ mod tests {
         assert_eq!(outcome((Some(5), 2, 10)), queued);
         drop(channel.subscribe());
 
-        assert_eq!(outcome((Some(1), 3, 10)), queued, "a lower rank than the last gap's");
-        assert_eq!(outcome((Some(1), 4, 15)), queued);
+        assert_eq!(outcome((Some(1), 1, 10)), queued, "a lower rank than the last gap's");
+        assert_eq!(outcome((Some(1), 3, 15)), queued, "a third author within the caps");
+    }
+
+    /// A ranked message that the kept message of its author supersedes counts apart from the
+    /// messages over budget and reports unsubscribed: a lower rank, an equal rank, and the kept
+    /// message that a higher rank replaces. A new author past the author cap and a message past
+    /// the byte cap still count and report over budget.
+    #[test]
+    fn superseded_newest_messages_count_apart_from_over_budget() {
+        let channel = QueChannel::new_always_subscribed_held(ranked_policy());
+        let queued = Some(TrySendOutcome::Queued);
+        let unsubscribed = Some(TrySendOutcome::Unsubscribed);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        [
+            ((Some(5), 1, 10), queued),
+            ((Some(4), 1, 10), unsubscribed),
+            ((Some(5), 1, 10), unsubscribed),
+            ((Some(6), 1, 10), queued),
+            ((Some(1), 2, 15), queued),
+            ((Some(1), 3, 0), over),
+            ((Some(7), 1, 11), over),
+        ]
+        .into_iter()
+        .for_each(|(message, outcome)| {
+            assert_eq!(channel.try_send_outcome(message).ok(), outcome, "{message:?}");
+        });
+
+        let counts = channel.gap.as_deref().map(|gap| {
+            let state = gap.state.lock();
+            (state.superseded, state.over_budget)
+        });
+        assert_eq!(counts, Some((3, 2)), "(superseded, over budget)");
+    }
+
+    /// A newest message that the gap weighed before a consumer subscribed queues for that
+    /// consumer when the keep finds it present, so the message is not lost.
+    #[test]
+    fn newest_message_weighed_before_subscribe_queues_for_the_consumer() {
+        let channel = QueChannel::new_always_subscribed_held(ranked_policy());
+        let message = (Some(1), 1, 10);
+        let GapAdmit::Newest(weight, rank) = channel.admit(&message) else {
+            panic!("a ranked message is kept apart from the queue")
+        };
+        let mut rx = channel.subscribe();
+
+        let outcome = channel.try_keep_newest(weight, rank, message).ok();
+        assert_eq!(outcome, Some(TrySendOutcome::Queued));
+        assert_eq!(rx.try_recv(), Ok(message));
     }
 
     /// The ranked messages that a consumer leaves queued go through the rule of the kept newest

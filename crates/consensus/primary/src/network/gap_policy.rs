@@ -242,25 +242,39 @@ mod tests {
         encode(&PrimaryGossip::Consensus(Box::new(result)))
     }
 
+    /// What the next event loop of `channel`, for the epoch after [`EPOCH`], receives, in order:
+    /// the source of each gossip, and the consensus number of a result or `None` for a vote.
+    fn delivered(
+        channel: &QueChannel<NetworkEvent<Req, Res>>,
+    ) -> Vec<(Option<PeerId>, Option<u64>)> {
+        let mut rx = channel.subscribe_in_epoch(Some(EPOCH.saturating_add(1)));
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| {
+                let NetworkEvent::Gossip(gossip) = event else {
+                    panic!("the gap holds only gossip")
+                };
+                let message = gossip.message;
+                let number = match try_decode(&message.data).expect("held gossip decodes") {
+                    PrimaryGossip::EpochVote(_) => None,
+                    PrimaryGossip::Consensus(result) => Some(result.number),
+                    PrimaryGossip::Certificate(_) => panic!("the gap holds no certificate"),
+                };
+                (message.source, number)
+            })
+            .collect()
+    }
+
     /// What the next event loop of `channel`, for the epoch after [`EPOCH`], receives: the
     /// number of epoch votes, and the consensus numbers of the results of each source.
     fn received(
         channel: &QueChannel<NetworkEvent<Req, Res>>,
     ) -> (usize, HashMap<Option<PeerId>, Vec<u64>>) {
-        let mut rx = channel.subscribe_in_epoch(Some(EPOCH.saturating_add(1)));
         let mut votes = 0_usize;
         let mut outputs = HashMap::<_, Vec<_>>::new();
-        while let Ok(event) = rx.try_recv() {
-            let NetworkEvent::Gossip(gossip) = event else { panic!("the gap holds only gossip") };
-            let message = gossip.message;
-            match try_decode(&message.data).expect("held gossip decodes") {
-                PrimaryGossip::EpochVote(_) => votes = votes.saturating_add(1),
-                PrimaryGossip::Consensus(result) => {
-                    outputs.entry(message.source).or_default().push(result.number)
-                }
-                PrimaryGossip::Certificate(_) => panic!("the gap holds no certificate"),
-            }
-        }
+        delivered(channel).into_iter().for_each(|(source, number)| match number {
+            Some(number) => outputs.entry(source).or_default().push(number),
+            None => votes = votes.saturating_add(1),
+        });
         (votes, outputs)
     }
 
@@ -421,25 +435,42 @@ mod tests {
     }
 
     /// A result with a lower or an equal consensus number does not replace the kept result of
-    /// its author.
+    /// its author. It is superseded, not over budget, so it reports unsubscribed and the swarm
+    /// does not count it as a queue budget shed.
     #[test]
     fn older_consensus_output_does_not_replace_the_newer() {
         let channel = primary_channel();
         let author = Some(PeerId::random());
         let newer = NUMBER.saturating_add(1);
+        let unsubscribed = Some(TrySendOutcome::Unsubscribed);
 
         assert_eq!(outcome(&channel, output_gossip(newer, author)), Some(TrySendOutcome::Queued));
-        assert_eq!(
-            outcome(&channel, output_gossip(NUMBER, author)),
-            Some(TrySendOutcome::OverBudget)
-        );
-        assert_eq!(
-            outcome(&channel, output_gossip(newer, author)),
-            Some(TrySendOutcome::OverBudget)
-        );
+        assert_eq!(outcome(&channel, output_gossip(NUMBER, author)), unsubscribed);
+        assert_eq!(outcome(&channel, output_gossip(newer, author)), unsubscribed);
 
         let (_, outputs) = received(&channel);
         assert_eq!(outputs, HashMap::from([(author, vec![newer])]));
+    }
+
+    /// The next event loop gets the held votes first, in the order they arrived, then the kept
+    /// results by consensus number, although the results arrived first and the higher number
+    /// before the lower.
+    #[test]
+    fn next_event_loop_gets_the_votes_then_the_results_by_number() {
+        let channel = primary_channel();
+        let [high, voter, low, other_voter] = [(); 4].map(|()| Some(PeerId::random()));
+        let higher = NUMBER.saturating_add(2);
+        let queued = Some(TrySendOutcome::Queued);
+
+        assert_eq!(outcome(&channel, output_gossip(higher, high)), queued);
+        assert_eq!(outcome(&channel, vote_gossip(EPOCH, voter)), queued);
+        assert_eq!(outcome(&channel, output_gossip(NUMBER, low)), queued);
+        assert_eq!(outcome(&channel, vote_gossip(EPOCH, other_voter)), queued);
+
+        assert_eq!(
+            delivered(&channel),
+            [(voter, None), (other_voter, None), (low, Some(NUMBER)), (high, Some(higher))]
+        );
     }
 
     /// More authors than the result cap keep at most the cap of results, and neither the votes
