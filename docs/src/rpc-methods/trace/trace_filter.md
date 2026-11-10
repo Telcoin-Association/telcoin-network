@@ -5,7 +5,7 @@
 
 Returns the Parity-style traces in a block range whose sender or receiver matches the filter, much as `eth_getLogs` does for logs. The node keeps no index of trace addresses: it re-executes every transaction in every block of the range and applies the address filter to the traces afterwards, so a narrow address filter does not make a request cheaper. A request holds two permits from the tracing permit pool and traces up to `--rpc.max-tracing-requests` blocks at a time.
 
-`toBlock` minus `fromBlock` may be at most `--rpc.max-trace-filter-blocks` (default 100). A wider range fails with `-32602` and the message `Block range too large; currently limited to <limit> blocks`, with the configured limit. Because `fromBlock` defaults to `0x0` and `toBlock` to the latest block, a request that sets neither field fails this check once the latest block number is above 100.
+`toBlock` minus `fromBlock` may be at most `--rpc.max-trace-filter-blocks` (default 100). A wider range fails with `-32602` and the message `Block range too large; currently limited to <limit> blocks`, with the configured limit. Both bounds default to the latest block, so a request that sets neither traces the latest block only, and one that sets only a `toBlock` below the latest block has a `fromBlock` greater than its `toBlock`.
 
 A `fromBlock` or `toBlock` past the node's latest block fails with `-32001` and a `block not found` message, and a `fromBlock` greater than `toBlock` fails with `-32602` and the message `invalid parameters: fromBlock cannot be greater than toBlock`.
 
@@ -17,7 +17,7 @@ Telcoin Network has no block or uncle rewards, so these traces never include `re
 
 `Object` - The filter object. A field not listed here fails the request with `-32602`.
 
-* `fromBlock`: `QUANTITY` - (optional) The first block to trace, as a hexadecimal block number; tags such as `latest` are not accepted. Defaults to `0x0`.
+* `fromBlock`: `QUANTITY` - (optional) The first block to trace, as a hexadecimal block number; tags such as `latest` are not accepted. Defaults to the latest block.
 * `toBlock`: `QUANTITY` - (optional) The last block to trace, inclusive, as a hexadecimal block number. Defaults to the latest block.
 * `fromAddress`: `Array` - (optional) Sender addresses (`DATA`, 20 bytes each) to match: a call's `from`, a create's `from`, or the contract a `suicide` destroyed.
 * `toAddress`: `Array` - (optional) Receiver addresses (`DATA`, 20 bytes each) to match: a call's `to`, the contract a create deployed, or a `suicide`'s `refundAddress`.

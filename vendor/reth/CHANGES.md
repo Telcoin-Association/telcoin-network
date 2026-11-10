@@ -785,6 +785,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `trace_call_many_defaults_to_latest` (an omitted block equals `latest` and
   differs from `pending`, over the API and the RPC module). *Upstream*: n/a (upstream commit).
 
+- **TN-0070** — Backport 074bf32ef: `trace_filter` without `fromBlock` starts at the latest block.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-api/src/trace.rs` (method docs), `crates/rpc/rpc/src/trace.rs`
+  (`trace_filter`; upstream's test `trace_filter_defaults_to_latest` in the `tests` module, its
+  imports inside the test as the module's other tests keep them, and a two-permit guard where
+  upstream's has one: the vendored `trace_filter` takes its two permits itself (TN-0038), so a
+  one-permit guard deadlocks the direct call).
+  *Why*: an omitted `fromBlock` meant genesis, so a filter that set neither bound asked for the
+  whole chain and failed the `--rpc.max-trace-filter-blocks` range check on any chain longer than
+  the limit (review R26). Both bounds now default to the latest block, as upstream and the other
+  Parity-style clients have it; a filter with only `toBlock` below the latest block fails with
+  `-32602` (`fromBlock cannot be greater than toBlock`). `docs/src/rpc-methods/trace/trace_filter.md`
+  records the defaults. RPC only.
+  *Tests*: upstream's `trace_filter_defaults_to_latest` (an omitted range equals the latest block
+  under a one-block limit, a two-block range still passes, and `toBlock` alone below the tip fails
+  with `-32602`). *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 
