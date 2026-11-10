@@ -426,8 +426,10 @@ impl RethEnv {
     ///
     /// A successful commit logs one `persisted output` debug line (target `engine`) with the
     /// block range, what was written and the per-phase wall time (`open_ms`, `save_blocks_ms`,
-    /// `markers_ms`, `commit_ms`), and records the `tn_reth.persist_*` series (see
-    /// [`record_persisted_output`]). A failed attempt records nothing.
+    /// `markers_ms`, `commit_ms`), and records four series (see [`record_persisted_output`]):
+    /// the histograms `tn_reth.persist_save_blocks_seconds` and `tn_reth.persist_commit_seconds`
+    /// and the counters `tn_reth.persisted_accounts_total` and
+    /// `tn_reth.persisted_storage_slots_total`. A failed attempt records nothing.
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
