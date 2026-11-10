@@ -270,7 +270,8 @@ where
     /// config's epoch.
     ///
     /// Fails when `vote_timeout` is shorter than `max_header_delay` plus the voter's longest drift
-    /// wait, or is not below the libp2p request timeout. The drift wait depends on the epoch's
+    /// wait, does not exceed the voter's 1 s execution wait ([`VOTE_EXECUTION_WAIT`]), or is not
+    /// below the libp2p request timeout. The drift wait depends on the epoch's
     /// fork regime: with sub-second timestamps active it is the network config's
     /// `max_header_time_drift_tolerance`, and without them the voter compares whole seconds and
     /// waits out the tolerance rounded up to whole seconds. The same parameters can therefore
@@ -447,6 +448,16 @@ where
 /// that call site if it ever sets its own timeout.
 const LIBP2P_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest a voter waits for its own execution to reach the block a header was built on.
+///
+/// A voter only votes once the header's `latest_execution_block` is canonical locally, so it first
+/// waits for its execution to reach that block. A voter still behind when this wait runs out
+/// refuses the request as recoverable instead of holding it until `vote_timeout`, so the requester
+/// asks again soon and a voter only a second or two behind still votes on a retry.
+/// [`ConsensusConfig::validate_epoch_timing`] refuses a `vote_timeout` that does not exceed this
+/// wait.
+pub const VOTE_EXECUTION_WAIT: Duration = Duration::from_secs(1);
+
 /// Validate the consensus timing knobs that span [`Parameters`] and [`SyncConfig`] for the epoch
 /// about to run.
 ///
@@ -486,6 +497,10 @@ fn validate_epoch_timing(
 /// tolerance rounded up to whole seconds, so it can admit, and then wait out, a lead of that
 /// rounded-up length: 1 s at the 250 ms default.
 ///
+/// `vote_timeout` must also exceed [`VOTE_EXECUTION_WAIT`]. Its deadline is set before the wait
+/// starts, so at or below the wait the vote timeout fires while a voter behind on execution is
+/// still waiting, and the requester never sees the quick recoverable refusal that wait exists for.
+///
 /// The upper bound is [`LIBP2P_REQUEST_TIMEOUT`], exclusive: at or above it the transport cancels
 /// a slow vote before `vote_timeout` can fire. The transport also counts the time to read and
 /// dispatch the request, so a value just below the bound leaves little margin.
@@ -516,6 +531,15 @@ fn validate_vote_timeout(
         vote_window,
     );
     eyre::ensure!(
+        parameters.vote_timeout > VOTE_EXECUTION_WAIT,
+        "vote_timeout {:?} does not exceed the voter's execution wait VOTE_EXECUTION_WAIT {:?}, so \
+         a voter behind on execution would time out instead of refusing the vote as \
+         ExecutionBehind; raise vote_timeout above {:?}",
+        parameters.vote_timeout,
+        VOTE_EXECUTION_WAIT,
+        VOTE_EXECUTION_WAIT,
+    );
+    eyre::ensure!(
         parameters.vote_timeout < LIBP2P_REQUEST_TIMEOUT,
         "vote_timeout {:?} must stay below the libp2p request timeout {:?}, which otherwise \
          cancels a slow vote before vote_timeout fires; lower vote_timeout",
@@ -529,7 +553,7 @@ fn validate_vote_timeout(
 mod tests {
     use super::{
         validate_epoch_timing, validate_vote_timeout, ConsensusConfig, PriorEpoch,
-        LIBP2P_REQUEST_TIMEOUT,
+        LIBP2P_REQUEST_TIMEOUT, VOTE_EXECUTION_WAIT,
     };
     use crate::{Config, KeyConfig, NetworkConfig, Parameters, SyncConfig};
     use rand::{rngs::StdRng, SeedableRng as _};
@@ -758,6 +782,28 @@ mod tests {
             )
             .expect("just below the transport timeout must be accepted");
         }
+    }
+
+    /// A `vote_timeout` that covers the header window but does not exceed [`VOTE_EXECUTION_WAIT`]
+    /// is rejected, since the vote timeout would fire before a voter behind on execution refuses;
+    /// one just above the wait is accepted.
+    #[test]
+    fn vote_timeout_must_exceed_the_execution_wait() {
+        // a 750 ms header window, so only the execution wait can refuse these
+        let short_rounds = |vote_timeout| Parameters {
+            max_header_delay: Duration::from_millis(500),
+            vote_timeout,
+            ..Default::default()
+        };
+        for refused in [VOTE_EXECUTION_WAIT - Duration::from_millis(1), VOTE_EXECUTION_WAIT] {
+            let err = validate_vote_timeout(&short_rounds(refused), &tolerance_ms(250), true)
+                .expect_err("a vote_timeout not above the execution wait must be rejected");
+            assert!(err.to_string().contains("VOTE_EXECUTION_WAIT"), "{refused:?}: {err}");
+            assert!(err.to_string().contains("raise vote_timeout above 1s"), "{refused:?}: {err}");
+        }
+        let just_above = VOTE_EXECUTION_WAIT + Duration::from_millis(1);
+        validate_vote_timeout(&short_rounds(just_above), &tolerance_ms(250), true)
+            .expect("a vote_timeout above the execution wait must be accepted");
     }
 
     /// An overflowing `max_header_delay + tolerance` must reject rather than panic, including

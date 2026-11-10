@@ -12,10 +12,13 @@ use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
 };
@@ -50,6 +53,10 @@ const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 /// number of frames and a slow reader are not, so this backstops the whole serve
 /// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Minimum interval between two `behind the gc window inside the rejoin grace; holding demotion`
+/// lines from one handler. Every hold is still counted in `rejoin_grace_holds_total`.
+const REJOIN_GRACE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -131,6 +138,12 @@ pub(crate) struct RequestHandler<DB> {
     consensus_chain: ConsensusChain,
     /// Vote path metric handles, resolved once for this handler's epoch.
     vote_metrics: Arc<VoteStageHandles>,
+    /// Rate limit for the line logged when a demotion is held inside the rejoin grace.
+    rejoin_grace_log: Arc<Mutex<RejoinGraceLog>>,
+    /// True while the rejoin grace holds a demotion: set by a hold, cleared once an incoming round
+    /// is inside the activity window again. A demotion while it is set is the held one taking
+    /// effect at the end of the grace, so the rejoin it follows counts as failed.
+    rejoin_grace_holding: Arc<AtomicBool>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -161,6 +174,8 @@ where
             deferred_vote_warned: Default::default(),
             consensus_chain,
             vote_metrics: Arc::new(VoteStageHandles::new()),
+            rejoin_grace_log: Default::default(),
+            rejoin_grace_holding: Default::default(),
         }
     }
 
@@ -173,6 +188,14 @@ where
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
+    ///
+    /// For [`tn_types::REJOIN_DEMOTION_GRACE`] after a rejoin in this epoch, and while the incoming
+    /// round leads the effective round by at most `ROUNDS_TO_KEEP - gc_depth`, a demotion for the
+    /// activity window is held instead: logged, counted in `rejoin_grace_holds_total`, and
+    /// answered as not behind. A demotion for an epoch behind is never held.
+    ///
+    /// A demotion settles the latest rejoin in the rejoin state: it failed when the demotion came
+    /// inside the grace, or was the one the grace held taking effect when the grace ended.
     pub(crate) async fn behind_consensus(
         &self,
         epoch: Epoch,
@@ -244,6 +267,44 @@ where
         } else {
             epoch > exec_epoch
         };
+        if outside_gc_window {
+            // a promoted node commits again only once its dag is refilled from peers; until then
+            // the window measures the rejoin, not a new fall behind. an epoch behind is never
+            // held, nor a lag past the rounds peers still keep, which no refill can recover
+            let rebuild_bound = tn_types::ROUNDS_TO_KEEP
+                .saturating_sub(self.consensus_config.parameters().gc_depth);
+            let since_promotion = self
+                .consensus_bus
+                .rejoin_state()
+                .borrow()
+                .promoted_at(self.consensus_config.committee().epoch())
+                .map(|promoted_at| promoted_at.elapsed());
+            if let Some(since_promotion) = since_promotion.filter(|since| {
+                *since < tn_types::REJOIN_DEMOTION_GRACE
+                    && round.saturating_sub(effective_exec_round) <= rebuild_bound
+            }) {
+                self.consensus_bus.metrics().rejoin_grace_holds_total.increment(1);
+                self.rejoin_grace_holding.store(true, Ordering::Relaxed);
+                // every certificate past the window is held, about twenty a second under load,
+                // so the line is rate limited and carries the holds it stands for
+                let due = self.rejoin_grace_log.lock().record_hold(tokio::time::Instant::now());
+                if let Some(holds_since_last_line) = due {
+                    warn!(
+                        target: "primary",
+                        round,
+                        effective_round = effective_exec_round,
+                        since_promotion_ms = millis(since_promotion),
+                        holds_since_last_line,
+                        "behind the gc window inside the rejoin grace; holding demotion"
+                    );
+                }
+                return false;
+            }
+        } else if epoch == exec_epoch {
+            // a round of the executed epoch inside the window: a hold, if any, has ended without
+            // a demotion
+            self.rejoin_grace_holding.store(false, Ordering::Relaxed);
+        }
         if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
@@ -288,6 +349,15 @@ where
             );
             let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             record_mode_transition(previous, NodeMode::CvvInactive, reason);
+            // settle the latest rejoin now rather than when the catch-up loop restarts, which
+            // waits for the engine to drain the outputs already sequenced
+            let released_hold =
+                outside_gc_window && self.rejoin_grace_holding.load(Ordering::Relaxed);
+            let committee_epoch = self.consensus_config.committee().epoch();
+            let now = tokio::time::Instant::now();
+            self.consensus_bus.rejoin_state().send_if_modified(|state| {
+                state.record_demotion(committee_epoch, now, released_hold)
+            });
             self.consensus_config.shutdown().notify();
             true
         } else {
@@ -778,6 +848,15 @@ where
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
+        // a node that is not an active cvv (an inactive node catching up, or an observer) has no
+        // live dag to check the header's parents against and must not sign a new vote. refuse
+        // here, after the recast above (a vote already signed for this header is still returned)
+        // and before the per-author lock and the execution wait, so the requester learns at once
+        // instead of waiting out the vote timeout. `vote_inner` checks again before it signs
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
         // voted on in parallel but only one vote for an authority can proceed at a time.
@@ -1095,11 +1174,19 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
+        // the wait is bounded by `VOTE_EXECUTION_WAIT`, well inside the vote timeout: a voter
+        // further behind refuses with a recoverable `ExecutionBehind` instead of holding the
+        // request, so the requester asks again soon and votes once execution has caught up
         timing.enter(VoteStage::ExecWait);
         let header_block = header.latest_execution_block();
-        match self.consensus_bus.wait_for_execution(header_block).await {
-            Ok(()) => {}
-            Err(ExecutionCheckError::Fork) => {
+        match tokio::time::timeout(
+            VOTE_EXECUTION_WAIT,
+            self.consensus_bus.wait_for_execution(header_block),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(ExecutionCheckError::Fork)) => {
                 error!(
                     target: "primary",
                     peer_hash = ?header_block,
@@ -1108,7 +1195,7 @@ where
                 );
                 return Err(HeaderError::UnknownExecutionResult(header_block).into());
             }
-            Err(ExecutionCheckError::BelowFloor { floor }) => {
+            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
                 // a snapshot-restored voter holds no block below its floor, so it can neither
                 // confirm nor refute the header's and never will: a final refusal without a
                 // penalty, not a fork
@@ -1124,8 +1211,16 @@ where
                 }
                 .into());
             }
-            Err(ExecutionCheckError::Closed) => {
+            Ok(Err(ExecutionCheckError::Closed)) => {
                 return Err(HeaderError::ClosedWatchChannel.into());
+            }
+            Err(_) => {
+                self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
+                return Err(HeaderError::ExecutionBehind {
+                    header_block: header_block.number,
+                    local_block: self.consensus_bus.latest_execution_block_num_hash().number,
+                }
+                .into());
             }
         }
         timing.enter(VoteStage::Parents);
@@ -1344,7 +1439,12 @@ where
             }
         }
 
-        // this node hasn't voted yet
+        // this node hasn't voted yet. read the mode again: a node demoted while this request
+        // waited on execution, parents or batches must not sign a new vote
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         let vote = Vote::new(
             &header,
             self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
@@ -1924,6 +2024,10 @@ enum VoteOutcome {
     Deferred,
     /// The header round is beyond the committed round plus the gc depth.
     TooNew,
+    /// A recoverable refusal because this node is not ready to vote: it is not an active committee
+    /// validator, or its execution did not reach the header's block within the voter's execution
+    /// wait.
+    Behind,
     /// The request or its header failed a check, or a cached refusal was returned.
     Rejected,
     /// The vote timeout fired before a decision.
@@ -1946,6 +2050,9 @@ impl VoteOutcome {
             // a refusal cached for this header's digest
             Ok(_) => Self::Rejected,
             Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. })) => Self::TooNew,
+            Err(PrimaryNetworkError::InvalidHeader(
+                HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
+            )) => Self::Behind,
             Err(PrimaryNetworkError::Timeout(_)) => Self::Timeout,
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::Storage(_)
@@ -1975,10 +2082,43 @@ impl VoteOutcome {
             Self::MissingParents => "missing_parents",
             Self::Deferred => "deferred",
             Self::TooNew => "too_new",
+            Self::Behind => "behind",
             Self::Rejected => "rejected",
             Self::Timeout => "timeout",
             Self::Error => "error",
         }
+    }
+}
+
+/// Rate limit for the `behind the gc window inside the rejoin grace; holding demotion` line: one
+/// line per [`REJOIN_GRACE_LOG_INTERVAL`] at most, carrying the holds counted since the previous
+/// line. The lines add up to every hold up to the last one logged; holds after it appear on the
+/// next line, or only in `rejoin_grace_holds_total` if the node is demoted or the handler rebuilt
+/// first.
+///
+/// Locked only to record a hold, never across an await. Stamps use the tokio clock so a paused
+/// test clock drives the interval.
+#[derive(Debug, Default)]
+struct RejoinGraceLog {
+    /// When the last line was logged.
+    last_logged: Option<tokio::time::Instant>,
+    /// Holds recorded since the last line.
+    holds: u64,
+}
+
+impl RejoinGraceLog {
+    /// Record a hold at `now`. When a line is due, returns the holds it reports (this one and the
+    /// ones not logged since the previous line) and restarts the interval; otherwise `None`.
+    fn record_hold(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        self.holds = self.holds.saturating_add(1);
+        let due = self.last_logged.is_none_or(|logged_at| {
+            now.saturating_duration_since(logged_at) >= REJOIN_GRACE_LOG_INTERVAL
+        });
+        if !due {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.holds))
     }
 }
 
@@ -2061,6 +2201,9 @@ mod tests {
         assert_eq!(outcome(Err(too_new.into()), &timing), "too_new");
         assert_eq!(outcome(Err(HeaderError::PeerNotAuthor.into()), &timing), "rejected");
         assert_eq!(outcome(Err(HeaderError::InvalidParentRound.into()), &timing), "rejected");
+        assert_eq!(outcome(Err(HeaderError::NotActiveCvv.into()), &timing), "behind");
+        let behind = HeaderError::ExecutionBehind { header_block: 12, local_block: 9 };
+        assert_eq!(outcome(Err(behind.into()), &timing), "behind");
         let storage = HeaderError::Storage(eyre::eyre!("disk"));
         assert_eq!(outcome(Err(storage.into()), &timing), "error");
         assert_eq!(

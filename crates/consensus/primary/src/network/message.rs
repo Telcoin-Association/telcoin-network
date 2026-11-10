@@ -268,6 +268,12 @@ impl PrimaryResponse {
             PrimaryNetworkError::Timeout(_) => {
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
             }
+            // the voter is catching up or its execution is behind the header and refuses to vote
+            // for now: the same request succeeds once it has caught up, so the requester retries
+            // instead of giving up on this node
+            PrimaryNetworkError::InvalidHeader(
+                HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
+            ) => Self::RecoverableError(PrimaryRPCError(error.to_string())),
             PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Decode(_)
             | PrimaryNetworkError::Certificate(_)

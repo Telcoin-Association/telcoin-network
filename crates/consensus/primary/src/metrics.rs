@@ -96,6 +96,20 @@ pub struct PrimaryMetrics {
     /// `MAX_COMMIT_RUN_AHEAD_ROUNDS` ahead of the leader round this node has executed, counted
     /// once per hold.
     pub(crate) commit_run_ahead_blocked_total: Counter,
+    // bench5 f3-rejoin
+    /// Vote requests refused because this node is not an active committee validator (inactive
+    /// catch-up or observer).
+    ///
+    /// Such a node answers at once with a recoverable refusal instead of holding the request until
+    /// the vote timeout, so this moves only while the node is not an active CVV, plus the rare
+    /// request whose node was demoted before it signed.
+    pub(crate) votes_refused_inactive_total: Counter,
+    /// Vote requests refused because this node's execution did not reach the header's block
+    /// within the voter's execution wait (`VOTE_EXECUTION_WAIT`).
+    ///
+    /// A steady rate means this node executes behind the committee: it answers with a
+    /// recoverable refusal and votes on a retry once its execution has caught up.
+    pub(crate) votes_refused_execution_behind_total: Counter,
     /// Rounds the committed round leads the last leader round the engine processed (mirrored
     /// from the committed-round and recent-blocks watch channels; zero while execution is at or
     /// ahead of it).
@@ -109,6 +123,11 @@ pub struct PrimaryMetrics {
     /// This is the lag the activity window demotes on, measured against the node's own round
     /// instead of an incoming certificate's.
     pub(crate) commit_lag_rounds: Gauge,
+    // bench5 f3-rejoin
+    /// Demotions for the activity window held because the node rejoined consensus less than
+    /// `REJOIN_DEMOTION_GRACE` ago, counted once per certificate or consensus result that would
+    /// have demoted it. Non-zero means a promoted node's DAG was not live yet.
+    pub(crate) rejoin_grace_holds_total: Counter,
     // bench5 f1-commit-lag
     /// Times the execution check asked the canonical database again because it could not answer
     /// for a block at or below the executed tip (a read error), one per retry.
@@ -518,6 +537,9 @@ mod tests {
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
             metrics.commit_run_ahead_blocked_total.increment(1);
+            metrics.votes_refused_inactive_total.increment(1);
+            metrics.votes_refused_execution_behind_total.increment(2);
+            metrics.rejoin_grace_holds_total.increment(1);
             metrics.execution_check_retries_total.increment(4);
         });
 
@@ -550,6 +572,12 @@ mod tests {
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.votes_refused_inactive_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.votes_refused_execution_behind_total");
+        assert!(matches!(value, DebugValue::Counter(2)));
+        let (_, _, _, value) = find("tn_primary.rejoin_grace_holds_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
         assert!(matches!(value, DebugValue::Counter(4)));

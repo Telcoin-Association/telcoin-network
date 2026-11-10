@@ -47,7 +47,7 @@ mod workload_bench;
 
 pub mod tndb;
 
-pub use tn_types::error::StoreError;
+pub use tn_types::{error::StoreError, ROUNDS_TO_KEEP};
 
 #[cfg(all(test, feature = "reth-libmdbx"))]
 use crate::mdbx::composite_db::CompositeDatabase;
@@ -60,10 +60,6 @@ pub type PayloadToken = u8;
 /// Convenience type to propagate store errors.
 /// Use eyre- just YOLO these errors for now...
 pub type StoreResult<T> = eyre::Result<T>;
-
-/// The number of rounds of certificates and sub dags to save before garbage collecting them out of
-/// the DB.
-pub const ROUNDS_TO_KEEP: u32 = 64;
 
 /// The datastore column family names.
 const LAST_PROPOSED_CF: &str = "last_proposed";

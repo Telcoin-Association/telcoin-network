@@ -78,9 +78,17 @@ struct WalkLedger {
 #[derive(Clone, Default)]
 struct WalkTracker {
     inner: Arc<Mutex<WalkLedger>>,
+    /// Signalled each time a walk's reservation is released.
+    ended: Arc<tokio::sync::Notify>,
 }
 
 impl WalkTracker {
+    /// Resolves once a walk has ended since the last time this resolved. A walk that ends while
+    /// nothing waits leaves one wake-up for the next wait.
+    async fn walk_ended(&self) {
+        self.ended.notified().await
+    }
+
     /// Number of walks in flight. A loose throttle metric: the value can race a walk finishing, but
     /// (as with the previous counter) one walk more or less does not matter.
     fn active(&self) -> usize {
@@ -159,6 +167,7 @@ struct WalkGuard {
 impl Drop for WalkGuard {
     fn drop(&mut self) {
         self.tracker.inner.lock().ranges.retain(|r| r.id != self.id);
+        self.tracker.ended.notify_one();
     }
 }
 
@@ -443,14 +452,29 @@ async fn try_partial_pack_catch_up(
 /// Spawn a long running task on task_manager that will keep the last_consensus_header watch on
 /// consensus_bus up to date. This should only be used when NOT participating in active consensus.
 /// Note, this an epoch scoped task so it will be stopped on each epoch boundary.  It should handle
-/// this but it is worth considering this will happen.  This is required because we only use this
-/// task when an observer, never as a CVV.
+/// this but it is worth considering this will happen. It runs only for a node outside active
+/// consensus, an observer or an inactive CVV (see `spawn_state_sync`).
+///
+/// A gossiped number above `consensus_chain`'s latest output that is already held when the task
+/// starts is requested at once, the same way as a later change.
 pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
+    consensus_chain: ConsensusChain,
 ) {
     // Get the epoch of our last executed consensus.
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
+    // subscribing marks the held value as seen. a node demoted for commit lag holds the frontier
+    // it heard while active, above its own last save, and when that demotion took the committee
+    // below quorum nothing newer is gossiped: without this the gap would never be fetched and the
+    // node could never rejoin on the stalled head. checked at the subscribe so a value published
+    // after it still fires changed() below
+    let (_, held_number, _) = *rx_gossip_update.borrow();
+    let latest_number = consensus_chain.latest_consensus_number();
+    if held_number > latest_number {
+        debug!(target: "state-sync", held_number, latest_number, "requesting the consensus frontier gossiped before tracking started");
+        rx_gossip_update.mark_changed();
+    }
     let rx_shutdown = config.shutdown().subscribe();
     // This loop will track current consensus as well as try to backfill from current.
     // This task backfills the current epoch records as well as requesting entire pack files
@@ -687,6 +711,10 @@ async fn get_consensus_header_range<DB: TNDatabase>(
 /// closes, can make progress. No walk is started then: it would abort at once, and its
 /// `last_number` bump would leave a hole below the next walk's floor. Otherwise the gossip starts a
 /// backward walk down to the previous gossip point.
+///
+/// While too many walks run the gossip starts none and is left for a later gossip to cover. The
+/// highest such gossip is kept in `skipped` until a walk reaches it, so the fetch task can offer it
+/// again when a walk ends: a committee halted below quorum sends no later gossip.
 #[allow(clippy::too_many_arguments)]
 async fn manage_new_consensus<DB: TNDatabase>(
     db: &DB,
@@ -701,6 +729,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
     partial_gate: &mut PartialPackGate,
     last_number: &mut Option<u64>,
     current_fetch_epoch: &mut Epoch,
+    skipped: &mut Option<(Epoch, u64, ConsensusHeaderDigest)>,
 ) {
     let db_clone = db.clone();
     let consensus_bus_clone = consensus_bus.clone();
@@ -773,6 +802,9 @@ async fn manage_new_consensus<DB: TNDatabase>(
         // Skip for now, this number will be subsumed by gossip once enough tasks end.
         let end_number = last_number.unwrap_or_default();
         *last_number = Some(number + 1);
+        if skipped.is_some_and(|(_, skipped_number, _)| skipped_number <= number) {
+            *skipped = None;
+        }
         let guard = walk_tracker.reserve(end_number, number);
         task_spawner.spawn_task(
             format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
@@ -791,6 +823,11 @@ async fn manage_new_consensus<DB: TNDatabase>(
                 Ok(())
             },
         );
+    } else if decodable {
+        if skipped.is_none_or(|(_, skipped_number, _)| skipped_number < number) {
+            *skipped = Some((epoch, number, hash));
+        }
+        debug!(target: "state-sync", number, active = walk_tracker.active(), "too many consensus walks running, holding the gossiped number until one ends");
     }
 
     if *current_fetch_epoch < epoch {
@@ -825,6 +862,8 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     // local pack decodes the gossiped epoch.
     let mut partial_gate = PartialPackGate::default();
     let mut last_number = None;
+    // the highest gossip no walk was started for while too many ran (see `manage_new_consensus`)
+    let mut skipped = None;
     // One ledger for every fetch walk (bulk backfill, gossip backfill, gap fill): it throttles how
     // many run at once and lets a gap fill defer to a walk already covering its range instead of
     // racing a duplicate download.
@@ -851,7 +890,30 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                     &mut partial_gate,
                     &mut last_number,
                     &mut current_fetch_epoch,
+                    &mut skipped,
                 ).await;
+            }
+
+            // a walk ended, so the gossip held back by the walk cap may start one now. a later
+            // gossip would cover it, but a halted committee sends none. a node promoted since the
+            // gossip was held follows consensus itself and no stream would drain the walk, so the
+            // held gossip is dropped then
+            _ = walk_tracker.walk_ended(), if skipped.is_some() => {
+                let held = skipped.take().filter(|_| !consensus_bus.is_active_cvv());
+                if let Some((epoch, number, hash)) = held {
+                    manage_new_consensus(&db,
+                        &consensus_bus,
+                        &network,
+                        &consensus_chain,
+                        &task_spawner,
+                        &walk_tracker,
+                        epoch, number, hash,
+                        &mut partial_gate,
+                        &mut last_number,
+                        &mut current_fetch_epoch,
+                        &mut skipped,
+                    ).await;
+                }
             }
 
             // The observer catch-up loop stalled on a bottom gap the gossip-driven walk cannot
@@ -932,7 +994,7 @@ mod tests {
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
         CommittedSubDag, ConsensusOutput, EpochSeedChainValue, ReputationScores, ShutdownNotifier,
-        TaskManager,
+        TaskManager, B256,
     };
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
@@ -1096,6 +1158,7 @@ mod tests {
                 &mut partial_gate,
                 &mut last_number,
                 &mut current_fetch_epoch,
+                &mut None,
             )
             .await;
         }
@@ -1367,5 +1430,135 @@ mod tests {
         drop(with_hole);
         drop(lo);
         assert_eq!(tracker.active(), 0);
+    }
+
+    /// A frontier gossiped before the tracker started (heard while active, before the demotion
+    /// that restarted the node inactive) is requested without a later change, once; a later
+    /// change is still requested. A held number the chain already reaches is not requested.
+    /// Before the fix the subscribe marked the held frontier as seen, so a committee halted by
+    /// that demotion left the gap unfetched for good.
+    #[tokio::test]
+    async fn tracker_requests_the_frontier_held_at_start() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        let tip = save_chained_outputs(&chain, &fixture, 3).await;
+        assert_eq!(chain.latest_consensus_number(), 3);
+        let mut authorities = fixture.authorities();
+        let wait = Duration::from_millis(200);
+
+        let consensus_bus = ConsensusBusApp::new();
+        let held = (0, 5, ConsensusHeaderDigest::from(B256::repeat_byte(5)));
+        consensus_bus.last_published_consensus_num_hash().send_replace(held);
+        // the queue drops what is sent while nothing is subscribed
+        let mut rx_request = consensus_bus.subscribe_consensus_request_queue();
+        let config = authorities.next().expect("an authority").consensus_config();
+        let tracker = tokio::spawn(spawn_track_recent_consensus(
+            config.clone(),
+            consensus_bus.clone(),
+            chain.clone(),
+        ));
+        let request = tokio::time::timeout(Duration::from_secs(5), rx_request.recv())
+            .await
+            .expect("the held frontier is requested without a later change")
+            .expect("request queue open");
+        assert_eq!(request, held);
+        let later = (0, 6, ConsensusHeaderDigest::from(B256::repeat_byte(6)));
+        consensus_bus.publish_consensus_num_hash_if_newer(later.0, later.1, later.2);
+        let request = tokio::time::timeout(Duration::from_secs(5), rx_request.recv())
+            .await
+            .expect("a later change is requested")
+            .expect("request queue open");
+        assert_eq!(request, later, "the held frontier is requested once");
+        config.shutdown().notify();
+        tracker.await.expect("the tracker stops on shutdown");
+
+        // the chain already holds the gossiped number: nothing to fetch
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.last_published_consensus_num_hash().send_replace((0, 3, tip));
+        let mut rx_request = consensus_bus.subscribe_consensus_request_queue();
+        let config = authorities.next().expect("a second authority").consensus_config();
+        let tracker =
+            tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus, chain));
+        assert!(
+            tokio::time::timeout(wait, rx_request.recv()).await.is_err(),
+            "a held number the chain reaches is not requested"
+        );
+        config.shutdown().notify();
+        tracker.await.expect("the tracker stops on shutdown");
+    }
+
+    /// A gossip that arrives while six walks run starts no walk. The highest such gossip is held
+    /// until a walk ends; offered again then, it starts a walk, which clears it. Before the fix it
+    /// was dropped on the assumption that a later gossip would cover it, which a committee halted
+    /// below quorum never sends.
+    #[tokio::test]
+    async fn gossip_skipped_under_the_walk_cap_is_held_until_a_walk_ends() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        // never answered: the walk started below waits on the network until the test ends
+        let (network, _rx) = test_network();
+        let db = MemDatabase::default();
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+        let task_manager = TaskManager::new("t");
+        let spawner = task_manager.get_spawner();
+        let walk_tracker = WalkTracker::default();
+        let mut partial_gate = PartialPackGate::default();
+        // the first gossip's partial pack attempt is spent, so these gossips take the walk path
+        drop(partial_gate.try_begin(Instant::now()));
+        let mut last_number = None;
+        let mut current_fetch_epoch = 0;
+        let mut skipped = None;
+        let mut running: Vec<_> =
+            (0..6).map(|walk| walk_tracker.reserve(walk * 100, walk * 100 + 99)).collect();
+        let hash = |number: u64| ConsensusHeaderDigest::from(B256::with_last_byte(number as u8));
+
+        for number in [37, 38, 36] {
+            manage_new_consensus(
+                &db,
+                &consensus_bus,
+                &network,
+                &chain,
+                &spawner,
+                &walk_tracker,
+                0,
+                number,
+                hash(number),
+                &mut partial_gate,
+                &mut last_number,
+                &mut current_fetch_epoch,
+                &mut skipped,
+            )
+            .await;
+        }
+        assert_eq!(skipped, Some((0, 38, hash(38))), "the highest skipped gossip is held");
+        assert_eq!((last_number, walk_tracker.active()), (None, 6), "no walk started");
+
+        drop(running.pop());
+        tokio::time::timeout(Duration::from_secs(1), walk_tracker.walk_ended())
+            .await
+            .expect("the fetch task wakes when a walk ends");
+        let (epoch, number, held) = skipped.take().expect("the skipped gossip is held");
+        manage_new_consensus(
+            &db,
+            &consensus_bus,
+            &network,
+            &chain,
+            &spawner,
+            &walk_tracker,
+            epoch,
+            number,
+            held,
+            &mut partial_gate,
+            &mut last_number,
+            &mut current_fetch_epoch,
+            &mut skipped,
+        )
+        .await;
+        assert_eq!(skipped, None);
+        assert_eq!((last_number, walk_tracker.active()), (Some(39), 6), "it starts a walk");
+        drop(task_manager);
     }
 }

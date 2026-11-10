@@ -215,6 +215,30 @@ pub enum HeaderError {
     /// This node is not a member of the current committee and cannot vote.
     #[error("This node is not a committee member and cannot vote")]
     NotCommitteeMember,
+    /// This node is not an active committee validator (an inactive node catching up, or an
+    /// observer), so it refuses to sign new votes.
+    ///
+    /// A `CvvInactive` node follows consensus output while it catches up. It holds no live DAG to
+    /// validate a header's parents against, so a vote from it would attest to nothing it checked.
+    /// The refusal is recoverable and carries no penalty: the requester retries and this node
+    /// votes again once it rejoins. A vote it already signed for the same header is still
+    /// recast.
+    #[error(
+        "This node is not an active committee validator (inactive catch-up or observer) and does \
+         not vote"
+    )]
+    NotActiveCvv,
+    /// This node's execution did not reach the block the header was built on within the voter's
+    /// execution wait, so it refuses to vote for now.
+    ///
+    /// `header_block` is the number of the header's `latest_execution_block` and `local_block` the
+    /// number of this node's latest executed block when the wait ran out. The refusal is
+    /// recoverable and carries no penalty: the requester retries, and a voter that has caught up
+    /// by then votes on the retry.
+    #[error(
+        "Execution is behind the header: header block {header_block}, local block {local_block}"
+    )]
+    ExecutionBehind { header_block: u64, local_block: u64 },
     /// The header's execution block lies below this node's restored-state floor, so this voter
     /// can never check it and refuses to vote.
     ///
