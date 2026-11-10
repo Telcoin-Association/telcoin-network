@@ -1,9 +1,10 @@
 //! Property-based tests for the output-scoped read cache (`OutputBuildScope`).
 //!
 //! These tests verify, over random native transfers, storage writes, CREATE2 creations (with and
-//! without a self-destruct in the creating transaction), calls into the created children and
-//! zero-value sends to an empty genesis account, spread across the 2-4 unpersisted blocks of one
-//! consensus output, that keeping one read cache for the whole output is invisible to consensus:
+//! without a self-destruct in the creating transaction), calls into the created children,
+//! zero-value sends to an empty genesis account and BLOCKHASH reads of the two blocks before the
+//! current one, spread across the 2-4 unpersisted blocks of one consensus output, that keeping
+//! one read cache for the whole output is invisible to consensus:
 //! - the shared cache builds the blocks a fresh cache per block builds: equal block hash, state
 //!   root, receipts root, gas used, receipts and bundle state;
 //! - after every block, each cached account, storage slot, bytecode and block hash equals what the
@@ -15,6 +16,7 @@ use crate::pipeline_helpers::{
 };
 use proptest::prelude::*;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
+use std::collections::BTreeSet;
 use tn_reth::{test_utils::TransactionFactory, ExecutedBlock, OutputBuildScope, OutputTrieOverlay};
 use tn_types::{Address, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
@@ -24,6 +26,13 @@ const STORE_RUNTIME: [u8; 12] = [
     0x60, 0x40, 0x35, 0x54, // sload(calldataload(0x40))
     0x60, 0x20, 0x35, 0x01, // + calldataload(0x20)
     0x5f, 0x35, 0x55, 0x00, // sstore(calldataload(0), ..); stop
+];
+
+/// Runtime of the block-hash contract: `sstore(0, blockhash(number - calldataload(0)))`, so every
+/// call reads one earlier block's hash through the database and writes it to state.
+const BLOCK_HASH_RUNTIME: [u8; 8] = [
+    0x5f, 0x35, 0x43, 0x03, 0x40, // blockhash(number - calldataload(0))
+    0x5f, 0x55, 0x00, // sstore(0, ..); stop
 ];
 
 /// Recipients a transfer picks from, by index: a fresh address (a zero-value transfer only
@@ -51,10 +60,13 @@ enum Op {
     /// A zero-value send to the empty genesis account, which clears it under EIP-161 while it is
     /// empty.
     TouchEmpty { from: usize },
+    /// A block-hash contract call reading the hash of the block `depth` below the current one
+    /// (the parent at depth 1; every block of an output has at least two ancestors).
+    BlockHash { from: usize, depth: u64 },
 }
 
-/// One of the five operations, over small ranges so senders, recipients, slots and children
-/// repeat within and across blocks.
+/// One of the six operations, over small ranges so senders, recipients, slots, children and block
+/// hashes repeat within and across blocks.
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0..2usize, 0..RECIPIENTS, 0..3u64)
@@ -66,6 +78,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0..2usize, 0..CHILDREN, 0..3u64)
             .prop_map(|(from, child, word)| Op::CallChild { from, child, word }),
         1 => (0..2usize).prop_map(|from| Op::TouchEmpty { from }),
+        1 => (0..2usize, 1..3u64).prop_map(|(from, depth)| Op::BlockHash { from, depth }),
     ]
 }
 
@@ -84,20 +97,23 @@ struct Fixture {
     store: Address,
     /// The CREATE2 factory.
     factory: Address,
+    /// The block-hash contract.
+    hasher: Address,
 }
 
 impl Fixture {
-    /// Deploy the store contract and the factory and fund the second sender, in one persisted
-    /// block (user nonces 0-2).
+    /// Deploy the store contract, the factory and the block-hash contract and fund the second
+    /// sender, in one persisted block (user nonces 0-3).
     fn new() -> eyre::Result<Self> {
         let mut env = PipelineTestEnv::new_with_empty_governance_eoa();
         let second = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(300));
         let user = env.user_factory.address();
-        let (store, factory) = (user.create(0), user.create(1));
+        let (store, factory, hasher) = (user.create(0), user.create(1), user.create(2));
         let funding = U256::from(10).pow(U256::from(18));
         let txs = [
             (None, U256::ZERO, deploy_code(&STORE_RUNTIME)),
             (None, U256::ZERO, deploy_code(&FACTORY_RUNTIME)),
+            (None, U256::ZERO, deploy_code(&BLOCK_HASH_RUNTIME)),
             (Some(second.address()), funding, Bytes::new()),
         ]
         .into_iter()
@@ -113,8 +129,8 @@ impl Fixture {
         })
         .collect();
         let setup = env.execute_block(txs)?;
-        eyre::ensure!((0..3).all(|index| env.tx_succeeded(&setup, index)), "setup block failed");
-        Ok(Self { env, second, store, factory })
+        eyre::ensure!((0..4).all(|index| env.tx_succeeded(&setup, index)), "setup block failed");
+        Ok(Self { env, second, store, factory, hasher })
     }
 
     /// The CREATE2 address of child `variant`.
@@ -148,6 +164,7 @@ impl Fixture {
             Op::TouchEmpty { from } => {
                 (from, self.env.governance_factory.address(), 0, Bytes::new())
             }
+            Op::BlockHash { from, depth } => (from, self.hasher, 0, word(depth).to_vec().into()),
         };
         let chain = self.env.chain.clone();
         let sender = if from == 0 { &mut self.env.user_factory } else { &mut self.second };
@@ -255,12 +272,37 @@ fn test_repeated_sender_and_slot_follow_the_output() -> Result<(), TestCaseError
         prop_assert!(block_differences(fresh, shared).is_empty());
         let user = env.user_factory.address();
         let cached = scope.reads().accounts[&user].info.as_ref().map(|info| info.nonce);
-        // nonces 0-2 set up the fixture before the output
-        prop_assert_eq!(cached, Some(number + 3));
+        // nonces 0-3 set up the fixture before the output
+        prop_assert_eq!(cached, Some(number + 4));
         let store = user.create(0);
         let slot = scope.reads().accounts[&store].storage.get(&U256::from(1)).copied();
         // block 1 writes 2 + 0, block 2 writes 3 + 2 (read from the cache), block 3 leaves it
         prop_assert_eq!(slot, Some(U256::from(if number == 1 { 2 } else { 5 })));
+        Ok(())
+    })
+}
+
+/// Non-proptest: BLOCKHASH reads fill the cache's block hashes. The first block reads the setup
+/// block's hash from the database, the second reads the first block's from the in-memory chain,
+/// and the third reads the first block's again, now from the cache; both builds agree and every
+/// cached hash is the chain's.
+#[test]
+fn test_block_hash_reads_are_cached() -> Result<(), TestCaseError> {
+    let depths = [1, 1, 2];
+    let blocks: Vec<Vec<Op>> =
+        depths.iter().map(|&depth| vec![Op::BlockHash { from: 0, depth }]).collect();
+    let mut read = BTreeSet::new();
+    let mut index = 0;
+    run_output(&blocks, |env, fresh, shared, scope| {
+        prop_assert!(block_differences(fresh, shared).is_empty());
+        let mismatches = env
+            .cache_mismatches(scope, fresh)
+            .map_err(|err| TestCaseError::fail(err.to_string()))?;
+        prop_assert!(mismatches.is_empty(), "block {}: {:?}", index + 1, mismatches);
+        read.insert(fresh.recovered_block.number - depths[index]);
+        let cached: BTreeSet<u64> = scope.reads().block_hashes.keys().copied().collect();
+        prop_assert_eq!(&cached, &read, "block {}", index + 1);
+        index += 1;
         Ok(())
     })
 }
