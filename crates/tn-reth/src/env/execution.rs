@@ -146,6 +146,15 @@ impl RethEnv {
     /// Callers that persist every block before building the next (tests, e2e helpers)
     /// pass a fresh empty overlay per block: the database then already holds the
     /// parent state, so the empty overlay is exact.
+    ///
+    /// # Callers
+    ///
+    /// The engine never calls this: it recovers signers with [`Self::recover_output_signers`]
+    /// and builds through [`Self::build_block_from_recovered_payload`]. Every remaining caller of
+    /// this and [`Self::build_block_from_batch_payload_timed`] is a test, a `#[cfg(test)]` module
+    /// or a `test-utils` helper. Both are kept as the differential oracle for the recovered path:
+    /// they recover each batch themselves and build from an empty read cache, so a test can
+    /// compare their blocks with the recovered build's.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
@@ -166,6 +175,10 @@ impl RethEnv {
     /// [`Self::build_block_from_recovered_payload`] runs, so both entry points share one build.
     /// Every call starts from an empty read cache; only the caller's `overlay` carries over from
     /// one block of an output to the next.
+    ///
+    /// Like the untimed call, this has no production caller: tests keep it as the differential
+    /// oracle for the recovered path (see the callers note on
+    /// [`Self::build_block_from_batch_payload`]).
     pub fn build_block_from_batch_payload_timed(
         &self,
         payload: TNPayload,
