@@ -1,0 +1,1 @@
+//! The RPC admission bound.
