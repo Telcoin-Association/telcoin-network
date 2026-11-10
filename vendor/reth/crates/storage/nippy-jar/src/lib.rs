@@ -500,7 +500,13 @@ impl DataReader {
         let offset_mmap = unsafe { Mmap::map(&offset_file)? };
 
         // First byte is the size of one offset in bytes
-        let offset_size = offset_mmap[0];
+        // TN(TN-0131): an empty offsets file (a crash right after a new jar's configuration was
+        // written can leave one) is an error, not a panic on the empty map.
+        let Some(&offset_size) = offset_mmap.first() else {
+            return Err(NippyJarError::EmptyOffsetsFile(
+                path.as_ref().with_extension(OFFSETS_FILE_EXTENSION),
+            ))
+        };
 
         // Ensure that the size of an offset is at most 8 bytes.
         if offset_size > 8 {
@@ -1823,6 +1829,60 @@ mod tests {
                 }
                 assert_eq!(data, after[0]);
                 assert!(read_all_rows(path).iter().all(Result::is_ok));
+            }
+        }
+    }
+
+    /// TN(TN-0131): a jar whose configuration counts no rows holds nothing committed, so the
+    /// writer's open restores the files a new jar starts with, whatever a crash left in them: an
+    /// empty or torn offsets file (a rotation's power loss after the new jar's configuration was
+    /// written), a damaged final offset, or another jar's leftover files. Both formats. The
+    /// reader refuses an empty offsets file with an error instead of a panic.
+    #[test]
+    fn test_jar_without_rows_opens_whatever_its_files_hold() {
+        let (col1, col2) = test_data(Some(17));
+        let mut created = vec![writer::OFFSET_SIZE_BYTES];
+        created.extend_from_slice(&[0; writer::OFFSET_SIZE_BYTES as usize]);
+        let mut damaged_final = created.clone();
+        damaged_final[8] = 0x80;
+        for checksums in [false, true] {
+            let leftover = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(leftover.path(), &col1, &col2, checksums);
+            let [leftover_data, leftover_offsets, _] = jar_files(leftover.path());
+
+            for (offsets, data) in [
+                (vec![], vec![]),
+                (created[..5].to_vec(), vec![]),
+                (damaged_final.clone(), vec![]),
+                (created.clone(), leftover_data[..40].to_vec()),
+                (leftover_offsets.clone(), leftover_data.clone()),
+            ] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                let mut nippy = NippyJar::new_without_header(2, path);
+                if checksums {
+                    nippy = nippy.with_checksums();
+                }
+                nippy.freeze_config().unwrap();
+                std::fs::write(path, &data).unwrap();
+                std::fs::write(path.with_extension(OFFSETS_FILE_EXTENSION), &offsets).unwrap();
+                if offsets.is_empty() {
+                    let err = NippyJar::load_without_header(path).unwrap().open_data_reader();
+                    assert!(matches!(err, Err(NippyJarError::EmptyOffsetsFile(_))), "{err:?}");
+                }
+
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), Vec::<u8>::new());
+                assert_eq!(
+                    std::fs::read(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap(),
+                    created
+                );
+                append_row(&mut writer, &col1, &col2, 0);
+                append_row(&mut writer, &col1, &col2, 1);
+                writer.commit().unwrap();
+                drop(writer);
+                assert_jar_rows(path, &col1, &col2, 2);
             }
         }
     }

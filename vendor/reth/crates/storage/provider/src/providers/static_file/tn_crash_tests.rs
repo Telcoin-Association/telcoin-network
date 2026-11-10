@@ -158,3 +158,61 @@ fn checksummed_changesets_shorter_than_the_header_are_refused() {
     assert!(provider.latest_writer(ACCOUNTS).is_err());
     assert!(!path.with_extension("csoff").exists());
 }
+
+/// TN(TN-0131): a power loss right after a rotation wrote the next jar's configuration (rows 0)
+/// can leave that jar's offsets file empty. The next persist reopens the jar and appends to it,
+/// in both formats, for a block segment and a changeset segment; it used to panic on the empty
+/// offsets map at every start.
+#[test]
+fn rotation_after_an_empty_offsets_file() {
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_storage_api::HeaderProvider;
+
+    let header = |number: u64| Header { number, ..Default::default() };
+    let hash = |number: u64| B256::with_last_byte(number as u8 + 1);
+    for checksums in [false, true] {
+        let (dir, _) = create_test_static_files_dir();
+        let provider = provider(dir.path(), checksums, 2);
+        let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
+        for number in 0..2 {
+            headers.append_header(&header(number), &hash(number)).unwrap();
+        }
+        headers.commit().unwrap();
+        // The rotation opens the next jar, whose configuration is written at once.
+        headers.append_header(&header(2), &hash(2)).unwrap();
+        drop(headers);
+        write_accounts(&provider, 0..2, 2);
+        let mut accounts = provider.latest_writer(ACCOUNTS).unwrap();
+        accounts.append_account_changeset(account_changes(2), 2).unwrap();
+        drop(accounts);
+        let next = [StaticFileSegment::Headers, ACCOUNTS]
+            .map(|segment| provider.directory().join(segment.filename(&(2..=3).into())));
+        drop(provider);
+        for path in &next {
+            assert_eq!(load(path).rows(), 0);
+            std::fs::write(path.with_extension("off"), []).unwrap();
+        }
+
+        let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+        let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
+        for number in 2..4 {
+            headers.append_header(&header(number), &hash(number)).unwrap();
+        }
+        headers.commit().unwrap();
+        drop(headers);
+        let mut accounts = provider.latest_writer(ACCOUNTS).unwrap();
+        for block in 2..4 {
+            accounts.append_account_changeset(account_changes(block), block).unwrap();
+        }
+        accounts.commit().unwrap();
+        drop(accounts);
+        for number in 0..4 {
+            assert_eq!(provider.header_by_number(number).unwrap(), Some(header(number)));
+        }
+        assert_accounts(&provider, 3, 4);
+        for path in &next {
+            assert_eq!(load(path).rows() as u64, if path == &next[0] { 2 } else { 2 * CHANGES });
+        }
+    }
+}

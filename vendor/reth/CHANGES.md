@@ -1123,3 +1123,27 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   build's order, a sidecar one record short, a sidecar gone). Mutation-checked: the `.conf`
   written after the cuts, the sidecar cut before the commit, each of the three refusals removed.
   *Upstream*: maybe (the order is an upstream bug; the refusal needs TN-0120's versions).
+
+- **TN-0131** — A jar without committed rows opens whatever a crash left in its files, and an
+  empty offsets file is an error, not a panic. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs, error.rs}`
+  (`NippyJarChecker::reset_files`, `DataReader::new`, `NippyJarError::EmptyOffsetsFile`, tests),
+  `crates/storage/provider/src/providers/static_file/tn_crash_tests.rs`.
+  *Why*: a rotation creates the next jar's data and offsets files, writes the 9-byte offsets
+  header without a sync and then the jar's configuration (rows 0) durably. A power loss there can
+  leave the configuration and an empty or torn offsets file (ext4's delayed allocation keeps the
+  size at 0). The next persist reopens that jar, the heal maps the offsets file and
+  `DataReader::new` indexed byte 0 of an empty map: a panic at every start, until someone deleted
+  the files by hand. A configuration that counts no rows commits nothing, so whatever the files
+  hold is uncommitted: the writer's open (`NippyJarChecker` in heal mode) now restores the files a
+  new jar starts with (the offset size and a final offset of 0, an empty data file), writing only
+  when they differ. That also covers a damaged final offset and another jar's leftover files
+  (TN-0132). Every other reader of an empty offsets file gets `EmptyOffsetsFile`. Jars with rows
+  are not touched; the read-only check is unchanged. It cannot reach execution: only jars with no
+  rows change, and their files end as a new jar's.
+  *Tests*: `test_jar_without_rows_opens_whatever_its_files_hold` (empty, torn and damaged offsets,
+  leftover data and a whole other jar's files, both versions: the open restores the new-jar files
+  and appends read back; the reader's error), `rotation_after_an_empty_offsets_file` (headers and
+  account changesets, both versions: the rotated jar's offsets emptied, the next persist appends
+  and every block reads). Mutation-checked: no reset (both fail), the reader indexing the map
+  (panics). *Upstream*: yes (the panic is upstream's).

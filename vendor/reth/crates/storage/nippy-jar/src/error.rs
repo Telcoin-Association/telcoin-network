@@ -134,4 +134,8 @@ pub enum NippyJarError {
         /// Which file is short: `offsets` or `data`.
         file: &'static str,
     },
+
+    /// TN(TN-0131): a jar's offsets file is empty, without even its offset size byte.
+    #[error("static file offsets file {} is empty", .0.display())]
+    EmptyOffsetsFile(PathBuf),
 }
