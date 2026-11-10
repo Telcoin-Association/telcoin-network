@@ -11,8 +11,11 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 # Image repository of the ad-hoc images that docker-adiri, docker-devnet and docker-push
 # build or push. Release images have their own packages, ghcr.io/telcoin-association/tn-mainnet
-# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and only
-# etc/release.sh writes them (release-build pushes the tag, release-publish moves the alias).
+# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and the release
+# process writes them only through etc/release.sh (release-build pushes the tag,
+# release-publish moves the alias). GHCR_IMAGE=... on the make command line replaces this
+# default and is not checked; each release package's access list limits who can write to it
+# (.github/ACTIONS.md).
 GHCR_IMAGE := ghcr.io/telcoin-association/tn-dev
 
 # Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the

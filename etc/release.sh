@@ -568,11 +568,22 @@ registry_digest() {
 # never pushed). Any other failure, such as DNS, a timeout or an expired login, is retried and
 # then stops with 3, so it never reads as "the login does not see TAG".
 login_digest() {
-    local out digest last attempt=1
+    local out line digest last attempt=1
     while :; do
         if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
-            digest=$(printf '%s\n' "$out" | awk 'NF { d = $1 } END { print d }')
-            [[ "$digest" =~ $DIGEST_RE ]] ||
+            # out holds stderr too, which the failure classification below needs. A warning can
+            # come before or after the digest line, so take the first line that is a digest,
+            # not the last line.
+            digest=
+            while IFS= read -r line; do
+                if [[ "$line" =~ $DIGEST_RE ]]; then
+                    digest=$line
+                    break
+                fi
+            done <<EOF
+$out
+EOF
+            [ -n "$digest" ] ||
                 die 1 "docker buildx imagetools inspect $IMAGE:$TAG answered without a digest: $out"
             printf '%s\n' "$digest"
             return 0
@@ -580,6 +591,12 @@ login_digest() {
         last=$(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')
         case "$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]')" in
             *"permission denied"*) ;;
+            # *denied* also matches "denied: requested access to the resource is denied", which
+            # ghcr answers to a login without read on an existing private package. That case
+            # reads as "the login does not see TAG" too, so with RELEASE_FIRST_PUSH set, build
+            # runs in full and then stops when its push is refused. Nothing reaches the registry
+            # or the draft, since write on a package implies read. The failure table in the
+            # maintainer guide says not to set RELEASE_FIRST_PUSH on a later release.
             *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied* | *"403 forbidden"*)
                 info "with the docker login, $IMAGE:$TAG does not resolve: $last"
                 return 0
