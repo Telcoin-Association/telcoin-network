@@ -503,7 +503,7 @@ impl WorkerNetworkHandle {
                 self.request_batches_from_peer(peer, digests_for_peer).await.map_or_else(
                     |error| match error {
                         PeerFetchError::Denied(e) => {
-                            self.metrics.record_batch_request_denied(&peer);
+                            self.metrics.record_batch_request_denied(&peer, &committee);
                             warn!(
                                 target: "worker::network",
                                 %peer,
@@ -512,7 +512,7 @@ impl WorkerNetworkHandle {
                             );
                         }
                         PeerFetchError::Failed(e) => {
-                            self.metrics.record_batch_request_failed(&peer);
+                            self.metrics.record_batch_request_failed(&peer, &committee);
                             warn!(
                                 target: "worker::network",
                                 %peer,
@@ -1279,7 +1279,8 @@ mod tests {
     }
 
     /// A peer whose stream open fails is counted once as a failed batch request, because it
-    /// is skipped on the later passes, and never as a denied one.
+    /// is skipped on the later passes, and never as a denied one. The peer is in the
+    /// handle's committee, so it records under its own key rather than `other`.
     #[tokio::test(start_paused = true)]
     async fn failed_peer_counts_one_failed_batch_request() {
         let recorder = DebuggingRecorder::new();
@@ -1304,8 +1305,9 @@ mod tests {
             }
         });
         let task_manager = TaskManager::default();
-        let handle =
+        let mut handle =
             WorkerNetworkHandle::new_for_test_with_sender(sender, task_manager.get_spawner());
+        handle.update_epoch(0, HashSet::from([peer]));
 
         let mut digests = BTreeSet::from([B256::default()]);
         let result = handle.request_batches(&mut digests, None).await;
