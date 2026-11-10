@@ -735,3 +735,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `sync_stats_record_each_phase_per_segment` (each phase once per segment, `.csoff` only for a
   changeset segment, a take drains them; fails when a phase is not recorded) and tn-reth's
   `test_persist_reports_static_file_sync_stats`. *Upstream*: no.
+
+- **TN-0100** — A timing harness for historical reads, storage v1 against v2. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/database/tn_v2_read_bench.rs` (new: the heavy
+  test `v2_history_read_timing_heavy`), `.../database/mod.rs` (the module),
+  `.../database/tn_v2_tests.rs` (`executed` is `pub(super)`).
+  *Why*: storage v2 answers a historical account or storage read that the history resolves to a
+  changeset from static files, not from a database table, and the exec bench showed those reads
+  slower than v1's with a longer tail. The harness saves one generated chain (2400 blocks of 150
+  account and 300 slot changes) into a v1 and a v2 factory in batches of 8 blocks, then times the
+  same 20k reads in each: right after the last persist, again warm, with the changeset jars
+  reloaded every 32 reads as a persist does, while a writer persists, and while a writer persists
+  and another thread holds a static-file jar the way a range walk does. Under v2 it also times
+  the steps of the changeset lookup (jar, `.csoff` read, cursor, binary search). Every answer is
+  compared between the passes and between the layouts. `#[ignore]`d (heavy, run with
+  `--release`); test code only. *Upstream*: no.

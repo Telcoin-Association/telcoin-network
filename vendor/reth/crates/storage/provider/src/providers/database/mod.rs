@@ -62,6 +62,10 @@ pub use chain::*;
 #[cfg(test)]
 mod tn_v2_tests;
 
+// TN(TN-0100): a timing harness for historical reads, storage v1 against v2.
+#[cfg(test)]
+mod tn_v2_read_bench;
+
 /// A common provider that fetches data from a database or static file.
 ///
 /// This provider implements most provider or provider factory traits.
