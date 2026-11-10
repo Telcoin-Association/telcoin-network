@@ -507,6 +507,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
   filter.
 
+- **TN-0102** — Backport 345fbbbfd: the in-memory trie cursor skips the database seek on an
+  exact overlay hit. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/trie_cursor/in_memory.rs` (`InMemoryTrieCursor`: a
+  `DbCursorState` replaces `cursor_wiped`/`cursor_entry`; `seek_exact` returns an exact in-memory
+  hit without touching the database cursor and marks it for a re-seek when it was behind; the
+  `seeked` flag is debug-only).
+  *Why*: the state root walks the account and storage tries through `InMemoryTrieCursor`, and TN's
+  output overlay stacks one per run of the blocks already built in the output (`RunTrieCursor` in
+  `crates/tn-reth/src/env/output_overlay/cursors.rs`). Every `seek_exact` seeked the layer below
+  first, down to the database, even when the overlay held the key; at a peak output the state root
+  does about 80k `StoragesTrie` exact seeks. Execution path (state root): the cursor returns the
+  same entries in the same order, only fewer lower-layer seeks. *Tests*: reth-trie (the in-memory
+  cursor's unit tests and `proptest_in_memory_trie_cursor`, against a reference merge; upstream
+  added the assertion that an exact hit leaves the database cursor untouched), reth-trie-db's
+  state-root tests, TN's `trie_overlay` tests and the exec-bench chain differential (TN-0106).
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
