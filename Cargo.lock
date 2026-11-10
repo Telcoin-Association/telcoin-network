@@ -7522,6 +7522,7 @@ version = "1.11.3"
 dependencies = [
  "anyhow",
  "bincode",
+ "crc",
  "crc32fast",
  "derive_more",
  "lz4_flex",

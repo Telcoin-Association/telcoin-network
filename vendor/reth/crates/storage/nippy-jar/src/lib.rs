@@ -71,16 +71,60 @@ pub const CONFIG_FILE_EXTENSION: &str = "conf";
 /// The file extension used for changeset offset sidecar files.
 pub const CHANGESET_OFFSETS_FILE_EXTENSION: &str = "csoff";
 
-/// TN(TN-0120): the checksum stored after a value of a checksummed jar: a CRC32 of the row index
-/// within the jar (u64 LE), the column index (u32 LE) and the value's stored bytes (compressed, if
-/// the jar compresses). The position binds the value to its place, so an offset that points at
-/// another value's start fails as well as a changed byte.
+/// TN(TN-0120): the checksum stored after a value of a checksummed jar: the CRC-32 (ISO-HDLC, the
+/// zlib CRC) of the value's stored bytes (compressed, if the jar compresses), started from
+/// [`value_seed`] of its position instead of the standard initial value.
+///
+/// The seed binds the value to its row and column: for inputs of one length the CRC is an
+/// injective function of the initial value, so a value read at another position (a damaged offset
+/// that lands exactly on another value) fails as surely as a changed byte, without hashing more
+/// bytes.
 pub fn value_checksum(row: u64, column: usize, stored: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&row.to_le_bytes());
-    hasher.update(&(column as u32).to_le_bytes());
-    hasher.update(stored);
+    checksum(value_seed(row, column), stored)
+}
+
+/// TN(TN-0120): the initial value of a checksummed jar's value at `row` (within the jar) and
+/// `column`, in crc32fast's convention (`crc32fast::Hasher::new_with_initial`, where 0 gives the
+/// standard CRC-32):
+/// `0x9E37_79B9 ^ (row as u32) ^ ((row >> 32) as u32).rotate_left(16) ^ (column as u32) *
+/// 0x85EB_CA6B` (wrapping). For rows below 2^32, two values of one column never share a seed, and
+/// values of two columns share one only if their rows differ by the XOR of the two column terms
+/// (at least 2^27 rows apart), so neighbouring values always differ.
+pub const fn value_seed(row: u64, column: usize) -> u32 {
+    0x9E37_79B9 ^
+        (row as u32) ^
+        ((row >> 32) as u32).rotate_left(16) ^
+        (column as u32).wrapping_mul(0x85EB_CA6B)
+}
+
+/// TN(TN-0120): the CRC-32 (ISO-HDLC) of `bytes` from the initial value `seed` (crc32fast's
+/// convention). On x86_64 below 128 bytes crc32fast runs a byte-at-a-time loop, so these inputs
+/// take the `crc` crate's slice-by-16 table instead; both give the same value.
+pub fn checksum(seed: u32, bytes: &[u8]) -> u32 {
+    if cfg!(target_arch = "x86_64") && bytes.len() < 128 {
+        checksum_slice16(seed, bytes)
+    } else {
+        checksum_crc32fast(seed, bytes)
+    }
+}
+
+/// [`checksum`] through crc32fast: hardware CRC on aarch64, PCLMULQDQ on x86_64 from 128 bytes.
+fn checksum_crc32fast(seed: u32, bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new_with_initial(seed);
+    hasher.update(bytes);
     hasher.finalize()
+}
+
+/// [`checksum`] through the `crc` crate's slice-by-16 table.
+fn checksum_slice16(seed: u32, bytes: &[u8]) -> u32 {
+    /// The CRC-32 the jar uses, with a 16-table slicing implementation.
+    static CRC32: crc::Crc<u32, crc::Table<16>> =
+        crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISO_HDLC);
+    // crc32fast keeps the finished (inverted) value as its state; `crc` takes the register's
+    // initial value, which for this reflected CRC it bit-reverses first.
+    let mut digest = CRC32.digest_with_initial((!seed).reverse_bits());
+    digest.update(bytes);
+    digest.finalize()
 }
 
 /// A [`RefRow`] is a list of column value slices pointing to either an internal buffer or a
@@ -1622,6 +1666,99 @@ mod tests {
                 (values[0], values[1]),
                 (col1[expected].as_slice(), col2[expected].as_slice())
             );
+        }
+    }
+
+    /// TN(TN-0120): both CRC implementations give the same value for every length and initial
+    /// value (they take the initial value in different forms), and seed 0 is the standard CRC-32.
+    #[test]
+    fn test_checksum_implementations_agree() {
+        let mut rng = SmallRng::seed_from_u64(12);
+        let mut bytes = vec![0u8; 300];
+        rng.fill_bytes(&mut bytes);
+        for len in 0..=300 {
+            for seed in [0, u32::MAX, value_seed(0, 0), rng.next_u32(), rng.next_u32()] {
+                let input = &bytes[..len];
+                let expected = checksum_crc32fast(seed, input);
+                assert_eq!(checksum_slice16(seed, input), expected, "len {len}, seed {seed:#x}");
+                assert_eq!(checksum(seed, input), expected, "len {len}, seed {seed:#x}");
+            }
+            assert_eq!(checksum(0, &bytes[..len]), crc32fast::hash(&bytes[..len]));
+        }
+        assert_eq!(checksum(0, b"123456789"), 0xCBF4_3926);
+        // Neighbouring positions get different seeds.
+        assert_ne!(value_seed(5, 0), value_seed(6, 0));
+        assert_ne!(value_seed(5, 0), value_seed(5, 1));
+        assert_ne!(value_seed(5, 1), value_seed(6, 0));
+    }
+
+    /// TN(TN-0120): an unverified read returns the stored bytes without the checksum, even when
+    /// they are damaged (the verified read of the same value fails); a value shorter than a
+    /// checksum and a row past the end are not handed out.
+    #[test]
+    fn test_unverified_value() {
+        let (col1, col2) = test_data(Some(13));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        freeze_checksummed(file.path(), &col1, &col2, false);
+        let nippy = NippyJar::load_without_header(file.path()).unwrap();
+        let cursor = NippyJarCursor::new(&nippy).unwrap();
+        for row in [0, 41, col1.len() - 1] {
+            assert_eq!(cursor.unverified_value(row, 0).unwrap(), Some(col1[row].as_slice()));
+            assert_eq!(cursor.unverified_value(row, 1).unwrap(), Some(col2[row].as_slice()));
+        }
+        assert_eq!(cursor.unverified_value(col1.len(), 0).unwrap(), None);
+        assert_eq!(cursor.unverified_value(0, 2).unwrap(), None);
+        drop(cursor);
+
+        let start = nippy.open_data_reader().unwrap().offset(41 * 2).unwrap();
+        flip_byte(file.path(), start, 0x80);
+        let nippy = NippyJar::load_without_header(file.path()).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        let mut damaged = col1[41].clone();
+        damaged[0] ^= 0x80;
+        assert_eq!(cursor.unverified_value(41, 0).unwrap(), Some(damaged.as_slice()));
+        assert!(matches!(
+            cursor.row_by_number_with_cols(41, 0b01),
+            Err(NippyJarError::ChecksumMismatch { row: 41, column: 0, .. })
+        ));
+
+        write_offset(file.path(), 2 * 41 + 1, start + 3);
+        let nippy = NippyJar::load_without_header(file.path()).unwrap();
+        let cursor = NippyJarCursor::new(&nippy).unwrap();
+        assert!(matches!(
+            cursor.unverified_value(41, 0),
+            Err(NippyJarError::ChecksumMismatch { row: 41, column: 0, .. })
+        ));
+    }
+
+    /// TN(TN-0120): nanoseconds per checksum by value size, for each implementation. Prints a
+    /// table; the x86_64 rows decide the 128-byte switch in [`checksum`].
+    #[test]
+    #[ignore = "heavy: run with --release"]
+    fn checksum_cost_heavy() {
+        let iterations = 2_000_000u32;
+        let mut bytes = vec![0u8; 600];
+        SmallRng::seed_from_u64(14).fill_bytes(&mut bytes);
+        println!("arch {}; ns per checksum", std::env::consts::ARCH);
+        println!(
+            "{:>5} {:>10} {:>10} {:>10} {:>10}",
+            "bytes", "unseeded", "crc32fast", "slice16", "dispatch"
+        );
+        type Scheme = fn(u32, &[u8]) -> u32;
+        let schemes: [Scheme; 4] =
+            [|_, b| crc32fast::hash(b), checksum_crc32fast, checksum_slice16, checksum];
+        for len in [20, 36, 44, 52, 60, 63, 64, 69, 80, 120, 127, 128, 176, 600] {
+            let input = &bytes[..len];
+            let ns = schemes.map(|scheme| {
+                let start = std::time::Instant::now();
+                let mut acc = 0u32;
+                for i in 0..iterations {
+                    acc ^= scheme(std::hint::black_box(i), std::hint::black_box(input));
+                }
+                std::hint::black_box(acc);
+                start.elapsed().as_nanos() as f64 / iterations as f64
+            });
+            println!("{len:>5} {:>10.1} {:>10.1} {:>10.1} {:>10.1}", ns[0], ns[1], ns[2], ns[3]);
         }
     }
 

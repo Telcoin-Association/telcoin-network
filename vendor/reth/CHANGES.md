@@ -918,11 +918,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 
 - **TN-0120** — NippyJar format version 2: a CRC32 on every value and on the configuration.
   *Kind*: feature (storage integrity; static files of storage-v2 datadirs only).
-  *Files*: `Cargo.toml` (workspace `crc32fast` 1.5.0, already in TN's root lockfile, so only
-  dependency edges are added), `crates/storage/nippy-jar/{Cargo.toml, src/lib.rs, src/writer.rs,
-  src/cursor.rs, src/error.rs}` (`NippyJar::with_checksums`, `has_checksums`, `value_checksum`,
-  `CHECKSUM_SIZE`; `NippyJarWriter::has_checksums`; errors `ChecksumMismatch`,
-  `ConfigChecksumMismatch`, `UnsupportedVersion`; tests).
+  *Files*: `Cargo.toml` (workspace `crc32fast` 1.5.0 and `crc` 3.4.0, both already in TN's root
+  lockfile, so only dependency edges are added), `crates/storage/nippy-jar/{Cargo.toml,
+  src/lib.rs, src/writer.rs, src/cursor.rs, src/error.rs}` (`NippyJar::with_checksums`,
+  `has_checksums`, `value_checksum`, `value_seed`, `checksum`, `CHECKSUM_SIZE`;
+  `NippyJarWriter::has_checksums`; `NippyJarCursor::unverified_value`; errors
+  `ChecksumMismatch`, `ConfigChecksumMismatch`, `UnsupportedVersion`; tests).
   *Why*: NippyJar had no checksum anywhere, and under storage v2 the account and storage
   changesets, which back every historical state read (TN's pinned committee and epoch reads
   included), live in static files: a flipped bit read back as a plausible wrong value, a silent
@@ -930,13 +931,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   a version-2 jar keeps the version-1 configuration encoding (bincode) and appends a CRC32 of
   it, which `load` verifies before decoding the rest (a damaged row count or block range would
   otherwise be believed, and the writer's heal truncates to the row count). Each value is
-  stored as its bytes (compressed if the jar compresses) followed by
-  `crc32(row u64 LE || column u32 LE || stored bytes)`, the row being the jar's own 0-based row
-  index; offsets include the four bytes, so the open-time heal, `prune_rows`, rotation and
+  stored as its bytes (compressed if the jar compresses) followed by a CRC-32 (ISO-HDLC, the zlib
+  CRC) of those bytes, little-endian, started from a seed of the value's position instead of the
+  standard initial value: `value_seed(row, column) = 0x9E3779B9 ^ (row as u32) ^
+  ((row >> 32) as u32).rotate_left(16) ^ (column as u32).wrapping_mul(0x85EBCA6B)`, in
+  crc32fast's convention (`Hasher::new_with_initial`; 0 is the standard CRC), the row being the
+  jar's own 0-based row index. For one input length a CRC is injective in its initial value, so
+  a value read at another position fails as surely as a changed byte, and no extra bytes are
+  hashed (on x86_64 every byte below 128 B costs a serial table step in crc32fast). On x86_64,
+  values below 128 B are checksummed with the `crc` crate's slice-by-16 table, longer ones and
+  every value on aarch64 with crc32fast (PCLMULQDQ, or the CRC instructions); the two give the
+  same values (`test_checksum_implementations_agree`). Offsets include the four bytes, so the open-time heal, `prune_rows`, rotation and
   deletion, which work on lengths only, keep the framing. `NippyJarCursor::read_value`, the one
   path every value read takes, verifies the checksum before any decompression or decoding and
   hands out the value without it; a mismatch is `NippyJarError::ChecksumMismatch` naming the data
-  file, row and column, never a panic, `None` or a default. A heal never acts on a mismatch: it
+  file, row and column, never a panic, `None` or a default. `NippyJarCursor::unverified_value`
+  returns a value's stored bytes without the check, for a search that only compares a prefix to
+  steer itself and then reads the row it settles on verified (TN-0124). A heal never acts on a mismatch: it
   checks lengths only, and a damaged value stays an error on every read. Binding the position
   makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
   written and read exactly as before (byte-identical files); `load` now refuses a version other
@@ -952,6 +963,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   reads), `test_checksum_detects_offset_moved_to_another_value` (offsets moved onto the next
   row's value fail; an unchecked jar returns the wrong value; a value shorter than a checksum
   fails), `test_checksummed_jar_heal_and_prune` (an uncommitted append healed away, a prune of
-  committed and uncommitted rows, appends after each: every row verifies). Mutation-checked: no
-  verification in the cursor, no row in the checksum, no configuration check, a wrong row index
-  in the writer. *Upstream*: maybe (a format change upstream would want behind its own version).
+  committed and uncommitted rows, appends after each: every row verifies),
+  `test_checksum_implementations_agree` (lengths 0 to 300, random and edge seeds, the standard
+  check value), `test_unverified_value` (stored bytes without the checksum, damaged ones
+  included; too short is an error), and the ignored `checksum_cost_heavy` (ns per checksum by
+  size and implementation; aarch64 M1 Max: crc32fast 4-9 ns from 20 to 176 B). Mutation-checked:
+  no verification in the cursor, no row in the seed, no configuration check, a wrong row index in
+  the writer. *Upstream*: maybe (a format change upstream would want behind its own version).
