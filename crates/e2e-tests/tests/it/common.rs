@@ -9,7 +9,9 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
+use e2e_tests::{
+    create_validator_info, setup_log_dir, FleetOverrides, NodeEndpoints, NodeOverrides, TestBinary,
+};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -477,7 +479,39 @@ pub(crate) fn start_validator_with_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Child {
+    let overrides = extra_env
+        .iter()
+        .fold(NodeOverrides::default(), |overrides, (name, value)| overrides.env(*name, *value));
+    start_validator_with_overrides(
+        instance, bin, base_dir, rpc_port, test, run, extra_args, &overrides,
+    )
+    .expect("failed to execute")
+}
+
+/// Start a validator node process with additional CLI arguments and the test's
+/// [`NodeOverrides`] for that node, usually `fleet.node(instance)` of a [`FleetOverrides`].
+///
+/// The overrides' `parameters.yaml` entries are merged into the node's datadir
+/// (`base_dir/validator-<instance + 1>`) before it starts (see
+/// [`NodeOverrides::apply_parameters`]); calling this again for a restart merges them again,
+/// which leaves the file as it was. Its environment variables are set on the spawned command
+/// as [`start_validator_with_env`] sets `extra_env`, which delegates here. Empty overrides start
+/// the node exactly as [`start_validator_with_args`] does.
+///
+/// [`FleetOverrides`]: e2e_tests::FleetOverrides
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_validator_with_overrides(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+    overrides: &NodeOverrides,
+) -> eyre::Result<Child> {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
+    overrides.apply_parameters(&data_dir)?;
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
@@ -500,11 +534,11 @@ pub(crate) fn start_validator_with_env(
         .arg(format!("{test}-node{instance}"));
 
     command.args(extra_args);
-    command.envs(extra_env.iter().copied());
+    command.envs(overrides.env.iter().map(|(name, value)| (name, value)));
 
     setup_log_dir(&mut command, instance, test, run);
 
-    command.spawn().expect("failed to execute")
+    Ok(command.spawn()?)
 }
 
 /// The log file [`setup_log_dir`] gives run `run` of node `instance` under `test_logs/<test>/`:
@@ -1068,12 +1102,30 @@ pub(crate) fn start_nodes(
     test: &str,
     run: u32,
 ) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
+    start_nodes_with_overrides(temp_path, validators, test, run, &FleetOverrides::default())
+}
+
+/// Like [`start_nodes`], with the test's per-node [`FleetOverrides`], keyed by each node's
+/// position in `validators`.
+///
+/// Node `i`'s `parameters.yaml` entries are merged into `temp_path/<validators[i].0>` before it
+/// starts (see [`NodeOverrides::apply_parameters`]) and its environment variables are set on its
+/// process only. A node without overrides starts exactly as [`start_nodes`] starts it.
+pub(crate) fn start_nodes_with_overrides(
+    temp_path: &Path,
+    validators: &[(&str, Address)],
+    test: &str,
+    run: u32,
+    overrides: &FleetOverrides,
+) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
     let bin = e2e_tests::get_telcoin_network_binary();
 
     let mut children = Vec::new();
     let mut endpoints = Vec::new();
-    for (v, _) in validators.iter() {
+    for (index, (v, _)) in validators.iter().enumerate() {
         let dir = temp_path.join(v);
+        let node_overrides = overrides.node(index);
+        node_overrides.apply_parameters(&dir)?;
 
         if *v == NEW_VALIDATOR {
             info!(target: "epoch-test", ?v, "starting new validator");
@@ -1104,6 +1156,7 @@ pub(crate) fn start_nodes(
             .arg(ws_port.to_string())
             .arg("--ipcpath")
             .arg(ipc_path.to_string_lossy().as_ref());
+        command.envs(node_overrides.env.iter().map(|(name, value)| (name, value)));
 
         setup_log_dir(&mut command, v, test, run);
 

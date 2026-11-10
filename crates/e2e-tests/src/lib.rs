@@ -7,7 +7,9 @@
 
 use clap::Parser;
 use escargot::{CargoBuild, CargoRun};
+use eyre::WrapErr as _;
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -389,6 +391,210 @@ pub fn config_observer(
     Ok(())
 }
 
+/// Settings a test layers onto one node of a local fleet, on top of the harness's own setup.
+///
+/// Both lists are empty by default, and an empty [`NodeOverrides`] starts the node exactly as the
+/// harness does without one: its `parameters.yaml` is neither read nor rewritten and its process
+/// gets no extra variable.
+///
+/// - `parameters` holds top-level `parameters.yaml` entries as `(key, raw YAML value)` pairs. The
+///   start helpers merge them into the node's own `parameters.yaml`, the file the `config_*`
+///   genesis helpers wrote, right before they spawn the node (see
+///   [`NodeOverrides::apply_parameters`] and [`merge_parameters_yaml`]). The harness knows none of
+///   the keys: the node's `Parameters` ignores a top-level key it does not know, so a test can name
+///   a switch whether or not the node under test reads it.
+/// - `env` holds environment variables for the node's process only, set after the variables
+///   [`TestBinary::command`] forwards, so an entry overrides a forwarded variable of the same name.
+///   This is how a test arms the hooks in `tn_types::test_hooks` (for example
+///   `TN_TEST_EXECUTION_DELAY_MS`) on chosen nodes. Never export such a variable from the harness
+///   process instead: every node spawned afterwards would inherit it.
+///
+/// [`FleetOverrides`] assigns these per node across a fleet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeOverrides {
+    /// Top-level `parameters.yaml` entries, `(key, raw YAML value)`, merged in order, so a later
+    /// entry for the same key wins.
+    pub parameters: Vec<(String, String)>,
+    /// Environment variables for the node's process, `(name, value)`, set in order, so a later
+    /// entry for the same name wins.
+    pub env: Vec<(String, String)>,
+}
+
+impl NodeOverrides {
+    /// Add the top-level `parameters.yaml` entry `key: value`.
+    ///
+    /// `value` is raw one-line YAML, written into the file as given: `true`, `400`, `750ms`, or a
+    /// flow collection such as `[1, 2]`.
+    pub fn parameter(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.parameters.push((key.into(), value.into()));
+        self
+    }
+
+    /// Add the environment variable `name=value` for the node's process.
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Whether this overrides nothing.
+    pub fn is_empty(&self) -> bool {
+        self.parameters.is_empty() && self.env.is_empty()
+    }
+
+    /// Merge [`NodeOverrides::parameters`] into `<node_dir>/parameters.yaml` (see
+    /// [`merge_parameters_yaml`]), then check the node's own loader still reads the merged file as
+    /// `Parameters`, so a malformed value fails the test here rather than the node at startup.
+    ///
+    /// With no parameters this does nothing: the file is neither read nor rewritten. Applying the
+    /// same overrides again leaves the file as the first application did, so a test can run this
+    /// before every start of a node, restarts included.
+    pub fn apply_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
+        if self.parameters.is_empty() {
+            return Ok(());
+        }
+        let path = node_dir.join("parameters.yaml");
+        let base = std::fs::read_to_string(&path)
+            .wrap_err_with(|| format!("reading {} to merge overrides", path.display()))?;
+        let merged = merge_parameters_yaml(&base, &self.parameters)?;
+        std::fs::write(&path, merged)
+            .wrap_err_with(|| format!("writing merged overrides to {}", path.display()))?;
+        Config::load_from_path::<Parameters>(&path, ConfigFmt::YAML).wrap_err_with(|| {
+            format!(
+                "{} no longer loads as node parameters after merging {:?}",
+                path.display(),
+                self.parameters
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// Per-node [`NodeOverrides`] for a local fleet, keyed by node index.
+///
+/// The index is the one the start helpers take: `instance` for the node whose datadir is
+/// `validator-<instance + 1>`, or the position in the `validators` slice for the helpers that take
+/// one. A node with no entry starts as the harness starts it. The builders add one setting to
+/// every node they name, so a mixed fleet reads as one chain:
+///
+/// ```
+/// use e2e_tests::FleetOverrides;
+///
+/// // nodes 0 and 1 run with the switch, nodes 2 and 3 without it
+/// let overrides = FleetOverrides::default().parameter([0, 1], "pipelined_persist", "true");
+/// assert!(overrides.node(2).is_empty());
+///
+/// // three of four nodes execute each output 400 ms later
+/// let overrides = FleetOverrides::default().env([1, 2, 3], "TN_TEST_EXECUTION_DELAY_MS", "400");
+/// assert!(overrides.node(0).is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FleetOverrides {
+    /// The overrides of each node that has any, by node index.
+    nodes: BTreeMap<usize, NodeOverrides>,
+}
+
+impl FleetOverrides {
+    /// Add the top-level `parameters.yaml` entry `key: value` (see [`NodeOverrides::parameter`])
+    /// to every node in `nodes`.
+    pub fn parameter(
+        mut self,
+        nodes: impl IntoIterator<Item = usize>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let (key, value) = (key.into(), value.into());
+        for index in nodes {
+            self.nodes.entry(index).or_default().parameters.push((key.clone(), value.clone()));
+        }
+        self
+    }
+
+    /// Add the environment variable `name=value` (see [`NodeOverrides::env`]) to every node in
+    /// `nodes`.
+    pub fn env(
+        mut self,
+        nodes: impl IntoIterator<Item = usize>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let (name, value) = (name.into(), value.into());
+        for index in nodes {
+            self.nodes.entry(index).or_default().env.push((name.clone(), value.clone()));
+        }
+        self
+    }
+
+    /// Replace node `index`'s overrides with `overrides`.
+    pub fn set_node(mut self, index: usize, overrides: NodeOverrides) -> Self {
+        self.nodes.insert(index, overrides);
+        self
+    }
+
+    /// Node `index`'s overrides, empty when the fleet sets none for it.
+    pub fn node(&self, index: usize) -> &NodeOverrides {
+        /// The overrides of a node the fleet sets nothing for.
+        static NONE: NodeOverrides = NodeOverrides { parameters: Vec::new(), env: Vec::new() };
+        self.nodes.get(&index).unwrap_or(&NONE)
+    }
+}
+
+/// `base`, the text of a `parameters.yaml`, with each `(key, value)` of `overrides` as a top-level
+/// `key: value` entry.
+///
+/// A pure text merge, so it needs no knowledge of the keys and leaves every other line of `base`
+/// byte for byte. Each entry, in order, first removes the top-level entry `key` already has in the
+/// text (its `key:` line at column 0 and the indented or `- ` lines of a block value below it),
+/// then appends `key: value` as the last line. A later entry for a key therefore replaces an
+/// earlier one, and merging the same overrides twice gives the text the first merge gave. With no
+/// overrides `base` comes back unchanged.
+///
+/// `base` must be one YAML document whose top level is a block mapping, the shape `serde_yaml`
+/// writes. A key must be a plain top-level name (ASCII letters, digits and `_`), and a value one
+/// non-empty line of YAML; anything else is an error. The value is not parsed here:
+/// [`NodeOverrides::apply_parameters`] checks the merged file against the node's loader.
+pub fn merge_parameters_yaml(base: &str, overrides: &[(String, String)]) -> eyre::Result<String> {
+    if overrides.is_empty() {
+        return Ok(base.to_owned());
+    }
+    let mut lines: Vec<String> = base.lines().map(str::to_owned).collect();
+    for (key, value) in overrides {
+        eyre::ensure!(
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "parameters override key {key:?} is not a plain top-level key"
+        );
+        eyre::ensure!(
+            !value.trim().is_empty() && !value.contains(['\n', '\r']),
+            "parameters override `{key}` needs a one-line YAML value, got {value:?}"
+        );
+        if let Some(start) = lines.iter().position(|line| starts_top_level_entry(line, key)) {
+            let end = lines[start + 1..]
+                .iter()
+                .position(|line| !continues_block_value(line))
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            lines.drain(start..end);
+        }
+        lines.push(format!("{key}: {value}"));
+    }
+    let mut merged = lines.join("\n");
+    merged.push('\n');
+    Ok(merged)
+}
+
+/// Whether `line` opens the top-level mapping entry `key`: `key:` at column 0, followed by the
+/// end of the line or whitespace.
+fn starts_top_level_entry(line: &str, key: &str) -> bool {
+    line.strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
+/// Whether `line` still belongs to the block value of the top-level entry above it: a blank
+/// line, an indented line, or a sequence item at column 0 (`serde_yaml` may write a top-level
+/// key's sequence unindented). The next top-level key or a document marker ends the value.
+fn continues_block_value(line: &str) -> bool {
+    line.trim().is_empty() || line.starts_with([' ', '\t']) || line == "-" || line.starts_with("- ")
+}
+
 /// Create validator info, genesis ceremony, and spawn node command.
 pub fn spawn_local_testnet(
     temp_path: &Path,
@@ -663,4 +869,147 @@ pub async fn ensure_account_balance_infinite_loop(
     }
 
     Ok(U256::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_parameters_yaml, FleetOverrides, NodeOverrides};
+    use std::time::Duration;
+    use tn_config::{Config, ConfigFmt, ConfigTrait as _, Parameters};
+
+    /// `(key, value)` pairs as owned strings, the shape [`NodeOverrides::parameters`] holds.
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    /// A file shaped like `serde_yaml`'s output: scalars, a nested block mapping holding an
+    /// indented sequence, and a sequence written at column 0.
+    const BASE: &str = "---\nfirst: 1\nnested:\n  inner: 2\n  list:\n    - a\n    - b\nlast: x\n\
+                        seq:\n- 1\n- 2\ntail: true\n";
+
+    #[test]
+    fn merge_without_overrides_returns_base_unchanged() {
+        let base = "---\nfirst: 1"; // no final newline, which a rewrite would add
+        assert_eq!(merge_parameters_yaml(base, &[]).unwrap(), base);
+    }
+
+    #[test]
+    fn merge_appends_a_new_key_and_keeps_every_other_line() {
+        let merged = merge_parameters_yaml(BASE, &pairs(&[("pipelined_persist", "true")])).unwrap();
+        assert_eq!(merged, format!("{BASE}pipelined_persist: true\n"));
+    }
+
+    #[test]
+    fn merge_replaces_an_existing_scalar_entry() {
+        let merged = merge_parameters_yaml(BASE, &pairs(&[("first", "9")])).unwrap();
+        assert_eq!(
+            merged,
+            "---\nnested:\n  inner: 2\n  list:\n    - a\n    - b\nlast: x\nseq:\n- 1\n- 2\n\
+             tail: true\nfirst: 9\n"
+        );
+    }
+
+    #[test]
+    fn merge_replaces_a_whole_block_value() {
+        let merged =
+            merge_parameters_yaml(BASE, &pairs(&[("nested", "{}"), ("seq", "[3]")])).unwrap();
+        assert_eq!(merged, "---\nfirst: 1\nlast: x\ntail: true\nnested: {}\nseq: [3]\n");
+    }
+
+    #[test]
+    fn merge_matches_whole_keys_only() {
+        // `last` must not match `last_round`, and an indented `first:` is not top level
+        let base = "---\nlast_round: 1\nnested:\n  first: 2\n";
+        let merged = merge_parameters_yaml(base, &pairs(&[("last", "x"), ("first", "y")])).unwrap();
+        assert_eq!(merged, format!("{base}last: x\nfirst: y\n"));
+    }
+
+    #[test]
+    fn merge_later_entry_wins_and_is_idempotent() {
+        let overrides = pairs(&[("switch", "false"), ("first", "2"), ("switch", "true")]);
+        let once = merge_parameters_yaml(BASE, &overrides).unwrap();
+        assert_eq!(once.matches("switch:").count(), 1, "{once}");
+        assert!(once.ends_with("first: 2\nswitch: true\n"), "{once}");
+        assert_eq!(merge_parameters_yaml(&once, &overrides).unwrap(), once);
+    }
+
+    #[test]
+    fn merge_rejects_keys_and_values_it_cannot_write_as_one_entry() {
+        for (key, value) in [
+            ("", "true"),
+            ("nested.inner", "3"),
+            (" indented", "true"),
+            ("key: x", "true"),
+            ("switch", ""),
+            ("switch", "  "),
+            ("switch", "a\nb: c"),
+        ] {
+            assert!(
+                merge_parameters_yaml(BASE, &pairs(&[(key, value)])).is_err(),
+                "merged {key:?}: {value:?}"
+            );
+        }
+    }
+
+    /// The harness's own `parameters.yaml` (as `config_local_testnet` writes it) takes an unknown
+    /// switch and a typed override, and the node's loader reads the typed value back.
+    #[test]
+    fn apply_parameters_reaches_the_node_loader() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        // nothing to apply: the file is left as written
+        NodeOverrides::default()
+            .env("TN_TEST_EXECUTION_DELAY_MS", "400")
+            .apply_parameters(dir.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+
+        let overrides = NodeOverrides::default()
+            .parameter("bench6_unknown_switch", "true")
+            .parameter("max_header_delay", "750ms")
+            .parameter("allow_private_forward_targets", "true");
+        overrides.apply_parameters(dir.path()).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(merged.matches("max_header_delay:").count(), 1, "{merged}");
+        assert!(merged.contains("\nbench6_unknown_switch: true\n"), "{merged}");
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(750));
+        assert!(loaded.allow_private_forward_targets);
+
+        // a restart applies the same overrides again and changes nothing
+        overrides.apply_parameters(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+
+        // a value the node cannot read fails the merge, not the node's startup
+        let bad = NodeOverrides::default().parameter("max_header_delay", "soon");
+        assert!(bad.apply_parameters(dir.path()).is_err());
+    }
+
+    #[test]
+    fn fleet_overrides_assign_each_setting_to_the_named_nodes() {
+        let fleet = FleetOverrides::default().parameter([0, 1], "pipelined_persist", "true").env(
+            [1, 2, 3],
+            "TN_TEST_EXECUTION_DELAY_MS",
+            "400",
+        );
+        assert_eq!(fleet.node(0), &NodeOverrides::default().parameter("pipelined_persist", "true"));
+        assert_eq!(
+            fleet.node(1),
+            &NodeOverrides::default()
+                .parameter("pipelined_persist", "true")
+                .env("TN_TEST_EXECUTION_DELAY_MS", "400")
+        );
+        assert_eq!(
+            fleet.node(3),
+            &NodeOverrides::default().env("TN_TEST_EXECUTION_DELAY_MS", "400")
+        );
+        assert!(fleet.node(4).is_empty());
+        assert!(FleetOverrides::default().node(0).is_empty());
+
+        let replaced = fleet.set_node(1, NodeOverrides::default());
+        assert!(replaced.node(1).is_empty());
+    }
 }
