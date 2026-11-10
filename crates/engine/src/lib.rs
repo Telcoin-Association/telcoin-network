@@ -176,6 +176,11 @@ impl ExecutorEngine {
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 let execution_start = Instant::now();
+                // test hook (off without tn-types/test-utils): slows outputs with batches
+                let has_batches = !build_args.output.batch_digests().is_empty();
+                if let Some(d) = tn_types::test_hooks::execution_delay().filter(|_| has_batches) {
+                    std::thread::sleep(d);
+                }
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
                 let result = execute_consensus_output_with_signers(

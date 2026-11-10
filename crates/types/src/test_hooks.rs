@@ -17,8 +17,12 @@
 //! [`fail_store_at_epoch`] fails one store of the node's consensus DB once an epoch's tasks are
 //! running, as a failed sync does, so a test sees whether the failure stops the node then rather
 //! than at the epoch's end.
+//!
+//! [`execution_delay`] slows a node's engine without touching its consensus, so a test can make
+//! one validator's execution trail its commits by more than the activity window.
 
 use crate::{Database, Epoch, Table};
+use std::time::Duration;
 
 /// Whether this node should stop at the live close of `epoch` after the closing block executed
 /// and before the epoch's record is written.
@@ -105,6 +109,75 @@ pub fn fail_store_at_epoch<T: Table, DB: Database>(db: &DB, epoch: Epoch) -> boo
         let _ = (db, epoch);
         false
     }
+}
+
+/// How long this node's engine sleeps before it executes a consensus output, or `None` for no
+/// delay.
+///
+/// Reads `TN_TEST_EXECUTION_DELAY_MS=<milliseconds>` once per process. It lets an e2e test slow
+/// one validator's execution while its consensus keeps pace with the committee, the way a
+/// persist-bound node's execution trails its commits under load. The engine consults it once per
+/// execution task and sleeps on that task's blocking thread before the output's build, so
+/// consensus sees the node's execution as slow: the task's measured time grows by the delay, while
+/// the build's own execute/persist/commit laps do not. The engine skips the sleep for an output
+/// without batches, which skips execution too.
+///
+/// Unset or zero means no delay. A value that does not parse as whole milliseconds is ignored with
+/// a warning. Always `None` without `test-utils`; as with the fork-epoch overrides, a node-scoped
+/// release build lacks the hook and a workspace-root build without `-p` has it.
+#[inline]
+pub fn execution_delay() -> Option<Duration> {
+    #[cfg(feature = "test-utils")]
+    {
+        *EXECUTION_DELAY.get_or_init(|| {
+            // a non-unicode value is lossily converted so it is warned about rather than read as
+            // unset
+            let raw = std::env::var_os(EXECUTION_DELAY_VAR);
+            parse_execution_delay(raw.as_deref().map(|raw| raw.to_string_lossy()).as_deref())
+        })
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        None
+    }
+}
+
+/// The environment variable behind [`execution_delay`].
+#[cfg(feature = "test-utils")]
+const EXECUTION_DELAY_VAR: &str = "TN_TEST_EXECUTION_DELAY_MS";
+
+/// The delay [`execution_delay`] read from [`EXECUTION_DELAY_VAR`], once per process.
+#[cfg(feature = "test-utils")]
+static EXECUTION_DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+
+/// Parses the value of [`EXECUTION_DELAY_VAR`] into the delay before each execution.
+///
+/// `None` (the variable is unset) and zero yield `None`. Surrounding whitespace is trimmed. A value
+/// that does not parse as whole milliseconds logs a warning and yields `None`, so a typo leaves
+/// execution at full speed rather than slowing it by a guess. A delay that is set is logged once,
+/// so a node log shows that its execution was slowed on purpose.
+#[cfg(feature = "test-utils")]
+fn parse_execution_delay(raw: Option<&str>) -> Option<Duration> {
+    let raw = raw?;
+    let delay_ms = raw
+        .trim()
+        .parse::<u64>()
+        .inspect_err(|err| {
+            tracing::warn!(
+                target: "engine",
+                value = ?raw,
+                %err,
+                "ignoring {EXECUTION_DELAY_VAR}: not whole milliseconds; execution is not delayed",
+            );
+        })
+        .ok()
+        .filter(|delay_ms| *delay_ms > 0)?;
+    tracing::warn!(
+        target: "engine",
+        delay_ms,
+        "test hook: delaying the execution of every consensus output with batches",
+    );
+    Some(Duration::from_millis(delay_ms))
 }
 
 /// The hook behind [`exit_before_epoch_record`].
@@ -211,6 +284,34 @@ mod tests {
         assert!(FAIL_STORE_AT_EPOCH.fires_for(3));
         assert!(!FAIL_STORE_AT_EPOCH.fires_for(2));
         assert!(!FAIL_STORE_AT_EPOCH.fires_for(4));
+    }
+
+    /// The delay hook reads its variable as milliseconds. This is the only test in the crate that
+    /// sets the variable, and the value latches on first read, so it holds under a
+    /// single-process `cargo test` run as well as under nextest's process per test.
+    #[test]
+    fn execution_delay_reads_milliseconds() {
+        std::env::set_var(EXECUTION_DELAY_VAR, "1500");
+        assert_eq!(execution_delay(), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn parse_execution_delay_reads_milliseconds() {
+        for (raw, expected_ms) in [("1500", 1500), (" 1\n", 1), ("+20", 20)] {
+            assert_eq!(
+                parse_execution_delay(Some(raw)),
+                Some(Duration::from_millis(expected_ms)),
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_execution_delay_unset_zero_and_garbage_are_none() {
+        assert_eq!(parse_execution_delay(None), None);
+        for raw in ["0", " 0 ", "", "garbage", "-1", "1.5", "1500ms", "0x10", "\u{FFFD}"] {
+            assert_eq!(parse_execution_delay(Some(raw)), None, "raw = {raw:?}");
+        }
     }
 
     #[test]

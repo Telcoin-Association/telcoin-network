@@ -1,6 +1,6 @@
 //! Prometheus metrics for the primary (consensus layer).
 
-use crate::{ConsensusBusApp, NodeMode};
+use crate::{ConsensusBusApp, NodeMode, RecentBlocks};
 use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
@@ -9,7 +9,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tn_types::{Noticer, TaskSpawner};
+use tn_types::{Noticer, Round, TaskSpawner};
+use tokio::sync::watch;
 use tracing::debug;
 
 #[cfg(test)]
@@ -90,6 +91,31 @@ pub struct PrimaryMetrics {
     /// Every caller looks the record up by the request's epoch, so a non-zero value is a caller
     /// bug.
     pub(crate) epoch_pack_record_epoch_mismatch_total: Counter,
+    // bench5 f1-commit-lag
+    /// Commits the consensus task held because the committed leader round ran more than
+    /// `MAX_COMMIT_RUN_AHEAD_ROUNDS` ahead of the leader round this node has executed, counted
+    /// once per hold.
+    pub(crate) commit_run_ahead_blocked_total: Counter,
+    /// Rounds the committed round leads the last leader round the engine processed (mirrored
+    /// from the committed-round and recent-blocks watch channels; zero while execution is at or
+    /// ahead of it).
+    ///
+    /// Commits no longer wait for execution, so this is the execution backlog in rounds. It may
+    /// reach `MAX_COMMIT_RUN_AHEAD_ROUNDS` before a commit is held.
+    pub(crate) consensus_exec_lag_rounds: Gauge,
+    /// Rounds the primary round leads the committed round (mirrored from the primary-round and
+    /// committed-round watch channels; zero while the committed round is at or ahead of it).
+    ///
+    /// This is the lag the activity window demotes on, measured against the node's own round
+    /// instead of an incoming certificate's.
+    pub(crate) commit_lag_rounds: Gauge,
+    // bench5 f1-commit-lag
+    /// Times the execution check asked the canonical database again because it could not answer
+    /// for a block at or below the executed tip (a read error), one per retry.
+    ///
+    /// Zero in a healthy node; a rising value means the execution database keeps failing reads
+    /// and the waits behind it (votes, the subscriber, catch-up) are held.
+    pub(crate) execution_check_retries_total: Counter,
 }
 
 impl PrimaryMetrics {
@@ -110,6 +136,18 @@ impl PrimaryMetrics {
     /// method is its route to [`record_mode_transition`].
     pub fn record_rejoin_transition(&self, previous: NodeMode) {
         record_mode_transition(previous, NodeMode::CvvActive, ModeTransitionReason::Rejoin);
+    }
+
+    /// Count an active CVV's demotion after a failed fork check in
+    /// `tn_node_mode_transitions_total{to="cvv_inactive", reason="bogus_subdag"}`.
+    ///
+    /// `previous` is the mode the watch held before the demotion, the value `send_replace`
+    /// returns. The check runs in the executor's subscriber before it assembles a committed
+    /// sub-dag's output, outside this crate, so this method is its route to
+    /// [`record_mode_transition`]. The label is the one the check carried when it ran in the
+    /// consensus task.
+    pub fn record_execution_fork_transition(&self, previous: NodeMode) {
+        record_mode_transition(previous, NodeMode::CvvInactive, ModeTransitionReason::BogusSubdag);
     }
 }
 
@@ -270,13 +308,17 @@ pub(crate) enum ModeTransitionReason {
     /// An active CVV saw a certificate or consensus result from an epoch ahead of the one it has
     /// executed.
     EpochBehind,
-    /// Bullshark committed a sub-dag whose leader references an execution block this node could
-    /// not wait for.
+    /// A committed sub-dag's leader references an execution block this node did not execute at
+    /// that height (the subscriber's fork check before it assembles the output).
     BogusSubdag,
     /// The committed round disagreed with the highest header round just sequenced.
     CommitAccounting,
     /// A catching-up CVV came within the rejoin window of the network head.
     Rejoin,
+    // bench5 f1-commit-lag
+    /// An active CVV restarted its epoch with a restored DAG whose lowest round lies above the
+    /// round after its committed round: the certificates Bullshark needs next were pruned.
+    RestartGap,
 }
 
 impl ModeTransitionReason {
@@ -288,6 +330,7 @@ impl ModeTransitionReason {
             Self::BogusSubdag => "bogus_subdag",
             Self::CommitAccounting => "commit_accounting",
             Self::Rejoin => "rejoin",
+            Self::RestartGap => "restart_gap",
         }
     }
 }
@@ -340,6 +383,7 @@ pub fn spawn_bus_metrics_mirror(
     set_node_mode_gauges(&rx_mode.borrow_and_update());
     let mut executed_height =
         rx_recent.borrow_and_update().latest_consensus_block_num_hash().number;
+    set_lag_gauges(&metrics, &rx_round, &rx_committed, &rx_recent);
     let mut gossip_height = rx_published.borrow_and_update().1;
     set_consensus_height_gauges(executed_height, gossip_height);
 
@@ -352,12 +396,14 @@ pub fn spawn_bus_metrics_mirror(
                         break;
                     }
                     metrics.round.set(*rx_round.borrow_and_update() as f64);
+                    set_lag_gauges(&metrics, &rx_round, &rx_committed, &rx_recent);
                 }
                 res = rx_committed.changed() => {
                     if res.is_err() {
                         break;
                     }
                     metrics.committed_round.set(*rx_committed.borrow_and_update() as f64);
+                    set_lag_gauges(&metrics, &rx_round, &rx_committed, &rx_recent);
                 }
                 res = rx_mode.changed() => {
                     if res.is_err() {
@@ -373,6 +419,7 @@ pub fn spawn_bus_metrics_mirror(
                     executed_height =
                         rx_recent.borrow_and_update().latest_consensus_block_num_hash().number;
                     set_consensus_height_gauges(executed_height, gossip_height);
+                    set_lag_gauges(&metrics, &rx_round, &rx_committed, &rx_recent);
                 }
                 res = rx_published.changed() => {
                     if res.is_err() {
@@ -386,6 +433,27 @@ pub fn spawn_bus_metrics_mirror(
         debug!(target: "primary::metrics", "bus metrics mirror shutting down");
         Ok(())
     });
+}
+
+/// Round-lag gauges: how far the committed round leads execution, and how far the primary round
+/// leads the committed round. Both saturate at zero.
+///
+/// Every watch is read at its current value, not one cached when it last changed. When
+/// `reset_for_epoch` zeroes the committed round and then the primary round back to back, the
+/// iteration woken by the first reset normally reads the second too, and the second's own change
+/// recomputes both, so a new committed round is not paired with the previous epoch's primary round
+/// until some unrelated change.
+fn set_lag_gauges(
+    metrics: &PrimaryMetrics,
+    rx_round: &watch::Receiver<Round>,
+    rx_committed: &watch::Receiver<Round>,
+    rx_recent: &watch::Receiver<RecentBlocks>,
+) {
+    let primary = *rx_round.borrow();
+    let committed = *rx_committed.borrow();
+    let executed = rx_recent.borrow().last_consensus_round();
+    metrics.consensus_exec_lag_rounds.set(committed.saturating_sub(executed) as f64);
+    metrics.commit_lag_rounds.set(primary.saturating_sub(committed) as f64);
 }
 
 /// Consensus-height gauges and the falling-behind alarm.
@@ -449,6 +517,8 @@ mod tests {
             metrics.subdags_committed_total.increment(1);
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
+            metrics.commit_run_ahead_blocked_total.increment(1);
+            metrics.execution_check_retries_total.increment(4);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -479,6 +549,10 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
+        let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
+        assert!(matches!(value, DebugValue::Counter(4)));
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four
@@ -572,6 +646,9 @@ mod tests {
             );
             metrics.record_rejoin_transition(NodeMode::CvvInactive);
             metrics.record_rejoin_transition(NodeMode::CvvActive);
+            demote(ModeTransitionReason::RestartGap);
+            metrics.record_execution_fork_transition(NodeMode::CvvActive);
+            metrics.record_execution_fork_transition(NodeMode::CvvInactive);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -593,10 +670,11 @@ mod tests {
         series.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         let expected = [
             ("cvv_active", "rejoin", 1),
-            ("cvv_inactive", "bogus_subdag", 1),
+            ("cvv_inactive", "bogus_subdag", 2),
             ("cvv_inactive", "commit_accounting", 1),
             ("cvv_inactive", "epoch_behind", 1),
             ("cvv_inactive", "outside_gc_window", 2),
+            ("cvv_inactive", "restart_gap", 1),
         ]
         .map(|(to, reason, count)| {
             (to.to_string(), reason.to_string(), DebugValue::Counter(count))
@@ -656,6 +734,38 @@ mod tests {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "mirror never updated round gauge");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // the engine processed the leader of round 35: execution trails the committed round 40
+        // by five rounds, and the committed round trails the primary round 42 by two
+        bus.recent_blocks().send_modify(|recent| {
+            recent.push_latest(
+                35,
+                tn_types::ConsensusNumHash::new(7, tn_types::ConsensusHeaderDigest::default()),
+                None,
+            )
+        });
+        // a snapshot swaps every value it reads back to zero, so both lags come from one snapshot;
+        // the mirror sets them together on every change
+        let lags = || {
+            let snapshot = snapshotter.snapshot().into_vec();
+            let gauge = |name: &str| {
+                snapshot.iter().find_map(|(key, _, _, value)| match value {
+                    DebugValue::Gauge(g) if key.key().name() == name => Some(g.0),
+                    _ => None,
+                })
+            };
+            (gauge("tn_primary.consensus_exec_lag_rounds"), gauge("tn_primary.commit_lag_rounds"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (exec_lag, commit_lag) = lags();
+            if exec_lag == Some(5.0) {
+                assert_eq!(commit_lag, Some(2.0), "commit lag set with the exec lag");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "mirror never updated the exec lag");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 

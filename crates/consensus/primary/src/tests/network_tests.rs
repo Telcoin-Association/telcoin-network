@@ -4023,3 +4023,228 @@ fn test_import_fault_is_peer_caused_whitelist() {
     ))
     .is_none());
 }
+
+// ---- bench5 f1-commit-lag ----
+
+/// A node whose committed round freezes is demoted once a certificate passes the activity window:
+/// committed 360 (execution at 352), certificate 403, window 40.
+///
+/// This is the path a commit held by the run-ahead gate takes: the gate stops the committed round,
+/// and the demotion follows 40 rounds later.
+#[tokio::test]
+async fn frozen_commit_is_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+
+    assert!(handler.behind_consensus(0, 403, None).await, "a frozen commit is behind");
+}
+
+/// Execution far behind the committed round is not behind while commits keep up with the
+/// committee: execution at 100, committed 400, certificate 403.
+///
+/// A pin: it duplicates `test_behind_consensus_committed_round_prevents_false_positive` with the
+/// lag consensus can now run ahead of execution.
+#[tokio::test]
+async fn execution_lag_beyond_window_is_not_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(100, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(400);
+
+    assert!(!handler.behind_consensus(0, 403, None).await, "execution lag alone is not behind");
+}
+
+/// Records every `primary` warn line as `message key=value ...` on the thread it is installed on
+/// with [`tracing::subscriber::set_default`].
+struct PrimaryWarnLines(Arc<Mutex<Vec<String>>>);
+
+/// Appends an event's message and fields to a line in the order the event records them.
+struct LineVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for LineVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.push_str(&format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for PrimaryWarnLines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "primary" && *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LineVisitor(&mut line));
+        self.0.lock().push(line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The `we are behind` line ends with the execution backlog and both round lags: the newest known
+/// header is output 4,500 and the engine processed output 3 at round 352 (its stored header reads
+/// leader round 0, so the execution lag takes the processed round), consensus committed round 360
+/// and the proposer is at round 405.
+#[tokio::test]
+async fn behind_line_reports_execution_and_commit_lag() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+    for number in 1..=3u64 {
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag(number)).await;
+    }
+    // the engine processed output 3, the header `write_subdag_for_test` stored for it
+    let processed = tn_types::ConsensusOutput::new(
+        sub_dag(3),
+        ConsensusHeaderDigest::default(),
+        3,
+        false,
+        Default::default(),
+        Vec::new(),
+    );
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, processed.num_hash(), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+    consensus_bus.primary_round_updates().send_replace(405);
+    consensus_bus
+        .last_consensus_header()
+        .send_replace(Some(tn_types::ConsensusHeader { number: 4_500, ..Default::default() }));
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    assert!(handler.behind_consensus(0, 403, None).await, "committed 360 + 40 < 403 is behind");
+
+    let lines = lines.lock();
+    let behind: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("we are behind, go to catchup mode!"))
+        .collect();
+    assert_eq!(behind.len(), 1, "one behind line: {lines:?}");
+    assert!(
+        behind[0].contains(" exec_number=3 exec_round=0 processed_consensus_round=352 "),
+        "the stored output resolves the executed number: {}",
+        behind[0]
+    );
+    assert!(
+        behind[0].ends_with(
+            " reason=\"outside_gc_window\" newest_header_number=4500 backlog_outputs=4497 \
+             exec_lag_rounds=8 commit_lag_rounds=45"
+        ),
+        "the lag fields follow the existing ones: {}",
+        behind[0]
+    );
+}
+
+// ---- bench5 f1-commit-lag ----
+
+/// SEC-6 / N1: a snapshot-restored voter can never check a header's execution block below its
+/// floor. It refuses at once with the final, unpenalized `BelowRestoreFloor`, neither the fork
+/// error `UnknownExecutionResult` nor the retryable `ExecutionBehind`, counts no execution-behind
+/// refusal and stores no vote.
+#[tokio::test]
+async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<()> {
+    /// A datadir restored at block 100 that attests no block.
+    struct RestoredAt100;
+    impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+        fn canonical_execution_hash(&self, _: u64) -> Option<BlockHash> {
+            None
+        }
+        fn restored_state_floor(&self) -> Option<u64> {
+            Some(100)
+        }
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    // executed through block 120 after a restore at block 100
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::seal_slow(ExecHeader { number: 120, ..Default::default() })),
+        )
+    });
+    consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+
+    let author = committee.last_authority();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(50, BlockHash::ZERO))
+        .build();
+    let err = handler
+        .vote(*author.authority().protocol_key(), header, vec![])
+        .await
+        .expect_err("a block below the floor cannot be checked");
+
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+            header_block: 50,
+            floor: 100
+        })
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "the refusal is final, so the requester stops asking this voter"
+    );
+    let behind =
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.votes_refused_execution_behind_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        });
+    assert_eq!(behind.unwrap_or_default(), 0, "not an execution-behind refusal");
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a refused header stores no vote");
+    Ok(())
+}

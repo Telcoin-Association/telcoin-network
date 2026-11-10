@@ -262,6 +262,11 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // restarted validator. The error carries rounds but no epoch, so a different header for
         // the same round cannot be told apart from a stale request of an earlier epoch.
         HeaderError::AlreadyVotedForLaterRound { .. } => None,
+        // ignore (this voter's restored datadir, not the requester's fault)
+        //
+        // a snapshot-restored voter cannot check a block below its floor; the requester's header
+        // may be valid, and the voters with the full history decide it
+        HeaderError::BelowRestoreFloor { .. } => None,
     }
 }
 
@@ -418,5 +423,19 @@ mod tests {
         assert!(!relayer_fault.is_author_content_fault());
         assert!(author_penalty(&relayer_fault).is_none());
         assert!(matches!(Option::<Penalty>::from(&relayer_fault), Some(Penalty::Medium)));
+    }
+
+    /// A snapshot-restored voter can never check a header's block below its floor: the refusal
+    /// carries no penalty, and it is final (not retryable), so the requester stops asking this
+    /// voter for the header.
+    #[test]
+    fn below_restore_floor_refusal_is_final_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let error = HeaderError::BelowRestoreFloor { header_block: 50, floor: 100 };
+        assert_eq!(penalty_from_header_error(&error), None);
+        let error = PrimaryNetworkError::InvalidHeader(error);
+        assert!(Option::<Penalty>::from(&error).is_none());
+        assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
     }
 }

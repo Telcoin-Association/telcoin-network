@@ -370,7 +370,12 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // `create_consensus` publishes this epoch's mode, so read it once here: the proposer and
-        // the batch builders below must decide from the same value
+        // the batch builders below must decide from the same value. `Consensus::spawn` (inside
+        // `primary.start`) may still demote the node after this read (a restored dag with a gap
+        // above the committed round): the proposer and batch builders then start as active while
+        // the subscriber starts the inactive path, every task exits on the latched shutdown and
+        // the epoch re-runs as a mode change. No node-level test covers that path yet; the e2e
+        // slow-execution test (bench F1-3) is meant to cover it.
         let node_mode = self.consensus_bus.current_node_mode();
         let proposer_started = starts_proposer(node_mode);
         // Shared with the consensus task, which saves into it; `finish_epoch` seals it once that

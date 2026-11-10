@@ -11,7 +11,9 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::PrimaryToWorkerClient;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
+use tn_primary::{
+    network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, ExecutionCheckError, NodeMode,
+};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
@@ -43,6 +45,12 @@ const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
 /// A catching-up CVV checks readiness after every output it handles, hundreds a second while it
 /// replays, so the line is logged when the blocker changes and otherwise at most this often.
 const REJOIN_NOT_READY_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Shortest wait for local execution that a committed sub-dag logs before its output is assembled.
+///
+/// Under load an output waits a few hundred milliseconds for the engine, so only a longer wait
+/// (an execution backlog) is worth a line.
+const EXECUTION_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// Only an output from this subscriber's still-open epoch can establish rejoin readiness.
 /// Future outputs are ignored by `handle_sync_output`, and finalized epochs must be replayed
@@ -509,6 +517,8 @@ impl<DB: Database> Subscriber<DB> {
         let mut waiting = FuturesOrdered::new();
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
+        // running maximum of the received leaders' execution blocks (see `next_wait_floor`)
+        let mut wait_floor = 0;
 
         let mut epoch_done = false;
         // rx_sequence is now passed as parameter to avoid race condition
@@ -532,7 +542,8 @@ impl<DB: Database> Subscriber<DB> {
                     let number = last_number + 1;
                     last_number += 1;
                     last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
-                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
+                    wait_floor = next_wait_floor(wait_floor, &sub_dag);
+                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number, wait_floor));
                 },
 
                 // Receive consensus messages after all transaction data is downloaded
@@ -544,6 +555,30 @@ impl<DB: Database> Subscriber<DB> {
                 Some(output) = waiting.next() => {
                     match output {
                         Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
+                        Err(SubscriberError::ExecutionFork {
+                            number,
+                            base_block,
+                            base_hash,
+                            leader,
+                            leader_round,
+                        }) => {
+                            error!(
+                                target: "subscriber",
+                                number,
+                                base_block,
+                                %base_hash,
+                                %leader,
+                                leader_round,
+                                "leader's execution block is not on the local chain; execution has forked, going inactive"
+                            );
+                            let previous =
+                                self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+                            self.consensus_bus.metrics().record_execution_fork_transition(previous);
+                            self.config.shutdown().notify();
+                            // not an error (that would fail this critical task) and not through
+                            // the shutdown drain (that would save outputs past the fork)
+                            return Ok(());
+                        }
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");
                             // Failure to fetch batches is a fatal condition, return an error which will trigger node shutdown.
@@ -592,13 +627,21 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
+    ///
+    /// Before anything else, empty sub-dags included, it waits for local execution to reach
+    /// `wait_floor` and checks the leader's execution block (see
+    /// [`Self::wait_for_leader_execution`]), so an output is only assembled, and later saved, once
+    /// its leader passed the fork check.
     #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
         sub_dag: CommittedSubDag,
         parent_hash: ConsensusHeaderDigest,
         number: u64,
+        wait_floor: u64,
     ) -> SubscriberResult<ConsensusOutput> {
+        self.wait_for_leader_execution(&sub_dag, number, wait_floor).await?;
+
         let num_blocks = sub_dag.num_primary_batches();
         let num_certs = sub_dag.len();
 
@@ -718,6 +761,75 @@ impl<DB: Database> Subscriber<DB> {
         ))
     }
 
+    /// Wait until local execution reaches block `wait_floor`, then check that the leader's
+    /// execution block is the block this node executed at that height.
+    ///
+    /// `wait_floor` is at least the leader's own block number: it is the running maximum over
+    /// every leader received so far (see [`next_wait_floor`]), so the outputs pass this wait in
+    /// consensus order and an output led by a node whose execution trails this one's does not
+    /// pass early and sit fully assembled behind a slower predecessor. Every leader's block comes
+    /// from an earlier output, so executing the outputs ahead of this one always reaches the
+    /// floor. The check itself is [`ConsensusBusApp::wait_for_execution`], the one each vote
+    /// makes.
+    ///
+    /// Returns [`SubscriberError::ExecutionFork`] only when this node holds a different block at
+    /// the leader's number. A block below this node's restored-state floor cannot be checked here:
+    /// it is logged at warn and the output goes on, because the voters that certified the leader
+    /// checked it against their own chains.
+    async fn wait_for_leader_execution(
+        &self,
+        sub_dag: &CommittedSubDag,
+        number: u64,
+        wait_floor: u64,
+    ) -> SubscriberResult<()> {
+        let started = Instant::now();
+        let base = sub_dag.leader().latest_execution_block();
+        let mut rx_recent_blocks = self.consensus_bus.recent_blocks().subscribe();
+        rx_recent_blocks
+            .wait_for(|blocks| blocks.latest_execution_block_num_hash().number >= wait_floor)
+            .await
+            .map(|_| ())
+            .map_err(|_| SubscriberError::ClosedChannel("recent_blocks".to_string()))?;
+        let checked = self.consensus_bus.wait_for_execution(base).await;
+        let waited = started.elapsed();
+        self.inner.metrics.execution_wait_seconds.record(waited.as_secs_f64());
+        if waited > EXECUTION_WAIT_LOG_THRESHOLD {
+            info!(
+                target: "subscriber",
+                number,
+                leader_round = sub_dag.leader_round(),
+                base_block = base.number,
+                executed_block = self.consensus_bus.latest_execution_block_num_hash().number,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "waited for execution before assembling the output"
+            );
+        }
+        match checked {
+            Ok(()) => Ok(()),
+            Err(ExecutionCheckError::BelowFloor { floor }) => {
+                warn!(
+                    target: "subscriber",
+                    number,
+                    leader_round = sub_dag.leader_round(),
+                    base_block = base.number,
+                    floor,
+                    "leader's execution block is below the restored-state floor; not checked"
+                );
+                Ok(())
+            }
+            Err(ExecutionCheckError::Fork) => Err(SubscriberError::ExecutionFork {
+                number,
+                base_block: base.number,
+                base_hash: base.hash,
+                leader: sub_dag.leader().author().clone(),
+                leader_round: sub_dag.leader_round(),
+            }),
+            Err(ExecutionCheckError::Closed) => {
+                Err(SubscriberError::ClosedChannel("recent_blocks".to_string()))
+            }
+        }
+    }
+
     /// Warn every [`FETCH_BATCHES_STALL_WARN_INTERVAL`] while a worker's fetch leg is
     /// outstanding.
     ///
@@ -792,6 +904,20 @@ impl<DB: Database> Subscriber<DB> {
                     .collect()
             })
     }
+}
+
+/// The execution block number the next received sub-dag's output waits for: the running maximum
+/// of the leaders' execution blocks, `wait_floor` so far raised to `sub_dag`'s leader's block.
+///
+/// Keeping the floor monotone makes the outputs pass their execution wait in consensus order: an
+/// output led from an older block does not pass early and sit fully assembled behind a slower
+/// predecessor. It does not bound how many outputs are assembled at once. Every output whose floor
+/// local execution has passed is assembled concurrently, so under a uniform backlog the outputs
+/// held in memory approach the outputs between the executed and the committed leader: up to about
+/// 500 at the 1,000-round run-ahead bound ([`tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS`]), about
+/// 0.5-0.6 GB at the 1.0-1.25 MB average output and 2.75 GB at the 5.5 MB maximum.
+fn next_wait_floor(wait_floor: u64, sub_dag: &CommittedSubDag) -> u64 {
+    wait_floor.max(sub_dag.leader().latest_execution_block().number)
 }
 
 /// Drain the batch-fetch futures still pending when graceful shutdown fires.
@@ -1522,6 +1648,218 @@ mod tests {
         assert_eq!(chain.latest_consensus_number(), 4, "the next output advances the chain");
         let forwarded = rx_consensus_output.try_recv().expect("the next output is forwarded");
         assert_eq!(forwarded.number(), 4);
+    }
+
+    mod f1_commit_lag {
+        use super::*;
+        use crate::subscriber::next_wait_floor;
+        use tn_types::{
+            Batch, BlockNumHash, ConsensusNumHash, EpochSeedChainValue, ExecHeader, Notifier,
+            SealedHeader,
+        };
+
+        /// The hash this node's execution gives block `number` in these tests.
+        fn local_hash(number: u64) -> B256 {
+            B256::repeat_byte(u8::try_from(number).unwrap())
+        }
+
+        /// A block hash this node never executed: the forked leader's.
+        fn forked_hash() -> B256 {
+            B256::repeat_byte(0xff)
+        }
+
+        /// Record block `number` as executed, as the engine does after each output.
+        fn execute(bus: &ConsensusBusApp, number: u64) {
+            let header = ExecHeader { number, ..Default::default() };
+            bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(
+                    0,
+                    ConsensusNumHash::new(number, ConsensusHeaderDigest::default()),
+                    Some(SealedHeader::new(header, local_hash(number))),
+                )
+            });
+        }
+
+        /// A one-certificate sub-dag whose leader references execution block `base`, with one
+        /// batch in its payload when `with_payload`.
+        fn led_at(
+            fixture: &CommitteeFixture<MemDatabase>,
+            base: BlockNumHash,
+            with_payload: bool,
+        ) -> CommittedSubDag {
+            let mut builder = fixture.header_builder_last_authority().latest_execution_block(base);
+            if with_payload {
+                builder = builder.with_payload_batch(&Batch::default(), 0);
+            }
+            let leader = fixture.certificate(&builder.build());
+            CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                0,
+                ReputationScores::new(&fixture.committee()),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            )
+        }
+
+        /// A fixture, its consensus chain and a recent blocks ring holding block 1.
+        async fn setup() -> (CommitteeFixture<MemDatabase>, TempDir, ConsensusChain, ConsensusBusApp)
+        {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            execute(&bus, 1);
+            (fixture, temp_dir, chain, bus)
+        }
+
+        /// A leader whose execution block this node executed differently fails the fork check
+        /// before any batch is fetched: the payload's batch exists nowhere, so a fetch would never
+        /// return.
+        #[tokio::test]
+        async fn fetch_batches_reports_execution_fork() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let sub_dag = led_at(&fixture, BlockNumHash::new(1, forked_hash()), true);
+            assert_ne!(sub_dag.num_primary_batches(), 0);
+            let (expected_leader, expected_round) =
+                (sub_dag.leader().author().clone(), sub_dag.leader_round());
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                subscriber.fetch_batches(sub_dag, B256::ZERO.into(), 1, 1),
+            )
+            .await
+            .expect("the fork check runs before the batch fetch");
+
+            // the error names the leader that referenced the block (SEC-11)
+            assert!(matches!(
+                result,
+                Err(SubscriberError::ExecutionFork {
+                    number: 1,
+                    base_block: 1,
+                    base_hash,
+                    leader,
+                    leader_round,
+                }) if base_hash == forked_hash()
+                    && leader == expected_leader
+                    && leader_round == expected_round
+            ));
+        }
+
+        /// A leader block below a snapshot-restored node's floor cannot be checked there, so it
+        /// is not a fork: the output is assembled, while the same mismatch at the floor still
+        /// fails the check (SEC-6).
+        #[tokio::test]
+        async fn fetch_batches_assembles_below_the_restore_floor() {
+            /// A restored execution database whose floor is block 3, attesting this node's
+            /// blocks from there on.
+            struct RestoredAt3;
+            impl tn_types::CanonicalExecutionReader for RestoredAt3 {
+                fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
+                    (number >= 3).then(|| local_hash(number))
+                }
+                fn restored_state_floor(&self) -> Option<u64> {
+                    Some(3)
+                }
+            }
+
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            (2..=5).for_each(|number| execute(&bus, number));
+            bus.set_canonical_reader(Arc::new(RestoredAt3));
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let below = led_at(&fixture, BlockNumHash::new(2, forked_hash()), false);
+            let output = subscriber.fetch_batches(below, B256::ZERO.into(), 1, 2).await.unwrap();
+            assert_eq!(output.number(), 1);
+
+            let at_floor = led_at(&fixture, BlockNumHash::new(3, forked_hash()), false);
+            let result = subscriber.fetch_batches(at_floor, B256::ZERO.into(), 2, 3).await;
+            assert!(matches!(result, Err(SubscriberError::ExecutionFork { base_block: 3, .. })));
+        }
+
+        /// A sub-dag with no batches gets the same fork check: its output is not returned before
+        /// the check, and the check passes for a leader on the local chain.
+        #[tokio::test]
+        async fn fetch_batches_checks_empty_subdag() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let forked = led_at(&fixture, BlockNumHash::new(1, forked_hash()), false);
+            assert_eq!(forked.num_primary_batches(), 0);
+            let result = subscriber.fetch_batches(forked, B256::ZERO.into(), 1, 1).await;
+            assert!(matches!(result, Err(SubscriberError::ExecutionFork { number: 1, .. })));
+
+            let local = led_at(&fixture, BlockNumHash::new(1, local_hash(1)), false);
+            let output = subscriber.fetch_batches(local, B256::ZERO.into(), 1, 1).await.unwrap();
+            assert_eq!(output.number(), 1);
+        }
+
+        /// A later output led from an older execution block still waits for the floor an earlier
+        /// output set: leaders at blocks 5 then 1, with block 1 executed, and the second output
+        /// does not finish before execution reaches block 5.
+        #[tokio::test]
+        async fn wait_floor_is_monotone() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let first = led_at(&fixture, BlockNumHash::new(5, local_hash(5)), false);
+            let second = led_at(&fixture, BlockNumHash::new(1, local_hash(1)), false);
+            let first_floor = next_wait_floor(0, &first);
+            let second_floor = next_wait_floor(first_floor, &second);
+            assert_eq!((first_floor, second_floor), (5, 5));
+
+            let first_output =
+                Box::pin(subscriber.fetch_batches(first, B256::ZERO.into(), 1, first_floor));
+            let mut second_output =
+                Box::pin(subscriber.fetch_batches(second, B256::ZERO.into(), 2, second_floor));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut second_output).await.is_err(),
+                "the second output waits for the first leader's block"
+            );
+
+            (2..=5).for_each(|number| execute(&bus, number));
+            let second_output = tokio::time::timeout(Duration::from_secs(10), second_output)
+                .await
+                .expect("execution reached the floor")
+                .unwrap();
+            let first_output = tokio::time::timeout(Duration::from_secs(10), first_output)
+                .await
+                .expect("execution reached the first leader's block")
+                .unwrap();
+            assert_eq!((first_output.number(), second_output.number()), (1, 2));
+        }
+
+        /// On a failed fork check `run` goes inactive, shuts the epoch down and returns `Ok`
+        /// without saving the output: an `Err` would fail the critical task, and the shutdown
+        /// drain would save outputs past the fork.
+        #[tokio::test]
+        async fn run_returns_ok_after_execution_fork() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain.clone(), &bus);
+            let epoch_shutdown =
+                fixture.authorities().next().unwrap().consensus_config().shutdown().subscribe();
+            let (tx_sequence, rx_sequence) = mpsc::channel(4);
+            tx_sequence
+                .send(led_at(&fixture, BlockNumHash::new(1, forked_hash()), false))
+                .await
+                .unwrap();
+            let run_shutdown = Notifier::new();
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                subscriber.run(run_shutdown.subscribe(), rx_sequence, chain.clone()),
+            )
+            .await
+            .expect("run returns after the fork");
+
+            assert!(result.is_ok(), "{result:?}");
+            assert!(bus.is_cvv_inactive(), "the node goes inactive");
+            assert!(epoch_shutdown.noticed(), "the epoch shuts down");
+            assert_eq!(chain.latest_consensus_number(), 0, "the forked output is not saved");
+        }
     }
 }
 
