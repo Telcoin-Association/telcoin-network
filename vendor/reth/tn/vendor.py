@@ -553,28 +553,40 @@ def expand_braces(text):
             for x in expand_braces(text[:m.start()] + alt.strip() + text[m.end():])]
 
 
+# The *Files* sentence of a ledger entry: from the `*Files*:` label to the next `*Label*:`.
+FILES_SENTENCE = re.compile(r"\*Files\*:(.*?)(?=\n\s*\*[A-Z][A-Za-z ]*\*:|\Z)", re.S)
+
+
 def ledger_paths(text, crates):
     """Map every path the ledger's entries name to the ids of the entries that name it.
 
-    A path is a backticked token, which may wrap across lines and use `{a,b}` alternatives. It
-    is written from vendor/reth (`crates/...`, `testing/...`), or from a crate the same entry
-    named earlier (`tests/it/startup.rs` after `crates/rpc/rpc-builder/src/lib.rs`). A directory
-    names every file under it. The words "workspace manifest" name the root `Cargo.toml`."""
+    Only the entry's *Files* sentence names paths (TN-0084, review R28): a backticked token
+    elsewhere in the entry is prose. A path token may wrap across lines and use `{a,b}`
+    alternatives. It is written from vendor/reth (`crates/...`, `testing/...`), or from a crate
+    the same sentence named earlier (`tests/it/startup.rs` after
+    `crates/rpc/rpc-builder/src/lib.rs`). A token with a trailing slash is a directory and names
+    every file under it; without one it names that file only. The words "workspace manifest" name
+    the root `Cargo.toml`."""
     named = {}
     by_len = sorted(crates, key=len, reverse=True)
     for m in LEDGER_ENTRY.finditer(text):
         tn, body = m.groups()
-        if "workspace manifest" in re.sub(r"\s+", " ", body):
+        files = FILES_SENTENCE.search(body)
+        if not files:
+            continue
+        sentence = files.group(1)
+        if "workspace manifest" in re.sub(r"\s+", " ", sentence):
             named.setdefault(MANIFEST, set()).add(tn)
         bases = []
-        for token in re.findall(r"`([^`]+)`", body):
+        for token in re.findall(r"`([^`]+)`", sentence):
             for raw in expand_braces(re.sub(r"\s*\n\s*", "", token).strip()):
-                path = raw.rstrip("/")
-                crate = next((c for c in by_len if path == c or path.startswith(c + "/")), None)
+                path = raw.rstrip("/") + ("/" if raw.endswith("/") else "")
+                bare = path.rstrip("/")
+                crate = next((c for c in by_len if bare == c or bare.startswith(c + "/")), None)
                 if crate:
                     bases = [crate] + [b for b in bases if b != crate]
                     named.setdefault(path, set()).add(tn)
-                elif path == MANIFEST or path.startswith(("crates/", "testing/")):
+                elif bare == MANIFEST or bare.startswith(("crates/", "testing/")):
                     named.setdefault(path, set()).add(tn)
                 elif "/" in raw or "." in raw:
                     for b in bases:
@@ -582,12 +594,16 @@ def ledger_paths(text, crates):
     return named
 
 
+def names_path(named, rel):
+    """Whether a changed file `rel` is named: exactly, or by a directory token (trailing slash)."""
+    return any(rel == p or (p.endswith("/") and rel.startswith(p)) for p in named)
+
+
 def ledger_problems(rows, text, crates, code_files):
     """What `ledger` reports, from `classify` rows, the ledger's text and {path: text} of the
     vendored files: changed files no entry names, and ids the code uses that no entry defines."""
     named = ledger_paths(text, crates)
-    unnamed = [(k, rel) for k, rel in rows
-               if not any(rel == p or rel.startswith(p + "/") for p in named)]
+    unnamed = [(k, rel) for k, rel in rows if not names_path(named, rel)]
     defined = {m.group(1) for m in LEDGER_ENTRY.finditer(text)}
     undefined = {}
     for rel, body in sorted(code_files.items()):

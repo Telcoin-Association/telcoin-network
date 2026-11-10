@@ -116,6 +116,36 @@ def drift(metadata, root_text):
     return sorted(out)
 
 
+# TN-0085 (review R30): the carried patch (patches/revm-inspectors) must be what both workspaces
+# resolve. A `[patch]` entry drops out silently when the dependency requirement stops matching the
+# patch crate's version (a sync to 0.35 up to 0.44.1 would), and the registry crate links instead.
+PATCHED = ("revm-inspectors",)
+
+
+def unpatched(metadata, root_text):
+    """Carried patch crates that resolve from a registry or git source: in the nested resolve
+    (`cargo metadata` packages) or in TN's lockfile (its entry has a `source`)."""
+    out = []
+    for p in metadata["packages"]:
+        if p["name"] in PATCHED and p.get("source") is not None:
+            out.append(("nested workspace", p["name"], p["version"], p["source"]))
+    for p in packages(root_text):
+        if p["name"] in PATCHED and p.get("source") is not None:
+            out.append(("TN's Cargo.lock", p["name"], p["version"], p["source"]))
+    return out
+
+
+def report_unpatched(metadata, root_text):
+    found = unpatched(metadata, root_text)
+    for where, name, version, source in found:
+        print(f"unpatched: {where} resolves {name} {version} from {source}, not "
+              f"patches/{name}")
+    if found:
+        print("\nthe carried patch is not in effect: its version must satisfy the dependency "
+              "requirement (patches/revm-inspectors/PATCH.md)")
+    return len(found)
+
+
 def write_seed():
     overlay_text = OVERLAY.read_text() if OVERLAY.exists() else ""
     NESTED_LOCK.write_text(seed(ROOT_LOCK.read_text(), overlay_text))
@@ -165,10 +195,12 @@ def cmd_check():
         print("\nthe nested workspace resolved packages tn/test-only.lock does not pin; review "
               "them and run `python3 -I vendor/reth/tn/lockfile.py update`")
     drifted = report_drift(metadata, root_text)
-    if loose or drifted:
+    unpatched_count = report_unpatched(metadata, root_text)
+    if loose or drifted or unpatched_count:
         return 1
-    print(f"lockfile: every nested package is pinned, and the vendored crates resolve TN's "
-          f"versions ({len(packages(OVERLAY.read_text()))} test-only packages)")
+    print(f"lockfile: every nested package is pinned, the vendored crates resolve TN's "
+          f"versions ({len(packages(OVERLAY.read_text()))} test-only packages), and both "
+          f"workspaces resolve the carried {', '.join(PATCHED)}")
     return 0
 
 

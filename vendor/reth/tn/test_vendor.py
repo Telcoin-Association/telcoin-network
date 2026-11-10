@@ -277,8 +277,23 @@ class Ledger(Fixture):
             "crates/foo/src/sub/a.rs": {"TN-0001"},
             "crates/foo/src/sub/b.rs": {"TN-0001"},
             "crates/foo/src/plain.rs": {"TN-0001"},
-            "crates/foo/tests": {"TN-0001"},
+            "crates/foo/tests/": {"TN-0001"},
         })
+        self.assertTrue(vendor.names_path(named, "crates/foo/tests/it/main.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/other.rs"))
+
+    def test_prose_tokens_and_bare_directories_name_nothing(self):
+        # R28: a backticked crate path in the *Why* prose covered every file of that crate, and
+        # a bare directory token did the same; only the *Files* sentence names paths, and only a
+        # trailing slash makes a token a directory.
+        text = ("## Section\n\n- **TN-0001** — A change. *Kind*: fix.\n"
+                "  *Files*: `crates/foo/src/lib.rs`, `crates/foo/src`.\n"
+                "  *Why*: this leaves `crates/bar` and `crates/foo/src/plain.rs` alone.\n\n")
+        named = vendor.ledger_paths(text, ["crates/foo", "crates/bar"])
+        self.assertEqual(named, {"crates/foo/src/lib.rs": {"TN-0001"}, "crates/foo/src": {"TN-0001"}})
+        self.assertFalse(vendor.names_path(named, "crates/bar/src/lib.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/plain.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/sub/a.rs"))
 
     def test_reports_unnamed_files_and_undefined_ids(self):
         r = self.repos

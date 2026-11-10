@@ -145,6 +145,7 @@ by section, newest last within each.
 - **TN-0014** — Remove RocksDB: the backend, the `rocksdb`/`edge` features and the `rocksdb`
   crate. *Kind*: removal.
   *Files*: deleted `crates/storage/provider/src/providers/rocksdb/` (the real implementation);
+  `crates/storage/provider/src/providers/rocksdb_stub.rs` (module comment);
   every `cfg(all(unix, feature = "rocksdb"))` item and every `cfg(feature = "edge")` item removed
   from `crates/storage/provider/src/{either_writer.rs, providers/database/{mod,provider}.rs,
   providers/{consistent,blockchain_provider,mod}.rs, providers/state/historical.rs,
@@ -359,7 +360,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/rpc/rpc-eth-api/src/helpers/{call.rs, blocking_task.rs, state.rs}`,
   `crates/rpc/rpc/src/eth/filter.rs`.
   *Why*: TN runs consensus and RPC on one tokio runtime, and the execution engine
-  (`crates/engine`, `spawn_blocking_task`) and certificate validation (`spawn_blocking`) use the
+  (the engine crate's `spawn_blocking_task`) and certificate validation (`spawn_blocking`) use the
   same blocking pool as RPC. RPC methods that occupied blocking threads without taking a permit
   from the blocking-IO semaphore, or that released it when the client disconnected, let
   unauthenticated requests pin an unbounded number of pool threads and delay block execution.
@@ -598,7 +599,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `spawn_blocking_io_fut` instead, so TN wraps that future in `InCancelScope`, which enters the
   scope around each poll; every replay and trace runs there. Also applied: 621f663ed's move of
   `CancelOnDrop` into reth-tasks (`call.rs` imports it from there), except that reth-revm's copy
-  stays, so this change leaves `crates/revm` untouched; 0973a1387 (`eth_simulateV1`), 34f77be92
+  stays, so this change leaves the reth-revm crate untouched; 0973a1387 (`eth_simulateV1`), 34f77be92
   (the pending-block build) and 329fcfc73's check in `eth_callBundle`. A stopped request returns
   an internal error to a client that has already left. RPC only: block execution does not run in
   these scopes.
@@ -1223,3 +1224,35 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `lockfile.py check`, and by TN-0079's reth-side tests compiling and passing under nextest.
   *Tests*: n/a (build configuration; the TN-0079 tests exercise it).
   *Upstream*: n/a.
+
+- **TN-0084** — The ledger check reads only an entry's *Files* sentence, and the attested run runs it.
+  *Kind*: tooling.
+  *Files*: `tn/vendor.py` (`FILES_SENTENCE`, `ledger_paths`, `names_path`), `tn/test_vendor.py`
+  (`test_prose_tokens_and_bare_directories_name_nothing`), the root `etc/test-and-attest.sh`.
+  *Why*: `ledger_paths` took any backticked token of an entry that started with `crates/` as a
+  path and treated every token as a possible directory, so the prose "`crates/engine`" in
+  TN-0019 and "`crates/revm`" in TN-0049 covered every file of two vendored crates, one of them
+  on the execution path, and a future edit there needed no entry to pass (review R28). Paths now
+  come from the *Files* sentence only, and a token names a directory only with a trailing slash;
+  the two prose tokens are reworded, and TN-0014's *Files* sentence names the stub it changed.
+  Neither `etc/ci-lanes.sh test-vendor-reth` nor `etc/test-and-attest.sh` ran `vendor.py status`,
+  `ledger` or `check`, so the ledger invariant was a manual claim (review R29); the attested run
+  now runs the three (they need the upstream clone, which CI lacks).
+  *Tests*: `test_prose_tokens_and_bare_directories_name_nothing`; the existing ledger tests, with
+  the directory token in `test_paths_expand_wrap_and_resolve_against_the_entry_crate` given its
+  slash. *Upstream*: n/a.
+
+- **TN-0085** — `lockfile.py check` fails when either workspace resolves revm-inspectors from the
+  registry.
+  *Kind*: tooling.
+  *Files*: `tn/lockfile.py` (`PATCHED`, `unpatched`, `report_unpatched`), `tn/test_lockfile.py`.
+  *Why*: the `[patch.crates-io]` entry for `patches/revm-inspectors` applies only while the
+  dependency requirement in the vendored manifest (`0.34.2`) matches the patch crate's version
+  (0.34.3). A sync to any 0.35 to 0.44.1 makes cargo print "patch was not used" and link the
+  registry crate, and the `revm-inspectors-patch` CI job, which tests the patch crate standalone,
+  stays green (review R30). The check the `test-vendor-reth` lane runs now reads the nested
+  resolve and TN's `Cargo.lock` and fails when the crate has a registry or git source. TN-0080
+  fixed the nested lane's own fallback to the registry; TN-0079's reth-side tests also fail to
+  compile against the registry crate.
+  *Tests*: `test_unpatched_reports_registry_sources_in_either_workspace`. *Upstream*: n/a.
+

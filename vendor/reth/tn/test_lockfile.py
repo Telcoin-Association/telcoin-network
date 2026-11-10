@@ -81,5 +81,22 @@ class Checks(unittest.TestCase):
         self.assertEqual(lockfile.drift(metadata, ROOT), [("libc", "0.2.191", ["0.2.183"])])
 
 
+class Patched(unittest.TestCase):
+    def test_unpatched_reports_registry_sources_in_either_workspace(self):
+        metadata = {"packages": [
+            {"name": "revm-inspectors", "version": "0.34.3", "source": None},
+            {"name": "serde", "version": "1.0.0", "source": "registry+https://x"},
+        ]}
+        root = ('[[package]]\nname = "revm-inspectors"\nversion = "0.34.3"\n\n'
+                '[[package]]\nname = "serde"\nversion = "1.0.0"\nsource = "registry+https://x"\n')
+        self.assertEqual(lockfile.unpatched(metadata, root), [])
+        metadata["packages"][0]["source"] = "registry+https://x"
+        root = root.replace('version = "0.34.3"\n', 'version = "0.34.3"\nsource = "registry+https://x"\n')
+        self.assertEqual(lockfile.unpatched(metadata, root), [
+            ("nested workspace", "revm-inspectors", "0.34.3", "registry+https://x"),
+            ("TN's Cargo.lock", "revm-inspectors", "0.34.3", "registry+https://x"),
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
