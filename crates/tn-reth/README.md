@@ -656,14 +656,19 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   heal will not cut). It reaches the epoch reads as a node-local provider fault
   (`StateReadError::Provider`): retried briefly, then the node stops instead of using any other
   value (`damaged_v2_changeset_fails_pinned_reads_closed`). RPC reads of the damaged rows fail;
-  others answer. Startup refuses a `.csoff` whose committed record fails its checksum rather than
-  cutting it. **Operator response:** the file is damaged on this node only (disk or memory fault,
+  others answer. Startup opens each segment's latest file to heal an interrupted write, and
+  refuses that file, rather than cutting it, when its `.csoff` holds a committed record that fails
+  its checksum, or when it or its `.csoff` is shorter than its committed configuration (a prune
+  commits the configuration before it shrinks a file, so only damage leaves that); older files are
+  verified as they are read. Startup also refuses a segment whose files skip blocks between two of
+  them (a file missing: `<segment> static files skip blocks`). **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
   the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
-  one damaged file usually means more. A datadir v2 wrote before these checksums keeps its
-  unchecked files until each one rotates (500k blocks); `db reset-execution` gives every file
-  checksums at once.
+  one damaged file usually means more. A v2 datadir written before these checksums does not open
+  (`static file <path> has no checksums`): v2 datadirs must hold only checksummed files, since
+  two flipped bits could otherwise pass a checksummed file off as an unchecked one. Recreate it,
+  or `db reset-execution` and re-execute.
 
 ### Upgrading a testnet node
 
