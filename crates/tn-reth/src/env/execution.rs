@@ -889,6 +889,9 @@ fn advance_cached_reads(reads: &mut CachedReads, bundle: &BundleState) {
     // each bundle account updates only its own entry, so the map's iteration order cannot change
     // the result
     for (address, account) in &bundle.state {
+        // evicting a recreated account (`DestroyedChanged`) is a deliberate, conservative choice:
+        // it is storage-known, so it could be kept like `InMemoryChange`, but eviction costs one
+        // re-read of a rare account and keeps the advance to the cases the differential tests pin
         let info = match &account.info {
             Some(info) if !account.status.was_destroyed() => info,
             _ => {
