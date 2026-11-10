@@ -56,7 +56,10 @@ const PRIMARY_GAP_OUTPUT_COMMITTEES: usize = 3;
 ///
 /// The results are kept apart from the votes, under their own caps. With the vote cap the sum is
 /// 1,500, below [`tn_types::CHANNEL_CAPACITY`], so the held votes and results alone never fill
-/// the queue.
+/// the queue. The votes that the last event loop left unread go back in the queue too, outside the
+/// gap caps, so in an extreme case the queue is full when the kept results are queued. The results
+/// are queued without waiting: one that does not fit is dropped and counted as discarded in the gap
+/// log.
 const PRIMARY_GAP_MAX_OUTPUTS: usize =
     PRIMARY_GAP_OUTPUT_COMMITTEES.saturating_mul(PRIMARY_GAP_COMMITTEE_SIZE);
 
@@ -152,10 +155,13 @@ fn epoch_vote_weight(gossip: &GossipPayload, epoch: Option<Epoch>) -> Option<Gap
 /// result with a lower or equal number does not. So the queue keeps the newest result, not the
 /// first.
 ///
-/// The queue keeps the results in every gap, also before the first event loop. A restarting node
-/// is the node that most needs the head. A vote needs the epoch of the last event loop to bound the
-/// records it can be for, but a result does not: the slot of its author already bounds the results
-/// of one author to one.
+/// The queue keeps the results in every gap. A vote needs the epoch of the last event loop to bound
+/// the records it can be for, but a result does not: the slot of its author already bounds the
+/// results of one author to one. The gap that matters is the one between two event loops of a
+/// running node, such as the restart of the epoch tasks after a demotion or an epoch change: the
+/// node stays subscribed to the topic through it, so results keep arriving. Before the first event
+/// loop nothing arrives on the topic, because the node subscribes to it only after that event loop
+/// holds the queue (see `spawn_primary_network_for_epoch` in the node crate).
 ///
 /// The hold gives an attacker nothing. Only members of the previous, current and next committee
 /// can publish on this topic, and the swarm forwards only gossip that such a publisher signed, so
@@ -498,7 +504,7 @@ mod tests {
     }
 
     /// Before the first event loop the gap has no epoch, but it keeps the consensus results: a
-    /// restarting node needs the head.
+    /// result needs no epoch to be bounded. In a node nothing arrives on the topic this early.
     #[test]
     fn consensus_output_is_held_before_the_first_event_loop() {
         let channel = QueChannel::new_always_subscribed_held(primary_event_gap_policy());

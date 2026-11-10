@@ -434,10 +434,14 @@ impl<T> GapHold<T> {
     /// by rank, mark the consumer present and reset the gap counters. So the new consumer gets
     /// at most the newest of each author, after the held ones. Write one log with what the gap
     /// dropped and what this discards, which also names the superseded newest messages; those
-    /// alone write no log. A held message sent while this runs can land ahead of the
-    /// held ones and the newest ones. A message queued for the new consumer lands after them.
-    /// The consumer of `epoch` sets the epoch of the next gap. With `None` the epoch does not
-    /// change.
+    /// alone write no log.
+    ///
+    /// A held message that a sender weighed before this marks the consumer present can land
+    /// anywhere among the held ones and the newest ones, also after all of them: the sender weighs
+    /// it under the lock but queues it after releasing the lock. A message weighed once the
+    /// consumer is present lands after them, because the weighing waits for the lock that this
+    /// holds while it queues the newest ones. The consumer of `epoch` sets the epoch of the next
+    /// gap. With `None` the epoch does not change.
     fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>, epoch: Option<Epoch>) {
         let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         // Use the epoch of the gap in which the messages arrived, not the epoch of the new
@@ -1595,10 +1599,13 @@ impl ConsensusBusApp {
     /// Provide a subscriber (Receiver) for primary network events.
     ///
     /// First discard the events that the previous epoch's event loop left queued and that the gap
-    /// policy does not hold (see [`crate::network::gap_policy`]). The held gossip, including the
-    /// epoch votes that arrive between two epochs, stays queued in order. `epoch` is the epoch of
-    /// the event loop that subscribes. In the gap after this event loop, the gap policy holds only
-    /// the votes for this epoch and the epoch before it.
+    /// policy does not hold (see [`crate::network::gap_policy`]). The held epoch votes, including
+    /// the ones that arrive between two epochs, stay queued in order. After them the event loop
+    /// gets the newest consensus result of each author by consensus number, whether the gap kept
+    /// it or the previous event loop left it queued. `epoch` is the epoch of the event loop that
+    /// subscribes. In the gap after this event loop, the gap policy holds the votes for this epoch
+    /// and the epoch before it, and keeps the newest consensus result of each author apart from
+    /// them.
     pub fn subscribe_primary_network_events(
         &self,
         epoch: Epoch,
