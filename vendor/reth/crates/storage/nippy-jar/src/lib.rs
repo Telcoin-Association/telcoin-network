@@ -345,6 +345,14 @@ impl<H: NippyJarHeader> NippyJar<H> {
         if jar.version != NIPPY_JAR_VERSION && jar.version != NIPPY_JAR_VERSION_CHECKSUMS {
             return Err(NippyJarError::UnsupportedVersion(jar.version))
         }
+        // TN(TN-0120): the dictionary zstd path is not usable (the writer compresses without the
+        // dictionaries the cursor decompresses with, and the cursor `expect`s them), so a
+        // checksummed jar may not name it: refused here rather than panicking on a read.
+        if jar.has_checksums() &&
+            matches!(&jar.compressor, Some(Compressors::Zstd(zstd)) if zstd.use_dict)
+        {
+            return Err(NippyJarError::UnsupportedCompression)
+        }
         Ok(jar)
     }
 
@@ -1522,6 +1530,21 @@ mod tests {
 
         std::fs::write(&config_path, &config).unwrap();
         assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+
+        // A checksummed configuration naming dictionary zstd, with a valid checksum: refused at
+        // load, before a read could reach the cursor's dictionary `expect`s. Without dictionaries
+        // zstd still loads.
+        for use_dict in [true, false] {
+            let mut bytes = Vec::new();
+            NippyJar::new_without_header(2, file.path())
+                .with_zstd(use_dict, 5000)
+                .with_checksums()
+                .save_to_writer(&mut bytes)
+                .unwrap();
+            let loaded = NippyJar::<()>::load_from_reader(&bytes[..]);
+            assert_eq!(matches!(loaded, Err(NippyJarError::UnsupportedCompression)), use_dict);
+            assert_eq!(loaded.is_ok(), !use_dict);
+        }
     }
 
     /// TN(TN-0120): a changed byte anywhere in a value or its checksum fails that value's read

@@ -32,6 +32,7 @@ use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::{Account, BlockBody as _, SealedBlock, SealedHeader};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{AccountReader, DBProvider, StateProvider, StorageSettingsCache};
+use reth_storage_errors::provider::ProviderError;
 use reth_testing_utils::generators::{self, random_block, BlockParams};
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm_database::{AccountStatus, BundleState, RevertToSlot};
@@ -661,4 +662,54 @@ fn v2_update_history_indices_refuses_uncommitted_changesets() {
     provider_rw.save_blocks(chain.batch(&(10..=12)), SaveBlocksMode::Full).unwrap();
     let err = provider_rw.update_history_indices(10..=12).unwrap_err().to_string();
     assert!(err.contains("cannot index history"), "{err}");
+}
+
+/// TN(TN-0123): a v2 history read whose changeset jar is missing fails closed. With the account
+/// and storage changeset files for blocks 4..=7 gone, every read that resolves to one of their
+/// changesets is `AccountChangesetNotFound` / `StorageChangesetNotFound`, never the plain or a
+/// later state's value; every other read still answers right.
+#[test]
+fn v2_history_read_without_its_changeset_jar_fails_closed() {
+    let chain = Chain::generate().across_static_files();
+    let factory = chain.save(StorageSettings::v2(), TIP);
+    let static_files = factory.static_file_provider();
+    for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
+        let range = static_files.find_fixed_range(segment, 4);
+        let path = static_files.directory().join(segment.filename(&range));
+        reth_nippy_jar::NippyJar::<reth_static_file_types::SegmentHeader>::load(&path)
+            .unwrap()
+            .delete()
+            .unwrap();
+    }
+    static_files.initialize_index().unwrap();
+
+    let provider = factory.provider().unwrap();
+    let (mut missing, mut answered) = (0, 0);
+    for block in 1..=TIP + 1 {
+        let state = HistoricalStateProviderRef::new(&provider, block);
+        let expected = &chain.states[block as usize - 1];
+        for i in 0..=RECREATED {
+            let address = address(i);
+            match state.basic_account(&address) {
+                Ok(account) => {
+                    assert_eq!(account, expected.account(address), "{address} at {block}");
+                    answered += 1;
+                }
+                Err(ProviderError::AccountChangesetNotFound { .. }) => missing += 1,
+                Err(err) => panic!("{address} at {block}: {err}"),
+            }
+            for s in 1..=SLOTS {
+                let slot = U256::from(s);
+                match state.storage(address, B256::from(slot)) {
+                    Ok(value) => {
+                        assert_eq!(value.unwrap_or_default(), expected.slot(address, slot));
+                        answered += 1;
+                    }
+                    Err(ProviderError::StorageChangesetNotFound { .. }) => missing += 1,
+                    Err(err) => panic!("{address} slot {slot} at {block}: {err}"),
+                }
+            }
+        }
+    }
+    assert!(missing > 0 && answered > 0, "missing {missing}, answered {answered}");
 }

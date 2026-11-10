@@ -22,7 +22,9 @@
 
 use super::tn_v2_tests::executed;
 use crate::{
-    providers::{HistoryInfo, RocksDBBuilder, StaticFileProvider},
+    providers::{
+        static_file::changeset_lower_bound, HistoryInfo, RocksDBBuilder, StaticFileProvider,
+    },
     test_utils::MockNodeTypesWithDB,
     ChangeSetReader, HistoricalStateProviderRef, ProviderFactory, SaveBlocksMode,
     StaticFileProviderFactory, StorageChangeSetReader,
@@ -256,25 +258,17 @@ fn sf_steps(factory: &Factory, query: Query, changeset_block: BlockNumber, steps
     let mut cursor = jar.cursor().unwrap();
     let t3 = Instant::now();
     let range = offset.changeset_range();
-    let (mut low, mut high) = (range.start, range.end);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        steps.probes += 1;
-        let less = match query {
-            Query::Account(..) => {
-                cursor.get_one::<AccountChangesetMask>(mid.into()).unwrap().unwrap().address <
-                    address
-            }
-            Query::Storage(_, _, key) => {
-                let change = cursor.get_one::<StorageChangesetMask>(mid.into()).unwrap().unwrap();
-                (change.address, change.key) < (address, key)
-            }
-        };
-        if less {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
+    // TN(TN-0124): the lookups' own search, with the matched row's verified read.
+    // A lower-bound search over n rows probes ceil(log2(n + 1)) rows at most.
+    steps.probes += u64::BITS as u64 - (range.end - range.start).leading_zeros() as u64;
+    let mut key = address.to_vec();
+    if let Query::Storage(_, _, slot) = query {
+        key.extend_from_slice(slot.as_slice());
+    }
+    let low = changeset_lower_bound(&mut cursor, range, &key).unwrap();
+    match query {
+        Query::Account(..) => drop(cursor.get_one::<AccountChangesetMask>(low.into()).unwrap()),
+        Query::Storage(..) => drop(cursor.get_one::<StorageChangesetMask>(low.into()).unwrap()),
     }
     let t4 = Instant::now();
     steps.jar.push(t1 - t0);
@@ -417,7 +411,8 @@ fn report(layout: &str, name: &str, phase: &mut Phase) -> String {
         row(&mut out, "sf step csoff", &mut steps.csoff);
         row(&mut out, "sf step cursor", &mut steps.cursor);
         row(&mut out, "sf step search", &mut steps.search);
-        writeln!(out, "    probes per lookup {:.1}", steps.probes as f64 / lookups).unwrap();
+        writeln!(out, "    probes per lookup (at most) {:.1}", steps.probes as f64 / lookups)
+            .unwrap();
     }
     out
 }

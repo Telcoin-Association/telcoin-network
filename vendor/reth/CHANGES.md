@@ -923,7 +923,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   src/lib.rs, src/writer.rs, src/cursor.rs, src/error.rs}` (`NippyJar::with_checksums`,
   `has_checksums`, `value_checksum`, `value_seed`, `checksum`, `CHECKSUM_SIZE`;
   `NippyJarWriter::has_checksums`; `NippyJarCursor::unverified_value`; errors
-  `ChecksumMismatch`, `ConfigChecksumMismatch`, `UnsupportedVersion`; tests).
+  `ChecksumMismatch`, `ConfigChecksumMismatch`, `UnsupportedVersion`,
+  `UnsupportedCompression`; tests).
   *Why*: NippyJar had no checksum anywhere, and under storage v2 the account and storage
   changesets, which back every historical state read (TN's pinned committee and epoch reads
   included), live in static files: a flipped bit read back as a plausible wrong value, a silent
@@ -951,14 +952,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   checks lengths only, and a damaged value stays an error on every read. Binding the position
   makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
   written and read exactly as before (byte-identical files); `load` now refuses a version other
-  than 1 or 2 (upstream only ever wrote 1). A jar's own configuration decides its format, so a
+  than 1 or 2 (upstream only ever wrote 1), and a version-2 configuration naming dictionary zstd
+  (`UnsupportedCompression`): the writer compresses without the dictionaries the cursor then
+  `expect`s, so that path cannot read back, and no TN segment uses it. A jar's own configuration decides its format, so a
   datadir can mix both. It cannot reach execution: the stored values are unchanged, and nothing
   creates a version-2 jar until the provider's policy (TN-0122) asks for one, which only storage
   v2 does. *Tests*: `test_checksummed_jar_round_trip` (plain and LZ4, whole rows and single
   columns; sizes: four bytes a value, and an unchecked jar's files keep upstream's sizes),
   `test_checksummed_config_serialization` (version 2 and the trailer, byte for byte),
   `test_checksummed_config_damage_is_refused` (every byte of the configuration flipped, a cut
-  file, an unknown version), `test_checksum_detects_damaged_value` (first, middle, last stored
+  file, an unknown version, dictionary zstd with a valid checksum), `test_checksum_detects_damaged_value` (first, middle, last stored
   byte and a checksum byte, plain and LZ4: only that value fails, its row's other column still
   reads), `test_checksum_detects_offset_moved_to_another_value` (offsets moved onto the next
   row's value fail; an unchecked jar returns the wrong value; a value shorter than a checksum
@@ -1055,4 +1058,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   and nothing is cut), `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` (an interrupted
   prune is healed and published at once; a gap is refused), `rotation_prune_and_mixed_formats`
   (unchecked jars keep their format while new jars are checksummed; prune and appends across
-  rotations keep verifying), `missing_row_inside_a_range_is_an_error`. *Upstream*: no.
+  rotations keep verifying), `missing_row_inside_a_range_is_an_error`,
+  `damaged_probe_key_is_an_error_not_another_row` (TN-0124), and in `database/tn_v2_tests.rs`
+  `v2_history_read_without_its_changeset_jar_fails_closed` (a v2 datadir missing the changeset
+  files of blocks 4 to 7: every history read that resolves to them is `*ChangesetNotFound`,
+  never another state's value, and the rest answer right; fails if a miss falls back to a
+  value). *Upstream*: no.
+
+- **TN-0124** — The changeset point lookups probe raw key bytes. *Kind*: performance (storage v2
+  historical reads).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs}`
+  (`changeset_lower_bound`, `changeset_lookup_missed`, `changeset_search`; used by
+  `get_account_before_block` and `get_storage_before_block`),
+  `crates/storage/provider/src/providers/database/tn_v2_read_bench.rs` (its search step runs the
+  same search).
+  *Why*: each of a lookup's ~8 binary-search probes decoded a whole `AccountBeforeTx` or
+  `StorageBeforeTx` into a fresh row `Vec` only to compare its key, and with TN-0120 would also
+  verify a checksum per probe (bytewise on x86_64 below 64 B). The key is the stored value's
+  leading bytes (the address, then the plain slot: 20 or 52 B, raw, so byte order is key order),
+  so a probe now compares them in place (`NippyJarCursor::unverified_value`), and only the row the
+  search settles on is read verified and decoded, its key compared again. A value shorter than
+  the key, or a probe past the jar's rows, is `CorruptedChangeSetStaticFile` (the range was
+  validated by TN-0121, so only damage gets there). Fail closed: a damaged probe can only end the
+  search on a row that does not match, which is not found, which every history caller turns into
+  `AccountChangesetNotFound`/`StorageChangesetNotFound` (TN halts on both); on a miss in a
+  checksummed jar the search reruns with every probe verified, so the damage is reported as the
+  checksum error. The answers are those of the old search, which compared the same keys decoded.
+  It cannot reach execution: historical reads only, same results. *Tests*:
+  `damaged_probe_key_is_an_error_not_another_row` (a probe's key damaged so the search lands on an
+  intact row of another key: the checksum error, never that row; real misses stay `None`; fails
+  without the rerun), and every changeset lookup test of the crate (TN-0045, TN-0115, TN-0123).
+  *Upstream*: maybe (the raw probe; the rerun needs TN-0120).

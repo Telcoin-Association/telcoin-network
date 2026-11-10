@@ -474,3 +474,40 @@ fn missing_row_inside_a_range_is_an_error() {
     assert!(err.to_string().contains("has no row for 3"), "{err}");
     assert_eq!(provider.headers_range(0..3).unwrap().len(), 3);
 }
+
+/// TN(TN-0124): the point lookups probe the stored keys unverified. A damaged probe key that
+/// steers the search onto an intact row of another key never returns that row: the miss reruns the
+/// search verifying every probe and reports the checksum error. A real miss is still `None`.
+#[test]
+fn damaged_probe_key_is_an_error_not_another_row() {
+    let (dir, _) = create_test_static_files_dir();
+    let provider = provider(dir.path(), true, 1_000);
+    write_changesets(&provider, 0..3);
+    let accounts = jar_path(&provider, StaticFileSegment::AccountChangeSets, 0);
+    let storage = jar_path(&provider, StaticFileSegment::StorageChangeSets, 0);
+    drop(provider);
+
+    let provider = provider_ro(dir.path());
+    assert_eq!(
+        provider.get_account_before_block(1, address(1, 0)).unwrap(),
+        Some(account_changes(1)[0].clone())
+    );
+    assert_eq!(provider.get_account_before_block(1, address(2, 0)).unwrap(), None);
+    assert_eq!(provider.get_storage_before_block(1, address(1, 0), slot(9)).unwrap(), None);
+    drop(provider);
+
+    // Block 1 is rows 5..10; the first probe is row 7 (change 2). Its key's last byte now sorts it
+    // below change 0's, so the search walks right and ends on change 3's intact row.
+    flip(&accounts, value_start(&accounts, 7, 0) + 19, 0x03);
+    flip(&storage, value_start(&storage, 7, 0) + 51, 0x03);
+    let provider = provider_ro(dir.path());
+    let err = provider.get_account_before_block(1, address(1, 0)).unwrap_err();
+    assert!(is_checksum_error(&err), "{err}");
+    let err = provider.get_storage_before_block(1, address(1, 0), slot(0)).unwrap_err();
+    assert!(is_checksum_error(&err), "{err}");
+    // A lookup whose probes avoid the damaged row still answers.
+    assert_eq!(
+        provider.get_account_before_block(0, address(0, 0)).unwrap(),
+        Some(account_changes(0)[0].clone())
+    );
+}

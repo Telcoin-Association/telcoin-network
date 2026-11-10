@@ -115,4 +115,9 @@ pub enum NippyJarError {
     /// TN(TN-0120): the configuration names a format version this build does not read.
     #[error("unsupported static file format version {0}")]
     UnsupportedVersion(usize),
+
+    /// TN(TN-0120): a checksummed jar's configuration names dictionary zstd compression, which
+    /// this build cannot read back.
+    #[error("unsupported static file compression: zstd with dictionaries in a checksummed jar")]
+    UnsupportedCompression,
 }
