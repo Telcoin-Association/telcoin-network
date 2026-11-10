@@ -710,19 +710,27 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `.../providers/database/mod.rs` (the `#[cfg(test)]` module line).
   *Why*: the oracle for TN-0041 to TN-0044. A seeded generator builds blocks 1 to 12 with
   transactions, account creations and updates, accounts whose only change is storage (an info
-  revert of `DoNothing`), slots changed in several blocks, slots cleared, and the empty bytecode
-  in a bundle's contracts. The chain is saved with `save_blocks` into a v1 and a v2 factory in
+  revert of `DoNothing`), slots changed in several blocks, slots cleared, the empty bytecode
+  in a bundle's contracts, and an account without storage that block 7 destroys and re-creates
+  with one slot set to 7 (a storage wipe whose slot revert is `Destroyed`, inside a multi-block
+  batch). The chain is saved with `save_blocks` into a v1 and a v2 factory in
   single- and multi-block batches. `v2_matches_v1_on_a_generated_chain` checks that v2 writes
   the three ex-`RocksDB` tables, that they, the changesets and `Bytecodes` equal v1's row for
   row, that every historical account and storage read at the start of each block equals v1's
-  answer and the generator's state, and that every transaction is found by hash.
+  answer and the generator's state, that the re-created slot reads 7 after the wipe block (its
+  only history entry), and that every transaction is found by hash.
   `v2_history_unwind_round_trip` removes blocks with `remove_block_and_execution_above` in both
   layouts, compares the tables and reads with a save of the shorter chain, then saves the removed
-  blocks again and compares with a full save. Three tests cover the fail-closed paths of
-  TN-0043: a v2 wipe of an account with committed storage, and of storage written earlier in the
-  same batch, fail (a wipe of an account without storage saves), and `update_history_indices`
-  refuses blocks whose static-file changesets are not committed yet while re-indexing committed
-  ones to what `save_blocks` wrote. Each test fails with the change it guards undone.
+  blocks again and compares with a full save. `v2_history_covers_the_tip_state` walks
+  `HashedAccounts` and `HashedStorages`, in both layouts, after a full save, an unwind to before
+  the wipe block and a re-save, and requires a history shard for every key: a key without one
+  reads as never written at every block, which no read reports as an error. Three tests cover
+  the fail-closed paths of TN-0043: a v2 wipe of an account with committed storage, and of
+  storage written earlier in the same batch, fail (a wipe of an account without storage saves),
+  and `update_history_indices` refuses blocks whose static-file changesets are not committed yet
+  while re-indexing committed ones to what `save_blocks` wrote. Each test fails with the change
+  it guards undone; dropping a wiped account's slots in `HistoryTransitions::from_reverts`
+  fails the differential, the unwind round trip, the re-index check and the history check.
   *Upstream*: n/a.
 - **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
   only).
