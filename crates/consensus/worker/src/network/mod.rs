@@ -1,6 +1,6 @@
 //! Worker network implementation.
 
-use crate::metrics::{SyncShedReason, WorkerMetrics};
+use crate::metrics::{tier_label, SyncShedReason, WorkerMetrics};
 use error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
@@ -731,10 +731,12 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
             }
         }
         OpeningRead::AtCapacity(refusal) => {
+            network_handle.metrics().record_sync_serve_denied(tier);
             debug!(
                 target: "worker::network",
                 %peer,
-                ?tier,
+                tier = tier_label(&tier),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 ?refusal,
                 "batch-serve admission refused, denying inbound sync stream"
             );
@@ -2406,6 +2408,46 @@ mod tests {
         // the held permits keep the public share full for the whole exchange
         drop(held);
         assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+    }
+
+    /// A request refused because the public share of the batch-serve pool is full counts one
+    /// denied serve under the `public` tier, and none under `committee`.
+    #[tokio::test(start_paused = true)]
+    async fn at_capacity_openings_count_a_denied_serve_by_tier() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the current-thread test runtime keeps every task on this thread, so the local
+        // recorder covers the handle built inside `stuck_opening`
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let (_opening, batch_serve) = admission_budgets();
+        let _held: Vec<_> = (0..MAX_CONCURRENT_BATCH_STREAMS)
+            .map(|_| {
+                batch_serve
+                    .pool
+                    .try_acquire(&key(1), PeerTier::Public)
+                    .expect("public batch-serve permit")
+            })
+            .collect();
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        stuck_opening(request, batch_serve).await;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let denied = |tier: PeerTier| {
+            snapshot.iter().find_map(|(key, _, _, value)| {
+                let labelled =
+                    key.key().labels().any(|l| l.key() == "tier" && l.value() == tier_label(&tier));
+                match value {
+                    DebugValue::Counter(n)
+                        if key.key().name() == "tn_worker.sync_serves_denied_total" && labelled =>
+                    {
+                        Some(*n)
+                    }
+                    _ => None,
+                }
+            })
+        };
+        assert_eq!(denied(PeerTier::Public), Some(1), "the refused public request is counted");
+        assert_eq!(denied(PeerTier::Committee), Some(0), "no committee request was refused");
     }
 
     /// A valid request that arrives in the second half of the public window is

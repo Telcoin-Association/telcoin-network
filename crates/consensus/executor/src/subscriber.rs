@@ -2,11 +2,12 @@
 
 use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
+use metrics::Counter;
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::PrimaryToWorkerClient;
@@ -36,6 +37,12 @@ const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// older than this is a stale record (for example one loaded at restart) and must not promote a
 /// node that has not caught up.
 const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Minimum interval between two `rejoin not ready` lines for the same [`RejoinBlocker`].
+///
+/// A catching-up CVV checks readiness after every output it handles, hundreds a second while it
+/// replays, so the line is logged when the blocker changes and otherwise at most this often.
+const REJOIN_NOT_READY_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Only an output from this subscriber's still-open epoch can establish rejoin readiness.
 /// Future outputs are ignored by `handle_sync_output`, and finalized epochs must be replayed
@@ -273,6 +280,10 @@ impl<DB: Database> Subscriber<DB> {
         // Derived from the same helper as the demotion window in `behind_consensus`, so a node
         // that rejoins is not demoted again at once.
         let rejoin_window = tn_types::rejoin_round_window(self.config.parameters().gc_depth);
+        // readiness is checked after every handled output, so the counter handles are resolved
+        // once here rather than per check
+        let blocked_counters = rejoin_blocked_counters();
+        let mut not_ready_log = RejoinLogThrottle::default();
         while let Some(output) = rx_sync_output.recv().await {
             let consensus_header_number = output.number();
             let handled_epoch = output.sub_dag().leader_epoch();
@@ -287,42 +298,87 @@ impl<DB: Database> Subscriber<DB> {
                 handled_epoch,
                 latest_record.as_ref(),
             );
-            if let Some(last_consensus_header) =
-                self.consensus_bus.last_consensus_header().borrow().as_ref()
-            {
+            // freshness is measured in milliseconds so a sub-second commit time is not rounded
+            // away. a pre-fork commit time is whole seconds, and there this equals comparing
+            // whole seconds against the clock rounded down to the second
+            let newest =
+                self.consensus_bus.last_consensus_header().borrow().as_ref().map(|header| {
+                    NewestHeader {
+                        number: header.number,
+                        epoch: header.sub_dag.leader_epoch(),
+                        round: header.sub_dag.leader_round(),
+                        age: header.sub_dag.commit_timestamp_ms().elapsed(),
+                    }
+                });
+            if let Some(newest) = &newest {
                 // Rejoin when the handled output is within the rejoin window of the newest known
                 // header and that header is fresh. The freshness check stops a stale record from
                 // promoting a node that has not caught up.
-                // freshness is measured in milliseconds so a sub-second commit time is not rounded
-                // away. a pre-fork commit time is whole seconds, and there this equals comparing
-                // whole seconds against the clock rounded down to the second
-                let newest_round = last_consensus_header.sub_dag.leader_round();
                 if epoch_is_open
                     && rejoin_ready(
                         handled_epoch,
                         handled_round,
-                        last_consensus_header.sub_dag.leader_epoch(),
-                        newest_round,
-                        last_consensus_header.sub_dag.commit_timestamp_ms().elapsed(),
+                        newest.epoch,
+                        newest.round,
+                        newest.age,
                         rejoin_window,
                     )
                 {
+                    let (exec_round, exec_number) = self.exec_progress();
                     // We are caught up enough so try to jump back into consensus
                     info!(
                         target: "subscriber",
                         consensus_header_number,
-                        newest_number = last_consensus_header.number,
-                        round_gap = newest_round.saturating_sub(handled_round),
+                        newest_number = newest.number,
+                        round_gap = newest.round.saturating_sub(handled_round),
                         rejoin_window,
+                        handled_round,
+                        newest_round = newest.round,
+                        exec_round,
+                        exec_number,
                         "attempting to rejoin consensus"
                     );
-                    self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+                    let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+                    self.consensus_bus.metrics().record_rejoin_transition(previous);
                     self.config.shutdown().notify();
                     return Ok(());
                 }
             }
+            let reason = RejoinBlocker::classify(epoch_is_open, newest.as_ref(), handled_epoch);
+            blocked_counters[reason.index()].increment(1);
+            if not_ready_log.should_log(reason, Instant::now()) {
+                // a node with no known header logs zeros for the newest header's fields
+                let (newest_epoch, newest_round, newest_age_ms) =
+                    newest.as_ref().map_or((0, 0, 0), |newest| {
+                        (
+                            newest.epoch,
+                            newest.round,
+                            u64::try_from(newest.age.as_millis()).unwrap_or(u64::MAX),
+                        )
+                    });
+                info!(
+                    target: "subscriber",
+                    consensus_header_number,
+                    handled_epoch,
+                    handled_round,
+                    newest_epoch,
+                    newest_round,
+                    newest_age_ms,
+                    rejoin_window,
+                    exec_round = self.consensus_bus.last_consensus_round(),
+                    reason = reason.as_str(),
+                    "rejoin not ready"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// The leader round and consensus number of the last output the engine processed, executed or
+    /// skipped as empty.
+    fn exec_progress(&self) -> (Round, u64) {
+        let recent = self.consensus_bus.recent_blocks().borrow();
+        (recent.last_consensus_round(), recent.latest_consensus_block_num_hash().number)
     }
 
     /// Follow along with consensus output but do not try to join consensus.
@@ -829,6 +885,138 @@ fn classify_sync_output(latest: u64, number: u64) -> SyncContinuity {
         SyncContinuity::Next
     } else {
         SyncContinuity::Gap
+    }
+}
+
+/// The newest consensus header a catching-up CVV knows about, copied out of the watch for one
+/// readiness check.
+#[derive(Clone, Copy, Debug)]
+struct NewestHeader {
+    /// The header's consensus number.
+    number: u64,
+    /// The epoch of the header's leader.
+    epoch: Epoch,
+    /// The round of the header's leader.
+    round: Round,
+    /// Time since the header's sub-dag was committed.
+    age: Duration,
+}
+
+/// Why a catching-up CVV did not rejoin consensus after handling an output: the `reason` of the
+/// `rejoin not ready` line and the `reason` label of `tn_executor_rejoin_blocked_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejoinBlocker {
+    /// The handled output is not from this subscriber's still-open epoch (see
+    /// `rejoin_epoch_is_open`), so the node keeps replaying.
+    EpochClosed,
+    /// No consensus header has been seen yet to measure the network head by.
+    NoKnownHeader,
+    /// The newest known header is at least [`REJOIN_HEAD_MAX_AGE`] old.
+    StaleHead,
+    /// The newest known header is from another epoch than the handled output.
+    EpochMismatch,
+    /// The handled output trails the newest known header by more than the rejoin window.
+    RoundGap,
+}
+
+impl RejoinBlocker {
+    /// The number of blockers.
+    const COUNT: usize = 5;
+
+    /// Every blocker, in the order [`Self::classify`] tests them. A blocker's position here is its
+    /// [`Self::index`].
+    const ALL: [Self; Self::COUNT] = [
+        Self::EpochClosed,
+        Self::NoKnownHeader,
+        Self::StaleHead,
+        Self::EpochMismatch,
+        Self::RoundGap,
+    ];
+
+    /// The static label for this blocker.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EpochClosed => "epoch_closed",
+            Self::NoKnownHeader => "no_known_header",
+            Self::StaleHead => "stale_head",
+            Self::EpochMismatch => "epoch_mismatch",
+            Self::RoundGap => "round_gap",
+        }
+    }
+
+    /// The position of this blocker in [`Self::ALL`], for per-blocker arrays.
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Classify a readiness check that failed: the first condition the check would refuse, in the
+    /// order of [`Self::ALL`].
+    ///
+    /// Call only on the not-ready branch. The first four blockers mirror `rejoin_epoch_is_open`
+    /// and the freshness and epoch parts of `rejoin_ready`, so a failed check that passes them
+    /// failed on the round gap.
+    fn classify(epoch_is_open: bool, newest: Option<&NewestHeader>, handled_epoch: Epoch) -> Self {
+        if !epoch_is_open {
+            return Self::EpochClosed;
+        }
+        let Some(newest) = newest else {
+            return Self::NoKnownHeader;
+        };
+        if newest.age >= REJOIN_HEAD_MAX_AGE {
+            Self::StaleHead
+        } else if newest.epoch != handled_epoch {
+            Self::EpochMismatch
+        } else {
+            Self::RoundGap
+        }
+    }
+}
+
+// compile-time check that `ALL` lists the blockers in declaration order, so every `index` in it is
+// a valid position in the per-blocker arrays. a blocker inserted without updating `COUNT` and
+// `ALL` fails the build here. stable rust cannot count variants, so a blocker appended after
+// `RoundGap` still needs `COUNT` and `ALL` updated by hand.
+const _: () = {
+    let mut position = 0;
+    while position < RejoinBlocker::COUNT {
+        assert!(
+            RejoinBlocker::ALL[position].index() == position,
+            "RejoinBlocker::ALL out of order"
+        );
+        position += 1;
+    }
+};
+
+/// Resolve the `tn_executor_rejoin_blocked_total{reason}` handles, indexed by
+/// [`RejoinBlocker::index`].
+fn rejoin_blocked_counters() -> [Counter; RejoinBlocker::COUNT] {
+    RejoinBlocker::ALL.map(
+        |reason| metrics::counter!("tn_executor.rejoin_blocked_total", "reason" => reason.as_str()),
+    )
+}
+
+/// Rate limit for the `rejoin not ready` line: log when the blocker changes, and otherwise at most
+/// once per [`REJOIN_NOT_READY_LOG_INTERVAL`].
+///
+/// Owned by one catch-up loop, so the stamp needs no synchronization.
+#[derive(Debug, Default)]
+struct RejoinLogThrottle {
+    /// The blocker last logged and when.
+    last: Option<(RejoinBlocker, Instant)>,
+}
+
+impl RejoinLogThrottle {
+    /// True when a check blocked by `reason` at `now` should be logged. A `true` answer records
+    /// `reason` and `now` as the last line logged.
+    fn should_log(&mut self, reason: RejoinBlocker, now: Instant) -> bool {
+        let due = self.last.is_none_or(|(last_reason, logged_at)| {
+            last_reason != reason
+                || now.saturating_duration_since(logged_at) >= REJOIN_NOT_READY_LOG_INTERVAL
+        });
+        if due {
+            self.last = Some((reason, now));
+        }
+        due
     }
 }
 
@@ -1553,5 +1741,130 @@ mod rejoin_tests {
                 .all(|gc_depth| rejoin_round_window(gc_depth) < gc_activity_window(gc_depth)),
             "the rejoin window must be smaller than the demotion window"
         );
+    }
+
+    /// A newest known header in [`EPOCH`] at round [`NEWEST`] with the given age.
+    fn newest_header(epoch: Epoch, age: Duration) -> NewestHeader {
+        NewestHeader { number: 9, epoch, round: NEWEST, age }
+    }
+
+    /// Each blocker is reported for the first condition that refuses promotion.
+    #[test]
+    fn rejoin_blocker_names_first_failed_condition() {
+        let fresh = newest_header(EPOCH, FRESH);
+        let stale = newest_header(EPOCH, REJOIN_HEAD_MAX_AGE);
+        let other_epoch = newest_header(EPOCH + 1, FRESH);
+        let cases = [
+            (false, Some(&fresh), RejoinBlocker::EpochClosed),
+            (false, None, RejoinBlocker::EpochClosed),
+            (true, None, RejoinBlocker::NoKnownHeader),
+            (true, Some(&stale), RejoinBlocker::StaleHead),
+            (true, Some(&newest_header(EPOCH + 1, REJOIN_HEAD_MAX_AGE)), RejoinBlocker::StaleHead),
+            (true, Some(&other_epoch), RejoinBlocker::EpochMismatch),
+            (true, Some(&fresh), RejoinBlocker::RoundGap),
+        ];
+        for (epoch_is_open, newest, expected) in cases {
+            assert_eq!(
+                RejoinBlocker::classify(epoch_is_open, newest, EPOCH),
+                expected,
+                "open={epoch_is_open} newest={newest:?}"
+            );
+        }
+        let labels =
+            ["epoch_closed", "no_known_header", "stale_head", "epoch_mismatch", "round_gap"];
+        assert_eq!(RejoinBlocker::ALL.map(RejoinBlocker::as_str), labels);
+        for (index, blocker) in RejoinBlocker::ALL.into_iter().enumerate() {
+            assert_eq!(blocker.index(), index);
+        }
+    }
+
+    /// Whenever the readiness check refuses an open epoch with a known header, the blocker names a
+    /// condition that holds, and `round_gap` only when the gap really exceeds the window.
+    #[test]
+    fn rejoin_blocker_agrees_with_rejoin_ready() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        let ages = [Duration::ZERO, FRESH, REJOIN_HEAD_MAX_AGE, Duration::from_secs(60)];
+        for age in ages {
+            for newest_epoch in [EPOCH - 1, EPOCH, EPOCH + 1] {
+                for handled_round in [0, NEWEST - window - 1, NEWEST - window, NEWEST, NEWEST + 1] {
+                    let newest = newest_header(newest_epoch, age);
+                    if rejoin_ready(EPOCH, handled_round, newest_epoch, NEWEST, age, window) {
+                        continue;
+                    }
+                    let holds = match RejoinBlocker::classify(true, Some(&newest), EPOCH) {
+                        RejoinBlocker::StaleHead => age >= REJOIN_HEAD_MAX_AGE,
+                        RejoinBlocker::EpochMismatch => newest_epoch != EPOCH,
+                        RejoinBlocker::RoundGap => NEWEST.saturating_sub(handled_round) > window,
+                        RejoinBlocker::EpochClosed | RejoinBlocker::NoKnownHeader => false,
+                    };
+                    assert!(holds, "age={age:?} epoch={newest_epoch} round={handled_round}");
+                }
+            }
+        }
+    }
+
+    /// The blocked counter registers one series per blocker under its `reason` label.
+    #[test]
+    fn rejoin_blocked_counters_register_labelled_series() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let counters = rejoin_blocked_counters();
+            counters[RejoinBlocker::EpochClosed.index()].increment(3);
+            counters[RejoinBlocker::RoundGap.index()].increment(1);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for blocker in RejoinBlocker::ALL {
+            let value = snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == "tn_executor.rejoin_blocked_total"
+                        && key
+                            .labels()
+                            .map(|label| (label.key(), label.value()))
+                            .eq([("reason", blocker.as_str())])
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("reason={} not registered", blocker.as_str()));
+            let expected = match blocker {
+                RejoinBlocker::EpochClosed => 3,
+                RejoinBlocker::RoundGap => 1,
+                _ => 0,
+            };
+            assert_eq!(value, &DebugValue::Counter(expected), "reason={}", blocker.as_str());
+        }
+    }
+
+    /// The not-ready line is logged on the first check, on every change of blocker and otherwise
+    /// once the interval has passed since the last line.
+    #[test]
+    fn rejoin_log_throttle_logs_on_change_or_interval() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let interval = u64::try_from(REJOIN_NOT_READY_LOG_INTERVAL.as_millis()).unwrap();
+        let mut throttle = RejoinLogThrottle::default();
+
+        assert!(throttle.should_log(RejoinBlocker::EpochClosed, at(0)), "first check logs");
+        assert!(!throttle.should_log(RejoinBlocker::EpochClosed, at(10)), "repeat is throttled");
+        assert!(throttle.should_log(RejoinBlocker::RoundGap, at(20)), "a new blocker logs");
+        assert!(throttle.should_log(RejoinBlocker::EpochClosed, at(30)), "a change back logs");
+        assert!(
+            !throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval - 1)),
+            "a repeat inside the interval is throttled"
+        );
+        assert!(
+            throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval)),
+            "a repeat once the interval has passed logs"
+        );
+        assert!(
+            !throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval + 1)),
+            "the interval restarts at the last line"
+        );
+        // an earlier stamp than the last line saturates to zero instead of panicking
+        assert!(!throttle.should_log(RejoinBlocker::EpochClosed, start));
     }
 }

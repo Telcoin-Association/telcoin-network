@@ -55,7 +55,10 @@
 //! in-memory only (the finalized/safe watches plus pruning persisted blocks from
 //! the in-memory state); its database half happens inside the atomic commit above.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy::primitives::FixedBytes;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
@@ -313,6 +316,13 @@ impl RethEnv {
     /// Post-commit reporting lives in [`Self::announce_executed_output`] so the commit
     /// boundary is a function boundary rather than an error-classification exercise
     /// (issue #1090).
+    ///
+    /// # Observability
+    ///
+    /// A successful commit logs one `persisted output` debug line (target `engine`) with the
+    /// block range, what was written and the per-phase wall time (`open_ms`, `save_blocks_ms`,
+    /// `markers_ms`, `commit_ms`), and records the `tn_reth.persist_*` series (see
+    /// [`record_persisted_output`]). A failed attempt records nothing.
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -326,9 +336,14 @@ impl RethEnv {
             "storing range of blocks",
         );
 
+        // observability only: each `lap` closes one phase of the `persisted output` line
+        let mut stamp = Instant::now();
+
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
+        let open = lap(&mut stamp);
         provider_rw.save_blocks(blocks.to_vec(), reth_provider::SaveBlocksMode::Full)?;
+        let save_blocks = lap(&mut stamp);
         // advance the finalized/safe markers in the same transaction as the blocks: every
         // canonical block comes from committed consensus output, so the last saved block is
         // final by construction, and the single commit leaves no crash window where the
@@ -338,10 +353,14 @@ impl RethEnv {
             provider_rw.save_finalized_block_number(last_number)?;
             provider_rw.save_safe_block_number(last_number)?;
         }
+        let markers = lap(&mut stamp);
         #[cfg(any(feature = "test-utils", test))]
         self.consume_injected_late_persist_fault()?;
 
         provider_rw.commit()?;
+        let commit = lap(&mut stamp);
+
+        record_persisted_output(blocks, PersistPhases { open, save_blocks, markers, commit });
         Ok(())
     }
 
@@ -495,5 +514,194 @@ impl RethEnv {
     #[cfg(any(feature = "test-utils", test))]
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `tn_reth.persist_save_blocks_seconds`: `save_blocks` time per successful persist.
+const PERSIST_SAVE_BLOCKS_SECONDS: &str = "tn_reth.persist_save_blocks_seconds";
+/// `tn_reth.persist_commit_seconds`: database commit time per successful persist.
+const PERSIST_COMMIT_SECONDS: &str = "tn_reth.persist_commit_seconds";
+/// `tn_reth.persisted_accounts_total`: changed accounts written, summed per block.
+const PERSISTED_ACCOUNTS_TOTAL: &str = "tn_reth.persisted_accounts_total";
+/// `tn_reth.persisted_storage_slots_total`: changed storage slots written, summed per block.
+const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_total";
+
+/// Wall time of each phase of one successful [`RethEnv::persist_executed_output`] call.
+#[derive(Debug, Clone, Copy)]
+struct PersistPhases {
+    /// Opening the read-write database provider.
+    open: Duration,
+    /// `save_blocks` (database writes plus the static-file appends).
+    save_blocks: Duration,
+    /// Writing the finalized and safe block-number markers.
+    markers: Duration,
+    /// Committing the database transaction.
+    commit: Duration,
+}
+
+/// What one [`RethEnv::persist_executed_output`] call wrote, summed over its blocks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PersistedCounts {
+    /// Transactions in the persisted blocks.
+    txs: usize,
+    /// Receipts in the persisted blocks.
+    receipts: usize,
+    /// Accounts in each block's bundle state (an account changed in two blocks counts twice).
+    accounts: usize,
+    /// Storage slots in each block's bundle state, summed the same way.
+    storage_slots: usize,
+}
+
+impl PersistedCounts {
+    /// Count what `blocks` carry into the database.
+    ///
+    /// Summing map lengths is independent of `HashMap` iteration order; this feeds only logs and
+    /// metrics, never block contents.
+    fn of(blocks: &[ExecutedBlock]) -> Self {
+        blocks.iter().fold(Self::default(), |counts, block| {
+            let bundle = &block.execution_output.state;
+            Self {
+                txs: counts.txs + block.recovered_block.transaction_count(),
+                receipts: counts.receipts + block.execution_output.result.receipts.len(),
+                accounts: counts.accounts + bundle.state.len(),
+                storage_slots: counts.storage_slots
+                    + bundle.state.values().map(|account| account.storage.len()).sum::<usize>(),
+            }
+        })
+    }
+}
+
+/// Log and record one successful persist of `blocks`.
+///
+/// The series use per-call `metrics::histogram!`/`counter!` macros rather than handles on
+/// `RethEnvMetrics`: a persist runs about once per consensus output (~1/s), so resolving the
+/// handle per call is cheap, and the macros bind to whichever recorder is current, which keeps
+/// the unit test independent of test ordering (see the `metrics` module docs).
+fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
+    let counts = PersistedCounts::of(blocks);
+    ::metrics::histogram!(PERSIST_SAVE_BLOCKS_SECONDS).record(phases.save_blocks);
+    ::metrics::histogram!(PERSIST_COMMIT_SECONDS).record(phases.commit);
+    ::metrics::counter!(PERSISTED_ACCOUNTS_TOTAL)
+        .increment(u64::try_from(counts.accounts).unwrap_or(u64::MAX));
+    ::metrics::counter!(PERSISTED_STORAGE_SLOTS_TOTAL)
+        .increment(u64::try_from(counts.storage_slots).unwrap_or(u64::MAX));
+    debug!(
+        target: "engine",
+        first = blocks.first().map(|block| block.recovered_block.number).unwrap_or_default(),
+        last = blocks.last().map(|block| block.recovered_block.number).unwrap_or_default(),
+        blocks = blocks.len(),
+        txs = counts.txs,
+        receipts = counts.receipts,
+        accounts = counts.accounts,
+        storage_slots = counts.storage_slots,
+        open_ms = duration_ms(phases.open),
+        save_blocks_ms = duration_ms(phases.save_blocks),
+        markers_ms = duration_ms(phases.markers),
+        commit_ms = duration_ms(phases.commit),
+        "persisted output"
+    );
+}
+
+/// Return the time since `stamp` and move `stamp` to now, so consecutive calls time
+/// consecutive phases.
+fn lap(stamp: &mut Instant) -> Duration {
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(*stamp);
+    *stamp = now;
+    elapsed
+}
+
+/// Whole milliseconds in `elapsed`, saturating at `u64::MAX`.
+fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, U256};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use reth_revm::{db::BundleState, state::AccountInfo};
+
+    /// One block's account reverts, in the shape `BundleState::new` takes.
+    type AccountReverts = Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>;
+
+    /// A block whose bundle changes `accounts` accounts with `slots_each` storage slots apiece,
+    /// carrying `receipts` receipts.
+    fn block_with_state(accounts: u8, slots_each: u8, receipts: usize) -> ExecutedBlock {
+        let state = (0..accounts).map(|a| {
+            let storage = (0..slots_each)
+                .map(|slot| (U256::from(slot), (U256::ZERO, U256::from(1u8))))
+                .collect();
+            (Address::with_last_byte(a), None, Some(AccountInfo::default()), storage)
+        });
+        let mut block = ExecutedBlock::default();
+        let mut output = (*block.execution_output).clone();
+        output.state = BundleState::new(state, Vec::<AccountReverts>::new(), Vec::new());
+        output.result.receipts = vec![Default::default(); receipts];
+        block.execution_output = Arc::new(output);
+        block
+    }
+
+    /// Counts sum the bundle accounts, their storage slots and the receipts across blocks.
+    #[test]
+    fn test_persisted_counts_sum_over_blocks() {
+        let blocks =
+            [block_with_state(2, 3, 4), block_with_state(1, 1, 0), ExecutedBlock::default()];
+        assert_eq!(
+            PersistedCounts::of(&blocks),
+            PersistedCounts { txs: 0, receipts: 4, accounts: 3, storage_slots: 7 }
+        );
+        assert_eq!(PersistedCounts::of(&[]), PersistedCounts::default());
+    }
+
+    /// A recorded persist registers both phase histograms and both write counters.
+    #[test]
+    fn test_record_persisted_output_metrics() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let blocks = [block_with_state(2, 3, 1), block_with_state(1, 2, 1)];
+
+        ::metrics::with_local_recorder(&recorder, || {
+            record_persisted_output(
+                &blocks,
+                PersistPhases {
+                    open: Duration::from_millis(1),
+                    save_blocks: Duration::from_millis(250),
+                    markers: Duration::from_millis(2),
+                    commit: Duration::from_millis(500),
+                },
+            );
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let find = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("metric {name} not registered"))
+        };
+        assert!(matches!(
+            find(PERSIST_SAVE_BLOCKS_SECONDS),
+            DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.25
+        ));
+        assert!(matches!(
+            find(PERSIST_COMMIT_SECONDS),
+            DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.5
+        ));
+        assert!(matches!(find(PERSISTED_ACCOUNTS_TOTAL), DebugValue::Counter(3)));
+        assert!(matches!(find(PERSISTED_STORAGE_SLOTS_TOTAL), DebugValue::Counter(8)));
+    }
+
+    /// Consecutive laps time consecutive phases and advance the stamp.
+    #[test]
+    fn test_lap_advances_stamp() {
+        let start = Instant::now();
+        let mut stamp = start;
+        let first = lap(&mut stamp);
+        assert!(stamp >= start);
+        assert_eq!(stamp.saturating_duration_since(start), first);
+        assert_eq!(duration_ms(Duration::from_micros(2_500)), 2);
     }
 }

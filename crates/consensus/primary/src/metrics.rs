@@ -5,7 +5,10 @@ use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tn_types::{Noticer, TaskSpawner};
 use tracing::debug;
 
@@ -98,6 +101,217 @@ impl PrimaryMetrics {
         let prev = MAX_CONSENSUS_OUTPUT_BYTES.fetch_max(bytes, Ordering::Relaxed);
         self.max_consensus_output_bytes.set(prev.max(bytes) as f64);
     }
+
+    /// Count a catching-up CVV's promotion back to an active CVV in
+    /// `tn_node_mode_transitions_total{to="cvv_active", reason="rejoin"}`.
+    ///
+    /// `previous` is the mode the watch held before the promotion, the value `send_replace`
+    /// returns. The promotion happens in the executor's subscriber, outside this crate, so this
+    /// method is its route to [`record_mode_transition`].
+    pub fn record_rejoin_transition(&self, previous: NodeMode) {
+        record_mode_transition(previous, NodeMode::CvvActive, ModeTransitionReason::Rejoin);
+    }
+}
+
+/// A stage of the voter's vote path, in the order `RequestHandler::vote_inner` runs them.
+///
+/// [`Self::as_str`] is the `stage` label of `tn_primary_vote_stage_seconds` and
+/// `tn_primary_vote_timeouts_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoteStage {
+    /// Header checks, the drift tier decision and the seed signature verify.
+    Validate,
+    /// The wait for local execution to reach the header's latest execution block.
+    ExecWait,
+    /// The missing-parent check, parent acceptance, the wait for the parents and their checks.
+    Parents,
+    /// The wait for a header lead within the drift tolerance to pass.
+    LeadSleep,
+    /// Synchronizing the header's batches from the workers.
+    SyncBatches,
+    /// Reading the previous vote, signing the vote and writing it to the `Votes` table.
+    VoteStore,
+    /// The durability barrier on the `Votes` table before a vote is returned.
+    Persist,
+}
+
+impl VoteStage {
+    /// The number of stages.
+    pub(crate) const COUNT: usize = 7;
+
+    /// Every stage, in vote path order. A stage's position here is its [`Self::index`].
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Validate,
+        Self::ExecWait,
+        Self::Parents,
+        Self::LeadSleep,
+        Self::SyncBatches,
+        Self::VoteStore,
+        Self::Persist,
+    ];
+
+    /// The static metric label for this stage.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::ExecWait => "exec_wait",
+            Self::Parents => "parents",
+            Self::LeadSleep => "lead_sleep",
+            Self::SyncBatches => "sync_batches",
+            Self::VoteStore => "vote_store",
+            Self::Persist => "persist",
+        }
+    }
+
+    /// The position of this stage in [`Self::ALL`], for per-stage arrays.
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+// compile-time check that `ALL` lists the stages in declaration order, so every `index` in it is
+// a valid position in the per-stage arrays. a stage inserted without updating `COUNT` and `ALL`
+// fails the build here. stable rust cannot count variants, so a stage appended after `Persist`
+// still needs `COUNT` and `ALL` updated by hand.
+const _: () = {
+    let mut position = 0;
+    while position < VoteStage::COUNT {
+        assert!(VoteStage::ALL[position].index() == position, "VoteStage::ALL out of order");
+        position += 1;
+    }
+};
+
+/// Vote path metric handles, resolved once when an epoch's request handler is built.
+///
+/// Every committee peer sends vote requests several times a second, so the handles are resolved
+/// up front and no `metrics` macro runs on the vote path. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct VoteStageHandles {
+    /// Vote requests received (`tn_primary_vote_requests_total`).
+    requests: Counter,
+    /// New votes signed, made durable and returned (`tn_primary_votes_created_total`).
+    created: Counter,
+    /// Votes signed earlier and returned again (`tn_primary_votes_recast_total`).
+    recast: Counter,
+    /// Requests refused because the header round is beyond the committed round plus the gc
+    /// depth (`tn_primary_vote_requests_too_new_total`).
+    too_new: Counter,
+    /// The wait for the author's vote lock (`tn_primary_vote_stage_seconds{stage="lock"}`).
+    ///
+    /// The lock is taken before the vote timeout starts, so it has no [`VoteStage`].
+    lock_wait: Histogram,
+    /// Time per stage, indexed by [`VoteStage::index`] (`tn_primary_vote_stage_seconds{stage}`).
+    stage_seconds: [Histogram; VoteStage::COUNT],
+    /// Vote timeouts by the stage in progress when the timeout fired, indexed by
+    /// [`VoteStage::index`] (`tn_primary_vote_timeouts_total{stage}`).
+    timeouts: [Counter; VoteStage::COUNT],
+}
+
+impl VoteStageHandles {
+    /// Resolve every vote path handle against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            requests: metrics::counter!("tn_primary.vote_requests_total"),
+            created: metrics::counter!("tn_primary.votes_created_total"),
+            recast: metrics::counter!("tn_primary.votes_recast_total"),
+            too_new: metrics::counter!("tn_primary.vote_requests_too_new_total"),
+            lock_wait: metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => "lock"),
+            stage_seconds: VoteStage::ALL.map(|stage| {
+                metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => stage.as_str())
+            }),
+            timeouts: VoteStage::ALL.map(|stage| {
+                metrics::counter!("tn_primary.vote_timeouts_total", "stage" => stage.as_str())
+            }),
+        }
+    }
+
+    /// Count a vote request.
+    pub(crate) fn record_request(&self) {
+        self.requests.increment(1);
+    }
+
+    /// Count a new vote returned to its author.
+    pub(crate) fn record_created(&self) {
+        self.created.increment(1);
+    }
+
+    /// Count a vote signed earlier and returned again.
+    pub(crate) fn record_recast(&self) {
+        self.recast.increment(1);
+    }
+
+    /// Count a request refused because its header round is too far ahead.
+    pub(crate) fn record_too_new(&self) {
+        self.too_new.increment(1);
+    }
+
+    /// Record the wait for the author's vote lock.
+    pub(crate) fn record_lock_wait(&self, waited: Duration) {
+        self.lock_wait.record(waited.as_secs_f64());
+    }
+
+    /// Record the time a request spent in `stage`.
+    pub(crate) fn record_stage(&self, stage: VoteStage, spent: Duration) {
+        self.stage_seconds[stage.index()].record(spent.as_secs_f64());
+    }
+
+    /// Count a vote timeout that fired while `stage` was in progress.
+    pub(crate) fn record_timeout(&self, stage: VoteStage) {
+        self.timeouts[stage.index()].increment(1);
+    }
+}
+
+/// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModeTransitionReason {
+    /// An active CVV saw a certificate or consensus result, in the epoch it has executed, more
+    /// than the gc activity window of rounds ahead of the round it has executed.
+    OutsideGcWindow,
+    /// An active CVV saw a certificate or consensus result from an epoch ahead of the one it has
+    /// executed.
+    EpochBehind,
+    /// Bullshark committed a sub-dag whose leader references an execution block this node could
+    /// not wait for.
+    BogusSubdag,
+    /// The committed round disagreed with the highest header round just sequenced.
+    CommitAccounting,
+    /// A catching-up CVV came within the rejoin window of the network head.
+    Rejoin,
+}
+
+impl ModeTransitionReason {
+    /// The static metric label for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutsideGcWindow => "outside_gc_window",
+            Self::EpochBehind => "epoch_behind",
+            Self::BogusSubdag => "bogus_subdag",
+            Self::CommitAccounting => "commit_accounting",
+            Self::Rejoin => "rejoin",
+        }
+    }
+}
+
+/// Count a node mode change in `tn_node_mode_transitions_total{to, reason}`.
+///
+/// `previous` is the mode the watch held before the change, the value `send_replace` returns. A
+/// change to the mode the node already holds is not counted, so two tasks that decide on the same
+/// demotion at once count it once. Mode changes are rare, so the handle is resolved per call.
+pub(crate) fn record_mode_transition(
+    previous: NodeMode,
+    to: NodeMode,
+    reason: ModeTransitionReason,
+) {
+    // `NodeMode` has no `PartialEq`; its variants carry no data, so the discriminant is the mode
+    if std::mem::discriminant(&previous) == std::mem::discriminant(&to) {
+        return;
+    }
+    metrics::counter!(
+        "tn_node.mode_transitions_total",
+        "to" => node_mode_label(to),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
 }
 
 /// Spawn a node-lifetime task that mirrors consensus watch channels into gauges.
@@ -199,6 +413,16 @@ fn set_node_mode_gauges(mode: &NodeMode) {
     }
 }
 
+/// The `to` label of `tn_node_mode_transitions_total`, spelled as the `tn_node_mode` gauge's
+/// `mode` label.
+const fn node_mode_label(mode: NodeMode) -> &'static str {
+    match mode {
+        NodeMode::CvvActive => "cvv_active",
+        NodeMode::CvvInactive => "cvv_inactive",
+        NodeMode::Observer => "observer",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +479,131 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
+    }
+
+    /// The vote path handles register every series and label the bench analysis reads: the four
+    /// counters, a timeout counter and a stage histogram per stage, and the `lock` histogram.
+    #[test]
+    fn test_vote_stage_handles_register_labelled_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let handles = VoteStageHandles::new();
+            handles.record_request();
+            handles.record_request();
+            handles.record_created();
+            handles.record_recast();
+            handles.record_too_new();
+            handles.record_lock_wait(Duration::from_millis(4));
+            handles.record_stage(VoteStage::SyncBatches, Duration::from_millis(250));
+            handles.record_timeout(VoteStage::ExecWait);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let find = |name: &str, stage: Option<&str>| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == name
+                        && key.labels().find(|label| label.key() == "stage").map(|l| l.value())
+                            == stage
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("metric {name} stage={stage:?} not registered"))
+        };
+
+        assert_eq!(find("tn_primary.vote_requests_total", None), &DebugValue::Counter(2));
+        assert_eq!(find("tn_primary.votes_created_total", None), &DebugValue::Counter(1));
+        assert_eq!(find("tn_primary.votes_recast_total", None), &DebugValue::Counter(1));
+        assert_eq!(find("tn_primary.vote_requests_too_new_total", None), &DebugValue::Counter(1));
+        let labels = [
+            "validate",
+            "exec_wait",
+            "parents",
+            "lead_sleep",
+            "sync_batches",
+            "vote_store",
+            "persist",
+        ];
+        assert_eq!(VoteStage::ALL.map(VoteStage::as_str), labels);
+        for (index, stage) in VoteStage::ALL.into_iter().enumerate() {
+            assert_eq!(stage.index(), index);
+            let timeouts = find("tn_primary.vote_timeouts_total", Some(stage.as_str()));
+            let fired = u64::from(stage == VoteStage::ExecWait);
+            assert_eq!(timeouts, &DebugValue::Counter(fired), "{} timeouts", stage.as_str());
+            let DebugValue::Histogram(samples) =
+                find("tn_primary.vote_stage_seconds", Some(stage.as_str()))
+            else {
+                panic!("{} stage series is not a histogram", stage.as_str());
+            };
+            let expected = if stage == VoteStage::SyncBatches { vec![0.25] } else { Vec::new() };
+            assert_eq!(samples.iter().map(|s| s.0).collect::<Vec<_>>(), expected);
+        }
+        let DebugValue::Histogram(lock) = find("tn_primary.vote_stage_seconds", Some("lock"))
+        else {
+            panic!("lock stage series is not a histogram");
+        };
+        assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
+    }
+
+    /// Every mode change counts once under its `to` and `reason` labels, and a change to the mode
+    /// the node already holds is not counted.
+    #[test]
+    fn test_mode_transitions_register_labelled_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new());
+            let demote =
+                |reason| record_mode_transition(NodeMode::CvvActive, NodeMode::CvvInactive, reason);
+            demote(ModeTransitionReason::OutsideGcWindow);
+            demote(ModeTransitionReason::OutsideGcWindow);
+            demote(ModeTransitionReason::EpochBehind);
+            demote(ModeTransitionReason::BogusSubdag);
+            demote(ModeTransitionReason::CommitAccounting);
+            // a second demotion racing the first finds the node inactive already
+            record_mode_transition(
+                NodeMode::CvvInactive,
+                NodeMode::CvvInactive,
+                ModeTransitionReason::CommitAccounting,
+            );
+            metrics.record_rejoin_transition(NodeMode::CvvInactive);
+            metrics.record_rejoin_transition(NodeMode::CvvActive);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let mut series: Vec<(String, String, DebugValue)> = snapshot
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == "tn_node.mode_transitions_total")
+            .map(|(key, _, _, value)| {
+                let label = |name: &str| {
+                    key.key()
+                        .labels()
+                        .find(|label| label.key() == name)
+                        .map(|label| label.value().to_string())
+                        .unwrap_or_else(|| panic!("missing {name} label"))
+                };
+                assert_eq!(key.key().labels().count(), 2, "only the to and reason labels");
+                (label("to"), label("reason"), value)
+            })
+            .collect();
+        series.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let expected = [
+            ("cvv_active", "rejoin", 1),
+            ("cvv_inactive", "bogus_subdag", 1),
+            ("cvv_inactive", "commit_accounting", 1),
+            ("cvv_inactive", "epoch_behind", 1),
+            ("cvv_inactive", "outside_gc_window", 2),
+        ]
+        .map(|(to, reason, count)| {
+            (to.to_string(), reason.to_string(), DebugValue::Counter(count))
+        });
+        assert_eq!(series, expected);
+
+        assert_eq!(node_mode_label(NodeMode::Observer), "observer");
     }
 
     /// The mirror task must keep the round gauges in sync with the watch channels, and
