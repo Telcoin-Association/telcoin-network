@@ -53,6 +53,9 @@ use crate::{
 pub(crate) mod database;
 mod epoch;
 mod execution;
+// The fixtures are tn-lmdb datadirs, and storage v2 runs on the tn-lmdb build only.
+#[cfg(all(test, not(feature = "mdbx")))]
+mod format_freeze_tests;
 mod genesis;
 mod helpers;
 mod layout;
