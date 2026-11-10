@@ -4731,7 +4731,8 @@ fn field_value<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str
 /// number and the queue depth after the push, and each block's `next block executed` line
 /// appends the output's consensus number and the block's batch index and digest, so a block
 /// joins back to its output and batch. The two timing lines keep their existing fields first
-/// and append the forward wait and the execute split.
+/// and append the forward wait and the execute split. `executing output` is a message-only
+/// marker: the `execute-consensus` span it is logged in carries the output's shape.
 #[tokio::test]
 async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
@@ -4834,6 +4835,10 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
         assert_eq!(field_value(line, "batch_index"), Some(index.to_string().as_str()));
         assert_eq!(field_value(line, "batch_digest"), Some(digest.to_string().as_str()));
     }
+
+    let executing = captured_engine_events("executing output");
+    assert_eq!(executing.len(), 1, "one marker per output");
+    assert!(executing[0].is_empty(), "the span carries the fields: {:?}", executing[0]);
 
     let finished = captured_engine_events("output execution task finished");
     assert_eq!(finished.len(), 1);

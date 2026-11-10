@@ -112,19 +112,15 @@ pub(crate) fn execute_consensus_output_with_signers(
         parent_exec_hash = canonical_header.hash().to_string(),
         executed_blocks = field::Empty,
         batches = batches.len(),
+        txs = tx_count,
     );
     let _guard = span.enter();
     // the whole output (every batch's raw transaction bytes) is a trace-only dump: at debug it
-    // was formatted on the executing thread for every output, so the debug line carries the
-    // output's shape only
+    // was formatted on the executing thread for every output. The debug line is a message-only
+    // marker: the entered span already carries the output's shape (consensus number, batches,
+    // transactions), and fields repeated here would print twice.
     trace!(target: "engine::dump", ?output, "executing output");
-    debug!(
-        target: "engine",
-        consensus_number = output.number(),
-        batches = batch_count,
-        txs = tx_count,
-        "executing output"
-    );
+    debug!(target: "engine", "executing output");
 
     // The flattened batches and the batch-digest deque share one flat index space:
     // `get_batch_digest(i)` reads the deque while the transactions come from the batch vectors, and
