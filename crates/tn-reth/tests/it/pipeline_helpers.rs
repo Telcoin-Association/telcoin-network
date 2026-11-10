@@ -430,8 +430,8 @@ impl PipelineTestEnv {
     /// hash, sorted. Empty when the cache is a subset of that state (the scope's invariant).
     ///
     /// Values are compared the way the cache serves them: account info as `(balance, nonce,
-    /// code hash)`, a missing slot as zero and missing bytecode as empty, as reth's state
-    /// provider database reads them.
+    /// code hash)` with neither code nor a storage-access hint (`account_id`), a missing slot as
+    /// zero and missing bytecode as empty, as reth's state provider database reads them.
     pub(crate) fn cache_mismatches(
         &self,
         scope: &OutputBuildScope,
@@ -441,10 +441,15 @@ impl PipelineTestEnv {
         let reads = scope.reads();
         let mut mismatches = Vec::new();
         for (address, cached) in &reads.accounts {
+            // a provider read carries no code (revm loads it by hash) and no `account_id`
             let state = provider.basic_account(address)?.map(|account| {
-                (account.balance, account.nonce, account.bytecode_hash.unwrap_or(KECCAK_EMPTY))
+                let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+                (account.balance, account.nonce, code_hash, true, true)
             });
-            let info = cached.info.as_ref().map(|info| (info.balance, info.nonce, info.code_hash));
+            let info = cached.info.as_ref().map(|info| {
+                let (no_code, no_id) = (info.code.is_none(), info.account_id.is_none());
+                (info.balance, info.nonce, info.code_hash, no_code, no_id)
+            });
             if info != state {
                 mismatches.push(format!("account {address}: cached {info:?}, state {state:?}"));
             }
