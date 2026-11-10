@@ -514,7 +514,16 @@ fn restored_dag_gap(
     dag: &Dag,
 ) -> Option<Round> {
     // the dag's inner maps are hash maps, but each check below only asks whether any certificate
-    // of a round matches, which does not depend on their iteration order
+    // of a round matches, which does not depend on their iteration order.
+    //
+    // the check is conservative at the committed boundary: with every authority committed through
+    // C and the dag's bottom at C + 1, the round-C parents are missing and this reports C + 1,
+    // although ordering never needs them (present, `order_dag` would skip each as committed,
+    // `round <= last_committed[origin]`). the node goes inactive and resyncs where it could have
+    // carried on. a missing parent's digest does not name its author, so the per-author rule
+    // cannot apply here. a possible refinement skips a missing parent when `round - 1` is at or
+    // below the lowest committed round of the whole committee (an authority absent from
+    // `last_committed` counting as 0). `restored_dag_gap_boundaries` pins the current answer.
     dag.range(gc_round.saturating_add(2)..).find_map(|(round, certificates)| {
         let parents: BTreeSet<&HeaderDigest> = dag
             .get(&round.saturating_sub(1))
