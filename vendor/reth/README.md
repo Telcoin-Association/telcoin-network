@@ -11,13 +11,16 @@ possible but optional.
   The local tags from that work (`reth-vendor-import-v1.11.3`, `reth-vendor-v1.11.3`,
   `reth-reduction-start`, `reth-reduction-2-start`) are not in `main`'s history. The durable
   record is `vendor.py diff` against the pin, plus CHANGES.md.
-- tndb-b: work in progress to replace MDBX as reth's database, on `sls_tndb_b_vendor`. It is not
-  on `main`, and it is not `tndb`, TN's consensus database in `crates/storage`.
+- tn-lmdb (called tndb-b until 2026-11-04): the engine that replaces MDBX as reth's database
+  (`crates/tn-lmdb`, through the adapter `crates/tn-lmdb-reth`), merged with this vendoring
+  (f88cb29d6). It is TN's default reth backend since 2026-11-09; MDBX is the opt-in `mdbx`
+  feature of `tn-reth`, kept until testnet has resynced (DECISIONS.md D22). It is not `tndb`, TN's
+  consensus database in `crates/storage`.
 - Carried: the reth crates in TN's dependency graph (57 after both reduction passes; 101 at
   import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.
-- What comes next (tndb-b, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.
+- What comes next (retiring MDBX, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.
 - Known issues left for separate changes: `tn/notes/open-issues.md`.
 - Agents and reviewers: CLAUDE.md is the short path through all of this (read order, where
   things are, fork-safety checks, tracking upstream).

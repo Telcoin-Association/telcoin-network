@@ -73,7 +73,8 @@ so it waits for the storage work (DECISIONS.md D15; ROADMAP.md, "RocksDB step B"
 ## MDBX fixes belong to the storage work
 
 Upstream MDBX fixes (7bf9241fe, 294e21507, 5fc3a81d3 in `upstream-backports.md`) are tracked for
-the tndb-b owners, who replace MDBX as the reth database (ROADMAP.md, Phase 3).
+the tn-lmdb owners (tndb-b until 2026-11-04), who replace MDBX as the reth database (ROADMAP.md,
+Phase 3; tn-lmdb is the default backend since 2026-11-09, DECISIONS.md D22).
 
 ## The revm-inspectors patch
 
@@ -112,9 +113,11 @@ named by an entry, every `TN(TN-NNNN)` id defined) would make that mechanical.
 `upstream-backports.md` surveyed upstream `main` up to `84caec584`. Upstream has moved since; the
 next survey starts there (CLAUDE.md, "Tracking upstream reth").
 
-## Branches that carry tndb-b
+## Branches that carry tndb-b [closed 2026-11-09]
 
-The tndb-b work was written against an earlier copy of this vendoring on another branch. Rebasing
-it onto `main` meets this copy's changes: it must re-add its own workspace dependencies to the
-root `Cargo.toml`, and it meets `patches/revm-inspectors` and the `--config` patch line in
-`tn/cargo.sh`.
+The tndb-b work (renamed tn-lmdb on 2026-11-04) was written against an earlier copy of this
+vendoring on another branch. `main`'s vendoring (#1768) was merged into it (f88cb29d6), not
+rebased, and `sls_storage_v2` builds on that merge. The merge re-added its workspace
+dependencies (`reth-db-api`, `reth-storage-errors`, `reth-trie-common`) to the root `Cargo.toml`,
+kept `patches/revm-inspectors` and the `--config` patch line in `tn/cargo.sh`, and took the union
+of both sides' CI lanes. tn-lmdb is the default reth backend there (DECISIONS.md D22).
