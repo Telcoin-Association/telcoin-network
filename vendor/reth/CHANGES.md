@@ -539,6 +539,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   hit leaves the database untouched until `next` and that a stale database position is
   re-seeked. *Upstream*: n/a (upstream commit).
 
+- **TN-0104** — Backport 0720dcd37: fast path for forward in-memory cursor seeks. *Kind*:
+  backport.
+  *Files*: `crates/trie/trie/src/forward_cursor.rs` (`ForwardInMemoryCursor::seek` and
+  `first_after` return the current entry when it already answers; the linear scan indexes the
+  slice directly; binary search from 128 remaining entries instead of 64).
+  *Why*: the overlay cursors of TN-0102/TN-0103 seek their sorted in-memory entries for every
+  trie and hashed-state seek, mostly to a key at or just after the current entry. The answer is
+  the same entry as before in every case (the old `advance_while` returned the current entry
+  without moving when it already answered), so this changes only the work. Execution path (state
+  root), no change in results. *Tests*: reth-trie's `forward_cursor` tests and as TN-0102.
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
