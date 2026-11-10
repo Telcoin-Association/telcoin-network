@@ -1,16 +1,16 @@
-//! TN(TN-0130): the crash points of the static-file prune, rotation and deletion paths through
-//! `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens as the
-//! state before it or after it, and files shorter than their committed configuration are refused
-//! in a checksummed jar.
+//! TN(TN-0130 to TN-0133): the crash points of the static-file prune, rotation and deletion paths
+//! through `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens
+//! as the state before it or after it, and files shorter than their committed configuration, or
+//! a jar missing between two others, are refused.
 
 use super::{
     manager::StaticFileWriter,
     tn_checksum_tests::{
-        account_changes, jar_path, load, provider, provider_rw, write_changesets, CHANGES,
+        account_changes, address, jar_path, load, provider, provider_rw, write_changesets, CHANGES,
     },
 };
 use crate::providers::StaticFileProvider;
-use reth_db::test_utils::create_test_static_files_dir;
+use reth_db::{models::AccountBeforeTx, test_utils::create_test_static_files_dir};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_nippy_jar::NippyJarWriter;
 use reth_static_file_types::{changeset_offset_record_size, StaticFileSegment};
@@ -214,5 +214,91 @@ fn rotation_after_an_empty_offsets_file() {
         for path in &next {
             assert_eq!(load(path).rows() as u64, if path == &next[0] { 2 } else { 2 * CHANGES });
         }
+    }
+}
+
+/// Changes unlike [`account_changes`] (fewer, other accounts), for blocks written again.
+fn other_changes(block: u64) -> Vec<AccountBeforeTx> {
+    (0..2)
+        .map(|change| AccountBeforeTx { address: address(block + 500, change), info: None })
+        .collect()
+}
+
+/// Writes account changesets 4 and 5 again, as [`other_changes`], and reads every block.
+fn rewrite_and_read(provider: &StaticFileProvider<EthPrimitives>) {
+    let mut writer = provider.latest_writer(ACCOUNTS).unwrap();
+    for block in 4..6 {
+        writer.append_account_changeset(other_changes(block), block).unwrap();
+    }
+    writer.commit().unwrap();
+    drop(writer);
+    assert_eq!(provider.get_highest_static_file_block(ACCOUNTS), Some(5));
+    for block in 0..6 {
+        let expected = if block < 4 { account_changes(block) } else { other_changes(block) };
+        assert_eq!(provider.account_block_changeset(block).unwrap(), expected, "block {block}");
+    }
+}
+
+/// TN(TN-0132): a jar deletion stopped after any of its files (data, offsets, configuration,
+/// sidecar: `NippyJar::delete`'s order) leaves files no listing sees. The next open serves the
+/// jars below, and the jar written again at that range starts empty: it reads only its new rows.
+/// Both formats.
+#[test]
+fn deletion_stopped_at_any_file() {
+    for checksums in [false, true] {
+        for kept in [&["off", "conf", "csoff"][..], &["conf", "csoff"], &["csoff"], &[]] {
+            let (dir, _) = create_test_static_files_dir();
+            let provider = provider(dir.path(), checksums, 2);
+            write_accounts(&provider, 0..6, 6);
+            let jar = jar_path(&provider, ACCOUNTS, 4);
+            drop(provider);
+            std::fs::remove_file(&jar).unwrap();
+            for ext in ["off", "conf", "csoff"] {
+                if !kept.contains(&ext) {
+                    std::fs::remove_file(jar.with_extension(ext)).unwrap();
+                }
+            }
+
+            let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+            assert_accounts(&provider, 3, 6);
+            rewrite_and_read(&provider);
+            drop(provider);
+            let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+            drop(provider.latest_writer(ACCOUNTS).unwrap());
+            for block in 0..6 {
+                let expected =
+                    if block < 4 { account_changes(block) } else { other_changes(block) };
+                assert_eq!(provider.account_block_changeset(block).unwrap(), expected);
+            }
+        }
+    }
+}
+
+/// TN(TN-0132): a changeset prune whose deletion of a jar fails at its first file (the data file
+/// replaced by a directory) leaves that jar whole: the next open reads every block. Fails if the
+/// sidecar goes before the data file, which left a jar that does not load.
+#[test]
+fn deletion_removes_the_data_file_first() {
+    for checksums in [false, true] {
+        let (dir, _) = create_test_static_files_dir();
+        let provider = provider(dir.path(), checksums, 2);
+        write_accounts(&provider, 0..6, 6);
+        let jar = jar_path(&provider, ACCOUNTS, 4);
+        let moved = jar.with_extension("moved");
+
+        let mut writer = provider.latest_writer(ACCOUNTS).unwrap();
+        std::fs::rename(&jar, &moved).unwrap();
+        std::fs::create_dir(&jar).unwrap();
+        std::fs::write(jar.join("block"), b"x").unwrap();
+        writer.prune_account_changesets(1).unwrap();
+        assert!(writer.commit().is_err());
+        drop(writer);
+        drop(provider);
+        std::fs::remove_dir_all(&jar).unwrap();
+        std::fs::rename(&moved, &jar).unwrap();
+
+        let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+        drop(provider.latest_writer(ACCOUNTS).unwrap());
+        assert_accounts(&provider, 5, 6);
     }
 }

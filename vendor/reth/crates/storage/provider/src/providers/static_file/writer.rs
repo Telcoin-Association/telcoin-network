@@ -1156,12 +1156,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer.set_dirty();
         self.data_path = data_path.clone();
 
-        // Delete the sidecar file for changeset segments before deleting the main jar
+        // TN(TN-0132): the sidecar goes with the jar below (`NippyJar::delete`), after its data
+        // file: removed first, it left a jar that does not load when the deletion stopped there.
         if segment.is_change_based() {
-            let csoff_path = current_path.with_extension("csoff");
-            if csoff_path.exists() {
-                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
-            }
             // Re-initialize the changeset offsets writer for the previous file
             let new_csoff_path = data_path.with_extension("csoff");
             let committed_len = self.writer.user_header().changeset_offsets_len();

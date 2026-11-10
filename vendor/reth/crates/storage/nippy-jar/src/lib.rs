@@ -382,11 +382,22 @@ impl<H: NippyJarHeader> NippyJar<H> {
     }
 
     /// Deletes from disk this [`NippyJar`] alongside every satellite file.
+    ///
+    /// TN(TN-0132): the data file goes first, and its removal is made durable before any
+    /// satellite goes. Jars are found by their data file (`iter_static_files`), so a deletion
+    /// stopped at any point leaves either the whole jar or files no listing sees, which
+    /// [`NippyJarWriter`] empties when it creates a jar at that path again.
     pub fn delete(self) -> Result<(), NippyJarError> {
-        // TODO(joshie): ensure consistency on unexpected shutdown
+        let data_path = self.data_path();
+        if data_path.exists() {
+            debug!(target: "nippy-jar", path = ?data_path, "Removing file.");
+            reth_fs_util::remove_file(data_path)?;
+            if let Some(dir) = data_path.parent() {
+                reth_fs_util::fsync_file(&File::open(dir)?)?;
+            }
+        }
 
         for path in [
-            self.data_path().into(),
             self.index_path(),
             self.offsets_path(),
             self.config_path(),
@@ -1883,6 +1894,65 @@ mod tests {
                 writer.commit().unwrap();
                 drop(writer);
                 assert_jar_rows(path, &col1, &col2, 2);
+            }
+        }
+    }
+
+    /// TN(TN-0132): a jar created where a deletion stopped part way (`NippyJar::delete` removes
+    /// the data file first) starts empty whatever the other files hold: the old jar's offsets
+    /// file, or a data file without offsets. A jar whose configuration counts rows and has lost a
+    /// file is refused, not created again.
+    #[test]
+    fn test_writer_creates_over_leftovers_and_refuses_a_missing_file() {
+        let (col1, col2) = test_data(Some(18));
+        for checksums in [false, true] {
+            // (the leftover files kept)
+            for kept in [&[OFFSETS_FILE_EXTENSION][..], &[""], &[OFFSETS_FILE_EXTENSION, ""]] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                for ext in ["", OFFSETS_FILE_EXTENSION, CONFIG_FILE_EXTENSION] {
+                    if !kept.contains(&ext) {
+                        let file = if ext.is_empty() {
+                            path.to_path_buf()
+                        } else {
+                            path.with_extension(ext)
+                        };
+                        std::fs::remove_file(file).unwrap();
+                    }
+                }
+                if kept.len() == 2 {
+                    // Both files there: the jar without rows the open finds is restored instead.
+                    std::fs::remove_file(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap();
+                }
+                let mut nippy = NippyJar::new_without_header(2, path);
+                if checksums {
+                    nippy = nippy.with_checksums();
+                }
+                let mut writer = NippyJarWriter::new(nippy).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                writer.commit().unwrap();
+                drop(writer);
+                assert_jar_rows(path, &col1, &col2, 1);
+            }
+
+            // A committed jar without its data or offsets file.
+            for ext in ["", OFFSETS_FILE_EXTENSION] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                let missing =
+                    if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+                std::fs::remove_file(&missing).unwrap();
+                let config = std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap();
+                let err =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap_err();
+                assert!(matches!(&err, NippyJarError::MissingFile(file) if file == &missing));
+                assert!(!missing.exists());
+                assert_eq!(
+                    std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap(),
+                    config
+                );
             }
         }
     }

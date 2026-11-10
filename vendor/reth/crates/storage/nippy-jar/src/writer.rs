@@ -53,6 +53,16 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     ///
     /// It will **always** attempt to heal any inconsistent state when called.
     pub fn new(jar: NippyJar<H>) -> Result<Self, NippyJarError> {
+        // TN(TN-0132): a jar whose configuration counts rows has no file to create: one missing
+        // is damage, not a new jar.
+        if jar.rows > 0 {
+            for path in [jar.data_path().to_path_buf(), jar.offsets_path()] {
+                if !path.exists() {
+                    return Err(NippyJarError::MissingFile(path))
+                }
+            }
+        }
+
         let (data_file, offsets_file, is_created) =
             Self::create_or_open_files(jar.data_path(), &jar.offsets_path())?;
 
@@ -153,6 +163,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
         let mut offsets_file = OpenOptions::new().read(true).write(true).open(offsets)?;
         if is_created {
+            // TN(TN-0132): whichever file was not missing is left over from a deletion that
+            // stopped part way (`NippyJar::delete`) and holds nothing of this jar.
+            data_file.set_len(0)?;
+            data_file.seek(SeekFrom::Start(0))?;
+            offsets_file.set_len(0)?;
+
             let mut buf = Vec::with_capacity(1 + OFFSET_SIZE_BYTES as usize);
 
             // First byte of the offset file is the size of one offset in bytes

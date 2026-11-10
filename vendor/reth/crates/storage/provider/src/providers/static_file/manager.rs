@@ -1118,14 +1118,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         let header = jar.user_header().clone();
 
-        // Delete the sidecar file for changeset segments before deleting the main jar
-        if segment.is_change_based() {
-            let csoff_path = file.with_extension("csoff");
-            if csoff_path.exists() {
-                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
-            }
-        }
-
+        // TN(TN-0132): `NippyJar::delete` removes the sidecar too, after the data file.
         jar.delete().map_err(ProviderError::other)?;
 
         // SAFETY: this is currently necessary to ensure that certain indexes like

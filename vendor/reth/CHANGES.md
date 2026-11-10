@@ -1147,3 +1147,33 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   account changesets, both versions: the rotated jar's offsets emptied, the next persist appends
   and every block reads). Mutation-checked: no reset (both fail), the reader indexing the map
   (panics). *Upstream*: yes (the panic is upstream's).
+
+- **TN-0132** — A jar deletion stopped at any file leaves the whole jar or files no listing sees,
+  and a jar created over such leftovers starts empty. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{lib.rs, writer.rs}` (`NippyJar::delete`,
+  `NippyJarWriter::new`, `create_or_open_files`, tests),
+  `crates/storage/provider/src/providers/static_file/{writer.rs, manager.rs, tn_crash_tests.rs}`
+  (`delete_current_and_open_previous`, `delete_jar`; tests).
+  *Why*: jars are found by their data file (`iter_static_files` parses only extension-less names
+  and then loads the `.conf`). `delete_current_and_open_previous` and `delete_jar` removed a
+  changeset jar's `.csoff` before `NippyJar::delete`, so a crash in between (a startup prune that
+  deletes a file, or `remove_unfinished_genesis`'s `delete_segment`) left a jar that is listed
+  but does not load, and startup failed until someone removed the files by hand. The sidecar now
+  goes with the jar in `NippyJar::delete`, whose data file goes first, and the directory is
+  synced before the satellites go (offsets, configuration, sidecar), so every stopped deletion
+  leaves either the whole jar or unlisted leftovers. A leftover data or offsets file then met the
+  next jar created at that path: `create_or_open_files` opened the surviving file as it was and
+  wrote the new offsets header over the start of an old offsets file, keeping its stale tail, so
+  the new jar's rows pointed into the old ones. A file a new jar is created next to now starts
+  empty (TN-0131 handles both files surviving; the sidecar writer already truncates to the
+  header's count). A jar whose configuration counts rows and has lost its data or offsets file is
+  refused (`MissingFile`) instead of being created again over its configuration. It cannot reach
+  execution: it changes only how files are removed and how a missing file is treated.
+  *Tests*: `test_writer_creates_over_leftovers_and_refuses_a_missing_file` (leftover offsets, data,
+  both; a committed jar missing either file: refused, its configuration unchanged; both
+  versions), `deletion_stopped_at_any_file` (a changeset jar stopped after each file of the
+  deletion order: the jars below serve, the range written again with other rows reads only them,
+  also after a reopen), `deletion_removes_the_data_file_first` (a deletion that fails at the data
+  file leaves the jar whole and loadable). Mutation-checked: no leftover truncation, no
+  missing-file refusal, the sidecar removed before the jar. *Upstream*: yes (the `TODO(joshie)` in
+  `NippyJar::delete`).
