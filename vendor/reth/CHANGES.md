@@ -507,6 +507,76 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
   filter.
 
+- **TN-0102** — Backport 345fbbbfd: the in-memory trie cursor skips the database seek on an
+  exact overlay hit. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/trie_cursor/in_memory.rs` (`InMemoryTrieCursor`: a
+  `DbCursorState` replaces `cursor_wiped`/`cursor_entry`; `seek_exact` returns an exact in-memory
+  hit without touching the database cursor and marks it for a re-seek when it was behind; the
+  `seeked` flag is debug-only).
+  *Why*: the state root walks the account and storage tries through `InMemoryTrieCursor`, and TN's
+  output overlay stacks one per run of the blocks already built in the output (`RunTrieCursor` in
+  `crates/tn-reth/src/env/output_overlay/cursors.rs`). Every `seek_exact` seeked the layer below
+  first, down to the database, even when the overlay held the key; at a peak output the state root
+  does about 80k `StoragesTrie` exact seeks. Execution path (state root): the cursor returns the
+  same entries in the same order, only fewer lower-layer seeks. *Tests*: reth-trie (the in-memory
+  cursor's unit tests and `proptest_in_memory_trie_cursor`, against a reference merge; upstream
+  added the assertion that an exact hit leaves the database cursor untouched), reth-trie-db's
+  state-root tests, TN's `trie_overlay` tests and the exec-bench chain differential (TN-0105).
+  *Upstream*: n/a (upstream commit).
+
+- **TN-0103** — Backport 75c327ee5: the hashed post-state cursor and the in-memory trie
+  cursor's `seek` skip the database seek on an exact overlay hit. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/hashed_cursor/post_state.rs` (`HashedPostStateCursor`: the same
+  `DbCursorState` as TN-0102; `seek` returns an exact non-deleted in-memory hit without touching
+  the database cursor), `crates/trie/trie/src/trie_cursor/in_memory.rs` (`seek` does the same for a
+  present node).
+  *Why*: TN-0102 covered the trie cursor's `seek_exact` only. The state root also seeks the
+  hashed accounts and storages through `HashedPostStateCursor`, which TN stacks per run of the
+  output overlay (`RunHashedCursor`) with the current block's on top; at a peak output that is
+  about 125k `HashedStorages` seeks. An exact hit with a value is the first entry at or after the
+  key, so the lower layers are seeked lazily, by the next `next`. Execution path (state root):
+  same entries in the same order. *Tests*: as TN-0102; upstream added cursor tests that an exact
+  hit leaves the database untouched until `next` and that a stale database position is
+  re-seeked. *Upstream*: n/a (upstream commit).
+
+- **TN-0104** — Backport 0720dcd37: fast path for forward in-memory cursor seeks. *Kind*:
+  backport.
+  *Files*: `crates/trie/trie/src/forward_cursor.rs` (`ForwardInMemoryCursor::seek` and
+  `first_after` return the current entry when it already answers; the linear scan indexes the
+  slice directly; binary search from 128 remaining entries instead of 64).
+  *Why*: the overlay cursors of TN-0102/TN-0103 seek their sorted in-memory entries for every
+  trie and hashed-state seek, mostly to a key at or just after the current entry. The answer is
+  the same entry as before in every case (the old `advance_while` returned the current entry
+  without moving when it already answered), so this changes only the work. Execution path (state
+  root), no change in results. *Tests*: reth-trie's `forward_cursor` tests and as TN-0102.
+  *Upstream*: n/a (upstream commit).
+
+- **TN-0105** — Backport 0a21d223a: the state root reuses one storage trie cursor and one
+  hashed storage cursor for every account. *Kind*: backport.
+  *Files*: `crates/trie/trie/src/trie.rs` (`StateRoot::calculate` keeps the two storage cursors
+  across accounts and repositions them with `set_hashed_address`; new
+  `StorageRoot::calculate_with_cursors`, `calculate_with_cursor` and `StorageRootCalculation`;
+  the factories no longer need `Clone`). It merged with the pin's `instrument` attribute on
+  `StorageRoot::calculate`, which the pin and upstream's parent spell differently.
+  *Why*: the state root built a fresh `StorageRoot`, and so two fresh cursor stacks, for every
+  account with changed storage. Under TN's output overlay each stack is one boxed layer per run
+  plus the database cursors and `OverlayStorageCursor` (`crates/tn-reth/src/env/output_overlay/`),
+  so each root opened thousands of database cursors (measured below). TN's cursor types implement `set_hashed_address` by
+  passing it down every layer (`RunHashedCursor`, `RunTrieCursor`, `OverlayStorageCursor`, which
+  also switches its own address), and reth's overlay cursors reset their position and their
+  in-memory view for the new account. Execution path (state root): the same walk over the same
+  entries, only the cursors are reused. *Tests*: as TN-0102; TN's `trie_overlay` differential
+  tests compare the layered root against a flattened reference over several accounts with
+  storage, so a cursor that kept the previous account's position or overlay would fail them.
+  *Measured* (TN-0102 to TN-0105 together; exec bench, tn-lmdb, storage v2, 40 outputs of 8
+  batches, prefill 50k, the same cached base, on a Mac at load ~70): the chain is identical (the
+  bench's differential, 3000 reads of headers, balances, storage, transactions and receipts, 0
+  mismatches against a run without them; the same tip hash). Per 320 state roots, counted at the
+  database trie cursors with temporary counters: `AccountsTrie` seeks 195.8k to 83.1k, `StoragesTrie` seeks 212.6k to
+  109.3k, `HashedStorages` cursors opened 1.89M to 640; hashed seeks and nexts unchanged. The
+  state root's mean fell from 100.5 to 84.7 ms on that loaded machine (a quiet run decides).
+  *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
@@ -735,3 +805,46 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `sync_stats_record_each_phase_per_segment` (each phase once per segment, `.csoff` only for a
   changeset segment, a take drains them; fails when a phase is not recorded) and tn-reth's
   `test_persist_reports_static_file_sync_stats`. *Upstream*: no.
+
+- **TN-0100** — A timing harness for historical reads, storage v1 against v2. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/database/tn_v2_read_bench.rs` (new: the heavy
+  test `v2_history_read_timing_heavy`), `.../database/mod.rs` (the module),
+  `.../database/tn_v2_tests.rs` (`executed` is `pub(super)`).
+  *Why*: storage v2 answers a historical account or storage read that the history resolves to a
+  changeset from static files, not from a database table, and the exec bench showed those reads
+  slower than v1's with a longer tail. The harness saves one generated chain (2400 blocks of 150
+  account and 300 slot changes) into a v1 and a v2 factory in batches of 8 blocks, then times the
+  same 20k reads in each: right after the last persist, again warm, with the changeset jars
+  reloaded every 32 reads as a persist does, while a writer persists, and while a writer persists
+  and another thread holds a static-file jar the way a range walk does. Under v2 it also times
+  the steps of the changeset lookup (jar, `.csoff` read, cursor, binary search). Every answer is
+  compared between the passes and between the layouts. `#[ignore]`d (heavy, run with
+  `--release`); test code only. *Upstream*: no.
+
+- **TN-0101** — `StaticFileProvider::update_index` loads the jar before it takes the index lock.
+  *Kind*: performance (static-file read path).
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (`update_index`, new
+  `prepare_index_update` and `PreparedIndexUpdate`; test
+  `growing_commit_waits_for_jar_readers_outside_the_index_lock`).
+  *Why*: `update_index`, which every static-file commit runs once per segment, held the write lock
+  of the segment index while it read the jar's configuration, mapped its data and offsets files,
+  opened its `.csoff`, inserted the jar into the cache (waiting for every reader of that cache
+  shard) and cleaned the cache with `DashMap::retain` (waiting for every reader of every shard).
+  Every static-file lookup of every segment takes that lock, so one reader holding a jar, such as
+  a range walk over receipts or headers, stalled all of them for as long as it held it; storage v2
+  routes each historical read that resolves to a changeset through it. Now the jar is loaded
+  before the lock; when the segment grows past the indexed tip it is published to the cache before
+  the lock too, and the stale jars above the new range are found under shared shard locks and
+  removed one by one. Publishing before the index is the state a jar loaded on a cache miss already
+  creates (TN-0051): lookups route by the index, which still ends at the old tip, and the new jar
+  holds every row the old one did. A shrinking or unchanged segment (unwind, prune) is still
+  published under the lock with the index, and if the index was re-initialized or the segment's
+  ranges moved since the load, the jar is reloaded under the lock as before. The index, the cached
+  jars and every byte read are the same once `update_index` returns, so this cannot reach
+  execution or what is written. *Tests*: `growing_commit_waits_for_jar_readers_outside_the_index_lock`
+  (a reader holds the headers jar, then another segment's, while a commit grows the headers: a
+  lookup from a third thread must not wait for it, and the new header must be readable after the
+  commit; it fails when the grown jar is published under the lock, and when the clean-up goes back
+  to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
+  effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
+  yes.

@@ -392,6 +392,18 @@ impl BeforeCacheInsertHook {
     }
 }
 
+/// TN(TN-0101): what [`StaticFileProvider::prepare_index_update`] did before the index lock.
+struct PreparedIndexUpdate {
+    /// The segment's file range the jar was loaded for.
+    fixed_range: SegmentRangeInclusive,
+    /// The jar cache generation before the load.
+    generation: u64,
+    /// The loaded jar's header.
+    header: SegmentHeader,
+    /// The loaded jar, when it was not published before the lock.
+    jar: Option<LoadedJar>,
+}
+
 /// [`StaticFileProviderInner`] manages all existing [`StaticFileJarProvider`].
 #[derive(Debug)]
 pub struct StaticFileProviderInner<N> {
@@ -1209,6 +1221,45 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         None
     }
 
+    /// TN(TN-0101): the file work of [`Self::update_index`], done before it takes the index
+    /// lock: the segment's file range from the current index, its jar loaded and, when the
+    /// segment grows past the indexed tip, the jar published to the cache.
+    ///
+    /// Publishing first is safe when the segment grows: lookups route by the index, which still
+    /// stops at the old tip, and the new jar holds every row the old one did. A jar loaded on a
+    /// cache miss can hold rows past the index tip in the same way (TN-0051). When the segment
+    /// shrinks or stays, the jar is published under the lock with the index, as upstream does,
+    /// so no lookup routed by the old index meets a jar without its rows.
+    fn prepare_index_update(
+        &self,
+        segment: StaticFileSegment,
+        segment_max_block: BlockNumber,
+    ) -> ProviderResult<PreparedIndexUpdate> {
+        let generation = self.cache_generation.load(Ordering::Acquire);
+        let (fixed_range, grows) = {
+            let indexes = self.indexes.read();
+            let index = indexes.get(segment);
+            let fixed_range = self.find_fixed_range_with_block_index(
+                segment,
+                index.map(|index| &index.expected_block_ranges_by_max_block),
+                segment_max_block,
+            );
+            (fixed_range, index.is_none_or(|index| segment_max_block > index.max_block))
+        };
+        let jar = NippyJar::<SegmentHeader>::load(&self.path.join(segment.filename(&fixed_range)))
+            .map_err(ProviderError::other)?;
+        let header = jar.user_header().clone();
+        let loaded = LoadedJar::new(jar)?;
+        let jar = if grows {
+            debug!(target: "providers::static_file", ?segment, "Inserting grown jar into cache");
+            self.map.insert((fixed_range.end(), segment), loaded);
+            None
+        } else {
+            Some(loaded)
+        };
+        Ok(PreparedIndexUpdate { fixed_range, generation, header, jar })
+    }
+
     /// Updates the inner transaction and block indexes alongside the internal cached providers in
     /// `self.map`.
     ///
@@ -1226,6 +1277,14 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             ?segment_max_block,
             "Updating provider index"
         );
+        // TN(TN-0101): load the jar before taking the index lock, and when the segment grows,
+        // publish it to the jar cache before the index too. Every static-file lookup of every
+        // segment takes the index lock, so holding it across the file reads, the maps and the
+        // wait for this jar's readers stalled all of them, storage v2's changeset reads included.
+        let prepared = match segment_max_block {
+            Some(segment_max_block) => Some(self.prepare_index_update(segment, segment_max_block)?),
+            None => None,
+        };
         let mut indexes = self.indexes.write();
 
         match segment_max_block {
@@ -1236,10 +1295,22 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     segment_max_block,
                 );
 
-                let jar = NippyJar::<SegmentHeader>::load(
-                    &self.path.join(segment.filename(&fixed_range)),
-                )
-                .map_err(ProviderError::other)?;
+                // The prepared jar holds only if nothing re-initialized the index or moved the
+                // segment's ranges since; otherwise load it under the lock, as upstream does.
+                let prepared = prepared.filter(|prepared| {
+                    prepared.fixed_range == fixed_range &&
+                        prepared.generation == self.cache_generation.load(Ordering::Acquire)
+                });
+                let (header, unpublished) = match prepared {
+                    Some(PreparedIndexUpdate { header, jar, .. }) => (header, jar),
+                    None => {
+                        let jar = NippyJar::<SegmentHeader>::load(
+                            &self.path.join(segment.filename(&fixed_range)),
+                        )
+                        .map_err(ProviderError::other)?;
+                        (jar.user_header().clone(), Some(LoadedJar::new(jar)?))
+                    }
+                };
 
                 let index = indexes
                     .entry(segment)
@@ -1283,7 +1354,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 // 2. Sync to block 100, this update sets min_block = [0..=100]
                 // 3. Pruner calls get_lowest_static_file_block() -> returns 100 (correct). Without
                 //    this update, it would incorrectly return 0 (stale)
-                if let Some(current_block_range) = jar.user_header().block_range() {
+                if let Some(current_block_range) = header.block_range() {
                     if let Some(min_block_range) = index.min_block_range.as_mut() {
                         // delete_jar WILL ALWAYS re-initialize all indexes, so we are always
                         // sure that current_min is always the lowest.
@@ -1297,10 +1368,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
                 // Updates the tx index by first removing all entries which have a higher
                 // block_start than our current static file.
-                if let Some(tx_range) = jar.user_header().tx_range() {
+                if let Some(tx_range) = header.tx_range() {
                     // Current block range has the same block start as `fixed_range``, but block end
                     // might be different if we are still filling this static file.
-                    if let Some(current_block_range) = jar.user_header().block_range() {
+                    if let Some(current_block_range) = header.block_range() {
                         let tx_end = tx_range.end();
 
                         // Considering that `update_index` is called when we either append/truncate,
@@ -1332,13 +1403,25 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     index.available_block_ranges_by_max_tx.take_if(|index| index.is_empty());
                 }
 
-                // Update the cached provider.
-                debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
-                self.map.insert((fixed_range.end(), segment), LoadedJar::new(jar)?);
+                // Update the cached provider, unless it was published before the lock.
+                if let Some(loaded) = unpublished {
+                    debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
+                    self.map.insert((fixed_range.end(), segment), loaded);
+                }
 
                 // Delete any cached provider that no longer has an associated jar.
+                // TN(TN-0101): find them under shared shard locks and remove only those;
+                // `retain` write-locks every shard and so waits for every jar reader.
                 debug!(target: "providers::static_file", ?segment, "Cleaning up jar map");
-                self.map.retain(|(end, seg), _| !(*seg == segment && *end > fixed_range.end()));
+                let stale: Vec<_> = self
+                    .map
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .filter(|(end, seg)| *seg == segment && *end > fixed_range.end())
+                    .collect();
+                for key in stale {
+                    self.map.remove(&key);
+                }
             }
             None => {
                 debug!(target: "providers::static_file", ?segment, "Removing segment from index");
@@ -3597,6 +3680,68 @@ mod tests {
         assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
         assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
         assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
+        Ok(())
+    }
+
+    /// TN(TN-0101): a commit that grows the headers while a reader holds a jar, the headers'
+    /// own or another segment's, waits for the reader without the index lock, so lookups go on,
+    /// and the new header is readable once the commit returns.
+    #[test]
+    fn growing_commit_waits_for_jar_readers_outside_the_index_lock() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x20, 0x21, 0x22].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+            let mut changesets =
+                static_files.latest_writer(StaticFileSegment::AccountChangeSets)?;
+            changesets.append_account_changeset(Vec::new(), 0)?;
+            changesets.commit()?;
+        }
+
+        // The headers' own jar (the cache insert waits for it), then another segment's (the
+        // clean-up of jars above the new range must not wait for it).
+        for (number, held) in
+            [(1u64, StaticFileSegment::Headers), (2, StaticFileSegment::AccountChangeSets)]
+        {
+            // A reader holds the jar, as a range walk does.
+            let held = static_files.get_segment_provider_for_block(held, 0, None)?;
+            thread::scope(|scope| -> eyre::Result<()> {
+                let commit = scope.spawn(|| -> eyre::Result<()> {
+                    let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+                    let header = Header { number, ..Default::default() };
+                    headers.append_header(&header, &hashes[number as usize])?;
+                    Ok(headers.commit()?)
+                });
+                // Give the commit time to reach the jar cache.
+                thread::sleep(Duration::from_millis(200));
+                let (tx, rx) = mpsc::channel();
+                let lookups = &static_files;
+                scope.spawn(move || {
+                    let lookup = lookups
+                        .get_segment_provider_for_block(
+                            StaticFileSegment::AccountChangeSets,
+                            0,
+                            None,
+                        )
+                        .map(drop);
+                    let _ = tx.send(lookup);
+                });
+                let lookup = rx.recv_timeout(Duration::from_secs(2));
+                drop(held);
+                assert!(
+                    matches!(lookup, Ok(Ok(()))),
+                    "block {number}: a lookup waited for the held jar: {lookup:?}"
+                );
+                commit.join().expect("commit thread")
+            })?;
+            let highest = static_files.get_highest_static_file_block(StaticFileSegment::Headers);
+            assert_eq!(highest, Some(number));
+            assert_eq!(static_files.block_hash(number)?, Some(hashes[number as usize]));
+        }
         Ok(())
     }
 

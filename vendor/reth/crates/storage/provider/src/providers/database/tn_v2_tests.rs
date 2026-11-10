@@ -207,7 +207,7 @@ impl Chain {
 }
 
 /// An executed block with one receipt per transaction and the bundle's hashed state.
-fn executed(block: SealedBlock<Block>, bundle: BundleState) -> ExecutedBlock {
+pub(super) fn executed(block: SealedBlock<Block>, bundle: BundleState) -> ExecutedBlock {
     let receipts = vec![Receipt::default(); block.body().transaction_count()];
     let hashed_state =
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state()).into_sorted();
