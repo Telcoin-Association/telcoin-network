@@ -59,6 +59,21 @@ struct LegacyNodeRecord {
     signature: BlsSignature,
 }
 
+/// Pre-#1751 [NodeRecord] layout: the current [NetworkInfo] and its BLS signature, without the
+/// network-key co-signature.
+///
+/// v0.16 nodes publish and relay records in this layout. See [NodeRecord::decodes_as_legacy].
+// TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to pre-#1751
+// records.
+#[cfg(feature = "adiri")]
+#[derive(Serialize, Deserialize)]
+struct UncosignedNodeRecord {
+    /// The network information contained within the record.
+    info: NetworkInfo,
+    /// Signature of the info field with the node's BLS key.
+    signature: BlsSignature,
+}
+
 impl From<LegacyNodeRecord> for NodeRecord {
     fn from(legacy: LegacyNodeRecord) -> Self {
         let LegacyNodeRecord {
@@ -342,6 +357,23 @@ impl NodeRecord {
         let record = Self::try_decode_current(value)?;
         validate_advertised_addresses(&record.info.multiaddrs, &record.info.pubkey).ok()?;
         record.verify(domain, key)
+    }
+
+    /// Whether `bytes` decode as the pre-#1751 layout: the current [NetworkInfo] and the BLS
+    /// signature, without the network-key co-signature.
+    ///
+    /// Such bytes never pass [Self::decode_and_verify]. The two layouts are mutually exclusive
+    /// under BCS: current bytes carry the co-signature after the BLS signature, which this decode
+    /// rejects as trailing input, and pre-#1751 bytes end where the current decoder expects the
+    /// co-signature. The pre-`rpc` layout fails here as well, at the `rpc` Option tag.
+    ///
+    /// A `true` result says nothing about authenticity: nothing in the record is verified, and
+    /// anyone can produce bytes in this layout.
+    // TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to
+    // pre-#1751 records.
+    #[cfg(feature = "adiri")]
+    pub fn decodes_as_legacy(bytes: &[u8]) -> bool {
+        try_decode::<UncosignedNodeRecord>(bytes).is_ok()
     }
 }
 

@@ -575,3 +575,54 @@ fn previous_layout_without_cosignature_is_rejected() {
     assert!(NodeRecord::decode_and_verify(&previous, domain, &key_config.primary_public_key())
         .is_none());
 }
+
+/// Pre-#1751 bytes decode as the legacy layout. Current bytes and garbage do not.
+// TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to pre-#1751
+// records.
+#[cfg(feature = "adiri")]
+#[test]
+fn decodes_as_legacy_matches_only_the_pre_cosignature_layout() {
+    use super::UncosignedNodeRecord;
+    use tn_types::encode;
+
+    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let domain = RecordDomain::new(2017, NetworkType::Primary);
+    let record = NodeRecord::build(
+        domain,
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
+        create_multiaddr(None),
+        None,
+        |data| key_config.request_signature_direct(data),
+    )
+    .expect("sign record");
+
+    // the bytes a v0.16 node publishes for the same info and BLS signature
+    let legacy =
+        encode(&UncosignedNodeRecord { info: record.info.clone(), signature: record.signature });
+    assert_eq!(legacy, encode(&(&record.info, &record.signature)));
+    assert!(NodeRecord::decodes_as_legacy(&legacy));
+    assert!(
+        NodeRecord::decode_and_verify(&legacy, domain, &key_config.primary_public_key()).is_none()
+    );
+
+    let current = encode(&record);
+    assert!(
+        NodeRecord::decode_and_verify(&current, domain, &key_config.primary_public_key()).is_some()
+    );
+    assert!(!NodeRecord::decodes_as_legacy(&current));
+
+    // the pre-`rpc` layout holds the signature's length prefix where this decode expects the
+    // `rpc` Option tag
+    let info = &record.info;
+    let pre_rpc = encode(&(&info.pubkey, &info.multiaddrs, info.timestamp, &record.signature));
+    assert!(NodeRecord::try_decode_compat(&pre_rpc).is_some());
+    assert!(!NodeRecord::decodes_as_legacy(&pre_rpc));
+
+    // a truncated legacy record, a legacy record with trailing bytes, and unstructured bytes
+    let mut trailing = legacy.clone();
+    trailing.push(0);
+    [vec![], vec![0xff; 64], legacy[..legacy.len() - 1].to_vec(), trailing]
+        .iter()
+        .for_each(|garbage| assert!(!NodeRecord::decodes_as_legacy(garbage)));
+}

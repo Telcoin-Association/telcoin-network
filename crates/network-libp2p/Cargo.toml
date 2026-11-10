@@ -57,6 +57,9 @@ tn-config = { workspace = true, features = ["test-utils"] }
 [features]
 default = []
 test-utils = []
+# Adiri testnet: drop pre-#1751 node records from v0.16 nodes without a penalty.
+# TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to pre-#1751 records.
+adiri = ["tn-node-record/adiri"]
 
 [lints]
 workspace = true

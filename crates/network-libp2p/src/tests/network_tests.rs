@@ -5781,6 +5781,12 @@ async fn test_record_retrieval_lazy_rejection_takes_legacy_fallback() -> eyre::R
 #[path = "record_review_tests.rs"]
 mod record_review_tests;
 
+// TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to pre-#1751
+// records.
+#[cfg(feature = "adiri")]
+#[path = "legacy_record_grace_tests.rs"]
+mod legacy_record_grace_tests;
+
 /// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
 /// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
 /// seen and would eventually OOM a RAM-capped node. It is now a capacity-bounded LRU: a flood of

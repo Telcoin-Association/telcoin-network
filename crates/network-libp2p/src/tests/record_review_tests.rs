@@ -74,6 +74,13 @@ async fn record_failures_score_only_invalid_data() -> eyre::Result<()> {
             let after = network.swarm.behaviour().peer_manager.peer_score(&peer);
             let deferred = network.record_exchange.take_deferred().contains(&peer);
             if kind == ErrorKind::InvalidData {
+                // TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed
+                // to pre-#1751 records.
+                //
+                // the adiri build excuses undecodable responses (see `legacy_record_grace_tests`)
+                #[cfg(feature = "adiri")]
+                assert_eq!(after, before);
+                #[cfg(not(feature = "adiri"))]
                 assert!(after.zip(before).is_some_and(|(after, before)| after < before));
                 assert!(!deferred);
             } else {

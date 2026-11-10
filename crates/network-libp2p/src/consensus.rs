@@ -1143,6 +1143,30 @@ where
         Some((pubkey, node_record))
     }
 
+    /// Whether a kad record that failed [`Self::peer_record_valid`] is a pre-#1751 node record,
+    /// which the caller drops without penalizing `peer`.
+    ///
+    /// v0.16 nodes publish and relay records without the network-key co-signature. Those records
+    /// never verify, but a sender that holds one is outdated rather than malicious, so it keeps
+    /// its score. Garbage, signature failures and publisher mismatches stay fatal. `path` labels
+    /// the kad path the record arrived on.
+    // TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to
+    // pre-#1751 records.
+    #[cfg(feature = "adiri")]
+    fn drop_legacy_node_record(
+        &self,
+        value: &[u8],
+        peer: Option<PeerId>,
+        path: &'static str,
+    ) -> bool {
+        let legacy = NodeRecord::decodes_as_legacy(value);
+        if legacy {
+            debug!(target: "network-kad", ?peer, path, "dropping pre-#1751 node record without a penalty");
+            self.metrics.record_legacy_node_record_dropped(path);
+        }
+        legacy
+    }
+
     /// Publish and provide our network addresses and peer id under our BLS public key for
     /// discovery.
     fn provide_our_data(&mut self) {
@@ -2419,6 +2443,20 @@ where
                             // use the existing deduplicated, bounded Kademlia query pipeline.
                             self.request_legacy_record(peer);
                         }
+                        // TODO(v0.18-adiri): remove the legacy node-record grace once the network
+                        // is closed to pre-#1751 records.
+                        //
+                        // a v0.16 peer answers with a pre-#1751 record, which fails to decode
+                        // inside the codec, so only the error kind reaches this point. every
+                        // undecodable response on this protocol is excused like a capability
+                        // failure, and this arm shadows the penalty arm below.
+                        #[cfg(feature = "adiri")]
+                        ReqResOutboundFailure::Io(error)
+                            if error.kind() == ErrorKind::InvalidData =>
+                        {
+                            debug!(target: "network", ?peer, ?error, "undecodable record response, possibly a pre-#1751 record: no penalty");
+                            self.request_legacy_record(peer);
+                        }
                         ReqResOutboundFailure::Io(error)
                             if error.kind() == ErrorKind::InvalidData =>
                         {
@@ -3037,6 +3075,18 @@ where
                         } else {
                             trace!(target: "network-kad", "Received invalid peer record!");
 
+                            // TODO(v0.18-adiri): remove the legacy node-record grace once the
+                            // network is closed to pre-#1751 records.
+                            //
+                            // a pre-#1751 record clears `peer`, so no penalty is assessed below
+                            #[cfg(feature = "adiri")]
+                            let peer =
+                                if self.drop_legacy_node_record(&record.value, peer, "lookup") {
+                                    None
+                                } else {
+                                    peer
+                                };
+
                             // assess penalty for invalid peer record
                             if let Some(peer_id) = peer {
                                 self.swarm
@@ -3224,7 +3274,16 @@ where
                 Ok(PutOutcome::Shed)
             }
             PutRecordRate::Allowed => {
-                self.peer_record_valid(&record).map(|(key, value)| {
+                let verified = self.peer_record_valid(&record);
+                // TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed
+                // to pre-#1751 records.
+                #[cfg(feature = "adiri")]
+                if verified.is_none()
+                    && self.drop_legacy_node_record(&record.value, Some(source), "put")
+                {
+                    return Ok(PutOutcome::Processed);
+                }
+                verified.map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
                     if record.value.len() <= MAX_KAD_PACKET_SIZE {
                         self.verified_peer_records.put(record.key.clone(), record.value.clone());

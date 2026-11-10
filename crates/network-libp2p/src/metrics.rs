@@ -1307,6 +1307,20 @@ impl SwarmMetrics {
         .increment(1);
     }
 
+    /// Record a pre-#1751 node record dropped without a penalty, labeled by the fixed kad `path`
+    /// it arrived on.
+    // TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to
+    // pre-#1751 records.
+    #[cfg(feature = "adiri")]
+    pub(crate) fn record_legacy_node_record_dropped(&self, path: &'static str) {
+        metrics::counter!(
+            "tn_network.legacy_node_records_dropped_total",
+            "network" => self.network.clone(),
+            "path" => path,
+        )
+        .increment(1);
+    }
+
     /// Publish the bounded live-request and deferred-retry set sizes.
     pub(crate) fn set_record_exchange_pending(&self, pending: usize, deferred: usize) {
         self.handles.record_exchange_pending.set(u32::try_from(pending).unwrap_or(u32::MAX));

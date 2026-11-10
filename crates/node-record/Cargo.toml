@@ -20,5 +20,11 @@ hex = { workspace = true }
 [dev-dependencies]
 rand = { workspace = true }
 
+[features]
+# Adiri testnet: recognise pre-#1751 node records (`NodeRecord::decodes_as_legacy`) so the network
+# layer can drop them without a penalty while v0.16 nodes remain on the network.
+# TODO(v0.18-adiri): remove the legacy node-record grace once the network is closed to pre-#1751 records.
+adiri = []
+
 [lints]
 workspace = true

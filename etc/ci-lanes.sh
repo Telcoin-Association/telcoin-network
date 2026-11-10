@@ -211,10 +211,13 @@ lane_test_adiri() {
     # tn-storage used to be left off here, on the grounds that two of its consensus_pack
     # tests failed under the adiri features. They pass now, so it is back. tn-engine
     # joined for #1247: with the mix-hash oracle dispatching on the fork gate, this lane
-    # is the only one that runs its pre-fork legacy arm.
+    # is the only one that runs its pre-fork legacy arm. tn-node-record and
+    # tn-network-libp2p carry the tests for the legacy node-record grace (pre-#1751 records
+    # from v0.16 nodes are dropped without a penalty).
     run cargo nextest run --locked \
         -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config \
-        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri \
+        -p tn-node-record -p tn-network-libp2p \
+        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri,tn-node-record/adiri,tn-network-libp2p/adiri \
         "${run_mode[@]}"
 }
 
