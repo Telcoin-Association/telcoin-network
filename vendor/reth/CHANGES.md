@@ -802,6 +802,23 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   under a one-block limit, a two-block range still passes, and `toBlock` alone below the tip fails
   with `-32602`). *Upstream*: n/a (upstream commit).
 
+- **TN-0071** — Backport 6d117042f: `trace_replayBlockTransactions` fills `vmTrace.code`.
+  *Kind*: backport (adapted).
+  *Files*: `crates/rpc/rpc/src/trace.rs` (`replay_block_transactions`; upstream's test
+  `replay_block_vmtrace_includes_root_and_callcode_bytecode` in the `tests` module without its
+  RPC-cache seeding, as TN-0066).
+  *Why*: a block replay with `vmTrace` left `code` empty in every frame, where
+  `trace_replayTransaction` of the same transaction filled it from the pre-state database (review
+  R26). Upstream fixes it with revm-inspectors' `into_trace_results_with_state_parts`, which
+  exists from 0.44 and not in the vendored 0.34 series (`patches/revm-inspectors` carries 0.34.3).
+  The vendored code uses the existing `into_trace_results_with_state` instead, which wants an
+  owned `ResultAndState`, so the `vmTrace` path clones the transaction's state changes; requests
+  without `vmTrace` keep the old path and copy nothing. The next revm-inspectors bump can take
+  upstream's line. RPC only.
+  *Tests*: upstream's `replay_block_vmtrace_includes_root_and_callcode_bytecode` (a root that
+  CALLCODEs a child, two transactions, three trace-type sets: the root's and child's code appear,
+  and each block entry equals the transaction's own replay). *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 
