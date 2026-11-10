@@ -19,7 +19,9 @@
 //!    the chain from genesis.
 //! 5. Compare every block from genesis across all six nodes.
 //! 6. Roll validator-1 back to PREV over the datadir CURRENT wrote; it must rejoin and close an
-//!    epoch with the others.
+//!    epoch with the others. Skipped when CURRENT migrated validator-1's reth database from MDBX to
+//!    tn-lmdb in phase 2 (its `db/mdbx-migrated` marker): the migration is one-way, and an MDBX
+//!    PREV cannot open the migrated database.
 //! 7. Stop the load and compare every block again, the rolled-back validator included.
 //!
 //! A light transfer load ([`drive_light_tx_load`]) runs on its own task through all four validators
@@ -93,6 +95,10 @@ const PREV_OBSERVER: &str = "observer-prev";
 
 /// The validator rolled back to PREV at the end: validator-1, the one that ran CURRENT longest.
 const ROLLBACK: usize = 0;
+
+/// The marker CURRENT's MDBX to tn-lmdb migration of a reth database leaves in `db/`
+/// (`tn_reth`'s `migrate_from_mdbx`): phase 6 has no rollback over it.
+const RETH_DB_MIGRATED_MARKER: &str = "mdbx-migrated";
 
 /// Bound on a started process answering RPC.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -1073,16 +1079,29 @@ async fn run_rolling_upgrade(
         net.nodes.len()
     ));
 
-    // phase 6: roll validator-1 back to PREV over the datadir CURRENT wrote
+    // phase 6: roll validator-1 back to PREV over the datadir CURRENT wrote, unless CURRENT
+    // migrated its reth database from MDBX to tn-lmdb: that move is one-way (tn-reth's README,
+    // "Database backend"), so an MDBX PREV refuses the migrated database or, from before the
+    // backend guard, starts a new one beside newer static files
     let phase = "phase 6 (rollback validator-1 to PREV)";
-    net.restart_validator(ROLLBACK, Release::Prev, phase).await?;
-    workload.round(&net.nodes[ROLLBACK].url, &chain).await.wrap_err(phase)?;
-    net.cross_epoch_boundary(phase).await?;
-    workload.round(&net.nodes[ROLLBACK].url, &chain).await.wrap_err(phase)?;
-    marks.push((
-        format!("{phase}, committee {}", net.committee()),
-        get_block_number(&net.nodes[1].url)?,
-    ));
+    let migrated =
+        net.temp_path.join(&net.nodes[ROLLBACK].name).join("db").join(RETH_DB_MIGRATED_MARKER);
+    if migrated.try_exists()? {
+        progress(format!(
+            "{phase}: skipped: CURRENT migrated validator-1's reth database from MDBX to tn-lmdb \
+             ({} exists), which has no rollback",
+            migrated.display()
+        ));
+    } else {
+        net.restart_validator(ROLLBACK, Release::Prev, phase).await?;
+        workload.round(&net.nodes[ROLLBACK].url, &chain).await.wrap_err(phase)?;
+        net.cross_epoch_boundary(phase).await?;
+        workload.round(&net.nodes[ROLLBACK].url, &chain).await.wrap_err(phase)?;
+        marks.push((
+            format!("{phase}, committee {}", net.committee()),
+            get_block_number(&net.nodes[1].url)?,
+        ));
+    }
 
     // phase 7: stop the load, let every node reach the same head, compare everything again
     let phase = "phase 7 (final compare)";
