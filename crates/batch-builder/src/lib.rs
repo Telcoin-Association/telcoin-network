@@ -167,6 +167,17 @@ impl Arrivals {
     /// Discard every notification already buffered, without waiting. Bounded by the pool's
     /// listener channel capacity; tokio's coop budget can also end it early, and whatever is
     /// left drains on the next wake-up.
+    ///
+    /// `now_or_never` polls with a noop waker, and the last poll of an empty channel leaves it
+    /// registered. That is safe only because every caller re-polls the stream in the run loop's
+    /// next `select!` before the task parks on it. The ack arm awaits the pool update between
+    /// its drain and that re-poll; a notification sent meanwhile wakes nobody, but it stays in
+    /// the channel and the real poll finds it.
+    ///
+    /// The pool keeps this listener when its channel (1024 slots by default, set by
+    /// `--txpool.max-new-txns`) is full and drops the notification instead (reth's
+    /// `TransactionListener::send_all`), so a full channel never ends the stream, and a dropped
+    /// notification costs at most one tick.
     fn drain(&mut self) {
         while let Some(Some(())) = self.0.next().now_or_never() {}
     }
@@ -680,8 +691,8 @@ impl BatchBuilder {
                 }
 
                 // a transaction entered any subpool (pending, queued or parked); polled while a
-                // build is in flight too, so the pool's bounded listener channel never fills, and
-                // drained so a burst is one wake
+                // build is in flight too and drained so a burst is one wake. The pool's listener
+                // channel is bounded and drops when full: a drop costs at most one tick
                 Some(()) = self.arrivals.0.next() => {
                     self.arrivals.drain();
                     // every admission defers, pending or not: the build waits for the fill delay
