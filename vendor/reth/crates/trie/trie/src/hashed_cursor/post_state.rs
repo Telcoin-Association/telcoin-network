@@ -217,20 +217,6 @@ where
         self.last_key = next_key;
     }
 
-    /// TN(TN-0106): repositions this layer for a seek behind its last key, or after it ran out.
-    ///
-    /// Upstream rewinds with `reset`, on a base without storage wipe markers. Here `reset` would
-    /// also clear a wiped storage's [`DbCursorState::Wiped`] and that of every layer below, so
-    /// the database's slots would show through. This rewinds the in-memory entries and lets the
-    /// layer below be seeked again, which its next operation does, and keeps a wipe.
-    fn rewind(&mut self) {
-        self.post_state_cursor.reset();
-        if !matches!(self.db_cursor_state, DbCursorState::Wiped) {
-            self.db_cursor_state = DbCursorState::NeedsPosition;
-        }
-        self.last_key = None;
-    }
-
     /// Positions the DB cursor state using the underlying cursor when needed.
     fn cursor_seek(&mut self, key: B256) -> Result<(), DatabaseError> {
         // Only seek if:
@@ -325,11 +311,6 @@ where
     /// The returned account key is memoized and the cursor remains positioned at that key until
     /// [`HashedCursor::seek`] or [`HashedCursor::next`] are called.
     fn seek(&mut self, key: B256) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
-        // Forward scans can reuse cursor positions; backward seeks and exhausted cursors cannot.
-        // TN(TN-0106): `rewind`, not upstream's `reset`: this base still has storage wipes.
-        if self.last_key.is_none_or(|last| key < last) {
-            self.rewind();
-        }
         let post_state_entry =
             self.post_state_cursor.seek(&key).copied().map(|(k, v)| (k, v.into_option()));
 
@@ -467,64 +448,6 @@ mod tests {
         let mut storages = alloy_primitives::map::B256Map::default();
         storages.insert(B256::ZERO, storage_sorted);
         HashedPostStateSorted::new(Vec::new(), storages)
-    }
-
-    /// Seeks `from`, then walks to the end.
-    fn walk<C: HashedCursor<Value = U256>>(cursor: &mut C, from: B256) -> Vec<(B256, U256)> {
-        let mut entries = Vec::new();
-        let mut entry = cursor.seek(from).unwrap();
-        while let Some(found) = entry {
-            entries.push(found);
-            entry = cursor.next().unwrap();
-        }
-        entries
-    }
-
-    fn db_cursor(entries: &[(u8, u64)]) -> MockHashedCursor<U256> {
-        let values = entries.iter().map(|(k, v)| (key(*k), U256::from(*v))).collect();
-        MockHashedCursor::new(Arc::new(values), Arc::new(Mutex::new(Vec::new())))
-    }
-
-    /// TN(TN-0106): a seek behind the last returned key, or after the cursor ran out, rewinds
-    /// the overlay and repositions the database below it (upstream 5868ee478).
-    #[test]
-    fn backward_seek_rewinds() {
-        let post_state = storage_post_state(vec![(key(1), U256::from(1)), (key(3), U256::from(3))]);
-        let mut cursor = HashedPostStateCursor::new_storage(
-            db_cursor(&[(2, 2), (4, 4)]),
-            &post_state,
-            B256::ZERO,
-        );
-        let all: Vec<_> = (1..=4).map(|i| (key(i), U256::from(i))).collect();
-
-        assert_eq!(cursor.seek(key(3)).unwrap(), Some(all[2]));
-        assert_eq!(cursor.next().unwrap(), Some(all[3]));
-        assert_eq!(walk(&mut cursor, key(1)), all, "seek behind the last returned key");
-        assert_eq!(walk(&mut cursor, key(2)), all[1..], "seek after the cursor ran out");
-    }
-
-    /// TN(TN-0106): rewinding keeps a wiped storage wiped, in the seeking layer and in every
-    /// layer below, so the database's slots stay hidden. Upstream's `reset` would not: its base
-    /// has no wipe markers.
-    #[test]
-    fn rewind_keeps_wiped_storage_wiped() {
-        let mut wiped = storage_post_state(vec![(key(3), U256::from(3))]);
-        wiped.storages.get_mut(&B256::ZERO).unwrap().wiped = true;
-        let newer = storage_post_state(vec![(key(4), U256::from(4))]);
-        let expected = vec![(key(3), U256::from(3)), (key(4), U256::from(4))];
-
-        // The wipe in the layer below the seeking one.
-        let lower =
-            HashedPostStateCursor::new_storage(db_cursor(&[(1, 1), (5, 5)]), &wiped, B256::ZERO);
-        let mut cursor = HashedPostStateCursor::new_storage(lower, &newer, B256::ZERO);
-        assert_eq!(walk(&mut cursor, B256::ZERO), expected);
-        assert_eq!(walk(&mut cursor, B256::ZERO), expected, "after a rewind");
-
-        // The wipe in the seeking layer.
-        let mut cursor =
-            HashedPostStateCursor::new_storage(db_cursor(&[(1, 1), (5, 5)]), &wiped, B256::ZERO);
-        assert_eq!(walk(&mut cursor, B256::ZERO), expected[..1]);
-        assert_eq!(walk(&mut cursor, B256::ZERO), expected[..1], "after a rewind");
     }
 
     #[test]
