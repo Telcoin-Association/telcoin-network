@@ -630,10 +630,19 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   | a marker whose layout disagrees with `storage_settings` | the row was changed without converting the data |
   | a v2 datadir without the marker | no TN build wrote it |
   | a v1 datadir whose static files hold a segment only v2 writes (senders, change sets) | another datadir's static files: a half-done swap |
+  | a v2 datadir whose static files hold headers but no senders segment, which v2 writes from genesis | a v1 datadir's static files: the other half-done swap; v2's consistency check would prune them to this database |
   | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
 
+  One state beside a database without a chain is healed instead: a creation stopped inside
+  genesis's commit. Genesis finalizes its static files before it commits the database, so a stop
+  between the two leaves TN's marker (committed first) and no `storage_settings` row in the
+  database, beside static files holding only this chain's genesis block. The open removes those
+  static files (headers last, so a stop part way is found again) and creates the datadir anew
+  (`holds_only_genesis`). With no marker, or anything past genesis, it refuses as above.
+
 - **Logs:** `new reth datadir: storage layout` or `reth datadir: storage layout` at each start, with
-  the layout.
+  the layout; an existing datadir in the other layout logs the warning `this reth datadir keeps its
+  storage layout` with `layout` and `new_datadirs` instead.
 
 ### Upgrading a testnet node
 

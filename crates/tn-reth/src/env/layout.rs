@@ -26,16 +26,21 @@
 //! - a marker of a format version this binary does not know (a newer binary wrote it);
 //! - a marker whose layout disagrees with `storage_settings`;
 //! - an existing v2 datadir without the marker (no TN build wrote it);
-//! - a v1 datadir whose static files hold v2-only segments (another datadir's static files);
+//! - a v1 datadir whose static files hold v2-only segments, or a v2 datadir whose static files hold
+//!   none (another datadir's static files);
 //! - static files holding a chain beside a database that holds none: reth's consistency check would
-//!   prune them down to the empty database.
+//!   prune them down to the empty database. The one exception is healed: a creation stopped inside
+//!   genesis's commit (TN's marker, no `storage_settings` row, static files holding only this
+//!   chain's genesis) is created again ([`holds_only_genesis`]).
 
 use std::fmt;
 
+use reth_chainspec::EthChainSpec as _;
 use reth_provider::{
-    providers::ProviderFactory, DBProvider as _, DatabaseProviderFactory as _,
-    MetadataProvider as _, MetadataWriter as _, StageCheckpointReader as _,
-    StaticFileProviderFactory as _, StaticFileSegment, StorageSettings, StorageSettingsCache as _,
+    providers::ProviderFactory, BlockHashReader as _, ChainSpecProvider as _, DBProvider as _,
+    DatabaseProviderFactory as _, MetadataProvider as _, MetadataWriter as _,
+    StageCheckpointReader as _, StaticFileProviderFactory as _, StaticFileSegment, StorageSettings,
+    StorageSettingsCache as _,
 };
 use reth_stages_types::StageId;
 use serde::{Deserialize, Serialize};
@@ -165,6 +170,10 @@ pub(super) fn settle(
     let sf_tip = static_files.get_highest_static_file_block(StaticFileSegment::Headers);
 
     let layout = match (db_tip, sf_tip) {
+        (None, Some(_)) if stored.is_none() && marker.is_some() && holds_only_genesis(factory)? => {
+            remove_unfinished_genesis(factory)?;
+            create(factory, requested)?
+        }
         (None, Some(sf_tip)) => eyre::bail!(
             "the reth database holds no chain, but its static files ({}) hold headers up to \
              block {sf_tip}: the database was removed or replaced, or the datadir's creation \
@@ -179,6 +188,43 @@ pub(super) fn settle(
     };
     factory.set_storage_settings_cache(layout.settings());
     Ok(layout)
+}
+
+/// Whether the datadir's static files hold this chain's genesis block and nothing past it: every
+/// segment ends at the genesis block or is empty, and the genesis header in them is the chain's.
+///
+/// With TN's marker and no `storage_settings` row in a database that holds no chain, that is a
+/// creation stopped inside genesis's commit: the marker commits first ([`create`]), then genesis
+/// finalizes its static files, then commits the database, writing reth's row and the checkpoints
+/// with the chain. The stop leaves only what genesis derives from the chain spec, so
+/// [`remove_unfinished_genesis`] can remove it and the open create the datadir again. Anything else
+/// beside an empty database is refused.
+fn holds_only_genesis(factory: &ProviderFactory<TelcoinNode>) -> eyre::Result<bool> {
+    let chain = factory.chain_spec();
+    let genesis = chain.genesis_header().number;
+    let static_files = factory.static_file_provider();
+    let past_genesis = StaticFileSegment::iter().any(|segment| {
+        static_files.get_highest_static_file_block(segment).is_some_and(|block| block > genesis)
+    });
+    if past_genesis {
+        return Ok(false);
+    }
+    Ok(static_files.block_hash(genesis)? == Some(chain.genesis_hash()))
+}
+
+/// Remove the static files a creation stopped inside genesis's commit left
+/// ([`holds_only_genesis`]), so genesis can write them again. The headers go last: until they are
+/// gone the next open finds the same state and removes the rest again.
+fn remove_unfinished_genesis(factory: &ProviderFactory<TelcoinNode>) -> eyre::Result<()> {
+    let static_files = factory.static_file_provider();
+    warn!(target: "tn::reth", dir = %static_files.directory().display(), "the reth datadir's creation stopped before genesis committed: removing its genesis static files to create it again");
+    let headers_last = StaticFileSegment::iter()
+        .filter(|segment| *segment != StaticFileSegment::Headers)
+        .chain([StaticFileSegment::Headers]);
+    for segment in headers_last {
+        static_files.delete_segment(segment)?;
+    }
+    Ok(())
 }
 
 /// The layout a `storage_settings` row records, or `None` without the row. A row that does not
@@ -279,8 +325,9 @@ fn existing(
             info!(target: "tn::reth", %layout, version = TN_LAYOUT_VERSION, "recorded TN's storage layout marker in an existing reth datadir");
         }
     }
-    if layout == StorageLayout::V1 {
-        refuse_v2_segments(factory)?;
+    match layout {
+        StorageLayout::V1 => refuse_v2_segments(factory)?,
+        StorageLayout::V2 => refuse_v1_static_files(factory)?,
     }
     if layout == requested {
         info!(target: "tn::reth", %layout, "reth datadir: storage layout");
@@ -314,6 +361,27 @@ fn refuse_v2_segments(factory: &ProviderFactory<TelcoinNode>) -> eyre::Result<()
              `static_files`, or swap `db` and `static_files` together",
             static_files.directory().display(),
             found.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse the static files of a v2 datadir that hold headers but no transaction senders segment,
+/// which v2's genesis always writes (`init_genesis_with_settings`), and before the database
+/// commit: they are a v1 datadir's (a half-done swap of `db` and `static_files`), and v2's
+/// consistency check would prune their headers and transactions to this database's checkpoints.
+fn refuse_v1_static_files(factory: &ProviderFactory<TelcoinNode>) -> eyre::Result<()> {
+    let static_files = factory.static_file_provider();
+    let headers = static_files.get_highest_static_file_block(StaticFileSegment::Headers);
+    let senders = static_files.get_highest_static_file_block(StaticFileSegment::TransactionSenders);
+    if let (Some(headers), None) = (headers, senders) {
+        eyre::bail!(
+            "the reth database is in storage layout v2, but its static files ({}) hold headers up \
+             to block {headers} and no {} segment, which every v2 datadir has from genesis: they \
+             belong to a v1 datadir. Restore this datadir's own `static_files`, or swap `db` and \
+             `static_files` together",
+            static_files.directory().display(),
+            StaticFileSegment::TransactionSenders,
         );
     }
     Ok(())
@@ -617,6 +685,95 @@ mod tests {
         Ok(())
     }
 
+    /// The datadir a creation stopped inside genesis's commit leaves in `path`: a database holding
+    /// only TN's marker (it commits before genesis), beside the static files genesis finalized
+    /// before its database commit. The static files are copied from a datadir of `chain` with
+    /// `blocks` executed blocks (0: genesis only), and the marker is written unless `marker` is
+    /// false. Returns the static files' listing.
+    fn stopped_inside_genesis(
+        chain: &Arc<RethChainSpec>,
+        path: &Path,
+        blocks: u64,
+        marker: bool,
+    ) -> eyre::Result<Vec<(String, u64)>> {
+        use reth_db::{transaction::DbTx as _, Database as _};
+
+        let layout = crate::env::genesis::temp_chain_new_datadir_layout()?;
+        let source = path.with_extension("source");
+        with_env(chain, &source, layout, |env| {
+            let mut parent = chain.sealed_genesis_header();
+            for number in 1..=blocks {
+                let output = consensus_output_for_tests(2 * number as u32, 0, number, false);
+                let payload = TNPayload::new_for_test(parent, &output);
+                let executed = execute_payload_and_update_canonical_chain(env, payload, vec![])?;
+                parent = executed.recovered_block.clone_sealed_header();
+            }
+            Ok(())
+        })?;
+        let config = RethConfig::from_node_config(reth_node_core::node_config::NodeConfig {
+            chain: chain.clone(),
+            db: crate::env::database::temp_chain_db_args(),
+            ..Default::default()
+        });
+        let database = RethEnv::new_database(&config, path)?;
+        if marker {
+            let tx = database.tx_mut()?;
+            tx.put::<tables::Metadata>(
+                TN_LAYOUT_KEY.to_string(),
+                LayoutMarker::current(layout).to_bytes()?,
+            )?;
+            tx.commit()?;
+        }
+        drop(database);
+        copy_tree(&source.join("static_files"), &path.join("static_files"), &[])?;
+        Ok(listing(&path.join("static_files")))
+    }
+
+    /// A creation stopped inside genesis's commit (TN's marker, no `storage_settings` row, the
+    /// static files holding only genesis) is created again at the next open: its genesis static
+    /// files are removed and written again, and the datadir runs on.
+    #[tokio::test]
+    async fn a_creation_stopped_inside_genesis_is_created_again() -> eyre::Result<()> {
+        let chain = chain();
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("datadir");
+        stopped_inside_genesis(&chain, &path, 0, true)?;
+        let layout = crate::env::genesis::temp_chain_new_datadir_layout()?;
+
+        with_env(&chain, &path, layout, |env| {
+            assert_eq!(recorded(env)?, (Some(layout), Some(LayoutMarker::current(layout))));
+            assert_eq!(env.last_block_number()?, 0);
+            let output = consensus_output_for_tests(2, 0, 1, false);
+            let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+            execute_payload_and_update_canonical_chain(env, payload, vec![])?;
+            assert_eq!(env.last_block_number()?, 1);
+            Ok(())
+        })?;
+        with_env(&chain, &path, layout, |env| {
+            assert_eq!(env.last_block_number()?, 1, "a normal reopen");
+            Ok(())
+        })
+    }
+
+    /// Only that state is healed. Beside a database that holds no chain the open refuses, and
+    /// leaves the static files as they were, when the database has no marker (no TN build was
+    /// creating it: the database was replaced) or the static files hold a block past genesis.
+    #[tokio::test]
+    async fn static_files_past_genesis_or_without_the_marker_stay_refused() -> eyre::Result<()> {
+        let chain = chain();
+        let tmp = TempDir::new()?;
+        let layout = crate::env::genesis::temp_chain_new_datadir_layout()?;
+        for (name, blocks, marker) in [("no-marker", 0, false), ("past-genesis", 1, true)] {
+            let path = tmp.path().join(name);
+            let before = stopped_inside_genesis(&chain, &path, blocks, marker)?;
+            let err = open_err(&chain, &path, layout);
+            assert!(err.contains("holds no chain, but its static files"), "{name}: {err}");
+            assert!(err.contains(&format!("headers up to block {blocks}")), "{name}: {err}");
+            assert_eq!(listing(&path.join("static_files")), before, "{name}: left as they were");
+        }
+        Ok(())
+    }
+
     /// A v1 datadir whose static files hold a segment only v2 writes (another datadir's static
     /// files) is refused.
     #[tokio::test]
@@ -634,5 +791,66 @@ mod tests {
         assert!(err.contains("hold segments only v2 writes"), "{err}");
         assert!(err.contains("AccountChangeSets up to block 0"), "{err}");
         Ok(())
+    }
+
+    /// Copy the directory tree `from` into `to`, leaving out the entries named in `skip`.
+    fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> eyre::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if skip.iter().any(|s| name == *s) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &to.join(&name), &[])?;
+            } else {
+                std::fs::copy(entry.path(), to.join(&name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A v2 database beside a v1 datadir's static files (the other half-done swap) is refused
+    /// before reth's consistency check, which would prune the static files' two blocks to the
+    /// database's one: the static files are left as they were.
+    #[cfg(not(feature = "mdbx"))]
+    #[tokio::test]
+    async fn v1_static_files_beside_a_v2_database_are_refused() -> eyre::Result<()> {
+        let chain = chain();
+        let tmp = TempDir::new()?;
+        let (v1, v2, swapped) =
+            (tmp.path().join("v1"), tmp.path().join("v2"), tmp.path().join("swapped"));
+        for (path, layout, blocks) in [(&v1, StorageLayout::V1, 2), (&v2, StorageLayout::V2, 1)] {
+            with_env(&chain, path, layout, |env| {
+                let mut parent = chain.sealed_genesis_header();
+                for number in 1..=blocks {
+                    let output = consensus_output_for_tests(2 * number as u32, 0, number, false);
+                    let payload = TNPayload::new_for_test(parent, &output);
+                    let executed =
+                        execute_payload_and_update_canonical_chain(env, payload, vec![])?;
+                    parent = executed.recovered_block.clone_sealed_header();
+                }
+                assert_eq!(env.last_block_number()?, blocks);
+                Ok(())
+            })?;
+        }
+        // a temp chain keeps its database files in the datadir's root, beside `static_files`
+        copy_tree(&v2, &swapped, &["static_files"])?;
+        copy_tree(&v1.join("static_files"), &swapped.join("static_files"), &[])?;
+        let before = listing(&swapped.join("static_files"));
+
+        let err = open_err(&chain, &swapped, StorageLayout::V2);
+        assert!(err.contains("storage layout v2, but its static files"), "{err}");
+        assert!(
+            err.contains("headers up to block 2") && err.contains("TransactionSenders"),
+            "{err}"
+        );
+        assert_eq!(listing(&swapped.join("static_files")), before, "left as they were");
+        // the v2 datadir's own static files open
+        with_env(&chain, &v2, StorageLayout::V2, |env| {
+            assert_eq!(env.last_block_number()?, 1);
+            Ok(())
+        })
     }
 }
