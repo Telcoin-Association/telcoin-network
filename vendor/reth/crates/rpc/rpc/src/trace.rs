@@ -571,11 +571,15 @@ where
         block_id: BlockId,
         trace_types: HashSet<TraceType>,
     ) -> Result<Option<Vec<TraceResultsWithTransactionHash>>, Eth::Error> {
+        let Some(block) = self.eth_api().recovered_block(block_id).await? else {
+            return Err(EthApiError::HeaderNotFound(block_id).into());
+        };
+
         let permit = self.trace_task_permit().await?;
         self.eth_api()
             .trace_block_with(
                 block_id,
-                None,
+                Some(block),
                 TracingInspectorConfig::from_parity_config(&trace_types),
                 move |tx_info, mut ctx| {
                     let _permit = &permit;

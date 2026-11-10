@@ -17,7 +17,7 @@ Telcoin Network has no block or uncle rewards, so these traces never include `re
 
 #### Returns
 
-`Array` - One object per transaction, or `null` when the node does not know the block. A block without transactions returns `[]`. Each object has:
+`Array` - One object per transaction. A block without transactions returns `[]`, and a block the node does not know fails with `-32001` and a `block not found` message. Each object has:
 
 * `output`: `DATA` - The return data of the top-level call; `0x` for a plain transfer.
 * `stateDiff`: `Object` - With `stateDiff` requested, the state changes keyed by account address; otherwise `null`. Each account has `balance`, `code`, `nonce` and `storage` (keyed by slot). Each value is `"="` when unchanged, `{"+": value}` when created, `{"-": value}` when removed, or `{"*": {"from": old, "to": new}}` when changed.

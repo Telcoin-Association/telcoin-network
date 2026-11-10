@@ -819,6 +819,19 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   CALLCODEs a child, two transactions, three trace-type sets: the root's and child's code appear,
   and each block entry equals the transaction's own replay). *Upstream*: n/a (upstream commit).
 
+- **TN-0072** — Backport 4e1a5574e: `trace_replayBlockTransactions` fails on an unknown block.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/trace.rs` (`replay_block_transactions` looks the block up before
+  taking its TN-0038 permit, so a miss costs no permit), `crates/rpc/rpc-builder/tests/it/http.rs`
+  (upstream's smoke-test change; the vendored test already expected an error).
+  *Why*: a replay of a block the node does not know answered `null`, where `trace_block` and the
+  `debug` block tracers fail (review R26). It now fails with `-32001` and a `block not found`
+  message, as upstream does; `docs/src/rpc-methods/trace/trace_replayblocktransactions.md`
+  records it. RPC only.
+  *Tests*: the `rpc-builder` trace smoke tests (`test_call_trace_functions_*`) expect the error;
+  `replay_block_vmtrace_includes_root_and_callcode_bytecode` covers the known-block path.
+  *Upstream*: n/a (upstream commit).
+
 
 ## TN fixes (not from an upstream commit)
 
