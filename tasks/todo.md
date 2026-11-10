@@ -478,7 +478,9 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
     carried change and its retire note. Docs: struct logger pages say the cap, `debug/README.md`.
 
 ### Step 4: pool
-- [ ] R7 nonce-continuity in the batch builder (TN side); R11 + T2-1 notes recorded in open-issues
+- [x] R7 nonce-continuity in the batch builder (TN side: `WorkerTxPool::best_transactions` calls
+      `no_updates()`, so a build packs the pending set as of its start); R11 + the two T2-1 notes
+      recorded under O3 in `vendor/reth/tn/notes/open-issues.md`
 
 ### Step 5: trie and storage (fork checks)
 - [ ] R12 `code_by_hash_ref` error; R15 8f5efd2b3; R16; R17

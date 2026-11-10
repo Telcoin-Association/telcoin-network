@@ -60,6 +60,22 @@ unpaid tip. Skipped copies add nothing to `gas_used`, so the base fee does not r
   `retry_forwarded` (`txn_pool.rs`), and a quorum batch whose header never commits. A canonical
   update for an earlier block that touches the sender also lowers the tracked nonce again
   (`txpool.rs`), so a complete fix makes that update monotonic. Needs the batch-builder owners.
+- Design notes from the 2026-11-08 review, for the TN half (`tasks/t2-1-plan.md`):
+  - R11, the RPC-visible symptom: with two of a sender's batches in flight (nonces k and k+1
+    certified, tracked nonce k+2), the canonical update for the first batch overwrites the
+    tracked nonce to k+1; `get_highest_consecutive_transaction_by_sender` then stops at the gap
+    and `eth_getTransactionCount(pending)` falls back to the on-chain k+1 until the second batch
+    executes. A wallet that signs k+1 again in that round produces a duplicate the pool admits
+    and execution skips for free, the T2-1 mechanism. The floor/clamp design (tracked nonce
+    monotonic while a quorum batch is unexecuted) covers it; a narrower stop-gap in TN's wrapper
+    iterates from the pool's lowest nonce for the sender when it is above the tracked one.
+  - With `enforce_tracked_nonce` on, a sender whose only transactions were orphaned keeps an
+    advanced tracked nonce that `unique_senders()` cannot surface, so the epoch-start reload
+    misses it and the orphan repool is refused with `NonceNotConsistent` and the batch deleted
+    from the cache; the pool needs a `sender_info` accessor or reset entry point (the observer
+    requeue has the same gap).
+  - `keep_sender_info` makes `sender_info` insert-only, one entry per sender ever admitted (the
+    growth class of `SenderIdentifiers`); prune on floor release.
 
 ## RocksDB stubs and storage-v2 plumbing
 
