@@ -7,9 +7,13 @@
 //! tracked, so a fault both layouts share fails too.
 
 use crate::{
-    test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
+    test_utils::{
+        create_test_provider_factory, create_test_provider_factory_with_blocks_per_file,
+        MockNodeTypesWithDB,
+    },
     BlockExecutionWriter, ChangeSetReader, HistoricalStateProviderRef, HistoryWriter,
-    ProviderFactory, SaveBlocksMode, StorageChangeSetReader, TransactionsProvider,
+    ProviderFactory, SaveBlocksMode, StaticFileProviderFactory, StorageChangeSetReader,
+    TransactionsProvider,
 };
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
@@ -26,6 +30,7 @@ use reth_db_api::{
 use reth_ethereum_primitives::{Block, Receipt, TransactionSigned};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::{Account, BlockBody as _, SealedBlock, SealedHeader};
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{AccountReader, DBProvider, StateProvider, StorageSettingsCache};
 use reth_testing_utils::generators::{self, random_block, BlockParams};
 use reth_trie::{HashedPostState, KeccakKeyHasher};
@@ -46,6 +51,9 @@ const SLOTS: u64 = 5;
 const TIP: BlockNumber = 12;
 /// The `save_blocks` calls, so the chain has single and multi-block saves.
 const BATCHES: [RangeInclusive<BlockNumber>; 4] = [1..=3, 4..=4, 5..=9, 10..=12];
+/// Blocks per static file in the tests across static files: the chain spans four files, and the
+/// batches `5..=9` and `10..=12` each cross into a new one.
+const BLOCKS_PER_FILE: u64 = 4;
 /// An account, by last address byte, that block 2 creates without storage and block
 /// [`RECREATED_AT`] destroys and re-creates with [`RECREATED_SLOT`] set to 7: a storage wipe
 /// with a slot revert of `Destroyed`. `address(ACCOUNTS)` is the account nothing touches.
@@ -87,6 +95,9 @@ struct Chain {
     blocks: Vec<ExecutedBlock>,
     states: Vec<Snapshot>,
     txs: Vec<(TxHash, TxNumber, TransactionSigned)>,
+    /// Blocks per static file of the factories [`Self::save`] makes; `None` for reth's default,
+    /// which holds the whole chain in one file per segment.
+    blocks_per_file: Option<u64>,
 }
 
 impl Chain {
@@ -226,7 +237,14 @@ impl Chain {
             states.push(state.clone());
         }
 
-        Self { blocks, states, txs }
+        Self { blocks, states, txs, blocks_per_file: None }
+    }
+
+    /// TN(TN-0115): the same chain, saved into factories with [`BLOCKS_PER_FILE`] blocks per
+    /// static file.
+    const fn across_static_files(mut self) -> Self {
+        self.blocks_per_file = Some(BLOCKS_PER_FILE);
+        self
     }
 
     /// The blocks of one batch.
@@ -236,7 +254,12 @@ impl Chain {
 
     /// A factory with genesis and the batches that end at or below `tip`.
     fn save(&self, settings: StorageSettings, tip: BlockNumber) -> Factory {
-        let factory = create_test_provider_factory();
+        let factory = match self.blocks_per_file {
+            Some(blocks_per_file) => {
+                create_test_provider_factory_with_blocks_per_file(blocks_per_file)
+            }
+            None => create_test_provider_factory(),
+        };
         factory.set_storage_settings_cache(settings);
         self.save_batches(&factory, 0..=0);
         for range in BATCHES.iter().filter(|range| *range.end() <= tip) {
@@ -384,12 +407,44 @@ fn assert_tx_lookups(factory: &Factory, chain: &Chain, tip: BlockNumber) {
     }
 }
 
+/// The files of `segment` that hold blocks `0..=tip`, each of which must be on disk.
+fn segment_files(factory: &Factory, segment: StaticFileSegment, tip: BlockNumber) -> usize {
+    let static_files = factory.static_file_provider();
+    let mut ranges: Vec<_> =
+        (0..=tip).map(|block| static_files.find_fixed_range(segment, block)).collect();
+    ranges.dedup();
+    for range in &ranges {
+        let path = static_files.path().join(segment.filename(range));
+        assert!(path.exists(), "{segment:?}: no {}", path.display());
+    }
+    ranges.len()
+}
+
 /// The three ex-`RocksDB` tables are written under v2, identical to v1's, and every historical
 /// read, changeset and transaction lookup agrees with v1 and with the generated state, including
 /// those of an account whose storage a block wiped.
 #[test]
 fn v2_matches_v1_on_a_generated_chain() {
-    let chain = Chain::generate();
+    assert_v2_matches_v1(&Chain::generate());
+}
+
+/// TN(TN-0115): the same with the chain spread over several static files, so the v2 history reads
+/// resolve their changesets in different files.
+#[test]
+fn v2_matches_v1_across_static_files() {
+    let chain = Chain::generate().across_static_files();
+    let v2 = assert_v2_matches_v1(&chain);
+    for segment in [
+        StaticFileSegment::Headers,
+        StaticFileSegment::AccountChangeSets,
+        StaticFileSegment::StorageChangeSets,
+    ] {
+        assert_eq!(segment_files(&v2, segment, TIP), 4, "{segment:?}");
+    }
+}
+
+/// Saves `chain` into a v1 and a v2 factory and compares them; returns the v2 factory.
+fn assert_v2_matches_v1(chain: &Chain) -> Factory {
     let v1 = chain.save(StorageSettings::v1(), TIP);
     let v2 = chain.save(StorageSettings::v2(), TIP);
 
@@ -405,9 +460,9 @@ fn v2_matches_v1_on_a_generated_chain() {
     assert_eq!(bytecodes.len(), 1, "v2 Bytecodes: {bytecodes:?}");
     assert_eq!(bytecodes, rows::<tables::Bytecodes>(&v1), "Bytecodes differ between v1 and v2");
     assert_eq!(changesets(&v2, TIP), changesets(&v1, TIP), "changesets differ between v1 and v2");
-    assert_eq!(historical_reads(&v2, &chain, TIP), historical_reads(&v1, &chain, TIP));
-    assert_tx_lookups(&v1, &chain, TIP);
-    assert_tx_lookups(&v2, &chain, TIP);
+    assert_eq!(historical_reads(&v2, chain, TIP), historical_reads(&v1, chain, TIP));
+    assert_tx_lookups(&v1, chain, TIP);
+    assert_tx_lookups(&v2, chain, TIP);
 
     // TN(TN-0043): the wipe block is the re-created slot's only history entry, so a read after
     // it finds the value only if the wiped account's slot revert made it into the history.
@@ -417,6 +472,7 @@ fn v2_matches_v1_on_a_generated_chain() {
         let slot = state.storage(address(RECREATED), B256::from(RECREATED_SLOT)).unwrap();
         assert_eq!(slot, Some(U256::from(7)), "the re-created slot after the wipe");
     }
+    v2
 }
 
 /// Removing blocks with `remove_block_and_execution_above` leaves the tables a save of the
@@ -424,7 +480,17 @@ fn v2_matches_v1_on_a_generated_chain() {
 /// again rebuilds the full chain's tables, in both layouts.
 #[test]
 fn v2_history_unwind_round_trip() {
-    let chain = Chain::generate();
+    assert_unwind_round_trip(&Chain::generate());
+}
+
+/// TN(TN-0115): the same with the chain spread over several static files, so the unwind deletes
+/// whole files and shortens another, and the re-save opens new files again.
+#[test]
+fn v2_history_unwind_round_trip_across_static_files() {
+    assert_unwind_round_trip(&Chain::generate().across_static_files());
+}
+
+fn assert_unwind_round_trip(chain: &Chain) {
     let keep = 4;
     for settings in [StorageSettings::v1(), StorageSettings::v2()] {
         let full = chain.save(settings, TIP);
@@ -436,16 +502,34 @@ fn v2_history_unwind_round_trip() {
 
         assert_eq!(index_tables(&full), index_tables(&short), "{settings:?}: unwound tables");
         assert_eq!(changesets(&full, keep), changesets(&short, keep), "{settings:?}");
-        historical_reads(&full, &chain, keep);
-        assert_tx_lookups(&full, &chain, keep);
+        historical_reads(&full, chain, keep);
+        assert_tx_lookups(&full, chain, keep);
+        if chain.blocks_per_file.is_some() {
+            let static_files = full.static_file_provider();
+            let mut segments = vec![StaticFileSegment::Headers];
+            if settings.storage_v2 {
+                segments.extend([
+                    StaticFileSegment::AccountChangeSets,
+                    StaticFileSegment::StorageChangeSets,
+                ]);
+            }
+            for segment in segments {
+                let last = static_files
+                    .path()
+                    .join(segment.filename(&static_files.find_fixed_range(segment, TIP)));
+                assert!(!last.exists(), "{settings:?} {segment:?}: {} kept", last.display());
+                assert_eq!(segment_files(&full, segment, keep), 2, "{settings:?} {segment:?}");
+                assert_eq!(static_files.get_highest_static_file_block(segment), Some(keep));
+            }
+        }
 
         for range in BATCHES.iter().filter(|range| *range.start() > keep) {
             chain.save_batches(&full, range.clone());
         }
         let rebuilt = chain.save(settings, TIP);
         assert_eq!(index_tables(&full), index_tables(&rebuilt), "{settings:?}: re-saved tables");
-        historical_reads(&full, &chain, TIP);
-        assert_tx_lookups(&full, &chain, TIP);
+        historical_reads(&full, chain, TIP);
+        assert_tx_lookups(&full, chain, TIP);
     }
 }
 

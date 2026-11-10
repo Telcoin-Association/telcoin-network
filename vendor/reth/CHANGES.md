@@ -856,3 +856,26 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
   effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
   yes.
+
+- **TN-0115** — Tests: storage v2 across static-file boundaries. *Kind*: test.
+  *Files*: `crates/storage/provider/src/test_utils/mod.rs` (new
+  `create_test_provider_factory_with_blocks_per_file`),
+  `.../providers/database/tn_v2_tests.rs` (`Chain::across_static_files`,
+  `v2_matches_v1_across_static_files`, `v2_history_unwind_round_trip_across_static_files`),
+  `.../providers/database/provider.rs` (`run_save_blocks_without_db_commit_heals` takes a
+  blocks-per-file setting; `test_save_blocks_without_db_commit_heals_across_files_v2`).
+  *Why*: every v2 test held its chain in one static file per segment (500k blocks per file
+  against a 12-block chain), so nothing exercised a v2 changeset lookup in a later file, an
+  unwind or heal that deletes files, or a save that rotates files in the segment threads
+  (TN-0051). The TN-0045 differential and unwind round trip now also run with 4 blocks per file
+  (four files; the `5..=9` and `10..=12` batches each cross into a new one); the unwind must
+  delete the later files, leave two, and read the shorter chain, and the re-save must rebuild the
+  full chain's tables. The aborted save of TN-0051 runs with 2 blocks per file under v2: blocks
+  1 to 3 rotate every segment into a new file with a new `.csoff`; the heal on reopen must delete
+  the new files with every satellite file and shorten the old ones to genesis, and the blocks
+  must save again. A rotation commits the filled file during the save (`increment_block`), so
+  the reader index reaches block 1 before the database commit; the test pins that (it is the
+  index's state, not the new file's). *Tests*: the across-files differential and unwind fail when
+  `SegmentHeader::changeset_offset_index` ignores the file's first block (the single-file ones
+  pass), the unwind when `truncate_changesets` stops deleting files, and the aborted save when
+  `NippyJar::delete` leaves a file's configuration behind. *Upstream*: n/a.
