@@ -501,7 +501,10 @@ impl<N> StaticFileProviderInner<N> {
 /// long as the read cost stays below the benches' noise.
 pub const fn checksummed_segment(segment: StaticFileSegment) -> bool {
     match segment {
-        StaticFileSegment::AccountChangeSets | StaticFileSegment::StorageChangeSets => true,
+        // Mandatory.
+        StaticFileSegment::AccountChangeSets |
+        StaticFileSegment::StorageChangeSets |
+        // The default for the rest; a segment leaves this list if its reads show the cost.
         StaticFileSegment::Headers |
         StaticFileSegment::Transactions |
         StaticFileSegment::Receipts |

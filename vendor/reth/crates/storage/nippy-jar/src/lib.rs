@@ -98,7 +98,7 @@ pub const fn value_seed(row: u64, column: usize) -> u32 {
 }
 
 /// TN(TN-0120): the CRC-32 (ISO-HDLC) of `bytes` from the initial value `seed` (crc32fast's
-/// convention). On x86_64 below 128 bytes crc32fast runs a byte-at-a-time loop, so these inputs
+/// convention). On `x86_64` below 128 bytes crc32fast runs a byte-at-a-time loop, so these inputs
 /// take the `crc` crate's slice-by-16 table instead; both give the same value.
 pub fn checksum(seed: u32, bytes: &[u8]) -> u32 {
     if cfg!(target_arch = "x86_64") && bytes.len() < 128 {
@@ -108,7 +108,7 @@ pub fn checksum(seed: u32, bytes: &[u8]) -> u32 {
     }
 }
 
-/// [`checksum`] through crc32fast: hardware CRC on aarch64, PCLMULQDQ on x86_64 from 128 bytes.
+/// [`checksum`] through crc32fast: hardware CRC on aarch64, PCLMULQDQ on `x86_64` from 128 bytes.
 fn checksum_crc32fast(seed: u32, bytes: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new_with_initial(seed);
     hasher.update(bytes);
@@ -1791,7 +1791,7 @@ mod tests {
     }
 
     /// TN(TN-0120): nanoseconds per checksum by value size, for each implementation. Prints a
-    /// table; the x86_64 rows decide the 128-byte switch in [`checksum`].
+    /// table; the `x86_64` rows decide the 128-byte switch in [`checksum`].
     #[test]
     #[ignore = "heavy: run with --release"]
     fn checksum_cost_heavy() {
