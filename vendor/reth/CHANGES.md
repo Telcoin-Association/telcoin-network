@@ -1274,3 +1274,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   empty code and diverged. No manifest or feature change (`graph.py diff` clean).
   *Tests*: `missing_bytecode_is_an_error_except_for_the_empty_code` over a `NoopProvider`.
   *Upstream*: candidate (reth main still returns empty code).
+
+- **TN-0083** — A first launch interrupted between the two genesis commits resumes.
+  *Kind*: fix.
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`,
+  `database_is_empty`; tests `init_genesis_resumes_after_a_torn_first_launch`,
+  `init_genesis_refuses_a_partly_written_database`).
+  *Why*: genesis initialization writes the genesis header to static files and everything else to
+  MDBX, and the commit finalizes the static files before the MDBX transaction. A crash between the
+  two left `block_hash(0)` set with no Headers checkpoint, and every restart returned
+  `UninitializedDatabase` until the operator deleted the datadir (review R17). When the database
+  holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
+  resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
+  written. A database with any checkpoint but not the Headers one is still refused.
+  *Storage path*: yes (`db-common` holds genesis init). The data written is unchanged: the same
+  header, state, trie and checkpoints as a clean first launch, since the resumed path is the
+  ordinary write path minus the header append. A datadir that already has chain data never
+  reaches it (its checkpoints exist). No manifest or feature change.
+  *Tests*: `init_genesis_resumes_after_a_torn_first_launch` (header in static files, MDBX
+  transaction dropped; init succeeds and writes the checkpoints; the next init is the ordinary
+  skip), `init_genesis_refuses_a_partly_written_database`.
+  *Upstream*: candidate.

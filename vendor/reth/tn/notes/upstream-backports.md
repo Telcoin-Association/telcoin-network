@@ -160,6 +160,8 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## TN-side hardening (not upstream fixes)
 
+- **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
+  files and an empty database writes the MDBX half instead of failing forever (review R17).
 - **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
   returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
   healthy database.
