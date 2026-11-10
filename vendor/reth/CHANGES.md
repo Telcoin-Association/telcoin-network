@@ -1177,3 +1177,35 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   file leaves the jar whole and loadable). Mutation-checked: no leftover truncation, no
   missing-file refusal, the sidecar removed before the jar. *Upstream*: yes (the `TODO(joshie)` in
   `NippyJar::delete`).
+
+- **TN-0133** — A jar missing between two others of its segment is refused at startup, and a
+  read that lands in such a gap is an error. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
+  tn_checksum_tests.rs, tn_crash_tests.rs}` (`StaticFileProvider::check_contiguity`, called by
+  `check_file_consistency` and `check_consistency`; `gap_at`, used by `account_block_changeset`,
+  `storage_changeset` and `fetch_range_with_predicate`; `StaticFileGapError`; tests),
+  `crates/storage/provider/src/providers/{mod.rs, database/tn_v2_tests.rs}`.
+  *Why*: the index is built from the directory listing with no check that a segment's jars are
+  contiguous, and a block in a gap maps to the next jar's range (`find_fixed_range_with_block_index`),
+  whose jar answers "absent". Point history reads already failed closed (`*ChangesetNotFound`),
+  but the changeset range walks (`from_reverts`, historical proofs and state roots) returned the
+  gap's blocks as empty changesets, and `fetch_range_with_predicate` (headers, transactions,
+  receipts, senders) returned the rows before the gap as the whole answer. A missing file is
+  invisible to the checksums. Now `check_contiguity` lists each segment's jars and errors when
+  one does not start right after the one below it (a jar missing, or one below the highest not
+  full); TN runs it at every start through `ProviderFactory::check_consistency`, before any heal,
+  and refuses to start. Only the joins between present jars are checked, not where the lowest jar
+  starts: history expiry deletes the lowest jars first (`delete_segment_below_block`), and the
+  index's own build stays as upstream's. Behind it, a block or transaction the index sends to a
+  jar that does not hold it, while a lower jar exists, is `StaticFileGapError::Number` in the
+  block changeset reads (so the range walks) and in `fetch_range_with_predicate`; numbers below
+  the lowest jar keep upstream's answers. It cannot reach execution: contiguous files read as
+  before. *Tests*: `a_jar_missing_between_two_others_is_refused` (headers, transactions and
+  account changesets without their middle jar, both formats: the startup check names the two
+  jars around the gap, range reads across it error, reads beside it answer; the lowest jars
+  deleted instead are no gap and read as before),
+  `v2_history_read_without_its_changeset_jar_fails_closed` (TN-0123's, extended: the account and
+  storage changeset walks across the missing jar error, and `ProviderFactory::check_consistency`
+  refuses). Mutation-checked: no startup
+  check, no gap error in the changeset reads, in the range fetch, or in its transaction arm.
+  *Upstream*: maybe (the contiguity check; upstream's history expiry keeps a contiguous suffix).

@@ -512,6 +512,49 @@ pub const fn checksummed_segment(segment: StaticFileSegment) -> bool {
     }
 }
 
+/// TN(TN-0133): a segment's static files skip blocks between two of its jars: a jar is missing,
+/// or one below the highest is not full. Its blocks would read as absent.
+#[derive(Debug)]
+pub enum StaticFileGapError {
+    /// Found at startup ([`StaticFileProvider::check_contiguity`]): `after` does not start right
+    /// after `before`.
+    Jars {
+        /// The segment.
+        segment: StaticFileSegment,
+        /// The lower jar's block range.
+        before: SegmentRangeInclusive,
+        /// The next jar's block range.
+        after: SegmentRangeInclusive,
+    },
+    /// Found by a read: no jar holds `number` (a block, or a transaction of a transaction
+    /// segment), though the segment has jars below and above it.
+    Number {
+        /// The segment.
+        segment: StaticFileSegment,
+        /// The block or transaction.
+        number: u64,
+    },
+}
+
+impl core::fmt::Display for StaticFileGapError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Jars { segment, before, after } => write!(
+                f,
+                "{segment} static files skip blocks: the jar with blocks {after} does not follow \
+                 the one with blocks {before} (a jar is missing or incomplete)"
+            ),
+            Self::Number { segment, number } => write!(
+                f,
+                "{segment} static files have no jar for {number}, though they have jars below \
+                 and above it (a jar is missing)"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for StaticFileGapError {}
+
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
     /// Creates a new [`StaticFileProviderInner`].
     fn new(path: impl AsRef<Path>, access: StaticFileAccess) -> ProviderResult<Self> {
@@ -1533,6 +1576,71 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Ok(())
     }
 
+    /// TN(TN-0133): errors when a segment's jars, as listed on disk, skip or overlap blocks
+    /// between two of them: a jar is missing, or one below the highest is not full. The blocks of
+    /// the gap would read as absent (a range walk comes back short, a point read finds no
+    /// changeset). Only the joins between present jars are checked, not where the lowest jar
+    /// starts, so a segment whose lowest jars were deleted on purpose (history expiry deletes the
+    /// lowest first, `delete_segment_below_block`) passes.
+    pub fn check_contiguity(&self) -> ProviderResult<()> {
+        for (segment, jars) in &*iter_static_files(&self.path).map_err(ProviderError::other)? {
+            for pair in jars.windows(2) {
+                let (before, after) = (pair[0].0, pair[1].0);
+                if after.start() != before.end() + 1 {
+                    tracing::error!(
+                        target: "reth::static_file",
+                        %segment,
+                        %before,
+                        %after,
+                        "Static files skip blocks between two jars"
+                    );
+                    return Err(ProviderError::other(StaticFileGapError::Jars {
+                        segment,
+                        before,
+                        after,
+                    }))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// TN(TN-0133): the error for a read of `number` (a block, or a transaction of a transaction
+    /// segment) that the index sent to `provider`'s jar, which does not hold it, while lower jars
+    /// exist: the jar that held it is missing ([`Self::check_contiguity`] refuses that at
+    /// startup). `None` when the jar holds `number`, or when `number` lies below the segment's
+    /// lowest jar (deleted on purpose, or never written).
+    fn gap_at(
+        &self,
+        segment: StaticFileSegment,
+        provider: &StaticFileJarProvider<'_, N>,
+        number: u64,
+    ) -> Option<ProviderError> {
+        let header = provider.user_header();
+        let jar_blocks = header.block_range()?;
+        let missing = if segment.is_tx_based() {
+            // The index sends a transaction to the first jar whose last transaction is at or
+            // past it, so only one below the jar's first can be missing, and only if the jar is
+            // not the lowest.
+            header.tx_range().is_some_and(|txs| number < txs.start()) &&
+                self.get_lowest_range_start(segment).is_some_and(|low| jar_blocks.start() > low)
+        } else {
+            // The index sends only blocks up to the highest one here.
+            !jar_blocks.contains(number) &&
+                self.get_lowest_range_start(segment).is_some_and(|low| number >= low)
+        };
+        missing.then(|| {
+            tracing::error!(
+                target: "reth::static_file",
+                %segment,
+                number,
+                path = %provider.data_path().display(),
+                "No static file jar holds this number, between the segment's lowest and highest"
+            );
+            ProviderError::other(StaticFileGapError::Number { segment, number })
+        })
+    }
+
     /// Ensures that any broken invariants which cannot be healed on the spot return a pipeline
     /// target to unwind to.
     ///
@@ -1591,6 +1699,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         info!(target: "reth::cli", "Verifying storage consistency.");
+
+        // TN(TN-0133): a jar missing between two others cannot be healed.
+        self.check_contiguity()?;
 
         let mut unwind_target: Option<BlockNumber> = None;
 
@@ -1704,6 +1815,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Provider: DBProvider + ChainSpecProvider + StorageSettingsCache + PruneCheckpointReader,
     {
         info!(target: "reth::cli", "Healing static file inconsistencies.");
+
+        // TN(TN-0133): a jar missing between two others cannot be healed; refuse before any heal.
+        self.check_contiguity()?;
 
         for segment in self.segments_to_check(provider) {
             let _guard = info_span!("Healing static file segment", ?segment).entered();
@@ -2348,6 +2462,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                                     provider.data_path().display()
                                 ))))
                             }
+                            // TN(TN-0133): nor is a number in a gap between jars the end.
+                            if let Some(err) = self.gap_at(segment, &provider, number) {
+                                return Err(err)
+                            }
                             return Ok(result);
                         }
                         // There is a very small chance of hitting a deadlock if two consecutive
@@ -2641,6 +2759,12 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        // TN(TN-0133): a block in a gap between jars is an error, not an empty changeset.
+        if let Some(err) =
+            self.gap_at(StaticFileSegment::AccountChangeSets, &provider, block_number)
+        {
+            return Err(err)
+        }
 
         if let Some(offset) = provider.read_changeset_offset(block_number)? {
             let mut cursor = provider.cursor()?;
@@ -2810,6 +2934,12 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        // TN(TN-0133): a block in a gap between jars is an error, not an empty changeset.
+        if let Some(err) =
+            self.gap_at(StaticFileSegment::StorageChangeSets, &provider, block_number)
+        {
+            return Err(err)
+        }
 
         if let Some(offset) = provider.read_changeset_offset(block_number)? {
             let mut cursor = provider.cursor()?;

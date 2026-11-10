@@ -89,7 +89,7 @@ pub(super) fn write_changesets(
 }
 
 /// Appends headers, one transaction, receipt and sender a block, for blocks `0..blocks`.
-fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u64) {
+pub(super) fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u64) {
     let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
     for number in 0..blocks {
         let header = Header { number, gas_limit: 30_000_000 + number, ..Default::default() };

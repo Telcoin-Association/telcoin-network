@@ -6,7 +6,8 @@
 use super::{
     manager::StaticFileWriter,
     tn_checksum_tests::{
-        account_changes, address, jar_path, load, provider, provider_rw, write_changesets, CHANGES,
+        account_changes, address, jar_path, load, provider, provider_rw, write_block_segments,
+        write_changesets, CHANGES,
     },
 };
 use crate::providers::StaticFileProvider;
@@ -301,4 +302,82 @@ fn deletion_removes_the_data_file_first() {
         drop(provider.latest_writer(ACCOUNTS).unwrap());
         assert_accounts(&provider, 5, 6);
     }
+}
+
+/// TN(TN-0133): a jar missing between two others of its segment (blocks 2 and 3 of headers,
+/// transactions and account changesets) is refused at startup, and every range read across it is
+/// an error instead of a shorter answer; reads that do not reach the gap still answer. The lowest
+/// jars deleted on purpose (as history expiry does) are not a gap.
+#[test]
+fn a_jar_missing_between_two_others_is_refused() {
+    use reth_nippy_jar::NippyJar;
+    use reth_static_file_types::SegmentHeader;
+    use reth_storage_api::{HeaderProvider, TransactionsProvider};
+
+    let is_gap = |err: &ProviderError| {
+        matches!(
+            err.downcast_other_ref::<super::StaticFileGapError>(),
+            Some(super::StaticFileGapError::Number { .. })
+        )
+    };
+    for checksums in [false, true] {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), checksums, 2);
+        write_block_segments(&static_files, 6);
+        write_accounts(&static_files, 0..6, 6);
+        let segments = [StaticFileSegment::Headers, StaticFileSegment::Transactions, ACCOUNTS];
+        let middle = segments.map(|segment| jar_path(&static_files, segment, 2));
+        drop(static_files);
+        for path in &middle {
+            NippyJar::<SegmentHeader>::load(path).unwrap().delete().unwrap();
+        }
+
+        let static_files = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+        let err = static_files.check_contiguity().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_other_ref::<super::StaticFileGapError>(),
+                Some(super::StaticFileGapError::Jars { before, after, .. })
+                    if (before.start(), before.end(), after.start()) == (0, 1, 4)
+            ),
+            "{err}"
+        );
+        assert!(is_gap(&static_files.headers_range(0..6).unwrap_err()));
+        assert!(is_gap(&static_files.headers_range(2..3).unwrap_err()));
+        assert!(is_gap(&static_files.transactions_by_tx_range(0..6).unwrap_err()));
+        assert!(is_gap(&static_files.account_changesets_range(0..6).unwrap_err()));
+        assert!(is_gap(&static_files.account_block_changeset(3).unwrap_err()));
+        assert_eq!(static_files.headers_range(0..2).unwrap().len(), 2);
+        assert_eq!(static_files.headers_range(4..6).unwrap().len(), 2);
+        assert_eq!(static_files.transactions_by_tx_range(4..6).unwrap().len(), 2);
+        assert_eq!(static_files.account_block_changeset(4).unwrap(), account_changes(4));
+        drop(static_files);
+
+        // The lowest jars gone instead: no gap, and the blocks below read as absent.
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), checksums, 2);
+        write_block_segments(&static_files, 6);
+        write_accounts(&static_files, 0..6, 6);
+        let lowest = segments.map(|segment| jar_path(&static_files, segment, 0));
+        drop(static_files);
+        for path in &lowest {
+            NippyJar::<SegmentHeader>::load(path).unwrap().delete().unwrap();
+        }
+        let static_files = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+        static_files.check_contiguity().unwrap();
+        assert_eq!(static_files.headers_range(0..6).unwrap().len(), 0);
+        assert_eq!(static_files.headers_range(2..6).unwrap().len(), 4);
+        assert_eq!(static_files.transactions_by_tx_range(2..6).unwrap().len(), 4);
+        assert_eq!(static_files.account_block_changeset(1).unwrap(), Vec::new());
+        assert_accounts_from(&static_files, 2);
+    }
+}
+
+/// Asserts that the account changesets from `first` to block 5 read back.
+fn assert_accounts_from(provider: &StaticFileProvider<EthPrimitives>, first: u64) {
+    for block in first..6 {
+        assert_eq!(provider.account_block_changeset(block).unwrap(), account_changes(block));
+    }
+    let walked = provider.account_changesets_range(first..6).unwrap();
+    assert_eq!(walked.len() as u64, (6 - first) * CHANGES);
 }

@@ -16,6 +16,8 @@ pub use static_file::{
 pub use static_file::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 // TN(TN-0122): which segments' new jars carry checksums under storage v2.
 pub use static_file::checksummed_segment;
+// TN(TN-0133): a gap between a segment's jars.
+pub use static_file::StaticFileGapError;
 
 mod state;
 pub use state::{

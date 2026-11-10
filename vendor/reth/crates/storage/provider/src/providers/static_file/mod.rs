@@ -5,6 +5,8 @@ pub use manager::{
 };
 // TN(TN-0122): which segments' new jars carry checksums under storage v2.
 pub use manager::checksummed_segment;
+// TN(TN-0133): a gap between a segment's jars.
+pub use manager::StaticFileGapError;
 // TN(TN-0124): the changeset point lookups' search, for the read timing harness (TN-0100).
 #[cfg(test)]
 pub(crate) use manager::changeset_lower_bound;
