@@ -5,7 +5,7 @@
 use crate::error::ExecutionError;
 use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
-use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
+use std::{collections::BTreeSet, net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -444,6 +444,19 @@ impl ExecutionNodeInner {
             .zip(epochs)
             .map(|(raw, &epoch)| decode_committee_keys(epoch, block_hash, raw))
             .collect()
+    }
+
+    /// Read the BLS keys of the committee-eligible validator pool (`PendingActivation`,
+    /// `Active` and `PendingExit`), pinned to `header`'s state.
+    ///
+    /// Best-effort, unlike the committee reads above: an undecodable key is skipped with a
+    /// warning rather than failing the read (see
+    /// [`RethEnv::committee_eligible_bls_keys_at_header`]).
+    pub(super) fn committee_eligible_keys_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<BTreeSet<BlsPublicKey>> {
+        self.reth_env.committee_eligible_bls_keys_at_header(header)
     }
 }
 

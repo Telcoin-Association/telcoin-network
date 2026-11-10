@@ -14,7 +14,13 @@ use self::inner::ExecutionNodeInner;
 use crate::health::WorkerReadiness;
 use builder::ExecutionNodeBuilder;
 use readiness::WorkerReadinessState;
-use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::Arc,
+};
 use tn_config::{Config, PidLock};
 use tn_exex::ExExInstallFn;
 use tn_reth::{
@@ -549,5 +555,22 @@ impl ExecutionNode {
     ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
         let guard = self.internal.read().await;
         guard.validators_for_epochs_at_block(epochs, block_hash)
+    }
+
+    /// Read the BLS keys of the committee-eligible validator pool (`PendingActivation`,
+    /// `Active` and `PendingExit`), pinned to `header`'s state.
+    ///
+    /// This is the pool the epoch-closing committee draw shuffles, read for peer tracking rather
+    /// than consensus. The read is best-effort: an undecodable key is skipped with a warning,
+    /// duplicates are removed, and registry or provider failures are returned classified so the
+    /// caller can log and skip. Like the committee reads above, it holds the engine read lock
+    /// while the registry calls run; the lock's writers are epoch-entry and epoch-close steps,
+    /// never block execution.
+    pub async fn committee_eligible_keys_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<BTreeSet<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.committee_eligible_keys_at_header(header)
     }
 }

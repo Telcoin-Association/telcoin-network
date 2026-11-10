@@ -76,6 +76,33 @@ impl AdmissionStatus {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl AdmissionStatus {
+    /// Build a status from its observations, for tests that need one without a swarm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_test(
+        configured: AdmissionMode,
+        effective: AdmissionMode,
+        epoch: Option<u64>,
+        fallback: Option<AdmissionFallback>,
+        resolved_current: usize,
+        required_current: usize,
+        connected_current: usize,
+        contradicted: usize,
+    ) -> Self {
+        Self {
+            configured,
+            effective,
+            epoch,
+            fallback,
+            resolved_current,
+            required_current,
+            connected_current,
+            contradicted,
+        }
+    }
+}
+
 /// Sender of an authoritative committee window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitteeUpdate {
@@ -150,6 +177,15 @@ impl AdmissionPolicy {
         } else {
             false
         }
+    }
+
+    /// The accepted committee window as its previous, current, and next committees, or `None`
+    /// before one is accepted.
+    ///
+    /// A later rejected update leaves the window in place; it is the window [`Self::evaluate`]
+    /// grants from, whatever the current fallback.
+    pub(super) fn window(&self) -> Option<[&HashSet<BlsPublicKey>; 3]> {
+        self.snapshot.as_ref().map(|s| [&s.previous, &s.current, &s.next])
     }
 
     /// Resolve grants from verified records and explicit operator identities only.

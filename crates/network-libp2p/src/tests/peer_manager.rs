@@ -1838,16 +1838,27 @@ async fn test_restored_records_not_pinned_and_pruned_at_rotation() {
     // Records restored from the persisted kad store at startup are peer-fillable third-party
     // records (DHT storage duty), so they must NOT be pinned: the first committee rotation prunes
     // every restored key that does not sit in a tracked slot, restoring the issue #827 bound that
-    // a pinning restore would bypass.
+    // a pinning restore would bypass. The restore also binds each key's peer id, and the store
+    // persists rows for tracked keys that must never be bound, so the same rotation unbinds every
+    // pruned key whose peer has not been dialed or connected since startup.
     let mut peer_manager = create_test_peer_manager(None);
     let mut rng = StdRng::from_seed([17; 32]);
 
     let restored_a = *BlsKeypair::generate(&mut rng).public();
     let restored_b = *BlsKeypair::generate(&mut rng).public();
-    peer_manager.add_restored_peer(restored_a, random_network_info());
-    peer_manager.add_restored_peer(restored_b, random_network_info());
+    let dialed = *BlsKeypair::generate(&mut rng).public();
+    let [info_a, info_b, info_dialed] = std::array::from_fn(|_| random_network_info());
+    let peer_a = PeerId::from(info_a.pubkey.clone());
+    let peer_b = PeerId::from(info_b.pubkey.clone());
+    let peer_dialed = PeerId::from(info_dialed.pubkey.clone());
+    peer_manager.add_restored_peer(restored_a, info_a);
+    peer_manager.add_restored_peer(restored_b, info_b);
+    peer_manager.add_restored_peer(dialed, info_dialed);
     assert!(peer_manager.auth_to_peer(restored_a).is_some(), "restored record a resolvable");
     assert!(peer_manager.auth_to_peer(restored_b).is_some(), "restored record b resolvable");
+    assert_eq!(peer_manager.peer_to_bls(&peer_a), Some(restored_a), "the restore binds a");
+    // a dial gives the record a connection status, which the rotation must not discard
+    peer_manager.register_dial_attempt(peer_dialed, None);
 
     // first rotation: only `restored_b` occupies a tracked committee slot
     peer_manager.update_committees(HashSet::new(), HashSet::from([restored_b]), HashSet::new());
@@ -1856,9 +1867,17 @@ async fn test_restored_records_not_pinned_and_pruned_at_rotation() {
         peer_manager.auth_to_peer(restored_a).is_none(),
         "restored non-member must be pruned at the first rotation"
     );
+    assert_eq!(peer_manager.peer_to_bls(&peer_a), None, "and its peer id unbound");
     assert!(
         peer_manager.auth_to_peer(restored_b).is_some(),
         "restored committee member must be retained"
+    );
+    assert_eq!(peer_manager.peer_to_bls(&peer_b), Some(restored_b), "with its binding");
+    assert!(peer_manager.auth_to_peer(dialed).is_none(), "a dialed non-member is pruned too");
+    assert_eq!(
+        peer_manager.peer_to_bls(&peer_dialed),
+        Some(dialed),
+        "but its peer record is left to the ordinary peer pruning"
     );
 }
 
