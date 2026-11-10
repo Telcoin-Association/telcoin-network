@@ -2472,17 +2472,22 @@ mod tests {
         }
 
         /// Drive `work` on this thread, returning its result and the `consensus::metrics` events
-        /// it logged here.
+        /// it logged here. The tests run on a current-thread runtime, so `work` logs on this
+        /// thread.
         ///
-        /// The capturing subscriber is the test binary's global default, installed once, and
-        /// records only the threads capturing at the time (the storage crate's pattern): a
-        /// thread-local default can miss events while other tests' subscribers come and go.
+        /// Events reach [`Capture`] through this thread's scoped default, held for the capture.
+        /// A [`Capture`] is also tried once as the global default, and a global that another test
+        /// installed first keeps its place. The global is there for tracing-core's interest cache:
+        /// while a single dispatcher is registered, a callsite reached for the first time takes
+        /// its interest from the default of the thread that reaches it, so another test's thread
+        /// could disable an event this capture waits for. A second registered dispatcher, ours or
+        /// another test's, makes every callsite consult this scoped default as well.
         async fn capture<T>(work: impl Future<Output = T>) -> (T, Vec<Captured>) {
             static INSTALLED: Once = Once::new();
             INSTALLED.call_once(|| {
-                tracing::subscriber::set_global_default(Capture)
-                    .expect("no other global subscriber in this test binary");
+                let _ = tracing::subscriber::set_global_default(Capture);
             });
+            let _scoped = tracing::subscriber::set_default(Capture);
             CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
             let result = work.await;
             let events = CAPTURED.with(|captured| captured.borrow_mut().take()).unwrap_or_default();
