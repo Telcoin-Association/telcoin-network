@@ -591,6 +591,12 @@ EOF
         last=$(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')
         case "$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]')" in
             *"permission denied"*) ;;
+            # *denied* also matches "denied: requested access to the resource is denied", which
+            # ghcr answers to a login without read on an existing private package. That case
+            # reads as "the login does not see TAG" too, so with RELEASE_FIRST_PUSH set, build
+            # runs in full and then stops when its push is refused. Nothing reaches the registry
+            # or the draft, since write on a package implies read. The failure table in the
+            # maintainer guide says not to set RELEASE_FIRST_PUSH on a later release.
             *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied* | *"403 forbidden"*)
                 info "with the docker login, $IMAGE:$TAG does not resolve: $last"
                 return 0
