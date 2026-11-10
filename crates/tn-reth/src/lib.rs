@@ -72,6 +72,9 @@
 #[cfg(test)]
 mod clippy {
     use proptest as _;
+    // the format-freeze tests' digests, compiled out on the mdbx build
+    #[cfg(feature = "mdbx")]
+    use sha2 as _;
     use tn_reth as _;
 }
 
