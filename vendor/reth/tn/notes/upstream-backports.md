@@ -160,6 +160,9 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## TN-side hardening (not upstream fixes)
 
+- **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
+  returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
+  healthy database.
 - **reth's tests now build against the carried revm-inspectors (TN-0080, 2026-11-09).** cargo
   does not forward `--config` to cargo-nextest, so the `test-vendor-reth` lane had been testing
   the registry crate; the patch now lives in `vendor/reth/.cargo/config.toml`.

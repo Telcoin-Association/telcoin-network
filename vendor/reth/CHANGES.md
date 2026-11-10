@@ -1256,3 +1256,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   compile against the registry crate.
   *Tests*: `test_unpatched_reports_registry_sources_in_either_workspace`. *Upstream*: n/a.
 
+- **TN-0082** — A missing bytecode row fails the lookup instead of executing as empty code.
+  *Kind*: fix.
+  *Files*: `crates/revm/src/database.rs` (`code_by_hash_ref`; test
+  `missing_bytecode_is_an_error_except_for_the_empty_code`),
+  `crates/storage/errors/src/provider.rs` (`ProviderError::BytecodeNotFound`).
+  *Why*: `StateProviderDatabase::code_by_hash_ref` returned `Bytecode::default()` for a code hash
+  the `Bytecodes` table does not hold. On a node whose datadir lost such a row (a torn write, a
+  partial snapshot), every call to that contract ran as a no-op and the node committed a root
+  the other validators do not; peers then rejected its execution result, and its own logs showed
+  no database error (review R12). The lookup now fails with `BytecodeNotFound` unless the hash is
+  the empty code's (`KECCAK256_EMPTY`), which revm resolves without a lookup anyway, so the block
+  fails on the node that lost the row.
+  *Execution path*: yes (`crates/revm`, every block and every RPC call). The change can not alter
+  a root: whenever the row exists, the code returned is the same as before, and a healthy node
+  never takes the new arm; the only new behaviour is an error where the old code silently ran
+  empty code and diverged. No manifest or feature change (`graph.py diff` clean).
+  *Tests*: `missing_bytecode_is_an_error_except_for_the_empty_code` over a `NoopProvider`.
+  *Upstream*: candidate (reth main still returns empty code).

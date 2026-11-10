@@ -42,6 +42,9 @@ pub enum ProviderError {
     /// A block body is missing.
     #[error("block meta not found for block #{_0}")]
     BlockBodyIndicesNotFound(BlockNumber),
+    /// TN(TN-0082): the bytecode for a code hash other than the empty code's is missing.
+    #[error("bytecode for code hash {_0} not found")]
+    BytecodeNotFound(B256),
     /// The transition ID was found for the given address and storage key, but the changeset was
     /// not found.
     #[error(
