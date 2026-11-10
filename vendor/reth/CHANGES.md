@@ -1145,6 +1145,45 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `u64::MAX`), `check_refuses_a_gas_limit_above_what_is_left`.
   *Upstream*: candidate (reth main runs raw blocks under the caller's header too).
 
+- **TN-0079** — The struct logger and `vmTrace` stop a trace whose recorded steps pass 160 MiB.
+  *Kind*: fix (TN-owned, in the carried revm-inspectors).
+  *Files*: `patches/revm-inspectors/src/tracing/config.rs` (`DEFAULT_MAX_RECORDED_BYTES`,
+  `TracingInspectorConfig::max_recorded_bytes` set by every preset and kept tightest by `merge`,
+  test `presets_cap_recorded_bytes`), `patches/revm-inspectors/src/tracing/mod.rs`
+  (`TracingInspector::recorded_bytes` counter, `share_recorded_bytes`, `record_bytes`, the
+  accounting in `start_step`; tests module), `patches/revm-inspectors/PATCH.md` and
+  `upstream.diff`; `crates/rpc/rpc-eth-api/src/helpers/trace.rs` (`trace_block_until` shares
+  one counter across a block's inspectors), `crates/rpc/rpc/src/trace.rs` (`trace_call_many`
+  shares one across its calls), `crates/rpc/rpc/src/debug.rs` (test `recorded_bytes_tests`).
+  *Why*: the tracing inspector copied the whole stack at every step for the struct logger
+  (unless `disableStack`) and memory when `enableMemory` was set, with nothing counting steps or
+  bytes; geth's `limit` option is ignored and the 160 MB response limit applies only once the
+  trace is serialized. Under the 50M gas cap a call with a 1,000-word stack looping on cheap
+  opcodes recorded tens of GB before any response was built, and the node was OOM-killed; a mined
+  30M-gas transaction of that shape made every `debug_traceTransaction` or
+  `trace_replayTransaction(vmTrace)` of it the same bomb (review R4). The inspector now counts the
+  bytes its steps hold (the step, its stack snapshot, a fresh memory copy, return data, immediate
+  bytes, the pushed values `step_end` records) and, past `max_recorded_bytes`, ends the
+  transaction the way TN-0017's interrupt does: the context error becomes `EVMError::Custom`
+  ("trace too large: ..."), which the RPC returns as `-32603`, and the halted interpreter cannot
+  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`:
+  a trace whose steps alone pass it serializes to a response the limit refuses, so no answer a
+  default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
+  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request; the sites that
+  build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
+  and `trace_filter`, and `trace_callMany`) share a counter. Call, prestate and 4byte tracers
+  record no steps and are unaffected. The cap lives in the patched crate rather than a wrapper
+  because the recording happens inside `TracingInspector`, which reth constructs at a dozen sites
+  and `DebugInspector` wraps privately. RPC only.
+  *Tests*: in the patched crate `steps_count_their_bytes`,
+  `a_trace_past_the_cap_halts_the_transaction` (a 30M-gas loop with a 16-word stack ends at a
+  64 KiB cap with the error, having recorded at most one step past it),
+  `without_a_cap_the_transaction_runs_out_of_gas`, `the_counter_survives_fuse_and_is_shared`,
+  `presets_cap_recorded_bytes`; in reth `struct_logger_stops_a_trace_past_the_recorded_bytes_cap`
+  (the struct logger through `DebugInspector`, and the error maps to `-32603`).
+  *Upstream*: candidate for revm-inspectors (0.44.3 caps nothing). On a revm-inspectors upgrade
+  the cap must be re-ported; PATCH.md says so.
+
 - **TN-0080** — The nested workspace carries the revm-inspectors patch in `.cargo/config.toml`.
   *Kind*: build only.
   *Files*: new `.cargo/config.toml` (the `[patch.crates-io]` entry and the

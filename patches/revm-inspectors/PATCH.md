@@ -1,4 +1,4 @@
-# Carried patch: revm-inspectors JavaScript recursion limit
+# Carried patch: revm-inspectors JavaScript recursion limit and trace size cap
 
 This is the published revm-inspectors 0.34.3 source, including both upstream licenses. Its
 registry archive SHA-256 is
@@ -7,7 +7,9 @@ recorded before the patch). The upstream revision is `5c5a3fabc2ff2cf9341aa6904f
 The normalized registry `Cargo.toml`, `Cargo.toml.orig`, dependencies and features are unchanged,
 so the lockfile entry keeps its version and dependency list and only loses its registry source.
 
-## The change
+## The changes
+
+### The JavaScript recursion limit
 
 `RECURSION_LIMIT` in `src/tracing/js/mod.rs` goes from 10,000 to 128, the value upstream chose in
 #548 (a5638ca, "Lower recursion limit to protect native stacks", released in 0.44.2). A recursive
@@ -22,6 +24,25 @@ Three tests are added to the JS tracer module: a recursive getter and a recursiv
 built on a thread with a 2 MiB stack, must fail with a `setup` error, and recursion below the
 limit must still work. With the old limit both recursion tests abort the test process (SIGABRT,
 stack overflow).
+
+### A cap on recorded trace steps (TN-0079)
+
+`TracingInspector` records a step for every opcode when steps are requested (the struct logger,
+and `vmTrace`), copying the whole stack at each step unless the stack is disabled and memory when
+it is enabled, and nothing counted steps or bytes; geth's `limit` option is ignored. Under a 50M
+gas cap a call with a 1,000-word stack looping on cheap opcodes recorded tens of GB before the
+response was built, and the node was OOM-killed (TN review R4). The inspector now counts the
+bytes its steps hold (`TracingInspector::recorded_bytes`: the step, its stack snapshot, a fresh
+memory copy, return data, immediate bytes and the values `step_end` records) and, past
+`TracingInspectorConfig::max_recorded_bytes`, ends the transaction as the JS interrupt does: the
+context error becomes `EVMError::Custom("trace too large: ...")` and the interpreter halts with
+`FatalExternalError`. Every preset sets the cap to `DEFAULT_MAX_RECORDED_BYTES` (160 MiB, reth's
+default `--rpc.max-response-size`; a trace whose steps alone pass it could not be returned
+anyway), `merge` keeps the tighter of two caps, and `None` disables it. The counter is an
+`Arc<AtomicUsize>` kept across `fuse` and shared between inspectors through
+`share_recorded_bytes`, so reth bounds a request, not a transaction (see TN-0079 in
+`vendor/reth/CHANGES.md` for the call sites). Tests are in `src/tracing/mod.rs` and
+`src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
 
 The crate's `.gitignore` is removed, because it would hide the standalone `Cargo.lock` from git.
 `upstream.diff` is the full difference from the registry archive (without
@@ -67,8 +88,12 @@ include) if it is not in the local registry, and run
 
 ## Retirement
 
-Remove this patch when TN's reth moves to a revm-inspectors release that contains #548 (0.44.2
-or later). Check that release's `RECURSION_LIMIT`, then delete:
+The recursion limit retires when TN's reth moves to a revm-inspectors release that contains #548
+(0.44.2 or later); check that release's `RECURSION_LIMIT`. The trace size cap has no upstream
+equivalent, so the patch directory stays: on an upgrade, take the new registry source, re-apply
+the cap (the `TN(TN-0079)` hunks of `upstream.diff`), and update the checksum, revision and
+`upstream.diff` above. Should upstream grow a cap of its own, drop TN's and, if nothing else is
+carried, delete:
 - this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;
 - the `[patch.crates-io]` entry in `vendor/reth/.cargo/config.toml`;
 - the `revm-inspectors-patch` job in `.github/workflows/pr.yaml` and its entries in the

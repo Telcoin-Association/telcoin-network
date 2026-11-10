@@ -34,7 +34,7 @@ not list.
 | known issues this work leaves open | `tn/notes/open-issues.md` |
 | what comes next | ROADMAP.md |
 | the TN side of the boundary | `crates/tn-reth` (README.md; `js-tracer.md` for the opt-in `js-tracer` feature) |
-| the carried revm-inspectors fix | `patches/revm-inspectors/PATCH.md` |
+| the carried revm-inspectors fixes | `patches/revm-inspectors/PATCH.md` |
 | CI for this code | `etc/ci-lanes.sh test-vendor-reth`; `.github/workflows/pr.yaml` jobs `vendor-reth-test` and `revm-inspectors-patch` |
 | the RocksDB ban | `etc/rocksdb-gate.sh` (DECISIONS.md D14) |
 | how reth's test-only dependencies are pinned | `tn/test-only.lock`, `tn/lockfile.py` (DECISIONS.md D7) |
@@ -54,7 +54,7 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | RocksDB removed; storage v1 as the default | TN-0014 |
 | upstream sync to v1.11.4 | TN-0013 |
 | RPC security backports | TN-0015 to TN-0017, TN-0019, TN-0034, TN-0035, TN-0058, TN-0076 |
-| RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077, TN-0078 |
+| RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077 to TN-0079 |
 | transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0073 to TN-0075 |
 | RPC and CLI fixes backported after v1.11.4 (review R8, R9, R13, R22, R24, R26) | TN-0059, TN-0060, TN-0062 to TN-0072 |
 | static files and nippy-jar backports | TN-0023 |
@@ -157,7 +157,8 @@ Triage by subject first (fix, security, panic, overflow, DoS, limit), then `git 
 read diffs only for candidates. Skip files TN deleted (the `deleted` lines of `vendor.py status`).
 Record each verdict and the new survey point in `tn/notes/upstream-backports.md`, and apply a fix
 with `vendor.py pick <sha>`. A release bump is `vendor.py sync <tag>` (README.md). Watch
-revm-inspectors releases too: `patches/revm-inspectors/PATCH.md` says when that patch retires.
+revm-inspectors releases too: `patches/revm-inspectors/PATCH.md` says what an upgrade must re-port
+and when the recursion-limit part retires.
 
 ## Tracking TN main
 

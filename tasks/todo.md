@@ -438,7 +438,7 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
 - [x] R5 port the rest of 055fafc72 (per-window header collection in `eth_getLogs`)
 
 ### Step 2: cheap upstream picks and TN-side edges
-- [ ] R8 d46664fc8, R9 d8d704cf7, R13 f12d52de2, R20 0c8b1c187, R21 fe01db183 + 0a1d3e761,
+- [x] R8 d46664fc8, R9 d8d704cf7, R13 f12d52de2, R20 0c8b1c187, R21 fe01db183 + 0a1d3e761,
       R22 dfcb10454, R24 5b6863039, R26 (074bf32ef, 8760eb000, e3d7f0952, 3dd806a43, 4e1a5574e,
       6d117042f, 5d6634a6f) with doc page updates
 - [x] R14 range parsers on permit flags; R18 `checked_sub` on instance ports; R19 IPC path;
@@ -447,12 +447,35 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
 - picks done: R8 d46664fc8 (TN-0059), R13 f12d52de2 (TN-0060), R24 5b6863039 (TN-0062),
   R22 dfcb10454 (TN-0063), R26 48df75d88 (TN-0064), 5d6634a6f (TN-0065), 8760eb000 (TN-0066),
   3dd806a43 (TN-0067), e3d7f0952 (TN-0068), R9 d8d704cf7 (TN-0069), 074bf32ef (TN-0070),
-  6d117042f (TN-0071, adapted to revm-inspectors 0.34), 4e1a5574e (TN-0072)
-- picks left: R20 0c8b1c187, R21 0a1d3e761 + fe01db183, 43a7452b0 (getLogs retry range)
+  6d117042f (TN-0071, adapted to revm-inspectors 0.34), 4e1a5574e (TN-0072),
+  R20 0c8b1c187 (TN-0073), R21 0a1d3e761 (TN-0074) + fe01db183 (TN-0075), 43a7452b0
+  (TN-0076, getLogs retry range)
+- picks left: none
 
 ### Step 3: `debug` and `trace` hardening
-- [ ] R3 raw-block `debug_traceBlock` gas caps; R4 step budget in struct logger / vmTrace;
-      R10 `trace_filter` fan-out
+- [x] R3 raw-block `debug_traceBlock` gas caps; R4 step budget in struct logger / vmTrace;
+      R10 `trace_filter` fan-out (TN-0077 R10, TN-0078 R3, TN-0079 R4; plus TN-0080: the nested
+      test workspace had never built against the carried revm-inspectors, since cargo does not
+      forward `--config` to cargo-nextest; the patch now lives in `vendor/reth/.cargo/config.toml`)
+- plan (2026-11-09, done as above):
+  - R10 (TN-0077, `trace.rs`): `trace_filter` traces at most as many blocks at once as the
+    permits it holds: the `try_join_all` over a chunk becomes `stream::iter(..).buffered(2)`
+    (order kept), with one `TRACE_FILTER_PERMITS` constant for `acquire_many_owned` and the
+    buffer. Docs: `trace/README.md` line 7, `enabling-namespaces.md` row 58.
+  - R3 (TN-0078, `debug.rs`): `debug_trace_raw_block` treats the raw block as a callMany-shaped
+    request: `check_call_count(call_gas_limit(), tx_count)` right after the RLP decode (bounds
+    the inline signer recovery too), then a `CallManyBudget` passed into `trace_block` as
+    `Option<_>`; before each tx `budget.check(tx.gas_limit())` (new method; the block rule from
+    TN-0046), after it `budget.charge(gas_used)`. Stored-block paths pass `None`. No header
+    refusal needed once the budget holds. The in-transaction cancel is not added: the budget
+    bounds a request to `--rpc.gascap` gas. Docs: `debug/debug_traceblock.md`.
+  - R4 (TN-0079, `patches/revm-inspectors` + PATCH.md): `TracingInspector` counts the bytes its
+    steps record (stack words, newly copied memory, a fixed per-step overhead) and halts the
+    transaction with `ContextError::Custom("trace too large ...")` past
+    `TracingInspectorConfig::max_recorded_bytes` (default 160 MiB, reth's default response
+    limit: a trace above it could not be returned anyway). Surfaces as -32603 `EvmCustom`.
+    All struct-logger and vmTrace sites get it with no call-site change; PATCH.md gains a second
+    carried change and its retire note. Docs: struct logger pages say the cap, `debug/README.md`.
 
 ### Step 4: pool
 - [ ] R7 nonce-continuity in the batch builder (TN side); R11 + T2-1 notes recorded in open-issues

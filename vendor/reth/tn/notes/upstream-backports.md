@@ -178,3 +178,7 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 - **Raw `debug_traceBlock` bounded like callMany (TN-0078, 2026-11-09).** The caller's header
   and transactions are bounded by the call count and gas budget of TN-0057 (review R3); stored
   blocks keep their chain-enforced bounds.
+- **A cap on recorded trace steps (TN-0079, 2026-11-09).** The carried revm-inspectors'
+  `TracingInspector` stops a transaction whose recorded steps pass 160 MiB (`trace too large`,
+  `-32603`), shared across the inspectors of one request (review R4). Upstream caps nothing as of
+  0.44.3; re-port on every revm-inspectors upgrade (`patches/revm-inspectors/PATCH.md`).

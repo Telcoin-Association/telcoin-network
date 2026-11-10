@@ -1476,6 +1476,51 @@ mod tests {
 /// blocking task ends.
 ///
 /// Outside the `js-tracer` test module so the default build runs it too.
+/// TN(TN-0079): the struct logger stops a trace whose steps pass the recorded-bytes cap of
+/// the carried revm-inspectors. (The `tests` module above needs the `js-tracer` feature.)
+#[cfg(test)]
+mod recorded_bytes_tests {
+    use super::*;
+    use revm::{
+        context::TxEnv,
+        context_interface::result::EVMError,
+        database::{CacheDB, EmptyDB},
+        primitives::TxKind,
+        state::{AccountInfo, Bytecode},
+        InspectEvm, MainBuilder, MainContext,
+    };
+    use revm_inspectors::tracing::DEFAULT_MAX_RECORDED_BYTES;
+
+    #[test]
+    fn struct_logger_stops_a_trace_past_the_recorded_bytes_cap() {
+        let mut inspector = DebugInspector::new(GethDebugTracingOptions::default()).unwrap();
+        let DebugInspector::Default(tracing, _) = &mut inspector else {
+            panic!("default options select the struct logger")
+        };
+        assert_eq!(tracing.config().max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
+        tracing.config_mut().max_recorded_bytes = Some(64 << 10);
+
+        // a contract that loops until it runs out of gas: JUMPDEST; PUSH1 0; JUMP
+        let target = Address::with_last_byte(0xaa);
+        let mut db = CacheDB::<EmptyDB>::default();
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56]));
+        db.insert_account_info(target, AccountInfo::default().with_code(code));
+        let mut evm = revm::Context::mainnet().with_db(db).build_mainnet_with_inspector(inspector);
+        let err = match evm.inspect_tx(TxEnv {
+            gas_limit: 16_000_000, // under the default spec's EIP-7825 cap
+            kind: TxKind::Call(target),
+            ..Default::default()
+        }) {
+            Err(EVMError::Custom(msg)) => msg,
+            other => panic!("expected the cap's error, got {other:?}"),
+        };
+        assert!(err.starts_with("trace too large: more than 65536 bytes"), "{err}");
+        let rpc_err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::EvmCustom(err).into();
+        assert_eq!(rpc_err.code(), jsonrpsee_types::error::INTERNAL_ERROR_CODE);
+    }
+}
+
 /// TN(TN-0078): a raw block is bounded as a `debug_traceCallMany` request is.
 #[cfg(test)]
 mod raw_block_bound_tests {

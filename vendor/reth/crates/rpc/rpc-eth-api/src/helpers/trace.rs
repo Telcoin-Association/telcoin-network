@@ -21,7 +21,7 @@ use reth_storage_api::{ProviderBlock, ProviderTx};
 use reth_tasks::cancel::is_cancelled;
 use revm::{context::Block, context_interface::result::ResultAndState};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 
 /// Executes CPU heavy tasks.
 pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
@@ -222,11 +222,15 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             + 'static,
         R: Send + 'static,
     {
+        // TN(TN-0079): the block's transactions get one inspector each; sharing the
+        // recorded-bytes counter makes the cap bound the request's trace, not each
+        // transaction's.
+        let recorded_bytes = Arc::new(AtomicUsize::new(0));
         self.trace_block_until_with_inspector(
             block_id,
             block,
             highest_index,
-            move || TracingInspector::new(config),
+            move || TracingInspector::new(config).share_recorded_bytes(recorded_bytes.clone()),
             f,
         )
     }

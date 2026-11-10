@@ -177,6 +177,9 @@ where
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
                 let _permit = permit;
                 let mut budget = CallManyBudget::new(gas_budget);
+                // TN(TN-0079): the calls' inspectors share one recorded-bytes counter, so the
+                // cap bounds the request's trace, not each call's.
+                let recorded_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut results = Vec::with_capacity(calls.len());
                 let mut calls = calls.into_iter().peekable();
 
@@ -191,7 +194,8 @@ where
                         Default::default(),
                     )?;
                     let config = TracingInspectorConfig::from_parity_config(&trace_types);
-                    let mut inspector = TracingInspector::new(config);
+                    let mut inspector =
+                        TracingInspector::new(config).share_recorded_bytes(recorded_bytes.clone());
                     let res = eth_api.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
                     budget.charge(res.result.gas_used()).map_err(Eth::Error::from_eth_err)?;
 
