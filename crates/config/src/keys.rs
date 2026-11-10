@@ -419,11 +419,13 @@ impl KeyConfig {
     /// stored encrypted (`bls.kw`) or in cleartext (`bls.key`).
     ///
     /// Lets callers distinguish "no keys generated yet" from "keys present but
-    /// unreadable" (e.g. an incorrect passphrase) when reporting errors.
-    pub fn keys_exist<TND: TelcoinDirs>(tn_datadir: &TND) -> bool {
+    /// unreadable" (e.g. an incorrect passphrase) when reporting errors. An error checking
+    /// either file (for example a keys directory this user cannot search) is returned, as
+    /// [`Self::read_config`] returns it, rather than read as "no keys".
+    pub fn keys_exist<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<bool> {
         let keys_dir = tn_datadir.node_keys_path();
-        std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false)
-            || std::fs::exists(keys_dir.join(BLS_KEYFILE)).unwrap_or(false)
+        Ok(key_file_exists(&keys_dir.join(BLS_WRAPPED_KEYFILE))?
+            || key_file_exists(&keys_dir.join(BLS_KEYFILE))?)
     }
 
     /// Generate a new random primary BLS key and save to the config file.
@@ -1182,7 +1184,8 @@ mod tests {
     }
 
     /// An unreadable keys directory is reported as an error on that directory, not as a missing
-    /// encrypted key file, with or without a passphrase.
+    /// encrypted key file, with or without a passphrase. `keys_exist` reports the same error
+    /// rather than "no keys".
     #[cfg(unix)]
     #[test]
     fn read_config_reports_an_unreadable_keys_dir() {
@@ -1203,6 +1206,7 @@ mod tests {
         let locked = std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).is_err();
         let results = [Some(Zeroizing::new("passphrase".to_string())), None]
             .map(|passphrase| KeyConfig::read_config(&datadir, passphrase).map(|_| ()));
+        let exist = KeyConfig::keys_exist(&datadir);
         std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
             .expect("unlock keys dir");
         if !locked {
@@ -1213,6 +1217,8 @@ mod tests {
             assert!(msg.contains("cannot check key file"), "{msg}");
             assert!(!msg.contains("no encrypted key file"), "{msg}");
         }
+        let msg = exist.expect_err("keys_exist on an unreadable keys dir").to_string();
+        assert!(msg.contains("cannot check key file"), "{msg}");
     }
 
     /// `bls_key_is_cleartext` reports how the key is kept on disk on both the generate and the

@@ -53,27 +53,32 @@ impl PopArgs {
         // (distinguish "no keys yet" from "keys present but unreadable").
         let passphrase_given = passphrase.is_some();
         let key_config = KeyConfig::read_config(dir, passphrase).map_err(|e| {
-            let wrapped_exists = dir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE).exists();
-            if passphrase_given && KeyConfig::keys_exist(dir) && !wrapped_exists {
+            let keys_dir = dir.node_keys_path();
+            let shown = keys_dir.display();
+            // An error checking a key file (for example a keys directory this user cannot
+            // search) is not read as "absent", the same as in `read_config`, so the hint
+            // agrees with the error it wraps.
+            let exists = |file: &str| std::fs::exists(keys_dir.join(file));
+            match (exists(tn_config::BLS_WRAPPED_KEYFILE), exists(tn_config::BLS_KEYFILE)) {
+                (Err(_), _) | (_, Err(_)) => eyre::eyre!(
+                    "could not read existing BLS keys from {shown}: {e}\n\
+                     hint: the key files could not be checked - verify that this user can \
+                     access {shown} (its owner and permissions)"
+                ),
                 // a passphrase never unlocks the cleartext bls.key; name the source that does
-                eyre::eyre!(
-                    "could not read existing BLS keys from {}: {e}\n\
+                (Ok(false), Ok(true)) if passphrase_given => eyre::eyre!(
+                    "could not read existing BLS keys from {shown}: {e}\n\
                      hint: the BLS key is stored unencrypted (bls.key) - rerun with \
-                     `--bls-passphrase-source no-passphrase` to use it",
-                    dir.node_keys_path().display()
-                )
-            } else if KeyConfig::keys_exist(dir) {
-                eyre::eyre!(
-                    "could not read existing BLS keys from {}: {e}\n\
-                     hint: the keys exist but could not be read - verify the BLS passphrase is correct",
-                    dir.node_keys_path().display()
-                )
-            } else {
-                eyre::eyre!(
-                    "no BLS keys found at {}: {e}\n\
-                     hint: generate keys first with `keytool generate validator|observer`",
-                    dir.node_keys_path().display()
-                )
+                     `--bls-passphrase-source no-passphrase` to use it"
+                ),
+                (Ok(false), Ok(false)) => eyre::eyre!(
+                    "no BLS keys found at {shown}: {e}\n\
+                     hint: generate keys first with `keytool generate validator|observer`"
+                ),
+                _ => eyre::eyre!(
+                    "could not read existing BLS keys from {shown}: {e}\n\
+                     hint: the keys exist but could not be read - verify the BLS passphrase is correct"
+                ),
             }
         })?;
 
