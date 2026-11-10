@@ -123,3 +123,11 @@ nextest log for a crate the lockfile pins. Rules: put cargo configuration that m
 invocation in a `.cargo/config.toml`, not in `--config` flags; and when a carried patch is meant
 to be exercised by a test lane, make a test depend on a symbol only the patch has, so a silent
 fallback to the registry fails to compile.
+
+## A vendored behaviour change needs TN's own suites, not only reth's (2026-11-10, sls_reth_vendor2)
+
+TN-0064 changed a `debug` error code; its doc page was updated but `tn-reth`'s namespace test
+still pinned the old code and nobody ran it until an unrelated tn-reth run a day later. After
+any backport that changes an RPC answer, run `cargo nextest run -p tn-reth` (at least
+`-E 'test(rpc)'`) in the same step as the docs update; TN pins vendored behaviour in its own
+tests as well as in `docs/src/rpc-methods/`.

@@ -160,11 +160,6 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## TN-side hardening (not upstream fixes)
 
-- **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
-  files and an empty database writes the MDBX half instead of failing forever (review R17).
-- **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
-  returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
-  healthy database.
 - **reth's tests now build against the carried revm-inspectors (TN-0080, 2026-11-09).** cargo
   does not forward `--config` to cargo-nextest, so the `test-vendor-reth` lane had been testing
   the registry crate; the patch now lives in `vendor/reth/.cargo/config.toml`.
@@ -188,3 +183,8 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
   `TracingInspector` stops a transaction whose recorded steps pass 160 MiB (`trace too large`,
   `-32603`), shared across the inspectors of one request (review R4). Upstream caps nothing as of
   0.44.3; re-port on every revm-inspectors upgrade (`patches/revm-inspectors/PATCH.md`).
+- **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
+  returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
+  healthy database.
+- **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
+  files and an empty database writes the MDBX half instead of failing forever (review R17).

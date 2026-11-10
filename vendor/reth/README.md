@@ -32,8 +32,8 @@ vendor/reth/
   LICENSE-*         upstream's (MIT OR Apache-2.0)
   crates/...        upstream paths, e.g. crates/storage/db is upstream's crates/storage/db
   testing/...       testing/testing-utils (dev-only)
-  tn/               TN tooling: vendor.py, graph.py, cargo.sh, crates.txt, upstream.toml, and
-                    the tools' tests (test_*.py)
+  tn/               TN tooling: vendor.py, graph.py, lockfile.py, cargo.sh, crates.txt,
+                    upstream.toml, test-only.lock, and the tools' tests (test_*.py)
   tn/notes/         the usage map, the upstream-backport tracker and the open issues
   .config/          TN's nextest config for the nested workspace (upstream's is not carried)
   README.md CHANGES.md DECISIONS.md ROADMAP.md CLAUDE.md

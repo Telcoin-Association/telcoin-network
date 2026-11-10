@@ -7,7 +7,7 @@ against it").
 
 **Size: don't read the copy to understand TN's work.** `crates/` and `testing/` hold about 199k
 lines of Rust, almost all of it upstream code TN never changed. TN's whole change set is
-`vendor.py diff`: 110 files, about 14k lines removed and 2.5k added, most of the removals whole
+`vendor.py diff`: 153 files, about 14k lines removed and 5.8k added, most of the removals whole
 files. Start from that diff or from a ledger entry, never from a directory listing.
 
 **Read in this order:**
@@ -58,8 +58,8 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0073 to TN-0075 |
 | RPC and CLI fixes backported after v1.11.4 (review R8, R9, R13, R22, R24, R26) | TN-0059, TN-0060, TN-0062 to TN-0072 |
 | static files and nippy-jar backports | TN-0023 |
-| execution and storage fixes (review R12, R17) | TN-0082, TN-0083 |
 | trie backports (review R15) | TN-0081 |
+| execution and storage fixes (review R12, R17) | TN-0082, TN-0083 |
 
 CHANGES.md is ordered by section, then by id, newest last within a section.
 

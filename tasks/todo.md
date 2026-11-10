@@ -483,7 +483,15 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
       recorded under O3 in `vendor/reth/tn/notes/open-issues.md`
 
 ### Step 5: trie and storage (fork checks)
-- [ ] R12 `code_by_hash_ref` error; R15 8f5efd2b3; R16; R17
+- [x] R15 8f5efd2b3 (TN-0081, trie walker errors propagate), R12 (TN-0082, missing bytecode row
+      fails the lookup), R17 (TN-0083, torn first launch resumes), R16 (TN side: committed tip
+      reads use the `Finish` checkpoint). `graph.py diff` before/after step 5: 0 package or
+      feature changes. `make test-upgrade` against v0.16.0-adiri: see the review section below.
 
 ### Step 6: tooling and docs
-- [ ] R28 ledger prose tokens; R29 attest runs vendor.py checks; R30 patch assertion; doc drift
+- [x] R28 (TN-0084: the ledger check reads only *Files* sentences; directories need a trailing
+      slash), R29 (the attested run runs `vendor.py status|ledger|check`), R30 (TN-0085:
+      `lockfile.py check` fails when either workspace resolves revm-inspectors from the registry),
+      the info-list doc drift (CLAUDE.md numbers, ROADMAP, README `tn/` listing, usage-map counts,
+      TN-0019/0036/0038 supersession notes, TN-0049 omission note) and the PR text corrections.
+      Found on the way: TN-0080 (the nested test lane never built against the carried patch).

@@ -380,6 +380,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - e88a669b1: `eth_getProof` holds its tracing permit inside the blocking task
     (`rpc-eth-api/src/helpers/state.rs`). Ported by hand: TN's tree has only the one proof method;
     upstream's second site (the v2 multiproof) does not exist here.
+  *Note (2026-11-10)*: the shared blocking pool this entry argues from ended on 2026-11-06, when TN's `rpc_blocking.rs` gave RPC a blocking runtime of its own (tracker, "TN-side hardening"); the permit semantics stay as described.
 
 - **TN-0022** — Backport 47544d9a7: add transactions to the pending subpool in nonce order.
   *Kind*: backport.
@@ -606,6 +607,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `cancel.rs` tests and `blocking_task_observes_dropped_request`; TN's
   `blocking_future_observes_dropped_request`, which fails without `InCancelScope`. *Upstream*:
   n/a (upstream commits).
+  *Note (2026-11-10)*: 34f77be92's test `pending_block_build_stops_when_cancelled` was not ported (the pending-block build it drives is not carried). reth-revm's `cancelled.rs` keeps upstream's own `CancelOnDrop`, whose user (upstream's payload builder) TN does not carry; `reth_tasks::CancelOnDrop` is the one TN uses.
 
 - **TN-0050** — Backport 33b785d97: an empty revert returns `0x` as its error data. *Kind*:
   backport.
@@ -955,6 +957,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   until the first one ends. Both tests fail before the change ("the second trace started a
   blocking task while the first one's still runs"). *Upstream*: yes; upstream main still releases
   these permits on timeout and disconnect.
+  *Note (2026-11-10)*: the shared blocking pool this entry argues from ended on 2026-11-06, when TN's `rpc_blocking.rs` gave RPC a blocking runtime of its own (tracker, "TN-side hardening"); the permit semantics stay as described.
 
 - **TN-0037** — `eth_createAccessList` and `eth_callBundle` hold a blocking-IO permit inside
   their blocking task. *Kind*: fix (security).
@@ -1002,6 +1005,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   request must not start a blocking task until the first one's ends. `debug.rs`'s test does the same
   for `debug_executionWitness` and `debug_executionWitnessByBlockHash`. All thirteen fail before the
   change. *Upstream*: yes; upstream main still releases these permits on disconnect.
+  *Note (2026-11-10)*: the shared blocking pool this entry argues from ended on 2026-11-06, when TN's `rpc_blocking.rs` gave RPC a blocking runtime of its own (tracker, "TN-side hardening"); the permit semantics stay as described.
 
 - **TN-0054** — `eth_callBundle` bounds its transaction count and recovers signatures in its
   blocking task. *Kind*: fix (security).
@@ -1225,37 +1229,6 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: n/a (build configuration; the TN-0079 tests exercise it).
   *Upstream*: n/a.
 
-- **TN-0084** — The ledger check reads only an entry's *Files* sentence, and the attested run runs it.
-  *Kind*: tooling.
-  *Files*: `tn/vendor.py` (`FILES_SENTENCE`, `ledger_paths`, `names_path`), `tn/test_vendor.py`
-  (`test_prose_tokens_and_bare_directories_name_nothing`), the root `etc/test-and-attest.sh`.
-  *Why*: `ledger_paths` took any backticked token of an entry that started with `crates/` as a
-  path and treated every token as a possible directory, so the prose "`crates/engine`" in
-  TN-0019 and "`crates/revm`" in TN-0049 covered every file of two vendored crates, one of them
-  on the execution path, and a future edit there needed no entry to pass (review R28). Paths now
-  come from the *Files* sentence only, and a token names a directory only with a trailing slash;
-  the two prose tokens are reworded, and TN-0014's *Files* sentence names the stub it changed.
-  Neither `etc/ci-lanes.sh test-vendor-reth` nor `etc/test-and-attest.sh` ran `vendor.py status`,
-  `ledger` or `check`, so the ledger invariant was a manual claim (review R29); the attested run
-  now runs the three (they need the upstream clone, which CI lacks).
-  *Tests*: `test_prose_tokens_and_bare_directories_name_nothing`; the existing ledger tests, with
-  the directory token in `test_paths_expand_wrap_and_resolve_against_the_entry_crate` given its
-  slash. *Upstream*: n/a.
-
-- **TN-0085** — `lockfile.py check` fails when either workspace resolves revm-inspectors from the
-  registry.
-  *Kind*: tooling.
-  *Files*: `tn/lockfile.py` (`PATCHED`, `unpatched`, `report_unpatched`), `tn/test_lockfile.py`.
-  *Why*: the `[patch.crates-io]` entry for `patches/revm-inspectors` applies only while the
-  dependency requirement in the vendored manifest (`0.34.2`) matches the patch crate's version
-  (0.34.3). A sync to any 0.35 to 0.44.1 makes cargo print "patch was not used" and link the
-  registry crate, and the `revm-inspectors-patch` CI job, which tests the patch crate standalone,
-  stays green (review R30). The check the `test-vendor-reth` lane runs now reads the nested
-  resolve and TN's `Cargo.lock` and fails when the crate has a registry or git source. TN-0080
-  fixed the nested lane's own fallback to the registry; TN-0079's reth-side tests also fail to
-  compile against the registry crate.
-  *Tests*: `test_unpatched_reports_registry_sources_in_either_workspace`. *Upstream*: n/a.
-
 - **TN-0082** — A missing bytecode row fails the lookup instead of executing as empty code.
   *Kind*: fix.
   *Files*: `crates/revm/src/database.rs` (`code_by_hash_ref`; test
@@ -1295,3 +1268,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   transaction dropped; init succeeds and writes the checkpoints; the next init is the ordinary
   skip), `init_genesis_refuses_a_partly_written_database`.
   *Upstream*: candidate.
+
+- **TN-0084** — The ledger check reads only an entry's *Files* sentence, and the attested run runs it.
+  *Kind*: tooling.
+  *Files*: `tn/vendor.py` (`FILES_SENTENCE`, `ledger_paths`, `names_path`), `tn/test_vendor.py`
+  (`test_prose_tokens_and_bare_directories_name_nothing`), the root `etc/test-and-attest.sh`.
+  *Why*: `ledger_paths` took any backticked token of an entry that started with `crates/` as a
+  path and treated every token as a possible directory, so the prose "`crates/engine`" in
+  TN-0019 and "`crates/revm`" in TN-0049 covered every file of two vendored crates, one of them
+  on the execution path, and a future edit there needed no entry to pass (review R28). Paths now
+  come from the *Files* sentence only, and a token names a directory only with a trailing slash;
+  the two prose tokens are reworded, and TN-0014's *Files* sentence names the stub it changed.
+  Neither `etc/ci-lanes.sh test-vendor-reth` nor `etc/test-and-attest.sh` ran `vendor.py status`,
+  `ledger` or `check`, so the ledger invariant was a manual claim (review R29); the attested run
+  now runs the three (they need the upstream clone, which CI lacks).
+  *Tests*: `test_prose_tokens_and_bare_directories_name_nothing`; the existing ledger tests, with
+  the directory token in `test_paths_expand_wrap_and_resolve_against_the_entry_crate` given its
+  slash. *Upstream*: n/a.
+
+- **TN-0085** — `lockfile.py check` fails when either workspace resolves revm-inspectors from the
+  registry.
+  *Kind*: tooling.
+  *Files*: `tn/lockfile.py` (`PATCHED`, `unpatched`, `report_unpatched`), `tn/test_lockfile.py`.
+  *Why*: the `[patch.crates-io]` entry for `patches/revm-inspectors` applies only while the
+  dependency requirement in the vendored manifest (`0.34.2`) matches the patch crate's version
+  (0.34.3). A sync to any 0.35 to 0.44.1 makes cargo print "patch was not used" and link the
+  registry crate, and the `revm-inspectors-patch` CI job, which tests the patch crate standalone,
+  stays green (review R30). The check the `test-vendor-reth` lane runs now reads the nested
+  resolve and TN's `Cargo.lock` and fails when the crate has a registry or git source. TN-0080
+  fixed the nested lane's own fallback to the registry; TN-0079's reth-side tests also fail to
+  compile against the registry crate.
+  *Tests*: `test_unpatched_reports_registry_sources_in_either_workspace`. *Upstream*: n/a.
