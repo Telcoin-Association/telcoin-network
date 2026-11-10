@@ -447,6 +447,25 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             0
         };
 
+        // TN(TN-0130): a prune commits the header before it cuts the rows or the sidecar, so in a
+        // checksummed jar a sidecar shorter than the header, or a committed record past the
+        // rows, is damage: refuse and cut nothing. A plain jar keeps the heal below, since it may
+        // hold an interrupted prune of an older build, which cut them first.
+        if checksums &&
+            (actual_sidecar_blocks < header_claims_blocks || valid_blocks < committed_blocks)
+        {
+            tracing::error!(
+                target: "reth::static_file",
+                path = %csoff_path.display(),
+                header_claims = header_claims_blocks,
+                sidecar_has = actual_sidecar_blocks,
+                valid_blocks,
+                actual_rows = actual_nippy_rows,
+                "Changeset offsets are shorter than their committed header"
+            );
+            return Err(ProviderError::CorruptedChangeSetStaticFile)
+        }
+
         // Step 3: Determine correct state from synced files (source of truth)
         // Header is the commit marker - never enlarge, only shrink
         let correct_blocks = valid_blocks.min(header_claims_blocks);
@@ -1002,6 +1021,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let total_rows = self.writer.rows() as u64;
         let rows_to_delete = total_rows.saturating_sub(rows_to_keep);
 
+        // TN(TN-0130): the header takes its final form before anything is committed, and it is
+        // committed before any file shrinks: `prune_rows` writes it before it cuts the rows, and
+        // the sidecar is cut after the commit below. A prune stopped part way then leaves only
+        // uncommitted bytes past the configuration, which the next open cuts; the rows or the
+        // sidecar shorter than the header can only be damage (`heal_changeset_sidecar`). The
+        // finished prune writes the configuration it wrote before.
         if rows_to_delete > 0 {
             // Calculate the number of blocks to prune
             let current_block_end = self
@@ -1013,9 +1038,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
             // Update segment header - for changesets, prune expects number of blocks, not rows
             self.writer.user_header_mut().prune(blocks_to_remove);
-
-            // Prune the actual rows
-            self.writer.prune_rows(rows_to_delete as usize).map_err(ProviderError::other)?;
         }
 
         // Update the block range
@@ -1023,17 +1045,27 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         // Sync changeset offsets to match the new block range
         self.writer.user_header_mut().sync_changeset_offsets();
+        // The sidecar's record count once it is cut below, which `commit` used to read from it.
+        self.writer.user_header_mut().set_changeset_offsets_len(blocks_to_keep);
 
-        // Truncate the sidecar file to match the new block count
-        if let Some(writer) = &mut self.changeset_offsets {
-            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+        if rows_to_delete > 0 {
+            // Prune the actual rows
+            self.writer.prune_rows(rows_to_delete as usize).map_err(ProviderError::other)?;
         }
 
         // Clear current changeset offset tracking since we've pruned
         self.current_changeset_offset = None;
 
         // Commits new changes to disk
-        self.commit()?;
+        self.writer.commit().map_err(ProviderError::other)?;
+
+        // Truncate the sidecar file to match the new block count
+        if let Some(writer) = &mut self.changeset_offsets {
+            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+        }
+
+        self.update_index()?;
+        self.index_pending = false;
 
         Ok(())
     }
@@ -1124,12 +1156,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer.set_dirty();
         self.data_path = data_path.clone();
 
-        // Delete the sidecar file for changeset segments before deleting the main jar
+        // TN(TN-0132): the sidecar goes with the jar below (`NippyJar::delete`), after its data
+        // file: removed first, it left a jar that does not load when the deletion stopped there.
         if segment.is_change_based() {
-            let csoff_path = current_path.with_extension("csoff");
-            if csoff_path.exists() {
-                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
-            }
             // Re-initialize the changeset offsets writer for the previous file
             let new_csoff_path = data_path.with_extension("csoff");
             let committed_len = self.writer.user_header().changeset_offsets_len();

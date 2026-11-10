@@ -667,7 +667,9 @@ fn v2_update_history_indices_refuses_uncommitted_changesets() {
 /// TN(TN-0123): a v2 history read whose changeset jar is missing fails closed. With the account
 /// and storage changeset files for blocks 4..=7 gone, every read that resolves to one of their
 /// changesets is `AccountChangesetNotFound` / `StorageChangesetNotFound`, never the plain or a
-/// later state's value; every other read still answers right.
+/// later state's value; every other read still answers right. TN(TN-0133): the changeset range
+/// walks across the gap are errors, not shorter changesets, and the startup consistency check
+/// refuses the datadir.
 #[test]
 fn v2_history_read_without_its_changeset_jar_fails_closed() {
     let chain = Chain::generate().across_static_files();
@@ -682,6 +684,14 @@ fn v2_history_read_without_its_changeset_jar_fails_closed() {
             .unwrap();
     }
     static_files.initialize_index().unwrap();
+
+    let is_gap = |err: ProviderError| {
+        err.downcast_other_ref::<crate::providers::StaticFileGapError>().is_some()
+    };
+    assert!(is_gap(static_files.account_changesets_range(1..=TIP).unwrap_err()));
+    assert!(is_gap(static_files.storage_changesets_range(1..=TIP).unwrap_err()));
+    assert!(static_files.account_changesets_range(1..4).is_ok());
+    assert!(is_gap(factory.check_consistency().unwrap_err()));
 
     let provider = factory.provider().unwrap();
     let (mut missing, mut answered) = (0, 0);

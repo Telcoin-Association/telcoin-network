@@ -88,8 +88,11 @@ pub fn value_checksum(row: u64, column: usize, stored: &[u8]) -> u32 {
 /// standard CRC-32):
 /// `0x9E37_79B9 ^ (row as u32) ^ ((row >> 32) as u32).rotate_left(16) ^ (column as u32) *
 /// 0x85EB_CA6B` (wrapping). For rows below 2^32, two values of one column never share a seed, and
-/// values of two columns share one only if their rows differ by the XOR of the two column terms
-/// (at least 2^27 rows apart), so neighbouring values always differ.
+/// values of two columns share one only if their rows' XOR is the XOR of the two column terms.
+/// For the columns 0 to 2 that segments use, such rows are at least 69,757,738 apart (columns 0
+/// and 2; a little over 2^26), far more rows than a jar with more than one column holds (headers:
+/// one row a block, 500,000 a file), so values that can share a jar never share a seed. Rows from
+/// 2^32 on fold their high half in, so they too differ from the rows below.
 pub const fn value_seed(row: u64, column: usize) -> u32 {
     0x9E37_79B9 ^
         (row as u32) ^
@@ -98,8 +101,10 @@ pub const fn value_seed(row: u64, column: usize) -> u32 {
 }
 
 /// TN(TN-0120): the CRC-32 (ISO-HDLC) of `bytes` from the initial value `seed` (crc32fast's
-/// convention). On `x86_64` below 128 bytes crc32fast runs a byte-at-a-time loop, so these inputs
-/// take the `crc` crate's slice-by-16 table instead; both give the same value.
+/// convention). On `x86_64` crc32fast's PCLMULQDQ path starts at 128 bytes; below that its table
+/// path runs slice-by-16 on whole 64-byte blocks and a byte at a time on the rest (all of an input
+/// below 64 bytes), so these inputs take the `crc` crate's slice-by-16 table instead; both give
+/// the same value.
 pub fn checksum(seed: u32, bytes: &[u8]) -> u32 {
     if cfg!(target_arch = "x86_64") && bytes.len() < 128 {
         checksum_slice16(seed, bytes)
@@ -327,6 +332,14 @@ impl<H: NippyJarHeader> NippyJar<H> {
     /// version-1 configuration decodes as upstream's does; any other version is refused.
     fn decode_config(bytes: &[u8], config_path: &Path) -> Result<Self, NippyJarError> {
         let version = bytes.get(..8).map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")));
+        // TN(TN-0134): an unknown version is refused before anything is decoded with a layout it
+        // may not have.
+        if let Some(version) = version &&
+            version != NIPPY_JAR_VERSION as u64 &&
+            version != NIPPY_JAR_VERSION_CHECKSUMS as u64
+        {
+            return Err(NippyJarError::UnsupportedVersion(version as usize))
+        }
         let body = if version == Some(NIPPY_JAR_VERSION_CHECKSUMS as u64) {
             let checksummed = bytes
                 .len()
@@ -382,11 +395,22 @@ impl<H: NippyJarHeader> NippyJar<H> {
     }
 
     /// Deletes from disk this [`NippyJar`] alongside every satellite file.
+    ///
+    /// TN(TN-0132): the data file goes first, and its removal is made durable before any
+    /// satellite goes. Jars are found by their data file (`iter_static_files`), so a deletion
+    /// stopped at any point leaves either the whole jar or files no listing sees, which
+    /// [`NippyJarWriter`] empties when it creates a jar at that path again.
     pub fn delete(self) -> Result<(), NippyJarError> {
-        // TODO(joshie): ensure consistency on unexpected shutdown
+        let data_path = self.data_path();
+        if data_path.exists() {
+            debug!(target: "nippy-jar", path = ?data_path, "Removing file.");
+            reth_fs_util::remove_file(data_path)?;
+            if let Some(dir) = data_path.parent() {
+                reth_fs_util::fsync_file(&File::open(dir)?)?;
+            }
+        }
 
         for path in [
-            self.data_path().into(),
             self.index_path(),
             self.offsets_path(),
             self.config_path(),
@@ -500,7 +524,13 @@ impl DataReader {
         let offset_mmap = unsafe { Mmap::map(&offset_file)? };
 
         // First byte is the size of one offset in bytes
-        let offset_size = offset_mmap[0];
+        // TN(TN-0131): an empty offsets file (a crash right after a new jar's configuration was
+        // written can leave one) is an error, not a panic on the empty map.
+        let Some(&offset_size) = offset_mmap.first() else {
+            return Err(NippyJarError::EmptyOffsetsFile(
+                path.as_ref().with_extension(OFFSETS_FILE_EXTENSION),
+            ))
+        };
 
         // Ensure that the size of an offset is at most 8 bytes.
         if offset_size > 8 {
@@ -1692,14 +1722,40 @@ mod tests {
         }
     }
 
-    /// TN(TN-0120): pins what the open-time heal does to committed rows. Its prune-direction
-    /// arms trust the offsets file's length and its final offset: an offsets file one row short,
-    /// or a final offset past the data, cuts committed rows and rewrites the configuration,
-    /// without an error, in a checksummed jar too (the heal reads no value, so no checksum sees
-    /// it). The rows it keeps stay framed and verify. The cut leaves the static files behind the
-    /// database's stage checkpoints, which TN refuses at startup.
+    /// The data, offsets and configuration files of the jar at `path`.
+    fn jar_files(path: &Path) -> [Vec<u8>; 3] {
+        [
+            std::fs::read(path).unwrap(),
+            std::fs::read(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap(),
+            std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap(),
+        ]
+    }
+
+    /// Writes `files` ([`jar_files`]) as the jar at `path`.
+    fn write_jar_files(path: &Path, files: &[Vec<u8>; 3]) {
+        std::fs::write(path, &files[0]).unwrap();
+        std::fs::write(path.with_extension(OFFSETS_FILE_EXTENSION), &files[1]).unwrap();
+        std::fs::write(path.with_extension(CONFIG_FILE_EXTENSION), &files[2]).unwrap();
+    }
+
+    /// Freezes `col1` and `col2` into a jar at `path`, checksummed if `checksums`.
+    fn freeze_version(path: &Path, col1: &ColumnValues, col2: &ColumnValues, checksums: bool) {
+        if checksums {
+            freeze_checksummed(path, col1, col2, false);
+        } else {
+            NippyJar::new_without_header(2, path)
+                .freeze(vec![clone_with_result(col1), clone_with_result(col2)], col1.len() as u64)
+                .unwrap();
+        }
+    }
+
+    /// TN(TN-0130): files shorter than their configuration's committed rows: one row's offsets
+    /// missing, or a final offset past the data (one flipped high bit). A prune commits the
+    /// configuration before it cuts the files, so in a checksummed jar this is damage: the open
+    /// fails and every file is left as it was. A plain jar keeps upstream's heal, which cuts the
+    /// row, since it may hold an interrupted prune of an older build (which cut the files first).
     #[test]
-    fn test_heal_cuts_committed_rows_by_offsets_alone() {
+    fn test_heal_of_files_shorter_than_the_config() {
         let (col1, col2) = test_data(Some(15));
         let rows = col1.len();
         let damages: [fn(&Path); 2] = [
@@ -1716,16 +1772,295 @@ mod tests {
                 flip_byte(&offsets, len - 1, 0x80);
             },
         ];
-        for damage in damages {
-            let file = tempfile::NamedTempFile::new().unwrap();
-            freeze_checksummed(file.path(), &col1, &col2, false);
-            damage(file.path());
-            drop(NippyJarWriter::new(NippyJar::load_without_header(file.path()).unwrap()).unwrap());
+        for (damage, file) in damages.into_iter().zip(["offsets", "data"]) {
+            // Checksummed: refused, nothing cut.
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, true);
+            damage(jar.path());
+            let damaged = jar_files(jar.path());
+            let err = NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&err, NippyJarError::CommittedRowsMissing { path, file: short }
+                    if path == jar.path() && *short == file),
+                "{err}"
+            );
+            assert_eq!(jar_files(jar.path()), damaged);
 
-            let nippy = NippyJar::load_without_header(file.path()).unwrap();
+            // Plain: upstream's heal cuts the row, and the rows it keeps read.
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, false);
+            damage(jar.path());
+            drop(NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap());
+            let nippy = NippyJar::load_without_header(jar.path()).unwrap();
             assert_eq!(nippy.rows, rows - 1);
-            assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+            let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+            for row in 0..rows - 1 {
+                let values = cursor.row_by_number(row).unwrap().unwrap();
+                assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
+            }
         }
+    }
+
+    /// TN(TN-0130): a prune stopped at any point leaves a state the next open heals to either the
+    /// jar before the prune or the finished prune, byte for byte, in both formats. A prune whose
+    /// configuration cannot be written (a directory where its temporary file goes) has cut
+    /// nothing; the configuration written but no file cut yet, or only the offsets cut, heals to
+    /// the finished prune. Fails if a prune cuts a file before it commits the configuration.
+    #[test]
+    fn test_interrupted_prune_heals_at_every_point() {
+        let (col1, col2) = test_data(Some(16));
+        let rows = col1.len();
+        for checksums in [false, true] {
+            for prune in [1, 3, rows] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                let before = jar_files(path);
+
+                // The configuration cannot be written: the prune fails, nothing is cut.
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                let blocker = path.with_extension("tmp");
+                std::fs::create_dir(&blocker).unwrap();
+                assert!(writer.prune_rows(prune).is_err());
+                drop(writer);
+                std::fs::remove_dir(&blocker).unwrap();
+                drop(NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap());
+                assert_eq!(jar_files(path), before, "checksums {checksums}, prune {prune}");
+
+                // The finished prune.
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                writer.prune_rows(prune + 1).unwrap();
+                drop(writer);
+                let after = jar_files(path);
+                assert_jar_rows(path, &col1, &col2, rows - prune);
+
+                // Stopped after the configuration, before any cut; and after the offsets cut.
+                let [data, offsets, config] = after.clone();
+                for stopped in [
+                    [before[0].clone(), before[1].clone(), config.clone()],
+                    [before[0].clone(), offsets.clone(), config.clone()],
+                ] {
+                    write_jar_files(path, &stopped);
+                    drop(
+                        NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap(),
+                    );
+                    assert_eq!(jar_files(path), after, "checksums {checksums}, prune {prune}");
+                }
+                assert_eq!(data, after[0]);
+                assert!(read_all_rows(path).iter().all(Result::is_ok));
+            }
+        }
+    }
+
+    /// TN(TN-0131): a jar whose configuration counts no rows holds nothing committed, so the
+    /// writer's open restores the files a new jar starts with, whatever a crash left in them: an
+    /// empty or torn offsets file (a rotation's power loss after the new jar's configuration was
+    /// written), a damaged final offset, or another jar's leftover files. Both formats. The
+    /// reader refuses an empty offsets file with an error instead of a panic.
+    #[test]
+    fn test_jar_without_rows_opens_whatever_its_files_hold() {
+        let (col1, col2) = test_data(Some(17));
+        let mut created = vec![writer::OFFSET_SIZE_BYTES];
+        created.extend_from_slice(&[0; writer::OFFSET_SIZE_BYTES as usize]);
+        let mut damaged_final = created.clone();
+        damaged_final[8] = 0x80;
+        for checksums in [false, true] {
+            let leftover = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(leftover.path(), &col1, &col2, checksums);
+            let [leftover_data, leftover_offsets, _] = jar_files(leftover.path());
+
+            for (offsets, data) in [
+                (vec![], vec![]),
+                (created[..5].to_vec(), vec![]),
+                (damaged_final.clone(), vec![]),
+                (created.clone(), leftover_data[..40].to_vec()),
+                (leftover_offsets.clone(), leftover_data.clone()),
+            ] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                let mut nippy = NippyJar::new_without_header(2, path);
+                if checksums {
+                    nippy = nippy.with_checksums();
+                }
+                nippy.freeze_config().unwrap();
+                std::fs::write(path, &data).unwrap();
+                std::fs::write(path.with_extension(OFFSETS_FILE_EXTENSION), &offsets).unwrap();
+                if offsets.is_empty() {
+                    let err = NippyJar::load_without_header(path).unwrap().open_data_reader();
+                    assert!(matches!(err, Err(NippyJarError::EmptyOffsetsFile(_))), "{err:?}");
+                }
+
+                let mut writer =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), Vec::<u8>::new());
+                assert_eq!(
+                    std::fs::read(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap(),
+                    created
+                );
+                append_row(&mut writer, &col1, &col2, 0);
+                append_row(&mut writer, &col1, &col2, 1);
+                writer.commit().unwrap();
+                drop(writer);
+                assert_jar_rows(path, &col1, &col2, 2);
+            }
+        }
+    }
+
+    /// TN(TN-0132): a jar created where a deletion stopped part way (`NippyJar::delete` removes
+    /// the data file first) starts empty whatever the other files hold: the old jar's offsets
+    /// file, or a data file without offsets. A jar whose configuration counts rows and has lost a
+    /// file is refused, not created again.
+    #[test]
+    fn test_writer_creates_over_leftovers_and_refuses_a_missing_file() {
+        let (col1, col2) = test_data(Some(18));
+        for checksums in [false, true] {
+            // (the leftover files kept)
+            for kept in [&[OFFSETS_FILE_EXTENSION][..], &[""], &[OFFSETS_FILE_EXTENSION, ""]] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                for ext in ["", OFFSETS_FILE_EXTENSION, CONFIG_FILE_EXTENSION] {
+                    if !kept.contains(&ext) {
+                        let file = if ext.is_empty() {
+                            path.to_path_buf()
+                        } else {
+                            path.with_extension(ext)
+                        };
+                        std::fs::remove_file(file).unwrap();
+                    }
+                }
+                if kept.len() == 2 {
+                    // Both files there: the jar without rows the open finds is restored instead.
+                    std::fs::remove_file(path.with_extension(OFFSETS_FILE_EXTENSION)).unwrap();
+                }
+                let mut nippy = NippyJar::new_without_header(2, path);
+                if checksums {
+                    nippy = nippy.with_checksums();
+                }
+                let mut writer = NippyJarWriter::new(nippy).unwrap();
+                append_row(&mut writer, &col1, &col2, 0);
+                writer.commit().unwrap();
+                drop(writer);
+                assert_jar_rows(path, &col1, &col2, 1);
+            }
+
+            // A committed jar without its data or offsets file.
+            for ext in ["", OFFSETS_FILE_EXTENSION] {
+                let jar = tempfile::NamedTempFile::new().unwrap();
+                let path = jar.path();
+                freeze_version(path, &col1, &col2, checksums);
+                let missing =
+                    if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+                std::fs::remove_file(&missing).unwrap();
+                let config = std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap();
+                let err =
+                    NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap_err();
+                assert!(matches!(&err, NippyJarError::MissingFile(file) if file == &missing));
+                assert!(!missing.exists());
+                assert_eq!(
+                    std::fs::read(path.with_extension(CONFIG_FILE_EXTENSION)).unwrap(),
+                    config
+                );
+            }
+        }
+    }
+
+    /// TN(TN-0134): the seed's high-half term separates rows 2^32 apart, and the closest rows of
+    /// two columns that share a seed are as far apart as `value_seed` documents (columns 0 and 2,
+    /// 69,757,738 rows).
+    #[test]
+    fn test_value_seed_bounds() {
+        for row in [0, 1, 7, 499_999, u32::MAX as u64] {
+            for column in 0..3 {
+                assert_ne!(value_seed(row, column), value_seed(row + (1 << 32), column));
+                assert_ne!(value_seed(row, column), value_seed(row + (1 << 48), column));
+            }
+        }
+        assert_eq!(value_seed(64_459_990, 0), value_seed(134_217_728, 2));
+        let term = |column: usize| (column as u32).wrapping_mul(0x85EB_CA6B);
+        let closest = |difference: u32| {
+            let top = 1u64 << (31 - difference.leading_zeros());
+            top - (difference as u64 - top)
+        };
+        let pairs = [(0, 1), (0, 2), (1, 2)];
+        let min = pairs.iter().map(|&(a, b)| closest(term(a) ^ term(b))).min().unwrap();
+        assert_eq!(min, 134_217_728 - 64_459_990);
+    }
+
+    /// TN(TN-0134): a value copied over another column's value of the same row fails that
+    /// column's read, as one moved to another row does.
+    #[test]
+    fn test_checksum_detects_value_moved_to_another_column() {
+        let (col1, col2) = test_data(Some(19));
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        let path = jar.path();
+        freeze_checksummed(path, &col1, &col2, false);
+        let row = 5;
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let reader = nippy.open_data_reader().unwrap();
+        let (first, second, end) = (
+            reader.offset(row * 2).unwrap(),
+            reader.offset(row * 2 + 1).unwrap(),
+            reader.offset(row * 2 + 2).unwrap(),
+        );
+        drop(reader);
+        assert_eq!(second - first, end - second);
+        let mut data = std::fs::read(path).unwrap();
+        let moved = data[first as usize..second as usize].to_vec();
+        data[second as usize..end as usize].copy_from_slice(&moved);
+        std::fs::write(path, data).unwrap();
+
+        let nippy = NippyJar::load_without_header(path).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        for result in [
+            cursor.row_by_number(row).map(drop),
+            cursor.row_by_number_with_cols(row, 0b10).map(drop),
+        ] {
+            assert!(
+                matches!(result, Err(NippyJarError::ChecksumMismatch { row: 5, column: 1, .. })),
+                "{result:?}"
+            );
+        }
+        assert!(cursor.row_by_number_with_cols(row, 0b01).is_ok());
+    }
+
+    /// TN(TN-0134): a configuration naming an unknown version is refused as that, before its body
+    /// is decoded, whatever follows the version.
+    #[test]
+    fn test_unknown_version_refused_before_decode() {
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        for version in [0u64, 3, u64::MAX] {
+            let mut config = version.to_le_bytes().to_vec();
+            config.extend_from_slice(&[0xFF; 5]);
+            std::fs::write(jar.path().with_extension(CONFIG_FILE_EXTENSION), config).unwrap();
+            let err = NippyJar::load_without_header(jar.path()).unwrap_err();
+            assert!(
+                matches!(err, NippyJarError::UnsupportedVersion(v) if v == version as usize),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// TN(TN-0134): a version-1 configuration that names dictionary zstd without the dictionaries
+    /// (no checksum guards a version-1 configuration) makes reads fail, not panic.
+    #[test]
+    fn test_dictionary_zstd_without_dictionaries_is_an_error() {
+        let (col1, col2) = test_data(Some(20));
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        freeze_version(jar.path(), &col1, &col2, false);
+        let mut nippy = NippyJar::load_without_header(jar.path()).unwrap();
+        nippy.compressor = Some(Compressors::Zstd(compression::Zstd::new(true, 5000, 2)));
+        nippy.freeze_config().unwrap();
+
+        let nippy = NippyJar::load_without_header(jar.path()).unwrap();
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        let result = cursor.row_by_number(0).map(drop);
+        assert!(matches!(result, Err(NippyJarError::DictionaryNotLoaded)), "{result:?}");
     }
 
     /// TN(TN-0120): both CRC implementations give the same value for every length and initial

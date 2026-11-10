@@ -5,7 +5,7 @@
 use super::manager::{StaticFileProviderBuilder, StaticFileWriter};
 use crate::{
     providers::StaticFileProvider, test_utils::create_test_provider_factory, HeaderProvider,
-    ReceiptProvider, StaticFileProviderFactory, TransactionsProvider,
+    ReceiptProvider, StaticFileProviderFactory, TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::{Header, SignableTransaction, Transaction, TxLegacy};
 use alloy_primitives::{Address, Signature, B256, U160, U256};
@@ -15,7 +15,7 @@ use reth_db::{
 };
 use reth_db_api::models::StorageSettings;
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
-use reth_nippy_jar::{NippyJar, NippyJarError, NippyJarWriter};
+use reth_nippy_jar::{ColumnResult, NippyJar, NippyJarCursor, NippyJarError, NippyJarWriter};
 use reth_primitives_traits::Account;
 use reth_static_file_types::{
     changeset_offset_record_size, ChangesetOffsetChecksumMismatch, SegmentHeader, StaticFileSegment,
@@ -29,9 +29,9 @@ use std::{
 };
 
 /// Changes a block holds in each changeset segment.
-const CHANGES: u64 = 5;
+pub(super) const CHANGES: u64 = 5;
 
-fn provider(
+pub(super) fn provider(
     dir: &Path,
     checksums: bool,
     blocks_per_file: u64,
@@ -43,7 +43,7 @@ fn provider(
         .unwrap()
 }
 
-fn address(block: u64, change: u64) -> Address {
+pub(super) fn address(block: u64, change: u64) -> Address {
     Address::from(U160::from(block * 1_000 + change + 1))
 }
 
@@ -51,7 +51,7 @@ fn slot(change: u64) -> B256 {
     B256::with_last_byte(change as u8 + 1)
 }
 
-fn account_changes(block: u64) -> Vec<AccountBeforeTx> {
+pub(super) fn account_changes(block: u64) -> Vec<AccountBeforeTx> {
     (0..CHANGES)
         .map(|change| AccountBeforeTx {
             address: address(block, change),
@@ -71,7 +71,10 @@ fn storage_changes(block: u64) -> Vec<StorageBeforeTx> {
 }
 
 /// Appends both changeset segments' blocks `blocks`.
-fn write_changesets(provider: &StaticFileProvider<EthPrimitives>, blocks: std::ops::Range<u64>) {
+pub(super) fn write_changesets(
+    provider: &StaticFileProvider<EthPrimitives>,
+    blocks: std::ops::Range<u64>,
+) {
     let mut accounts = provider.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
     for block in blocks.clone() {
         accounts.append_account_changeset(account_changes(block), block).unwrap();
@@ -86,7 +89,7 @@ fn write_changesets(provider: &StaticFileProvider<EthPrimitives>, blocks: std::o
 }
 
 /// Appends headers, one transaction, receipt and sender a block, for blocks `0..blocks`.
-fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u64) {
+pub(super) fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u64) {
     let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
     for number in 0..blocks {
         let header = Header { number, gas_limit: 30_000_000 + number, ..Default::default() };
@@ -120,7 +123,7 @@ fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>, blocks: u6
 }
 
 /// The data file of `segment`'s jar holding `block`.
-fn jar_path(
+pub(super) fn jar_path(
     provider: &StaticFileProvider<EthPrimitives>,
     segment: StaticFileSegment,
     block: u64,
@@ -128,7 +131,7 @@ fn jar_path(
     provider.directory().join(segment.filename(&provider.find_fixed_range(segment, block)))
 }
 
-fn load(path: &Path) -> NippyJar<SegmentHeader> {
+pub(super) fn load(path: &Path) -> NippyJar<SegmentHeader> {
     NippyJar::<SegmentHeader>::load(path).unwrap()
 }
 
@@ -258,6 +261,9 @@ fn damaged_block_segment_value_is_an_error() {
     assert!(is_checksum_error(&provider.transaction_sender(1).unwrap_err()));
     assert!(is_checksum_error(&provider.headers_range(0..3).unwrap_err()));
     assert!(is_checksum_error(&provider.receipts_by_tx_range(0..3).unwrap_err()));
+    // TN(TN-0136): the hashes of a range holding the damaged transaction are an error too.
+    assert!(is_checksum_error(&provider.transaction_hashes_by_range(0..3).unwrap_err()));
+    assert_eq!(provider.transaction_hashes_by_range(2..3).unwrap().len(), 1);
     for number in [0, 2] {
         assert_eq!(provider.header_by_number(number).unwrap().unwrap().number, number);
         assert_eq!(provider.transaction_by_id(number).unwrap().unwrap().nonce(), number);
@@ -364,7 +370,7 @@ fn checksummed_sidecar_heal() {
     );
 }
 
-fn provider_rw(dir: &Path) -> StaticFileProvider<EthPrimitives> {
+pub(super) fn provider_rw(dir: &Path) -> StaticFileProvider<EthPrimitives> {
     StaticFileProviderBuilder::read_write(dir).with_blocks_per_file(1_000).build().unwrap()
 }
 
@@ -411,22 +417,16 @@ fn sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap() {
     assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
 }
 
-/// Rotation, prune and appends keep every checksummed jar verifying; a datadir whose old jars are
-/// unchecked keeps reading and appending them as they are, and its new jars are checksummed.
+/// Rotation, prune and appends keep every checksummed jar verifying.
 #[test]
-fn rotation_prune_and_mixed_formats() {
+fn rotation_prune_and_appends() {
     let (dir, _) = create_test_static_files_dir();
-    let unchecked = provider(dir.path(), false, 2);
-    write_changesets(&unchecked, 0..3);
-    drop(unchecked);
-
-    // Checksums on: block 3 goes to the existing unchecked jar 2..=3, blocks 4.. to new jars.
     let provider = provider(dir.path(), true, 2);
-    write_changesets(&provider, 3..7);
-    for (block, checksummed) in [(0, false), (2, false), (4, true), (6, true)] {
+    write_changesets(&provider, 0..7);
+    for block in [0, 2, 4, 6] {
         for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
         {
-            assert_eq!(load(&jar_path(&provider, segment, block)).has_checksums(), checksummed);
+            assert!(load(&jar_path(&provider, segment, block)).has_checksums());
         }
     }
     let read_all = |provider: &StaticFileProvider<EthPrimitives>, blocks: std::ops::Range<u64>| {
@@ -438,7 +438,7 @@ fn rotation_prune_and_mixed_formats() {
     };
     read_all(&provider, 0..7);
 
-    // Prune back into the checksummed jar 4..=5, then append past the rotation again.
+    // Prune back into the jar 4..=5, then append past the rotation again.
     let mut accounts = provider.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
     accounts.prune_account_changesets(4).unwrap();
     accounts.commit().unwrap();
@@ -452,6 +452,54 @@ fn rotation_prune_and_mixed_formats() {
     read_all(&provider, 0..9);
     drop(provider);
     read_all(&provider_ro(dir.path()), 0..9);
+}
+
+/// Whether `err` is TN-0135's refusal of a jar without checksums.
+fn is_unchecked_jar(err: &ProviderError) -> bool {
+    err.downcast_other_ref::<super::UncheckedJarError>().is_some()
+}
+
+/// TN(TN-0135): a provider with checksums on (storage v2) refuses a jar of a checksummed segment
+/// that has none, at every load: one written without checksums (a storage-v2 datadir from before
+/// them), and a checksummed jar whose configuration's version became 1 (its trailer dropped), which
+/// would otherwise read its values with their checksums appended. A provider with checksums off
+/// reads the unchecked jars.
+#[test]
+fn storage_v2_refuses_jars_without_checksums() {
+    // Written without checksums, opened with them.
+    let (dir, _) = create_test_static_files_dir();
+    let unchecked = provider(dir.path(), false, 2);
+    write_changesets(&unchecked, 0..3);
+    write_block_segments(&unchecked, 3);
+    drop(unchecked);
+    let opened = provider(dir.path(), true, 2);
+    assert!(is_unchecked_jar(&opened.account_block_changeset(0).unwrap_err()));
+    assert!(is_unchecked_jar(&opened.header_by_number(0).unwrap_err()));
+    let err = opened.latest_writer(StaticFileSegment::StorageChangeSets).map(drop).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    drop(opened);
+    let read_only = provider_ro(dir.path());
+    assert_eq!(read_only.account_block_changeset(0).unwrap(), account_changes(0));
+    drop(read_only);
+
+    // A checksummed jar whose configuration says version 1.
+    let (dir, _) = create_test_static_files_dir();
+    let checked = provider(dir.path(), true, 2);
+    write_changesets(&checked, 0..3);
+    let path = jar_path(&checked, StaticFileSegment::StorageChangeSets, 0);
+    drop(checked);
+    let config = path.with_extension("conf");
+    let mut bytes = std::fs::read(&config).unwrap();
+    assert_eq!(bytes[..8], 2u64.to_le_bytes());
+    bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+    bytes.truncate(bytes.len() - 4);
+    std::fs::write(&config, bytes).unwrap();
+    assert!(!load(&path).has_checksums());
+    let reopened = provider(dir.path(), true, 2);
+    let err = reopened.get_storage_before_block(0, address(0, 0), slot(3)).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    assert!(is_unchecked_jar(&reopened.storage_changeset(1).unwrap_err()));
+    assert_eq!(reopened.account_block_changeset(1).unwrap(), account_changes(1));
 }
 
 /// A range read that meets a row missing inside a jar's own range is an error, not a shorter
@@ -510,4 +558,57 @@ fn damaged_probe_key_is_an_error_not_another_row() {
         provider.get_account_before_block(0, address(0, 0)).unwrap(),
         Some(account_changes(0)[0].clone())
     );
+}
+
+/// TN(TN-0137): the changeset point lookups refuse a compressed jar with a typed error instead of
+/// comparing its compressed bytes as keys (by those bytes, a stored change reported absent, or
+/// here, values shorter than the key, a corruption error). The block reads decompress every row and
+/// still answer.
+#[test]
+fn compressed_changeset_jar_is_refused_by_the_lookups() {
+    let (dir, _) = create_test_static_files_dir();
+    let provider = provider(dir.path(), false, 1_000);
+    write_changesets(&provider, 0..3);
+    let jars = [
+        jar_path(&provider, StaticFileSegment::AccountChangeSets, 0),
+        jar_path(&provider, StaticFileSegment::StorageChangeSets, 0),
+    ];
+    drop(provider);
+
+    // Change 3 is not its block's first, so a search over compressed bytes does not land on it.
+    let provider = provider_ro(dir.path());
+    assert_eq!(
+        provider.get_account_before_block(1, address(1, 3)).unwrap(),
+        Some(account_changes(1)[3].clone())
+    );
+    assert!(provider.get_storage_before_block(1, address(1, 0), slot(3)).unwrap().is_some());
+    drop(provider);
+
+    // The same rows written again with compression; the `.csoff` sidecars still hold the blocks.
+    for path in &jars {
+        let (header, values) = {
+            let jar = load(path);
+            let mut cursor = NippyJarCursor::new(&jar).unwrap();
+            let mut values: Vec<ColumnResult<Vec<u8>>> = Vec::new();
+            while let Some(row) = cursor.next_row().unwrap() {
+                values.push(Ok(row[0].to_vec()));
+            }
+            (jar.user_header().clone(), values)
+        };
+        let rows = values.len() as u64;
+        let mut writer = NippyJarWriter::new(NippyJar::new(1, path, header).with_lz4()).unwrap();
+        writer.append_rows(vec![values], rows).unwrap();
+        writer.commit().unwrap();
+        assert!(load(path).compressor().is_some());
+    }
+
+    let provider = provider_ro(dir.path());
+    let is_compressed_jar = |err: &ProviderError| {
+        err.downcast_other_ref::<super::CompressedChangesetJarError>().is_some()
+    };
+    let err = provider.get_account_before_block(1, address(1, 3)).unwrap_err();
+    assert!(is_compressed_jar(&err), "{err}");
+    let err = provider.get_storage_before_block(1, address(1, 0), slot(3)).unwrap_err();
+    assert!(is_compressed_jar(&err), "{err}");
+    assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
 }

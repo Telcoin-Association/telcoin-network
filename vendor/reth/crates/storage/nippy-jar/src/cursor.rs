@@ -221,13 +221,15 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             let from = self.internal_buffer.len();
             match compression {
                 Compressors::Zstd(z) if z.use_dict => {
-                    // If we are here, then for sure we have the necessary dictionaries and they're
-                    // loaded (happens during deserialization). Otherwise, there's an issue
-                    // somewhere else and we can't recover here anyway.
-                    let dictionaries = z.dictionaries.as_ref().expect("dictionaries to exist")
-                        [column]
-                        .loaded()
-                        .expect("dictionary to be loaded");
+                    // TN(TN-0134): a configuration without this column's loaded dictionary (a
+                    // version-1 configuration has no checksum, so damage can say anything) is an
+                    // error, not a panic.
+                    let dictionaries = z
+                        .dictionaries
+                        .as_ref()
+                        .and_then(|dictionaries| dictionaries.get(column))
+                        .and_then(|dictionary| dictionary.loaded())
+                        .ok_or(NippyJarError::DictionaryNotLoaded)?;
                     let mut decompressor = Decompressor::with_prepared_dictionary(dictionaries)?;
                     Zstd::decompress_with_dictionary(
                         self.reader.data(column_offset_range),

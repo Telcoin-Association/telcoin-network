@@ -299,7 +299,10 @@ impl ChangesetOffsetReader {
         // TN(TN-0121): whole chunks of records a read, not one `pread` a record: the open-time
         // heal reads every committed record (up to one a block, 500k a file).
         const CHUNK_RECORDS: usize = 4096;
-        let mut result = Vec::with_capacity(count);
+        // TN(TN-0134): reserve no more than the file holds; a `len` past it (a damaged header)
+        // ends in the read error below, not in an allocation sized by the header.
+        let file_records = self.file.metadata()?.len() / record_size as u64;
+        let mut result = Vec::with_capacity(count.min(file_records as usize));
         let mut buf = vec![0u8; count.min(CHUNK_RECORDS) * record_size];
         let mut index = start;
         while index < end {
@@ -330,6 +333,33 @@ impl ChangesetOffsetReader {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// TN(TN-0134): the record seed's high-half term separates indexes 2^32 apart.
+    #[test]
+    fn test_record_seed_high_half() {
+        for index in [0, 1, 499_999, u32::MAX as u64] {
+            assert_ne!(record_seed(index), record_seed(index + (1 << 32)));
+            assert_ne!(record_seed(index), record_seed(index + (1 << 48)));
+        }
+    }
+
+    /// TN(TN-0134): a range read whose length (from a damaged header) runs past the file is a read
+    /// error, after reserving only what the file holds, not an allocation sized by the length.
+    #[test]
+    fn test_get_range_past_the_file_is_an_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.csoff");
+        for checksums in [false, true] {
+            let mut writer = ChangesetOffsetWriter::new(&path, 0, checksums).unwrap();
+            writer.append_many(&[ChangesetOffset::new(0, 1), ChangesetOffset::new(1, 1)]).unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+            let reader = ChangesetOffsetReader::new(&path, 1 << 60, checksums).unwrap();
+            let err = reader.get_range(0, 1 << 60).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
 
     #[test]
     fn test_write_and_read() {
