@@ -3,6 +3,7 @@
 #![allow(unused_crate_dependencies)]
 
 mod bls_precompile_props;
+mod cached_reads_props;
 mod economics_props;
 mod pipeline_helpers;
 mod precompile_relays;
