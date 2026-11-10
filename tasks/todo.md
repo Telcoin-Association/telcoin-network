@@ -495,3 +495,33 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
       the info-list doc drift (CLAUDE.md numbers, ROADMAP, README `tn/` listing, usage-map counts,
       TN-0019/0036/0038 supersession notes, TN-0049 omission note) and the PR text corrections.
       Found on the way: TN-0080 (the nested test lane never built against the carried patch).
+
+### Review (2026-11-10)
+- Commits on `sls_reth_vendor2`, local only: TN-0066 to TN-0085 plus the TN-side commits (R7
+  `no_updates`, R16 `Finish`-checkpoint tip reads, the TN-0064 namespace test). One commit per
+  item; shared ledger files carved per commit.
+- Fork checks for the execution/storage-path changes (TN-0081, TN-0082, TN-0083):
+  `graph.py diff` before/after: 0 packages left, 0 feature changes (both targets, run and build
+  units); `make test-upgrade` with v0.16.0-adiri as the previous binary: `test_upgrade_rolling_in_place`
+  passes (every node agrees on block hash, stateRoot and receiptsRoot).
+- Suites: nested `reth-rpc`, `reth-rpc-eth-api`, `reth-rpc-eth-types`, `reth-transaction-pool`
+  (validate), `reth-trie*` (213), `reth-revm`, `reth-db-common` all pass; `cargo.sh check
+  --workspace --all-targets` clean; TN `tn-reth`, `tn-batch-builder`, `telcoin-network-cli`: 636
+  passed. The patch crate's own tests (18) pass.
+- Gates: `vendor.py ledger` (155 files), `vendor.py check`, `lockfile.py check` (now also proves
+  the patch is resolved), `etc/rocksdb-gate.sh`, `etc/ci-lanes.sh fmt` all pass.
+- Not finished: `etc/ci-lanes.sh test-vendor-reth`, nested clippy, root clippy (chained in one
+  background run). The lane rebuilt the nested test profile in 104 min, then nextest's listing
+  step hung: ten test binaries sat 6 to 8 hours at 0% CPU inside dyld, blocked in the `fcntl`
+  that registers `libstd-*.dylib`'s code signature, and `syspolicyd` was in uninterruptible wait
+  with no new log lines. A fresh exec of a never-run test binary still blocks after the run was
+  killed, while already-assessed binaries (cargo, git, python) run. This is the macOS
+  first-launch assessment (SentinelOne/syspolicyd) wedged on the machine, not a test; it needs
+  `syspolicyd` restarted or a reboot, then the three lanes rerun. The nested clippy stall earlier
+  in the session (drivers asleep at 0% CPU) was most likely the same thing.
+- Open issues O1 to O11 are unchanged except: O3 gained R11 and the two T2-1 notes; O6 now
+  reads TN-0079/TN-0080/TN-0085; O10's `cargo.sh --config` line is now `.cargo/config.toml`.
+  `tasks/pr-sls_reth_vendor2.md` (untracked) was corrected but needs the new items added before
+  the PR text is reused.
+- Previous-binary build needs `GIT_CONFIG_COUNT=2` with `url.<repo>/.git/modules/tn-contracts.insteadOf`
+  and `protocol.file.allow=always` in an agent session (no SSH hardware key).

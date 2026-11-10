@@ -131,3 +131,8 @@ still pinned the old code and nobody ran it until an unrelated tn-reth run a day
 any backport that changes an RPC answer, run `cargo nextest run -p tn-reth` (at least
 `-E 'test(rpc)'`) in the same step as the docs update; TN pins vendored behaviour in its own
 tests as well as in `docs/src/rpc-methods/`.
+
+- The macOS first-launch assessment can wedge outright, not just add ~80 s per binary: new test
+  binaries then block forever in dyld (`fcntl` on `libstd-*.dylib`) at 0% CPU and `syspolicyd`
+  sits in uninterruptible wait. Before chaining long lanes, probe one never-run binary with a
+  30 s watchdog; if it blocks, stop and ask for a `syspolicyd` restart instead of waiting.
