@@ -617,8 +617,8 @@ fn set_lag_gauges(
     let primary = *rx_round.borrow();
     let committed = *rx_committed.borrow();
     let executed = rx_recent.borrow().last_consensus_round();
-    metrics.consensus_exec_lag_rounds.set(committed.saturating_sub(executed) as f64);
-    metrics.commit_lag_rounds.set(primary.saturating_sub(committed) as f64);
+    metrics.consensus_exec_lag_rounds.set(f64::from(committed.saturating_sub(executed)));
+    metrics.commit_lag_rounds.set(f64::from(primary.saturating_sub(committed)));
 }
 
 /// Consensus-height gauges and the falling-behind alarm.
