@@ -444,7 +444,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             info!(
                 target: "consensus::metrics",
                 digest = %digest,
-                report_ms = millis(report_elapsed),
                 report_us = micros(report_elapsed),
                 "batch reported"
             );

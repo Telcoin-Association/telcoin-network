@@ -435,9 +435,8 @@ async fn seal_lines_carry_digest_quorum_and_report_timing() {
     let reported = lines(&events, "batch reported");
     assert_eq!(reported.len(), 1, "one batch reported line per successful report");
     assert_eq!(reported[0].field("digest"), Some(digest.as_str()));
-    let (report_ms, report_us) =
-        (number(reported[0], "report_ms"), number(reported[0], "report_us"));
-    assert_eq!(report_ms, report_us / 1_000, "report_ms and report_us time the same report");
+    number(reported[0], "report_us");
+    assert_eq!(reported[0].field("report_ms"), None, "report time is logged in microseconds only");
 
     let report_samples =
         snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
