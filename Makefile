@@ -431,7 +431,7 @@ test-e2e-forked:
 # All five sibling fork variables are pinned explicitly rather than left to the build: an adiri
 # build compiles DIFFERENT fork epochs for every one of them than a default build, which has
 # all five active from genesis (adiri: seed-signature 383, multi-workers 570, PREVRANDAO 574,
-# leader-seeded ordering 567, sub-second timestamps u32::MAX). Forwarding the same values the
+# leader-seeded ordering 567, sub-second timestamps 747). Forwarding the same values the
 # lanes above use overrides those compiled constants and is what keeps this lane differing from
 # `test-epochs` in exactly one dimension — the governance-Safe fork. (adiri also compiles in
 # CONSENSUS_REGISTRY_FORK_EPOCH = 407 and ADIRI_DUP_BATCH_EPOCH = 160; the first is far outside a

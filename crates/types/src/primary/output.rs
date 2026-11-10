@@ -1120,8 +1120,8 @@ mod tests {
     }
 
     /// An epoch whose leaders carry millisecond commit timestamps under the running cfg:
-    /// `u32::MAX` under `adiri` (the placeholder `SUBSECOND_TIMESTAMP_FORK_EPOCH` itself,
-    /// compared with `>=`), epoch zero elsewhere (non-adiri is active from genesis).
+    /// `u32::MAX` under `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 747, compared with
+    /// `>=`), epoch zero elsewhere (non-adiri is active from genesis).
     fn v2_epoch() -> Epoch {
         let epoch = if cfg!(feature = "adiri") { u32::MAX } else { 0 };
         // anti-vacuity: every post-fork assertion below means nothing on an inactive epoch
@@ -1555,8 +1555,9 @@ mod tests {
     }
 
     /// Epoch of the frozen V2 consensus header vector: `u32::MAX` is sub-second-active under
-    /// BOTH cfgs (adiri's placeholder `SUBSECOND_TIMESTAMP_FORK_EPOCH` is `u32::MAX`, compared
-    /// with `>=`; non-adiri everywhere), so one hex constant pins the bytes for every build.
+    /// BOTH cfgs (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (747), far below
+    /// `u32::MAX`, compared with `>=`; non-adiri everywhere), so one hex constant pins the bytes
+    /// for every build.
     const GOLDEN_V2_EPOCH: Epoch = u32::MAX;
 
     /// Deterministic BLS signature from a seeded keypair (BLS signing is deterministic).
