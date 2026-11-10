@@ -148,7 +148,7 @@ fn checksummed_changesets_shorter_than_the_header_are_refused() {
     // The sidecar one record short of the header.
     write_changeset_files(&path, &clean);
     let record = changeset_offset_record_size(true) as usize;
-    let mut short = clean.clone();
+    let mut short = clean;
     short[3].truncate(short[3].len() - record);
     write_changeset_files(&path, &short);
     refused(&short);
