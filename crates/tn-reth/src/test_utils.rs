@@ -48,8 +48,7 @@ use alloy::{
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
-use reth_primitives::sign_message;
-use reth_primitives_traits::SignerRecoverable;
+use reth_primitives_traits::{crypto::secp256k1::sign_message, SignerRecoverable};
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,

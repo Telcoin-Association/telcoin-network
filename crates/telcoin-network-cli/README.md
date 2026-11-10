@@ -459,7 +459,7 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--ws.addr`                              | `127.0.0.1`           | WebSocket listen address                                        |
 | `--ws.port`                              | `8546`                | WebSocket listen port                                           |
 | `--ws.api`                               | `eth,net,web3,rpc,tn` | RPC namespaces to serve over WebSocket (see below)              |
-| `--ws.origins`                           | none                  | Allowed WebSocket origins                                       |
+| `--ws.origins`                           | any origin            | Allowed WebSocket origins                                       |
 | `--ipcdisable`                           | `false`               | Disable the IPC-RPC server                                      |
 | `--ipcpath`                              | `/tmp/tn.ipc`         | IPC socket path                                                 |
 | `--rpc.jwtsecret`                        | none                  | Hex-encoded JWT secret for RPC auth                             |

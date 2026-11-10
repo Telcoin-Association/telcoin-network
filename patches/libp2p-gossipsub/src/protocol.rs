@@ -169,23 +169,34 @@ where
     TSocket: AsyncWrite + AsyncRead + Unpin + Send + 'static,
 {
     type Output = (Framed<TSocket, GossipsubCodec>, PeerKind);
-    type Error = Infallible;
+    type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
-    fn upgrade_outbound(self, socket: TSocket, protocol_id: Self::Info) -> Self::Future {
-        Box::pin(future::ok((
-            Framed::new(
-                socket,
-                GossipsubCodec::new(
-                    self.default_max_transmit_size,
-                    self.validation_mode,
-                    self.max_transmit_sizes,
-                    self.max_publish_messages,
-                    self.max_control_message_size,
+    fn upgrade_outbound(self, mut socket: TSocket, protocol_id: Self::Info) -> Self::Future {
+        Box::pin(async move {
+            // Carried telcoin-network patch: under multistream-select `V1Lazy` the dialer's
+            // last proposal (the `/1.0.0` fallback once `/1.1.0` is rejected) is handed back
+            // before the listener confirms it. A zero-length read drives the negotiation to
+            // completion without consuming data, so a listener that speaks neither id fails
+            // the upgrade here and the handler disables itself as `ProtocolUnsupported`, as
+            // under strict negotiation. A strictly negotiated stream is already complete and
+            // the read returns at once. See patches/libp2p-gossipsub/PATCH.md.
+            let consumed = socket.read(&mut []).await?;
+            debug_assert_eq!(consumed, 0, "an empty buffer reads no stream data");
+            Ok((
+                Framed::new(
+                    socket,
+                    GossipsubCodec::new(
+                        self.default_max_transmit_size,
+                        self.validation_mode,
+                        self.max_transmit_sizes,
+                        self.max_publish_messages,
+                        self.max_control_message_size,
+                    ),
                 ),
-            ),
-            protocol_id.kind,
-        )))
+                protocol_id.kind,
+            ))
+        })
     }
 }
 

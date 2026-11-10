@@ -5,14 +5,14 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
-    error::NetworkError,
+    error::{normalize_outbound_failure, NetworkError},
     gossip_config::{gossipsub_config, GossipBehaviour, RejectGossipKey},
     kad::{identical_refresh, node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, HandshakeDirection, InboundFailureOutcome, InboundRejection,
         OutboundRequestOutcome, PeerManagerMetrics, SwarmMetrics,
     },
-    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, LookupClass, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
@@ -29,6 +29,7 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     connection_limits::{self, ConnectionLimits},
+    core::upgrade::Version,
     gossipsub::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
         PublishError, Topic, TopicHash,
@@ -43,6 +44,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use lru::LruCache;
+use rand::seq::SliceRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
@@ -53,8 +55,8 @@ use tn_config::{
     KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
 };
 use tn_types::{
-    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender, TrySendOutcome, WorkerId,
+    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, TaskSpawner, TnSender,
+    TrySendOutcome, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -108,6 +110,18 @@ mod catch_up_contention;
 #[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]
 mod loop_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/tracked_rearm.rs"]
+mod tracked_rearm;
+
+#[cfg(test)]
+#[path = "tests/tracked_store.rs"]
+mod tracked_store;
+
+#[cfg(test)]
+#[path = "tests/admission_snapshot.rs"]
+mod admission_snapshot;
 
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
@@ -568,6 +582,11 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
+    /// This node's transport identity.
+    ///
+    /// It co-signs our [NodeRecord] so peers can verify that our network key agreed to be bound
+    /// to our BLS key (issue #1751).
+    network_keypair: NetworkKeypair,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
     /// The signed [NodeRecord].
@@ -875,7 +894,7 @@ where
             info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
 
-        let network_pubkey = keypair.public().into();
+        let network_keypair = keypair.clone();
 
         // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
         let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
@@ -901,9 +920,21 @@ where
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
+                // request-response proposes one protocol per substream, so `V1Lazy` sends the
+                // proposal and the request in one flight. strict `V1` waits a round trip for the
+                // listener's confirmation first, which made every vote request cost two round
+                // trips on a 10-region bench while gossiped certificates arrived in half of one.
+                // a lazy rejection surfaces on the first read as an io error: see
+                // `normalize_outbound_failure`. the sync stream and the vendored gossipsub finish
+                // negotiation with a zero-length read in their outbound upgrades, so a peer
+                // without the protocol still fails the open. gossipsub's first proposal (`1.1.0`)
+                // stays strict and only its `1.0.0` fallback is lazy. kad may report
+                // `ProtocolConfirmed` for a peer before the listener confirms, which is harmless
+                // while kad bucket inserts are manual.
                 c.with_idle_connection_timeout(
                     network_config.libp2p_config().max_idle_connection_timeout,
                 )
+                .with_substream_upgrade_protocol_override(Version::V1Lazy)
             })
             .with_connection_timeout(connection_timeout)
             .build();
@@ -919,9 +950,9 @@ where
             record_domain,
             external_addr.clone(),
             &key_config,
-            network_pubkey,
+            &network_keypair,
             rpc,
-        );
+        )?;
 
         Ok(Self {
             swarm,
@@ -939,6 +970,7 @@ where
             pending_px_disconnects,
             pending_goodbyes,
             key_config,
+            network_keypair,
             task_spawner,
             node_record,
             record_domain,
@@ -989,7 +1021,8 @@ where
     pub fn with_advertised_addresses(mut self, addresses: Vec<Multiaddr>) -> NetworkResult<Self> {
         let record = NodeRecord::build_multi(
             self.record_domain,
-            self.node_record.info.pubkey.clone(),
+            &self.key_config.primary_public_key(),
+            &self.network_keypair,
             addresses,
             self.node_record.info.rpc.clone(),
             |data| self.key_config.request_signature_direct(data),
@@ -1005,16 +1038,25 @@ where
     }
 
     /// Create and sign this node's [NodeRecord].
+    ///
+    /// The BLS key in `key_config` signs the record and `network_keypair` co-signs the binding of
+    /// our network key to that BLS key (issue #1751).
     fn create_node_record(
         domain: RecordDomain,
         external_addr: Multiaddr,
         key_config: &KeyConfig,
-        network_pubkey: NetworkPublicKey,
+        network_keypair: &NetworkKeypair,
         rpc: Option<RpcInfo>,
-    ) -> NodeRecord {
-        NodeRecord::build(domain, network_pubkey, external_addr, rpc, |data| {
-            key_config.request_signature_direct(data)
-        })
+    ) -> NetworkResult<NodeRecord> {
+        NodeRecord::build(
+            domain,
+            &key_config.primary_public_key(),
+            network_keypair,
+            external_addr,
+            rpc,
+            |data| key_config.request_signature_direct(data),
+        )
+        .map_err(NetworkError::from)
     }
 
     /// Re-sign our configured network information and publish it with a fresh timestamp.
@@ -1023,10 +1065,23 @@ where
     /// direct pushes and record lookups use the new signed value. Our local copy keeps
     /// `expires: None`; Kademlia assigns the configured TTL to outbound copies. The libp2p-kad
     /// record job is disabled (see [`configure_record_jobs`]), so this is the only periodic
-    /// republication of our record.
+    /// republication of our record. If the network key cannot co-sign, the previous signed copy
+    /// is published unchanged.
     fn refresh_own_record(&mut self) {
         self.node_record
-            .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
+            .refresh(
+                self.record_domain,
+                &self.key_config.primary_public_key(),
+                &self.network_keypair,
+                |data| self.key_config.request_signature_direct(data),
+            )
+            .unwrap_or_else(|err| {
+                bounded_error!(Record,
+                    target: "network-kad",
+                    ?err,
+                    "could not re-sign our node record; republishing the previous signed copy"
+                );
+            });
         self.provide_our_data();
     }
 
@@ -1046,12 +1101,13 @@ where
         }
     }
 
-    /// Verify the address list in Record was signed by the key and the kad record's publisher
+    /// Verify the address list in Record was signed by the key, that the network key named in the
+    /// record co-signed its binding to that key (issue #1751), and that the kad record's publisher
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
-        // decode the domain-scoped record (no legacy fallback) and verify bls signature
+        // decode the domain-scoped record (no legacy fallback) and verify both signatures
         let cached = self
             .verified_peer_records
             .peek(&record.key)
@@ -1561,14 +1617,16 @@ where
             }
             NetworkCommand::ConnectedPeers { reply } => {
                 let peer_manager = &self.swarm.behaviour().peer_manager;
-                // current-committee members first (stable order), so a caller that tries
-                // peers in order reaches the peers most likely to hold consensus data first
+                // current-committee members first, so a caller that tries peers in order
+                // reaches the peers most likely to hold consensus data first; each tier is
+                // shuffled per request, so no peer keeps a fixed early place in every
+                // caller's order (#1773)
                 let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
                     .flat_map(|id| peer_manager.peer_to_bls(id))
                     .partition(|bls| peer_manager.is_current_committee_member(bls));
-                let peers: Vec<_> = committee.into_iter().chain(others).collect();
+                let peers = order_connected_peers(committee, others, &mut rand::rng());
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
@@ -1725,6 +1783,10 @@ where
                 let status = self.swarm.behaviour().peer_manager.admission_status();
                 send_or_log_error!(reply, status, "AdmissionStatus");
             }
+            NetworkCommand::AdmissionSnapshot { reply } => {
+                let snapshot = self.swarm.behaviour().peer_manager.admission_snapshot();
+                send_or_log_error!(reply, snapshot, "AdmissionSnapshot");
+            }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
                 // mutating the committee slots (the real slot update follows shortly after).
@@ -1733,6 +1795,34 @@ where
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // Fetch signed records for unknown peers and unresolved configured dial hints.
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
+            }
+            NetworkCommand::UpdateTrackedKeys { epoch, scheduled, eligible } => {
+                let published_scheduled = scheduled.clone();
+                let behaviour = self.swarm.behaviour_mut();
+                // the peer manager applies the epoch rule and the key cap, so the store follows
+                // only an update it accepted and only the keys it kept
+                if behaviour.peer_manager.update_tracked_keys(epoch, scheduled, eligible) {
+                    // the store keeps the leading keys that fit its headroom, so they follow the
+                    // peer manager's cap priority: scheduled keys, then eligible keys, each in key
+                    // order
+                    let mut keys: Vec<_> = behaviour.peer_manager.tracked_keys().copied().collect();
+                    keys.sort_unstable_by_key(|key| (!published_scheduled.contains(key), *key));
+                    // the store rows only extend serving and the peer manager keeps its own
+                    // tracked records, so a short headroom or a failed prune must not hold back
+                    // the export
+                    match behaviour.kademlia.store_mut().retain_tracked(keys) {
+                        Ok(left_out) if left_out.is_empty() => {}
+                        Ok(left_out) => {
+                            let left_out = left_out.len();
+                            bounded_warn!(Command, target: "network-kad", epoch, left_out,
+                                "kad store headroom reached, tracked records left out");
+                        }
+                        Err(error) => {
+                            bounded_warn!(Command, target: "network-kad", epoch, ?error,
+                                "released tracked records could not be pruned; tracking continues");
+                        }
+                    }
+                }
             }
             NetworkCommand::GetValidatorRpc { bls_key, reply } => {
                 let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
@@ -1854,7 +1944,7 @@ where
             .missing_required_records()
             .into_iter()
             .for_each(|key| {
-                if self.kad_record_queries.values().all(|query| query.query.request != key) {
+                if !self.join_record_query(&key, LookupClass::Committee) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
                 }
@@ -2106,6 +2196,7 @@ where
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
+                let error = normalize_outbound_failure(error);
                 // handle px disconnects
                 //
                 // px attempts to support peer discovery, but failures are okay
@@ -2312,6 +2403,7 @@ where
                 }
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, .. } => {
+                let error = normalize_outbound_failure(error);
                 let kind = match &error {
                     ReqResOutboundFailure::DialFailure => "outbound_dial_failure",
                     ReqResOutboundFailure::Timeout => "outbound_timeout",
@@ -2471,6 +2563,7 @@ where
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for peer exchange");
+                let error = normalize_outbound_failure(error);
                 if let Some(pending) = self.pending_goodbyes.remove(&request_id) {
                     match &error {
                         // Not penalized: honest version skew, the same class the main
@@ -2755,26 +2848,9 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
-                // Polling callers such as `current_committee_rpcs` report a member as
-                // missing on every call until its signed metadata reaches `known_peers`, so the
-                // same key arrives here repeatedly while its lookup is still in flight.
-                // Issue at most one live `get_record` per key: skip keys already tracked
-                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
-                // source because every terminal query path removes its entry (see
-                // `close_kad_query`), so a skipped key becomes queryable again as soon
-                // as its current query ends. The removal there runs before any result
-                // filtering, so even a query whose record is dropped as stale or
-                // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
-                        let key = node_record_key(&bls_key);
-                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                        self.kad_record_queries.insert(query_id, bls_key.into());
-                    } else {
-                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
-                    }
-                }
+                self.query_node_records(missing, LookupClass::Committee);
             }
+            PeerEvent::MissingRecords(missing, class) => self.query_node_records(missing, class),
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
                 self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
@@ -2782,6 +2858,45 @@ where
         }
 
         Ok(())
+    }
+
+    /// Start one kad `get_record` per requested key that has no query in flight.
+    fn query_node_records(&mut self, missing: Vec<BlsPublicKey>, class: LookupClass) {
+        // Polling callers such as `current_committee_rpcs` report a member as
+        // missing on every call until its signed metadata reaches `known_peers`, so the
+        // same key arrives here repeatedly while its lookup is still in flight.
+        // Issue at most one live `get_record` per key: skip keys already tracked
+        // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
+        // source because every terminal query path removes its entry (see
+        // `close_kad_query`), so a skipped key becomes queryable again as soon
+        // as its current query ends. The removal there runs before any result
+        // filtering, so even a query whose record is dropped as stale or
+        // non-committee re-arms the key. A committee lookup that joins a tracked
+        // query in flight is re-issued if that query closes without a record.
+        for bls_key in missing {
+            if self.join_record_query(&bls_key, class) {
+                trace!(target: "network-kad", ?bls_key, ?class, "kad record query already in flight");
+            } else {
+                let key = node_record_key(&bls_key);
+                let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                self.kad_record_queries.insert(query_id, PendingKadQuery::new(bls_key, class));
+            }
+        }
+    }
+
+    /// Join a lookup of `class` for `bls_key` to the record query already in flight for that key,
+    /// returning whether one was.
+    ///
+    /// A committee lookup that joins a tracked query is not lost: the tracked query re-issues it
+    /// if it closes without a record (see [`Self::close_kad_query`]).
+    fn join_record_query(&mut self, bls_key: &BlsPublicKey, class: LookupClass) -> bool {
+        let Some(query) =
+            self.kad_record_queries.values_mut().find(|query| query.query.request == *bls_key)
+        else {
+            return false;
+        };
+        query.join(class);
+        true
     }
 
     /// Process events from the stream behavior.
@@ -3380,15 +3495,18 @@ where
     /// matching results may also fill an independently owned committee or pinned store row in
     /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
     /// periodic replication is disabled by [`configure_record_jobs`].
+    ///
+    /// The result is routed by the key's membership at close, not by the query's class, so a
+    /// tracked query whose key has since entered the committee window resolves it like a
+    /// committee query. A tracked query that a committee lookup joined and that closes without a
+    /// record hands the key back to the peer manager, which queues a committee lookup for it if
+    /// its record is still unlearned.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        self.kad_record_queries
-            .remove(query_id)
-            .and_then(|query| {
-                let key = query.query.request;
-                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
-            })
-            .into_iter()
-            .for_each(|(key, node_record, timestamp)| {
+        let Some(query) = self.kad_record_queries.remove(query_id) else { return };
+        let key = query.query.request;
+        let rearm_committee = query.rearm_committee;
+        match query.into_result() {
+            Some((node_record, timestamp)) => {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
                     key,
@@ -3396,7 +3514,13 @@ where
                     timestamp,
                 );
                 self.refresh_explicit_peer(&peer);
-            });
+            }
+            None if rearm_committee => {
+                trace!(target: "network-kad", ?key, "tracked kad record query closed empty, re-arming committee lookup");
+                self.swarm.behaviour_mut().peer_manager.find_authorities(vec![key]);
+            }
+            None => (),
+        }
     }
 }
 
@@ -3407,15 +3531,35 @@ pub(crate) struct PendingKadQuery {
     query: KadQuery,
     /// Admission ceiling of the winning result, retained until the query closes.
     timestamp: Option<crate::freshness::RecordTimestamp>,
+    /// Why the query was issued.
+    class: LookupClass,
+    /// Whether a committee lookup joined this tracked query, so closing it without a record must
+    /// re-issue that lookup.
+    rearm_committee: bool,
 }
 
+/// A query built from a bare key is a committee lookup.
 impl From<BlsPublicKey> for PendingKadQuery {
     fn from(key: BlsPublicKey) -> Self {
-        Self { query: key.into(), timestamp: None }
+        Self::new(key, LookupClass::Committee)
     }
 }
 
 impl PendingKadQuery {
+    /// Track a fresh query for `key` issued under `class`.
+    fn new(key: BlsPublicKey, class: LookupClass) -> Self {
+        Self { query: key.into(), timestamp: None, class, rearm_committee: false }
+    }
+
+    /// Attach a lookup of `class` for the same key instead of issuing a second query.
+    ///
+    /// Only a committee lookup joining a tracked query is remembered: a committee query already is
+    /// that lookup, and a tracked lookup is served by whatever the query resolves.
+    fn join(&mut self, class: LookupClass) {
+        self.rearm_committee |=
+            self.class == LookupClass::Tracked && class == LookupClass::Committee;
+    }
+
     /// Retain the freshest verified result under the shared local admission policy.
     #[cfg(test)]
     pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
@@ -3658,4 +3802,46 @@ fn accepted_gossip_event<Req, Res>(
     author: Option<BlsPublicKey>,
 ) -> NetworkEvent<Req, Res> {
     NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
+}
+
+/// Order the connected peers for a `ConnectedPeers` answer: the current committee
+/// first, then every other peer, with each tier shuffled by `rng`.
+///
+/// The tier boundary is stable, so a caller that walks the list in order still
+/// reaches the committee first; the order inside a tier changes per request, so
+/// a peer that stalls its exchanges cannot keep a fixed early place in every
+/// caller's order (#1773).
+fn order_connected_peers<T, R: rand::Rng>(
+    mut committee: Vec<T>,
+    mut others: Vec<T>,
+    rng: &mut R,
+) -> Vec<T> {
+    committee.shuffle(rng);
+    others.shuffle(rng);
+    committee.into_iter().chain(others).collect()
+}
+
+#[cfg(test)]
+mod order_connected_peers_tests {
+    use super::order_connected_peers;
+    use std::collections::BTreeSet;
+
+    /// The committee tier stays ahead of the public tier whatever the shuffle.
+    #[test]
+    fn committee_tier_stays_first() {
+        let ordered = order_connected_peers(vec![1u8, 2, 3], vec![4u8, 5], &mut rand::rng());
+        let (head, tail) = ordered.split_at(3);
+        assert_eq!(head.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([1, 2, 3]));
+        assert_eq!(tail.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([4, 5]));
+    }
+
+    /// Repeated requests do not pin one peer to the front of its tier.
+    #[test]
+    fn tier_order_varies_per_request() {
+        let firsts: BTreeSet<u8> = (0..64)
+            .map(|_| order_connected_peers((0u8..8).collect(), Vec::new(), &mut rand::rng()))
+            .filter_map(|ordered| ordered.first().copied())
+            .collect();
+        assert!(firsts.len() > 1, "64 shuffles of 8 peers put the same peer first every time");
+    }
 }

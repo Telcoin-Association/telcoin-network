@@ -19,13 +19,17 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
+    io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use asynchronous_codec::Framed;
 use futures::{StreamExt, future::Either, prelude::*};
-use libp2p_core::{PeerId, upgrade::DeniedUpgrade};
+use libp2p_core::{
+    PeerId,
+    upgrade::{DeniedUpgrade, NegotiationError},
+};
 use libp2p_swarm::{
     Stream,
     handler::{
@@ -523,10 +527,6 @@ impl ConnectionHandler for Handler {
                         tracing::debug!("Dial upgrade error: Protocol negotiation timeout");
                     }
                     ConnectionEvent::DialUpgradeError(DialUpgradeError {
-                        error: StreamUpgradeError::Apply(e),
-                        ..
-                    }) => libp2p_core::util::unreachable(e),
-                    ConnectionEvent::DialUpgradeError(DialUpgradeError {
                         error: StreamUpgradeError::NegotiationFailed,
                         ..
                     }) => {
@@ -538,8 +538,23 @@ impl ConnectionHandler for Handler {
                             peer_kind_sent: false,
                         });
                     }
+                    // Carried telcoin-network patch: a lazily negotiated proposal that the
+                    // remote rejects fails the outbound upgrade's zero-length read instead of
+                    // the negotiation, so it is the same unsupported protocol as
+                    // `NegotiationFailed` above. See patches/libp2p-gossipsub/PATCH.md.
                     ConnectionEvent::DialUpgradeError(DialUpgradeError {
-                        error: StreamUpgradeError::Io(e),
+                        error: StreamUpgradeError::Apply(e),
+                        ..
+                    }) if is_negotiation_failure(&e) => {
+                        tracing::debug!(
+                            "The remote peer does not support gossipsub on this connection"
+                        );
+                        *self = Handler::Disabled(DisabledHandler::ProtocolUnsupported {
+                            peer_kind_sent: false,
+                        });
+                    }
+                    ConnectionEvent::DialUpgradeError(DialUpgradeError {
+                        error: StreamUpgradeError::Io(e) | StreamUpgradeError::Apply(e),
                         ..
                     }) => {
                         tracing::debug!("Protocol negotiation failed: {e}")
@@ -550,4 +565,26 @@ impl ConnectionHandler for Handler {
             Handler::Disabled(_) => {}
         }
     }
+}
+
+/// Whether `error` is multistream-select's rejection of every proposed protocol.
+///
+/// Carried telcoin-network patch: a lazily negotiated stream reports the rejection on its
+/// first read as `io::Error::other(NegotiationError::Failed)`, so the typed error is the io
+/// error's inner error. A `NegotiationError::ProtocolError` (malformed negotiation) is a plain
+/// io failure under strict negotiation too and is not a rejection. See
+/// patches/libp2p-gossipsub/PATCH.md.
+fn is_negotiation_failure(error: &io::Error) -> bool {
+    std::iter::successors(
+        error
+            .get_ref()
+            .map(|inner| inner as &(dyn std::error::Error + 'static)),
+        |err| err.source(),
+    )
+    .any(|err| {
+        matches!(
+            err.downcast_ref::<NegotiationError>(),
+            Some(NegotiationError::Failed)
+        )
+    })
 }

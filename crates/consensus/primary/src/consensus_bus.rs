@@ -79,28 +79,34 @@ pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
 ///
 /// A live consumer drains the channel as messages arrive, so the channel can fill only in the gap
 /// between two consumers and before the first one. The policy names the messages worth holding in
-/// that gap and caps them. The channel drops every other message that arrives in the gap.
+/// that gap and caps them. Each held message has an author, and the policy also caps the messages
+/// of each author, so one author cannot take the space of the other authors. The channel drops
+/// every other message that arrives in the gap.
 pub(crate) struct GapPolicy<T> {
     /// The channel name for the log.
     name: &'static str,
-    /// The byte weight of a message to hold, or `None` for a message to drop.
-    hold: fn(&T) -> Option<usize>,
+    /// The weight of a message to hold, or `None` for a message to drop. The second argument is
+    /// the epoch of the last consumer, or `None` before the first consumer.
+    hold: fn(&T, Option<Epoch>) -> Option<GapWeight>,
     /// The most messages that the channel holds in one gap.
     max_items: usize,
     /// The most bytes that the channel holds in one gap.
     max_bytes: usize,
+    /// The most messages of one author that the channel holds in one gap.
+    max_per_author: usize,
 }
 
 impl<T> GapPolicy<T> {
-    /// Hold the messages that `hold` weighs, at most `max_items` of them and `max_bytes` bytes in
-    /// one gap.
+    /// Hold the messages that `hold` weighs, at most `max_items` of them, `max_bytes` bytes and
+    /// `max_per_author` messages of one author in one gap.
     pub(crate) fn new(
         name: &'static str,
-        hold: fn(&T) -> Option<usize>,
+        hold: fn(&T, Option<Epoch>) -> Option<GapWeight>,
         max_items: usize,
         max_bytes: usize,
+        max_per_author: usize,
     ) -> Self {
-        Self { name, hold, max_items, max_bytes }
+        Self { name, hold, max_items, max_bytes, max_per_author }
     }
 
     /// The most messages that the channel holds in one gap.
@@ -116,7 +122,35 @@ impl<T> std::fmt::Debug for GapPolicy<T> {
             .field("name", &self.name)
             .field("max_items", &self.max_items)
             .field("max_bytes", &self.max_bytes)
+            .field("max_per_author", &self.max_per_author)
             .finish_non_exhaustive()
+    }
+}
+
+/// The author of a message that a [`GapPolicy`] holds: the key of the cap per author.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GapAuthor(Vec<u8>);
+
+impl GapAuthor {
+    /// The author with the identity bytes `id`.
+    pub(crate) fn new(id: Vec<u8>) -> Self {
+        Self(id)
+    }
+}
+
+/// The weight of a message that a [`GapPolicy`] holds: its byte length and its author.
+#[derive(Clone, Debug)]
+pub(crate) struct GapWeight {
+    /// The byte weight of the message.
+    bytes: usize,
+    /// The author of the message.
+    author: GapAuthor,
+}
+
+impl GapWeight {
+    /// The weight of a message of `bytes` bytes from `author`.
+    pub(crate) fn new(bytes: usize, author: GapAuthor) -> Self {
+        Self { bytes, author }
     }
 }
 
@@ -126,33 +160,56 @@ impl<T> std::fmt::Debug for GapPolicy<T> {
 struct GapState {
     /// A consumer holds the receiver. Subscribe sets it and the receiver's drop clears it.
     present: bool,
+    /// The epoch of the last consumer, or `None` before the first one. The policy uses it to
+    /// decide what to hold in the next gap.
+    epoch: Option<Epoch>,
     /// Messages held in this gap.
     items: usize,
     /// Bytes held in this gap.
     bytes: usize,
     /// Messages dropped in this gap because the policy does not hold them.
     dropped: usize,
-    /// Messages that the policy holds, dropped in this gap at the item cap or the byte cap.
+    /// Messages that the policy holds, dropped in this gap at the item cap, the byte cap or the
+    /// cap of their author.
     over_budget: usize,
+    /// Messages held in this gap, per author. An entry exists only for an author with a held
+    /// message, so the item cap also caps the entries.
+    authors: std::collections::HashMap<GapAuthor, usize>,
 }
 
 impl GapState {
-    /// The state when a consumer subscribes: present, with the gap counters at zero.
-    fn with_consumer() -> Self {
-        Self { present: true, ..Self::default() }
+    /// The state when a consumer of `epoch` subscribes: present, with the gap counters at zero.
+    fn with_consumer(epoch: Option<Epoch>) -> Self {
+        Self { present: true, epoch, ..Self::default() }
     }
 
-    /// Hold a message that weighs `bytes` when it fits the caps of `policy`, else count it over
-    /// budget.
-    fn hold<T>(&mut self, bytes: usize, policy: &GapPolicy<T>) -> GapAdmit {
-        let total = self.bytes.saturating_add(bytes);
-        if self.items < policy.max_items && total <= policy.max_bytes {
+    /// Hold a message of `weight` when it fits the caps of `policy` and the cap of its author,
+    /// else count it over budget.
+    fn hold<T>(&mut self, weight: GapWeight, policy: &GapPolicy<T>) -> GapAdmit {
+        let total = self.bytes.saturating_add(weight.bytes);
+        let authored = self.authors.get(&weight.author).copied().unwrap_or_default();
+        let fits = self.items < policy.max_items
+            && total <= policy.max_bytes
+            && authored < policy.max_per_author;
+        if fits {
             self.items = self.items.saturating_add(1);
             self.bytes = total;
-            GapAdmit::Held(bytes)
+            self.authors.insert(weight.author.clone(), authored.saturating_add(1));
+            GapAdmit::Held(weight)
         } else {
             self.over_budget = self.over_budget.saturating_add(1);
             GapAdmit::OverBudget
+        }
+    }
+
+    /// Release a held message of `weight`, saturating at zero. Remove its author from the count
+    /// when the author has no other held message.
+    fn release(&mut self, weight: &GapWeight) {
+        self.items = self.items.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(weight.bytes);
+        let left = self.authors.remove(&weight.author).map_or(0, |held| held.saturating_sub(1));
+        if left > 0 {
+            self.authors.insert(weight.author.clone(), left);
         }
     }
 
@@ -185,17 +242,15 @@ impl<T> GapHold<T> {
         if state.present {
             GapAdmit::Open
         } else {
-            (self.policy.hold)(value)
-                .map(|bytes| state.hold(bytes, &self.policy))
+            (self.policy.hold)(value, state.epoch)
+                .map(|weight| state.hold(weight, &self.policy))
                 .unwrap_or_else(|| state.drop_unheld())
         }
     }
 
-    /// Release `bytes` that a held message no longer takes, saturating at zero.
-    fn release(&self, bytes: usize) {
-        let mut state = self.state.lock();
-        state.items = state.items.saturating_sub(1);
-        state.bytes = state.bytes.saturating_sub(bytes);
+    /// Release the space and the author share that a held message of `weight` no longer takes.
+    fn release(&self, weight: &GapWeight) {
+        self.state.lock().release(weight);
     }
 
     /// Start the turn of a new consumer.
@@ -203,12 +258,16 @@ impl<T> GapHold<T> {
     /// Discard the queued messages that the policy does not hold: the requests, errors and
     /// streams that the previous consumer left. Put the held ones back in order, mark the
     /// consumer present and reset the gap counters. Write one log with what the gap dropped and
-    /// what this discards. A message sent while this runs can land ahead of the held ones.
-    fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>) {
+    /// what this discards. A message sent while this runs can land ahead of the held ones. The
+    /// consumer of `epoch` sets the epoch of the next gap. With `None` the epoch does not change.
+    fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>, epoch: Option<Epoch>) {
         let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        // Use the epoch of the gap in which the messages arrived, not the epoch of the new
+        // consumer, so the held messages of the last gap stay held.
+        let gap_epoch = self.state.lock().epoch;
         let (kept, discarded) =
             queued.into_iter().fold((0_usize, 0_usize), |(kept, discarded), value| {
-                if (self.policy.hold)(&value).is_some() {
+                if (self.policy.hold)(&value, gap_epoch).is_some() {
                     // The queue was just drained, so it has room for the held messages. Count
                     // one that it still refuses as discarded.
                     tx.try_send(value).map_or((kept, discarded.saturating_add(1)), |()| {
@@ -218,7 +277,10 @@ impl<T> GapHold<T> {
                     (kept, discarded.saturating_add(1))
                 }
             });
-        let gap = std::mem::replace(&mut *self.state.lock(), GapState::with_consumer());
+        let gap = std::mem::replace(
+            &mut *self.state.lock(),
+            GapState::with_consumer(epoch.or(gap_epoch)),
+        );
         let shed = gap.dropped.saturating_add(gap.over_budget).saturating_add(discarded);
         if shed > 0 {
             warn!(
@@ -240,15 +302,16 @@ impl<T> GapHold<T> {
 }
 
 /// What the gap policy of a [`QueChannel`] decided for one message.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum GapAdmit {
     /// The channel has no gap policy, or a consumer holds the receiver: queue the message.
     Open,
-    /// The policy holds the message, which weighs this many bytes: queue it.
-    Held(usize),
+    /// The policy holds the message, which has this weight: queue it.
+    Held(GapWeight),
     /// The policy does not hold the message: drop it.
     Unheld,
-    /// The gap already holds the item cap or the byte cap: drop the message.
+    /// The gap already holds the item cap, the byte cap or the cap of the message author: drop
+    /// the message.
     OverBudget,
 }
 
@@ -311,11 +374,12 @@ impl<T> QueChannel<T> {
     /// consumer holds its receiver.
     ///
     /// In the gap between two consumers, and before the first one, the channel queues only the
-    /// messages that `policy` holds, up to its item cap and byte cap. `try_send_outcome` reports
-    /// any other message as [`tn_types::TrySendOutcome::Unsubscribed`] and a held message past
-    /// either cap as [`tn_types::TrySendOutcome::OverBudget`]. While a consumer holds the
-    /// receiver, the channel queues every message with no extra cap. Each subscribe discards the
-    /// queued messages that `policy` does not hold and keeps the held ones in order.
+    /// messages that `policy` holds, up to its item cap, its byte cap and its cap per author.
+    /// `try_send_outcome` reports any other message as [`tn_types::TrySendOutcome::Unsubscribed`]
+    /// and a held message past a cap as [`tn_types::TrySendOutcome::OverBudget`]. While a consumer
+    /// holds the receiver, the channel queues every message with no extra cap. Each subscribe
+    /// discards the queued messages that `policy` does not hold and keeps the held ones in
+    /// order.
     pub(crate) fn new_always_subscribed_held(policy: GapPolicy<T>) -> Self {
         Self::build(CHANNEL_CAPACITY, true, Some(Arc::new(GapHold::new(policy))))
     }
@@ -352,9 +416,20 @@ impl<T> QueChannel<T> {
     where
         T: Send + 'static,
     {
+        self.subscribe_in_epoch(None)
+    }
+
+    /// Subscribe like [`Self::subscribe`] as the consumer of `epoch`.
+    ///
+    /// On a channel with a gap policy, the policy uses `epoch` to decide what to hold in the gap
+    /// after this consumer. With `None` the channel keeps the epoch of the last consumer.
+    pub(crate) fn subscribe_in_epoch(&self, epoch: Option<Epoch>) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
         let mut receiver = self.receiver.lock().take();
         let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
-        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel, epoch));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
@@ -388,7 +463,7 @@ impl<T> QueChannel<T> {
         if discarded > 0 {
             warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
-        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel, None));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
@@ -407,7 +482,7 @@ impl<T> QueChannel<T> {
     /// Release the hold of a message that the underlying queue did not take.
     fn refund(&self, admit: GapAdmit) {
         match admit {
-            GapAdmit::Held(bytes) => self.gap.iter().for_each(|gap| gap.release(bytes)),
+            GapAdmit::Held(weight) => self.gap.iter().for_each(|gap| gap.release(&weight)),
             GapAdmit::Open | GapAdmit::Unheld | GapAdmit::OverBudget => {}
         }
     }
@@ -455,8 +530,8 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     /// Queue `value` like [`TnSender::try_send`], and report
     /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed or the gap
     /// policy does not hold `value`, and [`tn_types::TrySendOutcome::OverBudget`] when the gap
-    /// already holds its item cap or byte cap, so the network layer counts the drop as shed
-    /// instead of as forwarded.
+    /// already holds its item cap, its byte cap or the cap of the author of `value`, so the network
+    /// layer counts the drop as shed instead of as forwarded.
     fn try_send_outcome(
         &self,
         value: T,
@@ -607,6 +682,9 @@ pub struct ConsensusBusAppInner {
     new_epoch_votes: QueChannel<EpochVote>,
     /// Watch channel to communicate the current epoch record to the vote collector.
     tx_epoch_record: watch::Sender<Option<EpochRecord>>,
+    /// The newest epoch for which the record collector stored a downloaded, certified epoch
+    /// record (`None` until it stores one).
+    tx_certified_record_epoch: watch::Sender<Option<Epoch>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
@@ -801,6 +879,7 @@ impl ConsensusBusApp {
         let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
+        let (tx_certified_record_epoch, _) = watch::channel(None);
 
         let (epoch_request_queue_tx, epochs_rx) =
             tokio::sync::mpsc::channel(EPOCH_REQUEST_QUEUE_CAPACITY);
@@ -822,6 +901,7 @@ impl ConsensusBusApp {
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
+                tx_certified_record_epoch,
                 primary_network_events: QueChannel::new_always_subscribed_held(
                     crate::network::gap_policy::primary_event_gap_policy(),
                 ),
@@ -956,6 +1036,10 @@ impl ConsensusBusApp {
 
     /// Update the last published consensus epoch, number and hash if number is greater than current
     /// value. Return true if it was updated.
+    ///
+    /// This is the gossip path: f+1 validator signatures move the watch forward and never back. A
+    /// certified epoch record is stronger evidence and uses
+    /// [`Self::publish_certified_consensus_num_hash`].
     pub fn publish_consensus_num_hash_if_newer(
         &self,
         epoch: Epoch,
@@ -967,6 +1051,37 @@ impl ConsensusBusApp {
                 state.0 = epoch;
                 state.1 = number;
                 state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Publish the `final_consensus` of a CERTIFIED epoch record to the last-published watch.
+    ///
+    /// A certificate is stronger evidence than f+1 gossip signatures (issue #1771). This moves
+    /// the watch forward like [`Self::publish_consensus_num_hash_if_newer`], and it also REPLACES
+    /// a stored value that cannot be a real consensus output given the record. Epochs and
+    /// consensus numbers advance together, so a stored `(epoch, number)` agrees with the record
+    /// only when `stored.epoch <= epoch` and `stored.number <= number` are both true or both
+    /// false, and the same `(epoch, number)` must carry the same hash. A stored value that fails
+    /// either rule is a gossip pin that f+1 signers fabricated; the certified value replaces it
+    /// so gossip-driven tip tracking resumes. Return true if the watch changed.
+    pub fn publish_certified_consensus_num_hash(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> bool {
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            let (stored_epoch, stored_number, stored_hash) = *state;
+            let newer = number > stored_number;
+            let impossible = (stored_epoch <= epoch) != (stored_number <= number);
+            let same_slot_other_hash =
+                stored_epoch == epoch && stored_number == number && stored_hash != hash;
+            if newer || impossible || same_slot_other_hash {
+                *state = (epoch, number, hash);
                 true
             } else {
                 false
@@ -1057,6 +1172,29 @@ impl ConsensusBusApp {
         &self.inner.tx_epoch_record
     }
 
+    /// Watch carrying the newest epoch for which the record collector stored a downloaded,
+    /// certified [`EpochRecord`].
+    ///
+    /// The epoch manager wakes on it to check whether such a record shows that the epoch it runs
+    /// already closed on the network. It is a wake-up only: the epoch manager decides from the
+    /// epoch store, never from this value.
+    pub fn certified_record_epoch(&self) -> &watch::Sender<Option<Epoch>> {
+        &self.inner.tx_certified_record_epoch
+    }
+
+    /// Publish that the record collector stored a certified record for `epoch`.
+    /// Return true if `epoch` is the newest so far; watchers are woken only then.
+    pub fn set_certified_record_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.certified_record_epoch().send_if_modified(|state| {
+            if state.is_none_or(|stored| epoch > stored) {
+                *state = Some(epoch);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Provide a subscriber (Receiver) for new_epoch_votes.
     /// Any vote on the channel has been verified:
     /// - It is for an EpochRecord we generated and is NOT certified yet.
@@ -1070,11 +1208,14 @@ impl ConsensusBusApp {
     ///
     /// First discard the events that the previous epoch's event loop left queued and that the gap
     /// policy does not hold (see [`crate::network::gap_policy`]). The held gossip, including the
-    /// epoch votes that arrive between two epochs, stays queued in order.
+    /// epoch votes that arrive between two epochs, stays queued in order. `epoch` is the epoch of
+    /// the event loop that subscribes. In the gap after this event loop, the gap policy holds only
+    /// the votes for this epoch and the epoch before it.
     pub fn subscribe_primary_network_events(
         &self,
+        epoch: Epoch,
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
-        self.inner.primary_network_events.subscribe()
+        self.inner.primary_network_events.subscribe_in_epoch(Some(epoch))
     }
 
     /// Provide a subscription (Receiver) for consensus output.
@@ -1700,8 +1841,8 @@ mod exex_receiver_count_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusBusApp, EpochPackRequest, GapPolicy, QueChannel,
-        CONSENSUS_OUTPUT_CHANNEL_CAPACITY, EPOCH_REQUEST_QUEUE_CAPACITY,
+        ConsensusBusApp, EpochPackRequest, GapAdmit, GapAuthor, GapHold, GapPolicy, GapWeight,
+        QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY, EPOCH_REQUEST_QUEUE_CAPACITY,
         SYNC_OUTPUT_CHANNEL_CAPACITY,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -1709,7 +1850,7 @@ mod tests {
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
         EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError, TrySendOutcome,
-        CHANNEL_CAPACITY,
+        B256,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
@@ -2110,17 +2251,82 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
+    /// A consensus header digest that differs per `byte`.
+    fn digest(byte: u8) -> ConsensusHeaderDigest {
+        ConsensusHeaderDigest::from(B256::repeat_byte(byte))
+    }
+
+    /// The issue #1771 pin: f+1 gossip signers set a number near `u64::MAX`, and the next
+    /// certified epoch record replaces it even though its number is lower.
+    #[tokio::test]
+    async fn certified_publish_replaces_gossip_pin() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(0, u64::MAX - 1, digest(1)));
+        assert!(
+            bus.publish_certified_consensus_num_hash(3, 100, digest(3)),
+            "a certified record must replace a pin its epoch proves impossible"
+        );
+        assert_eq!(bus.published_consensus_num_hash(), (3, 100, digest(3)));
+    }
+
+    /// A tip that agrees with a certified record is kept: a later epoch at a greater number is
+    /// what honest gossip produces after the record's epoch closed.
+    #[tokio::test]
+    async fn certified_publish_keeps_consistent_later_tip() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(5, 1000, digest(5)));
+        assert!(
+            !bus.publish_certified_consensus_num_hash(4, 900, digest(4)),
+            "a consistent later tip must not move back to an older certified record"
+        );
+        assert_eq!(bus.published_consensus_num_hash(), (5, 1000, digest(5)));
+    }
+
+    /// From the initial state a certified record moves the watch forward exactly like the gossip
+    /// path, and publishing the same record again changes nothing.
+    #[tokio::test]
+    async fn certified_publish_moves_forward_once() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_certified_consensus_num_hash(2, 50, digest(2)));
+        assert_eq!(bus.published_consensus_num_hash(), (2, 50, digest(2)));
+        assert!(
+            !bus.publish_certified_consensus_num_hash(2, 50, digest(2)),
+            "the same certified value must not report a change"
+        );
+    }
+
+    /// A stored claim of a later epoch at a number the certified record proves belongs to its own
+    /// epoch is replaced: consensus numbers never stand still across an epoch boundary.
+    #[tokio::test]
+    async fn certified_publish_replaces_later_epoch_at_record_number() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(9, 100, digest(9)));
+        assert!(bus.publish_certified_consensus_num_hash(4, 100, digest(4)));
+        assert_eq!(bus.published_consensus_num_hash(), (4, 100, digest(4)));
+    }
+
+    /// A stored value at the certified record's own `(epoch, number)` but with another hash is
+    /// replaced by the certified hash.
+    #[tokio::test]
+    async fn certified_publish_replaces_same_slot_other_hash() {
+        let bus = ConsensusBusApp::new();
+        assert!(bus.publish_consensus_num_hash_if_newer(4, 100, digest(7)));
+        assert!(bus.publish_certified_consensus_num_hash(4, 100, digest(4)));
+        assert_eq!(bus.published_consensus_num_hash(), (4, 100, digest(4)));
+    }
+
     /// A gap test message: whether the test policy holds it, and its byte weight.
     type Gap = (bool, usize);
 
-    /// Hold the messages marked held, at their byte weight.
-    fn gap_hold(message: &Gap) -> Option<usize> {
-        message.0.then_some(message.1)
+    /// Hold the messages marked held, at their byte weight, all from one author.
+    fn gap_hold(message: &Gap, _: Option<Epoch>) -> Option<GapWeight> {
+        message.0.then(|| GapWeight::new(message.1, GapAuthor::new(vec![0])))
     }
 
-    /// An always-subscribed channel that holds at most two messages and 100 bytes in a gap.
+    /// An always-subscribed channel that holds at most two messages and 100 bytes in a gap. The
+    /// cap per author is above the item cap, so it does not limit these messages.
     fn gap_channel() -> QueChannel<Gap> {
-        QueChannel::new_always_subscribed_held(GapPolicy::new("test", gap_hold, 2, 100))
+        QueChannel::new_always_subscribed_held(GapPolicy::new("test", gap_hold, 2, 100, 3))
     }
 
     /// What `try_send_outcome` reported for `message`, or `None` for an error.
@@ -2201,11 +2407,69 @@ mod tests {
         assert_eq!(outcome(&channel, (true, 9)), over);
     }
 
-    /// The gap item cap of the primary network event queue is at most the channel capacity, so
-    /// the held gossip alone never fills the queue.
+    /// A gap test message with an author: the author id and the byte weight.
+    type Authored = (u8, usize);
+
+    /// Hold every authored message, at its byte weight.
+    fn authored_hold(message: &Authored, _: Option<Epoch>) -> Option<GapWeight> {
+        Some(GapWeight::new(message.1, GapAuthor::new(vec![message.0])))
+    }
+
+    /// A gap policy that holds at most ten messages, 100 bytes and two messages of one author.
+    fn authored_policy() -> GapPolicy<Authored> {
+        GapPolicy::new("test", authored_hold, 10, 100, 2)
+    }
+
+    /// With no consumer, a held message past the cap of its author reports over budget, and the
+    /// messages of another author still queue.
     #[test]
-    fn primary_gap_item_cap_fits_the_channel() {
-        let items = crate::network::gap_policy::primary_event_gap_policy().max_items();
-        assert!(items <= CHANNEL_CAPACITY, "{items}");
+    fn gap_caps_held_messages_per_author() {
+        let channel = QueChannel::new_always_subscribed_held(authored_policy());
+        let outcome = |message: Authored| channel.try_send_outcome(message).ok();
+        let queued = Some(TrySendOutcome::Queued);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), over);
+        assert_eq!(outcome((2, 1)), queued);
+        assert_eq!(outcome((2, 1)), queued);
+        assert_eq!(outcome((2, 1)), over);
+    }
+
+    /// Subscribe resets the count of each author, so the next gap holds the full share of an
+    /// author again.
+    #[test]
+    fn subscribe_resets_the_author_counts() {
+        let channel = QueChannel::new_always_subscribed_held(authored_policy());
+        let outcome = |message: Authored| channel.try_send_outcome(message).ok();
+        let queued = Some(TrySendOutcome::Queued);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), over);
+
+        let mut rx = channel.subscribe();
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), 2);
+        drop(rx);
+
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), queued);
+        assert_eq!(outcome((1, 1)), over);
+    }
+
+    /// Release frees the share of the author of a held message, so the refund after a failed
+    /// send does not count against that author.
+    #[test]
+    fn release_frees_the_author_share() {
+        let hold = GapHold::new(authored_policy());
+        assert!(matches!(hold.admit(&(1, 1)), GapAdmit::Held(_)));
+        assert!(matches!(hold.admit(&(1, 1)), GapAdmit::Held(_)));
+        assert!(matches!(hold.admit(&(1, 1)), GapAdmit::OverBudget));
+
+        hold.release(&GapWeight::new(1, GapAuthor::new(vec![1])));
+        assert!(matches!(hold.admit(&(1, 1)), GapAdmit::Held(_)));
+        assert!(matches!(hold.admit(&(1, 1)), GapAdmit::OverBudget));
     }
 }

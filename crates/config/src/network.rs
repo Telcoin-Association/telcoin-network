@@ -555,6 +555,9 @@ impl Default for PeerReadinessTimeout {
 /// to accommodate it.
 pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 12_000;
 
+/// The prefix of the epoch-vote gossip topic. The topic is this prefix and the chain id.
+pub const EPOCH_VOTE_TOPIC_PREFIX: &str = "tn-epoch-vote-";
+
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
@@ -664,7 +667,7 @@ impl LibP2pConfig {
 
     /// Return the epoch-vote gossip topic for `chain_id`.
     pub fn epoch_vote_topic(chain_id: u64) -> String {
-        format!("tn-epoch-vote-{chain_id}")
+        format!("{EPOCH_VOTE_TOPIC_PREFIX}{chain_id}")
     }
 
     /// Return the worker-batch gossip topic for worker `worker_id` on `chain_id`.

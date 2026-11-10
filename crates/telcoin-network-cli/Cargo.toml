@@ -74,6 +74,12 @@ rand = { workspace = true }
 roaring = { workspace = true }
 crc32fast = "1.5.0"
 
+# `EILSEQ` for the non-UTF-8 bootstrap-peers test, which ends early on a filesystem that refuses
+# the name (APFS). Kept apart from the Linux-only runtime dependency above: the passphrase scrub
+# is Linux-gated, so a `cfg(unix)` runtime dependency would be unused on macOS.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
@@ -91,5 +97,3 @@ adiri = ["faucet", "tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-typ
 # Faucet build (devnet): the instant, role-gated TEL mint in tn-reth. Declared on this crate
 # because vergen reads this crate's features for the `--version` "Build Features" line.
 faucet = ["tn-node/faucet", "tn-reth/faucet"]
-# Opt back in to reth's RocksDB storage backend: propagate to the node graph.
-rocksdb = ["tn-node/rocksdb", "tn-reth/rocksdb"]

@@ -47,6 +47,73 @@ nft add counter inet filter tn_drop_public_udp
 nft add rule inet filter input udp dport 49590 ip saddr != @validators counter name tn_drop_public_udp drop
 ```
 
+### The `validators` set
+
+The drop rule above admits only the sources in the nft set `validators`.
+Fill it from the node's own view: [tn\_admissionSnapshot](../rpc-methods/tn/tn_admissionsnapshot.md) on the node's loopback RPC lists, for every swarm, the committee window, the committee two epochs ahead, the eligible validator pool and the configured trusted and bootstrap peers, with the addresses the node would use for each.
+A set built from it opens to a validator once it is eligible and its record resolves, and closes to a departed one once the node stops listing it.
+
+The set leads the node's own admission on purpose.
+Under Closed the node refuses an inbound peer it does not admit only after the QUIC/TLS handshake, because the PeerId is known only then, and the peer's own dial can complete before the connection closes.
+Its own outbound dials to such a peer are refused before any transport work.
+The firewall is therefore what spares the host the handshake of a source outside the node's view, and since it drops a peer before the node can see it, it must already pass every scheduled and eligible validator by the time the node admits one.
+
+Build the set from three sources:
+
+- the IP literal of every `/ip4/` and `/ip6/` address in `multiaddrs` and `record_multiaddrs` of every entry of every swarm, whatever its slots, `source` or `admitted`; skip `dns` addresses rather than resolving them;
+- the operator's static allowlist;
+- the configured bootstrap peers.
+
+The static list and the bootstrap peers are always in the set, so a wrong snapshot can never cut the launch set and the set is never empty.
+IPv4 and IPv6 addresses need separate sets, one of `type ipv4_addr` matched by `ip saddr` and one of `type ipv6_addr` matched by `ip6 saddr`.
+Replace the elements in one `nft -f` transaction, so the kernel applies the new set whole or not at all:
+
+```text
+flush set inet filter validators
+add element inet filter validators { 198.51.100.7, 203.0.113.10 }
+```
+
+Only an authoritative snapshot, as defined below, may run that transaction.
+
+#### Fail-open rule
+
+The set never shrinks on bad input.
+A snapshot is authoritative for membership only when every one of these holds:
+
+1. The RPC answered with a result, and its `version` is one the reader knows (`1`).
+2. The primary swarm (`"network": "primary"`) reports `available: true` and a non-null `admission`.
+3. The primary's `tracked_epoch` is non-null and not lower than its `admission.epoch`.
+   A lower value means the node has not published this epoch's validator pool, and the swarm still lists the previous epoch's keys.
+4. The primary's `tracked_epoch` is not lower than that of the last applied snapshot.
+5. The primary's `admission.fallback` is `null` or `"Unresolved"`.
+
+`Missing` and `Stale` mean that no versioned committee window has arrived, for example right after a restart, when the node runs Open with the current committee only.
+`Contradictory` means that membership itself is in doubt.
+The effective admission mode does not matter: the firewall is a cost filter, independent of the node's own gate.
+
+When the snapshot is authoritative, the addresses of a key it no longer lists leave the set at that apply, unless the static list or the bootstrap peers still hold them.
+A worker swarm that reports `available: false`, a null `admission`, or a `tracked_epoch` behind its own `admission.epoch` is not authoritative for its own entries: keep the addresses last applied for it and add any new ones it lists.
+
+When the snapshot is not authoritative, change nothing.
+That covers an unreachable RPC, a node without the method (JSON-RPC error `-32601`), the error `-32001` (`Not Found.`) of a node whose networks have not started, an unknown `version`, and any failed check above.
+Keep the loaded set, and record since when and why the feed is stale.
+Never flush the set on an error path.
+
+A key listed with `"source": "unresolved"` has no addresses.
+Keep the addresses it last resolved to for 3 epochs after its last resolution, then let it contribute nothing until it resolves again.
+That absorbs a transient kad miss without pinning a departed peer.
+
+#### Age policy
+
+- Poll the snapshot every 5 minutes and after every change to the static list.
+  The node serves a cached snapshot for up to 1 second, so callers cannot load its swarms.
+- The snapshot carries no generation time.
+  The feed's age is the time since the last authoritative snapshot was applied.
+- Warn when the feed has been stale for more than 2 epochs, and keep the set: the last good view is still a superset of what the node admitted then.
+- Alert at once on a missing method or an unknown `version`, because neither clears by itself.
+- Do not expire an entry on its `record_timestamp`.
+  The node lists a record until a newer one supersedes it or the key leaves its sets, and it looks up again every tracked record signed more than two record publication intervals ago (24 hours by default).
+
 ### Compose profile
 
 `etc/compose.yaml` has an `observability` profile with node_exporter, Prometheus (`prom/prometheus:v3.15.0`) and Grafana (`grafana/grafana:13.2.4`). The profile is off by default, so `make up` is unchanged. Start it with:
@@ -234,3 +301,4 @@ The unit test file `etc/prometheus/rules/telcoin-host-network.test.yaml` covers 
 
 - Issue #1672 (gateway dashboards) and issue #930: the scoping and label policy on this page applies to the work tracked there.
 - [Validator production operations](validator-operations.md): firewall configuration and capacity monitoring.
+- [tn\_admissionSnapshot](../rpc-methods/tn/tn_admissionsnapshot.md): the admission view that fills the `validators` set.

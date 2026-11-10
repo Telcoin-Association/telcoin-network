@@ -42,15 +42,16 @@ pub use consensus::ConsensusNetwork;
 pub use gossip_config::gossipsub_config;
 pub use metrics::AdmissionShed;
 pub use peers::{
-    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeKey,
-    PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER, MAX_PEER_EXCHANGE_ENTRIES,
+    AdmissionFallback, AdmissionStatus, CommitteeUpdate, EntrySource, LoadPenalty, PeerExchangeKey,
+    PeerExchangeMap, Penalty, SwarmAdmissionSnapshot, TrackedEntry, TrackedSlot,
+    MAX_PEER_EXCHANGE_ADDRS_PER_PEER, MAX_PEER_EXCHANGE_ENTRIES,
 };
 pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
-    read_frame, write_frame, DenyReason, PeerSlot, PeerSlots, PeerTier, PrimarySyncRequest,
-    ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
+    read_frame, write_frame, DenyReason, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,
+    PrimarySyncRequest, ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
 pub use types::{EpochPosition, ResponseChannel};

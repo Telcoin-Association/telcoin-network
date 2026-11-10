@@ -77,7 +77,7 @@
 //! [`StateReadError`]'s string-only variants cannot carry.
 
 use reth_errors::ProviderError;
-use reth_eth_wire::BlockHashNumber;
+use reth_eth_wire_types::BlockHashNumber;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmEnv, EvmFactory as _};
 use reth_provider::{
     BlockIdReader as _, BlockNumReader as _, ChainStateBlockReader as _,
@@ -89,10 +89,11 @@ use reth_revm::{
     database::StateProviderDatabase,
     State,
 };
+use std::collections::BTreeSet;
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::WorkerConfigEntry, Address, Bytes, Epoch, ExecHeader, SealedHeader,
-    SolCall as _, B256,
+    gas_accumulator::WorkerConfigEntry, Address, BlsPublicKey, Bytes, Epoch, ExecHeader,
+    SealedHeader, SolCall as _, B256,
 };
 use tracing::{debug, error, warn};
 
@@ -102,8 +103,9 @@ use crate::{
     },
     evm::TNEvm,
     system_calls::{
-        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
-        CONSENSUS_REGISTRY_ADDRESS,
+        decode_worker_fee_configs,
+        ConsensusRegistry::{self, ValidatorStatus},
+        EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
     },
     RethEnv, SYSTEM_ADDRESS,
 };
@@ -475,6 +477,57 @@ impl RethEnv {
             })
             .collect();
         self.classified_registry_batch_at_header(header, calldatas)
+    }
+
+    /// Read the BLS pubkeys of the committee-eligible validator pool from the
+    /// [ConsensusRegistry], pinned to `header`'s state.
+    ///
+    /// The pool is the union of the `PendingActivation`, `Active` and `PendingExit` status sets,
+    /// the same pool the epoch-closing committee draw shuffles (`read_committee_eligible_pool` in
+    /// `evm/block.rs`). One [`Self::classified_registry_batch_at_header`] call reads the three
+    /// `getValidatorsInfo(status)` sets and a second reads `getBlsPubkey(address)` for every
+    /// member, both at `header`, so every key derives from the same block.
+    ///
+    /// Best-effort: the result feeds peer tracking, never consensus. A key whose on-chain bytes
+    /// do not decode is skipped with a warning rather than failing the read, and the set removes
+    /// duplicates. Registry and provider failures are returned, classified per
+    /// [`StateReadError`]; a registry still on the pre-fork adiri code has no
+    /// `getValidatorsInfo`, so a pin before that fork fails [`StateReadError::ChainGlobal`].
+    pub fn committee_eligible_bls_keys_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<BTreeSet<BlsPublicKey>> {
+        let calldatas = [
+            ValidatorStatus::PendingActivation,
+            ValidatorStatus::Active,
+            ValidatorStatus::PendingExit,
+        ]
+        .into_iter()
+        .map(|status| {
+            ConsensusRegistry::getValidatorsInfoCall { status: status.into() }.abi_encode().into()
+        })
+        .collect();
+        let addresses: Vec<Address> = self
+            .classified_registry_batch_at_header::<Vec<ConsensusRegistry::ValidatorInfo>>(
+                header, calldatas,
+            )?
+            .into_iter()
+            .flatten()
+            .map(|validator| validator.validatorAddress)
+            .collect();
+
+        let calldatas = addresses
+            .iter()
+            .map(|&address| {
+                ConsensusRegistry::getBlsPubkeyCall { validatorAddress: address }
+                    .abi_encode()
+                    .into()
+            })
+            .collect();
+        let raw_keys = self
+            .classified_registry_batch_at_header::<alloy::primitives::Bytes>(header, calldatas)?;
+
+        Ok(decode_eligible_keys(header.hash(), addresses.into_iter().zip(raw_keys)))
     }
 
     /// Read the [`ConsensusRegistry`] [`EpochInfo`](ConsensusRegistry::EpochInfo) for `epoch` at
@@ -991,6 +1044,35 @@ impl RethEnv {
 
         Ok(res)
     }
+}
+
+/// Decode the committee-eligible pool's on-chain BLS key bytes, read at block `pin` and paired
+/// with each validator's address, into a deduplicated key set.
+///
+/// A key that does not decode is skipped with a warning naming its validator. Skipping costs that
+/// validator one epoch of peer tracking, which is cheaper than losing the whole pool to one bad
+/// row; the node decodes committee keys through a hard-error path instead because a short
+/// committee is a safety fault.
+fn decode_eligible_keys(
+    pin: B256,
+    raw_keys: impl IntoIterator<Item = (Address, alloy::primitives::Bytes)>,
+) -> BTreeSet<BlsPublicKey> {
+    raw_keys
+        .into_iter()
+        .filter_map(|(address, raw)| {
+            BlsPublicKey::from_literal_bytes(raw.as_ref())
+                .inspect_err(|err| {
+                    warn!(
+                        target: "engine",
+                        ?pin,
+                        ?address,
+                        ?err,
+                        "skipping undecodable bls key in the committee-eligible pool"
+                    );
+                })
+                .ok()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3469,6 +3551,206 @@ mod tests {
         assert_eq!(state_after.bls_pubkeys, state.bls_pubkeys);
 
         Ok(())
+    }
+
+    /// The committee-eligible pool read at a pinned header returns exactly the BLS keys of the
+    /// `PendingActivation`, `Active` and `PendingExit` validators and leaves out an `Exited` one.
+    ///
+    /// The fixture does not depend on the shuffle seed. Four genesis validators fill a four-seat
+    /// committee. In epoch 0 `exited` begins its exit while `joined` stakes and activates, so the
+    /// pool without pending exits stays at exactly four and `assemble_new_committee` seats the
+    /// same four at every close. `exited` then holds no seat in epochs 3, 4 or 5 and leaves at the
+    /// close into epoch 3. One block in epoch 3 stakes and activates `joining` and starts
+    /// `leaving`'s exit, which puts one validator in each of statuses 2 to 5 at that block.
+    ///
+    /// The same read at the previous header returns the pool as it stood there, so the result
+    /// comes from the pinned state rather than the canonical tip.
+    #[tokio::test]
+    async fn committee_eligible_bls_keys_at_header_reads_three_statuses() -> eyre::Result<()> {
+        // every validator that sends a registry call signs it itself, so each one is a seeded eoa
+        let eoa =
+            |seed: u64| TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(seed));
+        let node_info = |seed: u64, address: Address| {
+            let bls = BlsKeypair::generate(&mut StdRng::seed_from_u64(seed));
+            let proof_of_possession = generate_proof_of_possession_bls_for_test(&bls, &address)
+                .expect("proof of possession");
+            NodeInfo {
+                name: format!("validator-{seed}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: address,
+                proof_of_possession,
+            }
+        };
+        let mut leaving_eoa = eoa(43);
+        let mut exited_eoa = eoa(44);
+        let mut joined_eoa = eoa(45);
+        let mut joining_eoa = eoa(46);
+        let mut governance = eoa(47);
+        let active_a = node_info(1, eoa(41).address());
+        let active_b = node_info(2, eoa(42).address());
+        let leaving = node_info(3, leaving_eoa.address());
+        let exited = node_info(4, exited_eoa.address());
+        let joined = node_info(5, joined_eoa.address());
+        let joining = node_info(6, joining_eoa.address());
+
+        let stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: parse_ether("1_000_000")?,
+            minWithdrawAmount: parse_ether("1_000")?,
+            epochIssuance: parse_ether("20_000_000")?
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: 60 * 60 * 24,
+        };
+        let funded = GenesisAccount::default()
+            .with_balance(stake_config.stakeAmount.saturating_mul(U256::from(2)));
+        let genesis = tn_types::test_genesis().extend_accounts([
+            (governance.address(), funded.clone()),
+            (leaving.execution_address, funded.clone()),
+            (exited.execution_address, funded.clone()),
+            (joined.execution_address, funded.clone()),
+            (joining.execution_address, funded),
+        ]);
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            vec![active_a.clone(), active_b.clone(), leaving.clone(), exited.clone()],
+            genesis,
+            stake_config.clone(),
+            governance.address(),
+            vec![(0u8, 30_000_000u64)],
+        )?;
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Eligible Pool Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let registry_tx = |signer: &mut TransactionFactory, value: U256, calldata: Bytes| {
+            signer.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(CONSENSUS_REGISTRY_ADDRESS),
+                value,
+                calldata,
+            )
+        };
+        // governance mints the nft, then the validator stakes and activates in the same block
+        let join_txs = |governance: &mut TransactionFactory,
+                        signer: &mut TransactionFactory,
+                        info: &NodeInfo| {
+            let mint = ConsensusRegistry::mintCall { validatorAddress: info.execution_address };
+            let stake = ConsensusRegistry::stakeCall {
+                blsPubkey: info.bls_public_key.to_bytes().into(),
+                proofOfPossession: ConsensusRegistry::ProofOfPossession {
+                    signature: info.proof_of_possession.to_bytes().into(),
+                },
+            };
+            vec![
+                registry_tx(governance, U256::ZERO, mint.abi_encode().into()),
+                registry_tx(signer, stake_config.stakeAmount, stake.abi_encode().into()),
+                registry_tx(
+                    signer,
+                    U256::ZERO,
+                    ConsensusRegistry::activateCall {}.abi_encode().into(),
+                ),
+            ]
+        };
+        let begin_exit = ConsensusRegistry::beginExitCall {}.abi_encode();
+        // each output carries the epoch it commits in; a closing output concludes that epoch
+        let execute = |parent: SealedHeader,
+                       epoch: Epoch,
+                       subdag_index: u64,
+                       close_epoch: bool,
+                       transactions: Vec<Vec<u8>>| {
+            let output = consensus_output_for_tests(2, epoch, subdag_index, close_epoch);
+            let payload = TNPayload::new_for_test(parent, &output);
+            execute_payload_and_update_canonical_chain(&reth_env, payload, transactions)
+                .map(|block| block.recovered_block.clone_sealed_header())
+        };
+
+        // block 1 (epoch 0): `joined` becomes PendingActivation and `exited` PendingExit
+        let mut transactions = join_txs(&mut governance, &mut joined_eoa, &joined);
+        transactions.push(registry_tx(&mut exited_eoa, U256::ZERO, begin_exit.clone().into()));
+        let header = execute(chain.sealed_genesis_header(), 0, 1, false, transactions)?;
+        // blocks 2-4 close epochs 0, 1 and 2; the close into epoch 3 exits `exited`
+        let header = execute(header, 0, 2, true, vec![])?;
+        let header = execute(header, 1, 3, true, vec![])?;
+        let before = execute(header, 2, 4, true, vec![])?;
+        // block 5 (epoch 3): `joining` becomes PendingActivation and `leaving` PendingExit
+        let mut transactions = join_txs(&mut governance, &mut joining_eoa, &joining);
+        transactions.push(registry_tx(&mut leaving_eoa, U256::ZERO, begin_exit.into()));
+        let pin = execute(before.clone(), 3, 5, false, transactions)?;
+
+        // every status from 2 to 5 is present at the pin, so the pool read meets all four
+        let everyone = [&active_a, &active_b, &joined, &joining, &leaving, &exited];
+        let statuses: Vec<ValidatorStatus> = reth_env
+            .classified_registry_batch_at_header::<ConsensusRegistry::ValidatorInfo>(
+                &pin,
+                everyone
+                    .iter()
+                    .map(|info| {
+                        ConsensusRegistry::getValidatorCall {
+                            validatorAddress: info.execution_address,
+                        }
+                        .abi_encode()
+                        .into()
+                    })
+                    .collect(),
+            )?
+            .into_iter()
+            .map(|info| info.currentStatus)
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ValidatorStatus::Active,
+                ValidatorStatus::Active,
+                ValidatorStatus::Active,
+                ValidatorStatus::PendingActivation,
+                ValidatorStatus::PendingExit,
+                ValidatorStatus::Exited,
+            ]
+        );
+
+        // the pool is the three committee-eligible statuses; the exited validator is left out
+        let keys = |infos: &[&NodeInfo]| -> BTreeSet<BlsPublicKey> {
+            infos.iter().map(|info| info.bls_public_key).collect()
+        };
+        assert_eq!(
+            reth_env.committee_eligible_bls_keys_at_header(&pin)?,
+            keys(&[&active_a, &active_b, &joined, &joining, &leaving])
+        );
+
+        // pinned to the previous block, the read sees `leaving` still Active and no `joining`,
+        // although the canonical tip is now the pin block
+        assert_eq!(reth_env.canonical_tip().hash(), pin.hash());
+        assert_eq!(
+            reth_env.committee_eligible_bls_keys_at_header(&before)?,
+            keys(&[&active_a, &active_b, &joined, &leaving])
+        );
+
+        Ok(())
+    }
+
+    /// The best-effort decode keeps every well-formed key, skips the rows that do not decode and
+    /// collapses a key listed under two addresses into one entry.
+    #[test]
+    fn decode_eligible_keys_skips_undecodable_rows() {
+        let key = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
+        let (first, second) = (key(1), key(2));
+        let raw_keys = vec![
+            (Address::repeat_byte(0x01), Bytes::from(first.to_bytes())),
+            // empty, truncated and flag-invalid rows: none is a 96-byte compressed g2 point
+            (Address::repeat_byte(0x02), Bytes::new()),
+            (Address::repeat_byte(0x03), Bytes::copy_from_slice(&second.to_bytes()[..48])),
+            (Address::repeat_byte(0x04), Bytes::from(vec![0xff; 96])),
+            (Address::repeat_byte(0x05), Bytes::from(second.to_bytes())),
+            (Address::repeat_byte(0x06), Bytes::from(first.to_bytes())),
+        ];
+
+        let decoded = decode_eligible_keys(B256::repeat_byte(0xaa), raw_keys);
+
+        assert_eq!(decoded, BTreeSet::from([first, second]));
     }
 
     #[tokio::test]

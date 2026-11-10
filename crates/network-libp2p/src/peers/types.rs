@@ -53,9 +53,26 @@ pub(crate) enum PeerEvent {
     /// Peer manager has unbanned a peer and associated ip addresses.
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers kad queries.
+    ///
+    /// Every emitter of this variant requests [`LookupClass::Committee`] lookups.
     MissingAuthorities(Vec<BlsPublicKey>),
+    /// Keys whose node records are missing or outdated, to be queried in kad under the class.
+    MissingRecords(Vec<BlsPublicKey>, LookupClass),
     /// Initiate a discovery attempt because discovery peer counts are low.
     Discovery,
+}
+
+/// Why the peer manager asked kad for a node record.
+///
+/// The class decides how a lookup shares the per-key in-flight query with other lookups: a
+/// committee lookup feeds admission and consensus addressing, so a tracked lookup must never
+/// hold it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupClass {
+    /// A committee window member or a configured hub.
+    Committee,
+    /// A scheduled or eligible key, resolved for export only and never admitted.
+    Tracked,
 }
 
 /// The action to take after a peer's reputation or connection status changes.
