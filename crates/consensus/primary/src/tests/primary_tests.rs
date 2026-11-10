@@ -576,7 +576,7 @@ async fn test_request_vote_accept_missing_parents() {
 fn test_requested_parents_records_every_citing_author() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee: Committee = fixture.committee();
-    let mut digests = Certificate::genesis(&committee).iter().map(|x| x.digest());
+    let mut digests = Certificate::genesis(&committee).into_iter().map(|x| x.digest());
     let digest = digests.next().unwrap();
     let other_digest = digests.next().unwrap();
     let mut ids = fixture.authorities().map(|a| a.id());
