@@ -15,7 +15,7 @@
 # the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
 # exists only because nextest has no other way to build a lane without running it.
 #
-# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and both test lanes with
+# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes with
 # `--build-only` after every push to main that the merge queue did not make. A
 # security-advisory merge reaches main without either pr.yaml event, so that workflow is
 # what says such a commit still compiles. It reports after the fact and gates nothing.
@@ -29,11 +29,11 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|all>
-#        etc/ci-lanes.sh <test-default|test-adiri> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-vendor-reth|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-vendor-reth> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
-# the two test lanes and nothing else, and it is the only option there is: no flag passes
+# the three test lanes and nothing else, and it is the only option there is: no flag passes
 # through to cargo, so a caller still cannot weaken a lane, only skip the run.
 #
 # NEXTEST_PROFILE selects a profile from .config/nextest.toml. CI sets it to `ci`
@@ -63,8 +63,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|all>" >&2
-    echo "       $0 <test-default|test-adiri> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-vendor-reth|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-vendor-reth> --build-only" >&2
     exit 2
 }
 
@@ -218,12 +218,33 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
+lane_test_vendor_reth() {
+    # The vendoring tools (tn/vendor.py, tn/graph.py) and the RocksDB gate, against synthetic
+    # repositories, workspaces and lockfiles.
+    run python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py'
+    run python3 -B -I -m unittest discover -s etc -p 'test_rocksdb_gate.py'
+    # reth's own unit and integration tests for the vendored crates (vendor/reth/README.md).
+    # They resolve only inside the nested workspace, which tn/cargo.sh runs with its lockfile
+    # seeded from TN's; reth's dev-dependencies add packages to it, so --locked cannot apply.
+    # Neither the root workspace lanes above nor clippy reach these tests, and the regression
+    # tests of every backport in vendor/reth/CHANGES.md live here. reth-db runs on its own with
+    # two threads: at the default count macOS fails some MDBX opens with ENOMEM
+    # (vendor/reth/README.md), and this lane also runs in etc/test-and-attest.sh.
+    run vendor/reth/tn/cargo.sh nextest run --workspace --exclude reth-db "${run_mode[@]}"
+    run vendor/reth/tn/cargo.sh nextest run -p reth-db --test-threads 2 "${run_mode[@]}"
+    # The opt-in js-tracer build (crates/tn-reth/js-tracer.md): reth-rpc's JavaScript tracer
+    # tests and tn-reth's suite with the feature on, which runs the feature's arm of
+    # js_tracer_follows_the_build_feature. The clippy lane compiles these but runs nothing.
+    run vendor/reth/tn/cargo.sh nextest run -p reth-rpc --features js-tracer "${run_mode[@]}"
+    run cargo nextest run --locked -p tn-reth --features js-tracer "${run_mode[@]}"
+}
+
 (($# <= 2)) || usage
 case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-vendor-reth) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -235,11 +256,13 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
+test-vendor-reth) lane_test_vendor_reth ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
+    lane_test_vendor_reth
     ;;
 *) usage ;;
 esac

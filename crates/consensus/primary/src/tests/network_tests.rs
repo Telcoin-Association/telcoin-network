@@ -629,6 +629,11 @@ async fn test_uncertified_epoch_record_is_unavailable_without_waiting() {
             assert_matches!(err, $($expected)+);
             let penalty: Option<Penalty> = (&err).into();
             assert!(penalty.is_none(), "an unavailable epoch record must not penalize the peer");
+            // the reply on the wire is the one requesters recognise as a definitive answer
+            assert_eq!(
+                Err::<PrimaryResponse, _>(err).into_response(),
+                PrimaryResponse::unavailable_epoch_record($epoch, $hash),
+            );
         }};
     }
     assert_unavailable_without_waiting!(Some(0), None, PrimaryNetworkError::UnavailableEpoch(0));

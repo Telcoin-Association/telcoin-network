@@ -1673,26 +1673,47 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    /// Request consensus header from a random peer up to three times from three different peers.
+    /// Request an epoch record and its certificate from a random peer, up to three times from
+    /// three different peers.
+    ///
+    /// The error tells a definitive answer apart from a failed exchange:
+    /// - [`NetworkError::RPCError`]: at least one peer answered that it holds no certified record
+    ///   for the request ([`PrimaryResponse::unavailable_epoch_record`]) and no peer returned one;
+    /// - [`NetworkError::RPCRetryable`]: no peer answered either way. There was no connected peer,
+    ///   the request was dropped (a peer between epochs drops inbound primary requests), the
+    ///   responder's identity was not resolved yet, or the reply was another error or an unexpected
+    ///   response.
+    ///
+    /// A closed network command channel returns its own error at once.
     pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
         hash: Option<EpochDigest>,
     ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
+        let unavailable = PrimaryResponse::unavailable_epoch_record(epoch, hash);
+        let mut answered = false;
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(NetworkResponseMessage {
-                peer: _,
-                result: PrimaryResponse::EpochRecord { record, certificate },
-            })) = res.await
-            {
-                return Ok((record, certificate));
+            match res.await {
+                Ok(Ok(NetworkResponseMessage {
+                    peer: _,
+                    result: PrimaryResponse::EpochRecord { record, certificate },
+                })) => return Ok((record, certificate)),
+                Ok(Ok(NetworkResponseMessage { peer: _, result })) => {
+                    answered |= result == unavailable;
+                }
+                // no peer, a dropped request or an unresolved responder: no answer either way
+                Ok(Err(_)) | Err(_) => {}
             }
         }
-        Err(NetworkError::RPCError("Could not get the epoch record!".to_string()))
+        if answered {
+            Err(NetworkError::RPCError("Peers do not have the epoch record".to_string()))
+        } else {
+            Err(NetworkError::RPCRetryable("Could not get the epoch record!".to_string()))
+        }
     }
 
     /// Report a penalty to the network's peer manager.

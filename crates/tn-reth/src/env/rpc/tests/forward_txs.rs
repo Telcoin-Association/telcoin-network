@@ -8,7 +8,7 @@ use crate::rpc_tx_forward::{
 };
 use alloy::consensus::{transaction::RlpEcdsaEncodableTx as _, Signed, TxLegacy};
 use jsonrpsee::{types::ErrorObject, Methods, MethodsError};
-use reth_primitives::sign_message;
+use reth_primitives_traits::crypto::secp256k1::sign_message;
 use reth_rpc_eth_types::{EthApiError, RpcInvalidTransactionError};
 use reth_transaction_pool::{EthBlobTransactionSidecar, EthPoolTransaction as _};
 use std::collections::BTreeSet;
@@ -21,7 +21,7 @@ fn forwarding_env(
     targets: &str,
     cap_wei: u128,
     sanitize: bool,
-    rpc_args: reth::args::RpcServerArgs,
+    rpc_args: reth_node_core::args::RpcServerArgs,
     task_manager: &TaskManager,
     tmp_dir: &TempDir,
 ) -> eyre::Result<RethEnv> {
@@ -31,7 +31,7 @@ fn forwarding_env(
         tmp_dir.path(),
         task_manager,
         None,
-        reth::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args },
+        reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args },
         tx_forward,
     )
 }
@@ -248,7 +248,8 @@ async fn test_http_transport_gets_the_forwarder() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let (raw, hash) = transfer(&chain, &mut TransactionFactory::new(), 21_000);
     let upstream = FakeUpstream::start(Reply::Hash(hash)).await?;
-    let rpc_args = reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+    let rpc_args =
+        reth_node_core::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
     let reth_env =
         forwarding_env(chain, &upstream.url, 0, false, rpc_args, &task_manager, &tmp_dir)?;
     let (server, pool) = worker_server(&reth_env, &GasAccumulator::new(1), 0)?;

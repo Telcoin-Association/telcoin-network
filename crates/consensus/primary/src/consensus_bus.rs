@@ -682,6 +682,9 @@ pub struct ConsensusBusAppInner {
     new_epoch_votes: QueChannel<EpochVote>,
     /// Watch channel to communicate the current epoch record to the vote collector.
     tx_epoch_record: watch::Sender<Option<EpochRecord>>,
+    /// The newest epoch for which the record collector stored a downloaded, certified epoch
+    /// record (`None` until it stores one).
+    tx_certified_record_epoch: watch::Sender<Option<Epoch>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
@@ -876,6 +879,7 @@ impl ConsensusBusApp {
         let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
+        let (tx_certified_record_epoch, _) = watch::channel(None);
 
         let (epoch_request_queue_tx, epochs_rx) =
             tokio::sync::mpsc::channel(EPOCH_REQUEST_QUEUE_CAPACITY);
@@ -897,6 +901,7 @@ impl ConsensusBusApp {
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
+                tx_certified_record_epoch,
                 primary_network_events: QueChannel::new_always_subscribed_held(
                     crate::network::gap_policy::primary_event_gap_policy(),
                 ),
@@ -1165,6 +1170,29 @@ impl ConsensusBusApp {
     /// The epoch vote collector observes this to know when a new epoch starts.
     pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
         &self.inner.tx_epoch_record
+    }
+
+    /// Watch carrying the newest epoch for which the record collector stored a downloaded,
+    /// certified [`EpochRecord`].
+    ///
+    /// The epoch manager wakes on it to check whether such a record shows that the epoch it runs
+    /// already closed on the network. It is a wake-up only: the epoch manager decides from the
+    /// epoch store, never from this value.
+    pub fn certified_record_epoch(&self) -> &watch::Sender<Option<Epoch>> {
+        &self.inner.tx_certified_record_epoch
+    }
+
+    /// Publish that the record collector stored a certified record for `epoch`.
+    /// Return true if `epoch` is the newest so far; watchers are woken only then.
+    pub fn set_certified_record_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.certified_record_epoch().send_if_modified(|state| {
+            if state.is_none_or(|stored| epoch > stored) {
+                *state = Some(epoch);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Provide a subscriber (Receiver) for new_epoch_votes.

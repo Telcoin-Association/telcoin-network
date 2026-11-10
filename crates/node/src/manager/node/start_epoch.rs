@@ -66,6 +66,10 @@ use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// How long the epoch-start publication waits for one swarm's command channel to take its
+/// tracked keys before it logs that swarm as missed.
+const TRACKED_KEYS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Clears an epoch's observer observations when its monitor is cancelled or exits.
 struct SubmitCoverageMonitor {
     /// Forwarder whose admission cache is the authoritative endpoint consumer.
@@ -128,9 +132,18 @@ where
         committee: Committee,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) -> eyre::Result<ReplayResult> {
+        let executed =
+            state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
+                .await?
+                .unwrap_or_default();
+        // Repair a stale slot even if a previous recovery already executed the whole suffix
+        // and there is nothing left to replay, including across an epoch boundary.
+        self.consensus_chain.recover_latest_consensus_from_execution(&executed).await?;
         let missing =
             state_sync::get_missing_consensus(&self.consensus_bus, &self.consensus_chain).await?;
         let mut last_replayed_hash = None;
+        let mut epoch_close_hash = None;
+        let mut parent = executed;
         for consensus_header in missing.into_iter() {
             if consensus_header.sub_dag.leader_epoch() != committee.epoch() {
                 error!(target: "epoch-manager", "Crossed epoch boundary with missing execution! expected epoch {} got {}",
@@ -141,27 +154,43 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
+            eyre::ensure!(
+                consensus_header.number == parent.number + 1
+                    && consensus_header.parent_hash == parent.digest(),
+                "restart replay is not contiguous: expected consensus {} following {}, got {}",
+                parent.number + 1,
+                parent.number,
+                consensus_header.number,
+            );
             let consensus_output =
                 self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
             let is_epoch_close = consensus_output.reaches_epoch_boundary(self.epoch_boundary);
             let output_hash = consensus_output.consensus_header_hash();
+            // Imported packs already contain these outputs but their saved marker can lag.
+            // The normal save path validates the stored epoch/digest before advancing it.
+            // Outputs saved before shutdown still need execution, without a non-monotonic save.
+            if consensus_header.number > self.consensus_chain.latest_consensus_number() {
+                self.consensus_chain.save_consensus_output(consensus_output.clone()).await?;
+            }
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
             self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
+            parent = consensus_header.clone();
             if is_epoch_close {
                 // stash the boundary header (digest-identical to `output_hash`) for the caller's
                 // close-and-write sequence
                 self.last_consensus_header = Some(consensus_header);
-                return Ok(ReplayResult {
-                    epoch_close_hash: Some(output_hash),
-                    last_replayed_hash,
-                });
+                epoch_close_hash = Some(output_hash);
+                break;
             }
         }
-        Ok(ReplayResult { epoch_close_hash: None, last_replayed_hash })
+        if last_replayed_hash.is_some() {
+            self.consensus_chain.persist_current().await?;
+        }
+        Ok(ReplayResult { epoch_close_hash, last_replayed_hash })
     }
 
     /// Derive the current [`Committee`] from state pinned to the previous epoch's closing block.
@@ -241,7 +270,9 @@ where
     ///
     /// After all nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
-    /// those epochs arrive — a best-effort warm-up whose failure is intentionally ignored.
+    /// those epochs arrive — a best-effort warm-up whose failure is intentionally ignored. The
+    /// epoch + 2 committee and the eligible validator pool are then published to every swarm as
+    /// tracked keys ([`Self::publish_tracked_keys`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_consensus(
         &mut self,
@@ -312,11 +343,17 @@ where
         // CLOSE_READ_ATTEMPTS x CLOSE_READ_RETRY_BACKOFF on the epoch-entry critical path to
         // salvage one is a bad trade. Both failure classes skip.
         prefetches.extend(consensus_config.next_committee_keys().iter());
-        match engine.validators_for_epoch_at_header(committee.epoch() + 2, epoch_start_header).await
+        let scheduled: HashSet<BlsPublicKey> = match engine
+            .validators_for_epoch_at_header(committee.epoch() + 2, epoch_start_header)
+            .await
         {
-            Ok(keys) => prefetches.extend(keys),
-            Err(e) => warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch"),
-        }
+            Ok(keys) => keys.into_iter().collect(),
+            Err(e) => {
+                warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch");
+                HashSet::new()
+            }
+        };
+        prefetches.extend(scheduled.iter().copied());
         // Attempt to pre-load the next couple of committee's network info.
         let _ = primary_handle
             .inner_handle()
@@ -335,6 +372,15 @@ where
                 }
             })
             .await;
+        self.publish_tracked_keys(
+            engine,
+            epoch_task_manager.get_spawner(),
+            epoch_start_header,
+            primary_handle,
+            committee.epoch(),
+            scheduled,
+        )
+        .await;
         Ok((primary, workers))
     }
 
@@ -560,6 +606,7 @@ where
             self.consensus_bus.clone(),
             self.consensus_chain.clone(),
             node_info,
+            self.admission_snapshots.clone(),
         ))
     }
 
@@ -688,6 +735,78 @@ where
         .map(drop)
     }
 
+    /// Publish this epoch's scheduled and eligible validator keys to every swarm for tracking.
+    ///
+    /// `scheduled` is the epoch + 2 committee that [`Self::create_consensus`] read at
+    /// `epoch_start_header` for its prefetch, empty when that read failed. The eligible pool
+    /// (pending activation, active and pending exit validators) is read at the same pin on a task
+    /// of this epoch's spawner, off the entry path. Both sets go to the primary swarm and to every
+    /// configured worker swarm, including the swarms outside the on-chain worker range, because
+    /// each swarm resolves and exports its own tracked records. Tracked keys are never admitted,
+    /// so nothing here feeds the admission predicate. The peer managers re-resolve the keys on
+    /// their heartbeat, so the publication runs once per epoch entry.
+    ///
+    /// A historical epoch publishes nothing, so a catching-up node does not read the pool once
+    /// per replayed epoch. Like the prefetch, the pool read is not retried: a failure logs a
+    /// warning and publishes nothing, which leaves each swarm's tracked keys at its last
+    /// publication.
+    ///
+    /// The swarms are sent to concurrently, each bounded by [`TRACKED_KEYS_SEND_TIMEOUT`], so a
+    /// swarm whose command channel stays full misses this publication with a warning and never
+    /// holds it back from the others.
+    async fn publish_tracked_keys(
+        &self,
+        engine: &ExecutionNode,
+        epoch_task_spawner: TaskSpawner,
+        epoch_start_header: &SealedHeader,
+        primary_handle: PrimaryNetworkHandle,
+        epoch: Epoch,
+        scheduled: HashSet<BlsPublicKey>,
+    ) {
+        if matches!(self.epoch_position(epoch).await, EpochPosition::Historical) {
+            debug!(target: "epoch-manager", epoch, "historical epoch, skipping tracked key publication");
+            return;
+        }
+        let engine = engine.clone();
+        let epoch_start_header = epoch_start_header.clone();
+        let worker_handles = self.worker_network_handles.clone();
+        let epoch = u64::from(epoch);
+        epoch_task_spawner.spawn_task("Publish tracked validator keys", async move {
+            let eligible: HashSet<BlsPublicKey> =
+                match engine.committee_eligible_keys_at_header(&epoch_start_header).await {
+                    Ok(keys) => keys.into_iter().collect(),
+                    Err(error) => {
+                        warn!(target: "epoch-manager", ?error, epoch, "eligible pool read failed, skipping tracked key publication");
+                        return Ok(());
+                    }
+                };
+            let primary = send_tracked_keys(
+                primary_handle.inner_handle(),
+                epoch,
+                scheduled.clone(),
+                eligible.clone(),
+            );
+            let workers = futures::future::join_all(worker_handles.iter().map(|worker_handle| {
+                send_tracked_keys(
+                    worker_handle.inner_handle(),
+                    epoch,
+                    scheduled.clone(),
+                    eligible.clone(),
+                )
+            }));
+            let (primary, workers) = tokio::join!(primary, workers);
+            if let Err(error) = primary {
+                warn!(target: "epoch-manager", ?error, epoch, "failed to publish tracked keys to the primary swarm");
+            }
+            for (worker_id, result) in workers.into_iter().enumerate() {
+                if let Err(error) = result {
+                    warn!(target: "epoch-manager", ?error, epoch, worker_id, "failed to publish tracked keys to a worker swarm");
+                }
+            }
+            Ok(())
+        });
+    }
+
     /// Initialize one worker's persistent components in ascending worker-id order.
     ///
     /// Test initialization per id so activating a new worker after startup creates its pool
@@ -743,6 +862,7 @@ where
                         rpc_context.consensus_bus,
                         self.consensus_chain.clone(),
                         node_info,
+                        self.admission_snapshots.clone(),
                     );
                     engine
                         .initialize_worker_components(
@@ -1193,9 +1313,10 @@ where
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
-    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
-    /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
-    /// assumes it is caught up and is demoted to inactive later if that turns out to be false.
+    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record, or a
+    /// certified record for this epoch, proves it must catch up, and otherwise starts as
+    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is demoted to
+    /// inactive later if that turns out to be false.
     /// The chosen mode is written to the [`ConsensusBus`] before returning.
     async fn identify_node_mode(
         &self,
@@ -1231,12 +1352,17 @@ where
         };
         // Apply the same record-tip veto as startup so stale execution state cannot restore a
         // validator that has rotated out. A record older than this committee cannot veto admission.
-        let record = self.consensus_chain.epochs().latest_record().await;
+        let epochs = self.consensus_chain.epochs();
+        let local_epoch = consensus_config.committee().epoch();
+        let record = epochs.latest_record().await;
+        let certified =
+            super::newest_certified_record(epochs, local_epoch).await.map(|record| record.epoch);
         let mode = super::node_mode_from_epoch_record(
             initial_mode,
-            consensus_config.committee().epoch(),
+            local_epoch,
             &self.key_config.primary_public_key(),
             record.as_ref(),
+            certified,
         );
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");
@@ -1401,6 +1527,25 @@ fn check_committee_worker_count(
     configured_workers: usize,
 ) -> eyre::Result<()> {
     super::check_configured_worker_count(epoch, num_workers.get(), configured_workers)
+}
+
+/// Queue one swarm's tracked keys, waiting at most [`TRACKED_KEYS_SEND_TIMEOUT`] for room in its
+/// command channel.
+///
+/// A send that times out is dropped before it is queued, so a stuck swarm gets nothing late.
+async fn send_tracked_keys<Req: TNMessage, Res: TNMessage>(
+    handle: &NetworkHandle<Req, Res>,
+    epoch: u64,
+    scheduled: HashSet<BlsPublicKey>,
+    eligible: HashSet<BlsPublicKey>,
+) -> eyre::Result<()> {
+    tokio::time::timeout(
+        TRACKED_KEYS_SEND_TIMEOUT,
+        handle.update_tracked_keys(epoch, scheduled, eligible),
+    )
+    .await
+    .map_err(|_| eyre!("command channel full for {TRACKED_KEYS_SEND_TIMEOUT:?}"))??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2014,6 +2159,29 @@ mod tests {
         drop(restarted);
         next_tasks.abort_all_tasks();
         next_tasks.wait_for_task_shutdown().await;
+
+        // A certified record for the local epoch proves the network closed that epoch without
+        // this node, so identification demotes an active validator to catch up (issue #1792).
+        if mode.is_active_cvv() {
+            let members: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let record = tn_types::EpochRecord {
+                epoch: consensus_config.committee().epoch(),
+                committee: members.clone(),
+                next_committee: members,
+                ..Default::default()
+            };
+            let certificate = tn_types::EpochCertificate {
+                epoch_hash: record.digest(),
+                signature: tn_types::BlsSignature::default(),
+                signed_authorities: Default::default(),
+            };
+            manager.consensus_chain.epochs().save(record, certificate).await?;
+            let identified = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+            assert!(
+                identified.is_cvv_inactive(),
+                "a certified record for the local epoch must demote the validator: {identified:?}",
+            );
+        }
         Ok(())
     }
 
@@ -2312,6 +2480,26 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(probe(handle.established_peer_count()).await, SwarmReadiness::TimedOut);
         assert_eq!(acknowledgement.await, SwarmReadiness::TimedOut);
+        Ok(())
+    }
+
+    /// A tracked-key send to a swarm whose command channel stays full gives up after the send
+    /// timeout and queues nothing late.
+    #[tokio::test(start_paused = true)]
+    async fn tracked_key_send_to_a_full_swarm_times_out() -> eyre::Result<()> {
+        use super::{send_tracked_keys, NetworkHandle, TRACKED_KEYS_SEND_TIMEOUT};
+        use std::collections::HashSet;
+        use tn_network_libp2p::{types::NetworkCommand, PeerExchangeMap};
+
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        let handle = NetworkHandle::<PeerExchangeMap, PeerExchangeMap>::new(sender);
+        send_tracked_keys(&handle, 1, HashSet::new(), HashSet::new()).await?;
+        let started = tokio::time::Instant::now();
+        let timed_out = send_tracked_keys(&handle, 2, HashSet::new(), HashSet::new()).await;
+        assert!(timed_out.is_err(), "a full channel fails the send");
+        assert_eq!(started.elapsed(), TRACKED_KEYS_SEND_TIMEOUT);
+        assert!(matches!(commands.try_recv()?, NetworkCommand::UpdateTrackedKeys { epoch: 1, .. }));
+        assert!(commands.try_recv().is_err(), "the timed-out send queued nothing");
         Ok(())
     }
 

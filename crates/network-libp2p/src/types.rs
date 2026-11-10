@@ -2,7 +2,7 @@
 
 use crate::{
     codec::TNMessage, error::NetworkError, peers::Penalty, serve_permits::ServePermits,
-    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap,
+    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap, SwarmAdmissionSnapshot,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -526,6 +526,11 @@ where
         /// Admission observations from this handle's swarm.
         reply: oneshot::Sender<AdmissionStatus>,
     },
+    /// Export the swarm's admission status with every key it tracks, built from local state.
+    AdmissionSnapshot {
+        /// The snapshot of this handle's swarm.
+        reply: oneshot::Sender<SwarmAdmissionSnapshot>,
+    },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
     PrepareCommitteeDial {
@@ -536,6 +541,17 @@ where
     FindAuthorities {
         /// The collection of bls public keys associated with authorities to find.
         bls_keys: Vec<BlsPublicKey>,
+    },
+    /// Replace the validator keys this swarm resolves for export but never admits.
+    ///
+    /// The peer manager ignores an update for an epoch older than the one it holds.
+    UpdateTrackedKeys {
+        /// Epoch at which both sets were read.
+        epoch: u64,
+        /// Committee scheduled beyond the previous/current/next window.
+        scheduled: HashSet<BlsPublicKey>,
+        /// Registry validators eligible for committee selection.
+        eligible: HashSet<BlsPublicKey>,
     },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
@@ -973,6 +989,19 @@ where
         res.await.map_err(Into::into)
     }
 
+    /// Export this swarm's admission status together with every key it tracks: the committee
+    /// window, the scheduled and eligible keys, and the trusted and bootstrap peers, each with
+    /// its slots, addresses, address source, and admission decision.
+    ///
+    /// The swarm answers from local state without network queries, but the command shares the
+    /// channel that carries publishes, so a caller that polls it should cache the answer and
+    /// bound its wait.
+    pub async fn admission_snapshot(&self) -> NetworkResult<SwarmAdmissionSnapshot> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionSnapshot { reply }).await?;
+        res.await.map_err(Into::into)
+    }
+
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
     ///
     /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
@@ -988,6 +1017,27 @@ where
     /// Return network information for authorities by bls pubkey on kad.
     pub async fn find_authorities(&self, bls_keys: Vec<BlsPublicKey>) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::FindAuthorities { bls_keys }).await?;
+        Ok(())
+    }
+
+    /// Replace the scheduled and eligible validator keys this swarm tracks for export.
+    ///
+    /// `scheduled` is the committee beyond the previous/current/next window and `eligible` the
+    /// registry's pool of validators eligible for committee selection, both read at `epoch`. The
+    /// swarm resolves their signed node records through kad but never admits, scores, or pins
+    /// them; membership comes only from the committee updates. An update for an epoch older than
+    /// the one the swarm holds is ignored, and keys an applied update no longer lists are dropped
+    /// with their records and lookups.
+    ///
+    /// Like [`Self::find_authorities`], this returns once the command is queued, not once it has
+    /// been applied.
+    pub async fn update_tracked_keys(
+        &self,
+        epoch: u64,
+        scheduled: HashSet<BlsPublicKey>,
+        eligible: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateTrackedKeys { epoch, scheduled, eligible }).await?;
         Ok(())
     }
 
