@@ -309,3 +309,142 @@ async fn seal_records_batch_metrics_only_after_report() {
     batch_provider.seal(sealed_batch).await.expect("re-seal reports to the primary");
     assert_eq!(drain(), (1, vec![expected_size], vec![2.0]), "the reported seal is recorded once");
 }
+
+/// One captured tracing event: its target and its fields, the message under `message`.
+#[derive(Debug, Default)]
+struct Captured {
+    /// The event's target.
+    target: String,
+    /// Field names and values, strings without quotes.
+    fields: Vec<(String, String)>,
+}
+
+impl Captured {
+    /// The value of field `name`, if the event carries it.
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+}
+
+impl tracing::field::Visit for Captured {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields.push((field.name().to_string(), value.to_string()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields.push((field.name().to_string(), format!("{value:?}")));
+    }
+}
+
+/// A subscriber that keeps every event and ignores spans.
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<Captured>>>);
+
+impl Capture {
+    /// Take every event captured since the last call.
+    fn take(&self) -> Vec<Captured> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+/// The `consensus::metrics` events in `events` whose message is `message`, in order.
+fn lines<'a>(events: &'a [Captured], message: &str) -> Vec<&'a Captured> {
+    events
+        .iter()
+        .filter(|event| {
+            event.target == "consensus::metrics" && event.field("message") == Some(message)
+        })
+        .collect()
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut captured =
+            Captured { target: event.metadata().target().to_string(), ..Default::default() };
+        event.record(&mut captured);
+        self.0.lock().unwrap().push(captured);
+    }
+}
+
+/// `batch sealed` carries the digest and quorum time on every quorum, `batch reported` follows
+/// only a successful report with the digest and report time, and the report histogram times
+/// both outcomes.
+///
+/// The seal runs on the test's thread (the quorum waiter resolves at once), so a thread-local
+/// subscriber sees every line.
+#[tokio::test]
+async fn seal_lines_carry_digest_quorum_and_report_timing() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    let client = LocalNetwork::new_with_empty_id();
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let batch_provider = metrics::with_local_recorder(&recorder, || {
+        Worker::new(
+            0,
+            Some(RecordingQuorumWaiter::default()),
+            client.clone(),
+            store.clone(),
+            Duration::from_secs(5),
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Arc::new(NoopTxnForwarder),
+            Vec::new(),
+        )
+    });
+    let tx = transaction(test_chain_spec_arc());
+    let sealed_batch = Batch { transactions: vec![tx], ..Default::default() }.seal_slow();
+    let digest = sealed_batch.digest().to_string();
+    let number = |line: &Captured, field: &str| {
+        let value = line.field(field).unwrap_or_else(|| panic!("{field} missing: {line:?}"));
+        value.parse::<u64>().unwrap_or_else(|_| panic!("{field}={value} is not a number"))
+    };
+    let assert_sealed = |sealed: &[&Captured]| {
+        assert_eq!(sealed.len(), 1, "one batch sealed line per quorum");
+        assert_eq!(sealed[0].field("digest"), Some(digest.as_str()));
+        assert_eq!(sealed[0].field("worker_id"), Some("0"));
+        number(sealed[0], "quorum_ms");
+    };
+
+    // the report fails without a primary handler: sealed, but never reported
+    let res = batch_provider.seal(sealed_batch.clone()).await;
+    assert!(matches!(res, Err(BlockSealError::FailedToReport)), "first seal: {res:?}");
+    let events = capture.take();
+    assert_sealed(&lines(&events, "batch sealed"));
+    assert!(lines(&events, "batch reported").is_empty(), "a failed report logs no reported line");
+
+    client
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
+    batch_provider.seal(sealed_batch.clone()).await.expect("re-seal reports to the primary");
+    let events = capture.take();
+    assert_sealed(&lines(&events, "batch sealed"));
+    let reported = lines(&events, "batch reported");
+    assert_eq!(reported.len(), 1, "one batch reported line per successful report");
+    assert_eq!(reported[0].field("digest"), Some(digest.as_str()));
+    let (report_ms, report_us) =
+        (number(reported[0], "report_ms"), number(reported[0], "report_us"));
+    assert_eq!(report_ms, report_us / 1_000, "report_ms and report_us time the same report");
+
+    let report_samples =
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == "tn_worker.batch_report_seconds").then_some(value)
+        });
+    assert!(
+        matches!(report_samples, Some(DebugValue::Histogram(ref samples)) if samples.len() == 2),
+        "the failed and the successful report are both timed: {report_samples:?}"
+    );
+}

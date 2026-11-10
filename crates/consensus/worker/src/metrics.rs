@@ -81,6 +81,8 @@ struct WorkerMetricHandles {
     batch_validation_failures_total: Counter,
     /// Time to fetch all missing batches for a consensus output.
     batch_fetch_duration_seconds: Histogram,
+    /// Time to report a sealed batch's digest to the primary (success or failure).
+    batch_report_seconds: Histogram,
 }
 
 /// Metrics for the worker batch pipeline.
@@ -157,6 +159,11 @@ impl WorkerMetrics {
             "reason" => reason,
         )
         .increment(1);
+    }
+
+    /// Record the time one report of a sealed batch to the primary took (success or failure).
+    pub(crate) fn record_batch_report(&self, elapsed: Duration) {
+        self.handles.batch_report_seconds.record(elapsed);
     }
 
     /// Record a retry while reporting a batch to a single peer.
@@ -330,6 +337,7 @@ mod tests {
             metrics.record_sync_stream_shed(SyncShedReason::Denied);
             metrics.record_sync_stream_shed(SyncShedReason::Denied);
             metrics.record_sync_stream_shed(SyncShedReason::BudgetExhausted);
+            metrics.record_batch_report(Duration::from_millis(30));
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -401,6 +409,11 @@ mod tests {
                 .is_some_and(|(.., value)| matches!(value, DebugValue::Counter(1))),
             "budget-exhausted shed series should count the dropped stream"
         );
+
+        // one report-time sample under this worker's label
+        let (key, _, _, value) = find("tn_worker.batch_report_seconds");
+        assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+        assert!(key.key().labels().any(|l| l.key() == "worker" && l.value() == "0"));
     }
 
     /// The `tier` label of each admission tier.

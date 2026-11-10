@@ -1900,10 +1900,18 @@ impl ConsensusChain {
     }
 
     /// [`Self::persist_current`], also returning how long the pack's sync and the slot files'
-    /// syncs each took: `(pack, slots)`. They run together, so the whole takes about the longer.
-    pub(crate) async fn persist_current_timed(
-        &self,
-    ) -> Result<(Duration, Duration), ConsensusChainError> {
+    /// syncs each took: `(pack, slots)`.
+    ///
+    /// It makes exactly what [`Self::persist_current`] makes durable, in the same way: that
+    /// function is this one with the times dropped. The two syncs run together, so the whole
+    /// takes about the longer of the two. State sync's `save_consensus` calls this after each
+    /// output it saves, so the subscriber can report both times per output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the pack's sync error, as [`Self::persist_current`] does. The slot files' sync
+    /// reports no error (a failed hint write is logged by its thread).
+    pub async fn persist_current_timed(&self) -> Result<(Duration, Duration), ConsensusChainError> {
         async fn timed<T>(work: impl std::future::Future<Output = T>) -> (T, Duration) {
             let start = std::time::Instant::now();
             let out = work.await;
@@ -7485,5 +7493,82 @@ mod test {
                 .unwrap();
             assert_eq!(digest, header_db.digest(), "consensus headers mismatch (by digest) {i}");
         }
+    }
+
+    /// The public timed persist makes the same state durable as `persist_current` and reports two
+    /// non-zero times: the same outputs saved into two chains, one persisted each way, leave the
+    /// same slot files and the same pack, before and after a reopen.
+    #[tokio::test]
+    async fn test_persist_current_timed_matches_persist_current() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
+        for i in 0..k {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            outputs.push(output);
+        }
+
+        let mut persisted = Vec::new();
+        for timed in [false, true] {
+            let temp_dir = TempDir::with_prefix("test_persist_timed").expect("temp dir");
+            let consensus_chain =
+                ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+            for output in &outputs {
+                consensus_chain.save_consensus_output(output.clone()).await.unwrap();
+            }
+            if timed {
+                let (pack, slots) =
+                    consensus_chain.persist_current_timed().await.expect("timed persist");
+                // each is a round trip to another thread (the pack's actor, the slot files'
+                // thread) around a sync, never instantaneous
+                assert!(pack > Duration::ZERO, "the pack sync is timed");
+                assert!(slots > Duration::ZERO, "the slot files' sync is timed");
+            } else {
+                consensus_chain.persist_current().await.expect("persist");
+            }
+            let slots_on_disk = ["consensus_slot1", "consensus_slot2"].map(|name| {
+                let mut slot = std::fs::File::open(temp_dir.path().join(name)).expect("open slot");
+                LatestConsensus::read_slot(&mut slot).expect("read slot")
+            });
+            let latest = consensus_chain.consensus_header_latest().await.unwrap().expect("latest");
+            consensus_chain.close().await;
+
+            let reopened =
+                ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).expect("reopen");
+            reopened.clamp_latest_to_pack().await.unwrap();
+            let mut digests = Vec::new();
+            for number in 1..=k {
+                let header = reopened
+                    .consensus_header_by_number(number)
+                    .await
+                    .unwrap()
+                    .expect("saved header");
+                digests.push(header.digest());
+            }
+            persisted.push((
+                slots_on_disk,
+                latest.digest(),
+                reopened.latest_consensus_epoch(),
+                reopened.latest_consensus_number(),
+                digests,
+            ));
+            reopened.close().await;
+        }
+
+        assert_eq!(persisted[0], persisted[1], "the timed persist leaves the untimed state");
+        assert_eq!(persisted[1].3, k, "every saved output is durable");
+        assert_eq!(persisted[1].1, outputs[outputs.len() - 1].consensus_header_hash());
     }
 }
