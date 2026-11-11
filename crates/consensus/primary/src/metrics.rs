@@ -150,6 +150,13 @@ pub struct PrimaryMetrics {
     /// already demoted reads zero, and a demotion stops it one round past the window. The next
     /// epoch's handler starts it at zero again, so read it as a maximum over time.
     pub(crate) epoch_entry_rounds_behind: Gauge,
+    // bench6 parent-grace
+    /// How long the proposer held a ready header for the certificates of the authors its previous
+    /// header built on (the `parent_grace` switch), from arming the grace to its end: all of them
+    /// arrived, the deadline fired, or the max-delay path or a round advance ended it. Only an
+    /// armed grace records a sample; the `outcome` of each is counted in
+    /// `tn_primary_parent_grace_total`.
+    pub(crate) parent_grace_wait_seconds: Histogram,
 }
 
 impl PrimaryMetrics {

@@ -21,7 +21,7 @@ use crate::{
     metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
     ConsensusBus, RecentBlocks,
 };
-use reth_metrics::metrics::Counter;
+use reth_metrics::metrics::{Counter, Histogram};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -168,6 +168,9 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// Which rule names the execution block of each new header (the `quorum_exec_block`
     /// switches), and the adaptive policy's window state. Epoch-scoped with the proposer.
     exec_block_policy: ExecBlockPolicy,
+    /// The `parent_grace` switch's state: who the last own header built on, and the grace armed
+    /// for the round being collected, if any. Epoch-scoped with the proposer.
+    parent_grace: ParentGrace,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -203,6 +206,8 @@ struct ProposalTrigger {
     pending_before: usize,
     /// `tn_primary_headers_proposed_total{reason}` for [`Self::reason`].
     proposed: Counter,
+    /// How long the parent grace held this header, zero when no grace was armed for it.
+    grace: Duration,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -277,6 +282,11 @@ impl<DB: Database> Proposer<DB> {
         // a header above round 1 built on round-0 parents is rejected by every voter
         // (`InvalidParentRound`), so genesis seeds the parents of round 1 and nothing else
         let last_parents = if round == 0 { genesis } else { Vec::new() };
+        let parent_grace = ParentGrace::new(
+            config.parameters().parent_grace,
+            config.parameters().max_header_delay,
+            consensus_bus.app().metrics().parent_grace_wait_seconds.clone(),
+        );
 
         Self {
             authority_id,
@@ -308,6 +318,7 @@ impl<DB: Database> Proposer<DB> {
                 config.parameters().quorum_exec_block,
                 config.parameters().quorum_exec_block_starved_rounds,
             ),
+            parent_grace,
         }
     }
 
@@ -420,6 +431,7 @@ impl<DB: Database> Proposer<DB> {
             oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
             requeued = digests.iter().filter(|d| d.requeued).count(),
             pending_before = trigger.pending_before,
+            grace_ms = duration_ms(trigger.grace),
             exec_block = exec.block.number,
             exec_tip = exec.tip.number,
             exec_basis = exec.basis.as_str(),
@@ -794,6 +806,7 @@ impl<DB: Database> Proposer<DB> {
                     "ignoring older parents",
                 );
                 // Ignore parents from older rounds.
+                self.parent_grace.count_late_parents(round, self.round, parents.len());
             }
             Ordering::Equal => {
                 trace!(
@@ -1099,6 +1112,7 @@ impl<DB: Database> Proposer<DB> {
                     reason,
                     pending_before: self.pending_digests_len(),
                     proposed: self.headers_proposed.counter(reason),
+                    grace: self.parent_grace.in_flight_wait(),
                 };
                 let digests = self.drain_digests_for_header();
                 let parents = std::mem::take(&mut self.last_parents);
@@ -1166,6 +1180,8 @@ impl<DB: Database> Proposer<DB> {
         // reschedule intervals
         self.min_delay_interval.reset_after(self.calc_min_delay());
         self.max_delay_interval.reset_after(self.calc_max_delay());
+        // the parents this header actually carries are who the next round's grace waits for
+        self.parent_grace.on_proposed(&header);
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
@@ -1233,6 +1249,17 @@ impl<DB: Database> Proposer<DB> {
         }
     }
 
+    /// Wait for the armed parent grace's deadline, or never resolve when none is armed.
+    ///
+    /// No timer exists while no grace is armed, so with `parent_grace` at zero this future is
+    /// always pending.
+    async fn grace_deadline(deadline: Option<tokio::time::Instant>) {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+
     /// Run the proposer task.
     /// Returns Ok on shutdown or an error to indicate a fatal condition.
     async fn run(
@@ -1293,6 +1320,9 @@ impl<DB: Database> Proposer<DB> {
                 _ = self.min_delay_interval.tick() => {
                     min_delay_timed_out = true;
                 }
+                _ = Self::grace_deadline(self.parent_grace.deadline()) => {
+                    self.parent_grace.expire();
+                }
             }
             // gauge the backlog of digests waiting for inclusion in a header
             self.consensus_bus
@@ -1346,8 +1376,22 @@ impl<DB: Database> Proposer<DB> {
                 "polled...",
             );
 
+            // a jump to a newer round's parents ends a grace armed for the older round
+            self.parent_grace.end_if_round_moved(&self.last_parents);
+
             // if all conditions are met, create the next header
             if should_create_header {
+                // the parent grace can only hold a header that is ready now: it never proposes
+                // one that is not, and the max-delay path neither waits nor lets it run on
+                let grace = if max_delay_timed_out {
+                    self.parent_grace.end(GraceOutcome::Preempted)
+                } else {
+                    match self.parent_grace.hold(&self.last_parents) {
+                        GraceHold::Wait => continue,
+                        GraceHold::Propose(waited) => waited,
+                    }
+                };
+
                 if max_delay_timed_out {
                     // expect this interval to expire occassionally
                     //
@@ -1367,6 +1411,7 @@ impl<DB: Database> Proposer<DB> {
                 debug!(target: "primary::proposer", authority=?self.authority_id, reason = reason.as_str(), "proposing next header!");
 
                 // propose header
+                self.parent_grace.on_propose(&self.last_parents, grace);
                 pending_header = Some(self.propose_next_header(reason)?);
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
@@ -1777,6 +1822,347 @@ pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -
     match ring.newest_at_or_below(quorum_value) {
         Some(block) => ExecBlockChoice { block, tip, basis: ExecBasis::Quorum },
         None => ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor },
+    }
+}
+
+/// What ended an armed parent grace: the `outcome` label of `tn_primary_parent_grace_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraceOutcome {
+    /// Every author the grace waited for delivered its certificate.
+    Complete,
+    /// The deadline fired with at least one of them still missing.
+    Expired,
+    /// The max-delay path proposed, or the round moved on, before either.
+    Preempted,
+}
+
+impl GraceOutcome {
+    /// Every outcome, the order of [`ParentGraceHandles::outcomes`].
+    pub(crate) const ALL: [Self; 3] = [Self::Complete, Self::Expired, Self::Preempted];
+
+    /// The static metric label for this outcome.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Expired => "expired",
+            Self::Preempted => "preempted",
+        }
+    }
+
+    /// This outcome's position in [`Self::ALL`].
+    fn index(self) -> usize {
+        match self {
+            Self::Complete => 0,
+            Self::Expired => 1,
+            Self::Preempted => 2,
+        }
+    }
+}
+
+/// What the run loop does with a header that is ready to propose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraceHold {
+    /// Keep collecting parents: a grace is armed and still running.
+    Wait,
+    /// Propose now. The value is how long a grace held the header, zero when none was armed.
+    Propose(Duration),
+}
+
+/// How far behind the proposer's round a dropped parent certificate is: the `origin` label of
+/// `tn_primary_late_parents_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LateParentOrigin {
+    /// One round behind the proposer's round. In a running round this is a certificate of the
+    /// round the proposer's newest header built on that arrived after the header went out, so
+    /// that header does not carry it. Right after a round jump or a restart it can also be a
+    /// certificate of a round no own header built on.
+    OwnRoundBehind,
+    /// Two or more rounds behind: a replay or a far later delivery.
+    OlderRound,
+}
+
+impl LateParentOrigin {
+    /// The origin of a certificate of `parents_round` that reaches a proposer at `own_round`.
+    pub(crate) fn of(parents_round: Round, own_round: Round) -> Self {
+        if parents_round.saturating_add(1) == own_round {
+            Self::OwnRoundBehind
+        } else {
+            Self::OlderRound
+        }
+    }
+
+    /// The static metric label for this origin.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnRoundBehind => "own_round_behind",
+            Self::OlderRound => "older_round",
+        }
+    }
+}
+
+/// The parent grace's metric handles, resolved once per epoch with the proposer.
+struct ParentGraceHandles {
+    /// `tn_primary_parent_grace_wait_seconds`: how long each armed grace held its header.
+    wait: Histogram,
+    /// `tn_primary_parent_grace_total{outcome}`, in [`GraceOutcome::ALL`] order.
+    outcomes: [Counter; GraceOutcome::ALL.len()],
+    /// `tn_primary_late_parents_total{origin="own_round_behind"}`.
+    late_own_round_behind: Counter,
+    /// `tn_primary_late_parents_total{origin="older_round"}`.
+    late_older_round: Counter,
+}
+
+impl ParentGraceHandles {
+    /// Resolve the counters; `wait` is the histogram on the bus's [`crate::PrimaryMetrics`].
+    fn new(wait: Histogram) -> Self {
+        let late = |origin: LateParentOrigin| -> Counter {
+            metrics::counter!("tn_primary.late_parents_total", "origin" => origin.as_str())
+        };
+        Self {
+            wait,
+            outcomes: GraceOutcome::ALL.map(|outcome| {
+                metrics::counter!("tn_primary.parent_grace_total", "outcome" => outcome.as_str())
+            }),
+            late_own_round_behind: late(LateParentOrigin::OwnRoundBehind),
+            late_older_round: late(LateParentOrigin::OlderRound),
+        }
+    }
+}
+
+/// The authors whose certificates the last own header carried as parents, and its round.
+#[derive(Debug)]
+struct GraceBasis {
+    /// The round of the last own header.
+    round: Round,
+    /// The authors of its parents, all of round `round - 1`.
+    authors: BTreeSet<AuthorityIdentifier>,
+}
+
+/// The proposal in flight: the parents it was given and how long a grace held it.
+#[derive(Debug)]
+struct GraceInFlight {
+    /// The digest and author of every non-genesis parent handed to the proposal. A restart's
+    /// re-proposal sends the stored header instead, so only the digests that header carries count.
+    parents: Vec<(HeaderDigest, AuthorityIdentifier)>,
+    /// How long a grace held the proposal, reported as `grace_ms` on `header proposed`.
+    waited: Duration,
+}
+
+/// A grace armed for one round of parents.
+#[derive(Debug)]
+struct ArmedGrace {
+    /// The round of the parents being collected.
+    round: Round,
+    /// The authors of the last own header's parents that had no certificate among them.
+    waiting_for: BTreeSet<AuthorityIdentifier>,
+    /// When the grace was armed.
+    started: tokio::time::Instant,
+    /// When the grace gives up on `waiting_for`.
+    deadline: tokio::time::Instant,
+    /// Whether the deadline has fired.
+    expired: bool,
+}
+
+/// The proposer's parent grace (the `parent_grace` switch, issue #1803).
+///
+/// When the proposer has a header ready (the existing propose condition is true and the max-delay
+/// path did not fire), it looks for the authors of the certificates its last own header used as
+/// parents that have no certificate among the parents collected now. If there are any, it arms one
+/// deadline at now + `parent_grace` and keeps collecting, and proposes once they have all arrived
+/// or the deadline fires, whichever comes first. The grace only ever delays a header that is ready:
+///
+/// - the max-delay path is unconditional and ends a running grace (`preempted`);
+/// - a jump to a newer round's parents ends it too (`preempted`), and the new round has no basis;
+/// - at most one grace is armed per round of parents;
+/// - an author the last own header did not build on is never waited for;
+/// - the grace is capped at `max_header_delay`, though the max-delay tick, reset at every proposal,
+///   always fires first;
+/// - with `parent_grace` at zero nothing is armed and no timer is created.
+///
+/// There is no grace without a last own header of the previous round to compare with: at the first
+/// round of an epoch (round 1 builds on the genesis certificates, which say nothing about who is
+/// live, so round 2 has no grace either), after a round this node skipped by jumping to newer
+/// parents, after a restart until a header is built in this process, and after a header whose
+/// parents could not be matched.
+pub(crate) struct ParentGrace {
+    /// The configured grace, capped at `max_header_delay`; zero is off.
+    grace: Duration,
+    /// Who the last own header built on.
+    basis: Option<GraceBasis>,
+    /// The proposal in flight, between [`Self::on_propose`] and [`Self::on_proposed`].
+    in_flight: Option<GraceInFlight>,
+    /// The grace armed for the round being collected.
+    armed: Option<ArmedGrace>,
+    /// The parents round of the last grace armed: one per round.
+    last_armed_round: Option<Round>,
+    /// The metric handles.
+    handles: ParentGraceHandles,
+}
+
+impl ParentGrace {
+    /// The grace of a new epoch's proposer: no basis, nothing armed.
+    pub(crate) fn new(grace: Duration, max_header_delay: Duration, wait: Histogram) -> Self {
+        Self {
+            grace: grace.min(max_header_delay),
+            basis: None,
+            in_flight: None,
+            armed: None,
+            last_armed_round: None,
+            handles: ParentGraceHandles::new(wait),
+        }
+    }
+
+    /// The deadline of the armed grace, while it has not fired.
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.armed.as_ref().filter(|armed| !armed.expired).map(|armed| armed.deadline)
+    }
+
+    /// Mark the armed grace's deadline as fired; the next [`Self::hold`] proposes.
+    pub(crate) fn expire(&mut self) {
+        if let Some(armed) = self.armed.as_mut() {
+            armed.expired = true;
+        }
+    }
+
+    /// End an armed grace whose round is no longer the round of `parents`.
+    ///
+    /// Only the future-round jump of `Proposer::process_parents` replaces the parents while a grace
+    /// runs: a proposal ends the grace before it takes them.
+    pub(crate) fn end_if_round_moved(&mut self, parents: &[Certificate]) {
+        let round = parents.first().map(Certificate::round);
+        if self.armed.as_ref().is_some_and(|armed| Some(armed.round) != round) {
+            self.end(GraceOutcome::Preempted);
+        }
+    }
+
+    /// Decide whether a header that is ready over `parents` is proposed now.
+    ///
+    /// The caller has already found the header ready and the max-delay path not fired.
+    pub(crate) fn hold(&mut self, parents: &[Certificate]) -> GraceHold {
+        if self.grace.is_zero() {
+            return GraceHold::Propose(Duration::ZERO);
+        }
+        if let Some(armed) = &self.armed {
+            let present: BTreeSet<&AuthorityIdentifier> =
+                parents.iter().map(Certificate::origin).collect();
+            if armed.waiting_for.iter().all(|author| present.contains(author)) {
+                return GraceHold::Propose(self.end(GraceOutcome::Complete));
+            }
+            if armed.expired {
+                return GraceHold::Propose(self.end(GraceOutcome::Expired));
+            }
+            return GraceHold::Wait;
+        }
+        let Some(round) = parents.first().map(Certificate::round) else {
+            return GraceHold::Propose(Duration::ZERO);
+        };
+        if self.last_armed_round == Some(round) {
+            return GraceHold::Propose(Duration::ZERO);
+        }
+        let waiting_for = self.missing(round, parents);
+        if waiting_for.is_empty() {
+            return GraceHold::Propose(Duration::ZERO);
+        }
+        let started = tokio::time::Instant::now();
+        debug!(
+            target: "primary::proposer",
+            parent_round = round,
+            parents = parents.len(),
+            missing = waiting_for.len(),
+            grace_ms = duration_ms(self.grace),
+            "parent grace armed",
+        );
+        self.armed = Some(ArmedGrace {
+            round,
+            waiting_for,
+            started,
+            deadline: started + self.grace,
+            expired: false,
+        });
+        self.last_armed_round = Some(round);
+        GraceHold::Wait
+    }
+
+    /// End the armed grace with `outcome` and return how long it ran; zero when none was armed.
+    pub(crate) fn end(&mut self, outcome: GraceOutcome) -> Duration {
+        let Some(armed) = self.armed.take() else {
+            return Duration::ZERO;
+        };
+        let waited = armed.started.elapsed();
+        self.handles.wait.record(waited.as_secs_f64());
+        self.handles.outcomes[outcome.index()].increment(1);
+        debug!(
+            target: "primary::proposer",
+            parent_round = armed.round,
+            outcome = outcome.as_str(),
+            waited_ms = duration_ms(waited),
+            "parent grace ended",
+        );
+        waited
+    }
+
+    /// Note the parents handed to the next proposal and how long a grace held it.
+    ///
+    /// Genesis parents are left out: every authority has one, so they say nothing about who is
+    /// live. Nothing is kept while the grace is off.
+    pub(crate) fn on_propose(&mut self, parents: &[Certificate], waited: Duration) {
+        if self.grace.is_zero() {
+            return;
+        }
+        let parents = parents
+            .iter()
+            .filter(|parent| parent.round() > 0)
+            .map(|parent| (parent.digest(), parent.origin().clone()))
+            .collect();
+        self.in_flight = Some(GraceInFlight { parents, waited });
+    }
+
+    /// How long a grace held the proposal in flight, zero when none did.
+    pub(crate) fn in_flight_wait(&self) -> Duration {
+        self.in_flight.as_ref().map_or(Duration::ZERO, |in_flight| in_flight.waited)
+    }
+
+    /// Take the authors of the parents `header` carries as the next round's basis.
+    ///
+    /// A header from the max-delay re-send has no proposal in flight and keeps the basis: it is the
+    /// stored header again.
+    pub(crate) fn on_proposed(&mut self, header: &Header) {
+        let Some(in_flight) = self.in_flight.take() else {
+            return;
+        };
+        let authors: BTreeSet<_> = in_flight
+            .parents
+            .into_iter()
+            .filter(|(digest, _)| header.parents().contains(digest))
+            .map(|(_, author)| author)
+            .collect();
+        self.basis = if authors.is_empty() {
+            None
+        } else {
+            Some(GraceBasis { round: header.round(), authors })
+        };
+    }
+
+    /// Count `count` parent certificates of `parents_round` dropped by a proposer at `own_round`.
+    pub(crate) fn count_late_parents(&self, parents_round: Round, own_round: Round, count: usize) {
+        let counter = match LateParentOrigin::of(parents_round, own_round) {
+            LateParentOrigin::OwnRoundBehind => &self.handles.late_own_round_behind,
+            LateParentOrigin::OlderRound => &self.handles.late_older_round,
+        };
+        counter.increment(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+
+    /// The authors of the last own header's parents with no certificate among `parents`.
+    ///
+    /// Empty unless the last own header is of `round`, the round of `parents`, so it built on the
+    /// round before them.
+    fn missing(&self, round: Round, parents: &[Certificate]) -> BTreeSet<AuthorityIdentifier> {
+        let Some(basis) = self.basis.as_ref().filter(|basis| basis.round == round) else {
+            return BTreeSet::new();
+        };
+        let present: BTreeSet<&AuthorityIdentifier> =
+            parents.iter().map(Certificate::origin).collect();
+        basis.authors.iter().filter(|author| !present.contains(author)).cloned().collect()
     }
 }
 

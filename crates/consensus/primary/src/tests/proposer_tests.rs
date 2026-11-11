@@ -1345,6 +1345,7 @@ fn untracked_trigger() -> ProposalTrigger {
         reason: ProposeReason::MinDelay,
         pending_before: 0,
         proposed: Counter::noop(),
+        grace: Duration::ZERO,
     }
 }
 
@@ -2442,4 +2443,621 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     assert_eq!(round_41.round(), 41);
     assert_eq!(line.field("exec_policy"), Some("tip"));
     assert_eq!(proposer.exec_block_policy.next_window, 4);
+}
+
+// ---- bench6 parent-grace ----
+
+/// The bench fleet's `min_header_delay`, which the parent-grace tests run on.
+const GRACE_MIN_DELAY: Duration = Duration::from_millis(350);
+/// The bench fleet's `max_header_delay`.
+const GRACE_MAX_DELAY: Duration = Duration::from_millis(1_000);
+/// The bench-6 arm's `parent_grace`.
+const GRACE: Duration = Duration::from_millis(150);
+
+/// Round-`round` certificates by `authors`, in that order.
+///
+/// Created at time zero, so a proposal never waits for a parent's timestamp and tokio's paused
+/// clock moves only on the proposer's timers.
+fn grace_certs(
+    fixture: &CommitteeFixture<MemDatabase>,
+    round: Round,
+    authors: &[AuthorityIdentifier],
+) -> Vec<Certificate> {
+    let committee = fixture.committee();
+    authors
+        .iter()
+        .map(|author| {
+            let header = HeaderBuilder::default()
+                .author(author.clone())
+                .round(round)
+                .epoch(committee.epoch())
+                .parents(BTreeSet::new())
+                .build();
+            Certificate::new_unsigned_for_test(&committee, header, Vec::new())
+                .expect("unsigned parent certificate")
+        })
+        .collect()
+}
+
+/// How long a parent-grace test lets the proposer settle after a header before it sends parents.
+///
+/// The proposer resets its readiness when a header's result comes back, so parents that arrive
+/// while the header is still pending would wait for the max delay. On the paused clock this sleep
+/// ends only once the proposer is idle, so the result has been handled.
+const GRACE_SETTLE: Duration = Duration::from_millis(1);
+
+/// A spawned proposer of a four-member committee (quorum 3) with `parent_grace` set, past its
+/// round-2 header.
+struct GraceRun<R> {
+    /// The committee fixture the proposer runs in.
+    fixture: CommitteeFixture<MemDatabase>,
+    /// The proposer's bus.
+    cb: ConsensusBus,
+    /// The headers the proposer sends to the certifier.
+    rx_headers: R,
+    /// Keeps the proposer's tasks alive.
+    _task_manager: TaskManager,
+    /// Every authority, in fixture order.
+    all: Vec<AuthorityIdentifier>,
+    /// The authority that is neither the proposer nor a leader of round 2 or 4, so a quorum
+    /// without it still lets the proposer advance.
+    late: AuthorityIdentifier,
+    /// When the round-2 header went out: the round-3 min and max delays run from here. Tests send
+    /// round-2 parents [`GRACE_SETTLE`] later.
+    round_two_at: tokio::time::Instant,
+}
+
+impl<R: TnReceiver<Header>> GraceRun<R> {
+    /// Every authority but [`Self::late`].
+    fn all_but_late(&self) -> Vec<AuthorityIdentifier> {
+        self.all.iter().filter(|id| **id != self.late).cloned().collect()
+    }
+
+    /// Send round-`round` certificates by `authors` to the proposer as one parents message, and
+    /// return them.
+    async fn send(&self, round: Round, authors: &[AuthorityIdentifier]) -> Vec<Certificate> {
+        let certs = grace_certs(&self.fixture, round, authors);
+        self.cb.parents().send((certs.clone(), round)).await.expect("parents sent");
+        certs
+    }
+
+    /// The next header at `round` and how long after the round-2 header it went out.
+    async fn next(&mut self, round: Round) -> (Header, Duration) {
+        let header = next_header_at(&mut self.rx_headers, round).await;
+        (header, self.round_two_at.elapsed())
+    }
+}
+
+/// Spawn an epoch-start proposer with `grace` and run it to its round-2 header.
+///
+/// The proposer leads neither round 2 nor round 4, so its min and max delays are the configured
+/// ones at every round the tests measure. Round 1 builds on the genesis certificates and goes out
+/// at once; round 2 builds on the round-1 certificates of every authority, or of every authority
+/// but the late one when `round_one_without_late` is set, and goes out at once too (the intervals'
+/// first ticks are both immediate, so one is still set). The bus and the proposer resolve their
+/// metric handles under `recorder`.
+async fn start_grace_run(
+    grace: Duration,
+    recorder: &metrics_util::debugging::DebuggingRecorder,
+    round_one_without_late: bool,
+) -> GraceRun<impl TnReceiver<Header>> {
+    let params = tn_config::Parameters {
+        min_header_delay: GRACE_MIN_DELAY,
+        max_header_delay: GRACE_MAX_DELAY,
+        parent_grace: grace,
+        ..tn_config::Parameters::default()
+    };
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_consensus_parameters(params).build();
+    let committee = fixture.committee();
+    assert_eq!(committee.size(), 4, "the rounds below assume four authorities (quorum 3)");
+    let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let leaders = [schedule.leader(2).id(), schedule.leader(4).id()];
+    let mut others = all.iter().filter(|id| !leaders.contains(id)).cloned();
+    let own = others.next().expect("a non-leader proposer");
+    let late = others.next().expect("a second non-leader");
+    let config = fixture
+        .authorities()
+        .find(|authority| authority.id() == own)
+        .expect("the proposer's fixture")
+        .consensus_config();
+
+    let task_manager = TaskManager::default();
+    let cb = metrics::with_local_recorder(recorder, ConsensusBus::new);
+    let mut rx_headers = cb.subscribe_headers();
+    let proposer = metrics::with_local_recorder(recorder, || {
+        proposer_on(&config, &committee, &cb, &task_manager)
+    });
+    proposer.spawn(&task_manager);
+    next_header_at(&mut rx_headers, 1).await;
+    tokio::time::sleep(GRACE_SETTLE).await;
+
+    let round_one: Vec<_> = if round_one_without_late {
+        all.iter().filter(|id| **id != late).cloned().collect()
+    } else {
+        all.clone()
+    };
+    let certs = grace_certs(&fixture, 1, &round_one);
+    cb.parents().send((certs, 1)).await.expect("parents sent");
+    next_header_at(&mut rx_headers, 2).await;
+    let round_two_at = tokio::time::Instant::now();
+    tokio::time::sleep(GRACE_SETTLE).await;
+
+    GraceRun { fixture, cb, rx_headers, _task_manager: task_manager, all, late, round_two_at }
+}
+
+/// The parent-grace metrics, read from one snapshot.
+#[derive(Debug, PartialEq, Eq)]
+struct GraceMetrics {
+    /// `tn_primary_parent_grace_total` in [`GraceOutcome::ALL`] order.
+    outcomes: [u64; 3],
+    /// `tn_primary_late_parents_total` for `own_round_behind`, then `older_round`.
+    late: [u64; 2],
+    /// `tn_primary_parent_grace_wait_seconds` samples, in whole milliseconds.
+    waits_ms: Vec<u64>,
+}
+
+/// Snapshot the parent-grace metrics of `snapshotter`. Unregistered counters read zero.
+fn grace_metrics(snapshotter: &metrics_util::debugging::Snapshotter) -> GraceMetrics {
+    use metrics_util::debugging::DebugValue;
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let counter = |name: &str, label: &str, value: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == name
+                    && key.key().labels().any(|l| l.key() == label && l.value() == value)
+            })
+            .map_or(0, |(.., total)| match total {
+                DebugValue::Counter(total) => *total,
+                _ => 0,
+            })
+    };
+    let waits_ms = snapshot
+        .iter()
+        .find(|(key, ..)| key.key().name() == "tn_primary.parent_grace_wait_seconds")
+        .map(|(.., samples)| match samples {
+            DebugValue::Histogram(samples) => {
+                samples.iter().map(|sample| (sample.0 * 1_000.0).round() as u64).collect()
+            }
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+    GraceMetrics {
+        outcomes: GraceOutcome::ALL
+            .map(|outcome| counter("tn_primary.parent_grace_total", "outcome", outcome.as_str())),
+        late: [LateParentOrigin::OwnRoundBehind, LateParentOrigin::OlderRound]
+            .map(|origin| counter("tn_primary.late_parents_total", "origin", origin.as_str())),
+        waits_ms,
+    }
+}
+
+/// The last `header proposed` line of round `round` in `capture`.
+fn proposed_line(
+    capture: &crate::log_capture::LogCapture,
+    round: Round,
+) -> crate::log_capture::CapturedEvent {
+    capture
+        .events("header proposed")
+        .into_iter()
+        .rfind(|line| line.u64_field("round") == Some(u64::from(round)))
+        .unwrap_or_else(|| panic!("no header proposed line for round {round}"))
+}
+
+/// Every author of the last header's parents is among the new parents: the header goes out the
+/// moment it is ready, with no grace armed and `grace_ms=0`.
+///
+/// Catches: a grace armed when nobody is missing, which would slow every round by G.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_all_authors_present_proposes_at_once() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let all = run.all.clone();
+    run.send(2, &all).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MIN_DELAY, "proposed at the min delay, not later");
+    assert_eq!(header.parents().len(), 4);
+    let line = proposed_line(&capture, 3);
+    assert_eq!(line.u64_field("grace_ms"), Some(0));
+    assert_eq!(line.u64_field("num_parents"), Some(4));
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 0], late: [0, 0], waits_ms: vec![] }
+    );
+}
+
+/// One author of the last header's parents is missing when the header is ready; its certificate
+/// arrives 40 ms later. The header goes out then, with it among the parents, `grace_ms=40` and
+/// outcome `complete`.
+///
+/// Catches: a grace that does not wake on the late parent (it would run to the deadline), or a
+/// header built before the late parent was added.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_late_author_within_grace_rides_the_header() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    run.send(2, &run.all_but_late()).await;
+    let arrival = GRACE_MIN_DELAY + Duration::from_millis(40);
+    tokio::time::sleep_until(run.round_two_at + arrival).await;
+    let late = run.send(2, &[run.late.clone()]).await;
+
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, arrival, "proposed when the late parent arrived");
+    assert_eq!(header.parents().len(), 4);
+    assert!(header.parents().contains(&late[0].digest()), "the late parent rides the header");
+    let line = proposed_line(&capture, 3);
+    assert_eq!(line.u64_field("grace_ms"), Some(40));
+    assert_eq!(line.u64_field("num_parents"), Some(4));
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [1, 0, 0], late: [0, 0], waits_ms: vec![40] }
+    );
+}
+
+/// The missing author never delivers in time: the header goes out exactly G after it was ready,
+/// without that author, outcome `expired`. The certificate that turns up afterwards is a late
+/// parent one round behind the proposer.
+///
+/// Catches: a grace that runs past G, a header that never goes out, and a late certificate that
+/// is not counted.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_expires_without_the_late_author() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let quorum = run.send(2, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MIN_DELAY + GRACE, "proposed when the grace expired");
+    assert_eq!(
+        header.parents(),
+        &quorum.iter().map(|cert| cert.digest()).collect::<BTreeSet<_>>(),
+        "the header carries the quorum it had, without the late author"
+    );
+    let line = proposed_line(&capture, 3);
+    assert_eq!(line.u64_field("grace_ms"), Some(150));
+    assert_eq!(line.u64_field("num_parents"), Some(3));
+    assert_eq!(line.field("reason"), Some("min_delay"));
+
+    // the round-2 certificate that missed the header
+    run.send(2, &[run.late.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 1, 0], late: [1, 0], waits_ms: vec![150] }
+    );
+}
+
+/// The max-delay tick fires while a grace runs: the header goes out on the tick with the parents
+/// it has, `reason=max_delay`, outcome `preempted`. With G = 900 ms the grace would run to 1,250 ms
+/// after round 2; the tick is at 1,000 ms.
+///
+/// Catches: a grace that delays a header past `max_header_delay`.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_max_delay_preempts_the_grace() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let long_grace = Duration::from_millis(900);
+    let mut run = start_grace_run(long_grace, &recorder, false).await;
+
+    run.send(2, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MAX_DELAY, "proposed on the max-delay tick");
+    assert_eq!(header.parents().len(), 3);
+    let line = proposed_line(&capture, 3);
+    assert_eq!(line.field("reason"), Some("max_delay"));
+    assert_eq!(line.u64_field("grace_ms"), Some(650));
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 1], late: [0, 0], waits_ms: vec![650] }
+    );
+}
+
+/// `parent_grace` at zero is today's proposer: the header goes out at the min delay for the same
+/// reason and over exactly the quorum it had, without the missing author, `grace_ms=0`, no grace
+/// metric moves, and no deadline ever exists. The late certificate is still counted.
+///
+/// Catches: a zero grace that arms anything, creates a timer, or moves a proposal.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_zero_keeps_todays_timing() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(Duration::ZERO, &recorder, false).await;
+
+    let quorum = run.send(2, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MIN_DELAY, "proposed at the min delay");
+    assert_eq!(
+        header.parents(),
+        &quorum.iter().map(|cert| cert.digest()).collect::<BTreeSet<_>>(),
+        "over the quorum it had"
+    );
+    let line = proposed_line(&capture, 3);
+    assert_eq!(line.u64_field("grace_ms"), Some(0));
+    assert_eq!(line.field("reason"), Some("min_delay"));
+    run.send(2, &[run.late.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 0], late: [1, 0], waits_ms: vec![] }
+    );
+
+    // the state itself: nothing is kept, nothing is armed, no deadline
+    let mut grace = ParentGrace::new(Duration::ZERO, GRACE_MAX_DELAY, Histogram::noop());
+    let round_one = grace_certs(&run.fixture, 1, &run.all);
+    let header = HeaderBuilder::default()
+        .author(run.all[0].clone())
+        .round(2)
+        .epoch(run.fixture.committee().epoch())
+        .parents(round_one.iter().map(|cert| cert.digest()).collect())
+        .build();
+    grace.on_propose(&round_one, Duration::from_millis(5));
+    assert_eq!(grace.in_flight_wait(), Duration::ZERO, "nothing kept for the proposal");
+    grace.on_proposed(&header);
+    let quorum = grace_certs(&run.fixture, 2, &run.all_but_late());
+    assert_eq!(grace.hold(&quorum), GraceHold::Propose(Duration::ZERO));
+    assert_eq!(grace.deadline(), None, "no timer");
+}
+
+/// An author that was not among the last header's parents is never waited for: round 2 built on
+/// three round-1 certificates, so round 3 goes out at the min delay without the fourth author.
+///
+/// Catches: a grace that waits for every committee member instead of last round's authors, which
+/// would charge G every round for a crashed validator.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_ignores_authors_absent_from_last_header() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, true).await;
+
+    run.send(2, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MIN_DELAY, "the absent author is not waited for");
+    assert_eq!(header.parents().len(), 3);
+    assert_eq!(proposed_line(&capture, 3).u64_field("grace_ms"), Some(0));
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 0], late: [0, 0], waits_ms: vec![] }
+    );
+
+    // a restart's re-proposal sends the stored header, not the parents just collected: the basis
+    // is what that header carries (three of the four round-1 certificates here), so the fourth
+    // author is not waited for, and a header carrying none of them leaves no basis at all
+    let all = &run.all;
+    let round_one = grace_certs(&run.fixture, 1, all);
+    let stored = |carried: &[Certificate]| {
+        HeaderBuilder::default()
+            .author(all[0].clone())
+            .round(2)
+            .epoch(run.fixture.committee().epoch())
+            .parents(carried.iter().map(|cert| cert.digest()).collect())
+            .build()
+    };
+    let without_fourth = grace_certs(&run.fixture, 2, &all[..3]);
+    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
+    grace.on_propose(&round_one, Duration::ZERO);
+    grace.on_proposed(&stored(&round_one[..3]));
+    assert_eq!(grace.hold(&without_fourth), GraceHold::Propose(Duration::ZERO));
+    assert_eq!(grace.deadline(), None, "the fourth author was not carried");
+    let without_third = grace_certs(&run.fixture, 2, &[&all[..2], &all[3..]].concat());
+    assert_eq!(grace.hold(&without_third), GraceHold::Wait, "the third author was carried");
+
+    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
+    grace.on_propose(&round_one, Duration::ZERO);
+    grace.on_proposed(&stored(&[]));
+    assert_eq!(grace.hold(&without_fourth), GraceHold::Propose(Duration::ZERO));
+    assert_eq!(grace.deadline(), None, "no carried parent, no basis");
+}
+
+/// The grace never proposes a header that is not ready. The proposer's quorum is the aggregator's
+/// quorum message: while none for round 2 arrives, no round-3 header goes out through the min
+/// delay, G and two max-delay ticks (those re-send the round-2 header), and no grace is armed.
+/// The re-sends keep the basis: once a quorum without the late author arrives, the grace waits for
+/// it and expires.
+///
+/// Catches: a grace deadline that proposes on its own, and a re-send that drops the basis.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_never_proposes_below_quorum() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let quiet_until = run.round_two_at + GRACE_MAX_DELAY * 2 + Duration::from_millis(500);
+    let mut resends = 0;
+    while let Ok(header) = tokio::time::timeout_at(quiet_until, run.rx_headers.recv()).await {
+        let header = header.expect("header channel stayed open");
+        assert_eq!(header.round(), 2, "only the round-2 header is re-sent");
+        resends += 1;
+    }
+    assert_eq!(resends, 2, "one re-send per max-delay tick");
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 0], late: [0, 0], waits_ms: vec![] }
+    );
+
+    // the min delay re-armed at the last re-send has run out, so the quorum makes it ready now
+    run.send(2, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(3).await;
+    assert_eq!(elapsed, GRACE_MAX_DELAY * 2 + Duration::from_millis(500) + GRACE);
+    assert_eq!(header.parents().len(), 3);
+    assert_eq!(proposed_line(&capture, 3).u64_field("grace_ms"), Some(150));
+    assert_eq!(grace_metrics(&snapshotter).outcomes, [0, 1, 0]);
+}
+
+/// At most one grace per round of parents: once a round's grace has ended, a header that is ready
+/// over the same round proposes at once, whatever ended the grace, and only one deadline ever
+/// exists for the round.
+///
+/// Catches: a grace re-armed after it expired or was preempted, which would wait 2G or more.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_arms_once_per_round() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let round_one = grace_certs(&fixture, 1, &all);
+    let header = HeaderBuilder::default()
+        .author(all[0].clone())
+        .round(2)
+        .epoch(fixture.committee().epoch())
+        .parents(round_one.iter().map(|cert| cert.digest()).collect())
+        .build();
+    let quorum = grace_certs(&fixture, 2, &all[..3]);
+    let new_grace = || {
+        let mut grace = metrics::with_local_recorder(&recorder, || {
+            let wait = metrics::histogram!("tn_primary.parent_grace_wait_seconds");
+            ParentGrace::new(GRACE, GRACE_MAX_DELAY, wait)
+        });
+        grace.on_propose(&round_one, Duration::ZERO);
+        grace.on_proposed(&header);
+        grace
+    };
+
+    // expired: one deadline, then the same round proposes at once
+    let mut grace = new_grace();
+    assert_eq!(grace.hold(&quorum), GraceHold::Wait);
+    let deadline = grace.deadline().expect("armed");
+    assert_eq!(deadline, tokio::time::Instant::now() + GRACE);
+    assert_eq!(grace.hold(&quorum), GraceHold::Wait, "a second look keeps the grace");
+    assert_eq!(grace.deadline(), Some(deadline), "and its deadline");
+    tokio::time::advance(GRACE).await;
+    grace.expire();
+    assert_eq!(grace.deadline(), None);
+    assert_eq!(grace.hold(&quorum), GraceHold::Propose(GRACE));
+    assert_eq!(grace.hold(&quorum), GraceHold::Propose(Duration::ZERO), "not armed again");
+    assert_eq!(grace.deadline(), None);
+
+    // preempted by the max-delay path: the same round does not arm again either
+    let mut grace = new_grace();
+    assert_eq!(grace.hold(&quorum), GraceHold::Wait);
+    tokio::time::advance(Duration::from_millis(30)).await;
+    assert_eq!(grace.end(GraceOutcome::Preempted), Duration::from_millis(30));
+    assert_eq!(grace.hold(&quorum), GraceHold::Propose(Duration::ZERO), "not armed again");
+    assert_eq!(grace.deadline(), None);
+    assert_eq!(grace.end(GraceOutcome::Preempted), Duration::ZERO, "nothing left to end");
+
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 1, 1], late: [0, 0], waits_ms: vec![150, 30] }
+    );
+}
+
+/// No grace without a last own header of the previous round to compare with.
+///
+/// - Epoch start: round 1 has no last header, and it builds on the genesis certificates, which
+///   every authority has, so round 2 does not wait for an author missing from round 1 either.
+/// - A skipped round: a grace armed for round 2's parents ends `preempted` when a round-3 quorum
+///   jumps the proposer to round 3, and round 4 goes out at once, since there is no own round-3
+///   header to compare with. The certificate validator's empty-parents jump ends it the same way. A
+///   round-2 certificate that turns up at round 4 is a late parent of an older round.
+///
+/// Catches: genesis parents taken as liveness evidence, a grace that outlives a round jump (with
+/// or without parents), and a basis compared across a skipped round.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_none_at_epoch_start_or_after_a_skipped_round() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+
+    // epoch start, on the state itself: round 1 has nothing to compare with, and its genesis
+    // parents leave round 2 nothing either
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let genesis = Certificate::genesis(&fixture.committee());
+    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
+    assert_eq!(grace.hold(&genesis), GraceHold::Propose(Duration::ZERO), "round 1 at once");
+    grace.on_propose(&genesis, Duration::ZERO);
+    let round_one_header = HeaderBuilder::default()
+        .author(all[0].clone())
+        .round(1)
+        .epoch(fixture.committee().epoch())
+        .parents(genesis.iter().map(|cert| cert.digest()).collect())
+        .build();
+    grace.on_proposed(&round_one_header);
+    let three = grace_certs(&fixture, 1, &all[..3]);
+    assert_eq!(grace.hold(&three), GraceHold::Propose(Duration::ZERO), "round 2 at once");
+    assert_eq!(grace.deadline(), None, "nothing armed at the epoch start");
+
+    // the empty-parents jump: armed for round 2, then the parents are replaced by none
+    let round_one = grace_certs(&fixture, 1, &all);
+    grace.on_propose(&round_one, Duration::ZERO);
+    let round_two_header = HeaderBuilder::default()
+        .author(all[0].clone())
+        .round(2)
+        .epoch(fixture.committee().epoch())
+        .parents(round_one.iter().map(|cert| cert.digest()).collect())
+        .build();
+    grace.on_proposed(&round_two_header);
+    let round_two = grace_certs(&fixture, 2, &all[..3]);
+    assert_eq!(grace.hold(&round_two), GraceHold::Wait, "armed for the fourth author");
+    grace.end_if_round_moved(&round_two);
+    assert!(grace.deadline().is_some(), "the same round keeps the grace");
+    grace.end_if_round_moved(&[]);
+    assert_eq!(grace.deadline(), None, "the empty-parents jump ends the grace");
+    assert_eq!(grace.end(GraceOutcome::Preempted), Duration::ZERO, "already ended");
+
+    // a jump: armed for round 2's parents, then a round-3 quorum arrives 10 ms later
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+    run.send(2, &run.all_but_late()).await;
+    let jump = GRACE_MIN_DELAY + Duration::from_millis(10);
+    tokio::time::sleep_until(run.round_two_at + jump).await;
+    run.send(3, &run.all_but_late()).await;
+    let (header, elapsed) = run.next(4).await;
+    assert_eq!(elapsed, jump, "round 4 goes out at once after the jump");
+    assert_eq!(header.parents().len(), 3);
+    assert_eq!(proposed_line(&capture, 4).u64_field("grace_ms"), Some(0));
+    // the late author's round-2 certificate reaches the proposer at round 4
+    run.send(2, &[run.late.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 1], late: [0, 1], waits_ms: vec![10] }
+    );
 }
