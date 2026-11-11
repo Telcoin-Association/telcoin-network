@@ -772,7 +772,11 @@ where
     /// (`ConsensusOutput::set_forwarded_at`, observability only) and sent.
     /// `last_forwarded_consensus_number` is updated only after the send succeeds, so the
     /// restart-replay and leftover-drain paths can rely on it marking what actually reached the
-    /// engine rather than what was merely dequeued.
+    /// engine rather than what was merely dequeued. The shared [`ExecutionBacklog`] records the
+    /// number at the same point, and the `tn_node_execution_backlog_outputs` gauge takes the
+    /// backlog it then reads: the outputs forwarded and not yet executed and persisted.
+    ///
+    /// [`ExecutionBacklog`]: tn_types::ExecutionBacklog
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -791,6 +795,11 @@ where
         to_engine.send(output).await?;
         // store number after successful send
         self.last_forwarded_consensus_number = last_forwarded_consensus_number;
+        // the rpc admission bound reads this backlog; an output the engine never received must
+        // not count, so it is recorded only here, after the send
+        self.execution_backlog.record_forwarded(last_forwarded_consensus_number);
+        metrics::gauge!("tn_node_execution_backlog_outputs")
+            .set(self.execution_backlog.outputs_behind() as f64);
         Ok(())
     }
 
@@ -2939,5 +2948,65 @@ mod tests {
                 "in_committee={in_committee} mode={mode:?}"
             );
         }
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// `process_output` records the output in the shared execution backlog, and sets the
+    /// `tn_node_execution_backlog_outputs` gauge, only once the engine has received it: a send
+    /// that fails leaves both untouched, so the RPC admission bound never counts an output the
+    /// engine does not hold.
+    #[tokio::test]
+    async fn process_output_records_the_backlog_only_after_a_successful_send() -> eyre::Result<()> {
+        use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use tn_config::{Config, KeyConfig};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::BlsKeypair;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the test runtime polls every future on this thread, so the guard covers the awaits too
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let gauge = || {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == "tn_node_execution_backlog_outputs")
+                .map(|(.., value)| match value {
+                    DebugValue::Gauge(value) => value.0,
+                    other => panic!("the backlog series is not a gauge: {other:?}"),
+                })
+        };
+        let temp = TempDir::with_prefix("process_output_backlog")?;
+        let datadir = temp.path().to_path_buf();
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let config = Config::default_for_test();
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(11)));
+        std::fs::create_dir_all(datadir.join("db"))?;
+        let db = tn_storage::open_db(datadir.join("db"));
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let mut manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
+        let output = committed_output(&[]);
+
+        // the engine's receiver is gone: the send fails and nothing is recorded
+        let (to_engine, engine_rx) = mpsc::channel(1);
+        drop(engine_rx);
+        assert!(manager.process_output(&to_engine, output.clone()).await.is_err());
+        assert_eq!(manager.execution_backlog.last_forwarded(), None);
+        assert_eq!(gauge(), None);
+
+        // the engine receives it: recorded after the send, the gauge reads one output behind
+        manager.execution_backlog.record_executed(output.number() - 1);
+        let (to_engine, mut engine_rx) = mpsc::channel(1);
+        manager.process_output(&to_engine, output.clone()).await?;
+        assert_eq!(engine_rx.try_recv()?.number(), output.number());
+        assert_eq!(manager.execution_backlog.last_forwarded(), Some(output.number()));
+        assert_eq!(gauge(), Some(1.0));
+        Ok(())
     }
 }
