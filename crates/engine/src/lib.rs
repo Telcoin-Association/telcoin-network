@@ -517,9 +517,15 @@ impl ExecutorEngine {
     /// No exit leaves a build or commit running, since a blocking task cannot be cancelled:
     /// shutdown and a closed stream drain the queue and the pipeline first, a pipeline error is
     /// returned only once both slots settled and every unpersisted block was rolled back, and a
-    /// start the pipeline refuses waits for the outputs already in it. A closing output is a
-    /// barrier: the pipeline starts nothing on it before it committed, so the epoch close sees
-    /// it as both the durable and the in-memory tip.
+    /// start the pipeline refuses waits for the outputs already in it. A loop with nothing to
+    /// wait on (no arm enabled) fails closed with [`TnEngineError::PipelineInvariant`] instead
+    /// of spinning or panicking; the pipeline's own rules leave no such state.
+    ///
+    /// A closing output is a barrier: the pipeline starts nothing on it before it committed. The
+    /// barrier ends at the engine's `Committed`, which comes after the closing output's announce,
+    /// so it does not by itself keep the epoch close's readers (`adjust_base_fees`, the gas
+    /// accumulator's clear) on the closing block: the node forwarding nothing past a close until
+    /// the next epoch starts does, as it does for the sequential loop.
     ///
     /// `metrics` is the process-wide [`ENGINE_METRICS`] outside tests.
     async fn run_pipelined(mut self, metrics: &EngineMetrics) -> EngineResult<()> {
@@ -585,6 +591,14 @@ impl ExecutorEngine {
                 // never polled while idle: `next_event` is then pending forever
                 event = pipeline.next_event(), if !pipeline.is_idle() => {
                     self.on_pipeline_event(event?, &pipeline, &mut books, metrics);
+                }
+
+                // unreachable: an idle pipeline can start the queued output, and the checks above
+                // return once nothing is queued after shutdown or a closed stream
+                else => {
+                    return Err(TnEngineError::PipelineInvariant(
+                        "the pipelined loop had nothing to wait on",
+                    ));
                 }
             }
         }
