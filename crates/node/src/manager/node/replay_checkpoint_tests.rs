@@ -1,6 +1,6 @@
 //! Regression tests for restart replay over a fully imported pack with stale slot hints.
 
-use super::*;
+use super::{start_epoch::check_replay_link, *};
 use crate::manager::node::tests::reth_config_and_db;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::VecDeque, path::PathBuf, time::Duration};
@@ -60,12 +60,12 @@ async fn observer_manager(
     Ok((manager, fixture))
 }
 
-/// Import six outputs, save only a prefix, and point execution at an independently chosen
-/// output. This recreates the split between pack tip, saved slot and execution tip on disk.
-async fn imported_manager(
+/// Import an epoch-0 pack of six outputs from a peer, with output 1 built on `block1_parent`, and
+/// save only a prefix. Execution stays at genesis.
+async fn imported_epoch0_manager(
     temp: &TempDir,
+    block1_parent: ConsensusHeaderDigest,
     saved: usize,
-    executed: usize,
 ) -> eyre::Result<(
     EpochManager<PathBuf, DatabaseType>,
     CommitteeFixture<MemDatabase>,
@@ -84,7 +84,7 @@ async fn imported_manager(
         next_committee: committee.bls_keys().iter().copied().collect(),
         ..Default::default()
     };
-    let mut parent = ConsensusHeader::default().digest();
+    let mut parent = block1_parent;
     let mut outputs = Vec::new();
     for number in 1..=6 {
         let output = output_at(&fixture, 0, number, parent);
@@ -108,6 +108,24 @@ async fn imported_manager(
         manager.consensus_chain.save_consensus_output(output.clone()).await?;
     }
     manager.consensus_chain.persist_current().await?;
+    source.close().await;
+    Ok((manager, fixture, outputs, record))
+}
+
+/// Import six outputs, save only a prefix, and point execution at an independently chosen
+/// output. This recreates the split between pack tip, saved slot and execution tip on disk.
+async fn imported_manager(
+    temp: &TempDir,
+    saved: usize,
+    executed: usize,
+) -> eyre::Result<(
+    EpochManager<PathBuf, DatabaseType>,
+    CommitteeFixture<MemDatabase>,
+    Vec<ConsensusOutput>,
+    EpochRecord,
+)> {
+    let (manager, fixture, outputs, record) =
+        imported_epoch0_manager(temp, ConsensusHeader::default().digest(), saved).await?;
     let executed_output = &outputs[executed - 1];
     manager.consensus_bus.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
@@ -127,7 +145,6 @@ async fn imported_manager(
             )),
         );
     });
-    source.close().await;
     Ok((manager, fixture, outputs, record))
 }
 
@@ -278,6 +295,35 @@ async fn replay_anchors_block1_on_its_own_parent_when_nothing_executed() -> eyre
     Ok(())
 }
 
+/// Issue #1790, the import path: a node that imported the epoch-0 pack from a peer and restarted
+/// before executing any of it must replay the pack, though block 1 is not built on the default
+/// header's digest. From block 2 on the replay checks each parent link up to the epoch close. The
+/// importer refuses a pack whose block 2 does not build on block 1, so this path cannot carry the
+/// mis-parented case `replay_rejects_block2_not_built_on_block1_when_nothing_executed` covers.
+#[tokio::test]
+async fn replay_anchors_imported_block1_on_its_own_parent_before_execution() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let anchor: ConsensusHeaderDigest = B256::ZERO.into();
+    assert_ne!(anchor, ConsensusHeader::default().digest());
+    let (mut manager, fixture, outputs, _) = imported_epoch0_manager(&temp, anchor, 0).await?;
+    assert!(
+        state_sync::last_executed_consensus_block(&manager.consensus_bus, &manager.consensus_chain)
+            .await?
+            .is_none(),
+        "the fixture must leave execution at genesis"
+    );
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let mut replay = manager.replay_missed_consensus(fixture.committee(), &to_engine).await?;
+    assert_eq!(replay.take_epoch_close_hash(), Some(outputs[5].consensus_header_hash()));
+    for expected in &outputs {
+        assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), expected.consensus_header_hash());
+    }
+    assert!(engine_rx.try_recv().is_err());
+    assert_eq!(manager.consensus_chain.latest_consensus_number(), 6);
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
 /// The block-1 anchor exemption ends at block 1: a block 2 that does not build on block 1 still
 /// halts the replay, after block 1 alone reached the engine.
 #[tokio::test]
@@ -290,10 +336,45 @@ async fn replay_rejects_block2_not_built_on_block1_when_nothing_executed() -> ey
     };
     assert_eq!(
         err.to_string(),
-        "restart replay is not contiguous: expected consensus 2 following 1, got 2"
+        format!(
+            "restart replay parent mismatch: consensus 2 has parent_hash {:?}, expected consensus \
+             1's digest {:?}",
+            outputs[1].parent_hash(),
+            outputs[0].consensus_header_hash(),
+        )
     );
     assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), outputs[0].consensus_header_hash());
-    assert!(engine_rx.try_recv().is_err(), "nothing past the gap may reach the engine");
+    assert!(engine_rx.try_recv().is_err(), "nothing past the mismatch may reach the engine");
     manager.consensus_chain.clone().close().await;
     Ok(())
+}
+
+/// A numbering gap keeps its own message, apart from a parent mismatch, and the block-1 anchor
+/// exemption covers only block 1's parent hash, never its number.
+#[test]
+fn replay_link_reports_a_numbering_gap_by_number() {
+    let header = |number, parent_hash: ConsensusHeaderDigest| ConsensusHeader {
+        number,
+        parent_hash,
+        ..Default::default()
+    };
+    let genesis = ConsensusHeader::default();
+    let one = header(1, B256::ZERO.into());
+    let two = header(2, one.digest());
+    let three = header(3, two.digest());
+    assert!(check_replay_link(&genesis, &one).is_ok());
+    assert!(check_replay_link(&one, &two).is_ok());
+
+    // block 3 straight after block 1, with block 2's digest as parent
+    let err = check_replay_link(&one, &three).expect_err("2 is missing");
+    assert_eq!(
+        err.to_string(),
+        "restart replay is not contiguous: expected consensus 2 following 1, got 3"
+    );
+    // with nothing executed, the replay must still start at block 1
+    let err = check_replay_link(&genesis, &two).expect_err("1 is missing");
+    assert_eq!(
+        err.to_string(),
+        "restart replay is not contiguous: expected consensus 1 following 0, got 2"
+    );
 }

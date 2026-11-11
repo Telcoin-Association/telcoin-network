@@ -58,9 +58,9 @@ use tn_reth::{
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, Address, AuthorityIdentifier, BatchValidation, BlsPublicKey,
-    BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader,
-    TaskManager, TaskSpawner, WorkerId, DEFAULT_WORKER_ID,
+    BlsSigner, Committee, CommitteeBuilder, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey,
+    SealedHeader, TaskManager, TaskSpawner, WorkerId, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -154,19 +154,7 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
-            // with nothing executed the parent is the default header, whose digest is build-flavor
-            // dependent and is not the anchor adiri's block 1 was built on. block 1 anchors on its
-            // own parent instead, as state-sync catch-up and the epoch-0 pack importer do; its
-            // digest commits to that parent, and the check is strict from block 2 on.
-            let anchors_on_itself = parent.number == 0 && consensus_header.number == 1;
-            eyre::ensure!(
-                consensus_header.number == parent.number + 1
-                    && (anchors_on_itself || consensus_header.parent_hash == parent.digest()),
-                "restart replay is not contiguous: expected consensus {} following {}, got {}",
-                parent.number + 1,
-                parent.number,
-                consensus_header.number,
-            );
+            check_replay_link(&parent, &consensus_header)?;
             let consensus_output =
                 self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
             let is_epoch_close = consensus_output.reaches_epoch_boundary(self.epoch_boundary);
@@ -1484,6 +1472,39 @@ impl ReplayResult {
     pub(super) fn take_last_replayed_hash(&mut self) -> Option<ConsensusHeaderDigest> {
         self.last_replayed_hash.take()
     }
+}
+
+/// Check that restart replay may forward `consensus_header` after `parent`.
+///
+/// The number is checked first and the parent hash second, each with its own message, so the log
+/// tells a numbering gap apart from a header that does not build on its parent.
+///
+/// With nothing executed the parent is the default header, whose digest is build-flavor dependent
+/// and is not the anchor adiri's block 1 was built on. Block 1 anchors on its own parent instead,
+/// as state-sync catch-up and the epoch-0 pack importer do; its digest commits to that parent.
+/// Its number is still checked, and the parent hash is checked from block 2 on.
+pub(super) fn check_replay_link(
+    parent: &ConsensusHeader,
+    consensus_header: &ConsensusHeader,
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        consensus_header.number == parent.number + 1,
+        "restart replay is not contiguous: expected consensus {} following {}, got {}",
+        parent.number + 1,
+        parent.number,
+        consensus_header.number,
+    );
+    let anchors_on_itself = parent.number == 0 && consensus_header.number == 1;
+    eyre::ensure!(
+        anchors_on_itself || consensus_header.parent_hash == parent.digest(),
+        "restart replay parent mismatch: consensus {} has parent_hash {:?}, expected consensus \
+         {}'s digest {:?}",
+        consensus_header.number,
+        consensus_header.parent_hash,
+        parent.number,
+        parent.digest(),
+    );
+    Ok(())
 }
 
 /// Whether this [`NodeMode`] means the node is catching up on consensus output rather than
