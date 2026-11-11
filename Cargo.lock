@@ -10077,6 +10077,7 @@ dependencies = [
  "eyre",
  "futures",
  "jsonrpsee",
+ "libc",
  "metrics",
  "metrics-util",
  "parking_lot",

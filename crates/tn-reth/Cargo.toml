@@ -111,6 +111,10 @@ tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
+# `madvise` for the execution database's random-access advice (`env/mdbx_advice.rs`, Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 metrics-util = { workspace = true }
 serde_yaml = { workspace = true }

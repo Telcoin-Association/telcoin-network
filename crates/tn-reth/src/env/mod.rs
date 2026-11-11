@@ -40,6 +40,7 @@ use tn_types::{
 };
 use tracing::{debug, info, warn};
 
+use self::mdbx_advice::MdbxAdvice;
 use crate::{
     error::RestoredStateFloorError,
     evm::TnEvmConfig,
@@ -52,6 +53,7 @@ mod epoch;
 mod execution;
 mod genesis;
 mod helpers;
+mod mdbx_advice;
 mod output_overlay;
 mod rpc;
 
@@ -129,6 +131,9 @@ struct RethEnvInner {
     persist_attempts: std::sync::atomic::AtomicU32,
     /// The node's runtime switches for this env, fixed at construction.
     switches: RethSwitches,
+    /// The execution database's map advice (`mdbx_random_advice`) and the storage counters each
+    /// persist reports.
+    mdbx: MdbxAdvice,
 }
 
 /// The runtime switches from `parameters.yaml` that the node hands to its [`RethEnv`].
@@ -227,6 +232,9 @@ impl RethEnv {
     /// The node starts its env through here so the switches read from `parameters.yaml` reach the
     /// reth side; every other caller uses [`RethEnv::new`], which passes the defaults. The same
     /// runtime requirement, genesis initialization and process-global side effects apply.
+    ///
+    /// With `mdbx_random_advice` on, the env advises every mapping of the database's `mdbx.dat` as
+    /// read at random before it writes genesis or anything else (`env/mdbx_advice.rs`).
     pub fn new_with_switches(
         reth_config: &RethConfig,
         task_manager: &TaskManager,
@@ -241,6 +249,8 @@ impl RethEnv {
         // the pinned block while the history covering it is intact.
         reth_config.ensure_archive_mode()?;
 
+        // advise the map before this env writes genesis or anything else
+        let mdbx = MdbxAdvice::open(&database, switches.mdbx_random_advice);
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
@@ -268,6 +278,7 @@ impl RethEnv {
                 #[cfg(any(feature = "test-utils", test))]
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
                 switches,
+                mdbx,
             }),
         })
     }
@@ -865,6 +876,206 @@ mod tests {
         assert!(!env.sealed_tx_keep(), "RethEnv::new passes the defaults");
         assert_eq!(env.rpc_admission_backlog_outputs(), 0, "RethEnv::new passes the defaults");
         assert_eq!(env.execution_backlog().outputs_behind(), 0);
+        Ok(())
+    }
+
+    /// [`env_with_switches`] with only `mdbx_random_advice` set.
+    fn env_with_advice(
+        dir: &Path,
+        task_manager: &TaskManager,
+        advice: bool,
+    ) -> eyre::Result<RethEnv> {
+        let switches = RethSwitches { mdbx_random_advice: advice, ..Default::default() };
+        env_with_switches(dir, task_manager, switches)
+    }
+
+    /// Create the database under `dir` in an env that is then closed, as the deploy's stage-only
+    /// start does, so the next open is a re-open: libmdbx then advises only the pages in use.
+    fn create_and_close(dir: &Path) -> eyre::Result<()> {
+        let task_manager = TaskManager::new("create");
+        drop(env_with_advice(dir, &task_manager, false)?);
+        Ok(())
+    }
+
+    /// The value of gauge `name` in `snapshot`.
+    fn gauge_value(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            metrics_util::debugging::DebugValue,
+        )],
+        name: &str,
+    ) -> Option<f64> {
+        snapshot.iter().find(|(key, ..)| key.key().name() == name).and_then(|(.., value)| {
+            match value {
+                metrics_util::debugging::DebugValue::Gauge(gauge) => Some(gauge.into_inner()),
+                _ => None,
+            }
+        })
+    }
+
+    /// With the switch on, every `mdbx.dat` mapping of a re-opened database carries `rr`, and the
+    /// advised bytes (on the env and in `tn_reth_mdbx_random_advice_bytes`) equal the whole map,
+    /// not the file. `tn_reth_mdbx_used_bytes` is set at open.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mdbx_random_advice_covers_every_mapping_of_a_reopened_database(
+    ) -> eyre::Result<()> {
+        use super::mdbx_advice::test_support::mappings_of;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let dir = TempDir::new()?;
+        create_and_close(dir.path())?;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let tm = TaskManager::new("reopen with advice");
+        let env =
+            ::metrics::with_local_recorder(&recorder, || env_with_advice(dir.path(), &tm, true))?;
+
+        let mappings = mappings_of(&dir.path().join("db").join("mdbx.dat"));
+        assert!(!mappings.is_empty(), "the database is mapped");
+        assert!(mappings.iter().all(|mapping| mapping.random), "{mappings:?}");
+        let mapped: u64 = mappings.iter().map(|mapping| mapping.end - mapping.start).sum();
+        assert_eq!(mapped, u64::try_from(env.inner.mdbx.db().info()?.map_size())?);
+        assert_eq!(env.inner.mdbx.advised_bytes(), mapped);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&snapshot, "tn_reth.mdbx_random_advice_bytes"), Some(mapped as f64));
+        assert!(gauge_value(&snapshot, "tn_reth.mdbx_used_bytes").is_some_and(|used| used > 0.0));
+        Ok(())
+    }
+
+    /// With the switch off nothing is advised: past the pages libmdbx advised itself, a re-opened
+    /// map carries no `rr` and the gauge reads zero. An env with the switch on in the same process
+    /// advises its own file only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mdbx_random_advice_off_and_on_in_one_process() -> eyre::Result<()> {
+        use super::mdbx_advice::test_support::mappings_of;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let off_dir = TempDir::new()?;
+        create_and_close(off_dir.path())?;
+        let off_dat = off_dir.path().join("db").join("mdbx.dat");
+        let on_dir = TempDir::new()?;
+        let tm = TaskManager::new("two envs");
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let off = ::metrics::with_local_recorder(&recorder, || {
+            env_with_advice(off_dir.path(), &tm, false)
+        })?;
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&snapshot, "tn_reth.mdbx_random_advice_bytes"), Some(0.0));
+        assert!(gauge_value(&snapshot, "tn_reth.mdbx_used_bytes").is_some_and(|used| used > 0.0));
+        assert_eq!(off.inner.mdbx.advised_bytes(), 0);
+        let off_mappings = mappings_of(&off_dat);
+        assert!(off_mappings.iter().any(|mapping| !mapping.random), "{off_mappings:?}");
+
+        let on = env_with_advice(on_dir.path(), &tm, true)?;
+        let on_mappings = mappings_of(&on_dir.path().join("db").join("mdbx.dat"));
+        assert!(on_mappings.iter().all(|mapping| mapping.random), "{on_mappings:?}");
+        assert!(on.inner.mdbx.advised_bytes() > 0);
+        assert_eq!(mappings_of(&off_dat), off_mappings, "the other env's map is untouched");
+        Ok(())
+    }
+
+    /// Growth inside the upper limit adds no mapping: after the database grows by several steps,
+    /// the advised mappings are the same and all still carry `rr`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mdbx_random_advice_holds_while_the_database_grows() -> eyre::Result<()> {
+        use super::mdbx_advice::test_support::mappings_of;
+        use reth_db::{tables, transaction::DbTxMut as _};
+        use reth_provider::DBProvider as _;
+
+        let dir = TempDir::new()?;
+        create_and_close(dir.path())?;
+        let tm = TaskManager::new("growth");
+        let env = env_with_advice(dir.path(), &tm, true)?;
+        let mdbx_dat = dir.path().join("db").join("mdbx.dat");
+        let before = mappings_of(&mdbx_dat);
+        assert!(!before.is_empty(), "the database is mapped");
+        let file_before = std::fs::metadata(&mdbx_dat)?.len();
+        let last_pgno_before = env.inner.mdbx.db().info()?.last_pgno();
+
+        // 16 MiB of bytecode against a 4 MiB growth step
+        for round in 0..4u8 {
+            let provider = env.blockchain_provider().database_provider_rw()?;
+            for index in 0..256u16 {
+                let mut key = [round; 32];
+                key[30..].copy_from_slice(&index.to_be_bytes());
+                let code = reth_primitives_traits::Bytecode::new_raw(vec![round; 16 * 1024].into());
+                provider.tx_ref().put::<tables::Bytecodes>(key.into(), code)?;
+            }
+            provider.commit()?;
+        }
+
+        assert!(std::fs::metadata(&mdbx_dat)?.len() >= file_before + 8 * 1024 * 1024);
+        assert!(env.inner.mdbx.db().info()?.last_pgno() > last_pgno_before);
+        let after = mappings_of(&mdbx_dat);
+        assert_eq!(after, before, "growth inside the limit adds no mapping");
+        assert!(after.iter().all(|mapping| mapping.random), "{after:?}");
+        Ok(())
+    }
+
+    /// A persist that writes a block reports non-zero page-operation deltas and the storage
+    /// values after its commit; an empty persist reports zero deltas.
+    #[tokio::test]
+    async fn test_persisted_output_reports_the_storage_deltas() -> eyre::Result<()> {
+        use super::mdbx_advice::test_support::{number, persisted_output_lines};
+
+        const PAGE_FIELDS: [&str; 7] = [
+            "page_newly",
+            "page_cow",
+            "page_spill",
+            "page_unspill",
+            "page_prefault",
+            "page_wops",
+            "page_msync",
+        ];
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new()?;
+        let tm = TaskManager::new("persist counters");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+        let output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        let no_txs: Vec<Vec<u8>> = Vec::new();
+        let block =
+            env.build_block_from_batch_payload(payload, &no_txs, &mut OutputTrieOverlay::new())?;
+
+        let (persisted, lines) = persisted_output_lines(|| env.persist_executed_output(&[block]));
+        persisted?;
+        let [line] = lines.as_slice() else { panic!("one persisted output line: {lines:?}") };
+        for field in PAGE_FIELDS
+            .iter()
+            .chain(&["mdbx_used_bytes", "mdbx_advised_bytes", "mdbx_last_pgno"])
+            .chain(&["gc_entries", "gc_large_pages"])
+        {
+            assert!(number(line, field).is_some(), "{field} missing: {line:?}");
+        }
+        let dirtied = number(line, "page_newly").unwrap_or_default()
+            + number(line, "page_cow").unwrap_or_default();
+        assert!(dirtied > 0, "the block dirtied pages: {line:?}");
+        assert_eq!(number(line, "mdbx_advised_bytes"), Some(0), "the switch is off");
+        let page_size = u64::from(env.inner.mdbx.db().stat()?.page_size());
+        assert_eq!(
+            number(line, "mdbx_used_bytes"),
+            number(line, "mdbx_last_pgno").map(|last| (last + 1) * page_size)
+        );
+        if cfg!(target_os = "linux") {
+            assert!(number(line, "proc_write_bytes").is_some(), "{line:?}");
+        }
+
+        let (persisted, lines) = persisted_output_lines(|| env.persist_executed_output(&[]));
+        persisted?;
+        let [line] = lines.as_slice() else { panic!("one persisted output line: {lines:?}") };
+        for field in PAGE_FIELDS {
+            assert_eq!(number(line, field), Some(0), "{field} after an empty persist: {line:?}");
+        }
+        assert!(number(line, "prefault_wchar_bytes").is_none_or(|bytes| bytes == 0), "{line:?}");
         Ok(())
     }
 }

@@ -99,6 +99,7 @@ use crate::{
 };
 
 use super::{
+    mdbx_advice::PersistStorage,
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
     RethEnv,
 };
@@ -442,7 +443,10 @@ impl RethEnv {
     /// `markers_ms`, `commit_ms`), and records four series (see [`record_persisted_output`]):
     /// the histograms `tn_reth.persist_save_blocks_seconds` and `tn_reth.persist_commit_seconds`
     /// and the counters `tn_reth.persisted_accounts_total` and
-    /// `tn_reth.persisted_storage_slots_total`. A failed attempt records nothing.
+    /// `tn_reth.persisted_storage_slots_total`. The line also carries what the persist did to the
+    /// MDBX file (page-operation deltas, the process's `write_bytes` delta, the used size, the GC
+    /// table; see `PersistStorage` in `env/mdbx_advice.rs`), read in microseconds without a second
+    /// open of the environment. A failed attempt records nothing.
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -462,6 +466,8 @@ impl RethEnv {
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
         let open = lap(&mut stamp);
+        // observability only: the storage counters start once this persist holds the write lock
+        let mut probe = self.inner.mdbx.begin_persist();
         provider_rw.save_blocks(blocks.to_vec(), reth_provider::SaveBlocksMode::Full)?;
         let save_blocks = lap(&mut stamp);
         // advance the finalized/safe markers in the same transaction as the blocks: every
@@ -473,6 +479,7 @@ impl RethEnv {
             provider_rw.save_finalized_block_number(last_number)?;
             provider_rw.save_safe_block_number(last_number)?;
         }
+        probe.before_commit();
         let markers = lap(&mut stamp);
         #[cfg(any(feature = "test-utils", test))]
         self.consume_injected_late_persist_fault()?;
@@ -480,7 +487,12 @@ impl RethEnv {
         provider_rw.commit()?;
         let commit = lap(&mut stamp);
 
-        record_persisted_output(blocks, PersistPhases { open, save_blocks, markers, commit });
+        let storage = self.inner.mdbx.finish_persist(probe);
+        record_persisted_output(
+            blocks,
+            PersistPhases { open, save_blocks, markers, commit },
+            &storage,
+        );
         Ok(())
     }
 
@@ -809,8 +821,17 @@ impl PersistedCounts {
 /// `RethEnvMetrics`: a persist runs about once per consensus output (~1/s), so resolving the
 /// handle per call is cheap, and the macros bind to whichever recorder is current, which keeps
 /// the unit test independent of test ordering (see the `metrics` module docs).
-fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
+///
+/// The `page_*` fields, `proc_write_bytes` and `prefault_wchar_bytes` are deltas over the persist;
+/// `mdbx_used_bytes`, `mdbx_advised_bytes`, `mdbx_last_pgno`, `gc_entries` and `gc_large_pages`
+/// are values after the commit. A field whose source could not be read is left off the line.
+fn record_persisted_output(
+    blocks: &[ExecutedBlock],
+    phases: PersistPhases,
+    storage: &PersistStorage,
+) {
     let counts = PersistedCounts::of(blocks);
+    let ops = storage.page_ops;
     ::metrics::histogram!(PERSIST_SAVE_BLOCKS_SECONDS).record(phases.save_blocks);
     ::metrics::histogram!(PERSIST_COMMIT_SECONDS).record(phases.commit);
     ::metrics::counter!(PERSISTED_ACCOUNTS_TOTAL)
@@ -830,6 +851,20 @@ fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
         save_blocks_ms = duration_ms(phases.save_blocks),
         markers_ms = duration_ms(phases.markers),
         commit_ms = duration_ms(phases.commit),
+        page_newly = ops.map(|ops| ops.newly),
+        page_cow = ops.map(|ops| ops.cow),
+        page_spill = ops.map(|ops| ops.spill),
+        page_unspill = ops.map(|ops| ops.unspill),
+        page_prefault = ops.map(|ops| ops.prefault),
+        page_wops = ops.map(|ops| ops.wops),
+        page_msync = ops.map(|ops| ops.msync),
+        proc_write_bytes = storage.proc_write_bytes,
+        mdbx_used_bytes = storage.mdbx_used_bytes,
+        mdbx_advised_bytes = storage.mdbx_advised_bytes,
+        mdbx_last_pgno = storage.mdbx_last_pgno,
+        gc_entries = storage.gc.map(|gc| gc.entries),
+        gc_large_pages = storage.gc.map(|gc| gc.large_pages),
+        prefault_wchar_bytes = storage.prefault_wchar_bytes,
         "persisted output"
     );
 }
@@ -1010,6 +1045,7 @@ mod tests {
                     markers: Duration::from_millis(2),
                     commit: Duration::from_millis(500),
                 },
+                &PersistStorage::default(),
             );
         });
 
@@ -1225,5 +1261,78 @@ mod tests {
         assert!(stamp >= start);
         assert_eq!(stamp.saturating_duration_since(start), first);
         assert_eq!(duration_ms(Duration::from_micros(2_500)), 2);
+    }
+
+    // ---- bench6 mdbx-advice ----
+
+    /// The `persisted output` field names after the message, in order. FROZEN: the harness
+    /// sampler, the per-arm summary tool and the analysis parse them.
+    const PERSISTED_OUTPUT_FIELDS: [&str; 25] = [
+        "first",
+        "last",
+        "blocks",
+        "txs",
+        "receipts",
+        "accounts",
+        "storage_slots",
+        "open_ms",
+        "save_blocks_ms",
+        "markers_ms",
+        "commit_ms",
+        "page_newly",
+        "page_cow",
+        "page_spill",
+        "page_unspill",
+        "page_prefault",
+        "page_wops",
+        "page_msync",
+        "proc_write_bytes",
+        "mdbx_used_bytes",
+        "mdbx_advised_bytes",
+        "mdbx_last_pgno",
+        "gc_entries",
+        "gc_large_pages",
+        "prefault_wchar_bytes",
+    ];
+
+    /// Golden: the `persisted output` line carries exactly the frozen fields, in order; a field
+    /// whose source could not be read is left off and the rest stay.
+    #[test]
+    fn test_persisted_output_field_names() {
+        use super::super::mdbx_advice::{
+            test_support::persisted_output_lines, GcStat, PageOpCounts,
+        };
+
+        let phases = PersistPhases {
+            open: Duration::ZERO,
+            save_blocks: Duration::ZERO,
+            markers: Duration::ZERO,
+            commit: Duration::ZERO,
+        };
+        let names = |storage: PersistStorage| {
+            let ((), lines) =
+                persisted_output_lines(|| record_persisted_output(&[], phases, &storage));
+            let [line] = lines.as_slice() else { panic!("one line: {lines:?}") };
+            line.iter()
+                .map(|(name, _)| name.clone())
+                .filter(|name| name != "message")
+                .collect::<Vec<_>>()
+        };
+
+        let full = PersistStorage {
+            page_ops: Some(PageOpCounts::default()),
+            proc_write_bytes: Some(0),
+            mdbx_used_bytes: Some(0),
+            mdbx_advised_bytes: 0,
+            mdbx_last_pgno: Some(0),
+            gc: Some(GcStat::default()),
+            prefault_wchar_bytes: Some(0),
+        };
+        assert_eq!(names(full), PERSISTED_OUTPUT_FIELDS);
+
+        // nothing readable: the timing fields and the advised bytes, which are always known
+        let always: Vec<&str> =
+            PERSISTED_OUTPUT_FIELDS[..11].iter().copied().chain(["mdbx_advised_bytes"]).collect();
+        assert_eq!(names(PersistStorage::default()), always);
     }
 }

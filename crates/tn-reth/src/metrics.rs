@@ -41,6 +41,11 @@
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
+//! Three series describe the execution database's memory map (`env/mdbx_advice.rs`):
+//! `tn_reth.mdbx_random_advice_bytes` and `tn_reth.mdbx_used_bytes` (gauges) and
+//! `tn_reth.mdbx_page_ops_total` (a counter labelled by `op`). They are set when the database opens
+//! and after every persist.
+//!
 //! Three gauges under the same scope report what the epoch-boundary system calls spend against
 //! the budget they run under: [`EPOCH_CLOSE_SYSTEM_CALL_GAS_USED`] (labelled by `call`),
 //! [`EPOCH_CLOSE_GAS_USED`], and [`EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT`]. Nothing else can see that
@@ -771,6 +776,57 @@ impl RpcTxForwardMetrics {
 pub fn report_db_metrics(db: &RethDb) {
     use reth_db::database_metrics::DatabaseMetrics;
     db.report_metrics();
+}
+
+/// Bytes of the execution database's `mdbx.dat` mappings the node advised as read at random
+/// (`mdbx_random_advice`); zero with the switch off.
+///
+/// With the switch on it equals the whole reservation of the map (the upper size limit), not the
+/// file size: that is what keeps every page the database grows into covered.
+const MDBX_RANDOM_ADVICE_BYTES: &str = "tn_reth.mdbx_random_advice_bytes";
+
+/// The execution database's used size in bytes: pages `0..=last_pgno` times the page size.
+///
+/// Set at open and after every persist, with the advice switch on or off. Pages past this edge
+/// that are resident in the page cache were read around, not written.
+const MDBX_USED_BYTES: &str = "tn_reth.mdbx_used_bytes";
+
+/// libmdbx's cumulative page operations on the execution database, labelled by `op` (`newly`,
+/// `cow`, `spill`, `unspill`, `prefault`, `wops`, `msync`).
+///
+/// Mirrors the environment's own counters, kept in its lock file since the node opened it, so the
+/// series restarts with the node. Set at open and after every persist; the `persisted output` line
+/// carries the same counters as deltas over each persist.
+const MDBX_PAGE_OPS_TOTAL: &str = "tn_reth.mdbx_page_ops_total";
+
+/// Describe the execution database's map series. Called when an env opens its database.
+pub(crate) fn describe_mdbx_series() {
+    metrics::describe_gauge!(
+        MDBX_RANDOM_ADVICE_BYTES,
+        "Bytes of mdbx.dat mappings advised as read at random (0 with the switch off)"
+    );
+    metrics::describe_gauge!(MDBX_USED_BYTES, "Used size of the execution database in bytes");
+    metrics::describe_counter!(
+        MDBX_PAGE_OPS_TOTAL,
+        "libmdbx page operations on the execution database since it was opened"
+    );
+}
+
+/// Publish the bytes of `mdbx.dat` mappings advised as read at random.
+pub(crate) fn record_mdbx_random_advice_bytes(bytes: u64) {
+    metrics::gauge!(MDBX_RANDOM_ADVICE_BYTES).set(bytes as f64);
+}
+
+/// Publish the execution database's used size.
+pub(crate) fn record_mdbx_used_bytes(bytes: u64) {
+    metrics::gauge!(MDBX_USED_BYTES).set(bytes as f64);
+}
+
+/// Publish libmdbx's cumulative page operations, one series per `op` label.
+pub(crate) fn record_mdbx_page_ops(totals: impl IntoIterator<Item = (&'static str, u64)>) {
+    for (op, total) in totals {
+        metrics::counter!(MDBX_PAGE_OPS_TOTAL, "op" => op).absolute(total);
+    }
 }
 
 /// Gas spent by the epoch-boundary system calls together.
