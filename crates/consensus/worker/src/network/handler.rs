@@ -28,7 +28,7 @@ use tn_types::{
     ensure, now, try_decode, Batch, BatchValidation, BatchValidationError, BlsPublicKey, Database,
     Epoch, SealedBatch, WorkerId, B256,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 /// Total timeout for sending all batches over a stream.
@@ -56,6 +56,13 @@ pub(crate) const SEND_STREAM_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// oldest one, and a later repeat of the dropped digest is validated again.
 pub(crate) const REJECTED_BATCH_DIGESTS_CAPACITY: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1023);
+
+/// How long the report path waits for the primary to acknowledge a reported batch.
+///
+/// The report task runs to its end, also when the network layer cancels the request, so the
+/// cancel no longer bounds this wait. The limit matches the request timeout of the worker
+/// request-response behaviour (`request_response::Config::default()` in libp2p, 10 seconds).
+pub(super) const REPORT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether a batch validation failure proves that the batch body itself is invalid.
 ///
@@ -214,10 +221,15 @@ where
     /// parks the tokio worker thread that runs the caller until the recovery ends. A committee
     /// peer, which is exempt from peer scoring, could hold the worker threads that also serve
     /// honest reports, batch sync and the vote path (issue #1795). On the blocking pool the
-    /// recovery parks a blocking thread instead. The number of validations in flight stays
-    /// bounded by the per-peer report slots, the batch serve class and the prefetch cap, so the
-    /// blocking pool cannot grow without bound. A caller that is cancelled drops the result; the
-    /// validation still runs to its end on the blocking pool.
+    /// recovery parks a blocking thread instead.
+    ///
+    /// The report task holds its per-peer slot and its serve permit until the validation and
+    /// the acknowledgement end, also when the network layer cancels the request, because the
+    /// cancel only skips the reply (see [`Self::run_report_to_completion`]). The prefetch task
+    /// holds its permit across this await. So the validations in flight stay bounded by
+    /// `MAX_PENDING_REQUESTS_PER_PEER` for each committee key plus the prefetch cap, and the
+    /// bookkeeping of the handler (the failure count, the rejected digest, the cache insert and
+    /// the report to the primary) always runs.
     ///
     /// A validation failure is recorded (see [`Self::record_validation_failure`]) and returned.
     /// A validation task that does not complete (the runtime is shutting down) is an internal
@@ -415,7 +427,9 @@ where
     /// batch before any recovery, and a verified hash skips recovery (issue #1795).
     ///
     /// Validation runs on the blocking thread pool of the runtime, not on the tokio worker
-    /// thread that serves the report (see [`Self::validate_batch_blocking`]).
+    /// thread that serves the report (see [`Self::validate_batch_blocking`]). The
+    /// acknowledgement from the primary waits at most [`REPORT_ACK_TIMEOUT`]; a timeout is an
+    /// internal error with no penalty.
     pub(super) async fn process_report_batch(
         &self,
         peer: &BlsPublicKey,
@@ -458,13 +472,39 @@ where
             self.validate_and_cache_reported_batch(sealed_batch).await?;
         }
 
-        // notify primary for payload store
-        client
-            .report_others_batch(WorkerOthersBatchMessage::new(digest, self.id))
-            .await
-            .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
+        // notify primary for payload store; the cancel of the request does not bound this
+        // wait, so it has its own limit (a local fault, so no penalty)
+        tokio::time::timeout(
+            REPORT_ACK_TIMEOUT,
+            client.report_others_batch(WorkerOthersBatchMessage::new(digest, self.id)),
+        )
+        .await
+        .map_err(|_elapsed| {
+            WorkerNetworkError::Internal(format!(
+                "primary did not acknowledge reported batch {digest} within {REPORT_ACK_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Run a batch report to its end, then say whether its reply may still be sent.
+    ///
+    /// The report runs to its end, also when the network layer cancels the request, so the
+    /// per-peer slot and the serve permit that the caller holds cover the blocking validation,
+    /// the bookkeeping of the handler and the acknowledgement. The cancel only skips the reply:
+    /// the flag is `true` when no cancel arrived, and `false` when a cancel arrived or the
+    /// network layer dropped the sender.
+    pub(super) async fn run_report_to_completion(
+        &self,
+        peer: &BlsPublicKey,
+        sealed_batch: SealedBatch,
+        mut cancel: oneshot::Receiver<()>,
+    ) -> (WorkerNetworkResult<()>, bool) {
+        let res = self.process_report_batch(peer, sealed_batch).await;
+        let reply = matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        (res, reply)
     }
 
     /// Validate a reported batch, then cache it with the time it was received.
@@ -621,6 +661,27 @@ where
         batch: &Batch,
     ) -> WorkerNetworkResult<()> {
         self.validate_and_cache_prefetched_batch(digest, batch).await
+    }
+
+    /// Publicly available for tests.
+    /// Run an admitted report the way the report task of the worker network does: the task
+    /// holds `report_slot` until the report ends, also when `cancel` fires, and the flag says
+    /// whether a reply would be sent. See [Self::run_report_to_completion].
+    pub async fn pub_run_admitted_report(
+        &self,
+        peer: &BlsPublicKey,
+        sealed_batch: SealedBatch,
+        cancel: oneshot::Receiver<()>,
+        report_slot: tn_network_libp2p::PeerSlot,
+    ) -> (WorkerNetworkResult<()>, bool) {
+        let _report_slot = report_slot;
+        self.run_report_to_completion(peer, sealed_batch, cancel).await
+    }
+
+    /// Publicly available for tests.
+    /// Whether `digest` is in the per-epoch set of rejected reported batch digests.
+    pub fn pub_is_rejected_batch(&self, digest: &B256) -> bool {
+        self.rejected_batches.lock().contains(digest)
     }
 }
 
