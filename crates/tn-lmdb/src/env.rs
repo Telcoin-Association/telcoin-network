@@ -810,6 +810,11 @@ pub(crate) struct Writer {
     /// test reaches `EnvOptions::sync_period` without waiting for it.
     #[cfg(test)]
     pub(crate) clock_at: Option<Instant>,
+    /// Test-only: the unit a clean close's trim rounds the file's used length up to, in place of
+    /// the OS page (`sys::os_page_size`), so a suite on a host with 16 KiB pages runs the trim of
+    /// a 4 KiB-page host, which leaves the file no page past the ones in use.
+    #[cfg(test)]
+    pub(crate) trim_unit: Option<u64>,
 }
 
 /// [`SyncMode::NoSync`]'s bounds on the commits a sync waits for: [`EnvOptions::sync_period`] and
@@ -1367,10 +1372,14 @@ impl Writer {
     }
 
     /// The length a clean close may truncate the file to: [`Self::used_len`] rounded up to the OS
-    /// page.
+    /// page (in tests, to `trim_unit` when set).
     fn trim_len(&self) -> Result<u64> {
         let used = self.used_len()?;
-        used.checked_next_multiple_of(sys::os_page_size())
+        #[cfg(test)]
+        let unit = self.trim_unit.unwrap_or_else(sys::os_page_size);
+        #[cfg(not(test))]
+        let unit = sys::os_page_size();
+        used.checked_next_multiple_of(unit)
             .ok_or_else(|| Error::Failed(format!("no length holds {used} bytes")))
     }
 
@@ -1755,17 +1764,23 @@ impl Env {
             }
         }
         let file = open_locked(path, options.page_size)?;
+        // Step 4. A crash may have left a meta in the page cache whose msync never finished, a
+        // weak head whose pages a dead writer left there, or a created file whose name never
+        // reached the disk (a `create` that died, or failed, before its directory sync): make
+        // what this open reads, and the name it found it by, durable before anything is read or
+        // built on it (a directory that cannot be synced is skipped, with a warning:
+        // `sys::fsync_directory`). A weak head stays weak on disk: the next sync writes its
+        // steady meta. Then drop the file's cached pages (Linux), so every read of this open, the
+        // metas' and step 9's check, is the device's: a page a failed writeback left clean in the
+        // cache, its bytes never on the device and its error reported to the writer that is
+        // gone, would otherwise pass from the cache, and the next sync would write a steady meta
+        // naming pages the device lacks (README, "Open and recovery", step 4).
+        sys::fsync_file(&file)?;
+        sys::fsync_directory(parent_dir(path))?;
+        sys::drop_cached_pages(&file)?;
         let boot_id = sys::boot_id();
         let trusted = options.trust_unsynced.then_some(boot_id).flatten();
         let (chosen, geometry) = choose_state(&file, trusted)?;
-        // A crash may have left a meta in the page cache whose msync never finished, a weak head
-        // whose pages a dead writer left there, or a created file whose name never reached the
-        // disk (a `create` that died, or failed, before its directory sync): make what this open
-        // reads, and the name it found it by, durable before anything is built on them (a
-        // directory that cannot be synced is skipped, with a warning: `sys::fsync_directory`).
-        // A weak head stays weak on disk: the next sync writes its steady meta.
-        sys::fsync_file(&file)?;
-        sys::fsync_directory(parent_dir(path))?;
         let file =
             PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
         // macOS: that fsync leaves pages a crashed writer dirtied through its mapping unwritten (a
@@ -1830,6 +1845,8 @@ impl Env {
             stamped_on: 0,
             #[cfg(test)]
             clock_at: None,
+            #[cfg(test)]
+            trim_unit: None,
         };
         // A tail past the pages in use is an earlier process's, maybe sparse: the first growth
         // past those pages cuts it and grows again, preallocated. Nothing is written here.
@@ -2206,7 +2223,7 @@ fn create(path: &Path, page_size: u32) -> Result<()> {
 }
 
 /// The directory holding the entry `path` names (`.` for a bare file name): the one a [`create`]
-/// renames into and [`Env::open`] step 7 syncs.
+/// renames into and [`Env::open`] step 4 syncs.
 fn parent_dir(path: &Path) -> &Path {
     path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
@@ -2224,7 +2241,7 @@ fn remove_unused(tmp: &Path, file: &File) {
     }
 }
 
-/// Choose the state an open recovers from `file`, locked (open steps 4–6): the meta
+/// Choose the state an open recovers from `file`, locked and synced (open steps 5–7): the meta
 /// [`choose_meta`] picks, trusting weak metas of the boot `trusted` (`None`: none), and its
 /// geometry, refusing a slot's txn id with no next one ([`Chosen::next_txn`]) and a file shorter
 /// than the meta's pages. A trusted weak head the file is too short for lost its growth with the

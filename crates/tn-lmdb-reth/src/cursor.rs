@@ -641,12 +641,15 @@ enum Pos {
     /// A dup-sort cursor at the end of its key's rows, where MDBX's cursor stops stepping
     /// through them: left by its own delete of the key's last row while the key keeps earlier
     /// rows (the engine cursor is then on the row before the deleted one), and with `soft` by
-    /// `last` (and the moves that take the last row as `last` does). `current` returns the row;
-    /// `next` and `next_no_dup` the next key's first, by a seek past the key's rows (so rows put
-    /// since after the row are skipped, as MDBX skips them); `next_dup` and `next_dup_val`
-    /// nothing, and set `soft`; `last_dup`, and while not `soft` `prev` and `prev_dup`, the key's
-    /// last row; while `soft`, `prev` and `prev_dup` step back from the row. `delete_current`
-    /// deletes the row once `soft`, and before is `MDBX_ENODATA`.
+    /// `last` (and the moves that take the last row as `last` does). The row's key is kept
+    /// ([`Rows::end_key`], as for [`Pos::End`]): the steps past the key's rows are built from it,
+    /// not from the engine cursor's row, which another accessor's delete of the row moves to the
+    /// follower (the next key's first row, which a step from there would skip with its key).
+    /// `current` returns the row; `next` and `next_no_dup` the next key's first, by a seek past
+    /// the kept key's rows (so rows put since after the row are skipped, as MDBX skips them);
+    /// `next_dup` and `next_dup_val` nothing, and set `soft`; `last_dup`, and while not `soft`
+    /// `prev` and `prev_dup`, the key's last row; while `soft`, `prev` and `prev_dup` step back
+    /// from the row. `delete_current` deletes the row once `soft`, and before is `MDBX_ENODATA`.
     DupEnd { soft: bool },
 }
 
@@ -657,7 +660,7 @@ struct Rows {
     dup: Option<DupLayout>,
     pos: Pos,
     value: Vec<u8>,
-    /// The key of the row a [`Pos::End`] cursor is on (reused).
+    /// The stored key of the row a [`Pos::End`] or [`Pos::DupEnd`] cursor is on (reused).
     end_key: Vec<u8>,
 }
 
@@ -876,17 +879,32 @@ impl Rows {
 
     /// The position after a move that took the table's last row as MDBX's `last` does, the row
     /// of the stored key `landed` (`None`: the table is empty): on a dup-sort table, the end of
-    /// its key's rows; on another table, the end of the table, with the key kept.
+    /// its key's rows; on another table, the end of the table. The key is kept either way.
     fn ended(&mut self, landed: Option<&[u8]>) -> Pos {
         match landed {
-            Some(_) if self.dup.is_some() => Pos::DupEnd { soft: true },
             Some(key) => {
-                self.end_key.clear();
-                self.end_key.extend_from_slice(key);
-                Pos::End
+                self.keep_end_key(key);
+                if self.dup.is_some() {
+                    Pos::DupEnd { soft: true }
+                } else {
+                    Pos::End
+                }
             }
             None => Pos::Engine,
         }
+    }
+
+    /// Keep `key`, the stored key of the row an end position is on ([`Rows::end_key`]).
+    fn keep_end_key(&mut self, key: &[u8]) {
+        self.end_key.clear();
+        self.end_key.extend_from_slice(key);
+    }
+
+    /// Whether the engine cursor is still on the row a [`Pos::DupEnd`] or [`Pos::End`] cursor
+    /// ends on ([`Rows::end_key`]): once another accessor has deleted it, the engine cursor is on
+    /// its follower, and the kept key says where MDBX's cursor is.
+    fn still_on_end_row(&self, m: &mut impl Moves) -> tn_lmdb::Result<bool> {
+        Ok(m.current()?.is_some_and(|(key, _)| key == self.end_key))
     }
 
     /// Whether `row`, the engine cursor's current row as a [`Pos::End`] cursor's call found it,
@@ -919,7 +937,9 @@ impl Rows {
                     self.pos = Pos::Missed;
                     return Ok(None);
                 }
-                Pos::DupEnd { .. } => past_dup_end(pick, m, self.layout::<T>()?, false),
+                Pos::DupEnd { .. } => {
+                    past_dup_end(pick, m, self.layout::<T>()?, &self.end_key, false)
+                }
                 // Nothing, the cursor staying on the row; once another writer has deleted it,
                 // the follower, which `current` returns as `next` would.
                 Pos::End => {
@@ -943,16 +963,18 @@ impl Rows {
                     self.pos = Pos::Missed;
                     return Ok(None);
                 }
-                Pos::DupEnd { soft: false } => past_dup_end(pick, m, self.layout::<T>()?, true),
+                Pos::DupEnd { soft } => match self.still_on_end_row(m) {
+                    Ok(true) if soft => pick.prev(m),
+                    Ok(_) => past_dup_end(pick, m, self.layout::<T>()?, &self.end_key, true),
+                    Err(e) => Err(e),
+                },
                 // From a fresh cursor the last row, which MDBX takes by its `last`.
                 Pos::Fresh => {
                     let row = pick.prev(m);
                     self.pos = self.ended(landed(&row));
                     row
                 }
-                Pos::DupEnd { soft: true } | Pos::Engine | Pos::End | Pos::KeyDeleted => {
-                    pick.prev(m)
-                }
+                Pos::Engine | Pos::End | Pos::KeyDeleted => pick.prev(m),
             };
             row.map_err(error::read)?
         })
@@ -962,13 +984,21 @@ impl Rows {
         if self.pos == Pos::Missed {
             return Ok(None);
         }
-        pair!(self, pick => {
-            let row = pick.current(m).map_err(error::read)?;
-            if self.pos == Pos::End && !self.on_end_row(&row) {
+        if matches!(self.pos, Pos::End | Pos::DupEnd { .. })
+            && !self.still_on_end_row(m).map_err(error::read)?
+        {
+            if self.pos == Pos::End {
                 self.pos = Pos::Engine;
+            } else {
+                // Another accessor deleted the row: MDBX's cursor is past the key's rows, and
+                // reports the key's last row, or the follower once the key has none.
+                let dup = self.layout::<T>()?;
+                let row = past_dup_end_gone(PickTail(dup.subkey), m, dup, &self.end_key)
+                    .map_err(error::read)?;
+                return self.dup_pair::<T>(dup, row);
             }
-            row
-        })
+        }
+        pair!(self, pick => pick.current(m).map_err(error::read)?)
     }
 
     /// Move to the first row of `key` whose subkey is at or after `subkey` (MDBX's
@@ -1038,10 +1068,12 @@ impl Rows {
                 self.pos = pos;
                 Ok(None)
             }
-            Pos::DupEnd { soft: false } => past_dup_end(PickTail(dup.subkey), m, dup, true),
-            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End => {
-                m.prev_in_prefix_with_key_tail(dup.key, dup.subkey)
-            }
+            Pos::DupEnd { soft } => match self.still_on_end_row(m) {
+                Ok(true) if soft => m.prev_in_prefix_with_key_tail(dup.key, dup.subkey),
+                Ok(_) => past_dup_end(PickTail(dup.subkey), m, dup, &self.end_key, true),
+                Err(e) => Err(e),
+            },
+            Pos::Engine | Pos::End => m.prev_in_prefix_with_key_tail(dup.key, dup.subkey),
         }
     }
 
@@ -1060,7 +1092,9 @@ impl Rows {
                 self.pos = Pos::Missed;
                 return Ok(None);
             }
-            Pos::DupEnd { .. } => return past_dup_end(PickTail(dup.subkey), m, dup, false),
+            Pos::DupEnd { .. } => {
+                return past_dup_end(PickTail(dup.subkey), m, dup, &self.end_key, false)
+            }
             Pos::Engine | Pos::End | Pos::KeyDeleted => {}
         }
         match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
@@ -1082,21 +1116,37 @@ impl Rows {
     ) -> tn_lmdb::Result<Option<Tailed<'m>>> {
         let row = match self.pos {
             Pos::Fresh | Pos::Missed => return Ok(None),
-            Pos::DupEnd { .. } => past_dup_end(PickTail(dup.subkey), m, dup, true)?,
+            Pos::DupEnd { .. } => {
+                // The key's last row, wherever the engine cursor is. Once another accessor has
+                // emptied the key, MDBX's cursor is on the follower, and this is its key's last.
+                let key = &self.end_key[..dup.key];
+                let on_key = {
+                    let row = past_dup_end(PickEntry, m, dup, &self.end_key, true)?;
+                    row.is_some_and(|(stored, _)| dup.is_row_of(stored, key))
+                };
+                if on_key {
+                    m.current_with_key_tail(dup.subkey)?
+                } else if m.seek(&dup.past(&self.end_key))?.is_none() {
+                    None
+                } else {
+                    last_dup_of_current_key(m, dup)?
+                }
+            }
             Pos::Engine | Pos::End | Pos::KeyDeleted => {
                 if m.current()?.is_none() {
                     return Ok(None);
                 }
-                match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
-                    Some(past) => {
-                        m.seek(&past)?;
-                        m.prev_with_key_tail(dup.subkey)?
-                    }
-                    None => m.current_with_key_tail(dup.subkey)?,
-                }
+                last_dup_of_current_key(m, dup)?
             }
         };
-        self.pos = if row.is_some() { Pos::DupEnd { soft: true } } else { Pos::Engine };
+        self.pos = match &row {
+            Some((key, _)) => {
+                let key = *key;
+                self.keep_end_key(key);
+                Pos::DupEnd { soft: true }
+            }
+            None => Pos::Engine,
+        };
         Ok(row)
     }
 
@@ -1131,16 +1181,61 @@ impl Rows {
     }
 }
 
-/// From a [`Pos::DupEnd`] row, past its key's rows by a `seek` of [`DupLayout::past`] (which also
-/// steps past the end an engine cursor's `last` sets): the next key's first row, or with `back`
-/// the key's last row, its last move `pick`'s.
-fn past_dup_end<P: Pick>(pick: P, m: &mut impl Moves, dup: DupLayout, back: bool) -> Picked<'_, P> {
-    let Some(past) = m.current()?.map(|(stored, _)| dup.past(stored)) else { return Ok(None) };
+/// From a [`Pos::DupEnd`] row of stored key `end_key` ([`Rows::end_key`]), past its key's rows by
+/// a `seek` of [`DupLayout::past`] (which also steps past the end an engine cursor's `last`
+/// sets): the next key's first row, or with `back` the key's last row, its last move `pick`'s.
+/// The kept key, not the engine cursor's row: another accessor's delete of the row leaves the
+/// engine cursor on the follower, the next key's first row, whose key a step past would skip.
+fn past_dup_end<'m, P: Pick>(
+    pick: P,
+    m: &'m mut impl Moves,
+    dup: DupLayout,
+    end_key: &[u8],
+    back: bool,
+) -> Picked<'m, P> {
+    let past = dup.past(end_key);
     if back {
         m.seek(&past)?;
         pick.prev(m)
     } else {
         pick.seek(m, &past)
+    }
+}
+
+/// From a [`Pos::DupEnd`] row of stored key `end_key` that another accessor deleted, where
+/// MDBX's cursor is past the key's rows: the key's last row, or, the key left no row, the next
+/// key's first (the follower), its last move `pick`'s.
+fn past_dup_end_gone<'m, P: Pick>(
+    pick: P,
+    m: &'m mut impl Moves,
+    dup: DupLayout,
+    end_key: &[u8],
+) -> Picked<'m, P> {
+    let key = &end_key[..dup.key];
+    let on_key = {
+        let row = past_dup_end(PickEntry, m, dup, end_key, true)?;
+        row.is_some_and(|(stored, _)| dup.is_row_of(stored, key))
+    };
+    if on_key {
+        pick.current(m)
+    } else {
+        pick.seek(m, &dup.past(end_key))
+    }
+}
+
+/// The last row of the key of the row the engine cursor is on (there is one): past the key's
+/// rows and back one when another row of the key follows, else the current row. The last move is
+/// a tail form, or `current_with_key_tail`.
+fn last_dup_of_current_key<'m>(
+    m: &'m mut impl Moves,
+    dup: DupLayout,
+) -> tn_lmdb::Result<Option<Tailed<'m>>> {
+    match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
+        Some(past) => {
+            m.seek(&past)?;
+            m.prev_with_key_tail(dup.subkey)
+        }
+        None => m.current_with_key_tail(dup.subkey),
     }
 }
 
@@ -1445,6 +1540,8 @@ struct Parked {
     number: NonZeroU64,
     cursor: WriteCursor,
     pos: Pos,
+    /// The row's key when `pos` is [`Pos::DupEnd`] ([`Rows::end_key`]).
+    end_key: Vec<u8>,
 }
 
 impl Deferred {
@@ -1516,27 +1613,29 @@ impl Deferred {
         });
         let mut cursor = placed.map_err(|e| self.fail(e))?;
         self.count(BY_OTHER);
-        let pos = self.run(&mut cursor, txn, &table, dup)?;
-        self.parked.push(Parked { number, cursor, pos });
+        let mut end_key = Vec::new();
+        let pos = self.run(&mut cursor, txn, &table, dup, &mut end_key)?;
+        self.parked.push(Parked { number, cursor, pos, end_key });
         Ok(())
     }
 
     /// Run a held delete in `table` (of layout `dup`) through `cursor`, an engine cursor on its
-    /// row, and return where the reth cursor then is ([`after_delete`]); a failure is kept
-    /// ([`Self::failure`]).
+    /// row, and return where the reth cursor then is ([`after_delete`], the row's key in
+    /// `end_key` when it ends its key's rows); a failure is kept ([`Self::failure`]).
     fn run(
         &mut self,
         cursor: &mut WriteCursor,
         txn: &mut RwTxn,
         table: &EngineTable,
         dup: DupLayout,
+        end_key: &mut Vec<u8>,
     ) -> tn_lmdb::Result<Pos> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next) {
             return Err(self.fail(tn_lmdb::Error::StaleTable(table.name().into())));
         }
         let ran = match cursor.delete_current(txn) {
-            Ok(true) => after_delete(cursor, txn, dup),
+            Ok(true) => after_delete(cursor, txn, dup, end_key),
             Ok(false) => Err(held_row_missing(table)),
             Err(e) => Err(e),
         };
@@ -1629,14 +1728,24 @@ fn invariant_broken(table: &EngineTable, what: &str) -> tn_lmdb::Error {
 /// Where a cursor over a dup-sort table of layout `dup` is right after its engine cursor deleted
 /// a row: the key keeps later rows if the follower is the key's (the engine tells from the keys it
 /// kept, without a step: [`Pos::Engine`]), else earlier ones if a step back finds one (the cursor
-/// then on it, ending the key's rows: [`Pos::DupEnd`]), else none ([`Pos::KeyDeleted`]).
-fn after_delete(cursor: &mut WriteCursor, txn: &RwTxn, dup: DupLayout) -> tn_lmdb::Result<Pos> {
-    Ok(if cursor.follower_shares_prefix(txn, dup.key)? {
-        Pos::Engine
-    } else if cursor.prev_in_prefix(txn, dup.key)?.is_some() {
-        Pos::DupEnd { soft: false }
-    } else {
-        Pos::KeyDeleted
+/// then on it, ending the key's rows: [`Pos::DupEnd`], the row's key kept in `end_key`), else
+/// none ([`Pos::KeyDeleted`]).
+fn after_delete(
+    cursor: &mut WriteCursor,
+    txn: &RwTxn,
+    dup: DupLayout,
+    end_key: &mut Vec<u8>,
+) -> tn_lmdb::Result<Pos> {
+    if cursor.follower_shares_prefix(txn, dup.key)? {
+        return Ok(Pos::Engine);
+    }
+    Ok(match cursor.prev_in_prefix(txn, dup.key)? {
+        Some((stored, _)) => {
+            end_key.clear();
+            end_key.extend_from_slice(stored);
+            Pos::DupEnd { soft: false }
+        }
+        None => Pos::KeyDeleted,
     })
 }
 
@@ -1657,12 +1766,15 @@ fn settle(
         match (deferred.take(number), txn.as_mut()) {
             (Some(Pending { table, dup, .. }), Some(txn)) => {
                 deferred.count(BY_OWNER);
-                rows.pos = deferred.run(cursor, txn, &table, dup).map_err(error::delete)?;
+                rows.pos = deferred
+                    .run(cursor, txn, &table, dup, &mut rows.end_key)
+                    .map_err(error::delete)?;
             }
             _ => {
                 if let Some(parked) = deferred.unpark(number) {
                     *cursor = parked.cursor;
                     rows.pos = parked.pos;
+                    rows.end_key = parked.end_key;
                 }
             }
         }
@@ -1742,9 +1854,9 @@ impl<T: Table> Drop for TnLmdbCursorMut<T> {
         let TxnState { txn, deferred } = &mut *guard;
         match (deferred.take(number), txn.as_mut()) {
             (Some(Pending { table, dup, .. }), Some(txn)) => {
-                // A failure is kept by `run`.
+                // A failure is kept by `run`; where the cursor lands no longer matters.
                 deferred.count(BY_OWNER);
-                drop(deferred.run(&mut self.cursor, txn, &table, dup));
+                drop(deferred.run(&mut self.cursor, txn, &table, dup, &mut self.rows.end_key));
             }
             _ => drop(deferred.unpark(number)),
         }
@@ -1801,7 +1913,8 @@ impl<T: Table> TnLmdbCursorMut<T> {
                     // commit can follow: the delete does not run, and the put's error is the
                     // call's.
                     state.deferred.count(BY_OWNER);
-                    if let Ok(pos) = state.deferred.run(cursor, txn, &table, dup) {
+                    if let Ok(pos) = state.deferred.run(cursor, txn, &table, dup, &mut rows.end_key)
+                    {
                         rows.pos = pos;
                     }
                 }
@@ -1873,7 +1986,9 @@ impl<T: Table> TnLmdbCursorMut<T> {
                     if last_is_row_of(txn, table, dup, key).map_err(fail)? {
                         insert_dup_at(cursor, txn, table, stored, rest)
                     } else {
-                        cursor.last(txn).map_err(fail)?;
+                        if let Some((stored, _)) = cursor.last(txn).map_err(fail)? {
+                            rows.keep_end_key(stored);
+                        }
                         rows.pos = Pos::DupEnd { soft: true };
                         return Err(fail(tn_lmdb::Error::AppendOutOfOrder));
                     }
@@ -2014,14 +2129,13 @@ impl<T: Table> DbCursorRW<T> for TnLmdbCursorMut<T> {
             (_, dup) => dup,
         };
         let txn = live(&mut state.txn, error::delete)?;
-        // At a dup key's end after `last`, the row is found again by key first, which ends the
-        // engine cursor's end.
+        // At a dup key's end after `last`, the row is found again by its kept key first, which
+        // ends the engine cursor's end; a row another accessor deleted since is `MDBX_ENODATA`
+        // (never the follower, which the engine cursor is on then).
         if rows.pos == (Pos::DupEnd { soft: true }) {
-            let Some((stored, _)) = cursor.current(txn).map_err(error::delete)? else {
+            if cursor.seek_exact(txn, &rows.end_key).map_err(error::delete)?.is_none() {
                 return Err(no_data());
-            };
-            let stored = stored.to_vec();
-            cursor.seek_exact(txn, &stored).map_err(error::delete)?;
+            }
         } else if let Some(dup) = dup {
             // The row the cursor is on, held; none is `MDBX_ENODATA` now, as the engine's delete
             // would find none.
@@ -2035,7 +2149,7 @@ impl<T: Table> DbCursorRW<T> for TnLmdbCursorMut<T> {
             return Err(no_data());
         }
         let Some(dup) = dup else { return Ok(()) };
-        rows.pos = after_delete(cursor, txn, dup).map_err(error::delete)?;
+        rows.pos = after_delete(cursor, txn, dup, &mut rows.end_key).map_err(error::delete)?;
         Ok(())
     }
 }

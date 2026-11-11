@@ -407,8 +407,8 @@ fn an_mdbx_database_migrates_row_for_row() {
     for gone in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATING_DIR] {
         assert!(!exists(&path.join(gone)), "{gone} is removed");
     }
-    // the migration leaves reth's version as MDBX had it; the open after it records tn-lmdb's,
-    // which an MDBX-only binary refuses
+    // MDBX had reth's version; the migration records tn-lmdb's at its commit point, which an
+    // MDBX-only binary refuses
     assert_eq!(version_bytes, reth_db::version::DB_VERSION.to_string().as_bytes(), "MDBX's");
     assert_eq!(
         reth_db::version::get_db_version(&path).expect("a version"),

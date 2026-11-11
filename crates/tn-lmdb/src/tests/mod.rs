@@ -59,6 +59,22 @@ fn open(path: &Path, sync: SyncMode) -> Env {
     Env::open(path, options(sync)).expect("open")
 }
 
+/// The units a test runs a clean close's trim at: the host's OS page (`None`), and 4 KiB, the
+/// page of the hosts the node runs on (x86_64 Linux), where the trim leaves a 4 KiB-page file no
+/// page past the ones in use. On a host with 4 KiB pages the two are the same trim.
+pub(crate) fn trim_units() -> [Option<u64>; 2] {
+    [None, Some(4096)]
+}
+
+/// Close the cleanly closed file at `path` again with its trim rounded to `trim_unit`
+/// (`Writer::trim_unit`; `None`: the OS page), so the file past its pages in use is what a close
+/// on a host with that OS page leaves. A durable open changes nothing else.
+pub(crate) fn retrim(path: &Path, trim_unit: Option<u64>) {
+    let env = open(path, SyncMode::Durable);
+    env.with_writer(|w| w.trim_unit = trim_unit);
+    drop(env);
+}
+
 /// `Env::check`, which must pass, and whose page counts must add up to the page count.
 fn check(env: &Env) -> CheckReport {
     let r = env.check().expect("check");

@@ -1,6 +1,7 @@
 # tn
 
-The `tn` namespace serves Telcoin Network data that has no `eth` equivalent: the node's identity and consensus participation mode, consensus headers and signed epoch records, the millisecond commit time of execution blocks, and validator, committee and staking state from the `ConsensusRegistry` system contract at `0x07E17e17E17e17E17e17E17E17E17e17e17E17e1`. Registry methods read the contract at the node's canonical tip and take no block parameter.
+The `tn` namespace serves Telcoin Network data that has no `eth` equivalent: the node's identity, consensus participation mode and peer admission view, consensus headers and signed epoch records, the millisecond commit time of execution blocks, and validator, committee and staking state from the `ConsensusRegistry` system contract at `0x07E17e17E17e17E17e17E17E17E17e17e17E17e1`.
+Registry methods read the contract at the node's canonical tip and take no block parameter.
 
 `tn` is on by default: a node serves it unless `--http.api` or `--ws.api` names a list without it. The cost to serve it is low to moderate. Most methods answer from memory or the node's database; registry methods run a read-only contract call against the latest state. The blocking work behind these methods is capped at 64 concurrent requests per RPC server, and requests beyond that queue rather than fail. Public RPC nodes (observers) should serve it; see [Enabling Namespaces](../enabling-namespaces.md).
 
@@ -10,6 +11,9 @@ The `tn` namespace serves Telcoin Network data that has no `eth` equivalent: the
 > Validators should not expose the `tn` namespace publicly. A [tn\_getBlockTimestampMillis](tn_getblocktimestampmillis.md) request for a block from a sealed epoch can open that epoch's consensus pack, and the node opens packs into a small cache it shares with state sync and peer epoch serving. The lookup runs under a tight concurrency bound, but public callers can still churn that cache.
 >
 > Omit `tn` from the validator's `--http.api` and `--ws.api` and serve the namespace from non-validating nodes instead; see [Enabling Namespaces](../enabling-namespaces.md).
+>
+> The warning is about public exposure.
+> A validator may serve `tn` on a loopback-only listener (`--http.addr 127.0.0.1`, the default) for its own host tooling, such as the firewall feed from [tn\_admissionSnapshot](tn_admissionsnapshot.md).
 
 Errors use these codes: a registry call that reverts is reported as `eth_call` reports one, with code `3`, a message that starts with `execution reverted`, and the ABI-encoded revert data in `data`; `-32001` (`Not Found.`) means the node does not have the requested record; `-32602` is an invalid parameter; `-32603` (`internal error`) is a failure inside the node, whose detail is only logged on the node.
 
@@ -20,6 +24,7 @@ Example values are illustrative; field names and types match what the node retur
 | **Node** | |
 | [tn\_info](tn_info.md) | The node's publicly available identity and connection information: name, ids, public keys and network addresses |
 | [tn\_nodeMode](tn_nodemode.md) | The node's current consensus participation mode, read live at call time |
+| [tn\_admissionSnapshot](tn_admissionsnapshot.md) | Each swarm's connection admission status and the committee, scheduled, eligible, trusted and bootstrap keys it lists, with their addresses, for host firewall tooling |
 | **Consensus** | |
 | [tn\_latestConsensusHeader](tn_latestconsensusheader.md) | The latest consensus header |
 | [tn\_latestHeader](tn_latestheader.md) | Deprecated alias for `tn_latestConsensusHeader` |

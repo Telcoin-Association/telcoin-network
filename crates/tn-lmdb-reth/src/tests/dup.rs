@@ -478,7 +478,14 @@ fn dup_steps<D: Database>(db: &D, steps: &str) -> String {
 /// second, the calls that match MDBX's are those that do not step (`current`, `delete_current`,
 /// `last_dup`, `delete_current_duplicates`), `next_dup`, and any call after a third `append`.
 /// Right after a delete that leaves a key no rows, `prev_dup` finds nothing, even once another
-/// writer has put rows of the key again.
+/// writer has put rows of the key again. A cursor ending a key's rows (after `last_dup`, or
+/// after its own delete of the key's last row) whose row the transaction then deletes is past
+/// the key's rows, as MDBX's is: `next` and `next_no_dup` take the next key's first row, never
+/// skipping that key (the step is built from the kept key, not from the engine cursor, which is
+/// on the follower); `current`, `prev`, `prev_dup` and `last_dup` the key's last row (one put
+/// since included), or, the key emptied, the follower and its key's last row. A `delete_current`
+/// or `delete_current_duplicates` there is not compared: libmdbx aborts in `tree_rebalance` when
+/// a cursor's dup key was changed by another accessor (crate docs, class 3).
 const DUP_MATCHED: &[&str] = &[
     "sk:1/3 d c n",
     "sk:1/3 d nd nd",
@@ -595,15 +602,43 @@ const DUP_MATCHED: &[&str] = &[
     "a:5/1 a:5/2 a:5/3 tap:5/4 n",
     "se:2 d put:2/3 pd n",
     "se:1 dd put:1/2 pd c",
+    "sk:1/5 ld del:1/5 n",
+    "sk:1/5 ld del:1/5 nnd",
+    "sk:1/5 ld del:1/5 ld",
+    "sk:1/5 ld del:1/5 c",
+    "sk:1/5 ld del:1/5 p",
+    "sk:1/5 ld del:1/5 pd",
+    "sk:1/5 ld del:1/5 nd",
+    "sk:1/5 d del:1/3 n",
+    "sk:1/5 d del:1/3 p",
+    "sk:1/5 d del:1/3 pd",
+    "sk:1/5 d del:1/3 nnd",
+    "sk:1/5 d del:1/3 ld",
+    "sk:1/5 d del:1/3 c",
+    "sk:1/5 d del:1/3 nd",
+    "sk:1/5 ld del:1/5 put:1/6 n",
+    "sk:1/5 ld del:1/5 put:1/4 n",
+    "sk:1/5 ld del:1/5 put:1/4 ld",
+    "sk:1/5 ld del:1/5 put:1/6 ld",
+    "sk:1/5 ld del:1/5 put:1/6 pd",
+    "sk:1/5 d del:1/3 del:1/1 n",
+    "sk:1/5 d del:1/3 del:1/1 p",
+    "sk:1/5 d del:1/3 del:1/1 ld",
+    "sk:1/5 d del:1/3 del:1/1 c",
 ];
 
 #[test]
 fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
     on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
-        for seq in DUP_MATCHED {
-            assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq));
-        }
+        let differ: Vec<String> = DUP_MATCHED
+            .iter()
+            .filter_map(|seq| {
+                let (on_tn_lmdb, on_mdbx) = (dup_steps(&db, seq), dup_steps(&mdbx, seq));
+                (on_tn_lmdb != on_mdbx).then(|| format!("tn-lmdb {on_tn_lmdb}\n   MDBX {on_mdbx}"))
+            })
+            .collect();
+        assert!(differ.is_empty(), "sequences that differ from MDBX:\n{}", differ.join("\n"));
     });
 }
 

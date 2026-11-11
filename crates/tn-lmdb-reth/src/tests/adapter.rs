@@ -1022,9 +1022,10 @@ fn metrics_report_every_table_as_mdbx_does() {
     metrics_writes(&db);
     let (want, have) = (gauges(&mdbx), gauges(&db));
 
-    // The same gauges, names and labels.
+    // The same gauges, names and labels, plus tn-lmdb's two.
     let names = |g: &BTreeMap<_, _>| g.keys().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(names(&have), names(&want));
+    let own = ["db.oldest_reader_age_seconds", "db.latched"].map(|n| (n.to_string(), vec![]));
+    assert_eq!(names(&have), names(&want).into_iter().chain(own).collect());
     let label = |table: &str| vec![("table".to_string(), table.to_string())];
     for table in Tables::ALL.iter().map(Tables::name) {
         // The same entries in every table.
@@ -1063,6 +1064,20 @@ fn metrics_report_every_table_as_mdbx_does() {
     let report = db.env().check().unwrap();
     assert!(report.free_pages > report.free_records, "{report:?}");
     assert_eq!(have[&("db.freelist".to_string(), vec![])], report.free_pages as f64);
+
+    // tn-lmdb's own: no reader holds a superseded snapshot, and nothing has latched.
+    let own = |name: &str| gauges(&db)[&(name.to_string(), vec![])];
+    assert_eq!(own("db.latched"), 0.0);
+    assert_eq!(own("db.oldest_reader_age_seconds"), 0.0);
+    // A reader that outlives a commit holds a superseded snapshot: its age is reported.
+    let reader = db.env().begin_ro().unwrap();
+    db.update(|tx| tx.put::<CanonicalHeaders>(0, B256::ZERO)).unwrap().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(own("db.oldest_reader_age_seconds") >= 0.005);
+    // Ended, the next commit clears it.
+    drop(reader);
+    db.update(|tx| tx.put::<CanonicalHeaders>(1, B256::ZERO)).unwrap().unwrap();
+    assert_eq!(own("db.oldest_reader_age_seconds"), 0.0);
 }
 
 /// `gauge_metrics` reports exactly the tables and figures of `table_stats`.

@@ -190,11 +190,23 @@ fn open_tn_lmdb_with(
     } else {
         args
     };
+    // The version check first: a directory another binary wrote is refused before the backend
+    // guard migrates or opens anything in it.
+    check_db_version_file(path)?;
     check_backend(path, args)?;
-    init_db_version_file(path)?;
+    record_db_version_file(path)?;
     let mut env = TnLmdbEnv::open(path, TnLmdbEnvKind::RW, args).wrap_err_with(|| {
         format!("failed to open the tn-lmdb reth database at {}", path.display())
     })?;
+    // A page below the OS page puts both meta pages in one OS page, which every meta msync and
+    // every writeback of the pages sharing it rewrites unchanged: harmless where sector writes
+    // are atomic, and the file's page size is fixed at its creation (tn-lmdb's README, Platform
+    // notes). Say so once, so a 64 KiB-page kernel (some arm64 and ppc64 distributions) is not
+    // run on the 4 KiB default unawares; `--db.page-size` sets a new file's.
+    let os_page = u32::try_from(page_size::get()).unwrap_or(u32::MAX);
+    if env.page_size() < os_page {
+        tracing::warn!(target: "tn::reth", path = %path.display(), page_size = env.page_size(), os_page_size = os_page, "the tn-lmdb database's page is smaller than the OS page: both meta pages share one OS page, which every commit's meta sync rewrites; harmless on a drive with atomic sector writes (see tn-lmdb's README, Platform notes); a new file takes --db.page-size");
+    }
     env.create_tables()?;
     record_client_version(&env, client_version)?;
     Ok(Arc::new(env))
@@ -204,7 +216,8 @@ fn open_tn_lmdb_with(
 ///
 /// Opening the wrong engine would create an empty database beside the datadir's static files,
 /// and reth's `check_consistency` then prunes the static files back to the empty database's tip:
-/// the node would lose its chain. Each check is `try_exists`, so a stat error fails the open and
+/// the node would lose its chain. Each check stats the name itself (`symlink_metadata`: a
+/// symbolic link counts as present, dangling or not), so a stat error fails the open and
 /// is never read as an absent file.
 ///
 /// The MDBX build refuses `tn-lmdb.dat`, and a migrated directory whose `tn-lmdb.dat` is missing
@@ -257,7 +270,8 @@ fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
 ///
 /// Opening the wrong engine would create an empty database beside the datadir's static files,
 /// and reth's `check_consistency` then prunes the static files back to the empty database's tip:
-/// the node would lose its chain. Each check is `try_exists`, so a stat error fails the open and
+/// the node would lose its chain. Each check stats the name itself (`symlink_metadata`: a
+/// symbolic link counts as present, dangling or not), so a stat error fails the open and
 /// is never read as an absent file.
 ///
 /// The tn-lmdb build moves an MDBX database (`mdbx.dat`) onto tn-lmdb instead, through
@@ -322,6 +336,10 @@ pub struct DbTableStat {
     pub total_size: u64,
 }
 
+/// The engine this build runs reth's database on, for logs and reports: `"tn-lmdb"` by default,
+/// `"MDBX"` with the `mdbx` feature. A node logs it when it opens the database.
+pub const BACKEND: &str = if cfg!(feature = "mdbx") { "MDBX" } else { "tn-lmdb" };
+
 /// Whether [`db_table_stats`] needs the node stopped. The MDBX build reads beside a running node.
 /// The tn-lmdb build cannot: its read-only open is refused while another handle holds the database
 /// with write access, so a caller holds the datadir lock for the report, and a node starting
@@ -356,6 +374,140 @@ pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
         Ok::<(), eyre::Report>(())
     })??;
     Ok(stats)
+}
+
+/// Open the tn-lmdb reth database in directory `path` read-only, for a tool run while the node is
+/// stopped ([`db_table_stats`], [`db_check`]): the directory's state is checked first, as
+/// [`db_table_stats`] documents (an MDBX database, pending or unfinished migration, or a stray
+/// `mdbx.dat` is refused; no `tn-lmdb.dat` is no database), and a database another handle holds
+/// (the adapter reports it as MDBX's `MDBX_BUSY`) is refused saying to stop the node.
+#[cfg(not(feature = "mdbx"))]
+fn open_tn_lmdb_read_only(path: &Path) -> eyre::Result<tn_lmdb_reth::TnLmdbEnv> {
+    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
+    use tn_lmdb_reth::{TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
+
+    let mdbx = path.join(MDBX_DATA_FILE);
+    if file_exists(&mdbx)? {
+        if file_exists(&path.join(MIGRATED_MARKER))? {
+            return Err(migrate::written_after_migration(path));
+        }
+        if file_exists(&path.join(DATA_FILE))? && !migrate::stopped_after_commit_point(path)? {
+            return Err(migrate::both_engines(path));
+        }
+        eyre::bail!(
+            "the reth database at {} holds an MDBX database ({} exists): its MDBX to tn-lmdb \
+             migration is pending or unfinished; start the node to run it",
+            path.display(),
+            mdbx.display(),
+        );
+    }
+    let tn_lmdb = path.join(DATA_FILE);
+    if !file_exists(&tn_lmdb)? {
+        eyre::bail!(
+            "no reth database at {}: neither {} nor {} exists",
+            path.display(),
+            tn_lmdb.display(),
+            mdbx.display(),
+        );
+    }
+
+    let busy = MdbxError::Busy.to_err_code();
+    TnLmdbEnv::open(path, TnLmdbEnvKind::RO, TnLmdbArgs::default()).map_err(|e| match e {
+        DatabaseError::Open(info) if info.code == busy => {
+            eyre::eyre!("the reth database at {} is in use: stop the node first", path.display())
+        }
+        e => eyre::Report::new(e)
+            .wrap_err(format!("failed to open the tn-lmdb reth database at {}", path.display())),
+    })
+}
+
+/// What [`db_check`] found in the database's newest committed state: the engine's full check
+/// passed, and these are its figures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbCheckReport {
+    /// The id of the state checked.
+    pub txn_id: u64,
+    /// Its page count: the two meta pages plus the catalog, table, free-tree and free pages.
+    pub page_count: u64,
+    /// The pages of the catalog's tree.
+    pub catalog_pages: u64,
+    /// The pages of every table's tree, overflow runs included.
+    pub table_pages: u64,
+    /// The pages of the free tree.
+    pub free_tree_pages: u64,
+    /// The pages the free list lists as reusable.
+    pub free_pages: u64,
+    /// Each table the database holds, sorted by name.
+    pub tables: Vec<DbTableCheck>,
+}
+
+/// One table in a [`DbCheckReport`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbTableCheck {
+    /// The table's name.
+    pub name: String,
+    /// Its rows (each value of a dup-sort table is one).
+    pub entries: u64,
+    /// The pages of its tree, overflow runs included.
+    pub pages: u64,
+    /// The height of its tree (0: empty).
+    pub height: u64,
+}
+
+/// Whether [`db_check`] needs the node stopped: as [`db_table_stats`] does, on the tn-lmdb build.
+pub const DB_CHECK_NEEDS_STOPPED_NODE: bool = DB_TABLE_STATS_NEEDS_STOPPED_NODE;
+
+/// Check the reth database in directory `path` at rest (behind `telcoin-network db check`): the
+/// tn-lmdb engine's full check of its newest committed state (every page's CRC and structure,
+/// every tree, every overflow run, each table's entry and page counts, and the exact accounting
+/// of the file's pages), which reads do not run (the engine checks a page's bounds and identity
+/// on every read, its CRC only before a copy, a reuse or here). Damage is an error naming what
+/// failed, and nothing is changed: the file is opened read-only. The directory's state is
+/// checked as [`db_table_stats`] does, and the node must be stopped
+/// ([`DB_CHECK_NEEDS_STOPPED_NODE`]).
+///
+/// The MDBX build has no such check: MDBX keeps no page checksums, and reth has no checker. It
+/// refuses with an error saying so.
+#[cfg(not(feature = "mdbx"))]
+pub fn db_check(path: &Path) -> eyre::Result<DbCheckReport> {
+    let env = open_tn_lmdb_read_only(path)?;
+    let report = env.check().map_err(|e| {
+        eyre::Report::new(e).wrap_err(format!(
+            "the reth database at {} fails its check ({})",
+            path.display(),
+            env.failure().unwrap_or_else(|| "no detail recorded".to_string())
+        ))
+    })?;
+    Ok(DbCheckReport {
+        txn_id: report.txn_id,
+        page_count: u64::from(report.page_count),
+        catalog_pages: report.catalog_pages,
+        table_pages: report.table_pages,
+        free_tree_pages: report.free_tree_pages,
+        free_pages: report.free_pages,
+        tables: report
+            .tables
+            .iter()
+            .map(|(name, table)| DbTableCheck {
+                name: name.clone(),
+                entries: table.entries,
+                pages: table.pages,
+                height: u64::from(table.height),
+            })
+            .collect(),
+    })
+}
+
+/// [`db_check`] on the MDBX build: refused, MDBX keeps no page checksums and reth has no checker.
+/// The directory is not opened.
+#[cfg(feature = "mdbx")]
+pub fn db_check(path: &Path) -> eyre::Result<DbCheckReport> {
+    eyre::bail!(
+        "`db check` runs the tn-lmdb engine's check of the reth database, and this build runs \
+         reth on MDBX, which keeps no page checksums to check (the database at {} was not \
+         opened): build without the `mdbx` feature",
+        path.display()
+    )
 }
 
 /// The figures of table `name` in the MDBX database `tx` reads, or `None` if the database lacks
@@ -405,8 +557,7 @@ fn mdbx_table_stat(
 /// is no reth database at `path`.
 #[cfg(not(feature = "mdbx"))]
 pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
-    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
-    use tn_lmdb_reth::{TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
+    use tn_lmdb_reth::DATA_FILE;
 
     let mdbx = path.join(MDBX_DATA_FILE);
     if file_exists(&mdbx)? {
@@ -423,31 +574,7 @@ pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
             mdbx.display(),
         );
     }
-    let tn_lmdb = path.join(DATA_FILE);
-    if !file_exists(&tn_lmdb)? {
-        eyre::bail!(
-            "no reth database at {}: neither {} nor {} exists",
-            path.display(),
-            tn_lmdb.display(),
-            mdbx.display(),
-        );
-    }
-
-    // The adapter reports a database another handle holds as MDBX's `MDBX_BUSY`.
-    let busy = MdbxError::Busy.to_err_code();
-    let env =
-        TnLmdbEnv::open(path, TnLmdbEnvKind::RO, TnLmdbArgs::default()).map_err(|e| match e {
-            DatabaseError::Open(info) if info.code == busy => {
-                eyre::eyre!(
-                    "the reth database at {} is in use: stop the node first",
-                    path.display()
-                )
-            }
-            e => eyre::Report::new(e).wrap_err(format!(
-                "failed to open the tn-lmdb reth database at {}",
-                path.display()
-            )),
-        })?;
+    let env = open_tn_lmdb_read_only(path)?;
     let page_size = u64::from(env.page_size());
     let mut stats: Vec<_> = env
         .table_stats()
@@ -470,9 +597,17 @@ pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
 
 /// Whether `file` exists. A stat error is an error, never "absent".
 fn file_exists(file: &Path) -> eyre::Result<bool> {
-    file.try_exists().wrap_err_with(|| {
-        format!("failed to check for {} before opening the reth database", file.display())
-    })
+    // `symlink_metadata`, not `try_exists`: a symbolic link counts as present whether or not its
+    // target does. A dangling `mdbx.dat` or `tn-lmdb.dat` link would otherwise read as no
+    // database, and the open would create a fresh one beside the datadir's static files, which
+    // reth's consistency check then prunes down to it.
+    match std::fs::symlink_metadata(file) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).wrap_err_with(|| {
+            format!("failed to check for {} before opening the reth database", file.display())
+        }),
+    }
 }
 
 /// Map reth's `--db.*` flags onto the tn-lmdb adapter's settings.
@@ -593,29 +728,78 @@ const SAFE_NO_SYNC_BYTES: u64 = 64 << 20;
 /// The version the tn-lmdb build records in reth's `database.version` file: reth's schema version
 /// (`reth_db::version::DB_VERSION`, 2) plus 1000, so never a version reth itself writes.
 ///
-/// It is a rollback tripwire. A binary that runs reth on MDBX alone (`v0.16.0-adiri`, whose reth
-/// `create_db` checks this file before it opens anything) refuses any version but reth's
-/// ("breaking database change detected: your database version (v1002) ..."). Without it such a
-/// binary, started over a tn-lmdb `db/`, creates an empty `mdbx.dat` beside `tn-lmdb.dat`, and
-/// reth's consistency check prunes the static files down to that empty database before the start
-/// fails. The MDBX build of this tree refuses a tn-lmdb `db/` by its data file first
-/// (`check_backend`), and writes reth's own version.
+/// It is a rollback tripwire. A binary that runs reth on MDBX alone (a release from before the
+/// backend guard, `v0.16.0-adiri` among them, whose reth `create_db` checks this file before it
+/// opens anything) refuses any version but reth's ("breaking database change detected: your
+/// database version (v1002) ..."). Without it such a binary, started over a tn-lmdb `db/`, creates
+/// an empty `mdbx.dat` beside `tn-lmdb.dat`, and reth's consistency check prunes the static files
+/// down to that empty database before the start fails. The MDBX build of this tree refuses a
+/// tn-lmdb `db/` by its data file first (`check_backend`), and writes reth's own version.
 #[cfg(not(feature = "mdbx"))]
 pub(crate) const TN_LMDB_DB_VERSION: u64 = 1000 + reth_db::version::DB_VERSION;
 
-/// Create or check reth's database version file in `path` for tn-lmdb, as reth's `create_db` does
-/// but with [`TN_LMDB_DB_VERSION`]: an absent or empty directory is created and gets the file;
-/// otherwise the file must hold that version. A missing file, or one holding reth's own version (a
-/// tn-lmdb database written before the tripwire, or an MDBX database the migration has just moved:
-/// it leaves the file as MDBX had it), is rewritten with it. Any other version, or a file that does
-/// not parse, is refused.
+/// The versions of reth's `database.version` file this build opens, besides a missing file:
+/// [`TN_LMDB_DB_VERSION`], and reth's own (an MDBX database the backend guard is about to
+/// migrate, or a tn-lmdb database written before the tripwire).
 #[cfg(not(feature = "mdbx"))]
-fn init_db_version_file(path: &Path) -> eyre::Result<()> {
+fn db_version_accepted(version: u64) -> bool {
+    version == TN_LMDB_DB_VERSION || version == reth_db::version::DB_VERSION
+}
+
+/// The refusal of a `database.version` file in `path` holding `version`, one
+/// [`db_version_accepted`] does not accept: another binary wrote the directory.
+#[cfg(not(feature = "mdbx"))]
+fn unaccepted_db_version(path: &Path, version: u64) -> eyre::Report {
+    eyre::eyre!(
+        "the reth database at {} is at database version {version} ({}), and this build reads \
+         tn-lmdb's version {TN_LMDB_DB_VERSION} (or reth's {} from before it): another binary \
+         wrote this datadir. Run that binary, or rebuild the execution database (`telcoin-network \
+         db reset-execution`)",
+        path.display(),
+        reth_db::version::db_version_file_path(path).display(),
+        reth_db::version::DB_VERSION,
+    )
+}
+
+/// Check reth's database version file in `path` before anything in the directory is migrated or
+/// opened: an absent or empty directory, a missing file, or one holding an accepted version
+/// ([`db_version_accepted`]) passes; any other version, or a file that does not parse, is refused
+/// and nothing is changed.
+#[cfg(not(feature = "mdbx"))]
+fn check_db_version_file(path: &Path) -> eyre::Result<()> {
+    use reth_db::version::{get_db_version, DatabaseVersionError};
+
+    if database_is_empty(path)? {
+        return Ok(());
+    }
+    match get_db_version(path) {
+        Ok(version) if db_version_accepted(version) => Ok(()),
+        Err(DatabaseVersionError::MissingFile) => Ok(()),
+        Ok(version) => Err(unaccepted_db_version(path, version)),
+        Err(err) => Err(eyre::Report::new(err).wrap_err(format!(
+            "failed to read the reth database version file in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Record [`TN_LMDB_DB_VERSION`] in reth's database version file in `path`, as reth's `create_db`
+/// records its own: an absent or empty directory is created (and made durable in its parent) and
+/// gets the file; a missing file, or one holding reth's own version (a tn-lmdb database written
+/// before the tripwire; the migration records tn-lmdb's itself at its commit point), is rewritten
+/// with it. Runs after [`check_db_version_file`], and refuses what it refuses: any other version,
+/// or a file that does not parse.
+#[cfg(not(feature = "mdbx"))]
+fn record_db_version_file(path: &Path) -> eyre::Result<()> {
     use reth_db::version::{get_db_version, DatabaseVersionError, DB_VERSION};
 
     if database_is_empty(path)? {
         std::fs::create_dir_all(path)
             .wrap_err_with(|| format!("could not create database directory {}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            tn_storage::disk::fsync_directory(parent)
+                .wrap_err_with(|| format!("failed to fsync directory {}", parent.display()))?;
+        }
         return write_db_version_file(path);
     }
     match get_db_version(path) {
@@ -625,14 +809,7 @@ fn init_db_version_file(path: &Path) -> eyre::Result<()> {
             tracing::info!(target: "tn::reth", path = %path.display(), version = TN_LMDB_DB_VERSION, "recorded the tn-lmdb database version, which a binary running reth on MDBX alone refuses");
             Ok(())
         }
-        Ok(version) => eyre::bail!(
-            "the reth database at {} is at database version {version} ({}), and this build reads \
-             tn-lmdb's version {TN_LMDB_DB_VERSION} (or reth's {DB_VERSION} from before it): another \
-             binary wrote this datadir. Run that binary, or rebuild the execution database \
-             (`telcoin-network db reset-execution`)",
-            path.display(),
-            reth_db::version::db_version_file_path(path).display(),
-        ),
+        Ok(version) => Err(unaccepted_db_version(path, version)),
         Err(err) => Err(eyre::Report::new(err).wrap_err(format!(
             "failed to read the reth database version file in {}",
             path.display()
@@ -644,7 +821,7 @@ fn init_db_version_file(path: &Path) -> eyre::Result<()> {
 /// file, fsync, rename, fsync of the directory. A torn file would stop this build too (it does not
 /// parse), so the file is never rewritten in place.
 #[cfg(not(feature = "mdbx"))]
-fn write_db_version_file(path: &Path) -> eyre::Result<()> {
+pub(super) fn write_db_version_file(path: &Path) -> eyre::Result<()> {
     use std::io::Write as _;
     use tn_storage::disk::{fsync_directory, fsync_file};
 

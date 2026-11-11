@@ -22,6 +22,14 @@
 //! it. [`volume_loss`] and [`volume_loss_random`] lose the unsynced bytes as [`power_loss`] and
 //! [`power_loss_random`] do but keep the boot: a volume pulled and plugged back in. [`set_boot_id`]
 //! stands for a host whose id cannot be read.
+//!
+//! **Lost flushes.** [`set_flushes_lost`] models a device that takes no write: every msync, fsync
+//! and fdatasync on the thread reports success to its caller (as a kernel does after a writeback
+//! error it has already reported once) but changes no image, so the page cache (the file) and
+//! the device (the image) diverge until [`cache_dropped`], a writer open's drop of the file's
+//! cached pages (`sys::drop_cached_pages`), writes the image over the file: what the device
+//! holds, at the file's current length (every byte past the image reads zero, as a block
+//! reserved and never written does).
 
 use std::{
     cell::Cell,
@@ -40,6 +48,18 @@ use crate::sys::BootId;
 thread_local! {
     /// This thread's boot id, as [`boot_id`] reports it.
     static BOOT: Cell<Option<Option<BootId>>> = const { Cell::new(None) };
+    /// See [`set_flushes_lost`].
+    static FLUSHES_LOST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the flushes on this thread are lost: they report success and change no image (module
+/// docs, "Lost flushes"). Off by default; a test turns it off again before it ends.
+pub(crate) fn set_flushes_lost(lost: bool) {
+    FLUSHES_LOST.with(|flag| flag.set(lost));
+}
+
+fn flushes_lost() -> bool {
+    FLUSHES_LOST.with(Cell::get)
 }
 
 /// The reboots so far, in every thread: each gets a boot id no other has.
@@ -121,7 +141,7 @@ pub(crate) fn untrack(path: &Path) {
 /// The pages are copied through the raw pointer, never borrowed as a slice, since readers may hold
 /// slices of other bytes of the mapping meanwhile.
 pub(crate) fn flushed_range(ino: u64, base: *const u8, mapped: u64, start: u64, end: u64) {
-    if TRACKED.load(Ordering::Relaxed) == 0 || start >= end {
+    if TRACKED.load(Ordering::Relaxed) == 0 || start >= end || flushes_lost() {
         return;
     }
     let mut images = images();
@@ -170,7 +190,7 @@ fn ino_if_tracking(file: &File) -> u64 {
 /// An fsync (or fdatasync) of `file`: every byte of it is on disk, and so is its length.
 pub(crate) fn flushed_all(file: &File) {
     let ino = ino_if_tracking(file);
-    if ino == 0 {
+    if ino == 0 || flushes_lost() {
         return;
     }
     let mut images = images();
@@ -181,6 +201,30 @@ pub(crate) fn flushed_all(file: &File) {
     let mut bytes = vec![0_u8; len];
     if file.read_exact_at(&mut bytes, 0).is_ok() {
         *image = Image::new(bytes);
+    }
+}
+
+/// The file's cached pages were dropped (`sys::drop_cached_pages`): it reads what the device
+/// holds, the image, at its current length (module docs, "Lost flushes"). Untracked files are
+/// left alone.
+pub(crate) fn cache_dropped(file: &File) {
+    let ino = ino_if_tracking(file);
+    if ino == 0 {
+        return;
+    }
+    let Some(bytes) =
+        images().as_ref().and_then(|images| images.get(&ino).map(|image| image.bytes.clone()))
+    else {
+        return;
+    };
+    let len = file.metadata().expect("metadata").len() as usize;
+    file.write_all_at(&bytes[..bytes.len().min(len)], 0).expect("write the image");
+    let zeros = vec![0_u8; 1 << 20];
+    let mut at = bytes.len();
+    while at < len {
+        let n = zeros.len().min(len - at);
+        file.write_all_at(&zeros[..n], at as u64).expect("zero the bytes past the image");
+        at += n;
     }
 }
 

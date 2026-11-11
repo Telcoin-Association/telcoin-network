@@ -17,8 +17,11 @@ use crate::{
 /// failure is [`Error::Corrupt`].
 ///
 /// The CRC itself is not recomputed here (that costs a pass over the page on every read):
-/// copy-on-write verifies a page before copying it, and the root of each tree is verified when
-/// the file is opened.
+/// copy-on-write verifies a page before its first copy (unless this writer stamped the page
+/// itself: `Allocator::stamped`), and the root of each tree is verified when the file is opened.
+/// So damage inside a page's bounds (a key, a value, an in-bounds length or entry count) is
+/// returned as data until a copy, a free walk or `Env::check` meets it, as on an engine with no
+/// page CRC.
 #[inline]
 pub(crate) fn checked_page<'a>(
     pgno: u32,
@@ -33,7 +36,10 @@ pub(crate) fn checked_page<'a>(
 /// [`checked_page`] for a page reached through a pointer that names it as `(pgno, want_txn)` (a
 /// branch cell's `child` and `child_txn`, or a root's): after those checks, the low 32 bits of
 /// the header's txn must equal `want_txn`, so a pointer to a stale copy or redirected to another
-/// page is [`Error::Corrupt`]. The header's page number and txn are read once for every check.
+/// page is [`Error::Corrupt`], unless the page it now names was written by the same commit (the
+/// same low 32 bits): a page header names no tree, so that redirection, damage at rest to the
+/// 4-byte pointer, passes here and is found by `Env::check`, which refuses a page reached twice.
+/// The header's page number and txn are read once for every check.
 #[inline]
 pub(crate) fn checked_child<'a>(
     pgno: u32,

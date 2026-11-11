@@ -19,6 +19,7 @@ use crate::{
     },
     metrics::EpochMetrics,
     network_readiness::{monitor, NetworkReadiness},
+    AdmissionSnapshotSource,
 };
 use eyre::{eyre, WrapErr as _};
 use futures::TryStreamExt as _;
@@ -256,6 +257,11 @@ pub(crate) struct EpochManager<P, DB> {
     /// Worker network handles, indexed by [`WorkerId`](tn_types::WorkerId). Empty until
     /// [`spawn_node_networks`](Self::spawn_node_networks) runs.
     worker_network_handles: Vec<WorkerNetworkHandle>,
+    /// Admission snapshots served by `tn_admissionSnapshot` on every RPC server.
+    ///
+    /// Handed to each [`EngineToPrimaryRpc`](crate::EngineToPrimaryRpc) when it is built, and
+    /// given the network handles once [`run`](Self::run) spawns the networks.
+    admission_snapshots: AdmissionSnapshotSource,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [ShutdownNotifier] to shutdown all node processes.
@@ -802,6 +808,7 @@ where
             tn_datadir,
             primary_network_handle: None,
             worker_network_handles: Vec::new(),
+            admission_snapshots: AdmissionSnapshotSource::default(),
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
@@ -1056,6 +1063,16 @@ where
             .as_ref()
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
+
+        // worker 0's rpc was built with this source before any swarm existed and serves snapshots
+        // from here on; inactive worker swarms report too, because they keep listening
+        self.admission_snapshots.set(
+            primary_network_handle.inner_handle().clone(),
+            self.worker_network_handles
+                .iter()
+                .map(|worker| (worker.worker_id(), worker.inner_handle().clone()))
+                .collect(),
+        )?;
 
         // Monitor process-lifetime handles before startup issues any network commands.
         let primary = primary_network_handle.inner_handle().clone();
@@ -1957,13 +1974,16 @@ fn check_restore_consistency(
 ///
 /// A record closes its epoch, so `next_committee` belongs to the following epoch. A record at or
 /// ahead of the local committee can veto validator status; an older record cannot veto a later
-/// admission. An eligible validator whose local epoch precedes the record must catch up before
-/// voting. Records never promote a local observer or overwrite an inactive validator.
+/// admission. An eligible validator must catch up before voting when its local epoch precedes the
+/// record, or when `certified`, the epoch of the newest certified record, is at or after its local
+/// epoch: the network closed that epoch without this node. Records never promote a local observer
+/// or overwrite an inactive validator.
 fn node_mode_from_epoch_record(
     initial_mode: NodeMode,
     local_epoch: Epoch,
     public_key: &BlsPublicKey,
     record: Option<&EpochRecord>,
+    certified: Option<Epoch>,
 ) -> NodeMode {
     match initial_mode {
         NodeMode::Observer | NodeMode::CvvInactive => initial_mode,
@@ -1972,15 +1992,37 @@ fn node_mode_from_epoch_record(
                 record.epoch.saturating_add(1) < local_epoch
                     || record.next_committee.contains(public_key)
             });
+            // The closing block of epoch E moves the canonical tip into E + 1 before record E is
+            // written, so a node whose own close completed runs E + 1, never E: a certified record
+            // for the local epoch means the network closed it without this node (issue #1792).
+            // An uncertified record (the dummy epoch-0 anchor, this node's own) proves nothing
+            // about the network, so for it only a later epoch counts.
             if !eligible {
                 NodeMode::Observer
-            } else if record.is_some_and(|record| record.epoch > local_epoch) {
+            } else if record.is_some_and(|record| record.epoch > local_epoch)
+                || certified.is_some_and(|epoch| epoch >= local_epoch)
+            {
                 NodeMode::CvvInactive
             } else {
                 NodeMode::CvvActive
             }
         }
     }
+}
+
+/// The newest stored epoch record at or after `floor` that carries a certificate.
+///
+/// The dummy epoch-0 anchor has none, and neither has this node's own record until its quorum is
+/// stored. The walk starts at the newest record and stops at the first certified one: downloaded
+/// records always carry their certificate, so this is normally a single lookup.
+async fn newest_certified_record(db: &EpochRecordDb, floor: Epoch) -> Option<EpochRecord> {
+    let latest = db.latest_record().await?.epoch;
+    for epoch in (floor..=latest).rev() {
+        if let Some((record, Some(_))) = db.get_epoch_by_number(epoch).await {
+            return Some(record);
+        }
+    }
+    None
 }
 
 /// Publish the startup role after checking the epoch-start-pinned committee and synced records.
@@ -1994,8 +2036,14 @@ async fn seed_node_mode_on_startup(
     initial_mode: NodeMode,
 ) {
     let record = db.latest_record().await;
-    let selected =
-        node_mode_from_epoch_record(initial_mode, local_epoch, public_key, record.as_ref());
+    let certified = newest_certified_record(db, local_epoch).await.map(|record| record.epoch);
+    let selected = node_mode_from_epoch_record(
+        initial_mode,
+        local_epoch,
+        public_key,
+        record.as_ref(),
+        certified,
+    );
     node_mode.send_if_modified(|mode| {
         if std::mem::discriminant(mode) != std::mem::discriminant(&selected) {
             *mode = selected;
@@ -2012,7 +2060,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        BlsKeypair, EpochRecord, ExecHeader, RpcInfo, TnReceiver as _, TnSender as _, B256,
+        BlsKeypair, BlsSignature, EpochCertificate, EpochRecord, ExecHeader, RpcInfo,
+        TnReceiver as _, TnSender as _, B256,
     };
 
     /// Startup follows the latest record's next committee for both retiring and joining keys.
@@ -2070,6 +2119,40 @@ mod tests {
         Ok(())
     }
 
+    /// A certified record for the local epoch demotes a validator at startup; the dummy epoch-0
+    /// anchor at genesis, which is never certified, does not (issue #1792).
+    #[tokio::test]
+    async fn startup_node_mode_demotes_on_a_certified_record_for_the_local_epoch(
+    ) -> eyre::Result<()> {
+        let temp_dir = TempDir::with_prefix("startup_node_mode_certified")?;
+        let db = EpochRecordDb::open(temp_dir.path())?;
+        let public_key = worker_key_config().primary_public_key();
+        let genesis = EpochRecord {
+            committee: vec![public_key],
+            next_committee: vec![public_key],
+            ..Default::default()
+        };
+        db.save_dummy_epoch0(genesis.clone()).await?;
+
+        let (mode, rx) = watch::channel(NodeMode::CvvActive);
+        seed_node_mode_on_startup(&db, &mode, &public_key, 0, NodeMode::CvvActive).await;
+        assert!(matches!(*rx.borrow(), NodeMode::CvvActive), "the anchor must not demote");
+
+        // a peer's certified record 0 replaces the anchor: epoch 0 closed without this node
+        let cert = EpochCertificate {
+            epoch_hash: genesis.digest(),
+            signature: BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        db.save(genesis, cert).await?;
+        seed_node_mode_on_startup(&db, &mode, &public_key, 0, NodeMode::CvvActive).await;
+        assert!(matches!(*rx.borrow(), NodeMode::CvvInactive), "{:?}", *rx.borrow());
+        // the same record leaves a node that already runs epoch 1 active
+        seed_node_mode_on_startup(&db, &mode, &public_key, 1, NodeMode::CvvActive).await;
+        assert!(matches!(*rx.borrow(), NodeMode::CvvActive), "{:?}", *rx.borrow());
+        Ok(())
+    }
+
     /// Record membership can veto stale local eligibility but never grant eligibility by itself.
     #[test]
     fn epoch_record_mode_respects_committee_precedence() {
@@ -2090,7 +2173,9 @@ mod tests {
         ]
         .into_iter()
         .for_each(|(initial, epoch, record, expected)| {
-            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, record);
+            // downloaded records carry their certificate
+            let certified = record.map(|record| record.epoch);
+            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, record, certified);
             assert_eq!(
                 std::mem::discriminant(&mode),
                 std::mem::discriminant(&expected),
@@ -2107,17 +2192,24 @@ mod tests {
             EpochRecord { epoch: 5, next_committee: vec![public_key], ..Default::default() };
         let genesis = EpochRecord { next_committee: vec![public_key], ..Default::default() };
         [
-            (NodeMode::CvvActive, 3, &record, NodeMode::CvvInactive),
-            (NodeMode::CvvActive, 4, &record, NodeMode::CvvInactive),
-            (NodeMode::CvvActive, 5, &record, NodeMode::CvvActive),
-            (NodeMode::CvvActive, 6, &record, NodeMode::CvvActive),
-            (NodeMode::CvvActive, 0, &genesis, NodeMode::CvvActive),
-            (NodeMode::Observer, 3, &record, NodeMode::Observer),
-            (NodeMode::CvvInactive, 3, &record, NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 3, &record, Some(5), NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 4, &record, Some(5), NodeMode::CvvInactive),
+            // A certified record for the local epoch means the network closed that epoch without
+            // this node: the closing block of epoch 5 moves the canonical tip into epoch 6 before
+            // record 5 is written, so a node whose own close completed runs epoch 6, never 5.
+            (NodeMode::CvvActive, 5, &record, Some(5), NodeMode::CvvInactive),
+            // the same record without a certificate (this node's own) proves nothing
+            (NodeMode::CvvActive, 5, &record, None, NodeMode::CvvActive),
+            (NodeMode::CvvActive, 6, &record, Some(5), NodeMode::CvvActive),
+            // the dummy epoch-0 anchor is never certified, so genesis starts active
+            (NodeMode::CvvActive, 0, &genesis, None, NodeMode::CvvActive),
+            (NodeMode::Observer, 3, &record, Some(5), NodeMode::Observer),
+            (NodeMode::CvvInactive, 3, &record, Some(5), NodeMode::CvvInactive),
         ]
         .into_iter()
-        .for_each(|(initial, epoch, record, expected)| {
-            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, Some(record));
+        .for_each(|(initial, epoch, record, certified, expected)| {
+            let mode =
+                node_mode_from_epoch_record(initial, epoch, &public_key, Some(record), certified);
             assert_eq!(
                 std::mem::discriminant(&mode),
                 std::mem::discriminant(&expected),

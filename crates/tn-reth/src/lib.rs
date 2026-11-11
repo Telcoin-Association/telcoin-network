@@ -152,7 +152,8 @@ pub use cli::{
 };
 pub use env::{
     database::{
-        db_table_stats, default_page_size, refuse_pending_migration, DbTableStat,
+        db_check, db_table_stats, default_page_size, refuse_pending_migration, DbCheckReport,
+        DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
         DB_TABLE_STATS_NEEDS_STOPPED_NODE,
     },
     *,

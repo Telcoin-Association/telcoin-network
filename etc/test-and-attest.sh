@@ -124,6 +124,14 @@ fi
 ./etc/ci-lanes.sh test-mdbx
 ./etc/ci-lanes.sh test-vendor-reth
 
+# The engine's and the adapter's heavy test variants (`#[ignore = "heavy: run with --release"]`:
+# the random workloads at size, the crash matrices, the differential test against MDBX at 2000
+# scripts, the crash test that kills a child inside a commit; about 12 minutes). No merge-queue
+# lane runs them (CI runs nextest in debug), so they run here, before the e2e suites. The
+# benchmark and the stamp probe guard nothing and are skipped, as the crates' CLAUDE.md say.
+cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe
+cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --skip tn_lmdb_vs_mdbx
+
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via

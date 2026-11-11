@@ -88,7 +88,7 @@ lane_fmt() {
 }
 
 lane_clippy() {
-    # Two passes, because neither compiles what the other does.
+    # Three passes, because none compiles what the others do.
     #
     # 1. The release graph: the packages of the three shipped binaries, libraries and
     #    binaries only, under default features and with no dev-dependencies. `--workspace`
@@ -99,7 +99,9 @@ lane_clippy() {
     #    `test-utils` feature on (the only extras their union adds are reqwest/json and
     #    hyper-util/server-graceful), so this pass compiles each crate the way the release
     #    does, and it is the only compile of the `#[cfg(not(feature = "test-utils"))]` arms
-    #    in tn-types. No lane compiled that graph before this pass (2026-10-29).
+    #    in tn-types. No lane compiled that graph before this pass (2026-10-29). It is also the
+    #    shipped tn-lmdb graph: tn-lmdb is the default backend, so this pass is the one compile
+    #    of the `#[cfg(not(feature = "test-utils"))]` arms of tn-reth's backend code.
     # 2. --workspace --all-targets --all-features: every lib, bin, test, bench and example
     #    target and every positive feature arm, so test code is compiled and linted too.
     #    When the lane built libraries only, test code that did not compile reached main
@@ -277,6 +279,12 @@ lane_test_mdbx() {
     # reruns here (tn-utils, with no path either, holds a single test).
     run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
         --features tn-reth/mdbx "${run_mode[@]}"
+    # The adiri-gated tn-reth suites on MDBX: the consensus-registry fork tests and their
+    # determinism oracles read reth state through the database, and lane_test_adiri runs them
+    # on tn-lmdb, the default backend, only. The other adiri packages have no database path of
+    # their own.
+    run cargo nextest run --locked -p tn-reth \
+        --features tn-reth/adiri,tn-reth/test-utils,tn-reth/mdbx "${run_mode[@]}"
 }
 
 lane_test_vendor_reth() {

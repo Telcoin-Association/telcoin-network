@@ -81,7 +81,7 @@ bytes written by `pwrite` must be visible through a later mapping. That is a uni
 
 **Where.** Two places use the file outside the mapping. `env::create` writes a new file's two
 metas with `pwrite` (`FileExt::write_all_at`). `env::read_record` reads the metas with `pread`
-(`read_exact_at`) at open step 4, before the file is mapped. Every later read and write, a
+(`read_exact_at`) at open step 5, before the file is mapped. Every later read and write, a
 commit's meta included (`Writer::copy_meta`), goes through the mapping. So an open reads, by
 `pread`, metas an earlier writer wrote through its mapping, perhaps a writer of this boot that
 crashed before any sync. With `EnvOptions::gap_fill` on, step 4's gap fill
@@ -153,7 +153,7 @@ but the file ended at its old size until an `fsync`.
 **What it needs.** An `fsync` of a directory that makes a rename in it durable.
 
 **Where.** `sys::fsync_directory`: open the directory read-only, then `sys::fsync_file`. Used
-after `env::create` renames `<path>.creating` over the path, and at open step 7. As in
+after `env::create` renames `<path>.creating` over the path, and at open step 4. As in
 PostgreSQL, an `EACCES` from the open and an `EINVAL`, `ENOTSUP` or `EOPNOTSUPP` from the fsync
 are skipped with a warning: such a directory never could make a name durable.
 
@@ -166,12 +166,30 @@ through its mapping are still in the page cache. A writer open must write them t
 before it builds on them (they may be a trusted weak head's pages, or a meta whose `msync` never
 finished).
 
-**Where.** `Env::open` step 7 calls `sys::fsync_file` on the file before mapping it. On macOS it
+**Where.** `Env::open` step 4 calls `sys::fsync_file` on the file before it reads the metas or maps it. On macOS it
 then msyncs its whole new mapping (step 8): every mapping of a file shares its pages, so that
 writes the dead writer's.
 
 **Linux, macOS.** On Linux the `fsync` writes them. On macOS it does not, and the `msync` does
 (`a_writer_open_writes_the_pages_another_mapping_left_dirty`). A read-only open syncs nothing.
+
+### The page cache dropped at open
+
+**What it needs.** Advice that drops a file's clean cached pages, so later reads come from the
+device. A writer open gives it right after step 4's `fsync`, before it reads the metas or maps
+the file: a meta or a page a failed writeback left clean in the cache (its bytes never on the
+device, the error reported once to the writer that is gone) is then read from the device, where
+the open does not see the meta, or step 9's check finds the page old and falls back to the last
+sync.
+
+**Where.** `sys::drop_cached_pages`, called by `Env::open` at step 4. Without the advice the
+engine still works; it loses the fallback (README, "Known limit"), and
+`a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync` passes only through the disk
+model, which restores the device's bytes at the call whatever the OS does.
+
+**Linux, macOS.** Linux: `posix_fadvise(POSIX_FADV_DONTNEED)` over the whole file; the kernel
+keeps a dirty page, and one mapped by another process (none: the writer's lock excludes every
+other open). macOS: no such advice; a no-op.
 
 ### Growth with real blocks, and the trim at close
 
@@ -345,6 +363,7 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `sys.rs` | `read_boot_id` | `macos` | `sysctlbyname("kern.bootsessionuuid")` |
 | `sys.rs` | `fsync_file` | `macos` / `not(macos)` | plain `libc::fsync` (retried on `EINTR`) / `File::sync_all` |
 | `sys.rs` | `fdatasync_file` | `macos` / `not(macos)` | `fsync_file` / `File::sync_data` |
+| `sys.rs` | `drop_cached_pages` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_DONTNEED)` over the file / a no-op |
 | `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback |
 | `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback |
 | `env.rs` | `DataSync::Ranges` | `macos` | the variant exists on macOS only |

@@ -3,7 +3,9 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+The e2e suites it runs are the `#[ignore]`d tests of `e2e-tests` on the default (tn-lmdb) node binary, then `make test-e2e-reth-migration` (a committee on the MDBX build, each validator restarted onto the default binary) and `make test-e2e-resync` (a validator rebuilt in layout v2 with `db reset-execution`); both skip, passing, under the generic selection, which sets neither their marker nor the previous binary.
+The nightly `durable-e2e.yaml` runs the restart, epoch and sigkill suites and the same two; the rolling-upgrade suite (`make test-upgrade`) stays manual.
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
 
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
@@ -471,13 +473,17 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
    The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
 2. **Immutable releases** (Settings -> General -> Releases).
    Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
-3. **The ghcr package `ghcr.io/telcoin-association/telcoin-network` is public, linked to this repository, and writable only by the maintainers, by account and by workflow.**
-   Operators, `verify-release` and `etc/release.sh` read it anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
+3. **The release packages `ghcr.io/telcoin-association/tn-mainnet` (mainnet tags) and `ghcr.io/telcoin-association/tn-testnet` (Adiri tags) are public, linked to this repository, and writable only by the release maintainer account, by account and by workflow.**
+   Operators, `verify-release` and `etc/release.sh` read them anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
+   A package exists only after its first push, which `make release-build` makes for a network's first release only with `RELEASE_FIRST_PUSH` set to the package, so these settings are made right after it, as the maintainer guide's one-time setup describes; until then ghcr answers 403 for the package as it does for a private one.
    The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
-   Two lists in Package settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the maintainers; under "Manage Actions access", this repository must be absent or have the Read role.
+   Two lists in each package's settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the release maintainer account; under "Manage Actions access", this repository must be absent or have the Read role.
    Otherwise anyone with write access here can push to the package, directly or from a workflow on any branch that asks for `packages: write`, and overwrite `:vX.Y.Z`, `:latest` or `:adiri`.
    No workflow here asks for `packages: write`, but anyone with write access can add one on a branch, so that is not a control.
    A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST`.
+   `etc/release.sh` takes the package from the tag's channel and refuses an `IMAGE_DIGEST` that names an image in any other package, so an Adiri image cannot be released under a mainnet tag, nor the reverse.
+   A third package, `ghcr.io/telcoin-association/tn-dev`, takes the ad-hoc `dev-<flavor>-<TAG>` images of `make docker-adiri` and `make docker-devnet`; it holds no release, and nothing in the release process reads it.
+   The earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
 4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
    `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
 
