@@ -127,6 +127,20 @@ struct RethEnvInner {
     /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
     #[cfg(any(feature = "test-utils", test))]
     persist_attempts: std::sync::atomic::AtomicU32,
+    /// The node's runtime switches for this env, fixed at construction.
+    switches: RethSwitches,
+}
+
+/// The runtime switches from `parameters.yaml` that the node hands to its [`RethEnv`].
+///
+/// Each field's default keeps the behaviour from before the switch existed, and
+/// [`RethEnv::new`] uses the defaults. The node builds this from its parameters and passes it to
+/// [`RethEnv::new_with_switches`]; the env exposes each value through a getter of the same name.
+#[derive(Clone, Debug, Default)]
+pub struct RethSwitches {
+    /// Advise the kernel that the execution database's memory map is read at random
+    /// (`mdbx_random_advice`; default `false`).
+    pub mdbx_random_advice: bool,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -187,6 +201,30 @@ impl RethEnv {
         basefee_address: Option<Address>,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<Self> {
+        Self::new_with_switches(
+            reth_config,
+            task_manager,
+            database,
+            basefee_address,
+            gas_accumulator,
+            RethSwitches::default(),
+        )
+    }
+
+    /// Produce a new wrapped Reth environment, like [`RethEnv::new`], with the node's runtime
+    /// switches.
+    ///
+    /// The node starts its env through here so the switches read from `parameters.yaml` reach the
+    /// reth side; every other caller uses [`RethEnv::new`], which passes the defaults. The same
+    /// runtime requirement, genesis initialization and process-global side effects apply.
+    pub fn new_with_switches(
+        reth_config: &RethConfig,
+        task_manager: &TaskManager,
+        database: RethDb,
+        basefee_address: Option<Address>,
+        gas_accumulator: GasAccumulator,
+        switches: RethSwitches,
+    ) -> eyre::Result<Self> {
         // Fail fast on a pruning configuration before any database work happens. Every RethEnv in
         // the process funnels through here, and every pinned read this env goes on to serve
         // resolves historical state through `read_only_state_db`, which reth can only answer from
@@ -219,8 +257,16 @@ impl RethEnv {
                 persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
+                switches,
             }),
         })
+    }
+
+    /// Whether the node advises the kernel that the execution database's memory map is read at
+    /// random (`mdbx_random_advice` in `parameters.yaml`; `false` unless the node set it through
+    /// [`RethEnv::new_with_switches`]).
+    pub fn mdbx_random_advice(&self) -> bool {
+        self.inner.switches.mdbx_random_advice
     }
 
     /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
@@ -706,6 +752,69 @@ mod tests {
             assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
             assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
         }
+        Ok(())
+    }
+
+    // ---- bench6 mdbx-advice ----
+
+    /// Open an env over a fresh datadir at `dir` through [`RethEnv::new_with_switches`], the way
+    /// the node opens its own.
+    fn env_with_switches(
+        dir: &Path,
+        task_manager: &TaskManager,
+        switches: RethSwitches,
+    ) -> eyre::Result<RethEnv> {
+        use reth_node_core::{
+            args::{DatabaseArgs, DatadirArgs},
+            dirs::MaybePlatformPath,
+        };
+        crate::init_reth_defaults();
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config = RethConfig::from_node_config(NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(dir.to_path_buf()),
+                static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
+            },
+            chain,
+            // a small map, like a temp chain's, so parallel tests do not exhaust address space
+            db: DatabaseArgs {
+                max_size: Some(2 * 1024 * 1024 * 1024),
+                growth_step: Some(4 * 1024 * 1024),
+                ..Default::default()
+            },
+            ..NodeConfig::default()
+        });
+        let database = RethEnv::new_database(&config, dir.join("db"))?;
+        RethEnv::new_with_switches(
+            &config,
+            task_manager,
+            database,
+            None,
+            GasAccumulator::default(),
+            switches,
+        )
+    }
+
+    /// Each switch handed to [`RethEnv::new_with_switches`] reads back from the env, and
+    /// [`RethEnv::new`] leaves every switch at its default.
+    #[tokio::test]
+    async fn test_new_with_switches_hands_each_switch_to_the_env() -> eyre::Result<()> {
+        let tm = TaskManager::new("switches");
+        let on = TempDir::new()?;
+        let switches = RethSwitches { mdbx_random_advice: true };
+        let env = env_with_switches(on.path(), &tm, switches)?;
+        assert!(env.mdbx_random_advice());
+
+        let off = TempDir::new()?;
+        let env = env_with_switches(off.path(), &tm, RethSwitches::default())?;
+        assert!(!env.mdbx_random_advice());
+
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let temp = TempDir::new()?;
+        let env = RethEnv::new_for_temp_chain(chain, temp.path(), &tm, None)?;
+        assert!(!env.mdbx_random_advice(), "RethEnv::new passes the defaults");
         Ok(())
     }
 }

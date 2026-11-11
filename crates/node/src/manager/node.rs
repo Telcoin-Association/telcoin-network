@@ -34,7 +34,7 @@ use tn_network_libp2p::{
     source_admission::SourceAdmissionBudget, types::NetworkEvent, ConsensusNetwork,
 };
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
-use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
+use tn_reth::{system_calls::EpochState, RethDb, RethEnv, RethSwitches};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
@@ -1803,12 +1803,13 @@ where
         // snapshot-restore constructors (genesis tooling, `db load-state`, and tests), which pin
         // the governance default.
         let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let reth_env = RethEnv::new(
+        let reth_env = RethEnv::new_with_switches(
             &self.builder.node_config,
             engine_task_manager,
             self.reth_db.clone(),
             Some(basefee_address),
             gas_accumulator.clone(),
+            reth_switches(&self.builder.tn_config.parameters),
         )?;
         // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):
         // an execution tip evicted from the in-memory `recent_blocks` ring but still persisted as
@@ -2090,6 +2091,11 @@ fn announce_switches(parameters: &tn_config::Parameters) {
         "node switches"
     );
     crate::metrics::record_node_switches(&switches);
+}
+
+/// The runtime switches the reth environment reads, taken from the node's parameters.
+fn reth_switches(parameters: &tn_config::Parameters) -> RethSwitches {
+    RethSwitches { mdbx_random_advice: parameters.mdbx_random_advice }
 }
 
 #[cfg(test)]
@@ -2817,5 +2823,19 @@ mod tests {
         let expected: Vec<String> =
             arm.switches().iter().map(|(name, value)| format!("{name}={value}")).collect();
         assert_eq!(tokens, expected);
+    }
+
+    // ---- bench6 mdbx-advice ----
+
+    /// The reth switches the node passes to `RethEnv::new_with_switches` carry the values set in
+    /// its parameters.
+    #[test]
+    fn test_reth_switches_follow_parameters() {
+        let defaults = reth_switches(&tn_config::Parameters::default());
+        assert!(!defaults.mdbx_random_advice);
+
+        let parameters = tn_config::Parameters { mdbx_random_advice: true, ..Default::default() };
+        let switches = reth_switches(&parameters);
+        assert!(switches.mdbx_random_advice);
     }
 }
