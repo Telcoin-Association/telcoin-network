@@ -255,8 +255,7 @@ where
                 // transactions carry (switch `sealed_tx_keep`); the re-pool below clears them one
                 // by one, but only where it runs, and recovery can stop partway, so clear every
                 // orphan digest on every pool first, before any builder of this epoch starts; the
-                // clear also refuses a mark for the digest that the closing epoch acked but has
-                // not applied yet
+                // clear also refuses every mark the closing run acked but had not applied yet
                 orphan_batches.iter().for_each(|(digest, _)| {
                     pools.iter().for_each(|pool| {
                         pool.sealed_txs().clear_orphaned(digest);

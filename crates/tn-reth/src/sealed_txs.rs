@@ -114,7 +114,7 @@ impl SealedTxs {
                 by_digest: HashMap::new(),
                 by_hash: HashMap::new(),
                 generation: 0,
-                lag_floor: 0,
+                ticket_floor: 0,
                 executed: HashMap::new(),
                 executed_order: VecDeque::new(),
                 memory,
@@ -175,7 +175,7 @@ impl SealedTxs {
         present: impl FnOnce(Vec<TxHash>) -> Vec<TxHash>,
     ) -> usize {
         let mut store = self.store();
-        if store.executed_after(&digest, ticket) || ticket.0 < store.lag_floor {
+        if store.executed_after(&digest, ticket) || ticket.0 < store.ticket_floor {
             metrics::counter!(LATE_MARKS_REFUSED).increment(as_u64(hashes.len()));
             0
         } else {
@@ -240,15 +240,17 @@ impl SealedTxs {
     /// node that stays in the committee; a node that leaves it forwards the orphan instead and
     /// must clear the digest here, for every pool.
     ///
-    /// The digest is also remembered as if it executed now, so a mark for it whose ticket
-    /// predates this call is refused as late (see [`SealTicket`]). The worker can ack such a
-    /// batch during the closing epoch's shutdown grace and its mark can run after this pass;
-    /// nothing would clear that mark later.
+    /// It also raises the ticket floor, as a lag does, so every mark whose ticket predates this
+    /// call is refused as late (see [`SealTicket`]). The worker can ack a batch during the
+    /// closing epoch's shutdown grace and its mark can run after the orphan pass; nothing would
+    /// clear that mark later. The pass runs before any builder of the new run starts, so only
+    /// the closing run's marks are refused, however many orphans there are, and the cost is the
+    /// lag's: such a batch's transactions stay unmarked and may be sealed twice (execution skips
+    /// the copy).
     pub fn clear_orphaned(&self, digest: &BlockHash) -> usize {
         let mut store = self.store();
         store.generation = store.generation.saturating_add(1);
-        let generation = store.generation;
-        store.remember_executed(*digest, generation);
+        store.ticket_floor = store.generation;
         let cleared = store.unmark_digest(digest);
         drop(store);
         record_cleared(CLEARED_REPOOLED, cleared);
@@ -294,13 +296,13 @@ impl SealedTxs {
     ///
     /// The lost notifications carried digests that are now in neither the executed memory nor
     /// the generation count, so a batch whose ticket predates the lag may already have executed.
-    /// Raising the lag floor refuses every such ticket: at most each worker's one in-flight batch
-    /// goes unmarked, and its transactions may be sealed twice (execution skips the copy). The
-    /// executed-digest memory is kept: it only ever refuses marks.
+    /// Raising the ticket floor refuses every such ticket: at most each worker's one in-flight
+    /// batch goes unmarked, and its transactions may be sealed twice (execution skips the
+    /// copy). The executed-digest memory is kept: it only ever refuses marks.
     pub(crate) fn clear_all_lag(&self) -> usize {
         let mut store = self.store();
         store.generation = store.generation.saturating_add(1);
-        store.lag_floor = store.generation;
+        store.ticket_floor = store.generation;
         let cleared = store.by_hash.len();
         store.by_hash.clear();
         store.by_digest.clear();
@@ -328,8 +330,8 @@ impl SealedTxs {
 ///
 /// Lost canonical notifications also count as a canonical update and raise a floor: a ticket
 /// taken before the loss is refused, because the batch may have executed in the lost rounds.
-/// An epoch's orphan pass counts as one too, and remembers each orphaned digest as executed, so
-/// a ticket for that digest taken before the pass is refused.
+/// An epoch's orphan pass raises the same floor: a ticket taken before it belongs to the closing
+/// run, whose batch may be an orphan that never executes.
 ///
 /// A ticket only compares against the store that issued it: take it from the pool the batch's
 /// transactions came from, and mark through that same pool.
@@ -346,12 +348,11 @@ struct SealedStore {
     by_digest: HashMap<BlockHash, HashSet<TxHash>>,
     /// The digest each marked hash was sealed under.
     by_hash: HashMap<TxHash, BlockHash>,
-    /// The number of canonical updates applied so far, lag events and orphaned digests
-    /// included.
+    /// The number of canonical updates applied so far, lag events and orphan clears included.
     generation: u64,
-    /// The generation of the last lag event: a ticket below it is refused.
-    lag_floor: u64,
-    /// The generation at which each remembered digest last executed or was orphaned.
+    /// The generation of the last lag event or orphan clear: a ticket below it is refused.
+    ticket_floor: u64,
+    /// The generation at which each remembered digest last executed.
     executed: HashMap<BlockHash, u64>,
     /// The remembered executions in order, oldest first, bounding `executed`.
     executed_order: VecDeque<(BlockHash, u64)>,
@@ -703,8 +704,9 @@ mod tests {
     /// L1 of the review: a batch acked during the closing epoch's shutdown grace whose mark
     /// runs only after the next epoch's orphan pass cleared its digest. The digest never
     /// executes and the pass has run, so nothing would ever clear such a mark: the pass refuses
-    /// it as a late mark. Another digest's ticket of the same age still marks, and an identical
-    /// batch selected after the pass (a same-epoch re-entry) is marked normally.
+    /// it as a late mark. The pass runs before any builder of the new run exists, so it refuses
+    /// every ticket taken before it, whatever the digest; an identical batch selected after the
+    /// pass (a same-epoch re-entry) is marked normally.
     #[test]
     fn a_mark_after_its_digest_was_orphaned_is_refused() {
         let store = SealedTxs::new();
@@ -712,8 +714,22 @@ mod tests {
         assert_eq!(store.clear_orphaned(&digest(1)), 0);
 
         assert_eq!(store.mark_present(late, digest(1), &[tx(1), tx(2)], all), 0);
+        assert_eq!(store.mark_present(late, digest(2), &[tx(3)], all), 0);
         assert!(store.is_empty());
-        assert_eq!(store.mark_present(late, digest(2), &[tx(3)], all), 1);
         assert_eq!(mark(&store, digest(1), &[tx(1), tx(2)]), 2);
+    }
+
+    /// An orphan pass with more orphans than the executed-digest memory still refuses the late
+    /// mark of its first orphan: the refusal does not depend on that memory.
+    #[test]
+    fn an_orphan_pass_larger_than_the_executed_memory_still_refuses_late_marks() {
+        let store = SealedTxs::with_memory(2);
+        let late = store.ticket();
+        (1..=3).for_each(|byte| {
+            store.clear_orphaned(&digest(byte));
+        });
+
+        assert_eq!(store.mark_present(late, digest(1), &[tx(1)], all), 0);
+        assert!(store.is_empty());
     }
 }
