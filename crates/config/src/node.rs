@@ -419,9 +419,11 @@ pub struct Parameters {
     ///
     /// When the proposer is ready to propose but an author whose certificate its last header
     /// used is missing from the new parents, it waits up to this long for that certificate. A
-    /// header forced by `max_header_delay` never waits. Written like the other durations
-    /// (`150ms`). The default `0ms` keeps the previous behaviour: propose as soon as ready.
-    /// Issue #1803.
+    /// header forced by `max_header_delay` never waits. Neither does the header of the node that
+    /// leads the next round: a quorum of next-round certificates arriving during its wait would
+    /// move it past the round it leads, and that round would have no leader certificate to
+    /// commit. Written like the other durations (`150ms`). The default `0ms` keeps the previous
+    /// behaviour: propose as soon as ready. Issue #1803.
     #[serde(with = "humantime_serde", default, skip_serializing_if = "is_default")]
     pub parent_grace: Duration,
 

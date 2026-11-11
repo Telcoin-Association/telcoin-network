@@ -618,12 +618,7 @@ impl<DB: Database> Proposer<DB> {
     /// Reducing the max delay increases its chance of being included in the DAG. Leaders are only
     /// elected on even rounds, so the normal max delay interval is used for odd rounds.
     fn calc_max_delay(&self) -> Duration {
-        // check next round
-        let next_round = self.round + 1;
-
-        if next_round.is_multiple_of(2)
-            && self.leader_schedule.leader(self.round + 1).id() == self.authority_id
-        {
+        if self.leads_next_round() {
             self.max_header_delay / 2
         } else {
             self.max_header_delay
@@ -640,15 +635,22 @@ impl<DB: Database> Proposer<DB> {
     /// certifier has time to certify the previous (possibly batch-bearing) even round header
     /// before it gets canceled by the next proposal.
     fn calc_min_delay(&self) -> Duration {
-        let next_round = self.round + 1;
-
-        if next_round.is_multiple_of(2)
-            && self.leader_schedule.leader(next_round).id() == self.authority_id
-        {
+        if self.leads_next_round() {
             Duration::ZERO
         } else {
             self.min_header_delay
         }
+    }
+
+    /// Whether this authority is the anticipated leader of the round after [`Self::round`], the
+    /// round its next header is for. Leaders are only elected on even rounds.
+    ///
+    /// Such a header gets a zero min delay and a halved max delay, and the parent grace never
+    /// holds it.
+    fn leads_next_round(&self) -> bool {
+        let next_round = self.round + 1;
+        next_round.is_multiple_of(2)
+            && self.leader_schedule.leader(next_round).id() == self.authority_id
     }
 
     /// Update the last leader certificate.
@@ -1508,11 +1510,12 @@ impl<DB: Database> Proposer<DB> {
             // if all conditions are met, create the next header
             if should_create_header {
                 // the parent grace can only hold a header that is ready now: it never proposes
-                // one that is not, and the max-delay path neither waits nor lets it run on
+                // one that is not, the max-delay path neither waits nor lets it run on, and the
+                // next round's leader never waits
                 let grace = if max_delay_timed_out {
                     self.parent_grace.end(GraceOutcome::Preempted)
                 } else {
-                    match self.parent_grace.hold(&self.last_parents) {
+                    match self.parent_grace.hold(&self.last_parents, self.leads_next_round()) {
                         GraceHold::Wait => continue,
                         GraceHold::Propose(waited) => waited,
                     }
@@ -2002,7 +2005,8 @@ pub(crate) enum GraceOutcome {
     Complete,
     /// The deadline fired with at least one of them still missing.
     Expired,
-    /// The max-delay path proposed, or the round moved on, before either.
+    /// The max-delay path proposed, the round moved on, or the leader schedule made this node the
+    /// next round's leader, before either.
     Preempted,
 }
 
@@ -2148,8 +2152,15 @@ struct ArmedGrace {
 ///   next certificate at every other node's grace);
 /// - an author with no round-(r−1) certificate here is never waited for, so a crashed validator
 ///   costs one grace (the round it stopped in) and is then dropped;
+/// - the anticipated leader of the next round never waits (the condition that gives it a zero min
+///   delay): a quorum of next-round certificates from nodes that did not wait would jump it past
+///   the round it leads while the grace holds its header, that header would never be built, and
+///   with no leader certificate every proposer would wait out `max_header_delay` and the round's
+///   leader would never commit; the far certificates still ride the other nodes' headers;
 /// - the max-delay path is unconditional and ends a running grace (`preempted`);
-/// - a jump to a newer round's parents ends it too (`preempted`), and the new round has no basis;
+/// - a jump to a newer round's parents ends it too (`preempted`), and the new round has no basis; a
+///   non-leader's header for the skipped round is never built, as before the switch, which only
+///   costs that node's strand one reference;
 /// - at most one grace is armed per round of parents;
 /// - the grace is capped at `max_header_delay`, though the max-delay tick, reset at every proposal,
 ///   always fires first;
@@ -2225,9 +2236,14 @@ impl ParentGrace {
     /// Decide whether a header that is ready over `parents` is proposed now.
     ///
     /// The caller has already found the header ready and the max-delay path not fired.
-    pub(crate) fn hold(&mut self, parents: &[Certificate]) -> GraceHold {
+    /// `leads_next_round` is whether this node leads the round the header is for: such a header
+    /// never waits, and a grace armed before the leader schedule made it so ends `preempted`.
+    pub(crate) fn hold(&mut self, parents: &[Certificate], leads_next_round: bool) -> GraceHold {
         if self.grace.is_zero() {
             return GraceHold::Propose(Duration::ZERO);
+        }
+        if leads_next_round {
+            return GraceHold::Propose(self.end(GraceOutcome::Preempted));
         }
         if let Some(armed) = &self.armed {
             let present: BTreeSet<&AuthorityIdentifier> =
