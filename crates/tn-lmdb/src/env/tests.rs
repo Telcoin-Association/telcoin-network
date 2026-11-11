@@ -1213,6 +1213,45 @@ fn a_copied_datadir_drops_the_cache_its_copy_filled() {
     assert_eq!(take_cache_decision(), Some(boot_record::Cache::Clean), "the original's");
 }
 
+/// A directory the process may not write keeps the database's writer opens working with no boot
+/// record: the open cannot create one, logs it and goes on, and every open drops the cache, as for
+/// a missing record. Once the directory is writable again the next open creates it.
+#[test]
+fn a_directory_that_refuses_the_boot_record_opens_without_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::with_prefix("tn_lmdb_env").expect("temp dir");
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).expect("dir");
+    let path = dir.join("db");
+    put_all(&open(&path), "t", &[(b"k", b"v")]);
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    fs::remove_file(boot_file.path()).expect("remove the record");
+    /// Gives the directory its write permission back however the test ends.
+    struct Writable<'d>(&'d Path);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let writable = Writable(&dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+    // A process that writes the directory anyway (root) creates the record: nothing to check.
+    if fs::write(dir.join("probe"), b"").is_ok() {
+        return;
+    }
+    for _ in 0..2 {
+        let env = Env::open(&path, EnvOptions::default()).expect("an open with no record");
+        assert_eq!(take_cache_decision(), Some(boot_record::Cache::NoRecord));
+        put_all(&env, "t", &[(b"k", b"w")]);
+        drop(env);
+        assert!(boot_file.record().is_none(), "no record");
+    }
+    drop(writable);
+    drop(open(&path));
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::NoRecord));
+    assert_eq!(boot_file.record().map(|r| r.state), Some(State::Clean), "created");
+}
+
 /// A close that stops before its end leaves the record "open", so the next open in this boot
 /// drops the cache: a failed final sync (the close stops, latched), and a latched environment.
 #[test]

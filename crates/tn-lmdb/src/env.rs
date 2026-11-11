@@ -1403,13 +1403,33 @@ impl Writer {
     /// Write the boot record's "open" for this writer (open step 10), synced, and the directory
     /// too when `created` (the record was missing), before the writer can commit: a crash from
     /// here on leaves "open" of this boot, and the next writer open drops the file's cached pages
-    /// (`boot_record`). A failure fails the open. Nothing on a platform that keeps no record.
-    fn mark_open(&self, created: bool) -> Result<()> {
+    /// (`boot_record`). A failure fails the open, but for a missing record the directory refuses
+    /// to create (`PermissionDenied`, `ReadOnlyFilesystem`: a directory this process may not
+    /// write), which is logged: the record stays missing, which every open drops the cache for.
+    /// Nothing on a platform that keeps no record.
+    fn mark_open(&mut self, created: bool) -> Result<()> {
         let Some(boot_file) = &self.boot_file else {
             return Ok(());
         };
         let record = BootRecord::new(State::Open, self.boot_id, &self.file.metadata()?);
-        Ok(boot_file.write(&record, created, true)?)
+        match boot_file.write(&record, created, true) {
+            Err(e)
+                if created
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                    ) =>
+            {
+                tracing::warn!(
+                    target: "tn_lmdb",
+                    "open: no boot record could be created beside the file ({e}); every open \
+                     drops the file's cached pages"
+                );
+                self.boot_file = None;
+                Ok(())
+            }
+            written => Ok(written?),
+        }
     }
 
     /// Give back the file's preallocated tail at a clean close ([`EnvInner::drop`], after the

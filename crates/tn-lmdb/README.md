@@ -1328,7 +1328,10 @@ checks as `Cursor`'s.
    advises the same (it reads, writes nothing); `Env::check` advises nothing.
 10. **Write the boot record's "open"** (`Writer::mark_open`): this boot's id and the file's
    device and inode, synced (`fsync_file`), and the directory synced too when the record was
-   missing, before the writer can commit; an error fails the open, naming the record. Were "open"
+   missing, before the writer can commit; an error fails the open, naming the record, but for a
+   missing record its directory refuses to create (`PermissionDenied`, `ReadOnlyFilesystem`),
+   which is logged: the record stays missing, and every open drops the cache
+   (`a_directory_that_refuses_the_boot_record_opens_without_one`). Were "open"
    only in the page cache, a failed writeback of it could bring back the device's "clean" of an
    earlier close in this boot, and a crash after it would keep a cache it must drop. A crash
    between this step and the first commit leaves "open": the next open drops, which costs only
