@@ -5,7 +5,7 @@ use crate::{
     network::{
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
         try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
-        PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
+        PrimaryNetworkHandle, ProbeWalk, RequestHandler, RequestVoteResult,
         MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
         MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
@@ -13,6 +13,7 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use futures::{StreamExt as _, TryStreamExt as _};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
@@ -32,7 +33,7 @@ use tn_network_libp2p::{
         GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
         NetworkResult,
     },
-    GossipMessage, Penalty, StreamError, TopicHash,
+    GossipMessage, PeerId, Penalty, StreamError, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -628,6 +629,11 @@ async fn test_uncertified_epoch_record_is_unavailable_without_waiting() {
             assert_matches!(err, $($expected)+);
             let penalty: Option<Penalty> = (&err).into();
             assert!(penalty.is_none(), "an unavailable epoch record must not penalize the peer");
+            // the reply on the wire is the one requesters recognise as a definitive answer
+            assert_eq!(
+                Err::<PrimaryResponse, _>(err).into_response(),
+                PrimaryResponse::unavailable_epoch_record($epoch, $hash),
+            );
         }};
     }
     assert_unavailable_without_waiting!(Some(0), None, PrimaryNetworkError::UnavailableEpoch(0));
@@ -1159,11 +1165,12 @@ async fn test_primary_batch_gossip_topics() {
 // *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
 // the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
 
-/// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
-fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
+/// Build a gossip message from `source` carrying `vote` on `epoch_vote_topic` for `chain_id`. The
+/// swarm forwards only signed gossip, so the message has a source.
+fn epoch_vote_gossip(vote: EpochVote, chain_id: u64, source: PeerId) -> GossipMessage {
     let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(chain_id));
-    GossipMessage { source: None, data, sequence_number: None, topic }
+    GossipMessage { source: Some(source), data, sequence_number: None, topic }
 }
 
 /// Seed an uncertified epoch-0 [`EpochRecord`] (committee = the fixture's committee) into the
@@ -1206,7 +1213,7 @@ async fn test_epoch_vote_non_committee_rejected_before_verify() -> eyre::Result<
     let record = seed_uncertified_epoch0(&handler, &committee).await;
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 0, epoch_hash: record.digest(), ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert_matches!(
         res,
@@ -1234,7 +1241,7 @@ async fn test_epoch_vote_unknown_epoch_dropped_before_verify() -> eyre::Result<(
     // Epoch 9999 has no stored record in the fixture, so `get_epoch_by_number` returns `None`.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 9999, ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert!(
         res.is_ok(),
@@ -1267,7 +1274,7 @@ async fn test_epoch_vote_valid_committee_member_forwarded() -> eyre::Result<()> 
     assert!(vote.check_signature(), "test vote must be validly signed");
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    handler.process_gossip(&epoch_vote_gossip(vote, 0)).await?;
+    handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await?;
 
     let received = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -1310,7 +1317,7 @@ async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<
         ..Default::default()
     };
 
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
@@ -1342,7 +1349,7 @@ async fn test_epoch_vote_wrong_digest_rejected_before_verify() -> eyre::Result<(
     let vote = forked.sign_vote(&key_config);
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidEpochVote(0, _, _)),
@@ -1388,7 +1395,7 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
     // The vote is otherwise valid (correct digest, real committee member) — it is dropped ONLY
     // because the epoch is already certified.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert!(
         res.is_ok(),
         "a vote for an already-certified epoch must be dropped without error or penalty: {res:?}"
@@ -1402,9 +1409,10 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
-/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
-/// network. Epoch-record voting depends on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so epoch-vote gossip with
+/// an author that arrives while no `PrimaryNetwork` is running is queued (not dropped) and
+/// delivered to the next epoch's network. Epoch-record voting depends on this; enforce it going
+/// forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1470,7 +1478,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let mut epoch_a = TaskManager::new("epoch-a");
     let spawner_a = epoch_a.get_spawner();
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch),
         network_handle.clone(),
         config.clone(),
         app.clone(),
@@ -1484,7 +1492,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_a = vote_a.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_a, chain_id),
+            message: epoch_vote_gossip(vote_a, chain_id, PeerId::random()),
             relayer: None,
             author: None,
         })))
@@ -1510,7 +1518,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_gap = vote_gap.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_gap, chain_id),
+            message: epoch_vote_gossip(vote_gap, chain_id, PeerId::random()),
             relayer: None,
             author: None,
         })))
@@ -1530,7 +1538,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
     // the gap.
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch.saturating_add(1)),
         network_handle.clone(),
         config.clone(),
         app.clone(),
@@ -2975,10 +2983,14 @@ async fn test_sync_partial_epoch_pack_over_stream() {
         assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
 
         let mut reassembled = Vec::new();
-        crate::network::sync_codec::sync_pack_reader(cursor)
-            .read_to_end(&mut reassembled)
-            .await
-            .expect("reassemble partial pack data frames");
+        crate::network::sync_codec::sync_pack_reader(
+            cursor,
+            crate::network::sync_codec::SyncRateBound::Floor,
+            crate::network::sync_codec::SyncServeMeter::default(),
+        )
+        .read_to_end(&mut reassembled)
+        .await
+        .expect("reassemble partial pack data frames");
         reassembled
     }
 
@@ -3269,6 +3281,101 @@ async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
         consensus_bus.published_consensus_num_hash(),
         (epoch, number, hash),
         "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// Feed a quorum (`1/3 + 1`) of distinct fixture signers of one consensus result through the
+/// handler, in committee order.
+async fn gossip_consensus_result_quorum(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> eyre::Result<()> {
+    let quorum = committee.committee().size() / 3 + 1;
+    futures::stream::iter(committee.authorities().take(quorum))
+        .then(|auth| async move {
+            handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, number, hash)).await
+        })
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+/// Signers of a consensus result must come from the previous, current or next committee, the
+/// window the gossip layer authorises publishers from. A stored committee for an older epoch is
+/// retired: a quorum of its keys claiming that epoch must not publish (issue #1771). The old
+/// resolver read the epoch-0 record, verified the signatures and pinned the watch at `(0, 10)`.
+#[tokio::test]
+async fn test_consensus_result_rejects_signers_outside_committee_window() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    // An observer follows the tip through the watch and never enters catch-up mode here.
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+    // The retired committee: the fixture keys, stored as the epoch-0 record.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 0, 1, 10, hash).await?;
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a quorum of a retired committee must not publish a consensus result",
+    );
+    Ok(())
+}
+
+/// A result for the previous epoch is accepted from that epoch's committee, but the certified
+/// epoch record bounds its number: `final_consensus.number` is the last output of the epoch, so a
+/// result numbered past it is dropped before the signature check and never pins the watch
+/// (issue #1771). Without the bound the first batch publishes `(1, 7)` and the real `(1, 5)` is
+/// then dropped as old, so the final assertion fails.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The certified record of epoch 1: the fixture committee, closed at consensus number 5.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+    certify_epoch_record(&handler, &committee, &record).await;
+
+    // A quorum signs a number past the epoch's certified final consensus.
+    let past_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 7, past_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a result numbered past the certified epoch record must not publish",
+    );
+
+    // The same quorum signs the epoch's real final output.
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "a result at the certified final consensus of the previous epoch must publish",
     );
     Ok(())
 }
@@ -3581,12 +3688,11 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
         (0..5).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
 
     // peers[0], peers[1] failed THIS epoch (7); peers[2] failed a DIFFERENT epoch (6, ignored).
-    let mut failed: HashMap<BlsPublicKey, Epoch> = HashMap::new();
-    failed.insert(peers[0], 7);
-    failed.insert(peers[1], 7);
-    failed.insert(peers[2], 6);
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7), (peers[2], 6)].into_iter().collect();
 
-    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, None, &mut rng);
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &failed, 7, None, false, &mut rng);
 
     // Same set, no drops.
     assert_eq!(
@@ -3607,6 +3713,12 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
         ordered[..3].contains(&peers[2]),
         "a failure recorded for another epoch must not de-prioritise the peer"
     );
+}
+
+/// The context of an ordinary walk that starts now on `handle`: it reads the preference slot's
+/// current generation, so its serve records (#1787).
+fn current_walk(handle: &PrimaryNetworkHandle) -> ProbeWalk {
+    ProbeWalk { generation: handle.last_sync_server.lock().generation, explore: false }
 }
 
 /// Stand in for the swarm behind a [`PrimaryNetworkHandle`] in the sync probe tests.
@@ -3731,7 +3843,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let mut rng = StdRng::from_seed([7; 32]);
     let peers: Vec<BlsPublicKey> =
         (0..6).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
-    let none_failed = HashMap::new();
+    let none_failed: HashSet<(BlsPublicKey, Epoch)> = HashSet::new();
 
     // whichever peer served last, it is probed first while it has not failed this epoch
     for &preferred in &peers {
@@ -3740,6 +3852,7 @@ fn test_order_probe_peers_puts_last_server_first() {
             &none_failed,
             7,
             Some(preferred),
+            false,
             &mut rng,
         );
         assert_eq!(ordered[0], preferred, "a fresh preferred peer must be probed first");
@@ -3747,16 +3860,29 @@ fn test_order_probe_peers_puts_last_server_first() {
 
     // the preferred peer and one other both failed epoch 7: both sit behind the four fresh peers,
     // the preferred one first
-    let failed: HashMap<BlsPublicKey, Epoch> = [(peers[0], 7), (peers[1], 7)].into();
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &failed, 7, Some(peers[0]), &mut rng);
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
     assert_eq!(ordered[4], peers[0], "a failed preferred peer must lead the failed group");
     assert_eq!(ordered[5], peers[1], "the other failed peer must be probed last");
 
     // a failure recorded for another epoch does not cost the preference
-    let stale: HashMap<BlsPublicKey, Epoch> = [(peers[0], 6)].into();
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &stale, 7, Some(peers[0]), &mut rng);
+    let stale: HashSet<(BlsPublicKey, Epoch)> = [(peers[0], 6)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &stale,
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
     assert_eq!(ordered[0], peers[0], "a failure in another epoch must not demote the peer");
 
     // a preferred key that is not connected changes nothing: same rng state, same order as `None`
@@ -3766,9 +3892,11 @@ fn test_order_probe_peers_puts_last_server_first() {
         &none_failed,
         7,
         Some(stranger),
+        false,
         &mut rng.clone(),
     );
-    let without = crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, &mut rng);
+    let without =
+        crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, false, &mut rng);
     assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
     assert_eq!(
         with_stranger.into_iter().collect::<BTreeSet<_>>(),
@@ -3789,14 +3917,14 @@ async fn test_probe_loops_open_last_server_first() {
     // preferred peer is among the failed ones, so it loses the preference
     let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
     let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
-    handle.record_sync_served(peers[9]);
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
     let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
     assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
     assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
     assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
     assert_eq!(
-        *handle.last_sync_server.lock(),
+        handle.last_sync_server.lock().peer,
         None,
         "a preferred peer that failed its probe must lose the preference"
     );
@@ -3804,52 +3932,64 @@ async fn test_probe_loops_open_last_server_first() {
     // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
     // epoch 0 above. Serving again restores the preference (and clears the peer's failure), so
     // the preferred peer leads that group until it fails once more
-    handle.record_sync_served(peers[9]);
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
     let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
     assert!(result.is_err(), "no peer serves, so the output fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
     assert_eq!(opens.len(), 12, "the output fetch must skip the peers cached unsyncable");
     assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
     assert_eq!(
-        *handle.last_sync_server.lock(),
+        handle.last_sync_server.lock().peer,
         None,
         "a preferred peer that failed its probe must lose the preference"
     );
 
     // a preferred peer that already failed this epoch goes behind every fresh peer
     let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
-    handle.record_sync_served(peers[9]);
-    handle.epoch_sync_failed.lock().insert(peers[9], 0);
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
+    handle.epoch_sync_failed.lock().insert((peers[9], 0));
     let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
     assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
     assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
     assert_eq!(opens.last(), Some(&peers[9]), "a failed preferred peer must be opened last");
-    assert_eq!(*handle.last_sync_server.lock(), None, "and it loses the preference as well");
+    assert_eq!(handle.last_sync_server.lock().peer, None, "and it loses the preference as well");
 }
 
-/// `clear_sync_capability` empties the per-epoch caches but keeps the last peer that served.
+/// `clear_sync_capability` empties the per-epoch caches and also drops the last peer that
+/// served, so a peer preferred in one epoch gets no head start in the next (#1787). Serving
+/// clears only the `(peer, epoch)` slow mark it was recorded for.
 #[test]
-fn test_clear_sync_capability_keeps_last_server() {
+fn test_clear_sync_capability_drops_last_server() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let handle = PrimaryNetworkHandle::new_for_test(tx);
     let mut rng = StdRng::from_seed([7; 32]);
     let peer = *BlsKeypair::generate(&mut rng).public();
     let other = *BlsKeypair::generate(&mut rng).public();
 
-    handle.epoch_sync_failed.lock().insert(peer, 3);
-    handle.epoch_sync_failed.lock().insert(other, 3);
-    handle.record_sync_served(peer);
+    handle.epoch_sync_failed.lock().insert((peer, 2));
+    handle.epoch_sync_failed.lock().insert((peer, 3));
+    handle.epoch_sync_failed.lock().insert((other, 3));
+    handle.record_sync_served(peer, 3, current_walk(&handle));
     assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
     assert!(
-        !handle.epoch_sync_failed.lock().contains_key(&peer),
+        !handle.epoch_sync_failed.lock().contains(&(peer, 3)),
         "serving must clear the peer's failure for this epoch"
     );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(peer, 2)),
+        "serving in one epoch must not clear the peer's failure for another epoch"
+    );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(other, 3)),
+        "serving must not clear another peer's failure"
+    );
+    assert_eq!(handle.last_sync_server.lock().peer, Some(peer), "serving must set the preference");
 
     handle.clear_sync_capability();
     assert!(handle.sync_capability.lock().is_empty(), "capability cache must be cleared");
-    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure map must be cleared");
-    assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
+    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure set must be cleared");
+    assert_eq!(handle.last_sync_server.lock().peer, None, "the preference must be dropped");
 }
 
 /// `import_fault_is_peer_caused` admits ONLY faults attributable solely to

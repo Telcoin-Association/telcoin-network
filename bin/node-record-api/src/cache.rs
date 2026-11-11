@@ -285,6 +285,7 @@ pub(crate) mod test_support {
                 rpc,
             },
             signature: BlsSignature::default(),
+            network_signature: Vec::new(),
         }
     }
 

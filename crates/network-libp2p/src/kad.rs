@@ -4,7 +4,7 @@ use crate::{
     consensus::MAX_ADVERTISED_MULTIADDRS,
     diagnostics::{bounded_error, bounded_warn},
     freshness::RecordTimestamp,
-    retention::{RecordRetention, RetentionBudget},
+    retention::{RecordRetention, RetentionBudget, TrackedUpdate},
     types::NetworkType,
 };
 use libp2p::{
@@ -348,8 +348,15 @@ impl<DB: Database> KadStore<DB> {
     }
 
     /// Enable ownership with separate process allowances for required keys and connected sources.
-    /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024), bounding the union to
-    /// 2,048 rows across all primary and worker swarms. Excess configuration fails explicitly.
+    /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024) across all primary and
+    /// worker swarms. Tracked keys share the required allowance but take only headroom no required
+    /// key holds, so they never make a required reservation fail, and a tracked update keeps only
+    /// the keys that fit. A tracked key the same store already requires takes no tracked slot.
+    /// Required and tracked rows together exceed 1,024 only when committees grow into headroom
+    /// tracked rows already hold, or when a key leaves the committees while it is tracked without
+    /// a slot of its own, each until the next tracked updates resize the reservations. The union
+    /// stays within 3,072 rows plus, in the second case, the keys that left. Excess configuration
+    /// fails explicitly.
     ///
     /// Persisted rows are not pruned here. At startup only our own key is retained, because the
     /// committees are not known yet. The first committee update prunes the rows it does not
@@ -396,6 +403,33 @@ impl<DB: Database> KadStore<DB> {
             .transpose()
             .map_err(|_| Error::MaxRecords)?;
         self.prune_unretained()
+    }
+
+    /// Replace the tracked validator keys with as many of `keys` as the tracked headroom admits,
+    /// preserving pins, committees, and connections.
+    ///
+    /// Keys are kept in the order given, so the caller lists them by priority, and the keys past
+    /// the headroom are left out instead of refusing the update. Returns the record keys left out,
+    /// in the order given; a store without retention has no owners and leaves nothing out.
+    ///
+    /// Tracked rows are accepted and served like committee rows, but
+    /// [`Self::missing_required_records`] never lists them, so their absence triggers no lookup.
+    /// They share the required allowance without ever blocking a required reservation, and a key
+    /// this store already requires is tracked without taking any of it. Only the keys this update
+    /// stops tracking are pruned, and a failed prune is returned after the tracked keys are
+    /// replaced. A full prune here could run before the first committee update and delete
+    /// persisted committee rows that startup has not retained yet.
+    pub(crate) fn retain_tracked(
+        &mut self,
+        keys: impl IntoIterator<Item = BlsPublicKey>,
+    ) -> libp2p::kad::store::Result<Vec<RecordKey>> {
+        let Some(retention) = self.retention.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let TrackedUpdate { released, left_out } =
+            retention.track(keys.into_iter().map(|key| node_record_key(&key)));
+        released.iter().try_for_each(|key| self.prune_record(key))?;
+        Ok(left_out)
     }
 
     /// Retain a verified source's current binding without gating its identity confirmation.
@@ -2675,6 +2709,98 @@ mod test {
         store.retain_committees(std::iter::empty::<BlsPublicKey>())?;
         assert_eq!(store.startup_unretained, 0);
         assert_eq!(store.persisted_record_count(), 1, "only the connected peer row survives");
+        assert_eq!(store.num_records, 1);
+        Ok(())
+    }
+
+    /// A fresh validator key, as a tracked update lists it.
+    fn validator_key() -> BlsPublicKey {
+        test_key_config().primary_public_key()
+    }
+
+    /// A live row under `key`'s discovery record key; the store does not verify record values.
+    fn validator_row(key: &BlsPublicKey) -> Record {
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
+        Record {
+            key: node_record_key(key),
+            value: vec![7, 8, 9],
+            publisher: Some(PeerId::random()),
+            expires,
+        }
+    }
+
+    /// Tracked rows are accepted and served like committee rows but never looked up, an update
+    /// larger than the headroom keeps its first keys and returns the rest, and an update prunes
+    /// only the released rows that lost their last owner.
+    #[test]
+    fn test_kad_tracked_rows_follow_retain_tracked() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let mut store =
+            KadStore::new(db, PeerId::random(), &test_key_config(), NetworkType::Primary);
+        store.set_retention_budget_for_test(4)?;
+        let [tracked, member, untracked, extra] = std::array::from_fn(|_| validator_key());
+        assert!(store.retain_tracked([tracked, member])?.is_empty());
+        store.retain_committees([member])?;
+        assert_eq!(store.missing_required_records(), [member], "a tracked key is never looked up");
+        store.put(validator_row(&tracked))?;
+        store.put(validator_row(&member))?;
+        assert!(store.get(&node_record_key(&tracked)).is_some(), "a tracked row is served");
+        assert!(
+            matches!(store.put(validator_row(&untracked)), Err(Error::MaxRecords)),
+            "an untracked row is still refused"
+        );
+        assert!(store.missing_required_records().is_empty());
+
+        // own and member are required, so two of the three tracked keys fit
+        let left_out = store.retain_tracked([tracked, untracked, extra])?;
+        assert_eq!(left_out, [node_record_key(&extra)], "the key past the headroom is returned");
+        assert!(store.get(&node_record_key(&tracked)).is_some(), "a kept key stays served");
+        assert!(
+            matches!(store.put(validator_row(&extra)), Err(Error::MaxRecords)),
+            "a left-out key is not retained"
+        );
+
+        assert!(store.retain_tracked([untracked])?.is_empty());
+        assert!(store.get(&node_record_key(&tracked)).is_none(), "a released row is not served");
+        assert!(
+            store.get(&node_record_key(&member)).is_some(),
+            "a committee row outlives its tracked ownership"
+        );
+        assert_eq!(store.persisted_record_count(), 1, "only the row without an owner is pruned");
+        assert_eq!(store.num_records, 1);
+        Ok(())
+    }
+
+    /// After a restart a persisted tracked row is served again once an update tracks it, a
+    /// tracked update prunes no restored row, and the first committee prune deletes the restored
+    /// rows that no update tracked again.
+    #[test]
+    fn test_kad_restored_tracked_rows_pruned_unless_retracked() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let [kept, dropped] = std::array::from_fn(|_| validator_key());
+        let mut previous_run =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        previous_run.set_retention_budget_for_test(4)?;
+        previous_run.retain_tracked([kept, dropped])?;
+        [kept, dropped].iter().try_for_each(|key| previous_run.put(validator_row(key)))?;
+        drop(previous_run);
+
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        store.enable_retention()?;
+        assert_eq!(store.startup_unretained, 2);
+        assert!(store.get(&node_record_key(&kept)).is_none(), "no owner retains it at startup");
+        store.retain_tracked([kept])?;
+        assert!(store.get(&node_record_key(&kept)).is_some(), "tracking again serves the row");
+        assert!(store.get(&node_record_key(&dropped)).is_none());
+        assert_eq!(store.persisted_record_count(), 2, "a tracked update prunes no restored row");
+
+        store.retain_committees(std::iter::empty::<BlsPublicKey>())?;
+        assert_eq!(store.startup_unretained, 0);
+        assert_eq!(store.persisted_record_count(), 1, "the untracked restored row is pruned");
+        assert!(store.get(&node_record_key(&kept)).is_some());
         assert_eq!(store.num_records, 1);
         Ok(())
     }
