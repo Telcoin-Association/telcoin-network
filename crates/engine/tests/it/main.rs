@@ -4,6 +4,8 @@
 
 #![allow(unused_crate_dependencies)]
 
+mod persist_pipeline;
+
 use assert_matches::assert_matches;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::{
