@@ -377,6 +377,15 @@ pub struct Parameters {
     /// behaviour: a repeated digest is reported again and can be proposed twice. Issue #1807.
     #[serde(default)]
     pub digest_dedupe: bool,
+
+    /// Threads in a dedicated pool for recovering transaction signers.
+    ///
+    /// A value above zero runs signer recovery for queued outputs on its own pool of that many
+    /// threads, so it no longer competes with the executing output's work on the global rayon
+    /// pool. The default `0` keeps the previous behaviour: recovery runs on the global pool.
+    /// Issue #1805.
+    #[serde(default)]
+    pub recovery_threads: u16,
 }
 
 impl Parameters {
@@ -484,6 +493,7 @@ impl Default for Parameters {
             mdbx_random_advice: false,
             sealed_tx_keep: false,
             digest_dedupe: false,
+            recovery_threads: 0,
         }
     }
 }
@@ -645,6 +655,7 @@ impl Parameters {
             ("mdbx_random_advice", SwitchValue::Bool(self.mdbx_random_advice)),
             ("sealed_tx_keep", SwitchValue::Bool(self.sealed_tx_keep)),
             ("digest_dedupe", SwitchValue::Bool(self.digest_dedupe)),
+            ("recovery_threads", SwitchValue::Count(u64::from(self.recovery_threads))),
         ]
     }
 }
@@ -1338,5 +1349,15 @@ mod test {
         assert!(!parse_with("").digest_dedupe);
         assert!(parse_with("digest_dedupe: true").digest_dedupe);
         assert_eq!(listed("digest_dedupe: true", "digest_dedupe"), "true");
+    }
+
+    // ---- bench6 recovery-pool ----
+
+    /// `recovery_threads` stays on the global pool (0) unless the file sets a thread count.
+    #[test]
+    fn recovery_threads_parses() {
+        assert_eq!(parse_with("").recovery_threads, 0);
+        assert_eq!(parse_with("recovery_threads: 3").recovery_threads, 3);
+        assert_eq!(listed("recovery_threads: 3", "recovery_threads"), "3");
     }
 }
