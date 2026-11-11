@@ -386,6 +386,26 @@ pub struct Parameters {
     /// Issue #1805.
     #[serde(default)]
     pub recovery_threads: u16,
+
+    /// Keep the epoch's task manager tracking and reaping tasks while the node handles the epoch
+    /// boundary.
+    ///
+    /// When `true`, the boundary handler awaits closing the epoch, writing its record and
+    /// exporting it while the epoch's task manager keeps taking in newly spawned tasks and
+    /// reaping finished ones. The default `false` keeps the previous behaviour: the task manager
+    /// does neither until the close completes, and tasks spawned meanwhile can fail to be
+    /// tracked. Issue #1806.
+    #[serde(default)]
+    pub epoch_close_task_drain: bool,
+
+    /// Check the block an epoch record names as its final state before writing the record.
+    ///
+    /// When `true`, writing the epoch record halts the node if the executed block it pins as
+    /// `final_state` is not the epoch's closing block, rather than sign a record for the wrong
+    /// block; the check is skipped while no executed block is known. The default `false` keeps
+    /// the previous behaviour: the pinned block is used without the check. Issue #1806.
+    #[serde(default)]
+    pub epoch_record_state_check: bool,
 }
 
 impl Parameters {
@@ -494,6 +514,8 @@ impl Default for Parameters {
             sealed_tx_keep: false,
             digest_dedupe: false,
             recovery_threads: 0,
+            epoch_close_task_drain: false,
+            epoch_record_state_check: false,
         }
     }
 }
@@ -656,6 +678,8 @@ impl Parameters {
             ("sealed_tx_keep", SwitchValue::Bool(self.sealed_tx_keep)),
             ("digest_dedupe", SwitchValue::Bool(self.digest_dedupe)),
             ("recovery_threads", SwitchValue::Count(u64::from(self.recovery_threads))),
+            ("epoch_close_task_drain", SwitchValue::Bool(self.epoch_close_task_drain)),
+            ("epoch_record_state_check", SwitchValue::Bool(self.epoch_record_state_check)),
         ]
     }
 }
@@ -1359,5 +1383,20 @@ mod test {
         assert_eq!(parse_with("").recovery_threads, 0);
         assert_eq!(parse_with("recovery_threads: 3").recovery_threads, 3);
         assert_eq!(listed("recovery_threads: 3", "recovery_threads"), "3");
+    }
+
+    // ---- bench6 tracker-drain ----
+
+    /// Both tracker-drain switches stay at the bench-5 behaviour unless the file turns them on.
+    #[test]
+    fn tracker_drain_switches_parse() {
+        let params = parse_with("");
+        assert!(!params.epoch_close_task_drain);
+        assert!(!params.epoch_record_state_check);
+        let params = parse_with("epoch_close_task_drain: true\nepoch_record_state_check: true");
+        assert!(params.epoch_close_task_drain);
+        assert!(params.epoch_record_state_check);
+        assert_eq!(listed("epoch_close_task_drain: true", "epoch_close_task_drain"), "true");
+        assert_eq!(listed("epoch_record_state_check: true", "epoch_record_state_check"), "true");
     }
 }
