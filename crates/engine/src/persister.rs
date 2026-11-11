@@ -182,6 +182,13 @@ impl PersistPipeline {
         let gas_accumulator = self.gas_accumulator.clone();
         let repack_monitor = self.repack_monitor.clone();
         self.task_spawner.spawn_blocking_task(format!("build-output-{number}"), move || {
+            // test hook (off without tn-types/test-utils): slows outputs with batches, as the
+            // sequential engine's execution task does, so a test can put a pipelined node's
+            // execution behind its consensus too
+            let has_batches = !args.output.batch_digests().is_empty();
+            if let Some(d) = tn_types::test_hooks::execution_delay().filter(|_| has_batches) {
+                std::thread::sleep(d);
+            }
             let seed_start = Instant::now();
             let (scope, seed_elapsed) = match seed {
                 Some(seed) => (seed.into_scope(), seed_start.elapsed()),
