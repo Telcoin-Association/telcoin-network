@@ -550,14 +550,16 @@ impl RethEnv {
     /// Initialize a new transaction pool for worker.
     ///
     /// The `base_fee` container supplies the pool's pending base fee for the worker's current
-    /// epoch (issue #1262).
+    /// epoch (issue #1262). The pool's limits follow this env's `sealed_tx_keep` switch (see
+    /// [`WorkerTxPool::new_with_sealed_tx_keep`]).
     pub fn init_txn_pool(&self, base_fee: BaseFeeContainer) -> eyre::Result<WorkerTxPool> {
-        WorkerTxPool::new(
+        WorkerTxPool::new_with_sealed_tx_keep(
             self.node_config(),
             self.get_task_spawner(),
             self.blockchain_provider(),
             self.evm_config(),
             base_fee,
+            self.sealed_tx_keep(),
         )
     }
 
@@ -795,6 +797,28 @@ mod tests {
             assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
             assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
         }
+        Ok(())
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// The worker pool an env builds follows the env's `sealed_tx_keep`: with the switch on its
+    /// pending sub-pool holds twice the limits of a switch-off env's pool (the in-flight sealed
+    /// transactions stay pooled), so the switch reaches the pool the node really runs.
+    #[tokio::test]
+    async fn test_init_txn_pool_follows_sealed_tx_keep() -> eyre::Result<()> {
+        let tm = TaskManager::new("pool limits follow the switch");
+        let off_dir = TempDir::new()?;
+        let off = env_with_switches(off_dir.path(), &tm, RethSwitches::default())?;
+        let off_limit = off.init_txn_pool(BaseFeeContainer::default())?.pending_sub_pool_limit();
+        assert!(off_limit.max_txs > 0 && off_limit.max_size > 0, "{off_limit:?}");
+
+        let on_dir = TempDir::new()?;
+        let switches = RethSwitches { sealed_tx_keep: true, ..Default::default() };
+        let on = env_with_switches(on_dir.path(), &tm, switches)?;
+        let on_limit = on.init_txn_pool(BaseFeeContainer::default())?.pending_sub_pool_limit();
+        assert_eq!(on_limit.max_txs, off_limit.max_txs * 2);
+        assert_eq!(on_limit.max_size, off_limit.max_size * 2);
         Ok(())
     }
 

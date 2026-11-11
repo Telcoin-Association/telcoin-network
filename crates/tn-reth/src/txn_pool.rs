@@ -284,6 +284,12 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
+    /// The pending sub-pool's limits of the built pool, for tests of what an env hands the pool.
+    #[cfg(test)]
+    pub(crate) fn pending_sub_pool_limit(&self) -> SubPoolLimit {
+        self.0.config().pending_limit
+    }
+
     /// Set this epoch's fee in both the pool and its canonical-update fee handle.
     ///
     /// A worker that is removed and later reactivated gets a new accumulator slot. Its
