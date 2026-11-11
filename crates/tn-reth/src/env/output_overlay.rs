@@ -602,7 +602,10 @@ mod pinned_tests {
         assert_eq!(before.1, after.1, "a commit after the pin changed the pinned trie updates");
 
         let fresh = OutputTrieOverlay::new().root_with_updates(provider, d2.clone())?;
-        assert_eq!(after.0, fresh.0, "the pinned root differs from D2 over the committed S0 + D1");
+        assert_eq!(
+            after, fresh,
+            "the pinned root or trie updates differ from D2 over the committed S0 + D1"
+        );
 
         // the snapshot itself never moves: without D1 layered, the pinned root is still D2 over
         // S0, which the commit made different from D2 over the committed database

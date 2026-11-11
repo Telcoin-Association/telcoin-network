@@ -38,7 +38,10 @@ use tracing::{debug, error, field, info, info_span, trace, warn, Span};
 /// summed laps (`evm_ms`, `root_ms`, `finish_ms`, see [`BlockBuildTimings`]) and `other_ms`, the
 /// rest of it (payload construction, in-memory chain updates, logging); `max_block_root_ms` and
 /// `max_block_evm_ms` are the slowest block's laps and `txs` counts the transactions handed to
-/// the builder. The skipped empty path does not log it.
+/// the builder. The skipped empty path does not log it. The pipelined persist's commit task logs
+/// the same line with three more fields, which this sequential path never logs:
+/// `persist_wait_ms` (the built output's wait for the commit slot), `seed_ms` (seeding the
+/// build's overlay with the committing output's deltas) and `pipelined=true`.
 ///
 /// This entry point recovers the output's signers inline, on the calling thread, before the
 /// first block. No production code calls it: the engine's run loop starts that recovery on a
@@ -89,7 +92,7 @@ pub(crate) fn execute_consensus_output_with_signers(
     let reth_env = args.reth_env.clone();
     let built =
         build_output(args, signers, gas_accumulator, repack_monitor, OutputBuildScope::new())?;
-    match commit_output(&reth_env, &built, &engine_update_tx) {
+    match commit_output(&reth_env, &built, &engine_update_tx, Duration::ZERO, false) {
         Ok(committed) => Ok(committed.tip),
         Err(CommitFailure::Persist(e)) => {
             // the database transaction never committed: compensate the output's speculative
@@ -139,6 +142,12 @@ pub(crate) fn build_output(
     // boundary lines up with the executed tip, so an increment for a not-yet-finalized output is
     // reconstructed from scratch rather than carried across the restart. Do not add a compensating
     // decrement to the error paths below: it would double-subtract against that rebuild.
+    //
+    // With the pipelined persist two outputs can be in flight: this one building while the one
+    // before it commits, so both outputs' increments may be applied before either is durable.
+    // The argument holds for both: any error in either slot stops the engine with an error (see
+    // `PersistPipeline`), and the restart rebuilds both outputs' increments from the finalized
+    // tip.
     gas_accumulator.rewards_counter().inc_leader_count(output.leader().author());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
@@ -237,6 +246,7 @@ pub(crate) fn build_output(
                 consensus_number: output.number(),
                 leader_round,
                 consensus_num_hash,
+                close_epoch: false,
                 anchor: anchor_header,
                 tip: canonical_header,
                 blocks: executed_blocks,
@@ -244,6 +254,7 @@ pub(crate) fn build_output(
                 batches: batch_count,
                 timings,
                 execute: execute_start.elapsed(),
+                seed: Duration::ZERO,
                 span,
             });
         }
@@ -445,6 +456,7 @@ pub(crate) fn build_output(
         consensus_number: output.number(),
         leader_round,
         consensus_num_hash,
+        close_epoch: output.close_epoch(),
         anchor: anchor_header,
         tip: canonical_header,
         blocks: executed_blocks,
@@ -452,6 +464,7 @@ pub(crate) fn build_output(
         batches: batch_count,
         timings,
         execute,
+        seed: Duration::ZERO,
         span,
     })
 }
@@ -466,12 +479,18 @@ pub(crate) fn build_output(
 /// [`CommitFailure::PostCommit`] the blocks are durable and must stay. The reward accounting of
 /// the build stays in place on every path (see the note at the top of [`build_output`]).
 ///
+/// `persist_wait` (the output's wait for the commit slot) and `pipelined` only shape the
+/// `output executed` line: the pipelined persist adds `persist_wait_ms`, `seed_ms` and
+/// `pipelined=true` to it, and the sequential path logs today's fields only.
+///
 /// Must run on a blocking thread: the persist retry sleeps and the engine update is a
 /// `blocking_send`.
 pub(crate) fn commit_output(
     reth_env: &RethEnv,
     built: &BuiltOutput,
     engine_update_tx: &mpsc::Sender<EngineUpdate>,
+    persist_wait: Duration,
+    pipelined: bool,
 ) -> Result<Committed, CommitFailure> {
     let _guard = built.span.enter();
     if built.blocks.is_empty() {
@@ -482,7 +501,11 @@ pub(crate) fn commit_output(
                 error!(target: "engine", ?e, "engine update channel send failed");
                 CommitFailure::PostCommit(TnEngineError::ChannelClosed)
             })?;
-        return Ok(Committed { tip: built.tip.clone() });
+        return Ok(Committed {
+            tip: built.tip.clone(),
+            persist: Duration::ZERO,
+            announce: Duration::ZERO,
+        });
     }
 
     // Durably commit the output, then announce it. The two halves are called separately
@@ -525,27 +548,55 @@ pub(crate) fn commit_output(
         .executed_transactions_total
         .increment(u64::try_from(built.txs).unwrap_or(u64::MAX));
     let timings = &built.timings;
-    debug!(
-        target: "engine",
-        consensus_number = built.consensus_number,
-        leader_round = built.leader_round,
-        blocks = built.blocks.len(),
-        batches = built.batches,
-        execute_ms = duration_ms(built.execute),
-        persist_ms = duration_ms(persist),
-        announce_ms = duration_ms(announce),
-        txs = built.txs,
-        recover_wait_ms = duration_ms(timings.recover_wait),
-        evm_ms = duration_ms(timings.evm),
-        root_ms = duration_ms(timings.root),
-        finish_ms = duration_ms(timings.finish),
-        other_ms = duration_ms(built.execute.saturating_sub(timings.laps())),
-        max_block_root_ms = duration_ms(timings.max_block_root),
-        max_block_evm_ms = duration_ms(timings.max_block_evm),
-        "output executed"
-    );
+    let other = built.execute.saturating_sub(timings.laps());
+    if pipelined {
+        debug!(
+            target: "engine",
+            consensus_number = built.consensus_number,
+            leader_round = built.leader_round,
+            blocks = built.blocks.len(),
+            batches = built.batches,
+            execute_ms = duration_ms(built.execute),
+            persist_ms = duration_ms(persist),
+            announce_ms = duration_ms(announce),
+            txs = built.txs,
+            recover_wait_ms = duration_ms(timings.recover_wait),
+            evm_ms = duration_ms(timings.evm),
+            root_ms = duration_ms(timings.root),
+            finish_ms = duration_ms(timings.finish),
+            other_ms = duration_ms(other),
+            max_block_root_ms = duration_ms(timings.max_block_root),
+            max_block_evm_ms = duration_ms(timings.max_block_evm),
+            persist_wait_ms = duration_ms(persist_wait),
+            seed_ms = duration_ms(built.seed),
+            pipelined,
+            "output executed"
+        );
+    } else {
+        // the sequential line keeps exactly its fields (`test_engine_lines_carry_consensus_ids`
+        // pins them); a line without `pipelined` is a sequential one
+        debug!(
+            target: "engine",
+            consensus_number = built.consensus_number,
+            leader_round = built.leader_round,
+            blocks = built.blocks.len(),
+            batches = built.batches,
+            execute_ms = duration_ms(built.execute),
+            persist_ms = duration_ms(persist),
+            announce_ms = duration_ms(announce),
+            txs = built.txs,
+            recover_wait_ms = duration_ms(timings.recover_wait),
+            evm_ms = duration_ms(timings.evm),
+            root_ms = duration_ms(timings.root),
+            finish_ms = duration_ms(timings.finish),
+            other_ms = duration_ms(other),
+            max_block_root_ms = duration_ms(timings.max_block_root),
+            max_block_evm_ms = duration_ms(timings.max_block_evm),
+            "output executed"
+        );
+    }
 
-    Ok(Committed { tip: built.tip.clone() })
+    Ok(Committed { tip: built.tip.clone(), persist, announce })
 }
 
 /// One consensus output, built and in memory, not yet committed.
@@ -560,6 +611,8 @@ pub(crate) struct BuiltOutput {
     pub(crate) leader_round: Round,
     /// The output's consensus number and header digest, reported with the engine update.
     pub(crate) consensus_num_hash: ConsensusNumHash,
+    /// Whether the output closes the epoch (an empty skipped output never does).
+    pub(crate) close_epoch: bool,
     /// The pre-output tip: the parent of the output's first block.
     pub(crate) anchor: SealedHeader,
     /// The last block built, or `anchor` for an output without blocks.
@@ -574,6 +627,9 @@ pub(crate) struct BuiltOutput {
     pub(crate) timings: OutputTimings,
     /// Entry of the build to the end of its block loop: the line's `execute_ms`.
     pub(crate) execute: Duration,
+    /// Time the caller spent seeding the build's overlay with the committing output's deltas
+    /// before the build (zero unseeded): the line's `seed_ms`.
+    pub(crate) seed: Duration,
     /// The output's `execute-consensus` span, entered again by the commit so the commit's lines
     /// carry the output's context.
     pub(crate) span: Span,
@@ -595,6 +651,10 @@ pub(crate) enum CommitFailure {
 pub(crate) struct Committed {
     /// The output's last block (its pre-output tip when it built none), now durable.
     pub(crate) tip: SealedHeader,
+    /// The persist, retries included (zero without blocks).
+    pub(crate) persist: Duration,
+    /// The announce plus the in-memory finalize (zero without blocks).
+    pub(crate) announce: Duration,
 }
 
 /// The block builds' phase laps summed over one consensus output, plus the slowest block's

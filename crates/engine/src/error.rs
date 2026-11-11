@@ -36,6 +36,11 @@ pub enum TnEngineError {
     /// Both sides walk the same batches, so this indicates a bug in the engine.
     #[error("Recovered signers do not match the output's batches, batches {0}, recovered {1}")]
     RecoveredSignersMismatch(usize, usize),
+    /// A pipelined-persist ordering check failed (an output not built on the in-memory tip, not
+    /// dispatched on the durable tip, or a snapshot that does not match it). This is a bug
+    /// signal: like every engine error it stops the node, and nothing out of order is persisted.
+    #[error("pipelined persist ordering check failed: {0}")]
+    PipelineInvariant(&'static str),
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {
