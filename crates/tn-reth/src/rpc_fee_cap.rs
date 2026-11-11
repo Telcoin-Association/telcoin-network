@@ -33,6 +33,16 @@
 //! cap from the error string without a valid signature. The cap is operator
 //! configuration, not a secret, and any funded account learns it the same way.
 //! The delegated path is otherwise unchanged.
+//!
+//! With `rpc_admission_backlog_outputs` above zero, the guard also bounds admission by how far
+//! execution trails consensus ([`BacklogBound`]): while the node's engine is that many consensus
+//! outputs behind, an active validator refuses new raw submissions with reth's pool-overflow
+//! error (`txpool is full`, code `-32003`), after the mode check and before decoding. TN's
+//! observer forwarder treats that error as endpoint-local and tries another validator; a general
+//! client library may surface it as a rejection without retrying. The `/health/workers` readiness
+//! report does not follow the gate, so a gateway keeps routing to a validator while it refuses.
+//! Observers are not bounded, since they forward to validators whose own bound applies, and
+//! neither is the `--forward-txs` handler, which never reaches this guard.
 
 use crate::worker::WorkerRpcAdmission;
 use async_trait::async_trait;
@@ -43,9 +53,13 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::RpcPoolError, EthApiError};
 use tn_types::{
-    gas_accumulator::WorkerBaseFee, Bytes, Decodable2718 as _, NodeMode, PooledTransaction,
-    TransactionTrait as _, B256, U256,
+    gas_accumulator::WorkerBaseFee, AdmissionGate, Bytes, Decodable2718 as _, ExecutionBacklog,
+    NodeMode, PooledTransaction, TransactionTrait as _, B256, U256,
 };
+
+/// Counter: raw transaction submissions an active validator refused because its execution was at
+/// least `rpc_admission_backlog_outputs` consensus outputs behind.
+pub(crate) const RPC_ADMISSION_REFUSED_TOTAL: &str = "tn_reth_rpc_admission_refused_total";
 
 /// Whether a node in `mode` admits raw transaction submissions (issue #1514).
 ///
@@ -139,19 +153,67 @@ impl TxFeeCapWei {
     }
 }
 
+/// The execution-backlog bound on raw submissions (`rpc_admission_backlog_outputs`).
+///
+/// Built once per RPC server over the node's shared [`ExecutionBacklog`], which counts the
+/// consensus outputs forwarded to the engine and not yet executed and persisted. The
+/// [`AdmissionGate`] it holds closes once that backlog reaches the limit and reopens only once
+/// the backlog is below the limit minus one, so at a limit of two it reopens when execution has
+/// caught up completely. While it is closed an active validator refuses every new raw submission
+/// with [`RpcPoolError::TxPoolOverflow`], the error a full pool returns, and counts the refusal in
+/// [`RPC_ADMISSION_REFUSED_TOTAL`].
+///
+/// A limit of zero (the default) holds no gate, so a request costs one `None` check.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BacklogBound {
+    /// The gate and its refusal counter, or `None` when the switch is off.
+    gate: Option<(AdmissionGate, metrics::Counter)>,
+}
+
+impl BacklogBound {
+    /// Bound submissions at `limit` outputs of `backlog`; a `limit` of zero leaves them unbounded.
+    ///
+    /// An enabled bound registers its refusal counter at zero with the metrics recorder installed
+    /// now, so a scrape shows the series before the first refusal.
+    pub(crate) fn new(backlog: &ExecutionBacklog, limit: usize) -> Self {
+        let gate = AdmissionGate::new(backlog.clone(), limit);
+        if !gate.is_enabled() {
+            return Self::default();
+        }
+        let refused = metrics::counter!(RPC_ADMISSION_REFUSED_TOTAL);
+        refused.increment(0);
+        Self { gate: Some((gate, refused)) }
+    }
+
+    /// Refuse a raw submission to an active validator while the gate is closed.
+    ///
+    /// Only [`NodeMode::CvvActive`] is bounded: an observer forwards what it accepts to the
+    /// validators, whose own bound applies, and an inactive validator was refused before this.
+    /// The gate is read only for an active validator, so an observer's checks never move it.
+    pub(crate) fn ensure_admits(&self, mode: NodeMode) -> Result<(), EthApiError> {
+        match &self.gate {
+            Some((gate, refused)) if mode == NodeMode::CvvActive && !gate.admits() => {
+                refused.increment(1);
+                Err(EthApiError::PoolError(RpcPoolError::TxPoolOverflow))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// The two `eth` submission methods TN overrides.
 ///
 /// Method names match reth's `EthApiServer` exactly so the built server can swap
 /// the handlers in place with `TransportRpcModules::add_or_replace_if_module_configured`.
 #[rpc(server, namespace = "eth")]
 pub(crate) trait CappedEthSubmit {
-    /// `eth_sendRawTransaction`: check worker admission, live node mode and the fee cap,
-    /// then delegate to reth.
+    /// `eth_sendRawTransaction`: check worker admission, live node mode, the execution-backlog
+    /// bound and the fee cap, then delegate to reth.
     #[method(name = "sendRawTransaction")]
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
 
-    /// `eth_sendRawTransactionSync`: check worker admission, live node mode and the fee
-    /// cap, then delegate to reth.
+    /// `eth_sendRawTransactionSync`: check worker admission, live node mode, the
+    /// execution-backlog bound and the fee cap, then delegate to reth.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,
@@ -159,8 +221,8 @@ pub(crate) trait CappedEthSubmit {
     ) -> RpcResult<alloy::rpc::types::TransactionReceipt>;
 }
 
-/// Worker-admission, worker-membership, live node-mode and fee-cap guard over reth's
-/// `EthApi` submission methods.
+/// Worker-admission, worker-membership, live node-mode, execution-backlog and fee-cap guard over
+/// reth's `EthApi` submission methods.
 #[derive(Debug, Clone)]
 pub(crate) struct EthSubmitWithCap<Api, Mode> {
     /// The reth `EthApi` this guard delegates to once all checks pass.
@@ -173,19 +235,22 @@ pub(crate) struct EthSubmitWithCap<Api, Mode> {
     worker: WorkerBaseFee,
     /// Reads the node's current consensus participation mode on every request.
     node_mode: Mode,
+    /// Refuses submissions while execution trails consensus by the configured bound.
+    backlog: BacklogBound,
 }
 
 impl<Api, Mode> EthSubmitWithCap<Api, Mode> {
     /// Create a guard from the built `EthApi`, parsed flag, shared worker admission
-    /// gate, live worker handle, and live mode reader.
+    /// gate, live worker handle, live mode reader, and this server's execution-backlog bound.
     pub(crate) const fn new(
         eth_api: Api,
         cap: TxFeeCapWei,
         admission: WorkerRpcAdmission,
         worker: WorkerBaseFee,
         node_mode: Mode,
+        backlog: BacklogBound,
     ) -> Self {
-        Self { eth_api, cap, admission, worker, node_mode }
+        Self { eth_api, cap, admission, worker, node_mode, backlog }
     }
 
     /// Reject a removed worker before decoding or inserting into its retained pool.
@@ -219,7 +284,9 @@ where
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransaction");
         self.admission.ensure_active()?;
         self.ensure_active_worker()?;
-        ensure_can_submit((self.node_mode)())?;
+        let mode = (self.node_mode)();
+        ensure_can_submit(mode)?;
+        self.backlog.ensure_admits(mode)?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction(&self.eth_api, bytes).await?)
     }
@@ -231,7 +298,9 @@ where
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransactionSync");
         self.admission.ensure_active()?;
         self.ensure_active_worker()?;
-        ensure_can_submit((self.node_mode)())?;
+        let mode = (self.node_mode)();
+        ensure_can_submit(mode)?;
+        self.backlog.ensure_admits(mode)?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction_sync(&self.eth_api, bytes).await?)
     }
@@ -333,5 +402,47 @@ mod tests {
             err.to_string(),
             format!("tx fee ({total} wei) exceeds the configured cap ({} wei)", total - 1)
         );
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// The refusal refused submissions carry, its count, and who is bounded: a zero limit
+    /// registers nothing and admits any backlog, an enabled bound refuses an active validator
+    /// with reth's pool-overflow error object and counts it, and observers pass.
+    #[test]
+    fn test_backlog_bound_refuses_active_validators_with_pool_overflow() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // a snapshot resets counters, so each read is the refusals since the previous one
+        let refused = || {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == RPC_ADMISSION_REFUSED_TOTAL)
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(count) => count,
+                    other => panic!("the refusal series is not a counter: {other:?}"),
+                })
+        };
+        let backlog = ExecutionBacklog::new();
+        backlog.record_forwarded(12);
+        backlog.record_executed(2);
+
+        let off = metrics::with_local_recorder(&recorder, || BacklogBound::new(&backlog, 0));
+        assert!(off.ensure_admits(NodeMode::CvvActive).is_ok(), "ten behind, switch off");
+        assert_eq!(refused(), None, "a switch at zero registers no series");
+
+        let on = metrics::with_local_recorder(&recorder, || BacklogBound::new(&backlog, 2));
+        assert_eq!(refused(), Some(0), "an enabled bound exports its series before a refusal");
+        assert!(on.ensure_admits(NodeMode::Observer).is_ok(), "observers forward, not bounded");
+        let err = on.ensure_admits(NodeMode::CvvActive).expect_err("ten behind, bound at two");
+        assert_eq!(err.to_string(), "txpool is full");
+        let object = jsonrpsee::types::ErrorObjectOwned::from(err);
+        assert_eq!(object.code(), -32003);
+        assert_eq!(object.message(), "txpool is full");
+        assert_eq!(refused(), Some(1));
     }
 }

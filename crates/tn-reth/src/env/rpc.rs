@@ -49,7 +49,7 @@ use crate::{
     rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
     rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
-    rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
+    rpc_fee_cap::{BacklogBound, CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
     rpc_gas_price::{EpochGasPriceServer as _, GasPriceWithEpochBaseFee},
@@ -272,7 +272,11 @@ impl RethEnv {
     /// submission: a worker removed from the committee answers `worker is inactive`
     /// (#1505). `node_mode` then reads live consensus participation state. Inactive
     /// validators refuse admission before pool insertion; active validators and
-    /// forwarding observers retain their handlers.
+    /// forwarding observers retain their handlers. With `rpc_admission_backlog_outputs`
+    /// above zero, each server's guard also holds its own execution-backlog gate over the
+    /// env's shared [`tn_types::ExecutionBacklog`], and an active validator answers
+    /// `txpool is full` while execution trails consensus by that many outputs
+    /// (`crate::rpc_fee_cap::BacklogBound`).
     ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
     /// (`crate::rpc_fee_cap`) or, with `--forward-txs`, the forwarding handler
@@ -348,9 +352,11 @@ impl RethEnv {
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
         // RPC boundary and then delegates to these same reth handlers. The same guard checks
-        // worker admission, live worker membership, and live node mode before decoding. A
+        // worker admission, live worker membership, live node mode and, with
+        // `rpc_admission_backlog_outputs` set, the execution backlog before decoding. A
         // `--forward-txs` node enforces the same cap and then relays to its validators
         // instead of touching its own pool; every worker's server shares the one forwarder.
+        // It holds no backlog bound: the validators it relays to apply their own.
         let tx_fee_cap = TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap);
         let submission: Methods = match &self.inner.tx_forwarder {
             Some(forwarder) => {
@@ -364,6 +370,8 @@ impl RethEnv {
                 admission,
                 base_fee.clone(),
                 node_mode,
+                // one gate per server over the node's shared backlog
+                BacklogBound::new(self.execution_backlog(), self.rpc_admission_backlog_outputs()),
             )
             .into_rpc()
             .into(),
@@ -1845,4 +1853,271 @@ mod tests {
     }
 
     mod forward_txs;
+
+    // ---- bench6 inflight-bound ----
+
+    /// An env over `chain` whose submission guard is bounded at `limit` outputs of `backlog`,
+    /// both handed over through [`RethEnv::new_with_switches`] as the node hands them;
+    /// `tx_forward` makes it a `--forward-txs` node. The fee cap is off, so the bound is the only
+    /// check that can refuse a valid transfer, and the transport is the IPC-only default.
+    fn env_with_backlog_bound(
+        chain: Arc<RethChainSpec>,
+        limit: usize,
+        backlog: &tn_types::ExecutionBacklog,
+        tx_forward: crate::TxForwardConfig,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<RethEnv> {
+        use reth_node_core::{
+            args::{DatabaseArgs, DatadirArgs},
+            dirs::MaybePlatformPath,
+            node_config::NodeConfig,
+        };
+        // seed reth's process-wide defaults before the `Default` impls below read them
+        init_reth_defaults();
+        let node_config = NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(tmp_dir.path().to_path_buf()),
+                static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
+            },
+            chain,
+            // a small map, as a temp chain's, so parallel tests do not exhaust address space
+            db: DatabaseArgs {
+                max_size: Some(2 * 1024 * 1024 * 1024),
+                growth_step: Some(4 * 1024 * 1024),
+                ..Default::default()
+            },
+            rpc: reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 0, ..Default::default() },
+            ..NodeConfig::default()
+        };
+        let mut config = crate::RethConfig::from_node_config(node_config);
+        config.1 = tx_forward;
+        let database = RethEnv::new_database(&config, tmp_dir.path().join("db"))?;
+        RethEnv::new_with_switches(
+            &config,
+            task_manager,
+            database,
+            None,
+            GasAccumulator::default(),
+            crate::RethSwitches {
+                rpc_admission_backlog_outputs: limit,
+                execution_backlog: backlog.clone(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// One signed 21,000-gas transfer at 7 wei/gas from the factory's funded account: raw bytes
+    /// and hash. Each call takes the factory's next nonce.
+    fn backlog_transfer(
+        chain: &Arc<RethChainSpec>,
+        factory: &mut TransactionFactory,
+    ) -> (Bytes, B256) {
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        (Bytes::from(tx.encoded_2718()), *tx.hash())
+    }
+
+    /// The `tn_reth_rpc_admission_refused_total` refusals counted since the previous call (the
+    /// debugging recorder's snapshot resets counters), `None` while the series is not registered.
+    fn admission_refusals(snapshotter: &metrics_util::debugging::Snapshotter) -> Option<u64> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_reth_rpc_admission_refused_total")
+            .map(|(.., value)| match value {
+                metrics_util::debugging::DebugValue::Counter(count) => count,
+                other => panic!("the refusal series is not a counter: {other:?}"),
+            })
+    }
+
+    /// Whether `err` is reth's pool-overflow error object, the refusal of a closed bound.
+    fn is_pool_overflow(err: &jsonrpsee::MethodsError) -> bool {
+        matches!(err, jsonrpsee::MethodsError::JsonRpc(e)
+            if e.code() == -32003 && e.message() == "txpool is full")
+    }
+
+    /// The bound through the production registration with `rpc_admission_backlog_outputs: 2`:
+    /// an active validator's guard admits one output behind, closes at two, stays closed back at
+    /// one, and reopens only at zero, then stays open at one. A closed gate answers both
+    /// submission methods with `txpool is full` (-32003) before decoding, counts each refusal,
+    /// and keeps the refused transaction out of the pool; observers and the read methods pass.
+    #[tokio::test]
+    async fn test_backlog_bound_closes_holds_and_reopens_through_the_guard() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the test runtime polls every future on this thread, so the guard covers the awaits too
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let backlog = tn_types::ExecutionBacklog::new();
+        let reth_env = env_with_backlog_bound(
+            chain.clone(),
+            2,
+            &backlog,
+            Default::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default())?;
+        let (node_mode, mode_rx) = tokio::sync::watch::channel(NodeMode::CvvActive);
+        let methods = reth_env
+            .get_rpc_server(
+                pool.clone(),
+                WorkerNetwork::new_for_test(reth_env.chainspec()),
+                GasAccumulator::new(1).worker_base_fee(0),
+                move || *mode_rx.borrow(),
+                RpcModule::new(()),
+            )?
+            .methods_by(|_| true);
+        let mut factory = TransactionFactory::new();
+        assert_eq!(admission_refusals(&snapshotter), Some(0), "exported before any refusal");
+
+        // one behind: open
+        backlog.record_forwarded(11);
+        backlog.record_executed(10);
+        let (first, first_hash) = backlog_transfer(&chain, &mut factory);
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![first]).await?;
+        assert_eq!(accepted, first_hash);
+
+        // two behind: closes, on both methods, before the bytes are decoded
+        backlog.record_forwarded(12);
+        let (second, second_hash) = backlog_transfer(&chain, &mut factory);
+        let err = methods
+            .call::<_, B256>("eth_sendRawTransaction", rpc_params![second.clone()])
+            .await
+            .expect_err("two behind, bound at two");
+        assert!(is_pool_overflow(&err), "unexpected refusal: {err:?}");
+        assert!(pool.get(&second_hash).is_none(), "a refused transaction reached the pool");
+        let err = methods
+            .call::<_, serde_json::Value>(
+                "eth_sendRawTransactionSync",
+                rpc_params![Bytes::from_static(b"not a transaction")],
+            )
+            .await
+            .expect_err("the sync method is bounded too");
+        assert!(is_pool_overflow(&err), "refused before decoding, got: {err:?}");
+
+        // back to one behind: stays closed
+        backlog.record_executed(11);
+        let err = methods
+            .call::<_, B256>("eth_sendRawTransaction", rpc_params![second.clone()])
+            .await
+            .expect_err("one behind, still closed");
+        assert!(is_pool_overflow(&err), "unexpected refusal: {err:?}");
+        assert_eq!(admission_refusals(&snapshotter), Some(3));
+
+        // while closed, read methods answer and an observer's submission is admitted
+        let _: U64 = methods.call("eth_chainId", rpc_params![]).await?;
+        node_mode.send_replace(NodeMode::Observer);
+        let (observed, observed_hash) = backlog_transfer(&chain, &mut factory);
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![observed]).await?;
+        assert_eq!(accepted, observed_hash);
+        node_mode.send_replace(NodeMode::CvvActive);
+        assert_eq!(admission_refusals(&snapshotter), Some(0), "observers are never counted");
+
+        // zero behind: reopens, and stays open at one behind
+        backlog.record_executed(12);
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![second]).await?;
+        assert_eq!(accepted, second_hash);
+        assert!(pool.get(&second_hash).is_some());
+        backlog.record_forwarded(13);
+        let (fourth, fourth_hash) = backlog_transfer(&chain, &mut factory);
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![fourth]).await?;
+        assert_eq!(accepted, fourth_hash);
+        assert_eq!(admission_refusals(&snapshotter), Some(0), "an open gate counts nothing");
+        Ok(())
+    }
+
+    /// With the switch at zero the guard admits whatever the backlog reads and registers no
+    /// refusal series.
+    #[tokio::test]
+    async fn test_backlog_bound_off_admits_any_backlog() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let backlog = tn_types::ExecutionBacklog::new();
+        backlog.record_forwarded(1_000);
+        backlog.record_executed(0);
+        let reth_env = env_with_backlog_bound(
+            chain.clone(),
+            0,
+            &backlog,
+            Default::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default())?;
+        let methods = reth_env
+            .get_rpc_server(
+                pool.clone(),
+                WorkerNetwork::new_for_test(reth_env.chainspec()),
+                GasAccumulator::new(1).worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )?
+            .methods_by(|name| name.starts_with("eth_send"));
+        let (raw, hash) = backlog_transfer(&chain, &mut TransactionFactory::new());
+
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+
+        assert_eq!(accepted, hash);
+        assert!(pool.get(&hash).is_some());
+        assert_eq!(admission_refusals(&snapshotter), None);
+        Ok(())
+    }
+
+    /// A `--forward-txs` node holds no bound: even reading as an active validator with its
+    /// backlog past the limit, its submission handler relays the transaction to the validator
+    /// it forwards to, whose own bound decides.
+    #[tokio::test]
+    async fn test_backlog_bound_leaves_the_forward_path_open() -> eyre::Result<()> {
+        use crate::rpc_tx_forward::{
+            parse_forward_targets,
+            tests::{FakeUpstream, Reply},
+        };
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let (raw, hash) = backlog_transfer(&chain, &mut TransactionFactory::new());
+        let upstream = FakeUpstream::start(Reply::Hash(hash)).await?;
+        let backlog = tn_types::ExecutionBacklog::new();
+        backlog.record_forwarded(9);
+        backlog.record_executed(2);
+        let tx_forward = crate::TxForwardConfig {
+            targets: Some(parse_forward_targets(&upstream.url)?),
+            sanitize: false,
+        };
+        let reth_env =
+            env_with_backlog_bound(chain, 2, &backlog, tx_forward, &task_manager, &tmp_dir)?;
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default())?;
+        let methods = reth_env
+            .get_rpc_server(
+                pool,
+                WorkerNetwork::new_for_test(reth_env.chainspec()),
+                GasAccumulator::new(1).worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )?
+            .methods_by(|_| true);
+
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+
+        assert_eq!(accepted, hash);
+        assert_eq!(upstream.calls().len(), 1, "the transaction reached the validator");
+        Ok(())
+    }
 }
