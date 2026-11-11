@@ -1336,7 +1336,8 @@ async fn test_epoch_start_proposes_round_one_on_genesis_parents() {
 
 /// A digest of `worker_id` that arrived from its worker just now.
 fn queued(digest: BlockHash, worker_id: WorkerId) -> ProposerDigest {
-    ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false }
+    let now = Instant::now();
+    ProposerDigest { digest, worker_id, received: now, first_received: now, requeued: false }
 }
 
 /// A [`ProposalTrigger`] for tests that read neither the proposal's reason nor its counter.
@@ -1412,11 +1413,15 @@ async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
         // the second and the last were re-queued, and only the second rides this header
         let delayed = Instant::now().checked_sub(delay).expect("the clock runs past the delay");
         let queue: VecDeque<_> = (0..12)
-            .map(|i| ProposerDigest {
-                digest: B256::random(),
-                worker_id: 0,
-                received: if i == 0 { delayed } else { Instant::now() },
-                requeued: i == 1 || i == 11,
+            .map(|i| {
+                let received = if i == 0 { delayed } else { Instant::now() };
+                ProposerDigest {
+                    digest: B256::random(),
+                    worker_id: 0,
+                    received,
+                    first_received: received,
+                    requeued: i == 1 || i == 11,
+                }
             })
             .collect();
         proposer.digests = BTreeMap::from([(0, queue)]);
@@ -3362,4 +3367,147 @@ async fn test_digest_dedupe_pending_index_follows_the_lanes() {
         index_matches(&proposer, "a later drain");
     }
     assert!(proposer.digest_dedupe.as_ref().expect("switch on").pending.is_empty());
+}
+
+// ---- bench6 bench6-obs ----
+
+/// Build `proposer`'s next header and track it, as the run loop does with the proposal's result.
+async fn propose_and_track(proposer: &mut Proposer<MemDatabase>) -> Header {
+    let header = proposer
+        .propose_next_header(ProposeReason::MinDelay)
+        .expect("proposal spawned")
+        .await
+        .expect("proposal task reported")
+        .expect("header proposed");
+    proposer.handle_proposal_result(Ok(header.clone())).expect("header tracked");
+    header
+}
+
+/// The #1819 review note: a digest re-queued once reports its wait from the worker's report, not
+/// from the re-queue. The re-queue keeps the digest's first receipt and restarts only its queue
+/// wait; the next header's line reports `oldest_requeue_wait_ms` from the first receipt beside an
+/// unchanged `oldest_digest_wait_ms` from the re-queue, and `digest_wait_seconds` records the
+/// longer of the two. Once the header commits, the proposer holds no first receipt for it.
+///
+/// Catches: a re-queue that restamps the first receipt (the far validators' waits under-reported
+/// by one proposal cycle per lost header), a histogram still measured from the re-queue, a changed
+/// meaning of `oldest_digest_wait_ms`, and first receipts left behind after a commit.
+#[tokio::test]
+async fn test_requeued_digest_reports_its_wait_from_first_receipt() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = metrics::with_local_recorder(&recorder, || {
+        proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager)
+    });
+
+    // the worker reported the digest 300 ms ago, and it rides the round-1 header
+    let wait = Duration::from_millis(300);
+    let reported = Instant::now().checked_sub(wait).expect("the clock runs past the wait");
+    let digest = B256::random();
+    let report = ProposerDigest {
+        digest,
+        worker_id: 0,
+        received: reported,
+        first_received: reported,
+        requeued: false,
+    };
+    proposer.digests = BTreeMap::from([(0, VecDeque::from([report]))]);
+    let lost = propose_and_track(&mut proposer).await;
+    assert_eq!(payload_digests(&lost), [digest]);
+
+    // round 2 goes out, and the certifier cancels round 1
+    propose_and_track(&mut proposer).await;
+    let requeued_at = Instant::now();
+    proposer.process_uncertified_header(lost.round(), lost.digest());
+    let requeued = proposer.digests[&0].front().expect("the digest is pending again");
+    assert_eq!(requeued.first_received, reported, "the first receipt survives the re-queue");
+    assert!(requeued.received >= requeued_at, "the queue wait restarts at the re-queue");
+
+    let carrying = propose_and_track(&mut proposer).await;
+    assert_eq!(payload_digests(&carrying), [digest]);
+    let line = proposed_line(&capture, carrying.round());
+    assert_eq!(line.u64_field("requeued"), Some(1));
+    let requeue_wait = line.u64_field("oldest_requeue_wait_ms").expect("oldest_requeue_wait_ms");
+    assert!(requeue_wait >= 300, "waited {requeue_wait} ms from the report, at least 300");
+    let queue_wait = line.u64_field("oldest_digest_wait_ms").expect("oldest_digest_wait_ms");
+    assert!(queue_wait < 300, "oldest_digest_wait_ms still runs from the re-queue: {queue_wait}");
+
+    // one sample per header with digests, rounds 1 and 3, each from the report
+    let samples = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Histogram(samples)
+                if key.key().name() == "tn_primary.digest_wait_seconds" =>
+            {
+                Some(samples)
+            }
+            _ => None,
+        })
+        .expect("digest_wait_seconds recorded");
+    assert_eq!(samples.len(), 2);
+    assert!(samples.iter().all(|sample| sample.0 >= wait.as_secs_f64()), "{samples:?}");
+    // the later header's sample is the larger one, and it is the line's longer wait
+    let carrying_ms = samples.iter().map(|sample| sample.0).fold(0.0, f64::max) * 1_000.0;
+    assert!((carrying_ms - requeue_wait as f64).abs() < 1.0, "{carrying_ms} vs {requeue_wait}");
+
+    // the header commits: its digest's first receipt is released
+    proposer.process_committed_headers(carrying.round(), vec![carrying.round()]);
+    assert!(proposer.proposed_first_received.is_empty(), "no first receipt outlives its header");
+}
+
+/// A header that carries no re-queued digest reports `oldest_requeue_wait_ms=0`, whether it carries
+/// fresh digests (their oldest wait is still reported in `oldest_digest_wait_ms`) or none at all.
+///
+/// Catches: the field computed over every digest instead of the re-queued ones, or left out of a
+/// header without digests.
+#[tokio::test]
+async fn test_header_without_requeued_digest_reports_zero_requeue_wait() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
+
+    let reported =
+        Instant::now().checked_sub(Duration::from_millis(200)).expect("the clock runs past 200 ms");
+    let report = ProposerDigest {
+        digest: B256::random(),
+        worker_id: 0,
+        received: reported,
+        first_received: reported,
+        requeued: false,
+    };
+    proposer.digests = BTreeMap::from([(0, VecDeque::from([report, queued(B256::random(), 0)]))]);
+    let fresh = propose_and_track(&mut proposer).await;
+    let empty = propose_and_track(&mut proposer).await;
+    assert_eq!(fresh.payload().len(), 2);
+    assert!(empty.payload().is_empty());
+
+    let fresh_line = proposed_line(&capture, fresh.round());
+    assert_eq!(fresh_line.u64_field("requeued"), Some(0));
+    assert_eq!(fresh_line.u64_field("oldest_requeue_wait_ms"), Some(0));
+    let fresh_wait = fresh_line.u64_field("oldest_digest_wait_ms").expect("oldest_digest_wait_ms");
+    assert!(fresh_wait >= 200, "the fresh digests' wait is still reported: {fresh_wait}");
+    let empty_line = proposed_line(&capture, empty.round());
+    assert_eq!(empty_line.u64_field("oldest_requeue_wait_ms"), Some(0));
+    assert_eq!(empty_line.u64_field("oldest_digest_wait_ms"), Some(0));
 }

@@ -95,9 +95,11 @@ pub struct PrimaryMetrics {
     /// once per hold.
     pub(crate) commit_run_ahead_blocked_total: Counter,
     // bench5 land-path-obs
-    /// How long the oldest batch digest in each new own header waited in the proposer's queue,
-    /// from its arrival from the worker (or its re-queue after an uncommitted header) to the
-    /// header's creation. Headers without digests record nothing.
+    /// How long the oldest batch digest in each new own header waited in the proposer, from its
+    /// first arrival from the worker to the header's creation. The wait keeps counting across
+    /// re-queues after an uncommitted header, so it is the larger of the `header proposed` line's
+    /// `oldest_digest_wait_ms` (since the last queueing) and `oldest_requeue_wait_ms`. Headers
+    /// without digests record nothing.
     pub(crate) digest_wait_seconds: Histogram,
     // bench5 f3-rejoin
     /// Vote requests refused because this node is not an active committee validator (inactive

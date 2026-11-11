@@ -62,8 +62,14 @@ impl OurDigestMessage {
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
         let OurDigestMessage { digest, worker_id, ack_channel } = self;
-        let digest =
-            ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false };
+        let now = Instant::now();
+        let digest = ProposerDigest {
+            digest,
+            worker_id,
+            received: now,
+            first_received: now,
+            requeued: false,
+        };
         (ack_channel, digest)
     }
 }
@@ -78,9 +84,15 @@ struct ProposerDigest {
     /// The worker that produced this block.
     pub worker_id: WorkerId,
     /// When the proposer queued this digest: its arrival from the worker, or its re-queue after
-    /// the header that carried it was not committed. The `header proposed` line and
-    /// `tn_primary_digest_wait_seconds` measure the oldest digest's wait from here.
+    /// the header that carried it was not committed. The `header proposed` line's
+    /// `oldest_digest_wait_ms` measures the oldest digest's wait from here.
     pub received: Instant,
+    /// When the proposer first received this digest from its worker, kept across re-queues.
+    /// `tn_primary_digest_wait_seconds` and the `header proposed` line's `oldest_requeue_wait_ms`
+    /// measure from here, so a digest that rode an uncommitted header still reports its whole
+    /// wait. Equal to `received` until a re-queue; a re-queued digest this proposer never received
+    /// (it rode a stored header re-sent after a restart) starts here at its re-queue.
+    pub first_received: Instant,
     /// Whether this digest was re-queued at least once, so `received` marks its latest re-queue
     /// rather than its arrival from the worker. The `header proposed` line counts these as
     /// `requeued`, which splits headers whose digest wait may be cut short by a re-queue from the
@@ -146,6 +158,13 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
+    /// The first receipt of each batch digest drained into an own header this proposer still
+    /// holds: the header being built, or one tracked in [`Self::proposed_headers`]. A header's
+    /// payload keeps no time, so a re-queue takes the digest's stamp back from here and its wait
+    /// keeps counting from its first receipt. A stamp leaves when its digest is re-queued or its
+    /// header commits, so this holds at most the payloads of the tracked headers and the one in
+    /// flight.
+    proposed_first_received: BTreeMap<BlockHash, Instant>,
     /// The consensus leader schedule to be used in order to resolve the leader needed for the
     /// protocol advancement.
     leader_schedule: LeaderSchedule,
@@ -316,6 +335,7 @@ impl<DB: Database> Proposer<DB> {
             digests: BTreeMap::new(),
             next_lane: 0,
             proposed_headers: BTreeMap::new(),
+            proposed_first_received: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
             task_spawner,
@@ -421,12 +441,26 @@ impl<DB: Database> Proposer<DB> {
             created_at,
         );
 
-        // the oldest digest's wait ends here, once the header carrying it exists; a header
-        // without digests has no wait to report and records no sample
-        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(|r| r.elapsed());
-        if let Some(wait) = oldest_digest_wait {
+        // a digest's wait ends here, once the header carrying it exists, and one clock read keeps
+        // the waits below comparable; a header without digests has no wait to report and records
+        // no sample
+        let now = Instant::now();
+        let wait_since = move |stamp: Instant| now.saturating_duration_since(stamp);
+        // since the oldest digest was last queued, restarted by a re-queue
+        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(wait_since);
+        // since the oldest digest first arrived, across re-queues: the histogram's sample, which
+        // equals the larger of the two waits the line reports
+        let oldest_first_wait = digests.iter().map(|d| d.first_received).min().map(wait_since);
+        if let Some(wait) = oldest_first_wait {
             consensus_bus.app().metrics().digest_wait_seconds.record(wait.as_secs_f64());
         }
+        // the same over only the re-queued digests, zero when the header carries none
+        let oldest_requeue_wait = digests
+            .iter()
+            .filter(|d| d.requeued)
+            .map(|d| d.first_received)
+            .min()
+            .map_or(Duration::ZERO, wait_since);
 
         // Metric: header_proposed - tracks header proposals
         info!(
@@ -440,6 +474,7 @@ impl<DB: Database> Proposer<DB> {
             digests = %HeaderDigests(&digests),
             oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
             requeued = digests.iter().filter(|d| d.requeued).count(),
+            oldest_requeue_wait_ms = duration_ms(oldest_requeue_wait),
             pending_before = trigger.pending_before,
             grace_ms = duration_ms(trigger.grace),
             exec_block = exec.block.number,
@@ -866,9 +901,15 @@ impl<DB: Database> Proposer<DB> {
         for round in committed_headers {
             max_committed_round = max_committed_round.max(round);
             // try to remove round - log warning if round is missing
-            if self.proposed_headers.remove(&round).is_none() {
-                warn!("own committed header not found at round {round}, probably because of restarts.");
-            };
+            match self.proposed_headers.remove(&round) {
+                // a committed digest is done waiting, so its first receipt is no longer needed
+                Some(header) => header.payload().keys().for_each(|digest| {
+                    self.proposed_first_received.remove(digest);
+                }),
+                None => warn!(
+                    "own committed header not found at round {round}, probably because of restarts."
+                ),
+            }
         }
 
         // re-insert batches for any proposed header from a round below the current commit
@@ -879,8 +920,8 @@ impl<DB: Database> Proposer<DB> {
         let mut digests_to_resend: BTreeMap<WorkerId, VecDeque<ProposerDigest>> = BTreeMap::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
-        // a re-queued digest's wait restarts here: the proposer keeps no arrival time for digests
-        // already in a header
+        // a re-queued digest's wait since it was last queued restarts here; its first receipt
+        // comes back from `proposed_first_received`
         let requeued_at = Instant::now();
 
         // walk proposed headers in order by round, up to the committed round
@@ -889,7 +930,12 @@ impl<DB: Database> Proposer<DB> {
             .take_while(|(header_round, _)| **header_round <= max_committed_round)
             .for_each(|(header_round, header)| {
                 // add payloads from oldest to newest into each worker's lane
-                push_payload(&mut digests_to_resend, header, requeued_at);
+                push_payload(
+                    &mut digests_to_resend,
+                    header,
+                    requeued_at,
+                    &mut self.proposed_first_received,
+                );
                 retransmit_rounds.push(*header_round);
             });
 
@@ -950,7 +996,12 @@ impl<DB: Database> Proposer<DB> {
         let mut requeued = BTreeMap::new();
         match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
-                push_payload(&mut requeued, header, Instant::now());
+                push_payload(
+                    &mut requeued,
+                    header,
+                    Instant::now(),
+                    &mut self.proposed_first_received,
+                );
             }
             _ => {
                 debug!(
@@ -1052,6 +1103,14 @@ impl<DB: Database> Proposer<DB> {
         if let Some(dedupe) = self.digest_dedupe.as_mut() {
             dedupe.drained(drained.iter().map(|drained| drained.digest));
         }
+        // the header's payload keeps no time, so each digest's first receipt waits here until the
+        // digest commits or comes back in a re-queue
+        drained.iter().for_each(|drained| {
+            self.proposed_first_received
+                .entry(drained.digest)
+                .and_modify(|first| *first = (*first).min(drained.first_received))
+                .or_insert(drained.first_received);
+        });
         drained
     }
 
@@ -1530,18 +1589,21 @@ impl fmt::Display for HeaderDigests<'_> {
 /// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
 /// each stamped as queued at `requeued_at` and marked as re-queued.
 ///
-/// The proposer keeps no arrival time for a digest already in a header, so a re-queued digest's
-/// wait restarts at `requeued_at`.
+/// Each digest takes its first receipt back out of `first_received`, so its wait from the worker's
+/// report keeps counting across the re-queue. A digest without one (it rode a stored header
+/// re-sent after a restart, so this proposer never received it) starts at `requeued_at`.
 fn push_payload(
     lanes: &mut BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
     header: &Header,
     requeued_at: Instant,
+    first_received: &mut BTreeMap<BlockHash, Instant>,
 ) {
     header.payload().iter().for_each(|(digest, worker_id)| {
         lanes.entry(*worker_id).or_default().push_back(ProposerDigest {
             digest: *digest,
             worker_id: *worker_id,
             received: requeued_at,
+            first_received: first_received.remove(digest).unwrap_or(requeued_at),
             requeued: true,
         });
     });
