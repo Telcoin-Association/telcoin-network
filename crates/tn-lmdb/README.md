@@ -655,21 +655,23 @@ extra bytes, and two system calls per gap filled.
   block it was writing at a power cut damages only free pages and a meta (see the page-size
   item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page,
   which its CRC then reports as `Corrupt`. Leave gap fill off on such a drive.
-- **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous
-  random read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
-  `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap
-  it cannot read whole is skipped (`IoStats::gap_misses`). When the gap's first page is missing,
-  the kernel starts a read of the gap that nothing waits for, and `POSIX_FADV_RANDOM` on the file
-  (given at open when gap fill is on; the engine reads through the file only at open otherwise)
-  keeps that read to the gap's pages. A commit stops trying once its misses exceed its fills by
-  16, so the reads a commit's fill starts exceed the writes it saved by at most 16. A kernel or
-  file system that refuses `RWF_NOWAIT` (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap
-  fill off for the environment at the first gap read, a fixed width and auto alike, with one
-  warning and `IoStats::gap_fill_refusals` at 1: no later commit tries
-  (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap fill tests assert that
-  fallback on such a file system (`file::refuses_nowait_reads`, a probe of their own), so they
-  fill gaps only where the temp dir is on a disk. No safe call reports residency without reading
-  (`mincore` would be a raw call: new `unsafe`).
+- **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous random
+  read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
+  `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap it
+  cannot read whole is skipped (`IoStats::gap_misses`). When the gap's first page is missing, the
+  kernel starts a read of the gap that nothing waits for, and `POSIX_FADV_RANDOM` on the file (given
+  at open when gap fill is on; the engine reads through the file only at open otherwise) keeps that
+  read to the gap's pages. A commit stops trying once its misses exceed its fills by 16, so the
+  reads a commit's fill starts exceed the writes it saved by at most 16. Right after an open the
+  cache holds none of the file on Linux (open step 4 drops its pages), so the first commits' gaps
+  miss until the tree's reads and the commits' writes bring pages back; that bound caps what it
+  costs, and no byte changes either way. A kernel or file system that refuses `RWF_NOWAIT`
+  (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off for the environment at the
+  first gap read, a fixed width and auto alike, with one warning and `IoStats::gap_fill_refusals` at
+  1: no later commit tries (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap
+  fill tests assert that fallback on such a file system (`file::refuses_nowait_reads`, a probe of
+  their own), so they fill gaps only where the temp dir is on a disk. No safe call reports residency
+  without reading (`mincore` would be a raw call: new `unsafe`).
 - **macOS** has no `RWF_NOWAIT`: a gap is read with a plain `pread`, and a page not in memory
   costs a synchronous read. Gap fill there serves the tests and measurement, not production.
   Step 4's `msync`s of `DataSync::Ranges` write the rewritten gaps with the mapped pages (each
