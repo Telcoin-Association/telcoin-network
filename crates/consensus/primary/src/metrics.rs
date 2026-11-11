@@ -138,6 +138,18 @@ pub struct PrimaryMetrics {
     /// Zero in a healthy node; a rising value means the execution database keeps failing reads
     /// and the waits behind it (votes, the subscriber, catch-up) are held.
     pub(crate) execution_check_retries_total: Counter,
+    // bench6 tracker-drain
+    /// The highest round of a certificate from the epoch after the one this node last executed,
+    /// seen since this epoch's request handler was built (zero then): how many rounds the
+    /// committee had run in an epoch this node had not executed any of yet.
+    ///
+    /// Set where a certificate is checked for falling behind. The activity window
+    /// (`gc_activity_window(gc_depth)`, 40 rounds at a `gc_depth` of 50) demotes the node once a
+    /// certificate of that epoch passes it, so a value near the window means the node entered the
+    /// epoch with little margin left. Only an active CVV records it: a node that enters the epoch
+    /// already demoted reads zero, and a demotion stops it one round past the window. The next
+    /// epoch's handler starts it at zero again, so read it as a maximum over time.
+    pub(crate) epoch_entry_rounds_behind: Gauge,
 }
 
 impl PrimaryMetrics {

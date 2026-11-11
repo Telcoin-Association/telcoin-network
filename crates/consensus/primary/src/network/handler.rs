@@ -154,6 +154,12 @@ pub(crate) struct RequestHandler<DB> {
     /// is inside the activity window again. A demotion while it is set is the held one taking
     /// effect at the end of the grace, so the rejoin it follows counts as failed.
     rejoin_grace_holding: Arc<AtomicBool>,
+    /// The highest round of a certificate from the epoch after the one this node last executed
+    /// that this handler has checked: the value of `tn_primary_epoch_entry_rounds_behind`.
+    ///
+    /// The gauge is written under this lock, so certificates checked side by side cannot leave it
+    /// below the highest round. The lock is never held across an await.
+    epoch_entry_rounds_behind: Arc<Mutex<Round>>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -173,6 +179,8 @@ where
         for auth in consensus_config.committee().authorities() {
             auth_last_vote.insert(auth.id(), TokioMutex::new(None));
         }
+        // a handler serves one epoch, so its entry gauge starts again here
+        consensus_bus.metrics().epoch_entry_rounds_behind.set(0.0);
         Self {
             consensus_config,
             consensus_bus,
@@ -187,6 +195,7 @@ where
             vote_metrics: Arc::new(VoteStageHandles::new()),
             rejoin_grace_log: Default::default(),
             rejoin_grace_holding: Default::default(),
+            epoch_entry_rounds_behind: Default::default(),
         }
     }
 
@@ -274,6 +283,7 @@ where
             // checking a cert) then we let the next epoch early rounds through. Having the
             // number is better.  Note we will seen 1/3 + 1 (min) certs to here.
             // Also, these checks for certs are probably not 100% needed anyway...
+            self.record_epoch_entry_rounds_behind(round);
             round > gc_depth.max(6)
         } else {
             epoch > exec_epoch
@@ -375,6 +385,20 @@ where
             true
         } else {
             false
+        }
+    }
+
+    /// Raise `tn_primary_epoch_entry_rounds_behind` to `round`, the round of a certificate from
+    /// the epoch after the one this node last executed, when it is the highest this handler has
+    /// seen.
+    ///
+    /// This node has executed nothing of that epoch, so the round is how far it trails the
+    /// committee there. Observation only: [`Self::behind_consensus`] decides as before.
+    fn record_epoch_entry_rounds_behind(&self, round: Round) {
+        let mut highest = self.epoch_entry_rounds_behind.lock();
+        if round > *highest {
+            *highest = round;
+            self.consensus_bus.metrics().epoch_entry_rounds_behind.set(f64::from(round));
         }
     }
 

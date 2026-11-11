@@ -5459,3 +5459,58 @@ async fn vote_queue_fix_refuses_request_superseded_on_the_lock() -> eyre::Result
 
     Ok(())
 }
+
+// ---- bench6 tracker-drain ----
+
+/// `tn_primary_epoch_entry_rounds_behind` holds the highest round of a certificate from the epoch
+/// after the one this node last executed, without changing the decision: the node stays active up
+/// to the activity window and is demoted past it, as before. A certificate of the executed epoch
+/// does not move it, and the next epoch's handler, built on the same bus, starts it at zero.
+#[tokio::test]
+async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    // reads leave the gauge as it is, unlike a `DebuggingRecorder` snapshot, which zeroes it
+    let recorder = crate::metrics::test_recorder::TestMetricsRecorder::new();
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let config = committee.first_authority().consensus_config();
+    // the bus registers its metrics with the recorder that is active while it is built
+    let cb = {
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        ConsensusBus::new()
+    };
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee()).await?;
+    let handler = RequestHandler::new(
+        config.clone(),
+        cb.app().clone(),
+        synchronizer.clone(),
+        consensus_chain.clone(),
+    );
+    let gauge = || match recorder.metric("tn_primary.epoch_entry_rounds_behind") {
+        Some(DebugValue::Gauge(level)) => Some(level.0),
+        other => panic!("the gauge is not registered as a gauge: {other:?}"),
+    };
+    assert_eq!(gauge(), Some(0.0), "a new handler starts the gauge at zero");
+    let window = tn_types::gc_activity_window(config.parameters().gc_depth);
+
+    // nothing is executed here, so the last executed leader is of epoch 0 and epoch 1 is next
+    assert!(!handler.behind_consensus(1, 5, None).await);
+    assert_eq!(gauge(), Some(5.0));
+    assert!(!handler.behind_consensus(1, 3, None).await);
+    assert_eq!(gauge(), Some(5.0), "a lower round leaves the highest");
+    assert!(!handler.behind_consensus(0, window, None).await, "inside the executed epoch's window");
+    assert_eq!(gauge(), Some(5.0), "a certificate of the executed epoch does not move it");
+    assert!(!handler.behind_consensus(1, window, None).await, "the window's last round is kept");
+    assert_eq!(gauge(), Some(f64::from(window)));
+    assert!(handler.behind_consensus(1, window + 1, None).await, "past the window is behind");
+    assert_eq!(gauge(), Some(f64::from(window + 1)));
+    assert!(cb.app().is_cvv_inactive(), "the demotion is unchanged");
+
+    let _next = RequestHandler::new(config, cb.app().clone(), synchronizer, consensus_chain);
+    assert_eq!(gauge(), Some(0.0), "the next epoch's handler starts the gauge at zero");
+
+    Ok(())
+}
