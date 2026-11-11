@@ -7,7 +7,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use super::*;
-use crate::ReadTxn as _;
+use crate::{file::refuses_nowait_reads, ReadTxn as _};
 
 fn temp() -> (TempDir, PathBuf) {
     let dir = TempDir::with_prefix("tn_lmdb_gap").expect("temp dir");
@@ -57,12 +57,15 @@ fn open_with(path: &Path, sync: SyncMode, gap_fill: u32) -> Env {
 /// The same commits with gap fill off, at 4 pages and at `MAX_GAP_FILL` leave the three files
 /// identical, byte for byte, after every durable state (each `SyncMode::Durable` commit, each
 /// `Env::sync` of `SyncMode::NoSync` commits), while the fills rewrote gaps: the larger the
-/// option, the more. Step 4 synced the same runs in all three.
+/// option, the more. Step 4 synced the same runs in all three. On a file system that refuses
+/// reads that do not wait for the disk (tmpfs) both fills turn themselves off at their first gap
+/// instead, filling none: the files are identical all the same.
 #[test]
 fn a_gap_fill_changes_no_byte_of_the_file() {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
         let fills = [0, 4, MAX_GAP_FILL];
         let dirs: Vec<(TempDir, PathBuf)> = fills.iter().map(|_| temp()).collect();
+        let refused = refuses_nowait_reads(dirs[1].0.path());
         let envs: Vec<Env> =
             fills.iter().zip(&dirs).map(|(&g, (_, path))| open_with(path, sync, g)).collect();
         let compare = |step: &str| {
@@ -94,14 +97,25 @@ fn a_gap_fill_changes_no_byte_of_the_file() {
             assert!(s.gap_pages >= s.gaps_filled, "{sync:?} gap fill {g}: {s:?}");
             assert!(s.gaps_filled < s.sync_runs, "{sync:?} gap fill {g}: {s:?}");
         }
-        assert_eq!((stats[0].gaps_filled, stats[0].gap_pages), (0, 0), "{sync:?}: off fills none");
-        assert!(stats[1].gaps_filled > 0, "{sync:?}: 4 pages filled gaps: {:?}", stats[1]);
-        assert!(
-            stats[2].gaps_filled > stats[1].gaps_filled && stats[2].gap_pages > stats[1].gap_pages,
-            "{sync:?}: a larger gap fill fills more: {:?} {:?}",
-            stats[1],
-            stats[2]
-        );
+        let off = (stats[0].gaps_filled, stats[0].gap_pages, stats[0].gap_fill_refusals);
+        assert_eq!(off, (0, 0, 0), "{sync:?}: off fills none");
+        if refused {
+            eprintln!("{sync:?}: the file system refuses RWF_NOWAIT: gap fill turned itself off");
+            for (g, s) in fills.iter().zip(&stats).skip(1) {
+                let counts = (s.gaps_filled, s.gap_pages, s.gap_fill_refusals);
+                assert_eq!(counts, (0, 0, 1), "{sync:?} gap fill {g}: refused once: {s:?}");
+            }
+        } else {
+            assert!(stats.iter().all(|s| s.gap_fill_refusals == 0), "{sync:?}: {stats:?}");
+            assert!(stats[1].gaps_filled > 0, "{sync:?}: 4 pages filled gaps: {:?}", stats[1]);
+            assert!(
+                stats[2].gaps_filled > stats[1].gaps_filled
+                    && stats[2].gap_pages > stats[1].gap_pages,
+                "{sync:?}: a larger gap fill fills more: {:?} {:?}",
+                stats[1],
+                stats[2]
+            );
+        }
         let empty = envs[0].with_writer(|w| w.gap_buf.capacity());
         assert_eq!(empty, 0, "{sync:?}: off, no buffer");
         for env in envs {
@@ -113,10 +127,13 @@ fn a_gap_fill_changes_no_byte_of_the_file() {
 /// A fill rewrites exactly the gaps of 1 to `gap_fill` clean pages between two of the pages
 /// step 4 syncs, and none wider: here the gaps of 1, 3, 7 and 8 pages between pages 10..=40,
 /// so at 1 page one gap (1 page), at 4 two (4), at 7 three (11), at 8 four (19). No byte of the
-/// file changes, and on macOS the gap pages it wrote are dirty until a sync writes them.
+/// file changes, and on macOS the gap pages it wrote are dirty until a sync writes them. On a
+/// file system that refuses reads that do not wait for the disk (tmpfs) each fill fills nothing
+/// and turns gap fill off at its first gap.
 #[test]
 fn a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider() {
-    let (_dir, path) = temp();
+    let (dir, path) = temp();
+    let refused = refuses_nowait_reads(dir.path());
     let env = open_with(&path, SyncMode::Durable, 0);
     load(&env);
     let pages = [10u32, 12, 16, 24, 25, 34];
@@ -128,13 +145,16 @@ fn a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider() {
             assert_eq!(w.file.dirty_os_pages(), 0, "gap fill {g}: clean before the fill");
             w.gap_fill = g;
             w.fill_gaps(&pages).expect("fill");
+            assert_eq!(w.gap_fill, if refused { 0 } else { g }, "gap fill {g}: off once refused");
             #[cfg(target_os = "macos")]
             assert!(w.file.dirty_os_pages() > 0, "gap fill {g}: the fill wrote its gaps");
             // Write them now, so the next round starts clean.
             w.file.fdatasync_all().expect("sync");
         });
         let s = env.io_stats().since(&was);
-        assert_eq!((s.gaps_filled, s.gap_pages, s.gap_misses), (filled, pages_filled, 0), "{g}");
+        let want = if refused { (0, 0, 0, 1) } else { (filled, pages_filled, 0, 0) };
+        let counts = (s.gaps_filled, s.gap_pages, s.gap_misses, s.gap_fill_refusals);
+        assert_eq!(counts, want, "gap fill {g}: refused {refused}");
         assert!(fs::read(&path).expect("read") == before, "gap fill {g} changed the file");
     }
     env.check().expect("check");
@@ -158,6 +178,48 @@ fn a_fill_stops_once_its_misses_outnumber_its_fills_by_the_slack() {
     let s = env.io_stats().since(&was);
     assert_eq!((s.gaps_filled, s.gap_pages), (0, 0));
     assert_eq!(s.gap_misses, GAP_MISS_SLACK + 1, "it stopped after the slack");
+}
+
+/// A kernel or file system that refuses reads that do not wait for the disk
+/// (`PageFile::refuse_reads`, as tmpfs refuses `RWF_NOWAIT`) turns gap fill off for the
+/// environment at the first gap a durable commit reads: one refusal, so one warning, however many
+/// later commits have gaps to fill (each of the twin whose every read misses, `miss_reads`, tries
+/// some), no gap filled or missed, the bounce buffer given back, and the file byte for byte the
+/// one gap fill off leaves.
+#[test]
+fn a_file_that_refuses_nowait_reads_turns_gap_fill_off_once() {
+    let dirs: Vec<(TempDir, PathBuf)> = (0..3).map(|_| temp()).collect();
+    let fills = [0, MAX_GAP_FILL, MAX_GAP_FILL];
+    let envs: Vec<Env> = fills
+        .iter()
+        .zip(&dirs)
+        .map(|(&g, (_, path))| open_with(path, SyncMode::Durable, g))
+        .collect();
+    let (off, refusing, missing) = (&envs[0], &envs[1], &envs[2]);
+    refusing.with_writer(|w| w.file.refuse_reads = true);
+    missing.with_writer(|w| w.file.miss_reads = true);
+    for env in &envs {
+        load(env);
+    }
+    let mut tried = 0;
+    for round in 1..=6u32 {
+        let was = (refusing.io_stats(), missing.io_stats());
+        for env in &envs {
+            scatter(env, round);
+        }
+        let (r, m) = (refusing.io_stats().since(&was.0), missing.io_stats().since(&was.1));
+        tried += u32::from(m.gap_misses > 0);
+        assert_eq!((r.gaps_filled, r.gap_pages, r.gap_misses), (0, 0, 0), "round {round}: {r:?}");
+        let on = refusing.with_writer(|w| (w.gap_fill, w.gap_buf.capacity()));
+        let refused = refusing.io_stats().gap_fill_refusals;
+        assert_eq!(on, if refused == 0 { (MAX_GAP_FILL, 0) } else { (0, 0) }, "round {round}");
+    }
+    assert!(tried >= 2, "several commits read gaps: {tried}");
+    assert_eq!(refusing.io_stats().gap_fill_refusals, 1, "refused once");
+    assert_eq!(off.io_stats().gap_fill_refusals + missing.io_stats().gap_fill_refusals, 0);
+    let bytes = |env: usize| fs::read(&dirs[env].1).expect("read");
+    assert!(bytes(1) == bytes(0), "the refused fill changed the file");
+    refusing.check().expect("check");
 }
 
 /// `EnvOptions::gap_fill` defaults to 0 (off); past `MAX_GAP_FILL` it is refused at open as

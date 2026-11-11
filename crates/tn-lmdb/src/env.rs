@@ -271,8 +271,9 @@ pub struct EnvOptions {
     /// Linux reads a gap with `RWF_NOWAIT` and fills it only when the page cache holds it whole:
     /// a gap not in memory is skipped (its read, which the kernel starts, is not waited for), and
     /// a commit stops trying once its gaps not in memory outnumber those it filled by 16. A
-    /// kernel or file system that refuses `RWF_NOWAIT` turns it off for the environment, with a
-    /// warning. macOS reads a gap with a plain `pread`, so a gap page not in memory costs a
+    /// kernel or file system that refuses `RWF_NOWAIT` (tmpfs is one) turns it off for the
+    /// environment at the first gap it reads, with one warning ([`IoStats::gap_fill_refusals`]).
+    /// macOS reads a gap with a plain `pread`, so a gap page not in memory costs a
     /// synchronous read there: it serves tests and measurement, not production. A fill rewrites
     /// pages of the last durable state too, which no commit otherwise writes: it relies on the
     /// drive writing each logical block atomically (README, "Gap fill"). Applies to every run of
@@ -1011,8 +1012,9 @@ impl Writer {
     ///
     /// A gap not in memory is skipped and counted ([`IoStats::gap_misses`]); once a commit's
     /// misses exceed its fills by [`GAP_MISS_SLACK`] it stops trying. A kernel or file system that
-    /// refuses the residency check turns gap fill off for the environment, with a warning: the
-    /// gaps filled so far keep their bytes. An I/O error reading or writing a gap fails the
+    /// refuses the residency check turns gap fill off for the environment, with a warning and
+    /// [`IoStats::gap_fill_refusals`], once: no later commit calls this. The gaps filled so far
+    /// keep their bytes. An I/O error reading or writing a gap fails the
     /// commit and poisons the file (a failed write leaves each byte as it was or rewritten).
     fn fill_gaps(&mut self, pages: &[u32]) -> Result<()> {
         let size = self.geometry.page_size();
@@ -1045,6 +1047,7 @@ impl Writer {
                     );
                     self.gap_fill = 0;
                     self.gap_buf = Vec::new();
+                    self.stats.gap_fill_refusals += 1;
                     break;
                 }
             }

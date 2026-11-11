@@ -284,10 +284,10 @@ returns at once, short or with an error, when a page is not cached, without new 
 
 **Linux.** `preadv2` with `RWF_NOWAIT` (since 4.14 for buffered reads), through `rustix` (a
 Linux-only dependency, `Cargo.toml`); a kernel or file system that refuses it (`EOPNOTSUPP`,
-`EINVAL`, `ENOSYS`) turns gap fill off with a warning. `posix_fadvise(POSIX_FADV_RANDOM)` keeps the
-read a miss starts to the gap. **macOS.** No such read: a plain `pread` (a page not in memory
-costs a synchronous read), so gap fill there serves tests and measurement. A port without such a
-read does the same or refuses the option.
+`EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off with a warning, once.
+`posix_fadvise(POSIX_FADV_RANDOM)` keeps the read a miss starts to the gap. **macOS.** No such
+read: a plain `pread` (a page not in memory costs a synchronous read), so gap fill there serves
+tests and measurement. A port without such a read does the same or refuses the option.
 
 ### Errors
 
@@ -371,6 +371,7 @@ functions; the rest of the library and its tests type-check there.
 
 | file | item | switch | what |
 |---|---|---|---|
+| `file.rs` | `refuses_nowait_reads` | `linux` / `not(linux)` | probes the temp dir with its own `preadv2(RWF_NOWAIT)` (`rustix`) / never refuses: the gap fill tests' expected fallback |
 | `file.rs` | `PageFile::dirty_os_pages` | `all(test, macos)` | counts modified pages with `mincore` (`MINCORE_MODIFIED`, `MINCORE_MODIFIED_OTHER`: Apple only) |
 | `file.rs` | `fdatasync_all_writes_every_page_dirtied_through_the_mapping` | `macos` | no dirty page after `fdatasync_all` |
 | `file.rs` | `a_failed_msync_of_ranges_poisons_the_file` | `macos` | `msync_ranges` (macOS only) keeps the poison rule |

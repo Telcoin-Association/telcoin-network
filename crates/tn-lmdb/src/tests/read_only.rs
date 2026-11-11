@@ -162,15 +162,19 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
 /// byte-identical with its modification time unchanged, and the next open falls back again. Commits
 /// that reuse free pages keep the file's length, so the pages' check finds the loss; commits that
 /// grow the file lose their growth with the volume, so the file is shorter than the head's pages.
+/// Whether the commits grow the file is asserted before the crash: the reuse case's commits fit
+/// the free pages the gate lets them reuse (the pages freed before the last sync), so the test
+/// does not lean on the slack a close leaves when the OS page is larger than the engine's.
 #[test]
 fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
-    for (rows, grows) in [(97, false), (7, true)] {
+    for (rows, grows) in [(199, false), (7, true)] {
         let (_dir, path) = temp("tn_lmdb_ro_lost");
         let mut state = written(&path);
         disk_model::track(&path);
         let env = open(&path, SyncMode::NoSync);
         let synced_txn = durable_first_commit(&env, &mut state);
         let synced = state.clone();
+        let synced_len = fs::metadata(&path).expect("metadata").len();
         for round in 0..3_u32 {
             let mut txn = env.begin_rw().expect("begin");
             for i in (round..1500).step_by(rows) {
@@ -180,6 +184,8 @@ fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
         }
         assert_eq!(env.stat().txn_id, synced_txn + 3);
         let head_pages = env.stat().page_count;
+        let grown = fs::metadata(&path).expect("metadata").len() > synced_len;
+        assert_eq!(grown, grows, "rows step {rows}: the commits since the last sync grow the file");
         env.with_writer(|w| {
             let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
             w.file.msync_page(slot as u32, P as usize).expect("the meta page's writeback");
