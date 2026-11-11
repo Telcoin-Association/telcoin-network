@@ -99,7 +99,8 @@ pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 /// and starve its peers. A public key may serve on only
 /// `PUBLIC_BATCH_SERVES_PER_PEER` of its streams at a time. The same cap bounds
 /// the batch reports that one peer has in validation at a time (see
-/// `WorkerNetwork::process_report_batch`).
+/// `WorkerNetwork::process_report_batch`). A cancelled report does not release
+/// its slot early: the slot is held until the validation task ends.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
 /// Maximum number of concurrent gossip-triggered batch prefetches.
@@ -1072,10 +1073,11 @@ pub struct WorkerNetwork<DB, Events> {
     /// Per-peer in-flight batch report validations, capped at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`].
     ///
-    /// A report holds its slot for the life of its validation task. The cap is a per-peer
-    /// slot, not a shared class budget: a shared pool lets k colluding committee keys hold
-    /// 2k permits and starve honest reporters, while a per-peer slot bounds each key at 2
-    /// concurrent validations and other peers cannot exhaust it. The cap applies whatever
+    /// A report holds its slot for the life of its validation task. A cancelled request does
+    /// not release the slot early: the task runs to its end and only skips the reply. The cap
+    /// is a per-peer slot, not a shared class budget: a shared pool lets k colluding committee
+    /// keys hold 2k permits and starve honest reporters, while a per-peer slot bounds each key
+    /// at 2 concurrent validations and other peers cannot exhaust it. The cap applies whatever
     /// the value of `serve_budget.batch` (#1774).
     report_peer_slots: PeerSlots,
     /// The `tn_worker.batch_reports_shed_total` series of this worker, resolved once.
@@ -1227,8 +1229,10 @@ where
     /// Offer an admitted batch report to the batch serve class and spawn its validation.
     ///
     /// `report_slot` is the per-peer slot that [`Self::process_report_batch`] took. It moves
-    /// into the spawned task with the serve permit, so every exit of the task frees both. A
-    /// refused offer drops the slot here.
+    /// into the spawned task with the serve permit, so every exit of the task frees both. The
+    /// task runs the report to its end, also when the network layer cancels the request, so
+    /// both cover the blocking validation and the bookkeeping of the handler; a cancel only
+    /// skips the reply. A refused offer drops the slot here.
     fn serve_report_batch(
         &self,
         peer: BlsPublicKey,
@@ -1258,25 +1262,26 @@ where
                 // so every exit releases both
                 let _report_slot = report_slot;
                 let _serve_permit = serve_permit;
-                tokio::select! {
-                    res = request_handler.process_report_batch(&peer, sealed_batch) => {
-                        let response = match res {
-                            Ok(()) => WorkerResponse::ReportBatch,
-                            Err(err) => {
-                                // classify transient responder-side conditions as
-                                // recoverable so the requester retries instead of
-                                // treating this as a permanent rejection
-                                let response = WorkerResponse::into_error_ref(&err);
-                                if let Some(penalty) = err.into() {
-                                    network_handle.report_penalty(peer, penalty).await;
-                                }
-                                response
-                            }
-                        };
-                        let _ = network_handle.inner_handle().send_response(response, channel).await;
-                    },
-                    // cancel notification from network layer
-                    _ = cancel => (),
+                // run to the end, so the slot and the permit cover the blocking validation and
+                // the bookkeeping of the handler; a cancel from the network layer only skips
+                // the reply
+                let (res, reply) =
+                    request_handler.run_report_to_completion(&peer, sealed_batch, cancel).await;
+                let response = match res {
+                    Ok(()) => WorkerResponse::ReportBatch,
+                    Err(err) => {
+                        // classify transient responder-side conditions as
+                        // recoverable so the requester retries instead of
+                        // treating this as a permanent rejection
+                        let response = WorkerResponse::into_error_ref(&err);
+                        if let Some(penalty) = err.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                        response
+                    }
+                };
+                if reply {
+                    let _ = network_handle.inner_handle().send_response(response, channel).await;
                 }
                 Ok(())
             });
