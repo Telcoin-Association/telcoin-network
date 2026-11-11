@@ -421,13 +421,16 @@ mod tn_lmdb {
         );
     }
 
-    /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
     /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: off; a width in pages, `off`
     /// or `auto`; past `MAX_GAP_FILL` or anything else refused at the parse, naming the flag) and
     /// reaches the engine: a width past its `MAX_GAP_FILL` given by `with_db_gap_fill` is refused
     /// at the open, naming the flag, before the database is created; a width or `auto` opens, and
     /// its durable commits fill gaps (`IoStats::gaps_filled` is the engine's own count; `auto`'s
-    /// warm-up fills from its first scattered commit, `IoStats::gap_auto_steps`).
+    /// warm-up fills from its first scattered commit, `IoStats::gap_auto_steps`). On a file system
+    /// that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first
+    /// commit with a gap to fill turns gap fill off instead, a width and `auto` alike
+    /// (`IoStats::gap_fill_refusals`, the engine's documented fallback), filling none: the option
+    /// reached the engine either way.
     #[test]
     fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
         use clap::Parser as _;
@@ -474,11 +477,25 @@ mod tn_lmdb {
             }
             let s = db.io_stats();
             assert!(s.sync_runs > s.commits, "{gap_fill}: the commits formed runs: {s:?}");
-            assert!(s.gaps_filled > 0, "{gap_fill}: the durable commits filled gaps: {s:?}");
-            assert_eq!(s.gap_auto_steps > 0, gap_fill == GapFill::Auto, "{gap_fill}: {s:?}");
+            let auto = gap_fill == GapFill::Auto;
+            assert!(auto || s.gap_auto_steps == 0, "{gap_fill}: only auto chooses: {s:?}");
+            match s.gap_fill_refusals {
+                0 => {
+                    assert!(
+                        s.gaps_filled > 0,
+                        "{gap_fill}: the durable commits filled gaps: {s:?}"
+                    );
+                    assert!(!auto || s.gap_auto_steps > 0, "{gap_fill}: auto chose: {s:?}");
+                }
+                _ => {
+                    let counts = (s.gap_fill_refusals, s.gaps_filled);
+                    assert_eq!(counts, (1, 0), "{gap_fill}: refused once: {s:?}");
+                }
+            }
         }
     }
 
+    /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
     #[test]
     fn safe_no_sync_syncs_every_second_or_64_mib() {
         assert_eq!(SAFE_NO_SYNC_PERIOD, Duration::from_secs(1));

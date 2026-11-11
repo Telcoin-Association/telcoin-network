@@ -23,6 +23,7 @@ use crate::{
     disk_model,
     env::{self, CrashAt},
     error::Result,
+    file,
     meta::{slot_to_write, META_LEN},
     packed::PackedView,
     page::{self, Find, Val},
@@ -307,8 +308,9 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     }
     let (by_file, reused, runs) =
         env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
-    let io = env.io_stats();
-    let (gaps_filled, gap_auto_steps) = (io.gaps_filled, io.gap_auto_steps);
+    let s = env.io_stats();
+    let (gaps_filled, gap_auto_steps, gap_fill_refusals) =
+        (s.gaps_filled, s.gap_auto_steps, s.gap_fill_refusals);
     env.crash();
     Case {
         path,
@@ -322,6 +324,7 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
         runs,
         gaps_filled,
         gap_auto_steps,
+        gap_fill_refusals,
     }
 }
 
@@ -352,6 +355,9 @@ pub(super) struct Case {
     pub(super) gaps_filled: u64,
     /// The case's scattered durable steps whose width `GapFill::Auto` chose.
     pub(super) gap_auto_steps: u64,
+    /// `IoStats::gap_fill_refusals`: 1 when the file system refused the gap fill's reads, which
+    /// turned it off.
+    pub(super) gap_fill_refusals: u64,
 }
 
 /// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
@@ -436,31 +442,47 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
 /// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
 /// `msync` alone covers), and the base's `layout`.
 fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
-    let Case { path, latest, by_file, reused, gaps_filled, gap_auto_steps, .. } =
-        run_case(base, mode, by_msync, None);
+    let Case {
+        path, latest, by_file, reused, gaps_filled, gap_auto_steps, gap_fill_refusals, ..
+    } = run_case(base, mode, by_msync, None);
     assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{mode:?}: pages were reused");
     // Off, no gap is filled; at the largest gap fill the crash commit's runs always leave gaps to
     // fill. A smaller one fills those the layout leaves short enough, perhaps none. Auto chose the
     // width of the crash commit's durable step, a scattered one (its warm-up's first, 8 pages,
-    // the crash commit's in `Mode::Durable`), and filled what that width finds.
+    // the crash commit's in `Mode::Durable`), and filled what that width finds. On a file system
+    // that refuses reads that do not wait for the disk (tmpfs), the first gap read turns gap fill
+    // off instead (at the largest, always), and the rest of the case runs without it: auto files
+    // no step from the one refused on.
     let gap_fill = GAP_FILL.get();
-    let case = format!("{mode:?} page size {} gap fill {gap_fill}", base.page_size);
+    let case =
+        format!("{mode:?} page size {} gap fill {gap_fill}, by_msync={by_msync}", base.page_size);
+    let refused = gap_fill.is_on() && file::refuses_nowait_reads(base.dir.path());
+    let counts = (gaps_filled, gap_fill_refusals);
     match gap_fill {
-        GapFill::OFF => {
-            assert_eq!(gaps_filled, 0, "{case}: by_msync={by_msync}: off fills nothing")
+        GapFill::OFF => assert_eq!(counts, (0, 0), "{case}: off fills nothing"),
+        GapFill::Pages(MAX_GAP_FILL) if refused => {
+            assert_eq!(counts, (0, 1), "{case}: refused, so turned off")
         }
+        _ if refused => assert!(gaps_filled == 0 && gap_fill_refusals <= 1, "{case}: {counts:?}"),
         GapFill::Pages(MAX_GAP_FILL) => {
-            assert!(gaps_filled > 0, "{case}: by_msync={by_msync}: gaps filled")
+            assert!(gaps_filled > 0 && gap_fill_refusals == 0, "{case}: {counts:?}")
         }
-        GapFill::Pages(_) => eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled"),
-        GapFill::Auto => {
-            assert!(gap_auto_steps > 0, "{case}: by_msync={by_msync}: auto chose a width");
-            eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled");
+        _ => {
+            assert_eq!(gap_fill_refusals, 0, "{case}");
+            eprintln!("{case}: {gaps_filled} gaps filled");
         }
     }
-    if gap_fill != GapFill::Auto {
-        assert_eq!(gap_auto_steps, 0, "{case}: only auto chooses");
+    match gap_fill {
+        GapFill::Auto if refused => {
+            let chose = gap_auto_steps + gap_fill_refusals > 0;
+            assert!(chose, "{case}: auto chose a width, filed or refused: {counts:?}")
+        }
+        GapFill::Auto => assert!(gap_auto_steps > 0, "{case}: auto chose a width"),
+        _ => assert_eq!(gap_auto_steps, 0, "{case}: only auto chooses"),
+    }
+    if refused {
+        eprintln!("{case}: the file system refuses RWF_NOWAIT: gap fill turned itself off");
     }
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;

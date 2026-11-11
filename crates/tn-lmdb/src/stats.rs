@@ -72,6 +72,12 @@ pub struct IoStats {
     /// Gaps the gap fill skipped because the page cache did not hold them whole (Linux only: on
     /// macOS every gap is read).
     pub gap_misses: u64,
+    /// Commits whose gap fill met a kernel or file system that refuses reads that do not wait for
+    /// the disk (Linux's `RWF_NOWAIT`; tmpfs is one) and so turned
+    /// [`crate::EnvOptions::gap_fill`] off for the environment, a fixed width and
+    /// [`crate::GapFill::Auto`] alike, with a warning: 0 or 1 per open (always 0 on macOS, and
+    /// while gap fill is off).
+    pub gap_fill_refusals: u64,
     /// Scattered durable steps (more than 16 runs) whose width [`crate::GapFill::Auto`] chose:
     /// the steps it learns from. A step of fewer runs fills nothing under auto.
     pub gap_auto_steps: u64,
@@ -186,6 +192,7 @@ impl IoStats {
             gaps_filled,
             gap_pages,
             gap_misses,
+            gap_fill_refusals,
             gap_auto_steps,
             gap_auto_probes,
             gap_auto_readapts,
@@ -228,6 +235,7 @@ impl IoStats {
             gaps_filled: d(gaps_filled, earlier.gaps_filled),
             gap_pages: d(gap_pages, earlier.gap_pages),
             gap_misses: d(gap_misses, earlier.gap_misses),
+            gap_fill_refusals: d(gap_fill_refusals, earlier.gap_fill_refusals),
             gap_auto_steps: d(gap_auto_steps, earlier.gap_auto_steps),
             gap_auto_probes: d(gap_auto_probes, earlier.gap_auto_probes),
             gap_auto_readapts: d(gap_auto_readapts, earlier.gap_auto_readapts),

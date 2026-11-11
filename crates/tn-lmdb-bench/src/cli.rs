@@ -158,17 +158,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::Run(config, out))
 }
 
-/// Refuse a temp dir the run cannot use, before any work: one on tmpfs or ramfs (syncs there cost
-/// nothing), or one a temp dir cannot be made in (missing, not a directory, not writable), which
-/// the first rep would otherwise find by a panic.
+/// Refuse a temp dir the run cannot use, before any work: one a temp dir cannot be made in
+/// (missing, not a directory, not writable), which the first rep would otherwise find by a panic,
+/// then one on tmpfs or ramfs (syncs there cost nothing). The probe dir is removed either way.
 fn check_temp_dir(tmp: &Path) -> Result<(), String> {
-    if let Some(fs) = memory_fs(tmp) {
-        return Err(format!(
-            "the temp dir {} is on {fs}: syncs there cost nothing. Set TMPDIR to a directory on a \
-             real disk, for this command only.",
-            tmp.display()
-        ));
-    }
     tempfile::Builder::new()
         .prefix("tn-lmdb-bench-")
         .tempdir_in(tmp)
@@ -178,7 +171,15 @@ fn check_temp_dir(tmp: &Path) -> Result<(), String> {
                 "cannot make a temp dir under {}: {e}. Set TMPDIR to a writable directory.",
                 tmp.display()
             )
-        })
+        })?;
+    match memory_fs(tmp) {
+        Some(fs) => Err(format!(
+            "the temp dir {} is on {fs}: syncs there cost nothing. Set TMPDIR to a directory on a \
+             real disk, for this command only.",
+            tmp.display()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The command line: run `args` (without the program name) and return the exit code.
@@ -293,10 +294,19 @@ mod tests {
         }
     }
 
+    /// A writable temp dir is used, unless it is on tmpfs or ramfs (where `TMPDIR` often is):
+    /// there it is refused as such. One that cannot hold a temp dir is refused for that, on any
+    /// file system. The probe dir is removed either way.
     #[test]
     fn a_temp_dir_the_run_cannot_use_is_refused() {
         let root = tempfile::tempdir().expect("a temp dir");
-        check_temp_dir(root.path()).expect("a writable dir is used");
+        match memory_fs(root.path()) {
+            None => check_temp_dir(root.path()).expect("a writable dir is used"),
+            Some(fs) => {
+                let err = check_temp_dir(root.path()).expect_err("a memory file system");
+                assert!(err.contains(&format!("is on {fs}: syncs there cost nothing")), "{err}");
+            }
+        }
         assert_eq!(
             std::fs::read_dir(root.path()).expect("list").count(),
             0,

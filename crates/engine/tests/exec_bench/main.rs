@@ -119,8 +119,9 @@
 //! - `TN_EXEC_BENCH_GAP_FILL` (0): tn-lmdb's gap fill, a width in pages or `auto`, passed as
 //!   `--db.gap-fill` to the run's open (not the bases'): 0 (or `off`) is off, at most 64; refused
 //!   on MDBX. Its counters (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`,
-//!   `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_ns`, and under `auto` the `tn_lmdb_gap_auto_*`
-//!   counters and gauges: the width chosen and the fit) are among the per-output database counters.
+//!   `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_refusals`, `tn_lmdb_gap_fill_ns`, and under `auto` the
+//!   `tn_lmdb_gap_auto_*` counters and gauges: the width chosen and the fit) are among the
+//!   per-output database counters.
 //! - `TN_EXEC_BENCH_READERS` (0): reader threads, plus the balance poller when above 0; 0 runs no
 //!   side load.
 //! - `TN_EXEC_BENCH_SUBMIT_FRACTION` (0.25): the fraction, from 0 to 1, of each on-window output's
