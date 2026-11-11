@@ -79,6 +79,28 @@ impl RecentBlocks {
         self.executed_blocks.back().cloned().unwrap_or_else(Default::default)
     }
 
+    /// The newest executed block whose number is at or below `number`.
+    ///
+    /// `None` when the ring is empty or every entry is above `number`. The ring holds the final
+    /// block of each recent output, so this resolves a number to this node's own block at the end
+    /// of the newest output that had not passed it.
+    pub fn newest_at_or_below(&self, number: BlockNumber) -> Option<BlockNumHash> {
+        self.executed_blocks
+            .iter()
+            .rev()
+            .map(|block| block.num_hash())
+            .find(|block| block.number <= number)
+    }
+
+    /// The `k`-th newest executed block, counting the newest as `k = 0`.
+    ///
+    /// `k` counts ring entries (executed outputs that produced a block), not block numbers. A ring
+    /// holding `k` or fewer entries answers with its oldest entry, and an empty ring with `None`.
+    pub fn nth_newest(&self, k: usize) -> Option<BlockNumHash> {
+        let newest = self.executed_blocks.len().checked_sub(1)?;
+        self.executed_blocks.get(newest.saturating_sub(k)).map(|block| block.num_hash())
+    }
+
     /// Is `block` a recent block we have executed?
     ///
     /// The number and the hash must both agree. A header names its execution block by both, and a
@@ -243,5 +265,56 @@ mod tests {
             recent.check_execution_block(BlockNumHash::new(10, older.hash())),
             Some(ExecutionCheck::NotYet)
         );
+    }
+
+    /// A ring of `capacity` holding one executed output per number in `numbers`, oldest first.
+    fn ring_of(capacity: usize, numbers: &[u64]) -> (RecentBlocks, Vec<BlockNumHash>) {
+        let mut recent = RecentBlocks::new(capacity);
+        let mut pushed = Vec::new();
+        for (i, number) in numbers.iter().enumerate() {
+            let block =
+                SealedHeader::seal_slow(ExecHeader { number: *number, ..Default::default() });
+            pushed.push(block.num_hash());
+            let round = u32::try_from(i).expect("small ring");
+            let output =
+                ConsensusNumHash::new(u64::from(round), ConsensusHeaderDigest::from([4u8; 32]));
+            recent.push_latest(round, output, Some(block));
+        }
+        (recent, pushed)
+    }
+
+    /// `newest_at_or_below` answers with the newest entry at or below a number: an exact hit, a
+    /// number between two entries, one above the tip and one below the oldest entry.
+    #[test]
+    fn newest_at_or_below_resolves_numbers_to_own_entries() {
+        let (empty, _) = ring_of(4, &[]);
+        assert_eq!(empty.newest_at_or_below(u64::MAX), None, "empty ring");
+
+        let (recent, blocks) = ring_of(8, &[10, 13, 16, 19]);
+        assert_eq!(recent.newest_at_or_below(13), Some(blocks[1]), "exact hit");
+        assert_eq!(recent.newest_at_or_below(15), Some(blocks[1]), "between two entries");
+        assert_eq!(recent.newest_at_or_below(u64::MAX), Some(blocks[3]), "above the tip");
+        assert_eq!(recent.newest_at_or_below(10), Some(blocks[0]), "the oldest entry");
+        assert_eq!(recent.newest_at_or_below(9), None, "below the oldest entry");
+    }
+
+    /// `nth_newest` counts entries back from the tip and stops at the oldest entry; after the ring
+    /// wraps, the oldest entry is the oldest one still held.
+    #[test]
+    fn nth_newest_counts_entries_and_stops_at_the_oldest() {
+        let (empty, _) = ring_of(4, &[]);
+        assert_eq!(empty.nth_newest(0), None, "empty ring");
+        assert_eq!(empty.nth_newest(8), None, "empty ring");
+
+        let (recent, blocks) = ring_of(8, &[10, 13, 16, 19]);
+        assert_eq!(recent.nth_newest(0), Some(blocks[3]), "the tip");
+        assert_eq!(recent.nth_newest(2), Some(blocks[1]), "entries, not block numbers");
+        assert_eq!(recent.nth_newest(3), Some(blocks[0]), "the oldest entry");
+        assert_eq!(recent.nth_newest(8), Some(blocks[0]), "a short ring stops at its oldest");
+
+        let (wrapped, blocks) = ring_of(3, &[10, 13, 16, 19, 22]);
+        assert_eq!(wrapped.nth_newest(1), Some(blocks[3]));
+        assert_eq!(wrapped.nth_newest(usize::MAX), Some(blocks[2]), "the oldest held entry");
+        assert_eq!(wrapped.newest_at_or_below(14), None, "13 left the ring");
     }
 }
