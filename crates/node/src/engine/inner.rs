@@ -569,6 +569,7 @@ fn configure_engine(
     engine
         .with_recovery_threads(parameters.recovery_threads)
         .with_execution_backlog(execution_backlog.clone())
+        .with_pipelined_persist(parameters.pipelined_persist)
 }
 
 /// Hand the batch builder the runtime switches it reads from the node's `parameters.yaml`.
@@ -760,6 +761,26 @@ mod tests {
         let builder = batch_builder_on_temp_chain(arm_dir.path(), &task_manager)?;
         let builder = configure_batch_builder(builder, &parameters);
         assert!(builder.sealed_tx_keep());
+        Ok(())
+    }
+
+    // ---- bench6 pipelined-persist ----
+
+    /// The engine reads `pipelined_persist` as set in the node's parameters, and `false` when the
+    /// parameters leave it at its default.
+    #[tokio::test]
+    async fn test_configure_engine_hands_pipelined_persist_to_the_engine() -> eyre::Result<()> {
+        let task_manager = tn_types::TaskManager::new("configure engine pipelined");
+        let default_dir = tempfile::TempDir::new()?;
+        let engine = engine_on_temp_chain(default_dir.path(), &task_manager)?;
+        let engine = configure_engine(engine, &Parameters::default(), &ExecutionBacklog::new());
+        assert!(!engine.pipelined_persist());
+
+        let parameters = Parameters { pipelined_persist: true, ..Default::default() };
+        let arm_dir = tempfile::TempDir::new()?;
+        let engine = engine_on_temp_chain(arm_dir.path(), &task_manager)?;
+        let engine = configure_engine(engine, &parameters, &ExecutionBacklog::new());
+        assert!(engine.pipelined_persist());
         Ok(())
     }
 }

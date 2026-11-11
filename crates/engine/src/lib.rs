@@ -121,6 +121,9 @@ pub struct ExecutorEngine {
     /// outputs it holds and the last one it finished. Observability for the RPC submission
     /// guard only; nothing here reads it.
     execution_backlog: ExecutionBacklog,
+    /// Persist one output while the next one executes (`pipelined_persist` in
+    /// `parameters.yaml`); `false` builds, persists and commits each output before the next.
+    pipelined_persist: bool,
 }
 
 impl ExecutorEngine {
@@ -158,6 +161,7 @@ impl ExecutorEngine {
             repack_monitor,
             recovery_threads: 0,
             execution_backlog: ExecutionBacklog::default(),
+            pipelined_persist: false,
         }
     }
 
@@ -190,6 +194,22 @@ impl ExecutorEngine {
     /// The [`ExecutionBacklog`] the engine records into.
     pub fn execution_backlog(&self) -> &ExecutionBacklog {
         &self.execution_backlog
+    }
+
+    /// Set whether the engine persists one output while the next one executes
+    /// (`pipelined_persist` in `parameters.yaml`).
+    ///
+    /// `false`, the value [`ExecutorEngine::new`] starts with, builds, persists and commits each
+    /// output before the next one starts. The node applies the configured value right after
+    /// construction.
+    pub fn with_pipelined_persist(mut self, pipelined: bool) -> Self {
+        self.pipelined_persist = pipelined;
+        self
+    }
+
+    /// Whether the engine persists one output while the next one executes.
+    pub fn pipelined_persist(&self) -> bool {
+        self.pipelined_persist
     }
 
     /// Spawns a blocking task to execute consensus output.
