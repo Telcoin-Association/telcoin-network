@@ -14,7 +14,7 @@ use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkCommand, NetworkHandle},
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, PeerSlots, Penalty, TopicHash,
 };
 use tn_network_types::{
     MockWorkerToPrimary, WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
@@ -27,9 +27,10 @@ use tn_types::{
 };
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
-    WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS, MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+    WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS, MAX_PENDING_REQUESTS_PER_PEER,
+    MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The type for holding testing components.
 struct TestTypes<DB = MemDatabase> {
@@ -205,6 +206,57 @@ fn create_counting_test_types(verdict: Verdict) -> (TestTypes, MemDatabase, Repo
         Arc::new(CountingWorkerToPrimary { others_reports: counters.others_reports.clone() }),
     );
     (types, store, counters)
+}
+
+/// A [`BatchValidation`] that blocks in `validate_batch` until a test task releases it.
+///
+/// Each call first sends one message on `started`, then waits on `release` for at most five
+/// seconds. A call that is not released in time returns [`BatchValidationError::EmptyBatch`], so
+/// a test whose release never comes fails instead of hanging.
+#[derive(Debug)]
+struct GatedBatchValidator {
+    /// Gets one message each time a validation starts.
+    started: mpsc::UnboundedSender<()>,
+    /// Each validation takes one message from here before it returns.
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl BatchValidation for GatedBatchValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        let _ = self.started.send(());
+        self.release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| BatchValidationError::EmptyBatch)
+    }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
+}
+
+/// Build a [`GatedBatchValidator`]. Returns the validator, the receiver of its start messages,
+/// and the sender that releases one validation for each message.
+fn gated_validator(
+) -> (GatedBatchValidator, mpsc::UnboundedReceiver<()>, std::sync::mpsc::Sender<()>) {
+    let (started, started_rx) = mpsc::unbounded_channel();
+    let (release_tx, release) = std::sync::mpsc::channel();
+    (
+        GatedBatchValidator { started, release: std::sync::Mutex::new(release) },
+        started_rx,
+        release_tx,
+    )
+}
+
+/// A [`BatchValidation`] whose `validate_batch` panics.
+#[derive(Debug)]
+struct PanickingBatchValidator;
+
+impl BatchValidation for PanickingBatchValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        panic!("validator panics on purpose")
+    }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
 }
 
 // ============================================================================
@@ -557,7 +609,7 @@ async fn test_gossip_prefetch_rejects_invalid_batch() {
     let digest = batch.digest();
 
     // dropping an invalid body is not an error (it is a peer content fault, not a local one)
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
     assert_matches!(res, Ok(()));
 
     // the security property: an unvalidated body never reaches the cache the vote path trusts
@@ -578,13 +630,152 @@ async fn test_gossip_prefetch_caches_valid_batch() {
     let batch = Batch::default();
     let digest = batch.digest();
 
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
     assert_matches!(res, Ok(()));
 
     assert!(
         store.get::<NodeBatchesCache>(&digest).expect("read store").is_some(),
         "a validated gossip-prefetched batch must be cached"
     );
+}
+
+// ============================================================================
+// Blocking Validation Tests (issue #1795)
+// ============================================================================
+
+/// Report validation runs on the blocking pool, not on the tokio worker thread (issue #1795).
+///
+/// The runtime has one worker thread, and both the report and the releasing task run on it.
+/// The validator blocks until the releasing task sends the release, which it does only after
+/// the validation has started. Inline validation would park the only worker, the releasing
+/// task could not run, and the validator would time out with an error. So `Ok` shows that the
+/// validation ran off the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_report_validation_runs_off_the_tokio_worker() {
+    let (validator, mut started_rx, release_tx) = gated_validator();
+    let (TestTypes { committee, handler, .. }, _store) =
+        create_test_types_with_validator(Arc::new(validator));
+    let peer = committee.last_authority().primary_public_key();
+    let sealed_batch = SealedBatch::new(Default::default(), B256::random());
+
+    let releaser = tokio::spawn(async move {
+        started_rx.recv().await.expect("validation starts");
+        release_tx.send(()).expect("validator waits for the release");
+    });
+    let report =
+        tokio::spawn(async move { handler.pub_process_report_batch(&peer, sealed_batch).await });
+
+    assert_matches!(report.await.expect("report task ends"), Ok(()));
+    releaser.await.expect("releasing task ends");
+}
+
+/// A cancelled report holds its per-peer slot until its validation ends (issue #1795).
+///
+/// Two reports from one committee key take both of its slots, and the gated validator keeps
+/// both in validation. The network layer cancels both requests, but each report runs to its
+/// end, so both slots stay held and a third report from the key is shed. When the gate opens,
+/// both reports end without a reply, the slots are free, and a further report from the key is
+/// admitted and served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancelled_report_holds_its_slot_until_validation_ends() {
+    let (validator, started_rx, release_tx) = gated_validator();
+    let (TestTypes { committee, handler, .. }, _store) =
+        create_test_types_with_validator(Arc::new(validator));
+    let peer = committee.last_authority().primary_public_key();
+    let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
+
+    // admit one report for each slot of the key, and keep the cancel sender of each
+    let (cancels, reports): (Vec<_>, Vec<_>) = (0..MAX_PENDING_REQUESTS_PER_PEER)
+        .map(|_| {
+            let slot = slots.try_take(peer).expect("admit below the per-peer cap");
+            let (cancel_tx, cancel) = oneshot::channel::<()>();
+            let handler = handler.clone();
+            let sealed_batch = SealedBatch::new(Default::default(), B256::random());
+            let report = tokio::spawn(async move {
+                handler.pub_run_admitted_report(&peer, sealed_batch, cancel, slot).await
+            });
+            (cancel_tx, report)
+        })
+        .unzip();
+
+    // wait until each report is in validation
+    let started =
+        futures::stream::unfold(
+            started_rx,
+            |mut rx| async move { rx.recv().await.map(|()| ((), rx)) },
+        )
+        .take(MAX_PENDING_REQUESTS_PER_PEER)
+        .count()
+        .await;
+    assert_eq!(started, MAX_PENDING_REQUESTS_PER_PEER);
+
+    // the network layer cancels both requests while they are in validation
+    cancels.into_iter().for_each(|cancel_tx| {
+        cancel_tx.send(()).expect("the report task holds the cancel receiver");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // the cancel does not end the reports: both slots stay held, and a third report is shed
+    assert_eq!(slots.in_flight(&peer), MAX_PENDING_REQUESTS_PER_PEER);
+    assert!(slots.try_take(peer).is_none(), "a third report from the key is shed");
+
+    // open the gate: both reports end, their bookkeeping runs, and neither sends a reply
+    (0..MAX_PENDING_REQUESTS_PER_PEER)
+        .for_each(|_| release_tx.send(()).expect("validator waits for the release"));
+    future::join_all(reports).await.into_iter().for_each(|joined| {
+        let (res, reply) = joined.expect("report task ends");
+        assert_matches!(res, Ok(()));
+        assert!(!reply, "a cancelled report sends no reply");
+    });
+    assert_eq!(slots.in_flight(&peer), 0);
+
+    // the slots are free again, so a further report from the key is admitted and served
+    let slot = slots.try_take(peer).expect("a freed slot admits a report");
+    release_tx.send(()).expect("validator waits for the release");
+    let (_cancel_tx, cancel) = oneshot::channel::<()>();
+    let (res, reply) = handler
+        .pub_run_admitted_report(
+            &peer,
+            SealedBatch::new(Default::default(), B256::random()),
+            cancel,
+            slot,
+        )
+        .await;
+    assert_matches!(res, Ok(()));
+    assert!(reply, "a report that is not cancelled sends its reply");
+    assert_eq!(slots.in_flight(&peer), 0);
+}
+
+/// A validator that panics fails the report with an internal error, and nothing is recorded
+/// (issue #1795).
+///
+/// The validation task panics on the blocking pool, so its join fails. The handler maps that
+/// to [`WorkerNetworkError::Internal`], which carries no penalty, and records nothing: the
+/// digest is not kept as rejected and the batch is not cached. The prefetch path drops the
+/// body without an error and records nothing either.
+#[tokio::test]
+async fn test_panicking_validator_is_internal_and_records_nothing() {
+    let (TestTypes { committee, handler, .. }, store) =
+        create_test_types_with_validator(Arc::new(PanickingBatchValidator));
+    let peer = committee.last_authority().primary_public_key();
+    let batch = Batch::default();
+    let digest = batch.digest();
+
+    let err = handler
+        .pub_process_report_batch(&peer, batch.clone().seal(digest))
+        .await
+        .expect_err("a panicking validation fails the report");
+    assert_matches!(err, WorkerNetworkError::Internal(_));
+    // a local fault: the reporter gets no penalty
+    assert!(Option::<Penalty>::from(err).is_none());
+
+    // the prefetch path drops the body without an error
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
+    assert_matches!(res, Ok(()));
+
+    // nothing is recorded: the digest is not rejected and the batch is not cached
+    assert!(!handler.pub_is_rejected_batch(&digest));
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());
 }
 
 // ============================================================================

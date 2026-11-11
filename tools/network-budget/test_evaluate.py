@@ -170,6 +170,16 @@ class EvaluateTests(unittest.TestCase):
         write_run(pending_only, "candidate", "hostile", [*hostile(0, 0, 0, 8), *hostile(1, 7, 0, 5)])
         self.assertEqual(evaluate.hostile_recovery({}, pending_only)[0], "fail")
 
+    def test_hostile_recovery_counts_public_share_denials_as_the_defence(self):
+        steady = everywhere(0, 0, [item(evaluate.ESTABLISHED, 5), item(evaluate.LIMIT, 8)])
+        hostile = lambda sample, denied, connections: everywhere(sample, sample, [
+            *(item(evaluate.REJECTIONS, 0, reason=reason) for reason in evaluate.ESTABLISHED_REASONS),
+            item(evaluate.DENIALS, denied, reason="peer_manager_public_share", stage="authenticated_policy"),
+            item(evaluate.ESTABLISHED, connections), item(evaluate.LIMIT, 8)])
+        write_run(self.root, "candidate", "steady", steady)
+        write_run(self.root, "candidate", "hostile", [*hostile(0, 0, 8), *hostile(1, 3, 5)])
+        self.assertEqual(evaluate.hostile_recovery({}, self.root), ("pass", {"rejections": 12, "recovered": True}))
+
     def test_persistence_and_catch_up_compare_builds(self):
         write_run(self.root, "baseline", "steady", [*everywhere(0, 0, block=0), *everywhere(1, 10, block=10)])
         write_run(self.root, "candidate", "steady", [*everywhere(0, 0, block=0), *everywhere(1, 10, block=9)])

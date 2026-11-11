@@ -439,7 +439,7 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     // Stop the transaction stream and tear everything down.
     stop.store(true, Ordering::Relaxed);
     let _ = stream.await;
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -709,7 +709,7 @@ async fn test_state_export_import_idle_epoch_inner() -> eyre::Result<()> {
     send_and_confirm(&client_urls[1], &obs_url, &key, to_account, 0)?;
     info!(target: "restart-test", "observer reflected a live transaction after an idle-epoch bootstrap");
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -1122,6 +1122,6 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
         "observer entered the post-import epoch on the RECORDED fee"
     );
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }

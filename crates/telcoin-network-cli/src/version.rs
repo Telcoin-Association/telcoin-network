@@ -21,7 +21,9 @@ pub(crate) const SHORT_VERSION: &str = {
 /// - The latest version from Cargo.toml
 /// - The long SHA of the latest commit.
 /// - The build datetime
-/// - The build features
+/// - The build features (this crate's: a feature set on tn-reth alone does not show here)
+/// - The engine reth's database runs on, read from tn-reth's build (`MDBX`, or `tn-lmdb` with its
+///   `tn-lmdb` feature, however the feature was spelled on the command line)
 ///
 /// # Example:
 ///
@@ -36,6 +38,7 @@ pub(crate) const LONG_VERSION: &str = {
     const BUILD_TIMESTAMP: &str = env!("VERGEN_BUILD_TIMESTAMP");
     const CARGO_FEATURES: &str = env!("VERGEN_CARGO_FEATURES");
     const PROFILE: &str = build_profile_name();
+    const RETH_DATABASE: &str = tn_reth::BACKEND;
 
     const_str::concat!(
         "Version: ",
@@ -51,7 +54,10 @@ pub(crate) const LONG_VERSION: &str = {
         CARGO_FEATURES,
         "\n",
         "Build Profile: ",
-        PROFILE
+        PROFILE,
+        "\n",
+        "Reth Database: ",
+        RETH_DATABASE
     )
 };
 

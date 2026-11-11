@@ -39,11 +39,13 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wall-clock cap on sending one consensus-output sync pack to a peer.
+/// Wall-clock cap on sending one consensus-output sync pack to a peer, for every tier.
 ///
-/// It bounds a single message, not a whole epoch pack, so it caps the admission slot a
-/// drip-reading peer can hold during one consensus-output serve. The public epoch-pack serve
-/// bound is `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` in the network module, which is its own constant.
+/// It bounds a single message, not a whole epoch pack. It is not the public cap: the admission
+/// layer (`ServeHoldLimit` in the network module) cuts a public consensus-output serve at 60 s
+/// (`PUBLIC_SYNC_SERVE_TIMEOUT`) and a public epoch-pack serve at 200 s
+/// (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`). Committee serves are unbounded there, so for a committee
+/// peer this timeout is what caps the admission slot of one consensus-output serve.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
@@ -256,7 +258,8 @@ where
         let epoch_behind = if let Some(number) = number {
             // Throw this max() in so we can avoid races when execution is behind consensus at an
             // epoch boundary.
-            epoch > exec_epoch && exec_number.max(last_consensus_number) + 1 < number
+            // `saturating_add` keeps the test total when the watch holds a far-future number.
+            epoch > exec_epoch && exec_number.max(last_consensus_number).saturating_add(1) < number
         } else if exec_epoch + 1 == epoch {
             // This check is a little hand-wavy, basically if we don't have the number (i.e.
             // checking a cert) then we let the next epoch early rounds through. Having the
@@ -307,14 +310,20 @@ where
     /// issues #898 and #912). An older stored committee is never consulted, because its keys are
     /// retired and carry no stake, so f+1 of them would cost an attacker nothing. When this node
     /// holds the certified epoch record for `epoch`, the record's `final_consensus.number` bounds
-    /// the numbers that epoch can have produced. Returns `None` for an epoch outside the window
-    /// and for the previous epoch when its committee is not stored yet.
+    /// the numbers that epoch can have produced. Returns `None` for an epoch outside the window,
+    /// for the previous epoch when its committee is not stored yet, and for the previous epoch
+    /// while its record has no certificate (issue #1796). That epoch is closed, so every number
+    /// it produced is at or below the record's `final_consensus.number`, and a node that has
+    /// opened the current epoch has executed all of them: nothing is lost by waiting. Until the
+    /// certificate is stored the bound is unknown, so f+1 signers of the previous committee could
+    /// otherwise pin the last-published watch to any number; the caller asks the record collector
+    /// for the certificate instead, and the certified record then bounds the epoch.
     async fn consensus_result_committee(&self, epoch: Epoch) -> Option<ConsensusResultCommittee> {
         let current = self.consensus_config.committee().epoch();
         // `epoch` is peer-supplied, so the window test never adds to it; `checked_sub` keeps the
         // previous-epoch test total at epoch 0.
-        let in_window =
-            epoch == current || epoch == current + 1 || current.checked_sub(1) == Some(epoch);
+        let previous = current.checked_sub(1) == Some(epoch);
+        let in_window = epoch == current || epoch == current + 1 || previous;
         let keys = if in_window { self.get_committee(epoch).await } else { None }?;
         let final_number = self
             .consensus_chain
@@ -322,7 +331,9 @@ where
             .get_epoch_by_number(epoch)
             .await
             .and_then(|(record, cert)| cert.map(|_| record.final_consensus.number));
-        Some(ConsensusResultCommittee { keys, final_number })
+        // The previous epoch is verified against its certified record only.
+        (!previous || final_number.is_some())
+            .then_some(ConsensusResultCommittee { keys, final_number })
     }
 
     /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
@@ -654,9 +665,10 @@ where
                         self.consensus_certs.lock().clear();
                     }
                 } else if epoch >= self.consensus_config.committee().epoch().saturating_sub(1) {
-                    // The previous epoch without its record, or an epoch past the next one: this
-                    // node may be missing epoch records, so nudge the sync. If the epoch is bogus
-                    // the code to handle it should be fine, it stops when out of epochs.
+                    // The previous epoch without its certified record (issues #1771 and #1796), or
+                    // an epoch past the next one: this node may be missing epoch records or a
+                    // certificate, so nudge the sync. If the epoch is bogus the code to handle it
+                    // should be fine, it stops when out of epochs.
                     self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
                 } else {
                     // An epoch below the committee window: its signers are retired, so the result

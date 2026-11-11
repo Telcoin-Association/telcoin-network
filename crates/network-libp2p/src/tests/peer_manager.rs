@@ -4,13 +4,17 @@ use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    peers::{PeerAdmissionDenied, PublicShareExceeded},
     LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
     core::Endpoint,
     kad::GetClosestPeersError,
-    swarm::{ConnectionId, DialError, NetworkBehaviour as _},
+    swarm::{
+        ConnectionClosed, ConnectionDenied, ConnectionId, DialError, FromSwarm,
+        NetworkBehaviour as _,
+    },
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -780,6 +784,89 @@ async fn committee_seeding_keeps_identity_and_address_fixed() -> eyre::Result<()
         Some(&vec![peer.primary.network_address.clone()])
     );
     Ok(())
+}
+
+/// Register a member of the current committee and give back its transport peer id.
+fn current_committee_peer(manager: &mut PeerManager, seed: u8) -> PeerId {
+    let (bls, endpoint) = configured_hub(seed);
+    let info = NetworkInfo {
+        pubkey: endpoint.network_key.clone(),
+        multiaddrs: vec![endpoint.network_address.clone()],
+        timestamp: now(),
+        rpc: None,
+    };
+    manager.peers.upsert_peer(bls, info.pubkey.clone(), info.multiaddrs.clone());
+    manager.cache_known_peer(bls, info);
+    manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    endpoint.network_key.into()
+}
+
+/// Offer an established inbound connection to the peer manager, as the swarm does.
+fn offer_inbound(
+    manager: &mut PeerManager,
+    connection: usize,
+    peer: PeerId,
+) -> Result<(), ConnectionDenied> {
+    let addr = create_multiaddr(None);
+    manager
+        .handle_established_inbound_connection(
+            ConnectionId::new_unchecked(connection),
+            peer,
+            &addr,
+            &addr,
+        )
+        .map(|_| ())
+}
+
+/// Whether a refusal carries the given public connection share denial.
+fn is_public_share_denial(denial: &ConnectionDenied, expected: PublicShareExceeded) -> bool {
+    denial
+        .downcast_ref::<PeerAdmissionDenied>()
+        .is_some_and(|cause| *cause == PeerAdmissionDenied::PublicShare(expected))
+}
+
+/// A full public connection share still admits a privileged peer, and refuses a third public
+/// peer with the public share denial.
+#[tokio::test]
+async fn public_share_full_still_admits_a_privileged_peer() {
+    let mut manager = create_test_peer_manager(None);
+    manager.configure_public_share(PublicConnectionShare::of(3, 8));
+    let committee = current_committee_peer(&mut manager, 40);
+    assert!(manager.peer_is_privileged(&committee), "the committee peer is privileged");
+    let (first, second, third) = (PeerId::random(), PeerId::random(), PeerId::random());
+    assert!(offer_inbound(&mut manager, 1, first).is_ok());
+    assert!(offer_inbound(&mut manager, 2, second).is_ok());
+    assert!(offer_inbound(&mut manager, 3, committee).is_ok(), "reserve admits committee");
+    let denial = offer_inbound(&mut manager, 4, third).err();
+    assert!(
+        denial.is_some_and(|denial| is_public_share_denial(&denial, PublicShareExceeded::Share))
+    );
+    assert_eq!(manager.public_share.held(), 2);
+}
+
+/// Closing one connection of a public peer frees its slot even when the peer keeps another
+/// connection, so the refused public peer is admitted next.
+#[tokio::test]
+async fn closing_a_public_connection_frees_its_slot() {
+    let mut manager = create_test_peer_manager(None);
+    manager.configure_public_share(PublicConnectionShare::of(3, 8));
+    let (holder, refused) = (PeerId::random(), PeerId::random());
+    assert!(offer_inbound(&mut manager, 1, holder).is_ok());
+    assert!(offer_inbound(&mut manager, 2, holder).is_ok());
+    let denial = offer_inbound(&mut manager, 3, refused).err();
+    assert!(
+        denial.is_some_and(|denial| is_public_share_denial(&denial, PublicShareExceeded::Share))
+    );
+    let addr = create_multiaddr(None);
+    manager.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+        peer_id: holder,
+        connection_id: ConnectionId::new_unchecked(1),
+        endpoint: &ConnectedPoint::Listener { local_addr: addr.clone(), send_back_addr: addr },
+        cause: None,
+        remaining_established: 1,
+    }));
+    assert_eq!(manager.public_share.held_by(&holder), 1);
+    assert!(offer_inbound(&mut manager, 4, refused).is_ok(), "the freed slot admits the peer");
 }
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
