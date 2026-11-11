@@ -662,9 +662,13 @@ extra bytes, and two system calls per gap filled.
   (given at open when gap fill is on; the engine reads through the file only at open otherwise)
   keeps that read to the gap's pages. A commit stops trying once its misses exceed its fills by
   16, so the reads a commit's fill starts exceed the writes it saved by at most 16. A kernel or
-  file system that refuses `RWF_NOWAIT` (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`) turns gap fill off for
-  the environment with a warning. No safe call reports residency without reading (`mincore` would
-  be a raw call: new `unsafe`).
+  file system that refuses `RWF_NOWAIT` (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap
+  fill off for the environment at the first gap read, with one warning and
+  `IoStats::gap_fill_refusals` at 1: no later commit tries
+  (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap fill tests assert that
+  fallback on such a file system (`file::refuses_nowait_reads`, a probe of their own), so they
+  fill gaps only where the temp dir is on a disk. No safe call reports residency without reading
+  (`mincore` would be a raw call: new `unsafe`).
 - **macOS** has no `RWF_NOWAIT`: a gap is read with a plain `pread`, and a page not in memory
   costs a synchronous read. Gap fill there serves the tests and measurement, not production.
   Step 4's `msync`s of `DataSync::Ranges` write the rewritten gaps with the mapped pages (each
@@ -2001,7 +2005,7 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 | group | counters |
 |---|---|
 | commits | `commits` (each run of steps 4–6: a `Durable` commit, a `NoSync` commit that synced, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits` (`NoSync` commits that deferred their sync), `auto_syncs` (`NoSync` commits that synced their own pages and the deferred ones: past `sync_period` or `sync_bytes`, the first that changes something after an open, or one more than 2^20 txns past the last sync; each also counts in `commits`), `grown_commits` (the file grew since the last durable state) |
-| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages` and `gap_misses` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages`, `gap_misses` and `gap_fill_refusals` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`; a refusal turned gap fill off) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
 | step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `gap_fill_ns` (4's gap fill, before its sync), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |

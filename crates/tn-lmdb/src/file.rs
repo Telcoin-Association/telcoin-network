@@ -227,6 +227,10 @@ pub(crate) struct PageFile {
     /// over a file the cache does not hold would.
     #[cfg(test)]
     pub(crate) miss_reads: bool,
+    /// Test-only: [`Self::read_resident`] is refused (`Resident::Unsupported`) on any file system,
+    /// as on one that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`).
+    #[cfg(test)]
+    pub(crate) refuse_reads: bool,
 }
 
 impl PageFile {
@@ -289,6 +293,8 @@ impl PageFile {
             fail_next_fsync: AtomicBool::new(false),
             #[cfg(test)]
             miss_reads: false,
+            #[cfg(test)]
+            refuse_reads: false,
         })
     }
 
@@ -517,6 +523,10 @@ impl PageFile {
         #[cfg(test)]
         if self.miss_reads {
             return Ok(Resident::NotWhole);
+        }
+        #[cfg(test)]
+        if self.refuse_reads {
+            return Ok(Resident::Unsupported(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
         }
         Ok(self.read_cached(offset, buf)?)
     }
@@ -850,6 +860,38 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_advice_log() -> Vec<Option<Advice>> {
     ADVICE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Test-only: whether the file system holding `dir` refuses reads that do not wait for the disk
+/// (tmpfs refuses `RWF_NOWAIT`), where a gap fill turns itself off at its first read: the
+/// fallback a gap fill test asserts there. Probed on a file of its own by a `preadv2` of its own,
+/// not through [`PageFile::read_cached`], so a fault in that function's error mapping makes such
+/// a test fail rather than expect the fallback. Never on macOS, whose plain `pread` nothing
+/// refuses.
+#[cfg(test)]
+pub(crate) fn refuses_nowait_reads(dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::io::{preadv2, Errno, ReadWriteFlags};
+        use std::os::unix::fs::FileExt as _;
+        let probe = tempfile::tempfile_in(dir).expect("a probe file");
+        probe.write_all_at(&[1; 4096], 0).expect("the probe's page");
+        let mut page = [0; 4096];
+        loop {
+            let read =
+                preadv2(&probe, &mut [io::IoSliceMut::new(&mut page)], 0, ReadWriteFlags::NOWAIT);
+            match read {
+                Err(Errno::INTR) => {}
+                Err(Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS) => return true,
+                Ok(_) | Err(_) => return false,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
 }
 
 #[cfg(test)]

@@ -421,11 +421,13 @@ mod tn_lmdb {
         );
     }
 
-    /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
     /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: 0, off) and reaches the
     /// engine: more than its `MAX_GAP_FILL` is refused at the open, naming the flag, before the
     /// database is created; at most it opens, and its durable commits fill gaps
-    /// (`IoStats::gaps_filled` is the engine's own count).
+    /// (`IoStats::gaps_filled` is the engine's own count). On a file system that refuses reads
+    /// that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first commit with a gap to
+    /// fill turns gap fill off instead (`IoStats::gap_fill_refusals`, the engine's documented
+    /// fallback), filling none: the option reached the engine either way.
     #[test]
     fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
         use clap::Parser as _;
@@ -459,9 +461,13 @@ mod tn_lmdb {
         }
         let s = db.io_stats();
         assert!(s.sync_runs > s.commits, "the commits' pages formed runs: {s:?}");
-        assert!(s.gaps_filled > 0, "the durable commits filled gaps: {s:?}");
+        match s.gap_fill_refusals {
+            0 => assert!(s.gaps_filled > 0, "the durable commits filled gaps: {s:?}"),
+            _ => assert_eq!((s.gap_fill_refusals, s.gaps_filled), (1, 0), "refused once: {s:?}"),
+        }
     }
 
+    /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
     #[test]
     fn safe_no_sync_syncs_every_second_or_64_mib() {
         assert_eq!(SAFE_NO_SYNC_PERIOD, Duration::from_secs(1));

@@ -72,6 +72,11 @@ pub struct IoStats {
     /// Gaps the gap fill skipped because the page cache did not hold them whole (Linux only: on
     /// macOS every gap is read).
     pub gap_misses: u64,
+    /// Commits whose gap fill met a kernel or file system that refuses reads that do not wait for
+    /// the disk (Linux's `RWF_NOWAIT`; tmpfs is one) and so turned
+    /// [`crate::EnvOptions::gap_fill`] off for the environment, with a warning: 0 or 1 per open
+    /// (always 0 on macOS, and while gap fill is off).
+    pub gap_fill_refusals: u64,
     /// Bytes the file grew by: its physical length, which grows geometrically, with real blocks,
     /// ahead of the pages in use ([`Self::pages_from_end`] counts those). A growth that first cut
     /// a tail the file had at open counts from the cut length.
@@ -155,6 +160,7 @@ impl IoStats {
             gaps_filled,
             gap_pages,
             gap_misses,
+            gap_fill_refusals,
             bytes_grown,
             free_list_save_rounds,
             save_ns,
@@ -188,6 +194,7 @@ impl IoStats {
             gaps_filled: d(gaps_filled, earlier.gaps_filled),
             gap_pages: d(gap_pages, earlier.gap_pages),
             gap_misses: d(gap_misses, earlier.gap_misses),
+            gap_fill_refusals: d(gap_fill_refusals, earlier.gap_fill_refusals),
             bytes_grown: d(bytes_grown, earlier.bytes_grown),
             free_list_save_rounds: d(free_list_save_rounds, earlier.free_list_save_rounds),
             save_ns: d(save_ns, earlier.save_ns),
