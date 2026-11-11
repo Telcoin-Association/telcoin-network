@@ -517,8 +517,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     ///
     /// Both must hold:
     /// - this worker's latest seal of `digest` was acked by the primary: `report_own_batch` returns
-    ///   `Ok` only after the proposer acks the digest and queues it, and the proposer keeps
-    ///   proposing it until it is committed or the epoch ends;
+    ///   `Ok` only after the proposer acks the digest, and the proposer then either queues it or
+    ///   drops it because it already holds a copy; either way it keeps proposing the digest until
+    ///   it is committed or the epoch ends;
     /// - the digest still has its [`OurNodeBatchesCache`] row, so the batch is not yet committed
     ///   (the row is evicted when its output is forwarded to the engine) and orphan recovery at the
     ///   next epoch's start can re-pool its transactions if the epoch closes first.

@@ -371,10 +371,13 @@ pub struct Parameters {
 
     /// Drop a batch digest this node already holds instead of handling it again.
     ///
-    /// When `true`, the worker accepts a batch whose digest is already in its own batches cache
-    /// without reporting it to the primary again, and the proposer drops a digest that is already
-    /// pending or in one of its proposed headers. The default `false` keeps the previous
-    /// behaviour: a repeated digest is reported again and can be proposed twice. Issue #1807.
+    /// When `true`, the worker skips a sealed batch whose digest the primary acked for this
+    /// worker's latest seal of it and whose own-batches cache row is still present: it is neither
+    /// sent for a vote nor reported again. A cache row alone does not count (it survives a failed
+    /// report and a restart). The proposer still acks every report but drops a digest it already
+    /// holds: pending, in the header being built, or in an own header that is proposed and
+    /// neither committed nor re-queued. The default `false` keeps the previous behaviour: a
+    /// repeated digest is reported again and can be proposed twice. Issue #1807.
     #[serde(default, skip_serializing_if = "is_default")]
     pub digest_dedupe: bool,
 
