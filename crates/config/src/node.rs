@@ -368,6 +368,15 @@ pub struct Parameters {
     /// their batch is orphaned at an epoch close, so the pool and the RPC still see a transaction
     /// while its batch waits. The default `false` keeps the previous behaviour: the transactions
     /// leave the pool as soon as their batch is sealed. Issue #1807.
+    ///
+    /// Because in-flight transactions then stay in the pending sub-pool, a node with the switch on
+    /// builds its worker pools with twice the configured pending limits, count and bytes (reth's
+    /// defaults, 10,000 transactions and 20 MiB, unless `--txpool.pending-max-count` and
+    /// `--txpool.pending-max-size` set them): the configured share stays for unsealed
+    /// transactions and the in-flight ones get as much again. At the defaults the pending
+    /// sub-pool can then hold 20 MiB more transactions than with the switch off, plus reth's
+    /// bookkeeping for 10,000 more entries. With the switch off every pool limit is the configured
+    /// one.
     #[serde(default, skip_serializing_if = "is_default")]
     pub sealed_tx_keep: bool,
 

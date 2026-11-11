@@ -31,7 +31,9 @@
 //!   pool and marks them in [`SealedTxs`] instead of removing them (issue #1807). The canonical
 //!   update clears the marks of each executed block's batch digest (`ommers_hash`) and of every
 //!   mined hash, re-pooling clears a transaction's mark, and lost canonical notifications clear
-//!   them all. With the switch off nothing is ever marked.
+//!   them all. With the switch off nothing is ever marked. A pool built for a node with the switch
+//!   on ([`WorkerTxPool::new_with_sealed_tx_keep`]) takes twice the configured pending sub-pool
+//!   limits, because its in-flight transactions stay pending.
 
 use crate::metrics::{
     record_retired_pool_txns_dropped, record_retired_pool_txns_moved, HandoffDropReason,
@@ -55,8 +57,8 @@ use reth_transaction_pool::{
     },
     AddedTransactionOutcome, BestTransactions, BlockInfo as RethBlockInfo, CanonicalStateUpdate,
     EthPooledTransaction, EthTransactionPool, PoolSize, PoolTransaction, PoolUpdateKind,
-    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
-    TransactionValidationTaskExecutor, ValidPoolTransaction,
+    SubPoolLimit, TransactionEvents, TransactionOrigin, TransactionPool as _,
+    TransactionPoolExt as _, TransactionValidationTaskExecutor, ValidPoolTransaction,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -95,6 +97,13 @@ pub use reth_primitives_traits::InMemorySize as TxnSize;
 /// reload event, which is the next notification or the [`RELOAD_RETRY_INTERVAL`] tick,
 /// whichever comes first.
 const MAX_RELOAD_ACCOUNTS: usize = 100;
+
+/// How many times the configured pending sub-pool limits a worker pool takes with the switch
+/// `sealed_tx_keep` on (see [`pending_limit`]).
+///
+/// At reth's defaults the pending sub-pool then holds up to 20,000 transactions and 40 MiB of
+/// them (reth measures a transaction's in-memory size) instead of 10,000 and 20 MiB.
+const SEALED_TX_KEEP_PENDING_FACTOR: usize = 2;
 
 /// A transaction-pool setting incompatible with TN's batch or fee policy.
 #[derive(Debug, PartialEq, Eq)]
@@ -285,6 +294,9 @@ impl WorkerTxPool {
     }
 
     /// Create a pool and spawn canonical-state maintenance and queued-transaction expiry.
+    ///
+    /// The pool takes the node's configured limits, as with the switch `sealed_tx_keep` off (see
+    /// [`Self::new_with_sealed_tx_keep`]).
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -292,8 +304,37 @@ impl WorkerTxPool {
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
     ) -> eyre::Result<Self> {
-        let this =
-            Self::build(node_config, task_spawner, blockchain_provider, evm_config, base_fee)?;
+        Self::new_with_sealed_tx_keep(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            false,
+        )
+    }
+
+    /// Create a pool for a node whose switch `sealed_tx_keep` is `sealed_tx_keep`, and spawn
+    /// canonical-state maintenance and queued-transaction expiry.
+    ///
+    /// With the switch on, the pending sub-pool's limits are raised (see [`pending_limit`]);
+    /// with it off, every limit is the node's configured one, as in [`Self::new`].
+    pub fn new_with_sealed_tx_keep(
+        node_config: &NodeConfig<ChainSpec>,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
+        sealed_tx_keep: bool,
+    ) -> eyre::Result<Self> {
+        let this = Self::build_pool(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            sealed_tx_keep,
+        )?;
         this.spawn_maintenance_task(task_spawner, blockchain_provider);
         this.spawn_expiry_task(task_spawner);
         Ok(this)
@@ -304,12 +345,33 @@ impl WorkerTxPool {
     /// Kept separate from [`WorkerTxPool::new`] so tests can reproduce a pool that missed
     /// canonical updates (the drifted state the maintenance task's lag handling recovers
     /// from) without racing a live subscription (see issue #1236).
+    #[cfg(test)]
     pub(crate) fn build(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
         evm_config: &TnEvmConfig,
         base_fee: BaseFeeContainer,
+    ) -> eyre::Result<Self> {
+        Self::build_pool(
+            node_config,
+            task_spawner,
+            blockchain_provider,
+            evm_config,
+            base_fee,
+            false,
+        )
+    }
+
+    /// Construct the pool, with the pending limits [`pending_limit`] gives for `sealed_tx_keep`,
+    /// without spawning any task.
+    fn build_pool(
+        node_config: &NodeConfig<ChainSpec>,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
+        base_fee: BaseFeeContainer,
+        sealed_tx_keep: bool,
     ) -> eyre::Result<Self> {
         // The pool and validator survive epoch changes, so admission must fit the smallest
         // batch limit across all supported epochs. Non-blob reth validation measures the full
@@ -329,11 +391,13 @@ impl WorkerTxPool {
             .then_some(())
             .ok_or(TxPoolConfigError::MinimumPriorityFee)?;
         let data_dir = node_config.datadir();
-        let pool_config = node_config.txpool.pool_config();
+        let mut pool_config = node_config.txpool.pool_config();
+        // the forwarder retains unsealed transactions only: it keeps the configured limits
         let forward_limits = RetentionLimits::new(
             pool_config.pending_limit.max_txs,
             pool_config.pending_limit.max_size,
         );
+        pool_config.pending_limit = pending_limit(pool_config.pending_limit, sealed_tx_keep);
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
         let validator = TransactionValidationTaskExecutor::eth_builder(
             blockchain_provider.clone(),
@@ -1394,6 +1458,28 @@ impl HandoffSummary {
                 already_present = self.already_present, refused = ?self.refused,
                 "active worker refused retired worker transactions; discarding");
         }
+    }
+}
+
+/// The pending sub-pool's limits for a worker pool: the `configured` ones with the switch
+/// `sealed_tx_keep` off, and [`SEALED_TX_KEEP_PENDING_FACTOR`] times them, count and bytes,
+/// with it on.
+///
+/// With the switch on, a quorum-acked batch's transactions stay in the pending sub-pool until the
+/// batch executes, so this node's in-flight transactions and its unsealed ones share one cap.
+/// With it off, the in-flight ones are out of the pool and the cap bounds only unsealed ones.
+/// Above the cap reth evicts the worst senders' highest nonces with all their descendants, and
+/// only a transaction evicted while it is being inserted learns of it: an earlier accepted one
+/// just disappears. Twice the configured limits keep the configured share for unsealed
+/// transactions and give the in-flight ones as much again.
+fn pending_limit(configured: SubPoolLimit, sealed_tx_keep: bool) -> SubPoolLimit {
+    if sealed_tx_keep {
+        SubPoolLimit::new(
+            configured.max_txs.saturating_mul(SEALED_TX_KEEP_PENDING_FACTOR),
+            configured.max_size.saturating_mul(SEALED_TX_KEEP_PENDING_FACTOR),
+        )
+    } else {
+        configured
     }
 }
 
@@ -2589,6 +2675,73 @@ mod tests {
 
         let reseal = bench.pool.seal_ticket();
         assert_eq!(bench.pool.mark_sealed(reseal, digest, hashes(&gapped)).await?, 2);
+        Ok(())
+    }
+
+    /// The limits a built pool enforces, read back from reth: with `sealed_tx_keep` off they are
+    /// exactly the configured ones (reth's defaults, or an operator's flags); with it on the
+    /// pending sub-pool's count and byte limits are twice those and every other limit is the
+    /// same.
+    #[tokio::test]
+    async fn sealed_keep_doubles_only_the_pending_limits() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let env = RethEnv::new_for_temp_chain(
+            Arc::new(test_genesis().into()),
+            tmp_dir.path(),
+            &task_manager,
+            None,
+        )?;
+        let built = |config: &NodeConfig<ChainSpec>, keep: bool| {
+            WorkerTxPool::new_with_sealed_tx_keep(
+                config,
+                env.get_task_spawner(),
+                env.blockchain_provider(),
+                env.evm_config(),
+                BaseFeeContainer::default(),
+                keep,
+            )
+            .map(|pool| pool.0.config().clone())
+        };
+        let mut operator = env.node_config().clone();
+        operator.txpool.pending_max_count = 3_000;
+        operator.txpool.pending_max_size = 7;
+
+        for config in [env.node_config(), &operator] {
+            let configured = config.txpool.pool_config();
+            let off = built(config, false)?;
+            let on = built(config, true)?;
+            let default = WorkerTxPool::new(
+                config,
+                env.get_task_spawner(),
+                env.blockchain_provider(),
+                env.evm_config(),
+                BaseFeeContainer::default(),
+            )?;
+            for pool in [&off, default.0.config()] {
+                assert_eq!(pool.pending_limit, configured.pending_limit);
+                assert_eq!(pool.basefee_limit, configured.basefee_limit);
+                assert_eq!(pool.queued_limit, configured.queued_limit);
+                assert_eq!(pool.blob_limit, configured.blob_limit);
+                assert_eq!(pool.max_account_slots, configured.max_account_slots);
+            }
+            assert_eq!(
+                on.pending_limit,
+                SubPoolLimit::new(
+                    configured.pending_limit.max_txs * 2,
+                    configured.pending_limit.max_size * 2
+                )
+            );
+            assert_eq!(on.basefee_limit, configured.basefee_limit);
+            assert_eq!(on.queued_limit, configured.queued_limit);
+            assert_eq!(on.blob_limit, configured.blob_limit);
+            assert_eq!(on.max_account_slots, configured.max_account_slots);
+        }
+        // reth's defaults, which the devnet runs with: 10,000 transactions and 20 MiB
+        let defaults = built(env.node_config(), true)?.pending_limit;
+        assert_eq!(defaults, SubPoolLimit::new(20_000, 40 * 1024 * 1024));
+        // a limit an operator set to "unbounded" stays unbounded instead of overflowing
+        assert_eq!(pending_limit(SubPoolLimit::max(), true), SubPoolLimit::max());
         Ok(())
     }
 }
