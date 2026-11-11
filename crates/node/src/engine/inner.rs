@@ -107,6 +107,7 @@ impl ExecutionNodeInner {
         epoch_task_spawner: &TaskSpawner,
         base_fee: u64,
         epoch: Epoch,
+        seals_via_quorum: bool,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
         let transaction_pool = self
@@ -127,7 +128,8 @@ impl ExecutionNodeInner {
             base_fee,
             epoch,
         )?;
-        let batch_builder = configure_batch_builder(batch_builder, &self.tn_config.parameters);
+        let batch_builder =
+            configure_batch_builder(batch_builder, &self.tn_config.parameters, seals_via_quorum);
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
@@ -572,9 +574,17 @@ fn configure_engine(
         .with_pipelined_persist(parameters.pipelined_persist)
 }
 
-/// Hand the batch builder the runtime switches it reads from the node's `parameters.yaml`.
-fn configure_batch_builder(builder: BatchBuilder, parameters: &Parameters) -> BatchBuilder {
-    builder.with_sealed_tx_keep(parameters.sealed_tx_keep)
+/// Hand the batch builder the runtime switches it reads from the node's `parameters.yaml` and
+/// whether its worker seals batches through a quorum of peers.
+///
+/// Only a builder for a quorum-sealing worker keeps sealed transactions pooled and marked
+/// (`sealed_tx_keep`); a forwarding worker's builder prunes them as before.
+fn configure_batch_builder(
+    builder: BatchBuilder,
+    parameters: &Parameters,
+    seals_via_quorum: bool,
+) -> BatchBuilder {
+    builder.with_sealed_tx_keep(parameters.sealed_tx_keep).with_seals_via_quorum(seals_via_quorum)
 }
 
 #[cfg(test)]
@@ -746,21 +756,23 @@ mod tests {
     }
 
     /// The batch builder reads `sealed_tx_keep` as set in the node's parameters, and `false` when
-    /// the parameters leave it at its default.
+    /// the parameters leave it at its default; it reads its worker's sealing mode as passed.
     #[tokio::test]
     async fn test_configure_batch_builder_hands_sealed_tx_keep_to_the_builder() -> eyre::Result<()>
     {
         let task_manager = tn_types::TaskManager::new("configure batch builder");
         let default_dir = tempfile::TempDir::new()?;
         let builder = batch_builder_on_temp_chain(default_dir.path(), &task_manager)?;
-        let builder = configure_batch_builder(builder, &Parameters::default());
+        let builder = configure_batch_builder(builder, &Parameters::default(), false);
         assert!(!builder.sealed_tx_keep());
+        assert!(!builder.seals_via_quorum());
 
         let parameters = Parameters { sealed_tx_keep: true, ..Default::default() };
         let arm_dir = tempfile::TempDir::new()?;
         let builder = batch_builder_on_temp_chain(arm_dir.path(), &task_manager)?;
-        let builder = configure_batch_builder(builder, &parameters);
+        let builder = configure_batch_builder(builder, &parameters, true);
         assert!(builder.sealed_tx_keep());
+        assert!(builder.seals_via_quorum(), "the worker's sealing mode must reach the builder");
         Ok(())
     }
 

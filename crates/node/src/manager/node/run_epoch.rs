@@ -424,6 +424,7 @@ where
                         &batch_builder_task_spawner,
                         base_fee,
                         current_epoch,
+                        worker.seals_via_quorum(),
                     )
                     .await?;
             } else {

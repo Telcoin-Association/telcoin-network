@@ -392,6 +392,9 @@ impl ExecutionNode {
     }
 
     /// Start the worker's batch builder for the epoch.
+    ///
+    /// `seals_via_quorum` is the worker's `Worker::seals_via_quorum`: only a builder for a
+    /// quorum-sealing worker keeps sealed transactions pooled and marked (`sealed_tx_keep`).
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -399,9 +402,17 @@ impl ExecutionNode {
         task_spawner: &TaskSpawner,
         base_fee: u64,
         epoch: Epoch,
+        seals_via_quorum: bool,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
+        guard.start_batch_builder(
+            worker_id,
+            block_provider_sender,
+            task_spawner,
+            base_fee,
+            epoch,
+            seals_via_quorum,
+        )
     }
 
     /// Batch validator
