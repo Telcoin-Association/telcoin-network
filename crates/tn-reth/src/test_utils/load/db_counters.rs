@@ -62,8 +62,9 @@ impl DbCounters {
     }
 
     /// What happened between `earlier` and `self`, two reads of one database (`earlier` first):
-    /// tn-lmdb's `IoStats::since`, each counter's saturating difference except
-    /// `tn_lmdb_max_gate_lag`, a maximum since the open, which is `self`'s.
+    /// tn-lmdb's `IoStats::since`, each counter's saturating difference except those of
+    /// [`NOT_DIFFERENCES`] (`tn_lmdb_max_gate_lag`, a maximum since the open, and the automatic
+    /// gap fill's gauges), which are `self`'s.
     #[cfg(not(feature = "mdbx"))]
     pub fn since(&self, earlier: &Self) -> Self {
         Self { io: self.io.since(&earlier.io) }
@@ -92,6 +93,15 @@ impl DbCounters {
             gaps_filled,
             gap_pages,
             gap_misses,
+            gap_auto_steps,
+            gap_auto_probes,
+            gap_auto_readapts,
+            gap_auto_width_sum,
+            gap_auto_width,
+            gap_auto_run_ns,
+            gap_auto_page_ns,
+            gap_auto_gap_ns,
+            gap_auto_capped,
             bytes_grown,
             free_list_save_rounds,
             save_ns,
@@ -125,6 +135,15 @@ impl DbCounters {
             ("tn_lmdb_gaps_filled", gaps_filled),
             ("tn_lmdb_gap_pages", gap_pages),
             ("tn_lmdb_gap_misses", gap_misses),
+            ("tn_lmdb_gap_auto_steps", gap_auto_steps),
+            ("tn_lmdb_gap_auto_probes", gap_auto_probes),
+            ("tn_lmdb_gap_auto_readapts", gap_auto_readapts),
+            ("tn_lmdb_gap_auto_width_sum", gap_auto_width_sum),
+            ("tn_lmdb_gap_auto_width", gap_auto_width),
+            ("tn_lmdb_gap_auto_run_ns", gap_auto_run_ns),
+            ("tn_lmdb_gap_auto_page_ns", gap_auto_page_ns),
+            ("tn_lmdb_gap_auto_gap_ns", gap_auto_gap_ns),
+            ("tn_lmdb_gap_auto_capped", gap_auto_capped),
             ("tn_lmdb_bytes_grown", bytes_grown),
             ("tn_lmdb_free_list_save_rounds", free_list_save_rounds),
             ("tn_lmdb_save_ns", save_ns),
@@ -156,6 +175,18 @@ impl DbCounters {
         self.entries().into_iter().find_map(|(entry, value)| (entry == name).then_some(value))
     }
 }
+
+/// The tn-lmdb counters whose [`DbCounters::since`] is the later read's value, not a difference:
+/// `tn_lmdb_max_gate_lag`, a maximum since the open, and the automatic gap fill's gauges (its last
+/// width and its fit).
+pub const NOT_DIFFERENCES: [&str; 6] = [
+    "tn_lmdb_max_gate_lag",
+    "tn_lmdb_gap_auto_width",
+    "tn_lmdb_gap_auto_run_ns",
+    "tn_lmdb_gap_auto_page_ns",
+    "tn_lmdb_gap_auto_gap_ns",
+    "tn_lmdb_gap_auto_capped",
+];
 
 /// The open database `db`'s cumulative counters (see the module docs for what they count and what
 /// a read costs).
@@ -267,12 +298,12 @@ mod tests {
         for (((name, earlier), (_, later)), (delta_name, value)) in rows {
             assert_eq!(delta_name, name, "one order");
             // a maximum since the open, not a difference
-            let expected = if name == "tn_lmdb_max_gate_lag" { later } else { later - earlier };
+            let expected = if NOT_DIFFERENCES.contains(&name) { later } else { later - earlier };
             assert_eq!(value, expected, "{name}");
         }
         let unmoved = before.since(&after).entries();
         assert!(
-            unmoved.iter().all(|(name, value)| *value == 0 || *name == "tn_lmdb_max_gate_lag"),
+            unmoved.iter().all(|(name, value)| *value == 0 || NOT_DIFFERENCES.contains(name)),
             "a pair in the wrong order saturates at zero: {unmoved:?}"
         );
         Ok(())

@@ -118,7 +118,7 @@ use page_size as _;
 /// the global metrics recorder is installed, i.e. the node runs with `--metrics`).
 #[cfg(feature = "mdbx")]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
-    if reth_config.db_gap_fill() > 0 {
+    if reth_config.db_gap_fill().is_on() {
         eyre::bail!("--db.gap-fill is not supported by the MDBX backend");
     }
     check_backend(path)?;
@@ -158,25 +158,28 @@ fn open_tn_lmdb(
     db_args: &DatabaseArgs,
     client_version: reth_db::ClientVersion,
 ) -> eyre::Result<RethDb> {
-    open_tn_lmdb_with(path, db_args, 0, client_version)
+    open_tn_lmdb_with(path, db_args, tn_lmdb_reth::GapFill::OFF, client_version)
 }
 
-/// [`open_tn_lmdb`] with the engine's gap fill at `gap_fill` pages (`--db.gap-fill`, 0: off,
-/// [`RethConfig::db_gap_fill`]). More than the engine's `MAX_GAP_FILL` is refused here, naming the
-/// flag.
+/// [`open_tn_lmdb`] with the engine's gap fill at `gap_fill` (`--db.gap-fill`,
+/// [`RethConfig::db_gap_fill`]). A width past the engine's `MAX_GAP_FILL` is refused here, naming
+/// the flag.
 #[cfg(not(feature = "mdbx"))]
 fn open_tn_lmdb_with(
     path: &Path,
     db_args: &DatabaseArgs,
-    gap_fill: u32,
+    gap_fill: tn_lmdb_reth::GapFill,
     client_version: reth_db::ClientVersion,
 ) -> eyre::Result<RethDb> {
-    use tn_lmdb_reth::{TnLmdbEnv, TnLmdbEnvKind, MAX_GAP_FILL};
+    use tn_lmdb_reth::{GapFill, TnLmdbEnv, TnLmdbEnvKind, MAX_GAP_FILL};
 
-    if gap_fill > MAX_GAP_FILL {
-        eyre::bail!(
-            "--db.gap-fill {gap_fill} is over the tn-lmdb backend's maximum of {MAX_GAP_FILL} pages"
-        );
+    if let GapFill::Pages(pages) = gap_fill {
+        if pages > MAX_GAP_FILL {
+            eyre::bail!(
+                "--db.gap-fill {pages} is over the tn-lmdb backend's maximum of {MAX_GAP_FILL} \
+                 pages"
+            );
+        }
     }
     let args = tn_lmdb_args(db_args)?.with_gap_fill(gap_fill);
     #[cfg(test)]
