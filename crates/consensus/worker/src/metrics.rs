@@ -248,8 +248,9 @@ impl WorkerMetrics {
         }
     }
 
-    /// Record a batch request that `peer` answered with `Deny`; the peer stays eligible for
-    /// a later pass of the same `request_batches` call.
+    /// Record a batch request that `peer` answered with `Deny(AtCapacity)` or
+    /// `Deny(Unavailable)`; the peer stays eligible for a later pass of the same
+    /// `request_batches` call. A `Deny(Busy)` is not counted: worker serves never answer it.
     ///
     /// `committee` is the requester's current committee: a member records under its own
     /// `peer` series and every other peer under `peer="other"` (see

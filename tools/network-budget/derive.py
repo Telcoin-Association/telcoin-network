@@ -12,6 +12,20 @@ from evaluate import ACCEPTANCE, ESTABLISHED, gap, load_run, samples
 HONEST_PHASES = ("steady", "catch-up", "reconnect")
 TRANSPORT_FIELDS = ("peak_connections_per_peer", "peak_inbound_streams_per_connection", "peak_receive_credit_bytes_per_connection")
 U32_MAX = 2**32 - 1
+# These mirror PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE and MAX_ESTABLISHED_CONNECTIONS in
+# crates/network-libp2p/src/consensus.rs: a swarm keeps total * 50 // 128 established connections for
+# privileged peers, and peers without privilege share the rest.
+PRIVILEGED_RESERVE, DEFAULT_TOTAL = 50, 128
+
+
+def public_share(total):
+    """Mirror PublicConnectionShare::of in crates/network-libp2p/src/peers/public_share.rs."""
+    return total - total * PRIVILEGED_RESERVE // DEFAULT_TOTAL
+
+
+def total_for_public(share):
+    """The smallest per-swarm total whose public share is at least share."""
+    return (share - 1) * DEFAULT_TOTAL // (DEFAULT_TOTAL - PRIVILEGED_RESERVE) + 1
 
 
 def allocate(budget):
@@ -53,7 +67,10 @@ def derive(root, transport_path, headroom):
     expected = {"primary", *(f"worker-{worker}" for worker in range(topology["workers_per_node"]))}
     if set(peaks) != expected:
         raise ValueError(f"established connection peaks missing for: {', '.join(sorted(expected - set(peaks)))}")
-    connections = max(math.ceil(max(peaks.values()) * headroom), 1)
+    public = max(math.ceil(max(peaks.values()) * headroom), 1)
+    # The per-swarm total keeps the privileged reserve on top of the public peak, so a derived budget cannot
+    # leave the public share below what the honest phases used.
+    connections = total_for_public(public)
     admitted = connections * swarms
     scaled = {field: math.ceil(transport[field] * headroom) for field in TRANSPORT_FIELDS}
     budget = {
@@ -71,6 +88,7 @@ def derive(root, transport_path, headroom):
         "topology": topology,
         "headroom": headroom,
         "peak_established_per_swarm": peaks,
+        "public_share_per_swarm": public_share(connections),
         "transport_peaks": {field: transport[field] for field in TRANSPORT_FIELDS},
         "process_budget": budget,
         "allocation": allocate(budget),

@@ -40,11 +40,13 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wall-clock cap on sending one consensus-output sync pack to a peer.
+/// Wall-clock cap on sending one consensus-output sync pack to a peer, for every tier.
 ///
-/// It bounds a single message, not a whole epoch pack, so it caps the admission slot a
-/// drip-reading peer can hold during one consensus-output serve. The public epoch-pack serve
-/// bound is `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` in the network module, which is its own constant.
+/// It bounds a single message, not a whole epoch pack. It is not the public cap: the admission
+/// layer (`ServeHoldLimit` in the network module) cuts a public consensus-output serve at 60 s
+/// (`PUBLIC_SYNC_SERVE_TIMEOUT`) and a public epoch-pack serve at 200 s
+/// (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`). Committee serves are unbounded there, so for a committee
+/// peer this timeout is what caps the admission slot of one consensus-output serve.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.

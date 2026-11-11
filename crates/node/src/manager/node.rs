@@ -33,7 +33,10 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, T
 use tn_network_libp2p::{
     source_admission::SourceAdmissionBudget, types::NetworkEvent, ConsensusNetwork,
 };
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
+use tn_primary::{
+    network::{PrimaryNetworkHandle, PrimarySyncLedgers},
+    ConsensusBusApp, NodeMode, QueChannel,
+};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
 use tn_types::{
@@ -273,7 +276,7 @@ pub(crate) struct EpochManager<P, DB> {
     /// part of a commit never affects the decision). Once an output reaches the
     /// boundary the manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
+    /// Reth database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
     /// Consensus database handle. Held for the whole process; shared with the p2p networks
@@ -299,6 +302,11 @@ pub(crate) struct EpochManager<P, DB> {
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
+
+    /// Inbound sync ledgers of the primary network (opening admission and serve budgets),
+    /// built once per node process and shared by the network of every epoch, so an epoch
+    /// change does not refill the public hold budgets or the per-key serve cap.
+    primary_sync_ledgers: PrimarySyncLedgers,
 
     /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
     /// the long-running networks.
@@ -819,6 +827,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            primary_sync_ledgers: PrimarySyncLedgers::new(),
             bootstrap_servers,
             trusted_peer_keys: HashSet::new(),
             version_str,

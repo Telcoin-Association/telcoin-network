@@ -1126,10 +1126,12 @@ where
         // only speak legacy last epoch may now serve the sync protocol (739, step 6)
         network_handle.clear_sync_capability();
 
-        // spawn primary network
+        // spawn primary network over the node's sync ledgers, so the public hold budgets and
+        // the per-key serve cap survive the epoch change
         PrimaryNetwork::new(
             rx_event_stream,
             network_handle.clone(),
+            self.primary_sync_ledgers.clone(),
             consensus_config.clone(),
             consensus_bus.app().clone(),
             state_sync,

@@ -107,7 +107,7 @@ use crate::archive::error::rename::RenameError;
 /// `path` must refer to a directory.  Passing a regular file silently fsyncs
 /// that file's contents instead of providing the directory-entry durability
 /// guarantee callers expect, so all in-crate call sites pass a directory.
-pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
+pub fn fsync_directory(path: &Path) -> Result<(), io::Error> {
     #[cfg(test)]
     if FAIL_DIR_SYNC.with_borrow(|fail| fail.as_deref() == Some(path)) {
         return Err(io::Error::other(format!("injected directory fsync failure for {path:?}")));
@@ -134,7 +134,7 @@ fn entry_dir(path: &Path) -> Option<&Path> {
 
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`
 /// (see the module docs' Durability section) and this is a plain `fsync`.
-pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
+pub fn fsync_file(file: &File) -> io::Result<()> {
     // Retried when a signal interrupts it, as `File::sync_all` does: an interrupted call is not a
     // sync error, and the callers that fail-stop on one (the barriers, which poison the file, the
     // tndb commit thread, an open) would stop the node for nothing. Not every caller fail-stops:
@@ -187,7 +187,8 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
 /// is dirty, locked, under writeback or mapped by another process; nothing in this crate maps the
 /// file then (tndb's `lock_dir` keeps a second handle off its directory, and `try_clone` readers
 /// use `pread`). Elsewhere a no-op: macOS has no such advice, and is not a validator platform.
-fn drop_cached_pages(file: &File) -> io::Result<()> {
+/// Shared through [`crate::disk`] (`tn-reth`'s benchmark evicts its datadir copies with it).
+pub fn drop_cached_pages(file: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a plain syscall on a file descriptor `file` owns and keeps open for the call; it

@@ -33,3 +33,6 @@ docs/book/
 # reports written to the repo root by etc/storage-ab-bench.sh and etc/storage-baseline-bench.sh
 /storage-ab-*.txt
 /storage-baseline-*.txt
+
+# etc/reth-exec-bench.sh writes its reports to the repository root
+/reth-exec-*.txt

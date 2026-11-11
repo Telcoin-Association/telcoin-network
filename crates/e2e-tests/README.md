@@ -128,6 +128,19 @@ a stray package-local `target` tree.
 If `TN_BIN_PATH` is left unset the suite still runs; add `--no-capture` to watch the one-time build
 instead of waiting on a silent first test.
 
+`reth_db_migration::test_restart_migrates_reth_db_to_tn_lmdb` needs two binaries and skips (with a
+warning) in the run above. `make test-e2e-reth-migration` builds both and runs it: the committee
+starts on the default binary (`TN_BIN_PATH_PREV`, reth database on MDBX), and each validator
+restarts on the `tn-lmdb` binary (`TN_BIN_PATH`), migrates its reth database and follows the chain.
+The target also sets `TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the `tn-lmdb` build.
+
+`make test-e2e-tn-lmdb` runs the restart, epoch and sigkill suites on a node binary built with the
+`tn-lmdb` feature (`make build-e2e-bin-tn-lmdb`), so each spawned node keeps its reth database on
+tn-lmdb, then `make test-e2e-reth-migration`, stopping at the first that fails.
+`make test-restarts-tn-lmdb`, `make test-epochs-tn-lmdb` and `make test-sigkill-tn-lmdb` run one
+suite each. The test binaries themselves build without `tn-lmdb`: they never open a spawned node's
+reth database.
+
 ## Test Log Output
 
 The e2e integration tests (restart and epoch tests) spawn multiple validator node processes. Each node's stdout is captured to a separate log file under `test_logs/` so that failures can be debugged without sifting through interleaved output from all nodes.

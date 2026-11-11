@@ -5,6 +5,7 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
+    public_share::PublicConnectionShare,
     status::NewConnectionStatus,
     tracked::{
         EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedKeys, TrackedSlot,
@@ -263,6 +264,8 @@ pub(crate) struct PeerManager {
     config: PeerConfig,
     /// Leases owned by this swarm using optional process-wide source accounting.
     source_connections: SourceConnections,
+    /// Established-connection share of the peers without privilege, one slot per connection.
+    public_share: PublicConnectionShare,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// A single timer shared by all configured hub reconnects, dropped with the swarm.
@@ -687,6 +690,62 @@ impl PeerManager {
         self.source_connections.on_swarm_event(event);
     }
 
+    /// Install the public connection share that matches the swarm's established-connection
+    /// bounds.
+    ///
+    /// `ConsensusNetwork::new` calls this once at startup, ahead of the first poll of the swarm,
+    /// so no slot is held yet and replacing the whole share (with empty maps) is correct.
+    pub(crate) fn configure_public_share(&mut self, share: PublicConnectionShare) {
+        self.public_share = share;
+    }
+
+    /// Whether a peer is exempt from the distinct-peer gate and from the public connection share.
+    ///
+    /// Privileged peers are the important peers (members of the previous, current and next
+    /// committees, and trusted operator peers) and the peers that an effective Closed admission
+    /// policy authorizes. Under Open admission, privilege is the committee plus the trusted
+    /// operator peers. Bootstrap peers hold no share privilege: they are dial targets of this
+    /// node, and the heartbeat prune frees public slots above the peer target.
+    pub(super) fn peer_is_privileged(&self, peer: &PeerId) -> bool {
+        self.peer_is_important(peer) || self.admission_is_privileged(peer)
+    }
+
+    /// Take a public share slot when a peer without privilege completes an established
+    /// connection.
+    ///
+    /// A privileged peer (see [`Self::peer_is_privileged`]) takes no slot and is never refused
+    /// here. A refusal logs at debug level and carries `PeerAdmissionDenied::PublicShare`, so an
+    /// inbound refusal reaches the inbound denial metrics under its reason. The slot is freed by
+    /// [`Self::release_public_connection`].
+    pub(crate) fn reserve_public_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        if self.peer_is_privileged(&peer) {
+            Ok(())
+        } else {
+            self.public_share.reserve(connection_id, peer).map_err(|exceeded| {
+                debug!(
+                    target: "peer-manager",
+                    ?peer,
+                    held = self.public_share.held(),
+                    held_by_peer = self.public_share.held_by(&peer),
+                    %exceeded,
+                    "public connection share refused connection"
+                );
+                libp2p::swarm::ConnectionDenied::new(
+                    super::behavior::PeerAdmissionDenied::PublicShare(exceeded),
+                )
+            })
+        }
+    }
+
+    /// Free the public share slot of one connection; an id without a slot frees nothing.
+    pub(crate) fn release_public_connection(&mut self, connection_id: ConnectionId) {
+        self.public_share.release(connection_id);
+    }
+
     /// Reserve source occupancy at the authenticated established-connection boundary.
     ///
     /// Every denial is counted and logged. The importance signal is computed here so that
@@ -741,6 +800,10 @@ impl PeerManager {
             admission_operator_peers: Default::default(),
             config: *config,
             source_connections: SourceConnections::default(),
+            public_share: PublicConnectionShare::of(
+                crate::consensus::MAX_ESTABLISHED_CONNECTIONS,
+                crate::consensus::MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+            ),
             heartbeat,
             trusted_retry: None,
             trusted_dials: HashMap::new(),
