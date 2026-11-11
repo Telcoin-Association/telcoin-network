@@ -1626,11 +1626,38 @@ pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
 /// The bound on the adaptive policy's window, in rounds: repeated cancels double the configured
 /// `quorum_exec_block_starved_rounds` up to this value.
 ///
-/// Each failed return to the own tip costs about two cancelled headers (the probe, and the next
-/// header, proposed before the probe's cancel report arrives). At this bound a proposer that stays
-/// ahead of its quorum loses about 2 of every 130 headers, under the 2 % the bench-6 certification
-/// target (98 %) leaves. A configured value above the bound is used as is and never doubled.
+/// Each failed return to the own tip costs one or two cancelled headers: the probe, and the next
+/// header if it fails too (it is proposed before the probe's cancel report arrives). With p the
+/// chance that a header naming the own tip certifies, a proposer that spends a share f of its
+/// rounds on the tip loses about f × (1 − p) of its headers, never more than with the switch off
+/// (f = 1) as long as headers under the quorum rule certify. Holding the loss under the 2 % the
+/// bench-6 certification target (98 %) leaves needs f ≤ 0.02 ÷ (1 − p). At this bound a proposer
+/// whose tip never certifies loses 2 of every 130 headers; the model in the proposer tests loses
+/// about 1 % over 4000 rounds at p = 0.5 to 0.9 (1.3 % at p = 0.6).
+///
+/// What the policy cannot do: know p. Its only evidence is a streak of certified tip headers (see
+/// [`QUORUM_EXEC_BLOCK_RESET_STREAK`]). Between p = 0.9 and 0.98 such a streak is common enough to
+/// reset the window, so f grows and the share lost moves toward 1 − p: about 1 % at p = 0.97 in
+/// the model, 1.5 % in its worst 4000-round sample. Every climb to the bound also costs one or two
+/// headers per doubling (five doublings from a window of 4), so a measurement that starts as a
+/// regime starts loses 5 to 10 headers before the steady state: the e2e test, about 100 rounds
+/// long, lost 7 or 8 and certified 0.92 to 0.93. A configured value above the bound is used as is
+/// and never doubled.
 pub(crate) const QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS: Round = 128;
+
+/// How many consecutive own headers, proposed outside a window (under the tip policy) and
+/// certified, reset the adaptive policy's next window to the configured value.
+///
+/// One certified tip header says little about the chance that the tip certifies: where it
+/// certifies every other round, a reset on each success brought the proposer back to its tip every
+/// six rounds and lost one header in six (0.81 certified in the e2e test). A streak of 64 happens
+/// in about 0.1 % of returns at p = 0.9 (0.9^64), so the windows stay long while the tip fails
+/// often and reset once it certifies reliably. Waiting for the streak costs no headers: a policy
+/// back on a tip that keeps certifying stays there, since only a cancel opens a window. It only
+/// makes a cancel within 64 rounds of the return open a long window. The streak counts the own
+/// certificates found among the next header's parents, so a header certified after the proposer
+/// moved on neither counts nor breaks it, and the reset can take longer than 64 rounds.
+pub(crate) const QUORUM_EXEC_BLOCK_RESET_STREAK: u32 = 64;
 
 /// The rule that names a header's execution block, as the `quorum_exec_block` switches and the
 /// adaptive window select it for one header. Reported as `exec_policy` on `header proposed`.
@@ -1700,12 +1727,14 @@ impl ExecBasis {
 /// ratchet down, so a test such as "the quorum value reached my tip" would never pass.
 ///
 /// A cancel that is counted doubles the next window, up to
-/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]. An own header proposed outside a window (under the tip
-/// policy) that certified resets the next window to the configured value. A header certified
-/// inside a window does not, even when its quorum value reached the tip:
-/// it shows the quorum rule works, not that the tip would, and resetting there would make every
-/// return to the tip fail at the configured window's rate (about one probe and two lost headers
-/// every `K + 2` rounds) while the proposer stays ahead.
+/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]. The next window returns to the configured value only
+/// after [`QUORUM_EXEC_BLOCK_RESET_STREAK`] consecutive own headers proposed outside a window
+/// (under the tip policy) certified; every cancel report restarts the count. A single certified
+/// tip header is not enough where the tip certifies part of the time. A header certified inside a
+/// window does not count, even when its quorum value reached the tip: it shows the quorum rule
+/// works, not that the tip would, and counting it would make every return to the tip fail at the
+/// configured window's rate (about one probe and two lost headers every `K + 2` rounds) while the
+/// proposer stays ahead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecBlockPolicy {
     /// `quorum_exec_block`.
@@ -1722,6 +1751,8 @@ pub(crate) struct ExecBlockPolicy {
     window_start: Round,
     /// The last round of the current window; 0 before any window.
     starved_through: Round,
+    /// Own headers proposed outside a window and certified since the last cancel report.
+    certified_streak: u32,
 }
 
 impl ExecBlockPolicy {
@@ -1734,6 +1765,7 @@ impl ExecBlockPolicy {
             next_window: starved_rounds,
             window_start: 0,
             starved_through: 0,
+            certified_streak: 0,
         }
     }
 
@@ -1767,14 +1799,18 @@ impl ExecBlockPolicy {
     /// header that opened the run lags the next header by a round, and that next header named its
     /// tip too. Any other cancel, of a tip header after a window or of a header inside one, opens
     /// a window for the rounds after `proposer_round` (or extends the current one) and doubles the
-    /// next window.
+    /// next window. Every report, ignored or not, restarts the streak of certified tip headers.
     pub(crate) fn on_cancelled(&mut self, header_round: Round, proposer_round: Round) {
-        if !self.adaptive() || header_round <= self.window_start {
+        if !self.adaptive() {
+            return;
+        }
+        self.certified_streak = 0;
+        if header_round <= self.window_start {
             return;
         }
         // a cancel that arrives at the window's last round extends the run instead: that round's
-        // header was built under the rule and must stay inside it, or its certificate would read
-        // as a certified tip header and reset the window it just doubled
+        // header was built under the rule and must stay inside it, or its certificate would count
+        // toward the streak as a certified tip header
         if proposer_round > self.starved_through {
             // the previous window is spent: a new run starts after the proposer's round
             self.window_start = proposer_round;
@@ -1790,11 +1826,16 @@ impl ExecBlockPolicy {
 
     /// The own header at `header_round` certified: its certificate is a parent of the next header.
     ///
-    /// Resets the next window to the configured value when that header was proposed outside a
-    /// window, under the tip policy. A header inside a window whose quorum value reached the own
-    /// tip (`exec_basis=tip`) does not reset it; the next certified tip header does.
+    /// A header proposed outside a window, under the tip policy, extends the streak of certified
+    /// tip headers; once the streak reaches [`QUORUM_EXEC_BLOCK_RESET_STREAK`] the next window
+    /// returns to the configured value. A header inside a window, even one whose quorum value
+    /// reached the own tip (`exec_basis=tip`), neither counts nor breaks the streak.
     pub(crate) fn on_certified(&mut self, header_round: Round) {
-        if self.adaptive() && !self.in_window(header_round) {
+        if !self.adaptive() || self.in_window(header_round) {
+            return;
+        }
+        self.certified_streak = self.certified_streak.saturating_add(1);
+        if self.certified_streak >= QUORUM_EXEC_BLOCK_RESET_STREAK {
             self.next_window = self.base_window;
         }
     }

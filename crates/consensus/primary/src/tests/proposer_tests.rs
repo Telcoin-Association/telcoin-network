@@ -2162,9 +2162,10 @@ fn test_quorum_exec_block_self_feeding_fleet() {
 /// The adaptive policy's state machine: a cancel opens a window of K rounds after the proposer's
 /// round and the policy returns to the tip when they have elapsed; the lagging cancel of the
 /// header built before the window is not counted again; repeated cancels double K up to
-/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a certified tip header resets K, a header certified
-/// inside a window does not, including the window's last header when a cancel reported at that
-/// round extends the run. The switch off and the `always` policy keep no window.
+/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a streak of [`QUORUM_EXEC_BLOCK_RESET_STREAK`]
+/// certified tip headers resets K, a header certified inside a window does not count, including the
+/// window's last header when a cancel reported at that round extends the run. The switch off and
+/// the `always` policy keep no window.
 #[test]
 fn test_quorum_exec_block_adaptive_policy_state_machine() {
     let mut policy = ExecBlockPolicy::new(true, 4);
@@ -2181,9 +2182,9 @@ fn test_quorum_exec_block_adaptive_policy_state_machine() {
     policy.on_cancelled(4, 5);
     assert_eq!(window(&policy), (5..=8).collect::<Vec<_>>());
     assert_eq!(policy.next_window, 8);
-    // a header certified inside the window does not reset K
+    // a header certified inside the window does not count toward the reset
     policy.on_certified(6);
-    assert_eq!(policy.next_window, 8);
+    assert_eq!((policy.certified_streak, policy.next_window), (0, 8));
 
     // the rounds are spent: the round-9 tip probe is cancelled at round 10, so the doubled window
     // covers rounds 11-18
@@ -2209,13 +2210,20 @@ fn test_quorum_exec_block_adaptive_policy_state_machine() {
     assert_eq!(policy.for_round(last), ExecPolicy::Starved);
     assert_eq!(policy.for_round(last + 1), ExecPolicy::Tip, "returns by rounds elapsed");
 
-    // a certified header that named its tip resets K to the configured value
+    // one certified header that named its tip does not reset K; a streak of them does
     policy.on_certified(last + 1);
+    assert_eq!(policy.next_window, 128, "one certified tip header");
+    let streak_end = last + QUORUM_EXEC_BLOCK_RESET_STREAK;
+    for round in last + 2..streak_end {
+        policy.on_certified(round);
+    }
+    assert_eq!(policy.next_window, 128, "one short of the streak");
+    policy.on_certified(streak_end);
     assert_eq!(policy.next_window, 4);
-    policy.on_cancelled(last + 2, last + 3);
-    assert_eq!(policy.for_round(last + 4), ExecPolicy::Starved);
-    assert_eq!(policy.for_round(last + 7), ExecPolicy::Starved);
-    assert_eq!(policy.for_round(last + 8), ExecPolicy::Tip, "a fresh window of K = 4");
+    policy.on_cancelled(streak_end + 1, streak_end + 2);
+    assert_eq!(policy.for_round(streak_end + 3), ExecPolicy::Starved);
+    assert_eq!(policy.for_round(streak_end + 6), ExecPolicy::Starved);
+    assert_eq!(policy.for_round(streak_end + 7), ExecPolicy::Tip, "a fresh window of K = 4");
 
     // round 7, inside the window 5-8, is cancelled when round 8 is proposed: the run extends, so
     // round 8 stays a rule header and its certificate keeps the doubled K
@@ -2225,7 +2233,8 @@ fn test_quorum_exec_block_adaptive_policy_state_machine() {
     assert_eq!(window(&edge), (5..=16).collect::<Vec<_>>());
     assert_eq!(edge.next_window, 16);
     edge.on_certified(8);
-    assert_eq!(edge.next_window, 16, "a rule header's certificate does not reset K");
+    assert_eq!(edge.certified_streak, 0, "a rule header's certificate does not count");
+    assert_eq!(edge.next_window, 16);
 
     // a configured window above the bound is used as is
     let mut wide = ExecBlockPolicy::new(true, 200);
@@ -2382,8 +2391,8 @@ async fn test_quorum_exec_block_switch_off_keeps_header_bytes() {
 
 /// The adaptive policy through the proposer: the certifier's cancel report, handled by
 /// `process_uncertified_header`, moves the next headers onto the quorum rule
-/// (`exec_policy=starved`) for K rounds, and an own certificate among a new header's parents resets
-/// K.
+/// (`exec_policy=starved`) for K rounds, and an own certificate among a new header's parents counts
+/// toward the streak that resets K.
 ///
 /// Catches: a cancel report that never reaches the policy, a window counted from anything but the
 /// proposer's round, and an own certificate that is not seen as a certified header.
@@ -2430,7 +2439,8 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     proposer.process_uncertified_header(19, HeaderDigest::default());
     assert_eq!(proposer.exec_block_policy.next_window, 32);
 
-    // the own round-40 certificate, a tip header, among the parents of round 41 resets K
+    // the own round-40 certificate, a tip header, among the parents of round 41 starts the streak;
+    // one certified tip header does not reset K
     let own = Certificate::new_unsigned_for_test(
         &fixture.committee(),
         HeaderBuilder::default()
@@ -2447,7 +2457,260 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     let (round_41, line) = exec_propose(&mut proposer, &capture).await;
     assert_eq!(round_41.round(), 41);
     assert_eq!(line.field("exec_policy"), Some("tip"));
-    assert_eq!(proposer.exec_block_policy.next_window, 4);
+    assert_eq!(proposer.exec_block_policy.certified_streak, 1);
+    assert_eq!(proposer.exec_block_policy.next_window, 32);
+}
+
+/// The reset streak in the adaptive policy's state machine: after a doubled window one certified
+/// tip header does not reset K and [`QUORUM_EXEC_BLOCK_RESET_STREAK`] consecutive ones do; any
+/// cancel report restarts the streak, even one the window logic ignores; a header certified inside
+/// a window neither counts nor breaks the streak (D29).
+///
+/// Catches: a reset on a single certified tip header (the e2e test certified 0.81 that way), a
+/// streak that survives a cancel, and a header built under the quorum rule counted as a tip header.
+#[test]
+fn test_quorum_exec_block_reset_needs_a_streak_of_certified_tip_headers() {
+    let streak = QUORUM_EXEC_BLOCK_RESET_STREAK;
+    let window = |p: &ExecBlockPolicy| -> Vec<Round> {
+        (1..=400).filter(|r| p.for_round(*r) == ExecPolicy::Starved).collect()
+    };
+    let mut policy = ExecBlockPolicy::new(true, 4);
+    // round 3 cancelled at round 4 opens 5-8; the round-9 probe cancelled at round 10 opens 11-18
+    policy.on_cancelled(3, 4);
+    policy.on_cancelled(9, 10);
+    assert_eq!(policy.next_window, 16);
+
+    // a header certified inside the window does not count
+    policy.on_certified(12);
+    assert_eq!(policy.certified_streak, 0);
+
+    // back on the tip at round 19: one certified tip header leaves the doubled window
+    assert_eq!(policy.for_round(19), ExecPolicy::Tip);
+    policy.on_certified(19);
+    assert_eq!((policy.certified_streak, policy.next_window), (1, 16));
+
+    // a cancel inside the streak restarts it: round 30 cancelled at round 31 opens 32-47
+    for round in 20..30 {
+        policy.on_certified(round);
+    }
+    assert_eq!(policy.certified_streak, 11);
+    policy.on_cancelled(30, 31);
+    assert_eq!((policy.certified_streak, policy.next_window), (0, 32));
+    assert_eq!(window(&policy), (32..=47).collect::<Vec<_>>());
+
+    // a late report for a header built before that window opened leaves the window alone but
+    // still restarts the streak
+    policy.on_certified(31);
+    assert_eq!(policy.certified_streak, 1);
+    policy.on_cancelled(25, 32);
+    assert_eq!((policy.certified_streak, policy.next_window), (0, 32));
+    assert_eq!(window(&policy), (32..=47).collect::<Vec<_>>());
+
+    // the window is spent at round 48: one short of the streak keeps K doubled, a certified window
+    // header in between neither counts nor breaks it, and the streak's last header resets K
+    let last = 48 + streak - 1;
+    for round in 48..last {
+        policy.on_certified(round);
+    }
+    assert_eq!((policy.certified_streak, policy.next_window), (streak - 1, 32));
+    policy.on_certified(47);
+    assert_eq!(policy.certified_streak, streak - 1, "a window header does not count");
+    policy.on_certified(last);
+    assert_eq!((policy.certified_streak, policy.next_window), (streak, 4));
+
+    // the next isolated cancel opens a window of the configured K
+    policy.on_cancelled(last + 1, last + 2);
+    assert_eq!(policy.certified_streak, 0);
+    assert_eq!(window(&policy), (last + 3..=last + 6).collect::<Vec<_>>());
+}
+
+/// SplitMix64, the model's seeded draw: no wall clock, no generator state.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Whether a header naming the own tip at `round` certifies in sample `seed` of a regime where it
+/// certifies with probability `permille` / 1000. A function of the round alone, so a sample's
+/// failing rounds do not depend on the path the policy takes through it.
+fn tip_draw(seed: u64, permille: u64, round: Round) -> bool {
+    splitmix64((seed << 32) | u64::from(round)) % 1000 < permille
+}
+
+/// One round of [`exec_policy_model`].
+#[derive(Clone, Copy, Debug)]
+struct ModelRound {
+    /// The rule the header was built under.
+    rule: ExecPolicy,
+    /// Whether the header certified.
+    certified: bool,
+    /// The window the next counted cancel opens, after this round's reports.
+    next_window: Round,
+}
+
+/// The adaptive policy (configured window 4) driven by tip outcomes alone, in the proposer's
+/// order: the build of header `r` reports header `r - 1` certified (its certificate is a parent)
+/// before it picks the rule, and the certifier's cancel of header `r - 1` arrives once header `r`
+/// is proposed. A header under the quorum rule certifies (the e2e test: all of them did); a header
+/// naming the tip certifies when `tip_certifies(r)`, which is asked for tip headers only.
+fn exec_policy_model(
+    rounds: Round,
+    mut tip_certifies: impl FnMut(Round) -> bool,
+) -> Vec<ModelRound> {
+    let mut policy = ExecBlockPolicy::new(true, 4);
+    let mut out: Vec<ModelRound> = Vec::new();
+    for round in 1..=rounds {
+        let previous = out.last().map(|r| r.certified);
+        if previous == Some(true) {
+            policy.on_certified(round - 1);
+        }
+        let rule = policy.for_round(round);
+        if previous == Some(false) {
+            policy.on_cancelled(round - 1, round);
+        }
+        let certified = rule == ExecPolicy::Starved || tip_certifies(round);
+        out.push(ModelRound { rule, certified, next_window: policy.next_window });
+    }
+    out
+}
+
+/// The model the reset streak was chosen with (bench 6, #1804): with p the chance that a header
+/// naming the own tip certifies, the policy loses at most 2 % of its headers in every sample for
+/// every p up to 0.9, over 4000 rounds and eight samples per p. The numbers pinned, with their
+/// measured values: p = 0 1.75 %, 0.3 1.48 %, 0.5 alternating by round (the e2e regime) or by tip
+/// header 0.88 %, 0.6 1.27 %, 0.9 0.90 %, 0.97 1.11 %, 0.99 0.94 % with 87 % of rounds on the tip,
+/// 1 nothing lost and every round on the tip. The rule as built (one certified tip header reset K)
+/// lost 16.7 % at 0.5 alternating, 7.4 % at 0.9. A fresh policy loses five headers in the first
+/// 100 rounds of the alternation, one per doubling.
+///
+/// The model's headers under the quorum rule always certify (in the e2e test all of them did), so
+/// it loses only tip headers, never more than the switch off: that follows from the assumption and
+/// is not checked here. A voter that refuses an older block (`BelowRestoreFloor` after a restore)
+/// can fail a rule header the tip would have passed.
+///
+/// Catches: a reset rule that one success in two satisfies, a window that stops doubling while
+/// the tip keeps failing, and a rule that never resets (the share on the tip at p = 0.99).
+#[test]
+fn test_quorum_exec_block_policy_model_holds_the_target() {
+    const ROUNDS: Round = 4000;
+    const SEEDS: u64 = 8;
+    let total = usize::try_from(u64::from(ROUNDS) * SEEDS).expect("small model");
+    let lost = |rounds: &[ModelRound]| rounds.iter().filter(|r| !r.certified).count();
+    let on_tip =
+        |rounds: &[ModelRound]| rounds.iter().filter(|r| r.rule == ExecPolicy::Tip).count();
+
+    // (certify permille, most headers lost in basis points over all samples)
+    for (permille, max_lost_bp) in
+        [(0, 180), (300, 170), (600, 150), (900, 120), (970, 150), (990, 110), (1000, 0)]
+    {
+        let (mut all_lost, mut all_tip) = (0, 0);
+        for seed in 0..SEEDS {
+            let rounds = exec_policy_model(ROUNDS, |round| tip_draw(seed, permille, round));
+            let seed_lost = lost(&rounds);
+            if permille <= 900 {
+                assert!(
+                    seed_lost * 10_000 <= 200 * rounds.len(),
+                    "p {permille}/1000, seed {seed}: {seed_lost} of {ROUNDS} lost, over 2 %"
+                );
+            }
+            all_lost += seed_lost;
+            all_tip += on_tip(&rounds);
+        }
+        assert!(
+            all_lost * 10_000 <= max_lost_bp * total,
+            "p {permille}/1000: {all_lost} of {total} lost, over {max_lost_bp} bp"
+        );
+        if permille == 990 {
+            assert!(all_tip * 100 >= 85 * total, "p 0.99: {all_tip} of {total} rounds on the tip");
+        }
+        if permille == 1000 {
+            assert_eq!(all_tip, total, "every tip header certifies: no window, lag 0");
+        }
+    }
+
+    // p = 0.5 alternating, by round (the e2e regime: outputs commit every second round) and by
+    // tip header
+    let by_round = exec_policy_model(ROUNDS, |round| round % 2 == 0);
+    let mut nth = 0u32;
+    let by_tip = exec_policy_model(ROUNDS, |_| {
+        nth += 1;
+        nth % 2 == 1
+    });
+    for (name, rounds) in [("by round", &by_round), ("by tip header", &by_tip)] {
+        let (l, t) = (lost(rounds), on_tip(rounds));
+        assert!(
+            l * 10_000 <= 100 * rounds.len(),
+            "alternating {name}: {l} of {ROUNDS} lost, over 1 %"
+        );
+        assert!(
+            t * 10_000 <= 200 * rounds.len(),
+            "alternating {name}: {t} of {ROUNDS} rounds on the tip"
+        );
+    }
+    assert!(
+        lost(&by_round[..100]) <= 5,
+        "the climb from K = 4 to the bound costs one header a step"
+    );
+}
+
+/// The policy after a regime ends: the tip certifies every other round for 500 to 627 rounds (every
+/// phase of the 130-round cycle at the bound), then every tip header certifies but one isolated
+/// cancel. The policy is back on its tip within one maximum window plus the two headers of the
+/// failed probe, and stays there; K is back to 4 within [`QUORUM_EXEC_BLOCK_RESET_STREAK`] rounds
+/// of the return. An isolated cancel after that opens a window of 4 rounds; one soon after the
+/// return opens a window of the bound. Either costs only the cancelled header.
+///
+/// Catches: a policy that does not return to the tip after the regime ends, a streak that never
+/// completes, and a window opened by a cancel that is not counted.
+#[test]
+fn test_quorum_exec_block_policy_model_after_the_regime_ends() {
+    let max = QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS;
+    let idx = |round: Round| usize::try_from(round - 1).expect("small model");
+    for end in 500..500 + max {
+        let model = |at: Round| {
+            exec_policy_model(end + 600, |round| {
+                if round <= end {
+                    round % 2 == 0
+                } else {
+                    round != end + at
+                }
+            })
+        };
+        let rounds = model(300);
+        let back = (end + 1..end + 300)
+            .find(|&r| rounds[idx(r)..idx(end + 300)].iter().all(|x| x.rule == ExecPolicy::Tip))
+            .expect("back on the tip before the isolated cancel");
+        assert!(
+            back - end <= max + 2,
+            "regime of {end} rounds: back on the tip {} rounds after",
+            back - end
+        );
+        let reset = (end + 1..end + 300)
+            .find(|&r| rounds[idx(r)].next_window == 4)
+            .expect("K back to the configured value");
+        assert!(
+            reset <= back + QUORUM_EXEC_BLOCK_RESET_STREAK,
+            "regime of {end}: reset at {reset}, back at {back}"
+        );
+
+        // headers lost after the regime, and rounds under the rule after the isolated cancel
+        let cost = |rounds: &[ModelRound], cancel: Round| -> (usize, usize) {
+            (
+                rounds[idx(end + 1)..].iter().filter(|r| !r.certified).count(),
+                rounds[idx(cancel)..].iter().filter(|r| r.rule == ExecPolicy::Starved).count(),
+            )
+        };
+        assert_eq!(cost(&rounds, end + 300), (1, 4), "regime of {end}: a cancel after the reset");
+        let early = model(back - end + 10);
+        let bound = usize::try_from(max).expect("small model");
+        assert_eq!(
+            cost(&early, back + 10),
+            (1, bound),
+            "regime of {end}: a cancel before the reset"
+        );
+    }
 }
 
 // ---- bench6 parent-grace ----
