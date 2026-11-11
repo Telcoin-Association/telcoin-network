@@ -268,6 +268,10 @@ impl RethEnv {
         crate::metrics::init();
         let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
 
+        // read the e2e persist delay once at start (`None` without tn-types/test-utils): a node
+        // that has it logs so before its first persist, which a run killed early never
+        // reaches
+        let _ = tn_types::test_hooks::persist_delay();
         Ok(Self {
             inner: Arc::new(RethEnvInner {
                 node_config,
