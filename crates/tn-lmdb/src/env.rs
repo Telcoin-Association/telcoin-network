@@ -1067,18 +1067,6 @@ impl Writer {
         self.stats.pages_synced += pages.len() as u64;
         let sync_ns = lap(&mut clock);
         self.stats.data_sync_ns += sync_ns;
-        if let Some(choice) = choice {
-            let fill = fill.unwrap_or_default();
-            let outcome = Outcome {
-                runs: runs as u64 - fill.filled,
-                pages: pages.len() as u64 + fill.pages,
-                sync_ns,
-                fill_ns,
-                tried: fill.filled + fill.missed,
-                filled: fill.filled,
-            };
-            self.observe_auto(choice, outcome);
-        }
         #[cfg(test)]
         self.crash_point(CrashAt::AfterDataSync)?;
         self.file.sync_size_if_grown()?;
@@ -1100,6 +1088,19 @@ impl Writer {
         self.durable_at = clock;
         self.stats.commits += 1;
         self.stats.grown_commits += u64::from(grown);
+        if let Some(choice) = choice {
+            // After the meta's sync, so the fit's time never delays the state's durability.
+            let fill = fill.unwrap_or_default();
+            let outcome = Outcome {
+                runs: runs as u64 - fill.filled,
+                pages: pages.len() as u64 + fill.pages,
+                sync_ns,
+                fill_ns,
+                tried: fill.filled + fill.missed,
+                filled: fill.filled,
+            };
+            self.observe_auto(choice, outcome);
+        }
         #[cfg(test)]
         self.crash_point(CrashAt::AfterMetaMsync)?;
         Ok(())
