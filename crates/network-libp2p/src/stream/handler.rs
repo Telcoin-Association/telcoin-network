@@ -125,8 +125,10 @@ fn classify_outbound(error: StreamUpgradeError<io::Error>) -> (StreamFailure, St
         StreamUpgradeError::NegotiationFailed => {
             (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
         }
-        // under the swarm's lazy negotiation a peer rejecting the sync protocol surfaces
-        // here, from `TNStreamProtocol::upgrade_outbound` completing the negotiation
+        // `TNStreamProtocol::upgrade_outbound` does not read, so under the swarm's lazy
+        // negotiation a rejection of the sync protocol fails the caller's first read
+        // (`is_unsupported_protocol`) and does not reach this arm. the arm keeps an
+        // upgrade-time rejection classified as unsupported should an upgrade read again
         StreamUpgradeError::Apply(e) if is_negotiation_failure(&e) => {
             (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
         }
@@ -256,7 +258,7 @@ mod tests {
         assert!(matches!(failure, StreamFailure::Io(_)));
         assert!(matches!(error, StreamError::UpgradeIo));
 
-        // a lazily negotiated rejection is reported by the upgrade itself
+        // an upgrade-time lazy rejection, should an upgrade read again, stays unsupported
         let rejection = io::Error::from(NegotiationError::Failed);
         let (failure, error) = classify_outbound(StreamUpgradeError::Apply(rejection));
         assert!(matches!(failure, StreamFailure::UnsupportedProtocol));

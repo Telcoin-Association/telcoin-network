@@ -48,7 +48,7 @@ pub use peers::{
 };
 pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
-pub use stream::StreamError;
+pub use stream::{is_unsupported_protocol, StreamError};
 pub use sync::{
     read_frame, write_frame, DenyReason, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,
     PrimarySyncRequest, ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
