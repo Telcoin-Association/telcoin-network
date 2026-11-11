@@ -74,7 +74,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     ops::Range,
-    os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _},
+    os::{
+        fd::BorrowedFd,
+        unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _},
+    },
     path::{Path, PathBuf},
     sync::{
         atomic::{fence, AtomicU64, Ordering},
@@ -88,6 +91,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use self::gap_auto::{AutoGap, Choice, Gaps, Outcome};
 use crate::{
     alloc::{Allocator, PrivatePages, RUN_LOAD_RECORDS},
+    boot_record::{self, BootFile, BootRecord, Found, State},
     check::{self, CheckReport},
     crc::CrcState,
     error::{Error, Result},
@@ -626,7 +630,10 @@ impl EnvInner {
 /// one, which has no writer, nor a copy in a process the opener forked, whose file it is not (its
 /// state is the parent's as of the fork: its sync could write a stale meta, its trim cut the
 /// parent's slack under the parent's next writes). A failed sync skips the trim; a failed trim is
-/// logged and changes nothing that matters: the file keeps its tail, which is slack.
+/// logged and changes nothing that matters: the file keeps its tail, which is slack. Last, once
+/// both succeeded, the writer's state drops (the mappings go) and the boot record says "clean"
+/// ([`mark_clean`]); any close that stops earlier leaves "open", so the next writer open in this
+/// boot drops the file's cached pages.
 impl Drop for EnvInner {
     fn drop(&mut self) {
         if std::process::id() != self.pid {
@@ -653,7 +660,35 @@ impl Drop for EnvInner {
                 target: "tn_lmdb",
                 "the close did not trim the file's preallocated tail: {e}; the file keeps it"
             );
+            return;
         }
+        // The boot record's "clean" is written once the mappings are gone, since an unmap can
+        // move the file's times (macOS's file systems update them for pages written through a
+        // mapping), and while the lock still holds: a second descriptor of the file keeps it.
+        let Some(boot_file) = writer.boot_file.take() else { return };
+        let boot_id = writer.boot_id;
+        let held = writer.file.try_clone_file();
+        drop(self.writer.get_mut().take());
+        mark_clean(&boot_file, boot_id, held);
+    }
+}
+
+/// Write the boot record's "clean" at the end of a clean close ([`EnvInner::drop`], after its
+/// final sync and its trim, with the mappings gone), over `file`, a descriptor of the database
+/// file that still holds its lock: the file's ctime as the close left it, and no sync. A power
+/// loss before its writeback leaves "open" of a boot that is over, and the next boot's open keeps
+/// its cache for that anyway (`boot_record`). A failure is logged and leaves the record as it
+/// was, "open", which the next open in this boot drops the file's cached pages for.
+fn mark_clean(boot_file: &BootFile, boot_id: BootId, file: io::Result<File>) {
+    let written = file.and_then(|file| file.metadata()).and_then(|meta| {
+        boot_file.write(&BootRecord::new(State::Clean, boot_id, &meta), false, false)
+    });
+    if let Err(e) = written {
+        tracing::warn!(
+            target: "tn_lmdb",
+            "the close did not mark the boot record clean: {e}; the next open in this boot drops \
+             the file's cached pages"
+        );
     }
 }
 
@@ -703,8 +738,11 @@ pub(crate) struct Writer {
     /// which a weak record has not left.
     slots: [Option<Slot>; 2],
     /// The boot this writer runs in (`sys::boot_id`, zero when unknown), the tag of every record
-    /// it writes.
+    /// it writes, and the boot its boot record names.
     boot_id: BootId,
+    /// The boot record beside the file (`None` on a platform that keeps none): "open" from the
+    /// open on, "clean" after a clean close ([`mark_clean`]; `boot_record`).
+    boot_file: Option<BootFile>,
     /// [`SyncMode::NoSync`]: the pages commits stamped since the last sync.
     unsynced: PageSet,
     /// The pages [`Self::unsynced`] holds: each commit's stamped pages counted as it defers them,
@@ -1359,6 +1397,18 @@ impl Writer {
         Ok(())
     }
 
+    /// Write the boot record's "open" for this writer (open step 10), synced, and the directory
+    /// too when `created` (the record was missing), before the writer can commit: a crash from
+    /// here on leaves "open" of this boot, and the next writer open drops the file's cached pages
+    /// (`boot_record`). A failure fails the open. Nothing on a platform that keeps no record.
+    fn mark_open(&self, created: bool) -> Result<()> {
+        let Some(boot_file) = &self.boot_file else {
+            return Ok(());
+        };
+        let record = BootRecord::new(State::Open, self.boot_id, &self.file.metadata()?);
+        Ok(boot_file.write(&record, created, true)?)
+    }
+
     /// Give back the file's preallocated tail at a clean close ([`EnvInner::drop`], after the
     /// final sync): truncate the file to [`Self::trim_len`] when that is shorter
     /// ([`PageFile::trim_to`]). An error leaves the file as it was, or longer than its pages: never
@@ -1770,15 +1820,23 @@ impl Env {
         // what this open reads, and the name it found it by, durable before anything is read or
         // built on it (a directory that cannot be synced is skipped, with a warning:
         // `sys::fsync_directory`). A weak head stays weak on disk: the next sync writes its
-        // steady meta. Then drop the file's cached pages (Linux), so every read of this open, the
-        // metas' and step 9's check, is the device's: a page a failed writeback left clean in the
-        // cache, its bytes never on the device and its error reported to the writer that is
-        // gone, would otherwise pass from the cache, and the next sync would write a steady meta
-        // naming pages the device lacks (README, "Open and recovery", step 4).
+        // steady meta. Then, unless the boot record shows the cache equals the device (a clean
+        // close in this boot, or another boot's record: `boot_record`), drop the file's cached
+        // pages (Linux), so every read of this open, the metas' and step 9's check, is the
+        // device's: a page a failed writeback left clean in the cache, its bytes never on the
+        // device and its error reported to the writer that is gone, would otherwise pass from the
+        // cache, and the next sync would write a steady meta naming pages the device lacks
+        // (README, "Open and recovery", step 4).
         sys::fsync_file(&file)?;
         sys::fsync_directory(parent_dir(path))?;
-        sys::drop_cached_pages(&file)?;
         let boot_id = sys::boot_id();
+        let boot_file = BootFile::beside(path);
+        let (cache, found) = boot_record::read_and_decide(boot_file.as_ref(), &file, boot_id)?;
+        if cache.drops() {
+            sys::drop_cached_pages(&file)?;
+        }
+        #[cfg(test)]
+        CACHE_DECISION.with(|last| last.set(Some(cache)));
         let trusted = options.trust_unsynced.then_some(boot_id).flatten();
         let (chosen, geometry) = choose_state(&file, trusted)?;
         let file =
@@ -1789,7 +1847,7 @@ impl Env {
         // before anything is built on them.
         #[cfg(target_os = "macos")]
         file.msync_range(0..file.file_len())?;
-        let snapshot = opened_snapshot(&chosen, geometry, file.view())?;
+        let snapshot = opened_snapshot(&chosen, geometry, file.view(), file.fd())?;
         let meta = snapshot.meta;
         let skipped = chosen.skipped_txns().expect("choose_state refuses a slot with no next txn");
         let mut writer = Writer {
@@ -1800,6 +1858,7 @@ impl Env {
             last: meta,
             slots: chosen.slots,
             boot_id: boot_id.unwrap_or_default(),
+            boot_file,
             unsynced: PageSet::default(),
             unsynced_pages: 0,
             weak_limit: meta::weak_limit(&chosen.slots),
@@ -1858,6 +1917,8 @@ impl Env {
             // mapping otherwise, which the advice does not touch.
             writer.file.advise_random_reads();
         }
+        // Step 10: the boot record says "open", durably, before the writer can commit.
+        writer.mark_open(matches!(found, Found::Missing))?;
         let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
         Ok(Env { inner: Arc::new(inner) })
     }
@@ -1883,7 +1944,7 @@ impl Env {
         let (chosen, geometry) = choose_state(&file, trusted)?;
         // No sync, unlike `open`: nothing is built on what this open reads.
         let file = ReadOnlyFile::from_file(file, options.readahead)?;
-        let snapshot = opened_snapshot(&chosen, geometry, file.view())?;
+        let snapshot = opened_snapshot(&chosen, geometry, file.view(), file.fd())?;
         let inner = EnvInner::new(geometry, SyncMode::Durable, snapshot, None, Some(file));
         Ok(Env { inner: Arc::new(inner) })
     }
@@ -2281,13 +2342,15 @@ fn opened_snapshot(
     chosen: &Chosen,
     geometry: Geometry,
     view: Arc<MapView>,
+    fd: BorrowedFd<'_>,
 ) -> Result<Arc<Snapshot>> {
     let Some(last_sync) = chosen.last_sync else {
         return checked_snapshot(chosen.meta, geometry, view);
     };
     let head = chosen.meta;
-    let checked = checked_snapshot(head, geometry, Arc::clone(&view))
-        .and_then(|snapshot| Ok((check::check_since(&snapshot, last_sync.txn)?, snapshot)));
+    let checked = checked_snapshot(head, geometry, Arc::clone(&view)).and_then(|snapshot| {
+        Ok((check::check_since(&snapshot, last_sync.txn, Some(fd))?, snapshot))
+    });
     match checked {
         Ok((_pages, snapshot)) => {
             #[cfg(test)]
@@ -2311,6 +2374,20 @@ fn fall_back(head: Meta, last_sync: Meta, why: &dyn std::fmt::Display) -> Meta {
     #[cfg(test)]
     WEAK_HEAD_CHECK.with(|last| last.set(Some(Err(()))));
     last_sync
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: what this thread's last writer open did with the file's cached pages
+    /// ([`Env::open`], step 4). Read and cleared by [`take_cache_decision`].
+    static CACHE_DECISION: std::cell::Cell<Option<boot_record::Cache>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: what this thread's last writer open did with the file's cached pages, and why
+/// (`boot_record::decide`), or `None` if no writer open ran since the last call.
+#[cfg(test)]
+pub(crate) fn take_cache_decision() -> Option<boot_record::Cache> {
+    CACHE_DECISION.with(std::cell::Cell::take)
 }
 
 #[cfg(test)]

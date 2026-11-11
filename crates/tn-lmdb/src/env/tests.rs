@@ -952,7 +952,8 @@ fn nosync_commits_survive_a_process_crash_and_roll_back_at_a_reboot() {
 /// (`record_on_device`: its meta page msynced first), the head is trusted, step 9's check finds
 /// its pages old and falls back to the last sync. Either way the state is the last sync's, whose
 /// pages the device holds; without the drop the cache would pass the check, and the next sync
-/// would write a steady meta naming pages the device lacks.
+/// would write a steady meta naming pages the device lacks. The drop is the boot record's
+/// decision (`boot_record`): the crash left "open" of this boot, an unclean end.
 #[test]
 fn a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync() {
     for record_on_device in [false, true] {
@@ -980,6 +981,7 @@ fn a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync() {
 
         let env = Env::open(&path, nosync).expect("reopen");
         disk_model::set_flushes_lost(false);
+        assert_eq!(take_cache_decision(), Some(boot_record::Cache::Unclean), "{case}");
         let checked = take_weak_head_check();
         if record_on_device {
             assert_eq!(checked, Some(Err(())), "{case}: the head's pages are not the device's");
@@ -1004,6 +1006,236 @@ fn a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync() {
         drop(env);
         disk_model::untrack(&path);
     }
+}
+
+/// Open's check of a weak head starts the reads of what it descends into ahead of itself
+/// (`check::Ahead`, `sys::will_need`): every page it checks but the trees' roots (the catalog's,
+/// the free tree's and each table's, which the walk starts from) lies in a range it advised
+/// first, nested roots and overflow runs included, each batch's adjacent pages merged into one
+/// range (a bulk load's leaves are adjacent). A writer open with no weak head to check, and
+/// `Env::check`, advise nothing.
+#[test]
+fn a_weak_head_check_reads_ahead_what_it_descends_into() {
+    let (_dir, path) = temp();
+    let nosync = options(4096, SyncMode::NoSync);
+    let env = Env::open(&path, nosync).expect("open");
+    durable_first_commit(&env);
+    env.sync().expect("sync");
+    let mut txn = env.begin_rw().expect("begin");
+    let plain = txn.create_table("a").expect("table");
+    for i in 0..3000_u32 {
+        txn.put(&plain, &i.to_be_bytes(), &[0x5A; 200]).expect("put");
+    }
+    txn.put(&plain, b"large", &vec![0xC3; 20_000]).expect("an overflow run");
+    let dup = crate::DupOptions { key_len: 4, packed_max: 0 };
+    let dup = txn.create_dup_table("d", dup).expect("dup table");
+    for k in 0..40_u32 {
+        for s in 0..60_u32 {
+            let mut key = k.to_be_bytes().to_vec();
+            key.extend_from_slice(&s.to_be_bytes());
+            txn.put(&dup, &key, &[0x11; 40]).expect("dup put");
+        }
+    }
+    txn.commit().expect("a NoSync commit");
+    env.crash();
+
+    sys::take_will_need_log();
+    let env = Env::open(&path, nosync).expect("reopen");
+    let checked = take_weak_head_check().expect("checked").expect("the check passes");
+    let advised = sys::take_will_need_log();
+    let page_count = env.stat().page_count;
+    let mut pages = std::collections::BTreeSet::new();
+    for &(offset, len) in &advised {
+        assert!(offset % 4096 == 0 && len % 4096 == 0 && len > 0, "{offset}, {len}");
+        let (from, to) = (offset / 4096, (offset + len) / 4096);
+        assert!(to <= u64::from(page_count), "{from}..{to} past {page_count} pages");
+        pages.extend(from..to);
+    }
+    // The roots: the catalog's, the free tree's, and the three tables' ("opened", "a", "d").
+    let roots = 5;
+    assert!(
+        pages.len() as u64 + roots >= checked,
+        "{} pages advised of the {checked} checked",
+        pages.len()
+    );
+    assert!(advised.len() < pages.len(), "adjacent pages merged: {} ranges", advised.len());
+    let report = env.check().expect("check");
+    assert_eq!(sys::take_will_need_log(), [], "Env::check advises nothing");
+    assert!(report.table_pages > 0);
+    drop(env);
+    drop(Env::open(&path, nosync).expect("a steady reopen"));
+    assert_eq!(take_weak_head_check(), None);
+    assert_eq!(sys::take_will_need_log(), [], "no check, no advice");
+}
+
+/// The record of a clean close of this boot, over the file at `path` as it is now: what a clean
+/// close would have written, planted where it was not.
+fn plant_clean(path: &Path) {
+    let boot_file = BootFile::beside(path).expect("kept in tests");
+    let meta = fs::metadata(path).expect("metadata");
+    let record = BootRecord::new(State::Clean, sys::boot_id().unwrap_or_default(), &meta);
+    boot_file.plant(&record.encode());
+}
+
+/// The drop is what finds a lost writeback: the same crash as in
+/// `a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync`, its record on the device, but
+/// with a record that says "clean" planted over the crash's "open", so the open keeps the cache:
+/// it trusts the cached head and opens at the commit the device lacks. No close writes such a
+/// record: a close whose sync failed stops before "clean"
+/// (`a_failed_close_leaves_the_record_open`).
+#[test]
+fn a_reopen_that_keeps_the_cache_does_not_see_a_lost_writeback() {
+    let (_dir, path) = temp();
+    let nosync = options(4096, SyncMode::NoSync);
+    let env = Env::open(&path, nosync).expect("open");
+    disk_model::track(&path);
+    durable_first_commit(&env);
+    put_all(&env, "a", &[(b"k", b"synced")]);
+    env.sync().expect("sync");
+    let head = put_all(&env, "a", &[(b"k", b"lost")]);
+    env.with_writer(|w| {
+        let slot = w.slots.iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
+        w.file.msync_page(slot as u32, 4096).expect("the meta page's writeback");
+    });
+    disk_model::set_flushes_lost(true);
+    env.crash();
+    plant_clean(&path);
+    let env = Env::open(&path, nosync).expect("reopen");
+    disk_model::set_flushes_lost(false);
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::Clean));
+    let pages = take_weak_head_check().expect("checked").expect("the cached pages pass");
+    assert!(pages > 0);
+    let ro = env.begin_ro().expect("ro");
+    let read = (ro.txn_id(), val(&ro, &table(&ro, "a"), b"k"));
+    assert_eq!(read, (head, Some(b"lost".to_vec())), "the cached head");
+    drop(ro);
+    env.crash();
+    disk_model::untrack(&path);
+}
+
+/// Each row of the boot record's decision at a writer open (`boot_record::decide`), through
+/// `Env::open`: a new file has no record (drop), and its open writes "open" of this boot naming
+/// the file; a clean close writes "clean" with the file's ctime, and a reopen keeps the cache; a
+/// crash leaves "open", and a reopen drops it; a reboot keeps it, after a crash or a clean close;
+/// an unknown boot id drops it and records zeros, which drop it again; a record torn, missing or
+/// written over by another process drops it (a missing one's create syncs the directory again);
+/// a file changed since its clean close drops it; and a read-only open neither decides nor
+/// changes the record.
+#[test]
+fn a_writer_open_drops_the_cache_as_the_boot_record_says() {
+    use boot_record::Cache;
+    let host = sys::boot_id();
+    let (dir, path) = temp();
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    let reopen = |what: &str, want: Cache| {
+        let env = Env::open(&path, EnvOptions::default()).expect("open");
+        assert_eq!(take_cache_decision(), Some(want), "{what}");
+        let record = boot_file.record().expect("a record");
+        let meta = fs::metadata(&path).expect("metadata");
+        let open = BootRecord::new(State::Open, sys::boot_id().unwrap_or_default(), &meta);
+        assert_eq!(record, open, "{what}: the open's record");
+        env
+    };
+    let env = reopen("a new file", Cache::NoRecord);
+    put_all(&env, "a", &[(b"k", b"v")]);
+    drop(env);
+    let meta = fs::metadata(&path).expect("metadata");
+    let clean = BootRecord::new(State::Clean, host.expect("a host boot id"), &meta);
+    assert_eq!(boot_file.record(), Some(clean), "a clean close");
+    assert_ne!(clean.ctime, (0, 0));
+
+    drop(reopen("a clean close", Cache::Clean));
+    reopen("a clean close again", Cache::Clean).crash();
+    reopen("a crash", Cache::Unclean).crash();
+    disk_model::reboot();
+    drop(reopen("a crash, then a reboot", Cache::OtherBoot));
+    disk_model::reboot();
+    drop(reopen("a clean close, then a reboot", Cache::OtherBoot));
+
+    disk_model::set_boot_id(None);
+    drop(reopen("an unknown boot id", Cache::UnknownBoot));
+    disk_model::set_boot_id(host);
+    drop(reopen("a record of an unknown boot", Cache::UnknownBoot));
+
+    let mut torn = fs::read(boot_file.path()).expect("read");
+    torn[20] ^= 1;
+    boot_file.plant(&torn);
+    drop(reopen("a torn record", Cache::NoRecord));
+    fs::remove_file(boot_file.path()).expect("remove");
+    sys::take_dir_sync_log();
+    drop(reopen("a missing record", Cache::NoRecord));
+    let dir = dir.path().to_path_buf();
+    assert_eq!(sys::take_dir_sync_log(), [dir.clone(), dir], "the open, then the record's create");
+    drop(reopen("recreated", Cache::Clean));
+
+    // A change to the file since the clean close moves its ctime.
+    std::thread::sleep(Duration::from_millis(20));
+    let mode = fs::metadata(&path).expect("metadata").permissions();
+    fs::set_permissions(&path, mode).expect("chmod");
+    drop(reopen("the file changed since its clean close", Cache::Changed));
+
+    // A read-only open neither reads nor writes the record.
+    let before = fs::read(boot_file.path()).expect("read");
+    let ro = Env::open_read_only(&path, EnvOptions::default()).expect("read-only");
+    assert_eq!(take_cache_decision(), None, "a read-only open decides nothing");
+    drop(ro);
+    assert!(fs::read(boot_file.path()).expect("read") == before, "a read-only open");
+    drop(reopen("after a read-only open", Cache::Clean));
+}
+
+/// A datadir copied with its boot record (to another host, or beside itself) is another file:
+/// the record names the original's device and inode, so the copy's first open drops the cache
+/// the copy filled, whatever the record says, and writes its own record; the original keeps its
+/// own.
+#[test]
+fn a_copied_datadir_drops_the_cache_its_copy_filled() {
+    let (dir, path) = temp();
+    put_all(&open(&path), "a", &[(b"k", b"v")]);
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    let copy_dir = dir.path().join("copy");
+    fs::create_dir(&copy_dir).expect("dir");
+    let copy = copy_dir.join("db");
+    let copy_boot = BootFile::beside(&copy).expect("kept in tests");
+    fs::copy(&path, &copy).expect("copy the file");
+    fs::copy(boot_file.path(), copy_boot.path()).expect("copy the record");
+    let env = open(&copy);
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::NoRecord), "another file's record");
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"v"[..]));
+    drop(ro);
+    drop(env);
+    let ino = fs::metadata(&copy).expect("metadata").ino();
+    let record = copy_boot.record().expect("the copy's record");
+    assert_eq!((record.state, record.ino), (State::Clean, ino), "the copy's own record");
+    drop(open(&copy));
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::Clean));
+    drop(open(&path));
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::Clean), "the original's");
+}
+
+/// A close that stops before its end leaves the record "open", so the next open in this boot
+/// drops the cache: a failed final sync (the close stops, latched), and a latched environment.
+#[test]
+fn a_failed_close_leaves_the_record_open() {
+    let (_dir, path) = temp();
+    let nosync = options(4096, SyncMode::NoSync);
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    let env = Env::open(&path, nosync).expect("open");
+    durable_first_commit(&env);
+    put_all(&env, "a", &[(b"k", b"v")]);
+    env.with_writer(|w| {
+        w.file.fail_next_msync();
+        w.file.fail_next_fsync();
+    });
+    drop(env);
+    assert_eq!(boot_file.record().expect("a record").state, State::Open, "a failed final sync");
+    let env = Env::open(&path, nosync).expect("reopen");
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::Unclean));
+    env.inner.latch.fail("a test's latch".to_string());
+    drop(env);
+    assert_eq!(boot_file.record().expect("a record").state, State::Open, "a latched environment");
+    drop(open(&path));
+    assert_eq!(take_cache_decision(), Some(boot_record::Cache::Unclean));
 }
 
 /// `Env::sync` after a `NoSync` commit runs the durable steps although a slot already holds the
@@ -1569,15 +1801,20 @@ fn open_makes_the_meta_it_reads_durable() {
 }
 
 /// Every writer open syncs the directory naming the file, so a file whose creator died (or
-/// failed) before its directory sync gets its name made durable by the next open; a read-only
-/// open syncs nothing.
+/// failed) before its directory sync gets its name made durable by the next open; the open that
+/// creates the boot record syncs it once more, for the record's name; a read-only open syncs
+/// nothing.
 #[test]
 fn a_writer_open_syncs_the_directory_naming_the_file() {
     let (dir, path) = temp();
     crate::sys::take_dir_sync_log();
     drop(open(&path));
     let dir = dir.path().to_path_buf();
-    assert_eq!(crate::sys::take_dir_sync_log(), [dir.clone(), dir.clone()], "create, then open");
+    assert_eq!(
+        crate::sys::take_dir_sync_log(),
+        [dir.clone(), dir.clone(), dir.clone()],
+        "create, then open, then the boot record's create"
+    );
     drop(open(&path));
     assert_eq!(crate::sys::take_dir_sync_log(), [dir], "an open of an existing file");
     drop(Env::open_read_only(&path, EnvOptions::default()).expect("read-only"));
