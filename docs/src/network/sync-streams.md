@@ -46,6 +46,8 @@ The chain id in the protocol name means a node on one chain fails negotiation ag
 6. both sides close the stream
 ```
 
+The outbound open is lazy.
+The requester writes `Req` without waiting for the responder to accept the protocol, so the request frame travels in the same flight as the protocol proposal and is already buffered when the responder starts its opening read.
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
 On the worker, the whole batch stream is also bounded (95 seconds), so one peer can use at most 120 seconds of a 480-second `request_batches` call: the batches validated before the bound are kept, and the peer is recorded as stalled for the epoch and asked after the unmarked peers of its tier on later calls; a complete exchange slower than its allowance (15 seconds plus 1 second per batch) is marked too, and an empty answer is marked only when it took 5 seconds or more.
@@ -53,7 +55,9 @@ Each tier of the connected-peer list is shuffled per request so no peer keeps a 
 On the responding side, a peer that opens a stream and never sends its request frame is dropped after 1 second if it is a public-tier peer and after 5 seconds if it is a committee peer.
 While it waits it holds only an opening-read slot, never a serve slot.
 A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit, and, for a missing-certificates or consensus-output serve, for a serve cut at the 60-second hold limit, and, for a worker batch serve, for a serve cut at the 60-second hold limit and for a request above the 500-digest cap.
-A late request is charged whether it is then admitted or refused; a prompt `AtCapacity` refusal is not charged (see [Admission](#admission)).
+A late request is charged whether it is then admitted or refused; a prompt `AtCapacity` or `Busy` refusal is not charged (see [Admission](#admission)).
+A full pool answers `Deny(AtCapacity)`; on a primary, the per-peer cap and a per-key hold budget answer `Deny(Busy)`.
+A requester that receives `Busy` skips that responder for the rest of the walk and does not mark it failed.
 
 ## Frame tags
 
@@ -64,12 +68,13 @@ tag   frame           payload
 ----  --------------  -------------------------------------------
  0    Req(request)    the typed request for this role
  1    Ack             none
- 2    Deny(reason)    0 = AtCapacity, 1 = Unavailable
+ 2    Deny(reason)    0 = AtCapacity, 1 = Unavailable, 2 = Busy
  3    Data(bytes)     an opaque chunk of response payload
  4    End             none
  5    Err(reason)     0 = Internal, 1 = Malformed
 ```
 
+`Deny(Busy)` means the per-peer serve cap or a per-key hold budget refused the request; retry later.
 `Data` payload encoding is defined by each exchange, not by the frame layer.
 The frame layer only guarantees that a `Data` frame arrives whole or not at all.
 
@@ -121,7 +126,10 @@ It reports that the responder gave up, which is different from the transport fai
 
 A responder admits a bounded number of concurrent sync streams: each serve class has its own slot pool with a separate reserve for each committee key, and one peer can hold at most two in-flight sync streams (see [Admission](#admission)).
 Past that it does not drop the stream.
-It writes `Deny(AtCapacity)` and closes.
+It writes a `Deny` and closes.
+A full pool answers `Deny(AtCapacity)`.
+On a primary, a refusal by the per-peer cap or by a per-key hold budget answers `Deny(Busy)`: the responder has room, but not for this key now.
+A requester that receives `Busy` skips that responder for the rest of the walk at debug level, and does not mark the responder failed or forget it as a sync server.
 
 That distinction matters to a requester's wall-clock cost.
 A dropped stream costs the requester its full 5-second ack timeout before it can try elsewhere; an explicit `Deny` costs it one round trip.
@@ -139,10 +147,11 @@ A responder admits an inbound sync stream in stages, so a peer that opens stream
 Each peer is in one of two tiers.
 A peer whose BLS key is in the current committee or the next committee is in the committee tier; every other peer is in the public tier.
 The committee keys are captured when the network is built for an epoch.
+The hold books are not: the opening and serve hold books are built once per node process and shared by every epoch's network, so an epoch boundary or an epoch re-run does not refill a key's budget; a restart does.
 
-1. **Per-peer cap.** One peer can hold at most two in-flight sync streams. A third stream is shed.
-2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 1 second for a public peer and 5 seconds for a committee peer. A public peer whose valid request arrives in the second half of its 1-second window is charged a mild penalty, whether the request is then admitted or refused. There are 8 slots for any peer and 1 more for each committee key, which only that key can take. The opening-read slot is released as soon as the read ends, before any control write or close; the per-peer slot lasts for the whole task. A stream that never sends a valid request never takes a serve slot. A public key may hold opening-read slots for 10 seconds per 300-second window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`); a key with less than one 1-second read bound of that budget left is shed `AtCapacity` without a charge.
-3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 1 more for each committee key, which only that key can take. So public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`. A public key holds at most one serve slot at a time across all three classes (`PUBLIC_SYNC_SERVES_PER_PEER`). In each class a public key may hold serve slots for one public hold limit per window: 200 seconds per 1000-second window for an epoch pack (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`, `PUBLIC_EPOCH_PACK_SERVE_HOLD_WINDOW`), and 60 seconds per 300-second window for missing certificates and for consensus output (`PUBLIC_SYNC_SERVE_TIMEOUT`, `PUBLIC_SYNC_SERVE_HOLD_WINDOW`). A key is leased only with a full hold limit of budget left. A second serve, or a serve outside the budget, is refused `Deny(AtCapacity)` without a charge. A committee key takes no serve cap and no hold budget.
+1. **Per-peer cap.** One peer can hold at most two in-flight sync streams. A third stream is shed; on a primary it is answered `Deny(Busy)` where the shed path writes a frame.
+2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 1 second for a public peer and 5 seconds for a committee peer. A public peer whose valid request arrives in the second half of its 1-second window is charged a mild penalty, whether the request is then admitted or refused. There are 8 slots for any peer and 1 more for each committee key, which only that key can take. The opening-read slot is released as soon as the read ends, before any control write or close; the per-peer slot lasts for the whole task. A stream that never sends a valid request never takes a serve slot. The request frame travels with the protocol proposal, so an honest opening holds its opening-read slot for about the responder's read time, not a round trip. A public key may hold opening-read slots for 10 seconds per 300-second window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`), so the budget meters slow openers only. A key with less than one 1-second read bound of that budget left is shed without a charge and answered `Deny(Busy)`. A full opening pool answers `Deny(AtCapacity)`.
+3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 1 more for each committee key, which only that key can take. So public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`. A public key holds at most one serve slot at a time across all three classes (`PUBLIC_SYNC_SERVES_PER_PEER`). In each class a public key may hold serve slots for one public hold limit per window: 200 seconds per 1000-second window for an epoch pack (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`, `PUBLIC_EPOCH_PACK_SERVE_HOLD_WINDOW`), and 60 seconds per 300-second window for missing certificates and for consensus output (`PUBLIC_SYNC_SERVE_TIMEOUT`, `PUBLIC_SYNC_SERVE_HOLD_WINDOW`). A key is leased only with a full hold limit of budget left. A second serve, or a serve outside the budget, is refused `Deny(Busy)` without a charge. A committee key takes no serve cap and no hold budget.
 
 The worker batch sync stream uses the same tiers, with one pool of 5 slots for any peer and 1 more for each committee key.
 
@@ -150,10 +159,17 @@ Each committee key has its own reserve in each pool, and no committee key can ta
 So committee keys that hold streams without progress cannot stop a different committee key from catching up.
 The per-peer cap of two lets a committee key open its second stream from the slots for any peer.
 
+These budgets raise the cost of filling the public share; they do not close it while keys cost nothing.
+In each serve class the hold equals the budget, so a hold of H is followed by 5H of refusal, and a public key holds the class at most 1/6 of the time.
+So about 30 public keys per class keep the 5 public serve slots of that class busy on one primary.
+The same 30 keys cover all three classes, because each key is then busy 1/6 of the time in each class and 1/2 in total.
+The opening pool takes about 240 keys in steady state and about 120 in a book's first 300-second window.
+The books belong to each responder, so the same keys do this on every primary.
+
 Each serve is also bounded in time:
 
-- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes. That floor-derived deadline is the only time bound for a committee-tier serve. A public-tier epoch-pack serve is also cut by its own fixed, size-independent bound, `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` (200 seconds), and a serve that outlives it is charged as a stall. That bound is not scaled by pack length: it is the unit the per-key hold budget leases against, and the deadline above already scales with the pack. A public requester whose pack cannot finish inside 200 seconds at its read rate is cut and charged, and must read faster or sync the pack from another responder. The requester reads a fresh peer at a target of 8 MiB per 30-second window (`SYNC_TARGET_MIN_BYTES`) and a peer already de-prioritised this epoch at the 1 MiB floor, both prorated over the real window length and checked on the `End` frame too. Only a serve that completes at the target rate (plus a 1-second latency allowance) makes a peer the preferred sync server; a slower completed serve de-prioritises the peer for the epoch instead. The target is about 2.24 Mbit/s for each stream, so the three epoch fetchers together need about 6.7 Mbit/s. When the requester cuts a fresh peer at the target rate, it probes that peer again at the floor in the same walk, with no sleep; a timeout or any other failure does not cause this second probe. The slow marks are keyed by peer and epoch, so a walk on another epoch never clears them. The preference is dropped at epoch rotation, and every 16th walk on one handle (`SYNC_PREFERENCE_EXPLORE_EVERY`) ignores it, so another peer that serves at the target rate can take the slot. A peer-supplied record whose stored length is more than the zstd worst-case compressed size for its decompressed content is refused as undecodable, so a record of decompressed size n is credited to the rate meter at most about n + n/256 + 127 bytes; the bound does not refuse padding that fits under it, and bytes after the last decoded record are still credited.
-- A missing-certificates or consensus-output serve is bounded at 200 seconds in total. A public-tier serve of either class is also cut at a fixed 60-second hold limit (`PUBLIC_SYNC_SERVE_TIMEOUT`) and charged as a stall.
+- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes. That floor-derived deadline is the only time bound for a committee-tier serve. A public-tier epoch-pack serve is also cut by its own fixed, size-independent bound, `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` (200 seconds), and a serve that outlives it is charged as a stall. That bound is not scaled by pack length: it is the unit the per-key hold budget leases against, and the deadline above already scales with the pack. A public requester whose pack cannot finish inside 200 seconds at its read rate is cut and charged by every responder. So a public requester must read a pack of L bytes at no less than L/200 seconds on each stream. The requester reads a fresh peer at a target of 8 MiB per 30-second window (`SYNC_TARGET_MIN_BYTES`) and a peer already de-prioritised this epoch at the 1 MiB floor, both prorated over the real window length and checked on the `End` frame too. Only a serve that completes at the target rate (plus a 1-second latency allowance) makes a peer the preferred sync server; a slower completed serve de-prioritises the peer for the epoch instead. The target is about 2.24 Mbit/s for each stream, so the three epoch fetchers together need about 6.7 Mbit/s. A public key holds at most one serve per responder, and each class at most 1/6 of the time, so across N responders it gets about N/6 concurrent epoch-pack serves and needs about 18 responders to fetch three packs in parallel. When a committee-tier requester (its own key in the current or next committee) cuts a fresh peer at the target rate, it probes that peer again at the floor in the same walk, with no sleep; a timeout or any other failure does not cause this second probe. A public-tier requester skips that same-walk re-probe, because the cut peer refuses it `Busy` for about five times its hold. It keeps the (peer, epoch) slow mark and reads that peer at the floor in a later walk. The slow marks are keyed by peer and epoch, so a walk on another epoch never clears them. The preference is dropped at epoch rotation, and every 16th walk on one handle (`SYNC_PREFERENCE_EXPLORE_EVERY`) ignores it, so another peer that serves at the target rate can take the slot. A peer-supplied record whose stored length is more than the zstd worst-case compressed size for its decompressed content is refused as undecodable, so a record of decompressed size n is credited to the rate meter at most about n + n/256 + 127 bytes; the bound does not refuse padding that fits under it, and bytes after the last decoded record are still credited.
+- A missing-certificates or consensus-output serve is bounded at 200 seconds in total. A public-tier serve of either class is also cut at a fixed 60-second hold limit (`PUBLIC_SYNC_SERVE_TIMEOUT`) and charged as a stall. So a public requester must read a consensus output of L bytes at no less than L/60 seconds. Pack records are capped at 16 MiB, so the largest output needs about 273 KiB/s, the requester's own target rate.
 - A worker batch serve has 5 seconds to write its `Ack` and 30 seconds for each data frame, inside the 200-second total. A public-tier worker batch serve is also cut at a fixed 60-second hold limit (`PUBLIC_BATCH_SERVE_TIMEOUT`) and charged as a stall; a public key serves on one worker stream at a time and may hold worker serve permits for 60 seconds per 300-second window (`PUBLIC_BATCH_SERVE_HOLD_BUDGET`, `PUBLIC_BATCH_SERVE_HOLD_WINDOW`), and is refused `AtCapacity` outside that budget. A public key may hold worker opening-read permits for 10 seconds per 300-second window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`) and is shed `AtCapacity`, uncharged, outside it; a key is leased only with a full 60-second hold limit of serve budget left.
 
 A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window (whether the request is then admitted or refused), for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit, and, for a missing-certificates or consensus-output serve, for a serve cut at the 60-second hold limit, and, for a worker batch serve, for a serve cut at the 60-second hold limit and for a request above the 500-digest cap.
@@ -161,7 +177,7 @@ A serve stalls when it hits a write timeout or a missed deadline.
 On the primary, the whole-serve timeout of a missing-certificates or consensus-output serve is a stall.
 On the primary, a requester that resets or closes the stream during the serve is also a stall: a `TimedOut`, `ConnectionReset` or `NotConnected` stream error counts as a stall, the same set the worker uses.
 On the worker, a requester that stops or closes the stream after the `Ack` is a stall.
-A prompt `AtCapacity` refusal is not charged, because an honest peer gets it when a pool is full.
+A prompt `AtCapacity` or `Busy` refusal is not charged, because an honest peer gets it when a pool is full or its own budget is spent.
 Committee peers are not charged by admission.
 A mild penalty lowers the peer score by 1.0; the score thresholds are -20.0 for a disconnect and -50.0 for a ban, so, ignoring decay, twenty stalls disconnect a public peer and fifty ban it.
 These admission penalties are enforced, unlike the stream-failure penalties under [Failure classification](#failure-classification).
@@ -187,11 +203,11 @@ These admission penalties are enforced, unlike the stream-failure penalties unde
 | Public worker batch serves per key | 1 | Worker batch serves one public key may hold at a time (`PUBLIC_BATCH_SERVES_PER_PEER`); a second request is refused `AtCapacity` without a charge |
 | Public worker batch-serve hold budget | 60s per 300s | Serve-permit hold time one public key may use per window (`PUBLIC_BATCH_SERVE_HOLD_BUDGET`, `PUBLIC_BATCH_SERVE_HOLD_WINDOW`); a key is leased only with a full 60s hold limit left; outside that it is refused `AtCapacity` without a charge |
 | Public worker opening hold budget | 10s per 300s | Opening-read hold time one public key may use per window (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`); a key with less than one read bound left is shed `AtCapacity` without a charge |
-| Public primary opening hold budget | 10s per 300s | Opening-read hold time one public key may use per window on a primary (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`); a key with less than one read bound left is shed `AtCapacity` without a charge |
-| Public primary serves per key | 1 | Sync serves one public key may hold on a primary at a time, across all three classes (`PUBLIC_SYNC_SERVES_PER_PEER`); a second request is refused `AtCapacity` without a charge |
+| Public primary opening hold budget | 10s per 300s | Opening-read hold time one public key may use per window on a primary (`PUBLIC_OPENING_HOLD_BUDGET`, `PUBLIC_OPENING_HOLD_WINDOW`); a key with less than one read bound left is shed `Busy` without a charge |
+| Public primary serves per key | 1 | Sync serves one public key may hold on a primary at a time, across all three classes (`PUBLIC_SYNC_SERVES_PER_PEER`); a second request is refused `Busy` without a charge |
 | Public missing-certificates and consensus-output serve hold limit | 60s | Fixed bound on one public-tier serve of either class (`PUBLIC_SYNC_SERVE_TIMEOUT`); a serve that outlives it is dropped and charged as a stall; committee-tier serves keep the 200s total bound |
-| Public epoch-pack serve hold budget | 200s per 1000s | Epoch-pack serve-permit hold time one public key may use per window (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`, `PUBLIC_EPOCH_PACK_SERVE_HOLD_WINDOW`); a key is leased only with a full 200s hold limit left; outside that it is refused `AtCapacity` without a charge |
-| Public missing-certificates and consensus-output serve hold budget | 60s per 300s, per class | Serve-permit hold time one public key may use per window in each of the two classes (`PUBLIC_SYNC_SERVE_TIMEOUT`, `PUBLIC_SYNC_SERVE_HOLD_WINDOW`); a key is leased only with a full 60s hold limit left; outside that it is refused `AtCapacity` without a charge |
+| Public epoch-pack serve hold budget | 200s per 1000s | Epoch-pack serve-permit hold time one public key may use per window (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`, `PUBLIC_EPOCH_PACK_SERVE_HOLD_WINDOW`); a key is leased only with a full 200s hold limit left; outside that it is refused `Busy` without a charge |
+| Public missing-certificates and consensus-output serve hold budget | 60s per 300s, per class | Serve-permit hold time one public key may use per window in each of the two classes (`PUBLIC_SYNC_SERVE_TIMEOUT`, `PUBLIC_SYNC_SERVE_HOLD_WINDOW`); a key is leased only with a full 60s hold limit left; outside that it is refused `Busy` without a charge |
 
 The 15-second and 10-second budgets nest: the total open budget covers a dial that may itself have to establish a connection, while the negotiation timeout applies only once a connection exists.
 An open that is dispatch-ready when its peer disconnects is re-queued for dialing rather than handed to a handler that no longer exists.
@@ -213,6 +229,9 @@ InboundRateLimited    medium    abuse of the inbound stream path
 
 A failed negotiation is not even reported to the behaviour.
 Probing whether a peer speaks the sync protocol is a normal thing to do during a rolling upgrade, and a probe that comes back negative should cost nothing.
+Because the outbound open is lazy, the open succeeds before the responder answers the protocol proposal, so the "speaks sync" signal comes from the first read instead.
+A first read that fails because the responder rejected the protocol is classed `UnsupportedProtocol` and records that the peer does not speak sync.
+A peer is recorded as speaking sync only after a first frame is read from it.
 
 **These stream-failure penalties are classified and logged, not enforced.**
 Every classified failure produces a log line recording the penalty it would incur, and nothing is applied to the peer's score.
