@@ -398,12 +398,15 @@ pub struct Parameters {
     #[serde(default, skip_serializing_if = "is_default")]
     pub epoch_close_task_drain: bool,
 
-    /// Check the block an epoch record names as its final state before writing the record.
+    /// Compare an epoch record that is already stored with this node's own closing block.
     ///
-    /// When `true`, writing the epoch record halts the node if the executed block it pins as
-    /// `final_state` is not the epoch's closing block, rather than sign a record for the wrong
-    /// block. The default `false` keeps the previous behaviour: the pinned block is used without
-    /// the check. Issue #1806.
+    /// When `true`, a node that reaches an epoch's close and finds the epoch's record already
+    /// stored (the members that closed first wrote it) halts if the record's `final_state` is not
+    /// this node's closing block, rather than enter the next epoch on a different state. A record
+    /// this node builds itself pins its own closing block and is not checked. The check runs once,
+    /// at the close: a node restarted after the halt does not repeat it. The default `false` keeps
+    /// the previous behaviour: nothing at the boundary compares the stored record with this node's
+    /// execution. Issue #1806.
     #[serde(default, skip_serializing_if = "is_default")]
     pub epoch_record_state_check: bool,
 
