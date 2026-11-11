@@ -268,7 +268,7 @@ impl RethEnv {
         crate::metrics::init();
         let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
 
-        Ok(Self {
+        let env = Self {
             inner: Arc::new(RethEnvInner {
                 node_config,
                 blockchain_provider,
@@ -287,7 +287,14 @@ impl RethEnv {
                 switches,
                 mdbx,
             }),
-        })
+        };
+        // the e2e persist delay (`TN_TEST_PERSIST_DELAY_MS`), always `None` without
+        // tn-types/test-utils
+        #[cfg(any(feature = "test-utils", test))]
+        if let Some(delay) = tn_types::test_hooks::persist_delay() {
+            env.inject_persist_delay(delay);
+        }
+        Ok(env)
     }
 
     /// Whether the node advises the kernel that the execution database's memory map is read at

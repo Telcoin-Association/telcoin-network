@@ -20,6 +20,10 @@
 //!
 //! [`execution_delay`] slows a node's engine without touching its consensus, so a test can make
 //! one validator's execution trail its commits by more than the activity window.
+//!
+//! [`persist_delay`] holds each persist of a node's executed output for a while, so a test of the
+//! pipelined engine (`pipelined_persist`) sees the next output build while the previous one is
+//! still persisting, which a local network's millisecond persists almost never show.
 
 use crate::{Database, Epoch, Table};
 use std::time::Duration;
@@ -180,6 +184,76 @@ fn parse_execution_delay(raw: Option<&str>) -> Option<Duration> {
     Some(Duration::from_millis(delay_ms))
 }
 
+/// How long each persist of this node's executed outputs sleeps before it writes, or `None` for no
+/// delay.
+///
+/// Reads `TN_TEST_PERSIST_DELAY_MS=<milliseconds>` once per process. It lets an e2e test hold a
+/// node's commit slot the way a persist-bound node's slow writes do, so that with
+/// `pipelined_persist` on the next output finishes building while the previous one still persists
+/// and parks behind it. The reth environment reads it once where it is created and sleeps at the
+/// start of every persist, on the persisting thread, so the output's persist time grows by the
+/// delay while its execution does not. A sequential node waits the delay out between two outputs.
+///
+/// Unset or zero means no delay. A value that does not parse as whole milliseconds is ignored with
+/// a warning. Always `None` without `test-utils`; as with the fork-epoch overrides, a node-scoped
+/// release build lacks the hook and a workspace-root build without `-p` has it. The reth side
+/// applies it only with `tn-reth/test-utils` as well, so an e2e binary that should honor it is
+/// built with both.
+#[inline]
+pub fn persist_delay() -> Option<Duration> {
+    #[cfg(feature = "test-utils")]
+    {
+        *PERSIST_DELAY.get_or_init(|| {
+            // a non-unicode value is lossily converted so it is warned about rather than read as
+            // unset
+            let raw = std::env::var_os(PERSIST_DELAY_VAR);
+            parse_persist_delay(raw.as_deref().map(|raw| raw.to_string_lossy()).as_deref())
+        })
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        None
+    }
+}
+
+/// The environment variable behind [`persist_delay`].
+#[cfg(feature = "test-utils")]
+const PERSIST_DELAY_VAR: &str = "TN_TEST_PERSIST_DELAY_MS";
+
+/// The delay [`persist_delay`] read from [`PERSIST_DELAY_VAR`], once per process.
+#[cfg(feature = "test-utils")]
+static PERSIST_DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+
+/// Parses the value of [`PERSIST_DELAY_VAR`] into the delay before each persist.
+///
+/// `None` (the variable is unset) and zero yield `None`. Surrounding whitespace is trimmed. A value
+/// that does not parse as whole milliseconds logs a warning and yields `None`, so a typo leaves
+/// persists at full speed rather than slowing them by a guess. A delay that is set is logged once,
+/// so a node log shows that its persists were slowed on purpose.
+#[cfg(feature = "test-utils")]
+fn parse_persist_delay(raw: Option<&str>) -> Option<Duration> {
+    let raw = raw?;
+    let delay_ms = raw
+        .trim()
+        .parse::<u64>()
+        .inspect_err(|err| {
+            tracing::warn!(
+                target: "engine",
+                value = ?raw,
+                %err,
+                "ignoring {PERSIST_DELAY_VAR}: not whole milliseconds; persists are not delayed",
+            );
+        })
+        .ok()
+        .filter(|delay_ms| *delay_ms > 0)?;
+    tracing::warn!(
+        target: "engine",
+        delay_ms,
+        "test hook: delaying every persist of an executed output",
+    );
+    Some(Duration::from_millis(delay_ms))
+}
+
 /// The hook behind [`exit_before_epoch_record`].
 #[cfg(feature = "test-utils")]
 static EXIT_BEFORE_EPOCH_RECORD: EpochHook = EpochHook::new("TN_TEST_EXIT_BEFORE_EPOCH_RECORD");
@@ -311,6 +385,36 @@ mod tests {
         assert_eq!(parse_execution_delay(None), None);
         for raw in ["0", " 0 ", "", "garbage", "-1", "1.5", "1500ms", "0x10", "\u{FFFD}"] {
             assert_eq!(parse_execution_delay(Some(raw)), None, "raw = {raw:?}");
+        }
+    }
+
+    /// The persist delay hook reads its variable as milliseconds. This is the only test in the
+    /// crate that sets the variable, and the value latches on first read, so it holds under a
+    /// single-process `cargo test` run as well as under nextest's process per test. It names a
+    /// different delay than the execution test, so a hook that read the other variable could not
+    /// pass under a single-process run either.
+    #[test]
+    fn persist_delay_reads_milliseconds() {
+        std::env::set_var(PERSIST_DELAY_VAR, "250");
+        assert_eq!(persist_delay(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn parse_persist_delay_reads_milliseconds() {
+        for (raw, expected_ms) in [("1500", 1500), (" 1\n", 1), ("+20", 20)] {
+            assert_eq!(
+                parse_persist_delay(Some(raw)),
+                Some(Duration::from_millis(expected_ms)),
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_persist_delay_unset_zero_and_garbage_are_none() {
+        assert_eq!(parse_persist_delay(None), None);
+        for raw in ["0", " 0 ", "", "garbage", "-1", "1.5", "1500ms", "0x10", "\u{FFFD}"] {
+            assert_eq!(parse_persist_delay(Some(raw)), None, "raw = {raw:?}");
         }
     }
 
