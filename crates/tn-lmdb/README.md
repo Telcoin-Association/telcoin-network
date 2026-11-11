@@ -705,10 +705,13 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
   writes, a fill.
 - **Exploration.** At one width a step's runs and pages move together, so steps at one width
   cannot tell `a` from `b`. An open starts with a warm-up of 12 scattered steps at 8, 0 and 4
-  pages in turn; after it, one step in 16 is a probe at half the choice or twice it (at least 4),
-  alternately. The fit keeps the latest 48 steps at the choice and, apart, the latest 16 probes,
-  so the probes keep their say. On a disk where the choice is 0 a probe fills gaps of up to 4
-  pages (a few percent of that step's sync on the Mac): about a sixteenth of that over all steps.
+  pages in turn; after it, a step is now and then a probe at half the choice or twice it (at
+  least 2), alternately. Probes start 16 steps apart and the interval doubles after each, up to
+  128, while the choice holds; a new choice brings it back to 16. So a disk whose choice moves is
+  explored often and one that settles seldom: on the Mac's SSD, where the choice is 0, a probe's
+  fill costs about half its step's sync (a fill costs about 3.7 µs a gap there), a 128th of that
+  over all steps once settled. The fit keeps the latest 48 steps at the choice and, apart, the
+  latest 16 probes, so the probes keep their say.
 - **Re-adaptation.** The windows forget old samples as new ones come. A disk whose costs change
   at once (a cloud disk's limits raised, a drive that changed speed) is seen sooner: 8 steps in a
   row whose sync took more than 1.5 times the prediction, or less than 1/1.5 of it, the same way,

@@ -282,8 +282,10 @@ fn a_disk_whose_costs_change_re_adapts() {
 }
 
 /// The schedule: a warm-up of `WARMUP_STEPS` cycling `WARMUP`, each at another width than the
-/// model's 0 a probe; then one step in `PROBE_EVERY` a probe, alternating half and twice the
-/// choice (at least 4), the only one that exists at 0 and at the widest.
+/// model's 0 a probe; then probes `PROBE_EVERY` steps apart, the interval doubling after each up
+/// to `PROBE_EVERY_MAX` while the choice holds, and back to `PROBE_EVERY` at a new choice. A
+/// probe takes half or twice the choice (at least 2), alternately, the only one that exists at 0
+/// and at the widest.
 #[test]
 fn the_schedule_warms_up_then_probes_beside_the_choice() {
     let gaps = Gaps::of(&(0..400).map(|i| i * 3).collect::<Vec<u32>>());
@@ -296,20 +298,29 @@ fn the_schedule_warms_up_then_probes_beside_the_choice() {
         auto.pending = None;
     }
     assert_eq!(widths, [8, 0, 4].repeat(4));
-    assert_eq!(auto.probe(0), 4, "at 0 only the higher");
+    // Past the warm-up, a zero model chooses 0: probes at 16, 48, 112, 240, then 128 apart.
+    let probe_steps = |auto: &mut AutoGap, steps: u64| -> Vec<(u64, u32)> {
+        (1..=steps)
+            .filter_map(|i| {
+                let c = auto.choose(&gaps);
+                auto.pending = None;
+                c.probe.then_some((i, c.width))
+            })
+            .collect()
+    };
+    let probes = probe_steps(&mut auto, 400);
+    assert_eq!(probes, [(16, 2), (48, 2), (112, 2), (240, 2), (368, 2)]);
+    // A new choice brings the interval back: a model that pays per write fills every gap, here
+    // all of 2 pages, so 2 (the smallest of the widths that tie). Seen at the first step, it puts
+    // the next probe 16 steps on, then 32; the probes alternate twice and half of it.
+    auto.model = Model { per_run: 1e6, ..Model::default() };
+    let probes = probe_steps(&mut auto, 64);
+    assert_eq!(probes, [(17, 4), (49, 1)], "16 after the new choice, then 32");
+    assert_eq!(auto.probe(0), 2, "at 0 only the higher");
     assert_eq!(auto.probe(MAX_GAP_FILL), 32, "at the widest only the lower");
     let both: Vec<u32> = (0..4).map(|_| auto.probe(8)).collect();
     assert!(both == [4, 16, 4, 16] || both == [16, 4, 16, 4], "alternately: {both:?}");
-    assert_eq!([auto.probe(1), auto.probe(1)].iter().sum::<u32>(), 4, "half of 1 is 0, twice 4");
-    // Past the warm-up, a zero model chooses 0, and every PROBE_EVERY-th step probes at 4.
-    let probes: Vec<usize> = (1..=64)
-        .filter(|_| {
-            let c = auto.choose(&gaps);
-            auto.pending = None;
-            c.probe
-        })
-        .collect();
-    assert_eq!(probes, [16, 32, 48, 64]);
+    assert_eq!([auto.probe(1), auto.probe(1)].iter().sum::<u32>(), 2, "half of 1 is 0, twice 2");
 }
 
 /// `Gaps` counts the runs, pages and gap sizes of a step in one pass, and `upto` the gaps and

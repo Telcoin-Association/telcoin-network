@@ -30,11 +30,15 @@
 //!
 //! **Exploration.** At one width a step's runs and pages move together (their ratio is the
 //! workload's), so steps at one width cannot tell `a` from `b`. A warm-up of [`WARMUP_STEPS`]
-//! steps cycles the widths of [`WARMUP`] (0, 4 and 8), then every [`PROBE_EVERY`]th step is a
-//! probe at another width than the choice: half of it and twice it (at least 4), alternately (only
-//! the one that exists at 0 and at [`MAX_GAP_FILL`]). The fit keeps the latest [`BASE_WINDOW`]
-//! steps at the chosen width and, apart, the latest [`PROBE_WINDOW`] probes, so the probes keep
-//! their weight in the fit without a high probe rate.
+//! steps cycles the widths of [`WARMUP`] (0, 4 and 8); after it, a step is a probe at another
+//! width than the choice, half of it or twice it (at least 2), alternately (only the one that
+//! exists at 0 and at [`MAX_GAP_FILL`]). Probes start [`PROBE_EVERY`] steps apart, and the
+//! interval doubles after each, up to [`PROBE_EVERY_MAX`], while the choice holds: a new choice
+//! brings it back to [`PROBE_EVERY`]. So a disk whose choice moves is explored often, and one
+//! that settles (a fast drive at 0, where a probe's fill costs about half that step's sync on the
+//! Mac) seldom. The fit keeps the latest [`BASE_WINDOW`] steps at the chosen width and, apart,
+//! the latest [`PROBE_WINDOW`] probes, so the probes keep their weight in the fit without a high
+//! probe rate.
 //!
 //! **Re-adaptation.** The windows forget a disk's old costs as new steps arrive. A disk whose
 //! costs change at once (a cloud disk's limits raised, a drive that changed speed) is seen
@@ -66,15 +70,20 @@ const WARMUP: [u32; 3] = [8, 0, 4];
 /// times, the least that fits `c`, `a` and `b` with a spare step at each width.
 const WARMUP_STEPS: u32 = 12;
 
-/// Past the warm-up, one step in this many is a probe. On a disk where the choice is 0, a probe
-/// fills gaps of up to 4 pages at a cost of a few percent of that step's sync (measured on the
-/// Mac at 4 pages: +13% of a busy commit's time): a sixteenth of that over all steps.
+/// The steps from the warm-up's end, or from a new choice, to the next probe: the shortest
+/// interval between probes.
 const PROBE_EVERY: u64 = 16;
+
+/// The longest interval between probes, which the interval doubles to while the choice holds. On
+/// the Mac's SSD, where the choice is 0, a probe's fill costs about half its step's sync: a 128th
+/// of that over all steps once settled.
+const PROBE_EVERY_MAX: u64 = 128;
 
 /// The steps at the chosen width the fit keeps: about a minute of a node's commits.
 const BASE_WINDOW: usize = 48;
 
-/// The probes the fit keeps: [`PROBE_WINDOW`] · [`PROBE_EVERY`] steps' worth.
+/// The probes the fit keeps: from [`PROBE_WINDOW`] · [`PROBE_EVERY`] steps' worth to
+/// [`PROBE_WINDOW`] · [`PROBE_EVERY_MAX`].
 const PROBE_WINDOW: usize = 16;
 
 /// Steps in a row off the prediction by more than [`SHIFT_FACTOR`], the same way, that restart
@@ -227,6 +236,12 @@ pub(crate) struct AutoGap {
     warm: u32,
     /// Steps since the warm-up ended: the probe schedule's clock.
     steps: u64,
+    /// The interval to the probe after the next ([`PROBE_EVERY`] to [`PROBE_EVERY_MAX`]).
+    interval: u64,
+    /// The step ([`Self::steps`]) of the next probe.
+    next_probe: u64,
+    /// The model's choice at the last step past the warm-up.
+    last_best: u32,
     /// Whether the next probe that has two widths to pick from takes the larger.
     higher: bool,
     /// Steps in a row off the prediction past [`SHIFT_FACTOR`]: positive slower, negative faster.
@@ -246,6 +261,9 @@ impl Default for AutoGap {
             hit: 1.0,
             warm: WARMUP_STEPS,
             steps: 0,
+            interval: PROBE_EVERY,
+            next_probe: PROBE_EVERY,
+            last_best: 0,
             higher: true,
             streak: 0,
             pending: None,
@@ -255,7 +273,8 @@ impl Default for AutoGap {
 
 impl AutoGap {
     /// The width for a step whose gap sizes are `gaps`: the warm-up's next width during a
-    /// warm-up, else the model's choice, but a probe's width every [`PROBE_EVERY`]th step.
+    /// warm-up, else the model's choice, but a probe's width at the probe schedule's steps
+    /// (module docs, "Exploration").
     pub(crate) fn choose(&mut self, gaps: &Gaps) -> Choice {
         let best = if self.warm == 0 { self.best(gaps) } else { 0 };
         let width = if self.warm > 0 {
@@ -264,7 +283,15 @@ impl AutoGap {
             WARMUP[done % WARMUP.len()]
         } else {
             self.steps += 1;
-            if self.steps.is_multiple_of(PROBE_EVERY) {
+            if best != self.last_best {
+                // A new choice: explore around it soon.
+                self.last_best = best;
+                self.interval = PROBE_EVERY;
+                self.next_probe = self.next_probe.min(self.steps + PROBE_EVERY);
+            }
+            if self.steps >= self.next_probe {
+                self.interval = (2 * self.interval).min(PROBE_EVERY_MAX);
+                self.next_probe = self.steps + self.interval;
                 self.probe(best)
             } else {
                 best
@@ -300,6 +327,7 @@ impl AutoGap {
             self.base.clear();
             self.probes.clear();
             (self.warm, self.steps, self.streak) = (WARMUP_STEPS, 0, 0);
+            (self.interval, self.next_probe) = (PROBE_EVERY, PROBE_EVERY);
         }
         let (window, cap) = if choice.probe {
             (&mut self.probes, PROBE_WINDOW)
@@ -340,11 +368,11 @@ impl AutoGap {
         best.0
     }
 
-    /// A probe's width beside the choice `best`: half of it or twice it (at least 4),
+    /// A probe's width beside the choice `best`: half of it or twice it (at least 2),
     /// alternately, or the one of the two that exists.
     fn probe(&mut self, best: u32) -> u32 {
         let lower = (best >= 1).then_some(best / 2);
-        let higher = (best < MAX_GAP_FILL).then_some((2 * best).max(4));
+        let higher = (best < MAX_GAP_FILL).then_some((2 * best).max(2));
         self.higher = !self.higher;
         match (lower, higher) {
             (Some(lower), Some(higher)) => {
