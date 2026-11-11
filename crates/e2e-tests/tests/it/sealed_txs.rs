@@ -120,17 +120,31 @@ async fn test_validators_keep_and_mark_sealed_transactions() -> eyre::Result<()>
 }
 
 /// The control of [`test_validators_keep_and_mark_sealed_transactions`]: the same fleet and load
-/// with `sealed_tx_keep` off on all four validators.
+/// with `sealed_tx_keep` off on all four validators. It characterises the loss the switch removes
+/// (issue #1807, I-2 case S1): a sender's later batch executes before its earlier one, the later
+/// transactions are skipped as nonce too high, and since the switch-off builder pruned them at
+/// the quorum ack they are in no pool and never land without a client resend. In the first four
+/// runs of this fleet and load, two lost whole 16-transaction windows of two or three senders
+/// (`nonce_too_high` skips 11 on every validator) and two lost nothing.
 ///
-/// Asserts: every start line reads `keeps_sealed=false`, the [`MARKED`] gauge stays zero at every
-/// poll, and the same exactly-once and same-blocks checks hold. The bench-5 duplicate needs a
-/// client that resends after 300 s, which this load does not do; a failure here without a resend
-/// is a pruned-before-execution loss (I-2 case S1 with the switch off).
+/// Asserts in both outcomes: every start line reads `keeps_sealed=false`, the [`MARKED`] gauge
+/// stays zero at every poll, the four validators hold the same blocks, and no transaction is in
+/// more than one block. After the load stops the test waits (see [`settle_without_keep`]) until
+/// every accepted transaction has landed, which passes with a line saying the run saw no loss, or
+/// until the stuck ones are quiescent. A quiescent loss passes only with the issue's signature,
+/// printed as a `KNOWN LOSS (#1807) reproduced:` line: each stuck sender's executed nonce is the
+/// same on every validator and below what it submitted, its transactions below that nonce are in
+/// exactly one block and the ones from it on (a contiguous tail) in none, the transaction at that
+/// nonce (the gap) is unknown to every validator, and
+/// `tn_reth_invalid_txs_skipped_total{reason="nonce_too_high"}` is above zero on every validator.
+/// The rest of the tail may be in no pool or still pooled, queued behind the gap, as I-2 pins it
+/// (one run lost 16 transactions of one sender with only the gap side skipped, 3 skips per
+/// validator, and the rest queued). Any other loss fails the test.
 #[ignore = "should not run with a default cargo test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_validators_without_sealed_keep_do_not_mark() -> eyre::Result<()> {
+async fn test_without_sealed_keep_any_loss_is_the_known_cliff() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    run_keep_fleet("validators_without_sealed_keep_do_not_mark", false).await
+    run_keep_fleet("without_sealed_keep_any_loss_is_the_known_cliff", false).await
 }
 
 /// Start four validators with `sealed_tx_keep` set to `keep` (written to every node's
@@ -159,12 +173,20 @@ async fn keep_fleet_checks(fleet: &Fleet, keep: bool) -> eyre::Result<()> {
     let epochs = run_load_across_boundary(fleet).await;
     let reports = load.stop().await?;
     let (epoch_start, epoch_end) = epochs?;
-    let landed = wait_for_landing(fleet, &reports).await;
+    let settled = if keep {
+        wait_for_landing(fleet, &reports).await.map(|took| (took, Vec::new()))
+    } else {
+        settle_without_keep(fleet, &reports).await
+    };
     let marked_max = marks.stop();
-    let landed = landed?;
+    let (landed, losses) = settled?;
 
     let walk = walk_chain(&fleet.clients).await?;
-    let counts = assert_exactly_once(&reports, &walk)?;
+    let (counts, known_loss) = if losses.is_empty() {
+        (assert_exactly_once(&reports, &walk)?, None)
+    } else {
+        assert_known_loss(fleet, &reports, &walk, &losses).await?
+    };
 
     // every builder line, not just the first, carries the effective mode
     let builder_lines = (0..4)
@@ -203,9 +225,15 @@ async fn keep_fleet_checks(fleet: &Fleet, keep: bool) -> eyre::Result<()> {
     // marks clear on execution or at the next sweep, so a drained fleet reaches zero
     fleet.wait_for_gauge_zero(MARKED).await?;
 
+    let outcome = match &known_loss {
+        Some(line) => line.clone(),
+        None if !keep => "no loss in this run: every accepted transaction landed".to_string(),
+        None => "every accepted transaction landed".to_string(),
+    };
+    eprintln!("{}: {outcome}", fleet.test);
     eprintln!(
         "{}: keep={keep} epochs {epoch_start}->{epoch_end}; {} txs from {} senders each in \
-         exactly one block ({} refusals {:?}; all executed {landed:?} after the load stopped); \
+         exactly one block ({} refusals {:?}; settled {landed:?} after the load stopped); \
          chain height {} with {} txs; {MARKED} max per node {marked_max:?}; {CLEARED_EXECUTED} \
          {cleared:?}; builder start lines per node {:?}; skips by reason {:?}; counters {:?}",
         fleet.test,
@@ -220,6 +248,200 @@ async fn keep_fleet_checks(fleet: &Fleet, keep: bool) -> eyre::Result<()> {
         sealed_counters(fleet)?,
     );
     Ok(())
+}
+
+/// Validator-1 blocks that must pass, with the stuck transactions unchanged and in no pool,
+/// before [`settle_without_keep`] calls a loss quiescent. Without load a block comes only at an
+/// epoch close, so two blocks span two closes and the orphan pass of each.
+const QUIESCENT_BLOCKS: u64 = 2;
+
+/// Time limit of [`settle_without_keep`]: the drain, then [`QUIESCENT_BLOCKS`] epoch closes.
+const QUIESCENCE_LIMIT: Duration = Duration::from_secs(EPOCH_DURATION * 12);
+
+/// After the switch-off load: wait until every accepted transaction has landed, or until the stuck
+/// ones are quiescent. Quiescent means every validator reports the same executed nonce for each
+/// stuck sender, the transaction at that nonce (the gap) is known to no validator, and validator 1
+/// has added [`QUIESCENT_BLOCKS`] blocks while that held unchanged. The sender's later
+/// transactions may still be pooled, queued behind the gap, which never fills without a resend.
+/// Returns how long it took and, for a quiescent loss, each stuck sender's report index and
+/// executed nonce. Fails at [`QUIESCENCE_LIMIT`] with the stuck senders' diagnosis.
+async fn settle_without_keep(
+    fleet: &Fleet,
+    reports: &[SenderReport],
+) -> eyre::Result<(Duration, Vec<(usize, u64)>)> {
+    let started = Instant::now();
+    let mut stable_since: Option<(Vec<(usize, u64)>, u64)> = None;
+    loop {
+        let mut stuck = Vec::new();
+        let mut behind = Vec::new();
+        let mut agreed = true;
+        for (index, report) in reports.iter().enumerate() {
+            let accepted = report.hashes.len() as u64;
+            let mut executed = Vec::new();
+            for client in &fleet.clients {
+                executed.push(nonce(client, report.address).await?);
+            }
+            if executed.iter().all(|landed| *landed == accepted) {
+                continue;
+            }
+            agreed &= executed.iter().all(|landed| *landed == executed[0]);
+            for (node, landed) in executed.iter().enumerate() {
+                behind.push((node, report.address, *landed, report.hashes.len()));
+            }
+            stuck.push((index, executed[0]));
+        }
+        if stuck.is_empty() {
+            return Ok((started.elapsed(), stuck));
+        }
+        // a gap still known to a pool can be sealed and land, so it is not quiescent yet
+        let pooled = agreed
+            && tail_known(fleet, reports, &stuck)
+                .await?
+                .iter()
+                .any(|tail| tail.first().copied().unwrap_or(true));
+        let height = block_number(&fleet.clients[0]).await?;
+        if agreed && !pooled {
+            match &stable_since {
+                Some((seen, from)) if *seen == stuck => {
+                    if height >= from + QUIESCENT_BLOCKS {
+                        return Ok((started.elapsed(), stuck));
+                    }
+                }
+                _ => stable_since = Some((stuck, height)),
+            }
+        } else {
+            stable_since = None;
+        }
+        if started.elapsed() >= QUIESCENCE_LIMIT {
+            eyre::bail!(
+                "neither landed nor quiescent after {QUIESCENCE_LIMIT:?} (validators agree on \
+                 the stuck nonces: {agreed}, a gap transaction still known: {pooled}); \
+                 (validator index, sender, nonce, accepted) not landed: {behind:?}; {}",
+                stuck_diagnosis(fleet, reports, &behind).await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// For each of the `stuck` senders (report index, executed nonce), whether any validator knows
+/// each of its unexecuted transactions, in nonce order. The first is the gap: a stuck sender's
+/// later transactions can only be pooled (queued behind it) or in no pool.
+async fn tail_known(
+    fleet: &Fleet,
+    reports: &[SenderReport],
+    stuck: &[(usize, u64)],
+) -> eyre::Result<Vec<Vec<bool>>> {
+    let mut known = Vec::new();
+    for (index, executed) in stuck {
+        let mut tail = Vec::new();
+        for hash in reports[*index].hashes.iter().skip(*executed as usize) {
+            let mut anywhere = false;
+            for client in &fleet.clients {
+                let found: Option<Value> =
+                    client.request("eth_getTransactionByHash", rpc_params![hash]).await?;
+                anywhere |= found.is_some();
+            }
+            tail.push(anywhere);
+        }
+        known.push(tail);
+    }
+    Ok(known)
+}
+
+/// Check that a quiescent switch-off loss has the signature of issue #1807 (see
+/// [`test_without_sealed_keep_any_loss_is_the_known_cliff`]) and return the landing counts with
+/// the `KNOWN LOSS (#1807) reproduced:` line.
+async fn assert_known_loss(
+    fleet: &Fleet,
+    reports: &[SenderReport],
+    walk: &ChainWalk,
+    losses: &[(usize, u64)],
+) -> eyre::Result<(LandingCounts, Option<String>)> {
+    let mut repeated = Vec::new();
+    let mut missing = Vec::new();
+    let mut landed_in_tail = Vec::new();
+    let mut tails = Vec::new();
+    for (index, report) in reports.iter().enumerate() {
+        let executed = losses
+            .iter()
+            .find(|(stuck, _)| *stuck == index)
+            .map_or(report.hashes.len(), |(_, executed)| *executed as usize);
+        eyre::ensure!(
+            executed < report.hashes.len() || losses.iter().all(|(stuck, _)| *stuck != index),
+            "stuck sender {} has executed {executed} of {} transactions",
+            report.address,
+            report.hashes.len()
+        );
+        for (nonce, hash) in report.hashes.iter().enumerate() {
+            match (walk.tx_blocks.get(hash).map(Vec::as_slice), nonce < executed) {
+                (Some([_]), true) | (None, false) => (),
+                (None | Some([]), true) => missing.push((report.address, nonce, *hash)),
+                (Some(blocks), _) if blocks.len() > 1 => {
+                    repeated.push((report.address, nonce, *hash, blocks.to_vec()))
+                }
+                (Some(blocks), _) => landed_in_tail.push((report.address, nonce, blocks.to_vec())),
+            }
+        }
+        if executed < report.hashes.len() {
+            tails.push((
+                report.address,
+                report.target + 1,
+                executed,
+                report.hashes.len() - executed,
+            ));
+        }
+    }
+    eyre::ensure!(
+        repeated.is_empty(),
+        "{} transactions are in more than one block (first {:?}): not the known loss",
+        repeated.len(),
+        repeated.first()
+    );
+    eyre::ensure!(
+        missing.is_empty() && landed_in_tail.is_empty(),
+        "the loss is not a contiguous tail: {} below the executed nonce are in no block (first \
+         {:?}) and {} at or above it are in a block (first {:?})",
+        missing.len(),
+        missing.first(),
+        landed_in_tail.len(),
+        landed_in_tail.first()
+    );
+    let known = tail_known(fleet, reports, losses).await?;
+    eyre::ensure!(
+        known.iter().all(|tail| tail.first() == Some(&false)),
+        "a stuck sender's gap transaction is still known to a validator: not the known loss"
+    );
+    let queued: usize = known.iter().map(|tail| tail.iter().filter(|k| **k).count()).sum();
+    let too_high = fleet.metric_sums(INVALID_SKIPPED, Some("reason=\"nonce_too_high\""))?;
+    eyre::ensure!(
+        too_high.iter().all(|value| *value > 0.0),
+        "transactions were lost but nonce_too_high skips per validator read {too_high:?}: not the \
+         known loss"
+    );
+    let lost: usize = tails.iter().map(|(_, _, _, lost)| lost).sum();
+    let submitted: usize = reports.iter().map(|r| r.hashes.len()).sum();
+    let line = format!(
+        "KNOWN LOSS (#1807) reproduced: {} of {} senders lost {lost} of {submitted} accepted \
+         transactions as contiguous tails, (sender, submitted to validator, executed nonce, lost) \
+         {tails:?}; each gap unknown to all four validators, {} lost transactions in no pool and \
+         {queued} still pooled behind a gap; nonce_too_high skips per validator {too_high:?}; \
+         the other {} transactions each in exactly one block",
+        tails.len(),
+        reports.len(),
+        lost - queued,
+        submitted - lost,
+    );
+    let mut refusal_classes = BTreeMap::new();
+    for (class, count) in reports.iter().flat_map(|r| &r.refusals) {
+        *refusal_classes.entry(class.clone()).or_insert(0) += count;
+    }
+    let counts = LandingCounts {
+        submitted: submitted - lost,
+        refusals: refusal_classes.values().sum(),
+        refusal_classes,
+    };
+    Ok((counts, Some(line)))
 }
 
 /// The switched-on half of [`test_mixed_sealed_keep_and_admission_fleet_is_one_chain`]'s fleet.
