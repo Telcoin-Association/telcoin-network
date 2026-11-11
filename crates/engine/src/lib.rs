@@ -23,6 +23,7 @@
 mod error;
 mod metrics;
 mod payload_builder;
+pub mod persister;
 mod recovery;
 use crate::metrics::{EngineMetrics, ENGINE_METRICS};
 use error::EngineResult;
