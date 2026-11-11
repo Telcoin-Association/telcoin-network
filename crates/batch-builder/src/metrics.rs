@@ -27,6 +27,10 @@ pub(crate) struct BatchBuilderMetrics {
     pub(crate) peer_deferred_txs_total: Counter,
     /// Total transactions evicted for whole-batch limit violations, excluding descendants.
     pub(crate) unpackable_txs_total: Counter,
+    /// Total selection skips of transactions this node sealed into a batch that has not executed
+    /// yet (switch `sealed_tx_keep`, issue #1807). A transaction counts once per build that
+    /// skips it, so a long-lived mark counts many times; zero with the switch off.
+    pub(crate) sealed_txs_skipped_total: Counter,
     /// Max pool age per batch: the oldest included transaction's time from pool admission to
     /// the end of selection, one sample per non-empty batch (the median is on the `batch built`
     /// line).
@@ -252,5 +256,31 @@ mod tests {
             matches!(value, DebugValue::Gauge(g) if g.0 == expected),
             "{name} must hold the last write {expected}, got {value:?}"
         );
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// The sealed-skip counter is one series per worker under the crate's scope, so Prometheus
+    /// exposes it as `tn_batch_builder_sealed_txs_skipped_total{worker="…"}`.
+    #[test]
+    fn test_sealed_txs_skipped_counter_is_per_worker() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            BatchBuilderMetrics::new_for_worker(3).sealed_txs_skipped_total.increment(5);
+        });
+
+        let series: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == "tn_batch_builder.sealed_txs_skipped_total")
+            .collect();
+        assert_eq!(series.len(), 1, "one series, got {series:?}");
+        let (key, _, _, value) = &series[0];
+        let labels: Vec<_> = key.key().labels().map(|l| (l.key(), l.value())).collect();
+        assert_eq!(labels, [("worker", "3")]);
+        assert!(matches!(value, DebugValue::Counter(5)), "got {value:?}");
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::{build_batch, BatchBuilderOutput};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -42,6 +42,9 @@ pub(crate) struct TestPool {
     balances: BTreeMap<Address, U256>,
     /// Transactions seen inside a validated peer batch, deferred by the builder (issue #1329).
     peer_batch_txs: PeerBatchTxs,
+    /// Transactions marked as sealed into an unexecuted batch, which [`TxPool::is_sealed`]
+    /// reports (switch `sealed_tx_keep`). Empty unless a test marks some.
+    sealed: BTreeSet<TxHash>,
 }
 
 impl Default for TestPool {
@@ -51,6 +54,7 @@ impl Default for TestPool {
             by_id: BTreeMap::new(),
             balances: BTreeMap::new(),
             peer_batch_txs: PeerBatchTxs::new(TEST_PEER_BATCH_TTL),
+            sealed: BTreeSet::new(),
         }
     }
 }
@@ -90,6 +94,9 @@ impl TxPool for TestPool {
     fn is_peer_deferred(&self, hash: &TxHash) -> bool {
         self.peer_batch_txs.is_deferred(hash)
     }
+    fn is_sealed(&self, hash: &TxHash) -> bool {
+        self.sealed.contains(hash)
+    }
 }
 
 #[cfg(test)]
@@ -117,9 +124,20 @@ impl TxPool for &mut TestPool {
     fn is_peer_deferred(&self, hash: &TxHash) -> bool {
         (**self).is_peer_deferred(hash)
     }
+
+    fn is_sealed(&self, hash: &TxHash) -> bool {
+        (**self).is_sealed(hash)
+    }
 }
 
 impl TestPool {
+    /// Mark `hashes` as sealed into an unexecuted batch, as the worker pool does after a quorum
+    /// ack with `sealed_tx_keep` on. The transactions stay in the pool.
+    #[cfg(test)]
+    pub(crate) fn seal(&mut self, hashes: impl IntoIterator<Item = TxHash>) {
+        self.sealed.extend(hashes);
+    }
+
     /// Model mining by removing only the listed hashes, leaving later sender nonces pending.
     /// Eviction through [`TxPool::remove_unsupported_txs`] also removes descendants.
     #[cfg(test)]

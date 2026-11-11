@@ -13,6 +13,10 @@
 //! tip. The pool's pending base fee is never taken from a canonical update: it always comes from
 //! the worker's shared [`BaseFeeContainer`](tn_types::gas_accumulator::BaseFeeContainer), the gas
 //! accumulator's fee for the current epoch (issue #1262).
+//!
+//! With the `sealed_tx_keep` switch on, a builder whose worker seals by quorum keeps a sealed
+//! batch's transactions in the pool instead, marked under the batch digest until the batch
+//! executes, and skips them when it selects the next batch (issue #1807).
 
 // it tests
 #![allow(unused_crate_dependencies)]
@@ -25,13 +29,16 @@ use std::{
     pin::Pin,
     time::{Duration, Instant},
 };
-use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
+use tn_reth::{
+    sealed_txs::SealTicket, CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool,
+};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBatch,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, BlockHash, Epoch, SealedBatch,
     SealedHeader, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{
     sync::oneshot,
+    task::JoinError,
     time::{Instant as TokioInstant, Interval, Sleep},
 };
 use tracing::{debug, error, field, info, info_span, warn, Instrument};
@@ -67,6 +74,18 @@ enum BuildOutcome {
     /// The batch reached quorum (or a forward task was admitted to deliver it): prune the
     /// mined transactions from the pool and apply the account changes.
     Mined(MinedBatchResult),
+    /// The batch reached quorum and its transactions stay in the pool, marked as sealed under
+    /// its digest until it executes (switch `sealed_tx_keep`, on a worker that seals by quorum).
+    /// Nothing is pruned and no account changes apply: an optimistic nonce advance would make
+    /// the pool discard the very transactions it keeps. The run loop builds again at once, as
+    /// after a mined batch.
+    Kept,
+    /// Selection skipped only transactions sealed into this node's unexecuted batches (switch
+    /// `sealed_tx_keep`), so nothing is buildable until one of them executes. Like
+    /// [`Self::Empty`] nothing reaches the worker and the next build waits for a wake-up, but
+    /// there is nothing to retry, so arrivals arm the fill delay again, as after a pass that
+    /// finds nothing pending.
+    AllSealed,
     /// The worker refused the seal because no forward admitted the batch
     /// ([`BlockSealError::NotValidator`], issue #1132). The pool keeps its transactions; the
     /// run loop retries on a dedicated backoff and gates its logging on state changes rather
@@ -254,6 +273,11 @@ pub struct BatchBuilder {
     /// Keep a sealed batch's transactions in the pool, marked, until they execute
     /// (`sealed_tx_keep` in `parameters.yaml`).
     sealed_tx_keep: bool,
+    /// True when the worker this builder feeds seals by committee quorum
+    /// (`Worker::seals_via_quorum`). `sealed_tx_keep` acts only then: a forwarding worker's
+    /// batch is re-packed by the committee under other digests, so its own digest never
+    /// executes and nothing would clear the marks.
+    seals_via_quorum: bool,
 }
 
 impl BatchBuilder {
@@ -296,6 +320,8 @@ impl BatchBuilder {
             fill_delay: None,
             // the env builds the worker pools from the same switch, so both sides agree
             sealed_tx_keep: reth_env.sealed_tx_keep(),
+            // the forwarding default keeps today's prune path until the node says otherwise
+            seals_via_quorum: false,
         })
     }
 
@@ -314,6 +340,28 @@ impl BatchBuilder {
     /// Whether a sealed batch's transactions stay in the pool, marked, until they execute.
     pub fn sealed_tx_keep(&self) -> bool {
         self.sealed_tx_keep
+    }
+
+    /// Set whether the worker this builder feeds seals by committee quorum
+    /// (`Worker::seals_via_quorum`).
+    ///
+    /// [`BatchBuilder::new`] starts with `false`, the forwarding case. Only a builder for a
+    /// quorum-sealing worker marks a sealed batch's transactions (with `sealed_tx_keep` on);
+    /// with `false` every quorum ack prunes the batch from the pool, as with the switch off.
+    pub fn with_seals_via_quorum(mut self, seals_via_quorum: bool) -> Self {
+        self.seals_via_quorum = seals_via_quorum;
+        self
+    }
+
+    /// Whether the worker this builder feeds seals by committee quorum.
+    pub fn seals_via_quorum(&self) -> bool {
+        self.seals_via_quorum
+    }
+
+    /// True when a quorum ack marks the batch's transactions instead of pruning them: the
+    /// switch is on and the worker seals by quorum.
+    fn keeps_sealed(&self) -> bool {
+        self.sealed_tx_keep && self.seals_via_quorum
     }
 
     /// Spawns a task to build the batch and propose to peers.
@@ -340,6 +388,7 @@ impl BatchBuilder {
         let base_fee = self.base_fee;
         let metrics = self.metrics.clone();
         let build_counters = self.build_counters.clone();
+        let keeps_sealed = self.keeps_sealed();
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -350,7 +399,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable, stats } =
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable, sealed_skipped, stats } =
                 match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
                     Ok(output) => output,
                     Err(e) => {
@@ -369,6 +418,8 @@ impl BatchBuilder {
                 .increment(u64::try_from(peer_deferred).unwrap_or(u64::MAX));
             // Evictions happen during selection, even if the batch is empty or quorum fails.
             metrics.unpackable_txs_total.increment(u64::try_from(unpackable).unwrap_or(u64::MAX));
+            // transactions still in flight in this node's own batches (switch `sealed_tx_keep`)
+            metrics.sealed_txs_skipped_total.increment(u64::try_from(sealed_skipped).unwrap_or(u64::MAX));
             // Canonical updates can drain the pending pool after the run loop's build gate.
             // Selection can also skip every candidate, including peer-deferred transactions
             // (issue #1329). Peers reject empty batches, so record the selection metrics above
@@ -378,15 +429,27 @@ impl BatchBuilder {
                     target: "worker::batch_builder",
                     peer_deferred,
                     unpackable,
+                    sealed_skipped,
                     "transaction selection produced an empty batch; sealing nothing"
                 );
-                result.send(Ok(BuildOutcome::Empty)).err().into_iter().for_each(|e| {
+                // a peer deferral leaves something to retry; sealed transactions only wait for
+                // their own batch to execute
+                let outcome = if sealed_skipped > 0 && peer_deferred == 0 {
+                    BuildOutcome::AllSealed
+                } else {
+                    BuildOutcome::Empty
+                };
+                result.send(Ok(outcome)).err().into_iter().for_each(|e| {
                     error!(target: "worker::batch_builder", ?e, "failed to send no-work outcome to block builder task");
                 });
                 Ok(())
             } else {
+                // selection has finished and the batch has not reached the worker: any execution
+                // of this batch comes after this ticket, so a mark it would undo is refused
+                let ticket = keeps_sealed.then(|| pool.seal_ticket());
                 let batch = batch.seal_slow();
-                span.record("batch", batch.digest().to_string());
+                let digest = batch.digest();
+                span.record("batch", digest.to_string());
                 report_batch_built(&metrics, &build_counters, worker_id, &batch, &stats, trigger);
 
                 // forward to worker and wait for ack that quorum was reached
@@ -410,8 +473,15 @@ impl BatchBuilder {
                             Ok(_) => {
                                 debug!(target: "worker::batch-builder", ?res, "received ack");
                                 metrics.batches_sealed_total.increment(1);
+                                let mined = MinedBatchResult { mined_transactions, changed_accounts };
+                                // mark before reporting completion: the run loop starts the next
+                                // selection only after it receives this task's outcome
+                                let outcome = match ticket {
+                                    Some(ticket) => keep_sealed(&pool, ticket, digest, mined).await,
+                                    None => BuildOutcome::Mined(mined),
+                                };
                                 // signal to Self that this task is complete
-                                if let Err(e) = result.send(Ok(BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts }))) {
+                                if let Err(e) = result.send(Ok(outcome)) {
                                     error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                                 }
                             }
@@ -566,6 +636,18 @@ impl BatchBuilder {
 
     /// Run the batch builder event loop. Runs for the lifetime of the worker.
     pub async fn run(mut self) -> BatchBuilderResult<()> {
+        // one line per builder per epoch: `sealed_tx_keep` acts only when `keeps_sealed` is true,
+        // which needs the node to report a quorum-sealing worker, so the effective mode is logged
+        // beside the configured switch
+        info!(
+            target: "worker::batch_builder",
+            worker_id = self.worker_id,
+            epoch = self.epoch,
+            sealed_tx_keep = self.sealed_tx_keep,
+            seals_via_quorum = self.seals_via_quorum,
+            keeps_sealed = self.keeps_sealed(),
+            "batch builder started"
+        );
         // reproduces the original future's post-quorum-failure `break`: skip starting a build for
         // exactly one iteration so the loop backs off (parks) before retrying, instead of
         // immediately rebuilding the same (still-unmined) transactions. An arrival notification
@@ -649,13 +731,28 @@ impl BatchBuilder {
                     let outcome = res??;
 
                     // Refusal backoff bookkeeping (issue #1145): a refusal arms or extends the
-                    // backoff, anything mined ends it. Empty, Refused and Failed take the
-                    // pre-existing empty-mined path below: no pool update, one deferred build,
-                    // park until a wake-up.
+                    // backoff, anything mined ends it. Empty, AllSealed, Refused and Failed take
+                    // the pre-existing empty-mined path below: no pool update, one deferred
+                    // build, park until a wake-up.
                     let MinedBatchResult { mined_transactions, changed_accounts } = match outcome {
                         BuildOutcome::Mined(mined) => {
                             failed_hold = false;
                             mined
+                        }
+                        BuildOutcome::Kept => {
+                            // the batch's transactions stay pooled and marked, so there is no
+                            // pool update to apply; the completed seal still ends a refusal
+                            // backoff, and the loop builds again at once, as after a mined batch
+                            failed_hold = false;
+                            self.note_recovery();
+                            continue;
+                        }
+                        BuildOutcome::AllSealed => {
+                            // nothing to retry: what is pending waits for its own batch to
+                            // execute, so arrivals arm the fill delay again; the empty-mined path
+                            // below still defers the next build until a wake-up
+                            failed_hold = false;
+                            MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] }
                         }
                         BuildOutcome::Refused => {
                             self.note_refusal();
@@ -746,6 +843,58 @@ impl BatchBuilder {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Mark the transactions of the quorum-acked batch `digest` as sealed, keeping them in the pool
+/// (switch `sealed_tx_keep`), and return the outcome for the run loop.
+///
+/// `ticket` is the one taken when the batch's selection finished. A mark the pool refuses
+/// because the batch already executed still yields [`BuildOutcome::Kept`]: the canonical update
+/// for that execution removed what it mined and left what it skipped buildable.
+async fn keep_sealed(
+    pool: &WorkerTxPool,
+    ticket: SealTicket,
+    digest: BlockHash,
+    mined: MinedBatchResult,
+) -> BuildOutcome {
+    let marked = pool.mark_sealed(ticket, digest, mined.mined_transactions.clone()).await;
+    outcome_after_mark(marked, digest, mined)
+}
+
+/// Turn the result of [`WorkerTxPool::mark_sealed`] into the run loop's outcome.
+///
+/// If the mark's blocking task failed (a panic, or cancellation at runtime shutdown), the batch
+/// falls back to today's switch-off path: [`BuildOutcome::Mined`] prunes its transactions and
+/// advances each sender's pool nonce. That keeps the builder from re-sealing transactions the
+/// worker has already sealed, at the cost of the bench-5 behaviour for this one batch: the node
+/// forgets the transactions until they execute.
+fn outcome_after_mark(
+    marked: Result<usize, JoinError>,
+    digest: BlockHash,
+    mined: MinedBatchResult,
+) -> BuildOutcome {
+    match marked {
+        Ok(marked) => {
+            debug!(
+                target: "worker::batch_builder",
+                %digest,
+                marked,
+                num_txs = mined.mined_transactions.len(),
+                "kept sealed transactions in the pool"
+            );
+            BuildOutcome::Kept
+        }
+        Err(error) => {
+            error!(
+                target: "worker::batch_builder",
+                %digest,
+                ?error,
+                num_txs = mined.mined_transactions.len(),
+                "marking sealed transactions failed; pruning them from the pool instead"
+            );
+            BuildOutcome::Mined(mined)
         }
     }
 }
@@ -2427,6 +2576,753 @@ mod tests {
 
             ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
             assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// Switch `sealed_tx_keep` on the builder side (issue #1807): a quorum ack marks the batch's
+    /// transactions in the pool instead of pruning them, and selection skips them until their
+    /// batch executes. Case ids (S1-S3) are those of the I-2 sealed-keep test cases.
+    mod sealed_keep {
+        use super::{batch_built_line::Capture, *};
+        use std::collections::VecDeque;
+        use tn_types::{
+            repack_monitor::RepackMonitor, CertifiedBatch, EpochSeedChainValue, ReputationScores,
+            TransactionSigned,
+        };
+        use tokio::sync::mpsc::{error::TryRecvError, Receiver};
+
+        /// The batch delay of most tests: a failed seal retries on it, and a wait of two of them
+        /// with nothing sealed shows the builder offers nothing.
+        const TICK: Duration = Duration::from_millis(300);
+
+        /// A batch delay far beyond every assertion window: only an arrival explains a build.
+        const LONG_TICK: Duration = Duration::from_secs(60);
+
+        /// The bound on every wait for a batch, an ack's effect or a block.
+        const WAIT: Duration = Duration::from_secs(10);
+
+        /// What the builder hands the worker: each sealed batch with its ack sender.
+        type ToWorker = Receiver<(SealedBatch, oneshot::Sender<Result<(), BlockSealError>>)>;
+
+        /// Three funded senders, a worker pool, and the chain its batches execute on.
+        struct Bench {
+            /// The first sender (the default factory).
+            a: TransactionFactory,
+            /// The second sender.
+            b: TransactionFactory,
+            /// A third sender whose batch holds the builder busy while a test arranges the pool.
+            holder: TransactionFactory,
+            /// The worker pool every builder here builds from.
+            txpool: WorkerTxPool,
+            /// The test chain.
+            chain: Arc<RethChainSpec>,
+            /// The execution environment the blocks are executed in.
+            reth_env: RethEnv,
+            /// The last executed header: the parent of the next block.
+            tip: SealedHeader,
+            /// Holds the reth environment's tasks and the builders' build tasks.
+            task_manager: TaskManager,
+        }
+
+        impl Bench {
+            /// A fresh chain at genesis with every sender funded.
+            fn new(path: &Path) -> eyre::Result<Self> {
+                let a = TransactionFactory::new();
+                let b = TransactionFactory::new_random();
+                let holder = TransactionFactory::new_random();
+                let funded = || {
+                    GenesisAccount::default().with_balance(
+                        U256::from_str("0x51E410C0F93FE543000000").expect("balance parses"),
+                    )
+                };
+                let genesis = test_genesis().extend_accounts([
+                    (a.address(), funded()),
+                    (b.address(), funded()),
+                    (holder.address(), funded()),
+                ]);
+                let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+                let task_manager = TaskManager::new("sealed-keep test");
+                let reth_env =
+                    RethEnv::new_for_temp_chain(chain.clone(), path, &task_manager, None)?;
+                let txpool = reth_env.init_txn_pool(BaseFeeContainer::default())?;
+                let tip = chain.sealed_genesis_header();
+                Ok(Self { a, b, holder, txpool, chain, reth_env, tip, task_manager })
+            }
+
+            /// A builder over the pool with the switch at `keep`, feeding a worker that seals by
+            /// quorum when `quorum` is true, and the receiver of what it seals.
+            fn builder(
+                &self,
+                keep: bool,
+                quorum: bool,
+                tick: Duration,
+            ) -> eyre::Result<(BatchBuilder, ToWorker)> {
+                let (to_worker, from_builder) = tokio::sync::mpsc::channel(2);
+                let builder = BatchBuilder::new(
+                    &self.reth_env,
+                    self.txpool.clone(),
+                    to_worker,
+                    Address::ZERO,
+                    tick,
+                    self.task_manager.get_spawner(),
+                    0,
+                    MIN_PROTOCOL_BASE_FEE,
+                    0,
+                )?
+                .with_sealed_tx_keep(keep)
+                .with_seals_via_quorum(quorum);
+                Ok((builder, from_builder))
+            }
+
+            /// Add `txs` to the pool as a local client would, in order.
+            async fn submit(&self, txs: &[TransactionSigned]) {
+                for tx in txs {
+                    self.a.submit_tx_to_pool(tx.clone(), self.txpool.clone()).await;
+                }
+            }
+
+            /// Execute `batches` as one consensus output on top of the tip, one block per
+            /// batch, and wait until the pool has applied the last block.
+            async fn execute(&mut self, batches: &[&SealedBatch]) -> eyre::Result<SealedHeader> {
+                let output = ConsensusOutput::new(
+                    CommittedSubDag::new(
+                        vec![Certificate::default()],
+                        Certificate::default(),
+                        0,
+                        ReputationScores::default(),
+                        None,
+                        EpochSeedChainValue::genesis_placeholder(),
+                    ),
+                    ConsensusHeaderDigest::default(),
+                    0,
+                    false,
+                    batches.iter().map(|batch| batch.digest()).collect::<VecDeque<_>>(),
+                    vec![CertifiedBatch {
+                        address: Address::ZERO,
+                        batches: batches.iter().map(|batch| batch.batch().clone()).collect(),
+                    }],
+                );
+                let args = BuildArguments::new(self.reth_env.clone(), output, self.tip.clone());
+                let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+                let tip = tokio::task::spawn_blocking(move || {
+                    execute_consensus_output(
+                        args,
+                        GasAccumulator::default(),
+                        RepackMonitor::default(),
+                        engine_update_tx,
+                    )
+                })
+                .await??;
+                let number = tip.number;
+                let txpool = self.txpool.clone();
+                tn_test_utils::wait_until(WAIT, "the pool applies the block", || {
+                    let txpool = txpool.clone();
+                    async move { Ok(txpool.block_info().last_seen_block_number == number) }
+                })
+                .await?;
+                self.tip = tip.clone();
+                Ok(tip)
+            }
+
+            /// The canonical nonce of `address`.
+            fn nonce(&self, address: Address) -> eyre::Result<u64> {
+                Ok(self.reth_env.retrieve_account(&address)?.map_or(0, |account| account.nonce))
+            }
+
+            /// Wait until every hash in `txs` is marked as sealed (`marked`) or not.
+            async fn wait_marked(
+                &self,
+                txs: &[TransactionSigned],
+                marked: bool,
+            ) -> eyre::Result<()> {
+                let hashes = tx_hashes(txs);
+                let txpool = self.txpool.clone();
+                tn_test_utils::wait_until(WAIT, "sealed marks settle", || {
+                    let (txpool, hashes) = (txpool.clone(), hashes.clone());
+                    async move {
+                        Ok(hashes.iter().all(|hash| txpool.sealed_txs().is_marked(hash) == marked))
+                    }
+                })
+                .await
+            }
+
+            /// Wait until no transaction of `txs` is pooled any more.
+            async fn wait_gone(&self, txs: &[TransactionSigned]) -> eyre::Result<()> {
+                let hashes = tx_hashes(txs);
+                let txpool = self.txpool.clone();
+                tn_test_utils::wait_until(WAIT, "transactions leave the pool", || {
+                    let (txpool, hashes) = (txpool.clone(), hashes.clone());
+                    async move { Ok(hashes.iter().all(|hash| txpool.get(hash).is_none())) }
+                })
+                .await
+            }
+
+            /// Wait until nothing is marked. The pool removes a mined transaction before it
+            /// clears the marks of the same update, so a test that saw a transaction leave the
+            /// pool waits for its mark too.
+            async fn wait_no_marks(&self) -> eyre::Result<()> {
+                let txpool = self.txpool.clone();
+                tn_test_utils::wait_until(WAIT, "every sealed mark clears", || {
+                    let txpool = txpool.clone();
+                    async move { Ok(txpool.sealed_txs().is_empty()) }
+                })
+                .await
+            }
+
+            /// Assert every transaction of `txs` is still pooled.
+            fn assert_pooled(&self, txs: &[TransactionSigned]) {
+                for hash in tx_hashes(txs) {
+                    assert!(self.txpool.get(&hash).is_some(), "{hash} must stay visible by hash");
+                }
+            }
+        }
+
+        /// `count` sequential 10-wei transfers from `factory` at the minimum base fee.
+        fn transfers(
+            factory: &mut TransactionFactory,
+            chain: &Arc<RethChainSpec>,
+            count: usize,
+        ) -> Vec<TransactionSigned> {
+            (0..count)
+                .map(|_| {
+                    factory.create_eip1559(
+                        chain.clone(),
+                        None,
+                        u128::from(MIN_PROTOCOL_BASE_FEE),
+                        Some(Address::ZERO),
+                        U256::from(10),
+                        Bytes::new(),
+                    )
+                })
+                .collect()
+        }
+
+        /// The hashes of `txs`, in order.
+        fn tx_hashes(txs: &[TransactionSigned]) -> Vec<TxHash> {
+            txs.iter().map(|tx| *tx.hash()).collect()
+        }
+
+        /// The hashes of a sealed batch's transactions, in batch order.
+        fn hashes(batch: &SealedBatch) -> Vec<TxHash> {
+            batch
+                .batch()
+                .transactions()
+                .iter()
+                .map(|tx| *recover_raw_transaction(tx).expect("batch tx decodes").hash())
+                .collect()
+        }
+
+        /// `hashes` sorted, for batches that mix senders.
+        fn sorted(mut hashes: Vec<TxHash>) -> Vec<TxHash> {
+            hashes.sort();
+            hashes
+        }
+
+        /// The next batch the builder hands the worker.
+        async fn recv(
+            to_worker: &mut ToWorker,
+        ) -> eyre::Result<(SealedBatch, oneshot::Sender<Result<(), BlockSealError>>)> {
+            timeout(WAIT, to_worker.recv())
+                .await?
+                .ok_or_else(|| eyre::eyre!("the builder dropped the worker channel"))
+        }
+
+        /// Receive and ack `Ok` every batch the builder seals until together they carry
+        /// `expected`, in order, and return them. A burst can straddle the fill delay and land
+        /// in more than one batch.
+        async fn recv_covering(
+            to_worker: &mut ToWorker,
+            expected: &[TxHash],
+        ) -> eyre::Result<Vec<SealedBatch>> {
+            let mut batches = Vec::new();
+            let mut sealed = Vec::new();
+            while sealed.len() < expected.len() {
+                let (batch, batch_ack) = recv(to_worker).await?;
+                sealed.extend(hashes(&batch));
+                ack(batch_ack, Ok(()))?;
+                batches.push(batch);
+            }
+            assert_eq!(sealed, expected);
+            Ok(batches)
+        }
+
+        /// Acknowledge a batch with `result`.
+        fn ack(
+            ack: oneshot::Sender<Result<(), BlockSealError>>,
+            result: Result<(), BlockSealError>,
+        ) -> eyre::Result<()> {
+            ack.send(result).map_err(|_| eyre::eyre!("the build task dropped its ack receiver"))
+        }
+
+        /// Assert the builder seals nothing for `wait`.
+        async fn assert_no_batch(to_worker: &mut ToWorker, wait: Duration) {
+            tokio::time::sleep(wait).await;
+            assert_matches!(to_worker.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        /// True if a pool add answered `already imported`, the answer to a resend of pooled
+        /// bytes.
+        fn already_known<T>(result: &Result<T, tn_reth::PoolError>) -> bool {
+            matches!(result, Err(error) if error.kind.to_string() == "already imported")
+        }
+
+        /// I-2 S1: a sender's later batch executes before its earlier one, so execution skips
+        /// it (`nonce too high`). The canonical update for that block clears its marks, the
+        /// builder re-seals the same transactions (same digest), and every transaction executes
+        /// exactly once, with no client resend. Each transaction stays visible by hash until it
+        /// executes.
+        #[tokio::test]
+        async fn s1_a_batch_executed_out_of_order_is_resealed_and_lands_once() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let first = transfers(&mut bench.a, &bench.chain, 4);
+            let second = transfers(&mut bench.a, &bench.chain, 4);
+            let (builder, mut to_worker) = bench.builder(true, true, TICK)?;
+            assert!(builder.keeps_sealed());
+            bench.submit(&first).await;
+            let task = tokio::spawn(builder.run());
+
+            // B1 = a0..a3; a4..a7 arrive while it waits for its quorum
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&first));
+            bench.submit(&second).await;
+            ack(b1_ack, Ok(()))?;
+
+            // the ack marked B1 before the next selection, which skips it and seals a4..a7
+            let (b2, b2_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b2), tx_hashes(&second));
+            assert!(tx_hashes(&first).iter().all(|hash| bench.txpool.is_sealed(hash)));
+            ack(b2_ack, Ok(()))?;
+            bench.wait_marked(&second, true).await?;
+            bench.assert_pooled(&[first.clone(), second.clone()].concat());
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+
+            // B2 executes first and skips everything; its marks clear and a4..a7 are re-sealed
+            let block_1 = bench.execute(&[&b2]).await?;
+            assert_eq!(block_1.gas_used, 0, "a4..a7 are nonce-gapped behind B1");
+            let (b3, b3_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b3), tx_hashes(&second));
+            assert_eq!(b3.digest(), b2.digest(), "the re-seal is the same batch");
+            bench.assert_pooled(&[first.clone(), second.clone()].concat());
+            // the mark is accepted: the earlier execution of this digest predates B3's selection
+            ack(b3_ack, Ok(()))?;
+            bench.wait_marked(&second, true).await?;
+
+            // B1 executes: a0..a3 land, a4..a7 wait in B3 and are not sealed a third time
+            let block_2 = bench.execute(&[&b1]).await?;
+            assert!(block_2.gas_used > 0);
+            bench.wait_gone(&first).await?;
+            bench.assert_pooled(&second);
+            assert_eq!(bench.nonce(bench.a.address())?, 4);
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+
+            // a8..a11 arrive while a4..a7 are still sealed: they are pending, not queued behind a
+            // gap, and sealed at once (step 5 of the case)
+            let third = transfers(&mut bench.a, &bench.chain, 4);
+            bench.submit(&third).await;
+            assert_eq!(bench.txpool.pool_size().queued, 0);
+            let b4 = recv_covering(&mut to_worker, &tx_hashes(&third)).await?;
+            bench.wait_marked(&third, true).await?;
+
+            // B3 executes: a4..a7 land, each once; then a8..a11
+            let block_3 = bench.execute(&[&b3]).await?;
+            assert_eq!(block_3.gas_used, block_2.gas_used, "four transfers executed, once each");
+            bench.execute(&b4.iter().collect::<Vec<_>>()).await?;
+            bench.wait_gone(&[second, third].concat()).await?;
+            bench.wait_no_marks().await?;
+            assert_eq!(bench.nonce(bench.a.address())?, 12);
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+            task.abort();
+            Ok(())
+        }
+
+        /// I-2 S1 pin (switch off): both acks prune their batch and advance the sender's pool
+        /// nonce, so when the later batch executes first and skips everything, nothing is left
+        /// to re-seal: a4..a7 are in no pool and would land only through a client resend.
+        #[tokio::test]
+        async fn s1_pin_switch_off_out_of_order_execution_loses_the_skipped_batch(
+        ) -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let first = transfers(&mut bench.a, &bench.chain, 4);
+            let second = transfers(&mut bench.a, &bench.chain, 4);
+            let (builder, mut to_worker) = bench.builder(false, true, TICK)?;
+            bench.submit(&first).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&first));
+            bench.submit(&second).await;
+            ack(b1_ack, Ok(()))?;
+            let (b2, b2_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b2), tx_hashes(&second));
+            ack(b2_ack, Ok(()))?;
+            bench.wait_gone(&[first.clone(), second.clone()].concat()).await?;
+
+            let block_1 = bench.execute(&[&b2]).await?;
+            assert_eq!(block_1.gas_used, 0, "a4..a7 are nonce-gapped behind B1");
+            bench.execute(&[&b1]).await?;
+            assert_eq!(bench.nonce(bench.a.address())?, 4);
+            for hash in tx_hashes(&second) {
+                assert!(bench.txpool.get(&hash).is_none(), "the switch-off node forgot {hash}");
+            }
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+            assert!(bench.txpool.sealed_txs().is_empty(), "the switch-off path never marks");
+            task.abort();
+            Ok(())
+        }
+
+        /// The race the seal ticket exists for: a batch executes before the builder handles its
+        /// quorum ack. Whichever comes first, the refused mark or the clear of the executed
+        /// digest, the transaction the block skipped ends up pooled and unmarked and is sealed
+        /// again, not held marked for good; then everything lands once.
+        #[tokio::test]
+        async fn a_batch_executed_before_its_ack_is_sealed_again() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let first = transfers(&mut bench.a, &bench.chain, 1);
+            let second = transfers(&mut bench.a, &bench.chain, 1);
+            let (builder, mut to_worker) = bench.builder(true, true, TICK)?;
+            bench.submit(&first).await;
+            let task = tokio::spawn(builder.run());
+
+            // B0 = a0, sealed and marked
+            let (b0, b0_ack) = recv(&mut to_worker).await?;
+            ack(b0_ack, Ok(()))?;
+            bench.wait_marked(&first, true).await?;
+
+            // B1 = a1 executes before its ack and skips a1, nonce-gapped behind a0
+            bench.submit(&second).await;
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&second));
+            let block_1 = bench.execute(&[&b1]).await?;
+            assert_eq!(block_1.gas_used, 0);
+            ack(b1_ack, Ok(()))?;
+
+            let (again, again_ack) = recv(&mut to_worker).await?;
+            assert_eq!(again.digest(), b1.digest(), "a1 is sealed again, in the same batch");
+            assert!(!bench.txpool.sealed_txs().is_marked(second[0].hash()));
+            bench.assert_pooled(&second);
+            ack(again_ack, Ok(()))?;
+            bench.wait_marked(&second, true).await?;
+
+            bench.execute(&[&b0]).await?;
+            bench.execute(&[&again]).await?;
+            bench.wait_gone(&[first, second].concat()).await?;
+            bench.wait_no_marks().await?;
+            assert_eq!(bench.nonce(bench.a.address())?, 2);
+            task.abort();
+            Ok(())
+        }
+
+        /// I-2 S2 (switch on): while a sealed batch waits for commit, a client resend of its
+        /// bytes answers `already imported`, the builder offers none of it, and the batch
+        /// executes once.
+        #[tokio::test]
+        async fn s2_resend_of_a_sealed_batch_is_already_known() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 4);
+            let (builder, mut to_worker) = bench.builder(true, true, TICK)?;
+            bench.submit(&txs).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&txs));
+            ack(b1_ack, Ok(()))?;
+            bench.wait_marked(&txs, true).await?;
+
+            for tx in &txs {
+                let resend = bench.txpool.add_raw_transaction_external(tx.clone()).await;
+                assert!(already_known(&resend), "a resend of sealed bytes is known: {resend:?}");
+            }
+            bench.assert_pooled(&txs);
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+
+            let block = bench.execute(&[&b1]).await?;
+            assert!(block.gas_used > 0);
+            bench.wait_gone(&txs).await?;
+            bench.wait_no_marks().await?;
+            assert_eq!(bench.nonce(bench.a.address())?, 4);
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+            task.abort();
+            Ok(())
+        }
+
+        /// I-2 S2 pin (switch off): the quorum ack prunes the batch, so a client resend of its
+        /// bytes is accepted as new and the builder seals the same transactions again under the
+        /// same digest; the second execution skips all of them. This is the bench-5 duplicate.
+        #[tokio::test]
+        async fn s2_pin_switch_off_resend_reseals_the_same_digest() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 4);
+            let hold = transfers(&mut bench.holder, &bench.chain, 1);
+            let (builder, mut to_worker) = bench.builder(false, true, TICK)?;
+            assert!(!builder.keeps_sealed());
+            bench.submit(&txs).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            ack(b1_ack, Ok(()))?;
+            bench.wait_gone(&txs).await?;
+
+            // the holder's batch keeps the builder busy while all four resends land, so they
+            // share one batch
+            bench.submit(&hold).await;
+            let (held, held_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&held), tx_hashes(&hold));
+            for tx in &txs {
+                let resend = bench.txpool.add_raw_transaction_external(tx.clone()).await;
+                assert!(resend.is_ok(), "the switch-off node forgot the bytes: {resend:?}");
+            }
+            ack(held_ack, Ok(()))?;
+            let (again, again_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&again), tx_hashes(&txs));
+            assert_eq!(again.digest(), b1.digest());
+            ack(again_ack, Ok(()))?;
+
+            let landed = bench.execute(&[&b1]).await?;
+            let skipped = bench.execute(&[&again]).await?;
+            assert!(landed.gas_used > 0);
+            assert_eq!(skipped.gas_used, 0, "the second copy is skipped nonce-too-low");
+            assert!(bench.txpool.sealed_txs().is_empty(), "the switch-off path never marks");
+            task.abort();
+            Ok(())
+        }
+
+        /// I-2 S3 (switch on): a resend of one sender's part of a sealed two-sender batch answers
+        /// `already imported`, so no second batch carries it.
+        #[tokio::test]
+        async fn s3_resend_of_a_subset_is_already_known() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let a_txs = transfers(&mut bench.a, &bench.chain, 4);
+            let b_txs = transfers(&mut bench.b, &bench.chain, 4);
+            let both = [a_txs.clone(), b_txs.clone()].concat();
+            let (builder, mut to_worker) = bench.builder(true, true, TICK)?;
+            bench.submit(&both).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(sorted(hashes(&b1)), sorted(tx_hashes(&both)));
+            ack(b1_ack, Ok(()))?;
+            bench.wait_marked(&both, true).await?;
+
+            for tx in &a_txs {
+                let resend = bench.txpool.add_raw_transaction_external(tx.clone()).await;
+                assert!(already_known(&resend), "a resend of sealed bytes is known: {resend:?}");
+            }
+            assert_no_batch(&mut to_worker, TICK * 2).await;
+
+            bench.execute(&[&b1]).await?;
+            bench.wait_gone(&both).await?;
+            bench.wait_no_marks().await?;
+            assert_eq!(bench.nonce(bench.a.address())?, 4);
+            assert_eq!(bench.nonce(bench.b.address())?, 4);
+            task.abort();
+            Ok(())
+        }
+
+        /// I-2 S3 pin (switch off): after the ack prunes a two-sender batch, one sender's resend
+        /// is accepted and sealed into a second batch with a new digest, whose execution skips
+        /// every copy.
+        #[tokio::test]
+        async fn s3_pin_switch_off_subset_resend_seals_a_new_digest() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let a_txs = transfers(&mut bench.a, &bench.chain, 4);
+            let b_txs = transfers(&mut bench.b, &bench.chain, 4);
+            let hold = transfers(&mut bench.holder, &bench.chain, 1);
+            let both = [a_txs.clone(), b_txs.clone()].concat();
+            let (builder, mut to_worker) = bench.builder(false, true, TICK)?;
+            bench.submit(&both).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            ack(b1_ack, Ok(()))?;
+            bench.wait_gone(&both).await?;
+
+            // the holder's batch keeps the builder busy while A's four resends land
+            bench.submit(&hold).await;
+            let (held, held_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&held), tx_hashes(&hold));
+            for tx in &a_txs {
+                let resend = bench.txpool.add_raw_transaction_external(tx.clone()).await;
+                assert!(resend.is_ok(), "the switch-off node forgot the bytes: {resend:?}");
+            }
+            ack(held_ack, Ok(()))?;
+            let (b2, b2_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b2), tx_hashes(&a_txs));
+            assert_ne!(b2.digest(), b1.digest());
+            ack(b2_ack, Ok(()))?;
+
+            bench.execute(&[&b1]).await?;
+            let skipped = bench.execute(&[&b2]).await?;
+            assert_eq!(skipped.gas_used, 0, "every copy is skipped nonce-too-low");
+            task.abort();
+            Ok(())
+        }
+
+        /// A seal whose report fails (`FailedToReport`, as at an epoch boundary) marks nothing:
+        /// its transactions stay pooled and unmarked, the retry re-seals them, and the retry's
+        /// quorum ack marks them.
+        #[tokio::test]
+        async fn failed_report_marks_nothing_and_the_retry_reseals() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 2);
+            let (builder, mut to_worker) = bench.builder(true, true, TICK)?;
+            bench.submit(&txs).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            ack(b1_ack, Err(BlockSealError::FailedToReport))?;
+
+            // the retry on the next tick proves the failure was taken: nothing was marked
+            let (retry, retry_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&retry), hashes(&b1));
+            assert!(bench.txpool.sealed_txs().is_empty());
+            bench.assert_pooled(&txs);
+
+            ack(retry_ack, Ok(()))?;
+            bench.wait_marked(&txs, true).await?;
+            bench.assert_pooled(&txs);
+            task.abort();
+            Ok(())
+        }
+
+        /// With the switch on, a builder whose worker forwards instead of sealing by quorum
+        /// prunes an acked batch as today and marks nothing: its own digest never executes.
+        #[tokio::test]
+        async fn observer_prunes_an_acked_batch_as_today() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 2);
+            let (builder, mut to_worker) = bench.builder(true, false, TICK)?;
+            assert!(builder.sealed_tx_keep() && !builder.keeps_sealed());
+            bench.submit(&txs).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&txs));
+            ack(b1_ack, Ok(()))?;
+            bench.wait_gone(&txs).await?;
+            assert!(bench.txpool.sealed_txs().is_empty());
+            task.abort();
+            Ok(())
+        }
+
+        /// A mark whose blocking task fails falls back to the prune path for that batch: the
+        /// outcome carries the batch's hashes and optimistic account changes. A finished mark
+        /// keeps the transactions, whatever it marked.
+        #[tokio::test]
+        async fn mark_join_error_falls_back_to_pruning() {
+            let failed = tokio::task::spawn_blocking(|| -> usize { panic!("the mark task fails") })
+                .await
+                .expect_err("the blocking task panicked");
+            let hash = TxHash::repeat_byte(7);
+            let address = Address::repeat_byte(1);
+            let mined = || MinedBatchResult {
+                mined_transactions: vec![hash],
+                changed_accounts: vec![ChangedAccount {
+                    address,
+                    nonce: 3,
+                    balance: U256::from(5),
+                }],
+            };
+            let digest = BlockHash::repeat_byte(9);
+
+            assert_matches!(
+                outcome_after_mark(Err(failed), digest, mined()),
+                BuildOutcome::Mined(MinedBatchResult { mined_transactions, changed_accounts })
+                    if mined_transactions == vec![hash]
+                        && changed_accounts.iter().map(|account| (account.address, account.nonce))
+                            .eq([(address, 3)])
+            );
+            assert_matches!(outcome_after_mark(Ok(0), digest, mined()), BuildOutcome::Kept);
+            assert_matches!(outcome_after_mark(Ok(1), digest, mined()), BuildOutcome::Kept);
+        }
+
+        /// The builder logs its effective mode once when it starts: the configured switch, what
+        /// the node reported about the worker, and whether marks are made. A switch that is on
+        /// while nothing marks is visible on this line.
+        #[tokio::test]
+        async fn start_line_reports_the_effective_mode() -> eyre::Result<()> {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new()?;
+            let bench = Bench::new(tmp_dir.path())?;
+            for (keep, quorum) in [(true, false), (true, true)] {
+                let (builder, _to_worker) = bench.builder(keep, quorum, LONG_TICK)?;
+                let task = tokio::spawn(builder.run());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                task.abort();
+            }
+            let lines: Vec<_> = capture
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.field("message") == Some("batch builder started"))
+                .map(|event| {
+                    ["sealed_tx_keep", "seals_via_quorum", "keeps_sealed"]
+                        .map(|name| event.field(name).unwrap_or_default().to_string())
+                })
+                .collect();
+            assert_eq!(lines, [["true", "false", "false"], ["true", "true", "true"]]);
+            Ok(())
+        }
+
+        /// An empty build that skipped only sealed transactions leaves nothing to retry, so the
+        /// next arrival is sealed after the fill delay rather than at the batch-delay tick, as
+        /// after a pass that finds nothing pending.
+        #[tokio::test]
+        async fn arrival_after_an_all_sealed_build_arms_the_fill_delay() -> eyre::Result<()> {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let first = transfers(&mut bench.a, &bench.chain, 1);
+            let second = transfers(&mut bench.a, &bench.chain, 1);
+            let (builder, mut to_worker) = bench.builder(true, true, LONG_TICK)?;
+            bench.submit(&first).await;
+            let task = tokio::spawn(builder.run());
+
+            let (b1, b1_ack) = recv(&mut to_worker).await?;
+            assert_eq!(hashes(&b1), tx_hashes(&first));
+            ack(b1_ack, Ok(()))?;
+            // the build right after the ack finds only the sealed transaction
+            let all_sealed = || {
+                capture.0.lock().unwrap().iter().any(|event| {
+                    event.field("message")
+                        == Some("transaction selection produced an empty batch; sealing nothing")
+                        && event.field("sealed_skipped") == Some("1")
+                })
+            };
+            tn_test_utils::wait_until(WAIT, "an all-sealed build", || async { Ok(all_sealed()) })
+                .await?;
+
+            let submitted = Instant::now();
+            bench.submit(&second).await;
+            let (b2, b2_ack) = recv(&mut to_worker).await?;
+            let waited = submitted.elapsed();
+            assert!(waited >= BATCH_WAKE_FILL_DELAY, "built before the fill delay: {waited:?}");
+            assert_eq!(hashes(&b2), tx_hashes(&second));
+            let wakes: Vec<_> = capture
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.field("message") == Some("batch built"))
+                .filter_map(|event| event.field("wake").map(str::to_string))
+                .collect();
+            assert_eq!(wakes, ["tick", "arrival"]);
+            ack(b2_ack, Ok(()))?;
+            task.abort();
+            Ok(())
         }
     }
 }

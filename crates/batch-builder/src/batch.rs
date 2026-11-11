@@ -41,6 +41,11 @@ pub struct BatchBuilderOutput {
     pub(crate) peer_deferred: usize,
     /// Transactions evicted for exceeding a whole-batch limit, excluding their descendants.
     pub(crate) unpackable: usize,
+    /// The number of transactions skipped because this node sealed them into a batch that has
+    /// not executed yet (switch `sealed_tx_keep`, issue #1807).
+    ///
+    /// Always zero with the switch off: only the builder marks, and only with the switch on.
+    pub(crate) sealed_skipped: usize,
     /// Selection statistics for the `batch built` line and the build metrics.
     pub(crate) stats: BuildStats,
 }
@@ -152,6 +157,7 @@ pub fn build_batch<P: TxPool>(
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
     let mut sender_costs: HashMap<Address, U256> = HashMap::new();
     let mut peer_deferred: usize = 0;
+    let mut sealed_skipped: usize = 0;
     // the first remaining-capacity limit that turned a transaction away
     let mut capacity_limit: Option<BuildReason> = None;
     // pool admission time of every included transaction, turned into ages after selection
@@ -160,6 +166,17 @@ pub fn build_batch<P: TxPool>(
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
+        // A transaction this node sealed into a batch that has not executed stays pooled and
+        // marked (switch `sealed_tx_keep`). Skip it before every other check and without any
+        // `best_txs` call: the iterator has already unlocked the sender's next nonce, so later
+        // nonces stay buildable while this one executes from its batch. A peer deferral here
+        // would drop those descendants (issue #1329). The skip stays out of the unpackable and
+        // peer-deferred counts and out of the sender's optimistic nonce.
+        if pool.is_sealed(pool_tx.hash()) {
+            sealed_skipped = sealed_skipped.saturating_add(1);
+            continue;
+        }
+
         // Check whole-batch limits before peer or remaining-capacity deferrals. A transaction
         // that cannot fit an empty batch must be evicted even when higher-priority traffic
         // exhausts capacity on every build. Clone and encode only transactions selected below.
@@ -329,6 +346,7 @@ pub fn build_batch<P: TxPool>(
         changed_accounts,
         peer_deferred,
         unpackable,
+        sealed_skipped,
         stats,
     }
 }
@@ -860,5 +878,77 @@ mod tests {
             (output.stats.pool_age_p50, output.stats.pool_age_max),
             (Duration::ZERO, Duration::ZERO)
         );
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// `count` sequential 1-wei transfers from `factory`, encoded.
+    fn transfers(factory: &mut TransactionFactory, count: usize) -> Vec<Vec<u8>> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        (0..count)
+            .map(|_| {
+                factory.create_eip1559_encoded(
+                    chain.clone(),
+                    None,
+                    100,
+                    None,
+                    U256::from(1),
+                    Bytes::new(),
+                )
+            })
+            .collect()
+    }
+
+    /// The hash of an encoded transaction.
+    fn hash_of(encoded: &[u8]) -> TxHash {
+        *tn_reth::recover_raw_transaction(encoded).expect("test transaction decodes").hash()
+    }
+
+    /// I-2 S1 at selection: transactions this node sealed into an unexecuted batch stay in
+    /// the pool and are skipped, without `mark_invalid`, so the sender's later nonces are still
+    /// packed. A sender whose every transaction is sealed gets no optimistic account update, and
+    /// the skips are counted apart from peer deferrals and evictions.
+    #[test]
+    fn sealed_transactions_are_skipped_without_dropping_successors() {
+        let mut factory_a = TransactionFactory::new();
+        let mut factory_b = TransactionFactory::new_random();
+        let a = transfers(&mut factory_a, 4);
+        let b = transfers(&mut factory_b, 2);
+        let mut pool = TestPool::new(&[a.clone(), b.clone()].concat());
+        // a0, a1 and both of B's transactions are in flight in this node's own batches
+        pool.seal([&a[0], &a[1], &b[0], &b[1]].map(|tx| hash_of(tx)));
+
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        assert_eq!(output.batch.transactions, a[2..].to_vec(), "A's later nonces stay buildable");
+        assert_eq!(output.mined_transactions, vec![hash_of(&a[2]), hash_of(&a[3])]);
+        assert_eq!(output.sealed_skipped, 4);
+        assert_eq!((output.peer_deferred, output.unpackable), (0, 0));
+        // only A packed anything: B's sealed nonces never reach the optimistic update
+        assert_eq!(output.changed_accounts.len(), 1);
+        let changed = output.changed_accounts.first().expect("A's account update");
+        assert_eq!((changed.address, changed.nonce), (factory_a.address(), 4));
+        // selection removed nothing: the sealed transactions are still pooled
+        assert_eq!(pending_encoded(&pool).len(), 6);
+    }
+
+    /// The sealed skip comes before the peer deferral: a transaction both sealed here and seen in
+    /// a peer's batch is skipped as sealed, so its successor is still packed. A peer deferral
+    /// would have dropped the successor for this build.
+    #[test]
+    fn sealed_skip_precedes_the_peer_deferral() {
+        let mut factory = TransactionFactory::new();
+        let txs = transfers(&mut factory, 2);
+        let mut pool = TestPool::new(&txs);
+        let first = hash_of(&txs[0]);
+        pool.seal([first]);
+        pool.record_peer_batch(&[first]);
+
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        assert_eq!(output.batch.transactions, vec![txs[1].clone()]);
+        assert_eq!((output.sealed_skipped, output.peer_deferred), (1, 0));
     }
 }
