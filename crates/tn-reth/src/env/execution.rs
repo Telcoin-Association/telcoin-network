@@ -58,6 +58,14 @@
 //! callers that do not need the commit boundary. [`RethEnv::finalize_block`] is
 //! in-memory only (the finalized/safe watches plus pruning persisted blocks from
 //! the in-memory state); its database half happens inside the atomic commit above.
+//!
+//! With the engine's `pipelined_persist` on, the persist, announce and finalize of
+//! output N run on a commit thread while output N+1 builds on N's in-memory blocks.
+//! The order above still holds for every output, and across outputs: one persist at a
+//! time, in consensus order, each announced only after its own commit, so consensus
+//! never hears of a block that is not durable. `finalize_block(N)` then prunes N's
+//! blocks from the in-memory chain while N+1's blocks sit above them; reth keeps every
+//! block above the persisted height (see [`RethEnv::finalize_block`]).
 
 use std::{
     sync::Arc,
@@ -214,9 +222,11 @@ impl RethEnv {
     /// blocks built from the result through [`Self::build_block_from_recovered_payload`] equal
     /// those [`Self::build_block_from_batch_payload`] builds from the bytes.
     ///
-    /// Batches and the transactions within each batch are recovered in parallel on the global
-    /// rayon pool. The engine calls this on a blocking job when an output enters its queue, so
-    /// the work overlaps the previous output's execution.
+    /// Batches and the transactions within each batch are recovered in parallel on the current
+    /// rayon pool: the global one, unless the caller runs this inside another pool (the engine's
+    /// dedicated recovery pool when `recovery_threads` is above zero). The engine calls this on a
+    /// blocking job when an output enters its queue, so the work overlaps the previous output's
+    /// execution.
     pub fn recover_output_signers(
         output: &ConsensusOutput,
     ) -> Vec<Vec<Recovered<TransactionSigned>>> {
@@ -398,9 +408,17 @@ impl RethEnv {
     /// Finalize the block (header) executed from consensus output in memory.
     ///
     /// The finalized/safe database markers are persisted atomically with the blocks in
-    /// [`Self::finish_executing_output`]; this method only updates the in-memory
+    /// [`Self::persist_executed_output`]; this method only updates the in-memory
     /// finalized/safe watches (consumed by components like RPC) and prunes persisted blocks
     /// from the canonical in-memory state.
+    ///
+    /// A pipelined engine calls this on its commit thread while the next output builds, so
+    /// unpersisted blocks above `header` may be in memory. `remove_persisted_blocks` keeps every
+    /// block above `header`'s number and relinks the lowest of them to the database, and it
+    /// takes the same two write locks in the same order as the build's chain updates, so that
+    /// build keeps resolving `header`'s state, now from the database (the engine's
+    /// `test_finalize_during_next_build_keeps_unpersisted_blocks` lands this call between two
+    /// block builds of the next output).
     pub fn finalize_block(&self, header: SealedHeader) -> TnRethResult<()> {
         let num_hash = header.num_hash();
         // this clears up old blocks in-memory
@@ -458,6 +476,19 @@ impl RethEnv {
     /// MDBX file (page-operation deltas, the process's `write_bytes` delta, the used size, the GC
     /// table; see `PersistStorage` in `env/mdbx_advice.rs`), read in microseconds without a second
     /// open of the environment. A failed attempt records nothing.
+    ///
+    /// With a pipelined engine this persist overlaps the next output's build, and the storage
+    /// fields still describe the persist's own window. MDBX runs one write transaction at a time
+    /// and a build only reads, so the page-operation deltas are this persist's alone;
+    /// `prefault_wchar_bytes` counts per thread (the persisting thread and the transaction-manager
+    /// thread), so the build's thread is not in it; the used size, last page and GC table are read
+    /// after the commit and mean what they mean sequentially. `proc_write_bytes` is process-wide:
+    /// it always included the process's other writers in the window (the consensus database, log
+    /// files), and it now also includes what the concurrent build writes, which is no database
+    /// page but does include its log lines, so read it as an upper bound of this persist's bytes.
+    /// The read transaction pinned for the next build's roots is opened at the database tip just
+    /// before this persist, so it keeps no page alive that this persist could otherwise reuse. The
+    /// phase timings are wall time and include CPU contention with the build.
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -886,11 +917,12 @@ impl OutputBuildScope {
     ///   in order, each added with [`OutputTrieOverlay::extend_from_block`]. A block whose persist
     ///   is still in flight is unpersisted: leaving it out leaves a gap, and every state root built
     ///   over the overlay is wrong.
-    /// - A persist of those blocks may commit while the scope builds, so later roots can read a
-    ///   database that already holds some of the overlay's runs. That reads the same state only
-    ///   because each run holds absolute values (accounts, slots, tombstones, wipes and trie
-    ///   nodes); a caller that lets a persist commit mid-output relies on it and must keep it
-    ///   pinned by a differential test.
+    /// - A persist of those blocks may commit while the scope builds, so `overlay` must be pinned
+    ///   ([`RethEnv::pin_output_overlay`]) at the database anchor before any of those persists can
+    ///   commit: every root then reads that one snapshot under the runs, whatever commits while the
+    ///   scope builds. An unpinned overlay reads the database tip through a fresh transaction per
+    ///   root, so a commit mid-output would layer runs over a database that already holds them; do
+    ///   not seed one while a persist of its blocks may commit.
     /// - The blocks up to `tip` stay in reth's in-memory canonical state until their persist
     ///   commits, since the build reads `tip`'s state through it.
     pub fn seeded(overlay: OutputTrieOverlay, tip: B256) -> Self {
