@@ -394,20 +394,28 @@ pub fn config_observer(
 /// Settings a test layers onto one node of a local fleet, on top of the harness's own setup.
 ///
 /// Both lists are empty by default, and an empty [`NodeOverrides`] starts the node exactly as the
-/// harness does without one: its `parameters.yaml` is neither read nor rewritten and its process
-/// gets no extra variable.
+/// harness does without one: on a datadir no earlier start gave entries to, its `parameters.yaml`
+/// is neither read nor rewritten, and its process gets no extra variable.
 ///
 /// - `parameters` holds top-level `parameters.yaml` entries as `(key, raw YAML value)` pairs. The
 ///   start helpers merge them into the node's own `parameters.yaml`, the file the `config_*`
 ///   genesis helpers wrote, right before they spawn the node (see
-///   [`NodeOverrides::apply_parameters`] and [`merge_parameters_yaml`]). The harness knows none of
-///   the keys: the node's `Parameters` ignores a top-level key it does not know, so a test can name
-///   a switch whether or not the node under test reads it.
+///   [`NodeOverrides::apply_parameters`] and [`merge_parameters_yaml`]). Every start rewrites the
+///   file as the harness wrote it plus that start's entries, so a node restarted with other
+///   entries, or with none, does not keep an earlier start's. The harness knows none of the keys:
+///   the node's `Parameters` ignores a top-level key it does not know, so a test can name a switch
+///   whether or not the node under test reads it. The same holds for a misspelled key, or one the
+///   node reads from another file, so a test should check the setting took effect from the node's
+///   own report of it (its `node switches` log line) rather than trust the merge.
 /// - `env` holds environment variables for the node's process only, set after the variables
 ///   [`TestBinary::command`] forwards, so an entry overrides a forwarded variable of the same name.
 ///   This is how a test arms the hooks in `tn_types::test_hooks` (for example
 ///   `TN_TEST_EXECUTION_DELAY_MS`) on chosen nodes. Never export such a variable from the harness
 ///   process instead: every node spawned afterwards would inherit it.
+///
+/// A setting that changes what the chain computes, such as a `TN_*_FORK_EPOCH` variable or the
+/// `basefee_address` parameter, forks the fleet when only some nodes carry it. Give those to every
+/// node or to none, unless the divergence is what the test is about.
 ///
 /// [`FleetOverrides`] assigns these per node across a fleet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -441,100 +449,137 @@ impl NodeOverrides {
         self.parameters.is_empty() && self.env.is_empty()
     }
 
-    /// Merge [`NodeOverrides::parameters`] into `<node_dir>/parameters.yaml` (see
-    /// [`merge_parameters_yaml`]), then check the node's own loader still reads the merged file as
-    /// `Parameters`, so a malformed value fails the test here rather than the node at startup.
+    /// Write `<node_dir>/parameters.yaml` as the harness wrote it plus
+    /// [`NodeOverrides::parameters`] (see [`merge_parameters_yaml`]).
     ///
-    /// With no parameters this does nothing: the file is neither read nor rewritten. Applying the
-    /// same overrides again leaves the file as the first application did, so a test can run this
+    /// The first application with entries keeps the harness's file beside it as
+    /// `parameters.yaml.harness-base`, and every later one merges into that copy, so applying the
+    /// same entries again leaves the file as it was and applying other entries does not keep the
+    /// earlier ones. Applying no entries puts the harness's file back if an earlier application
+    /// changed it, and otherwise neither reads nor rewrites anything. The start helpers call this
     /// before every start of a node, restarts included.
+    ///
+    /// The merged text is written to `parameters.yaml.merging` first and moved into place only
+    /// once the node's own loader reads it as `Parameters`, so a malformed value fails here and
+    /// leaves the node's file as it was (and the refused merge in place for inspection). That
+    /// proves the file deserializes, not that the node accepts every value: the epoch timing
+    /// checks, for one, run when the node enters an epoch it can vote in, so a duration of the
+    /// right type that those checks refuse still fails there.
     pub fn apply_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
+        let path = node_dir.join("parameters.yaml");
+        let harness_base = node_dir.join("parameters.yaml.harness-base");
         if self.parameters.is_empty() {
+            if harness_base.exists() {
+                std::fs::rename(&harness_base, &path).wrap_err_with(|| {
+                    format!("restoring {} from {}", path.display(), harness_base.display())
+                })?;
+            }
             return Ok(());
         }
-        let path = node_dir.join("parameters.yaml");
-        let base = std::fs::read_to_string(&path)
-            .wrap_err_with(|| format!("reading {} to merge overrides", path.display()))?;
+        if !harness_base.exists() {
+            std::fs::copy(&path, &harness_base).wrap_err_with(|| {
+                format!("keeping {} as {}", path.display(), harness_base.display())
+            })?;
+        }
+        let base = std::fs::read_to_string(&harness_base)
+            .wrap_err_with(|| format!("reading {} to merge overrides", harness_base.display()))?;
         let merged = merge_parameters_yaml(&base, &self.parameters)?;
-        std::fs::write(&path, merged)
-            .wrap_err_with(|| format!("writing merged overrides to {}", path.display()))?;
-        Config::load_from_path::<Parameters>(&path, ConfigFmt::YAML).wrap_err_with(|| {
+        let staged = node_dir.join("parameters.yaml.merging");
+        std::fs::write(&staged, merged)
+            .wrap_err_with(|| format!("writing merged overrides to {}", staged.display()))?;
+        Config::load_from_path::<Parameters>(&staged, ConfigFmt::YAML).wrap_err_with(|| {
             format!(
-                "{} no longer loads as node parameters after merging {:?}",
-                path.display(),
+                "{} does not load as node parameters after merging {:?}",
+                staged.display(),
                 self.parameters
             )
         })?;
+        std::fs::rename(&staged, &path)
+            .wrap_err_with(|| format!("moving {} to {}", staged.display(), path.display()))?;
         Ok(())
     }
 }
 
-/// Per-node [`NodeOverrides`] for a local fleet, keyed by node index.
+/// Per-node [`NodeOverrides`] for a local fleet, keyed by the name of each node's datadir under
+/// the test's temp dir.
 ///
-/// The index is the one the start helpers take: `instance` for the node whose datadir is
-/// `validator-<instance + 1>`, or the position in the `validators` slice for the helpers that take
-/// one. A node with no entry starts as the harness starts it. The builders add one setting to
-/// every node they name, so a mixed fleet reads as one chain:
+/// The start helpers look a node up by that name, so a fleet means the same nodes to every helper
+/// and to a restart of a subset: `validator-<instance + 1>` for the helpers that take an
+/// `instance` (the `config_local_testnet*` layout), the name in the `validators` slice for those
+/// that take one. A node with no entry starts as the harness starts it. The builders add one
+/// setting to every node they name, so a mixed fleet reads as one chain:
 ///
 /// ```
 /// use e2e_tests::FleetOverrides;
 ///
-/// // nodes 0 and 1 run with the switch, nodes 2 and 3 without it
-/// let overrides = FleetOverrides::default().parameter([0, 1], "pipelined_persist", "true");
-/// assert!(overrides.node(2).is_empty());
+/// // validators 1 and 2 (instances 0 and 1) run with the switch, 3 and 4 without it
+/// let overrides = FleetOverrides::default().parameter(
+///     ["validator-1", "validator-2"],
+///     "pipelined_persist",
+///     "true",
+/// );
+/// assert!(overrides.node("validator-3").is_empty());
 ///
-/// // three of four nodes execute each output 400 ms later
-/// let overrides = FleetOverrides::default().env([1, 2, 3], "TN_TEST_EXECUTION_DELAY_MS", "400");
-/// assert!(overrides.node(0).is_empty());
+/// // three of four validators execute each output 400 ms later
+/// let overrides = FleetOverrides::default().env(
+///     ["validator-2", "validator-3", "validator-4"],
+///     "TN_TEST_EXECUTION_DELAY_MS",
+///     "400",
+/// );
+/// assert!(overrides.node("validator-1").is_empty());
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetOverrides {
-    /// The overrides of each node that has any, by node index.
-    nodes: BTreeMap<usize, NodeOverrides>,
+    /// The overrides of each node that has any, by datadir name.
+    nodes: BTreeMap<String, NodeOverrides>,
 }
 
 impl FleetOverrides {
     /// Add the top-level `parameters.yaml` entry `key: value` (see [`NodeOverrides::parameter`])
-    /// to every node in `nodes`.
+    /// to every node in `nodes`, named by datadir.
     pub fn parameter(
         mut self,
-        nodes: impl IntoIterator<Item = usize>,
+        nodes: impl IntoIterator<Item = impl Into<String>>,
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Self {
         let (key, value) = (key.into(), value.into());
-        for index in nodes {
-            self.nodes.entry(index).or_default().parameters.push((key.clone(), value.clone()));
+        for node in nodes {
+            self.nodes
+                .entry(node.into())
+                .or_default()
+                .parameters
+                .push((key.clone(), value.clone()));
         }
         self
     }
 
     /// Add the environment variable `name=value` (see [`NodeOverrides::env`]) to every node in
-    /// `nodes`.
+    /// `nodes`, named by datadir.
     pub fn env(
         mut self,
-        nodes: impl IntoIterator<Item = usize>,
+        nodes: impl IntoIterator<Item = impl Into<String>>,
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Self {
         let (name, value) = (name.into(), value.into());
-        for index in nodes {
-            self.nodes.entry(index).or_default().env.push((name.clone(), value.clone()));
+        for node in nodes {
+            self.nodes.entry(node.into()).or_default().env.push((name.clone(), value.clone()));
         }
         self
     }
 
-    /// Replace node `index`'s overrides with `overrides`.
-    pub fn set_node(mut self, index: usize, overrides: NodeOverrides) -> Self {
-        self.nodes.insert(index, overrides);
+    /// Replace the overrides of the node whose datadir is `node` with `overrides`.
+    pub fn set_node(mut self, node: impl Into<String>, overrides: NodeOverrides) -> Self {
+        self.nodes.insert(node.into(), overrides);
         self
     }
 
-    /// Node `index`'s overrides, empty when the fleet sets none for it.
-    pub fn node(&self, index: usize) -> &NodeOverrides {
+    /// The overrides of the node whose datadir is `node`, empty when the fleet sets none for it.
+    pub fn node(&self, node: &str) -> &NodeOverrides {
         /// The overrides of a node the fleet sets nothing for.
         static NONE: NodeOverrides = NodeOverrides { parameters: Vec::new(), env: Vec::new() };
-        self.nodes.get(&index).unwrap_or(&NONE)
+        self.nodes.get(node).unwrap_or(&NONE)
     }
 }
 
@@ -966,6 +1011,7 @@ mod tests {
             .apply_parameters(dir.path())
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "a no-op left files behind");
 
         let overrides = NodeOverrides::default()
             .parameter("bench6_unknown_switch", "true")
@@ -983,33 +1029,63 @@ mod tests {
         overrides.apply_parameters(dir.path()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
 
-        // a value the node cannot read fails the merge, not the node's startup
+        // a value the node cannot read fails the merge and leaves the node's file alone
         let bad = NodeOverrides::default().parameter("max_header_delay", "soon");
         assert!(bad.apply_parameters(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+    }
+
+    /// Each start gets the harness's file plus its own entries: a restart with other entries
+    /// drops the earlier ones, and a restart with none puts the harness's file back.
+    #[test]
+    fn apply_parameters_starts_each_run_from_the_harness_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        NodeOverrides::default()
+            .parameter("switch_a", "true")
+            .apply_parameters(dir.path())
+            .unwrap();
+        NodeOverrides::default()
+            .parameter("switch_b", "true")
+            .apply_parameters(dir.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{written}switch_b: true\n"));
+
+        NodeOverrides::default().apply_parameters(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "the restore left files");
     }
 
     #[test]
     fn fleet_overrides_assign_each_setting_to_the_named_nodes() {
-        let fleet = FleetOverrides::default().parameter([0, 1], "pipelined_persist", "true").env(
-            [1, 2, 3],
-            "TN_TEST_EXECUTION_DELAY_MS",
-            "400",
-        );
-        assert_eq!(fleet.node(0), &NodeOverrides::default().parameter("pipelined_persist", "true"));
+        let fleet = FleetOverrides::default()
+            .parameter(["validator-1", "validator-2"], "pipelined_persist", "true")
+            .env(
+                ["validator-2", "validator-3", "validator-4"],
+                "TN_TEST_EXECUTION_DELAY_MS",
+                "400",
+            );
         assert_eq!(
-            fleet.node(1),
+            fleet.node("validator-1"),
+            &NodeOverrides::default().parameter("pipelined_persist", "true")
+        );
+        assert_eq!(
+            fleet.node("validator-2"),
             &NodeOverrides::default()
                 .parameter("pipelined_persist", "true")
                 .env("TN_TEST_EXECUTION_DELAY_MS", "400")
         );
         assert_eq!(
-            fleet.node(3),
+            fleet.node("validator-4"),
             &NodeOverrides::default().env("TN_TEST_EXECUTION_DELAY_MS", "400")
         );
-        assert!(fleet.node(4).is_empty());
-        assert!(FleetOverrides::default().node(0).is_empty());
+        assert!(fleet.node("new-validator").is_empty());
+        assert!(FleetOverrides::default().node("validator-1").is_empty());
 
-        let replaced = fleet.set_node(1, NodeOverrides::default());
-        assert!(replaced.node(1).is_empty());
+        let replaced = fleet.set_node("validator-2", NodeOverrides::default());
+        assert!(replaced.node("validator-2").is_empty());
     }
 }

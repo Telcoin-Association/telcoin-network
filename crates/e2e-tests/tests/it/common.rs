@@ -479,26 +479,24 @@ pub(crate) fn start_validator_with_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Child {
-    let overrides = extra_env
+    let node = extra_env
         .iter()
-        .fold(NodeOverrides::default(), |overrides, (name, value)| overrides.env(*name, *value));
-    start_validator_with_overrides(
-        instance, bin, base_dir, rpc_port, test, run, extra_args, &overrides,
-    )
-    .expect("failed to execute")
+        .fold(NodeOverrides::default(), |node, (name, value)| node.env(*name, *value));
+    let fleet = FleetOverrides::default().set_node(format!("validator-{}", instance + 1), node);
+    start_validator_with_overrides(instance, bin, base_dir, rpc_port, test, run, extra_args, &fleet)
+        .expect("failed to execute")
 }
 
-/// Start a validator node process with additional CLI arguments and the test's
-/// [`NodeOverrides`] for that node, usually `fleet.node(instance)` of a [`FleetOverrides`].
+/// Start a validator node process with additional CLI arguments and the overrides `fleet` sets
+/// for it, looked up by its datadir name `validator-<instance + 1>`.
 ///
-/// The overrides' `parameters.yaml` entries are merged into the node's datadir
-/// (`base_dir/validator-<instance + 1>`) before it starts (see
-/// [`NodeOverrides::apply_parameters`]); calling this again for a restart merges them again,
-/// which leaves the file as it was. Its environment variables are set on the spawned command
-/// as [`start_validator_with_env`] sets `extra_env`, which delegates here. Empty overrides start
-/// the node exactly as [`start_validator_with_args`] does.
-///
-/// [`FleetOverrides`]: e2e_tests::FleetOverrides
+/// Its `parameters.yaml` entries are merged into `base_dir/validator-<instance + 1>` before it
+/// starts (see [`NodeOverrides::apply_parameters`]): every start writes the harness's file plus
+/// that start's entries, so a restart with the same fleet leaves the file as it was, and a restart
+/// through any other start helper puts the harness's file back. Its environment variables are set
+/// on the spawned command after the variables [`TestBinary::command`] forwards
+/// ([`start_validator_with_env`] delegates here with a one-node fleet). A node the fleet sets
+/// nothing for starts exactly as [`start_validator_with_args`] starts it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_validator_with_overrides(
     instance: usize,
@@ -508,9 +506,11 @@ pub(crate) fn start_validator_with_overrides(
     test: &str,
     run: u32,
     extra_args: &[&str],
-    overrides: &NodeOverrides,
+    fleet: &FleetOverrides,
 ) -> eyre::Result<Child> {
-    let data_dir = base_dir.join(format!("validator-{}", instance + 1));
+    let name = format!("validator-{}", instance + 1);
+    let overrides = fleet.node(&name);
+    let data_dir = base_dir.join(&name);
     overrides.apply_parameters(&data_dir)?;
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -1170,26 +1170,28 @@ pub(crate) fn start_nodes(
     start_nodes_with_overrides(temp_path, validators, test, run, &FleetOverrides::default())
 }
 
-/// Like [`start_nodes`], with the test's per-node [`FleetOverrides`], keyed by each node's
-/// position in `validators`.
+/// Like [`start_nodes`], with the overrides `fleet` sets for each node, looked up by its name in
+/// `validators` (its datadir under `temp_path`), so a restart of a subset finds the same nodes'
+/// overrides.
 ///
-/// Node `i`'s `parameters.yaml` entries are merged into `temp_path/<validators[i].0>` before it
-/// starts (see [`NodeOverrides::apply_parameters`]) and its environment variables are set on its
-/// process only. A node without overrides starts exactly as [`start_nodes`] starts it.
+/// A node's `parameters.yaml` entries are merged into `temp_path/<name>` before it starts (see
+/// [`NodeOverrides::apply_parameters`]; a start without entries puts the harness's file back), and
+/// its environment variables are set on its process only. A node the fleet sets nothing for
+/// starts exactly as [`start_nodes`] starts it.
 pub(crate) fn start_nodes_with_overrides(
     temp_path: &Path,
     validators: &[(&str, Address)],
     test: &str,
     run: u32,
-    overrides: &FleetOverrides,
+    fleet: &FleetOverrides,
 ) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
     let bin = e2e_tests::get_telcoin_network_binary();
 
     let mut children = Vec::new();
     let mut endpoints = Vec::new();
-    for (index, (v, _)) in validators.iter().enumerate() {
+    for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
-        let node_overrides = overrides.node(index);
+        let node_overrides = fleet.node(v);
         node_overrides.apply_parameters(&dir)?;
 
         if *v == NEW_VALIDATOR {
