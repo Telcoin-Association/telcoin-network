@@ -381,6 +381,30 @@ pub struct Parameters {
     // "Parameters::switch_at_default")]`, whose type's default is the behaviour from before the
     // switch existed; every field here also gets its default in `Default for Parameters` and an
     // entry in `runtime_switches!`
+    /// Propose headers that name the execution block a quorum of parents has reached, not this
+    /// node's own newest block.
+    ///
+    /// When `true`, the proposer ranks its own tip and each same-epoch parent's latest execution
+    /// block by voting weight and names the highest block that holders of 2f+1 weight have
+    /// reached, capped at its own tip and never older than a fixed number of entries back in its
+    /// recent-blocks ring. Voters then rarely wait for, or refuse, a block they have not executed.
+    /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
+    /// keeps the previous behaviour: every header names this node's own newest executed block.
+    /// Issue #1804.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub quorum_exec_block: bool,
+    /// When the proposer applies the [`Self::quorum_exec_block`] rule. Only matters while that
+    /// switch is `true`.
+    ///
+    /// The default `0` applies the rule to every header, as first designed. A value `K` above
+    /// zero names this node's own execution tip by default and applies the rule only for `K`
+    /// rounds after one of this node's headers was cancelled uncertified, doubling `K` while that
+    /// keeps happening. With the rule on every header, the blocks parents name are earlier picks
+    /// of the same rule rather than tips, so every proposer settles at the ring floor; `K` keeps
+    /// tips in the parents. Issue #1804.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub quorum_exec_block_starved_rounds: u32,
+
     /// Re-vote one older uncertified epoch record of this node's own at each epoch close and at
     /// startup, and keep verified epoch-vote signatures across vote rounds.
     ///
@@ -562,6 +586,8 @@ impl Default for Parameters {
                 Parameters::default_parallel_fetch_request_delay_interval(),
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             // ---- runtime switches: begin ----
+            quorum_exec_block: false,
+            quorum_exec_block_starved_rounds: 0,
             epoch_record_recertify: false,
             epoch_record_collect_past_uncertified: false,
             vote_queue_fix: false,
@@ -764,6 +790,8 @@ macro_rules! runtime_switches {
 runtime_switches! {
     // ---- runtime switches: begin ----
     // one entry per switch field, in the order the node lists them
+    quorum_exec_block,
+    quorum_exec_block_starved_rounds,
     epoch_record_recertify,
     epoch_record_collect_past_uncertified,
     vote_queue_fix,
