@@ -348,6 +348,15 @@ pub struct Parameters {
     /// lock in turn and waits for execution while holding it. Issue #1804.
     #[serde(default)]
     pub vote_queue_fix: bool,
+
+    /// Advise the kernel that the execution database's memory map is read at random.
+    ///
+    /// When `true`, the node applies `madvise(MADV_RANDOM)` to every mapping of `mdbx.dat` after
+    /// it opens the database and again when the database grows, so page faults stop pulling
+    /// read-ahead into the page cache. The default `false` keeps the previous behaviour: the map
+    /// keeps the kernel's default advice. Issue #1802.
+    #[serde(default)]
+    pub mdbx_random_advice: bool,
 }
 
 impl Parameters {
@@ -452,6 +461,7 @@ impl Default for Parameters {
             quorum_exec_block: false,
             quorum_exec_block_starved_rounds: 0,
             vote_queue_fix: false,
+            mdbx_random_advice: false,
         }
     }
 }
@@ -610,6 +620,7 @@ impl Parameters {
                 SwitchValue::Count(u64::from(self.quorum_exec_block_starved_rounds)),
             ),
             ("vote_queue_fix", SwitchValue::Bool(self.vote_queue_fix)),
+            ("mdbx_random_advice", SwitchValue::Bool(self.mdbx_random_advice)),
         ]
     }
 }
@@ -1273,5 +1284,15 @@ mod test {
         assert!(!parse_with("").vote_queue_fix);
         assert!(parse_with("vote_queue_fix: true").vote_queue_fix);
         assert_eq!(listed("vote_queue_fix: true", "vote_queue_fix"), "true");
+    }
+
+    // ---- bench6 mdbx-advice ----
+
+    /// `mdbx_random_advice` stays at the bench-5 behaviour unless the file turns it on.
+    #[test]
+    fn mdbx_random_advice_parses() {
+        assert!(!parse_with("").mdbx_random_advice);
+        assert!(parse_with("mdbx_random_advice: true").mdbx_random_advice);
+        assert_eq!(listed("mdbx_random_advice: true", "mdbx_random_advice"), "true");
     }
 }
