@@ -486,7 +486,8 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
   gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
   `--db.gap-fill <PAGES|auto>` (TN's own flag, `RethCommand::db_gap_fill`, carried as
-  `RethConfig::db_gap_fill`, a `GapFill`; unset, `off` or 0: off, a width of at most the engine's
+  `RethConfig::db_gap_fill`, a `GapFill`; unset: `auto` on Linux, off on macOS and on the MDBX
+  build (`DEFAULT_DB_GAP_FILL`); `off` or 0: off; a width of at most the engine's
   `MAX_GAP_FILL`, 64, else refused naming the flag) is the engine's `EnvOptions::gap_fill`: a
   durable commit first rewrites each gap of at most that many clean pages between two runs of its
   dirty pages with the bytes they hold, so the disk takes fewer, larger writes for more bytes

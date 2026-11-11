@@ -98,15 +98,28 @@ pub struct RethCommand {
     #[clap(flatten)]
     pub db: DatabaseArgs,
 
-    /// tn-lmdb only: gap fill, `auto` or a width in pages (unset, `off` or 0: off; at most 64). A
-    /// durable commit first rewrites each gap of at most this many clean pages between two runs of
-    /// its dirty pages with the bytes they hold, so the disk takes fewer, larger writes for more
-    /// bytes written. A width suits disks that cap I/Os per second (cloud block storage), not
-    /// local NVMe; `auto` chooses the width per commit from the disk's measured costs (settling
-    /// at 0 where filling does not pay). Refused on MDBX.
+    /// tn-lmdb only: gap fill, `auto`, `off` or a width in pages (at most 64; 0 is off). Unset, it
+    /// is `auto` on Linux and off elsewhere ([`DEFAULT_DB_GAP_FILL`]). A durable commit first
+    /// rewrites each gap of at most this many clean pages between two runs of its dirty pages with
+    /// the bytes they hold, so the disk takes fewer, larger writes for more bytes written. A width
+    /// suits disks that cap I/Os per second (cloud block storage), not local NVMe; `auto` chooses
+    /// the width per commit from the disk's measured costs (settling at 0 where filling does not
+    /// pay). Refused on MDBX, whose build defaults to off.
     #[arg(long = "db.gap-fill", value_name = "PAGES|auto", help_heading = "Database")]
     pub db_gap_fill: Option<GapFill>,
 }
+
+/// The gap fill a node runs with when `--db.gap-fill` is unset.
+///
+/// [`GapFill::Auto`] on the tn-lmdb build on Linux: bytes on disk are the same whatever width it
+/// picks, it settles at 0 on local NVMe, and it cuts the write I/Os of a durable commit on cloud
+/// block storage that caps them per second. Off on the MDBX build, which refuses gap fill, and on
+/// other OSes: macOS syncs a commit as ranged msyncs, which mislead the width's cost fit.
+pub const DEFAULT_DB_GAP_FILL: GapFill = if cfg!(all(target_os = "linux", not(feature = "mdbx"))) {
+    GapFill::Auto
+} else {
+    GapFill::OFF
+};
 
 /// The reth rpc modules an operator may enable at all.
 ///
@@ -464,7 +477,12 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this, tx_forward, StorageLayout::for_new_datadirs(), db_gap_fill.unwrap_or_default())
+        Self(
+            this,
+            tx_forward,
+            StorageLayout::for_new_datadirs(),
+            db_gap_fill.unwrap_or(DEFAULT_DB_GAP_FILL),
+        )
     }
 
     /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
@@ -492,7 +510,8 @@ impl RethConfig {
         self
     }
 
-    /// tn-lmdb's gap fill (`--db.gap-fill`; off by default), which the database open passes to
+    /// tn-lmdb's gap fill (`--db.gap-fill`; [`DEFAULT_DB_GAP_FILL`] when unset, off for a config
+    /// built without a parsed [`RethCommand`]), which the database open passes to
     /// the engine (`EnvOptions::gap_fill`). The MDBX build refuses any but off at the open.
     pub fn db_gap_fill(&self) -> GapFill {
         self.3

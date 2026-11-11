@@ -509,7 +509,8 @@ mod tn_lmdb {
         );
     }
 
-    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: off; a width in pages, `off`
+    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: `crate::DEFAULT_DB_GAP_FILL`,
+    /// `auto` on Linux and off on macOS; a width in pages, `off`
     /// or `auto`; past `MAX_GAP_FILL` or anything else refused at the parse, naming the flag) and
     /// reaches the engine: a width past its `MAX_GAP_FILL` given by `with_db_gap_fill` is refused
     /// at the open, naming the flag, before the database is created; a width or `auto` opens, and
@@ -533,7 +534,9 @@ mod tn_lmdb {
             let command = command(flags).expect("parse");
             RethConfig::new(command, None, TempDir::new().expect("tempdir").path(), true, chain)
         };
-        assert_eq!(parse(&[]).db_gap_fill(), GapFill::OFF, "off by default");
+        let unset = if cfg!(target_os = "linux") { GapFill::Auto } else { GapFill::OFF };
+        assert_eq!(crate::DEFAULT_DB_GAP_FILL, unset, "auto on Linux, off elsewhere");
+        assert_eq!(parse(&[]).db_gap_fill(), unset, "an unset flag takes the default");
         assert_eq!(parse(&["--db.gap-fill", "4"]).db_gap_fill(), GapFill::Pages(4));
         assert_eq!(parse(&["--db.gap-fill", "off"]).db_gap_fill(), GapFill::OFF);
         assert_eq!(parse(&["--db.gap-fill", "auto"]).db_gap_fill(), GapFill::Auto);
