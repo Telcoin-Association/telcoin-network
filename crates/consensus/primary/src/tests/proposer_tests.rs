@@ -3574,6 +3574,143 @@ async fn test_parent_grace_round_jump_keeps_the_leader_header() {
     );
 }
 
+/// A swap of the leader table under a running grace does not hold the header past G. The round-2
+/// grace arms for the late author; 10 ms later a swap makes that author round 2's leader, and a
+/// late round-1 certificate makes the proposer re-read its readiness, which drops. The header
+/// still goes out when the grace expires, at the min delay plus G, not on the max-delay tick.
+///
+/// Catches: a grace whose header waits for readiness to come back (review finding L1).
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_leader_swap_does_not_stretch_the_grace() {
+    let params = tn_config::Parameters {
+        min_header_delay: GRACE_MIN_DELAY,
+        max_header_delay: GRACE_MAX_DELAY,
+        parent_grace: GRACE,
+        ..tn_config::Parameters::default()
+    };
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_consensus_parameters(params).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = committee.authorities().iter().map(|authority| authority.id()).collect();
+    // spread scores make ids[0], round 2's round-robin leader, the one bad node
+    let mut scores = tn_types::ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (score, id) in ids.iter().enumerate() {
+        scores.add_score(id, score as u64);
+    }
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+    let late = table.swap(&ids[0], 2).expect("round 2's leader is swapped").id();
+    assert!(late == ids[2] || late == ids[3], "a non-leader of rounds 2 and 4 replaces it");
+    let own = if late == ids[2] { ids[3].clone() } else { ids[2].clone() };
+
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let config = fixture
+        .authorities()
+        .find(|authority| authority.id() == own)
+        .expect("the proposer's fixture")
+        .consensus_config();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let mut rx_headers = cb.subscribe_headers();
+    Proposer::new(config, own, cb.clone(), schedule.clone(), task_manager.get_spawner())
+        .spawn(&task_manager);
+    next_header_at(&mut rx_headers, 1).await;
+    tokio::time::sleep(GRACE_SETTLE).await;
+    cb.parents().send((grace_certs(&fixture, 1, &ids), 1)).await.expect("parents sent");
+    next_header_at(&mut rx_headers, 2).await;
+    let round_two_at = tokio::time::Instant::now();
+    tokio::time::sleep(GRACE_SETTLE).await;
+
+    let quorum: Vec<_> = ids.iter().filter(|id| **id != late).cloned().collect();
+    cb.parents().send((grace_certs(&fixture, 2, &quorum), 2)).await.expect("parents sent");
+    tokio::time::sleep_until(round_two_at + GRACE_MIN_DELAY + Duration::from_millis(10)).await;
+    schedule.update_leader_swap_table(table);
+    cb.parents().send((grace_certs(&fixture, 1, &ids[..1]), 1)).await.expect("parents sent");
+
+    let header = next_header_at(&mut rx_headers, 3).await;
+    assert_eq!(round_two_at.elapsed(), GRACE_MIN_DELAY + GRACE, "proposed when the grace expired");
+    assert_eq!(header.parents().len(), 3);
+}
+
+/// The grace lines name the authors. `parent grace armed` ends with `waiting_for`, and `parent
+/// grace ended` with `waiting_for` then `still_missing`, each a bracketed list of 8-character id
+/// prefixes: an expired grace still misses its author, a complete one misses nobody.
+///
+/// Catches: a late author the analysis of a run cannot name (review finding L4).
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_lines_name_the_authors() {
+    use crate::log_capture::{CapturedEvent, LogCapture};
+
+    let capture = LogCapture::new("primary::proposer");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let round_one = grace_certs(&fixture, 1, &all);
+    let quorum = grace_certs(&fixture, 2, &all[..3]);
+    let all_four = [quorum.clone(), grace_certs(&fixture, 2, &all[3..])].concat();
+
+    // expired, then complete
+    let mut grace = grace_for(&fixture, GRACE, Histogram::noop());
+    grace.on_propose(&round_one, Duration::ZERO);
+    assert_eq!(grace.hold(&quorum, false), GraceHold::Wait);
+    grace.expire();
+    assert_eq!(grace.hold(&quorum, false), GraceHold::Propose(Duration::ZERO));
+    let mut grace = grace_for(&fixture, GRACE, Histogram::noop());
+    grace.on_propose(&round_one, Duration::ZERO);
+    assert_eq!(grace.hold(&quorum, false), GraceHold::Wait);
+    assert_eq!(grace.hold(&all_four, false), GraceHold::Propose(Duration::ZERO));
+
+    let fourth = format!("[{}]", &all[3].to_string()[..8]);
+    let armed = capture.events("parent grace armed");
+    assert_eq!(armed.len(), 2);
+    for line in &armed {
+        assert_eq!(line.fields.last(), Some(&("waiting_for", fourth.clone())));
+    }
+    let tail = |line: &CapturedEvent| line.fields[line.fields.len() - 2..].to_vec();
+    let ended = capture.events("parent grace ended");
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[0].field("outcome"), Some("expired"));
+    assert_eq!(
+        tail(&ended[0]),
+        [("waiting_for", fourth.clone()), ("still_missing", fourth.clone())]
+    );
+    assert_eq!(ended[1].field("outcome"), Some("complete"));
+    assert_eq!(tail(&ended[1]), [("waiting_for", fourth), ("still_missing", "[]".to_owned())]);
+}
+
+/// A `parent_grace` above `max_header_delay` is capped there and logged once with both values;
+/// zero, a grace below the max delay and one equal to it log nothing.
+///
+/// Catches: a silent cap that leaves the operator reading the configured value (review finding
+/// L2).
+#[test]
+fn test_parent_grace_above_max_delay_warns() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("primary::proposer");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let own = fixture.authorities().next().expect("an authority").id();
+    let new = |grace: Duration| {
+        ParentGrace::new(
+            grace,
+            GRACE_MAX_DELAY,
+            fixture.committee(),
+            own.clone(),
+            Histogram::noop(),
+        )
+    };
+    for grace in [Duration::ZERO, GRACE, GRACE_MAX_DELAY] {
+        let _ = new(grace);
+    }
+    assert!(capture.events("parent grace capped at max header delay").is_empty());
+    let _ = new(Duration::from_millis(1_500));
+    let lines = capture.events("parent grace capped at max header delay");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].u64_field("parent_grace_ms"), Some(1_500));
+    assert_eq!(lines[0].u64_field("max_header_delay_ms"), Some(1_000));
+}
+
 // ---- bench6 digest-dedupe ----
 
 /// How long a digest-dedupe test lets the proposer settle after a header before it reports a digest

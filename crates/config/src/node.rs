@@ -417,12 +417,22 @@ pub struct Parameters {
 
     /// How long the proposer waits for late parents before it proposes a header.
     ///
-    /// When the proposer is ready to propose but an author whose certificate its last header
-    /// used is missing from the new parents, it waits up to this long for that certificate. A
-    /// header forced by `max_header_delay` never waits. Neither does the header of the node that
-    /// leads the next round: a quorum of next-round certificates arriving during its wait would
-    /// move it past the round it leads, and that round would have no leader certificate to
-    /// commit. Written like the other durations (`150ms`). The default `0ms` keeps the previous
+    /// When the proposer is ready to propose, it waits up to this long for the certificates of
+    /// the committee members that were live in the round its last header built on and are
+    /// missing from the new parents. Live means their certificate of that round reached this
+    /// node, in time for that header or later, so an author whose certificate missed one header
+    /// comes back once it arrives. The proposer never waits for its own certificate. A header
+    /// forced by `max_header_delay` never waits. Neither does the header of the node that leads
+    /// the next round: a quorum of next-round certificates arriving during its wait would move it
+    /// past the round it leads, and that round would have no leader certificate to commit.
+    ///
+    /// The cost is up to this value per round on each node that waits, also under load: the
+    /// header is then ready on the quorum message, so the wait arms on almost every round. One
+    /// author whose certificate lands just inside the wait costs about this value every round.
+    /// Keep it at or below the largest one-way delay between members. A value above
+    /// `max_header_delay` is capped there, with a warning when each epoch's proposer starts.
+    ///
+    /// Written like the other durations (`150ms`). The default `0ms` keeps the previous
     /// behaviour: propose as soon as ready. Issue #1803.
     #[serde(with = "humantime_serde", default, skip_serializing_if = "is_default")]
     pub parent_grace: Duration,

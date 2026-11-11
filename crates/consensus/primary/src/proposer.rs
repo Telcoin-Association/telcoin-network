@@ -14,6 +14,13 @@
 //! Collections of batches that reach quorum are included in each header. If the Proposer's
 //! header fails to be committed, then block digests from the failed round are included in the next
 //! header once the Proposer's round advances.
+//!
+//! With the `parent_grace` switch set, a Proposer that is ready to propose first waits a bounded
+//! grace for the certificates of the other committee members that were live in the round its last
+//! header built on (`ParentGrace`). The next round's leader never waits: a round jump during its
+//! wait would leave that round without a leader certificate. Under load the grace arms on almost
+//! every round and costs up to the grace per round, and one author whose certificate lands just
+//! inside the grace costs about the grace every round.
 
 use crate::{
     consensus::LeaderSchedule,
@@ -1465,6 +1472,9 @@ impl<DB: Database> Proposer<DB> {
                 continue;
             }
 
+            // a jump to a newer round's parents ends a grace armed for the older round
+            self.parent_grace.end_if_round_moved(&self.last_parents);
+
             // proposer doesn't have a pending header
             // Check if conditions are met for proposing a new header
             //
@@ -1484,8 +1494,13 @@ impl<DB: Database> Proposer<DB> {
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
+            //
+            // a header that was ready when its parent grace armed stays ready until the grace
+            // ends: `advance_round` reads the live leader schedule, and a swap of the leader
+            // table during the grace must not strand the header past G
             let should_create_header = enough_parents
                 && (max_delay_timed_out
+                    || self.parent_grace.is_armed()
                     || (self.advance_round && (enough_digests || min_delay_timed_out)));
             // If we have not proposed a header in more than a max_header_delay time then repropose.
             // We may be in a race condition on a network restart...
@@ -1503,9 +1518,6 @@ impl<DB: Database> Proposer<DB> {
                 should_create_header,
                 "polled...",
             );
-
-            // a jump to a newer round's parents ends a grace armed for the older round
-            self.parent_grace.end_if_round_moved(&self.last_parents);
 
             // if all conditions are met, create the next header
             if should_create_header {
@@ -2120,6 +2132,9 @@ struct ArmedGrace {
     round: Round,
     /// The basis authors that had no certificate among the parents when the grace armed.
     waiting_for: BTreeSet<AuthorityIdentifier>,
+    /// The authors of `waiting_for` with no certificate among the parents at the latest
+    /// [`ParentGrace::hold`]; the grace is complete when this is empty.
+    still_missing: BTreeSet<AuthorityIdentifier>,
     /// When the grace was armed.
     started: tokio::time::Instant,
     /// When the grace gives up on `waiting_for`.
@@ -2162,14 +2177,29 @@ struct ArmedGrace {
 ///   non-leader's header for the skipped round is never built, as before the switch, which only
 ///   costs that node's strand one reference;
 /// - at most one grace is armed per round of parents;
-/// - the grace is capped at `max_header_delay`, though the max-delay tick, reset at every proposal,
-///   always fires first;
+/// - a header that was ready when its grace armed stays ready until the grace ends, so a change of
+///   the leader table under a running grace cannot hold it past G;
+/// - the grace is capped at `max_header_delay` (a larger setting is logged once per epoch as
+///   `parent grace capped at max header delay`), though the max-delay tick, reset at every
+///   proposal, always fires first;
 /// - with `parent_grace` at zero nothing is armed, nothing is kept and no timer is created.
 ///
 /// There is no grace without a last own header of the previous round: at the first round of an
 /// epoch (round 1 builds on the genesis certificates, which say nothing about who is live, so
 /// round 2 has no grace either), after a round this node skipped by jumping to newer parents, and
 /// after a restart until a header is proposed in this process.
+///
+/// What it costs. Under load the header is ready the moment the quorum message arrives (the digest
+/// threshold is met, or the min delay ran out long ago), so every live author outside that message
+/// is missing by construction and the grace arms on almost every round. Each such round costs the
+/// gap from the quorum to the last basis certificate, up to G; the cost under load is not about
+/// zero. One author sets that gap. An author whose certificate lands just inside G costs about G
+/// every round with outcome `complete`, because its certificate rides the header and keeps it in
+/// the basis. An author that is always past G costs G every round too, because its late
+/// certificate puts it back. Up to f colluding authors cost no more than one, since they share the
+/// round's one deadline. The bound is G per round on each node that waits, never above
+/// `max_header_delay`, which is why G stays at or below the largest one-way delay between members.
+/// The `waiting_for` and `still_missing` fields of the grace lines name the authors waited for.
 pub(crate) struct ParentGrace {
     /// The configured grace, capped at `max_header_delay`; zero is off.
     grace: Duration,
@@ -2198,6 +2228,14 @@ impl ParentGrace {
         own: AuthorityIdentifier,
         wait: Histogram,
     ) -> Self {
+        if grace > max_header_delay {
+            warn!(
+                target: "primary::proposer",
+                parent_grace_ms = duration_ms(grace),
+                max_header_delay_ms = duration_ms(max_header_delay),
+                "parent grace capped at max header delay",
+            );
+        }
         Self {
             grace: grace.min(max_header_delay),
             own,
@@ -2220,6 +2258,14 @@ impl ParentGrace {
         if let Some(armed) = self.armed.as_mut() {
             armed.expired = true;
         }
+    }
+
+    /// Whether a grace is armed, its deadline fired or not.
+    ///
+    /// The run loop keeps the header ready while this holds, so every grace ends through
+    /// [`Self::hold`], the max-delay path or a round jump, within G.
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.is_some()
     }
 
     /// End an armed grace whose round is no longer the round of `parents`.
@@ -2245,10 +2291,11 @@ impl ParentGrace {
         if leads_next_round {
             return GraceHold::Propose(self.end(GraceOutcome::Preempted));
         }
-        if let Some(armed) = &self.armed {
+        if let Some(armed) = self.armed.as_mut() {
             let present: BTreeSet<&AuthorityIdentifier> =
                 parents.iter().map(Certificate::origin).collect();
-            if armed.waiting_for.iter().all(|author| present.contains(author)) {
+            armed.still_missing.retain(|author| !present.contains(author));
+            if armed.still_missing.is_empty() {
                 return GraceHold::Propose(self.end(GraceOutcome::Complete));
             }
             if armed.expired {
@@ -2273,10 +2320,12 @@ impl ParentGrace {
             parents = parents.len(),
             missing = waiting_for.len(),
             grace_ms = duration_ms(self.grace),
+            waiting_for = %ShortIds(&waiting_for),
             "parent grace armed",
         );
         self.armed = Some(ArmedGrace {
             round,
+            still_missing: waiting_for.clone(),
             waiting_for,
             started,
             deadline: started + self.grace,
@@ -2299,6 +2348,8 @@ impl ParentGrace {
             parent_round = armed.round,
             outcome = outcome.as_str(),
             waited_ms = duration_ms(waited),
+            waiting_for = %ShortIds(&armed.waiting_for),
+            still_missing = %ShortIds(&armed.still_missing),
             "parent grace ended",
         );
         waited
@@ -2386,6 +2437,30 @@ impl ParentGrace {
         let present: BTreeSet<&AuthorityIdentifier> =
             parents.iter().map(Certificate::origin).collect();
         basis.authors.iter().filter(|author| !present.contains(author)).cloned().collect()
+    }
+}
+
+/// How many leading base58 characters of an authority id a parent-grace line prints.
+const SHORT_ID_LEN: usize = 8;
+
+/// The authors on a parent-grace line: each id's first [`SHORT_ID_LEN`] base58 characters,
+/// comma-separated in brackets (`[248pyaRx,9fQe2LkT]`), in id order.
+///
+/// The sets it prints hold committee members only, so the line is bounded by the committee size.
+/// Formatted only when the line is written.
+struct ShortIds<'a>(&'a BTreeSet<AuthorityIdentifier>);
+
+impl fmt::Display for ShortIds<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, author) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            let id = author.to_string();
+            f.write_str(id.get(..SHORT_ID_LEN).unwrap_or(&id))?;
+        }
+        f.write_str("]")
     }
 }
 
