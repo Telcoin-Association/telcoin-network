@@ -5514,3 +5514,172 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
 
     Ok(())
 }
+
+// ---- bench6 quorum-exec-block voter cases ----
+
+/// The final block of each output an old-block voter has executed, oldest first.
+const OLD_BLOCK_OUTPUTS: [u64; 8] = [10, 13, 16, 19, 22, 25, 28, 31];
+
+/// The old-block voter's ring capacity: it still holds blocks 22, 25, 28 and 31 and has evicted
+/// the older four.
+const OLD_BLOCK_RING: usize = 4;
+
+/// A canonical database holding every block a voter has executed, with no restored-state floor.
+struct ExecutedChain(BTreeMap<u64, BlockHash>);
+
+impl tn_types::CanonicalExecutionReader for ExecutedChain {
+    fn canonical_execution_hash(&self, number: u64) -> Option<BlockHash> {
+        self.0.get(&number).copied()
+    }
+
+    fn restored_state_floor(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// A voter (the first authority, `vote_queue_fix` set to `on`) whose execution reached block 31
+/// through the outputs of [`OLD_BLOCK_OUTPUTS`], with a ring of [`OLD_BLOCK_RING`] entries and a
+/// canonical database that holds every one of those blocks, plus the executed blocks by number.
+/// The bus registers its metrics with `recorder`.
+async fn old_block_voter(
+    path: &Path,
+    on: bool,
+    recorder: &DebuggingRecorder,
+) -> (TestTypes, BTreeMap<u64, BlockNumHash>) {
+    let types = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(recorder);
+        create_test_types_vote_queue_fix(path, on).await
+    };
+    let mut ring = RecentBlocks::new(OLD_BLOCK_RING);
+    let mut executed = BTreeMap::new();
+    for (round, number) in (1..).zip(OLD_BLOCK_OUTPUTS) {
+        let block = SealedHeader::seal_slow(ExecHeader { number, ..Default::default() });
+        executed.insert(number, block.num_hash());
+        ring.push_latest(
+            round,
+            ConsensusNumHash::new(u64::from(round), ConsensusHeaderDigest::default()),
+            Some(block),
+        );
+    }
+    assert_eq!(ring.latest_execution_block_num_hash(), executed[&31]);
+    assert!(ring.contains_execution_block(executed[&22]), "block 22 is still in the ring");
+    assert!(!ring.contains_execution_block(executed[&13]), "block 13 has left the ring");
+    types.consensus_bus.recent_blocks().send_replace(ring);
+    let chain = executed.iter().map(|(number, block)| (*number, block.hash)).collect();
+    types.consensus_bus.set_canonical_reader(Arc::new(ExecutedChain(chain)));
+    (types, executed)
+}
+
+/// I-4 §U1 item 11, first case: a header that names an old block the voter has executed is voted
+/// for at once, both while the block is still in the voter's ring (block 22, three outputs below
+/// its tip) and once it has left the ring and only the canonical database confirms it (block 13,
+/// six outputs below, inside the quorum rule's eight-output floor). The answer is the same with
+/// `vote_queue_fix` off and on.
+///
+/// Catches: a voter that waits for, or refuses, a block below its tip, and one that reads a ring
+/// miss as a fork while its database holds the block.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_old_executed_block_at_once() -> eyre::Result<()> {
+    for on in [false, true] {
+        for number in [22, 13] {
+            let temp_dir = TempDir::new().unwrap();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let (TestTypes { committee, handler, task_manager: _task_manager, .. }, executed) =
+                old_block_voter(temp_dir.path(), on, &recorder).await;
+            let author = committee.last_authority();
+            let header = committee
+                .header_builder_last_authority()
+                .latest_execution_block(executed[&number])
+                .created_at(1)
+                .build();
+
+            let start = tokio::time::Instant::now();
+            let answer = handler.vote(*author.authority().protocol_key(), header, Vec::new()).await;
+            assert_matches!(
+                answer,
+                Ok(PrimaryResponse::Vote(_)),
+                "vote_queue_fix={on}: executed block {number} is voted for"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::ZERO,
+                "vote_queue_fix={on}: executed block {number} is not waited for"
+            );
+            assert_eq!(
+                counter_value(&snapshotter, "tn_primary.votes_refused_execution_behind_total"),
+                0,
+                "vote_queue_fix={on}: block {number} is not behind"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// I-4 §U1 item 11, second case: a header that names an old block number with a different hash
+/// than the block the voter executed there is refused with the existing `UnknownExecutionResult`
+/// (`unexpected execution result received`, logged once), at once, never as `ExecutionBehind`,
+/// and stores no vote. Both for a number still in the voter's ring (22) and one that has left it
+/// (13), with `vote_queue_fix` off and on.
+///
+/// Catches: a hash mismatch below the tip read as "behind" (a retryable refusal the requester
+/// would repeat until its vote timeout) or answered after a wait.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_refuses_old_number_with_another_hash() -> eyre::Result<()> {
+    for on in [false, true] {
+        for number in [22, 13] {
+            let temp_dir = TempDir::new().unwrap();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let (TestTypes { committee, handler, task_manager: _task_manager, .. }, executed) =
+                old_block_voter(temp_dir.path(), on, &recorder).await;
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let _guard = tracing::subscriber::set_default(LinesAt {
+                target: "primary",
+                level: tracing::Level::ERROR,
+                lines: lines.clone(),
+            });
+            let author = committee.last_authority();
+            let named = BlockNumHash::new(number, BlockHash::repeat_byte(0xab));
+            assert_ne!(named, executed[&number], "the voter executed another block there");
+            let header = committee
+                .header_builder_last_authority()
+                .latest_execution_block(named)
+                .created_at(1)
+                .build();
+
+            let start = tokio::time::Instant::now();
+            let answer = handler.vote(*author.authority().protocol_key(), header, Vec::new()).await;
+            assert_matches!(
+                answer,
+                Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(block)))
+                    if block == named,
+                "vote_queue_fix={on}: block {number} with another hash is a fork refusal"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::ZERO,
+                "vote_queue_fix={on}: a fork at block {number} is not waited for"
+            );
+            assert_eq!(
+                counter_value(&snapshotter, "tn_primary.votes_refused_execution_behind_total"),
+                0,
+                "vote_queue_fix={on}: block {number} with another hash is not behind"
+            );
+            let logged = lines.lock().clone();
+            let forks = logged
+                .iter()
+                .filter(|line| line.starts_with("unexpected execution result received"))
+                .count();
+            assert_eq!(forks, 1, "vote_queue_fix={on}: one fork line: {logged:?}");
+            let vote_info = committee
+                .first_authority()
+                .consensus_config()
+                .node_storage()
+                .read_vote_info(&author.id())?;
+            assert!(vote_info.is_none(), "vote_queue_fix={on}: a refused header stores no vote");
+        }
+    }
+    Ok(())
+}
