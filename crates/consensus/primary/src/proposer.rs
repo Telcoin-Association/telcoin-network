@@ -2158,8 +2158,15 @@ struct ArmedGrace {
 /// holds their round-(r−1) certificate"). A late certificate is the evidence that matters: an
 /// author whose certificate missed one own header (one expired grace, a skipped round) comes back
 /// as soon as that certificate arrives, so a far validator that is always later than the quorum
-/// stays in every grace instead of dropping out on its first excursion. A late certificate that
-/// arrives after the grace of its round has armed joins the following round's basis instead.
+/// stays in every grace instead of dropping out on its first excursion. A round-(r−1) certificate
+/// that arrives after the round-r grace has armed does not join that grace, and the next proposal
+/// replaces the basis it joined; the author comes back only if its round-r certificate also
+/// reaches this node, so re-entry follows an author that lags by less than about one round.
+///
+/// One case is left as it is with the grace off: if a leader-table swap during a grace names this
+/// node the leader of the round being collected, the header still goes out when the grace ends,
+/// and the certifier's cancel of this node's previous header can then leave that round without a
+/// leader certificate. With `parent_grace` at zero the header would have gone out before the swap.
 ///
 /// The bounds:
 /// - only committee members enter the basis, and this node never does: it does not wait for its own

@@ -3574,6 +3574,48 @@ async fn test_parent_grace_round_jump_keeps_the_leader_header() {
     );
 }
 
+/// A round jump ends the grace before readiness is read, so the latch that keeps an armed header
+/// ready does not carry over to the new round. The round-3 grace arms for the late author, then a
+/// round-4 quorum without round 4's leader jumps the proposer to round 4, where it is not ready:
+/// no round-5 header goes out until the leader's certificate arrives, and then it goes out at once.
+///
+/// Catches: a grace of the old round that makes a header of the new round look ready, which would
+/// propose round 5 without the round-4 leader.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_jump_does_not_carry_readiness() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+    let schedule = LeaderSchedule::new(run.fixture.committee(), LeaderSwapTable::default());
+    let leader_four = schedule.leader(4).id();
+
+    let all = run.all.clone();
+    run.send(2, &all).await;
+    let (_, three_at) = run.next(3).await;
+    tokio::time::sleep(GRACE_SETTLE).await;
+    run.send(3, &run.all_but_late()).await;
+    let armed_at = run.round_two_at + three_at + GRACE_MIN_DELAY;
+    tokio::time::sleep_until(armed_at + Duration::from_millis(10)).await;
+    let without_leader: Vec<_> = all.iter().filter(|id| **id != leader_four).cloned().collect();
+    run.send(4, &without_leader).await;
+
+    let quiet_until = tokio::time::Instant::now() + Duration::from_millis(200);
+    let early = tokio::time::timeout_at(quiet_until, run.rx_headers.recv()).await;
+    assert!(early.is_err(), "no round-5 header without the round-4 leader");
+    run.send(4, &[leader_four]).await;
+    let header =
+        tokio::time::timeout(Duration::from_millis(1), next_header_at(&mut run.rx_headers, 5))
+            .await
+            .expect("round 5 goes out on the leader's certificate");
+    assert_eq!(header.parents().len(), 4);
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 1], late: [0, 0], waits_ms: vec![10] }
+    );
+}
+
 /// A swap of the leader table under a running grace does not hold the header past G. The round-2
 /// grace arms for the late author; 10 ms later a swap makes that author round 2's leader, and a
 /// late round-1 certificate makes the proposer re-read its readiness, which drops. The header
