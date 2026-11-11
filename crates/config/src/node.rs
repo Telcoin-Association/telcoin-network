@@ -393,8 +393,8 @@ pub struct Parameters {
     /// When `true`, the boundary handler awaits closing the epoch, writing its record and
     /// exporting it while the epoch's task manager keeps taking in newly spawned tasks and
     /// reaping finished ones. The default `false` keeps the previous behaviour: the task manager
-    /// does neither until the close completes, and tasks spawned meanwhile can fail to be
-    /// tracked. Issue #1806.
+    /// does neither until the boundary handler returns, and tasks spawned meanwhile can fail to
+    /// be tracked. Issue #1806.
     #[serde(default)]
     pub epoch_close_task_drain: bool,
 
@@ -402,8 +402,8 @@ pub struct Parameters {
     ///
     /// When `true`, writing the epoch record halts the node if the executed block it pins as
     /// `final_state` is not the epoch's closing block, rather than sign a record for the wrong
-    /// block; the check is skipped while no executed block is known. The default `false` keeps
-    /// the previous behaviour: the pinned block is used without the check. Issue #1806.
+    /// block. The default `false` keeps the previous behaviour: the pinned block is used without
+    /// the check. Issue #1806.
     #[serde(default)]
     pub epoch_record_state_check: bool,
 
