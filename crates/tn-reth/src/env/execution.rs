@@ -316,9 +316,10 @@ impl RethEnv {
 
         // Execute the recovered transactions sequentially, in batch order.
         for tx in recovered {
-            // the hash is cached at decode and is not an execution input: reading it first lets
-            // the transaction move into the builder without a per-transaction clone
+            // copy the hash (cached at decode) and the recovered signer out for the skip line, so
+            // the transaction moves into the builder without a per-transaction clone
             let tx_hash = *tx.tx_hash();
+            let sender = tx.signer();
             // forks are impossible
             match builder.execute_transaction(tx) {
                 Ok(_gas_used) => (),
@@ -329,7 +330,13 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    debug!(target: "engine", %error, ?tx_hash, "skipping invalid transaction");
+                    debug!(
+                        target: "engine",
+                        %error,
+                        ?tx_hash,
+                        %sender,
+                        "skipping invalid transaction"
+                    );
                     // expected in normal operation - see the reason docs, this is not an alert
                     record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
                     continue;
