@@ -63,8 +63,9 @@ const SYNC_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// transfer is treated as a drip/stall and aborted, so a pack finishes at any sustained rate
 /// at/above the floor, and a below-floor peer is cut within roughly one window. Both the
 /// requester's reads and the responder's writes check this floor. The responder additionally
-/// applies a fixed, size-independent `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to public-tier epoch-pack
-/// serves, as an interim bound until a length-scaled bound lands.
+/// applies a fixed `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` (200 s) to public-tier epoch-pack serves. The
+/// bound is not scaled by pack length, so a public requester must read a pack of L bytes at
+/// L / 200 s or faster on each stream.
 const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
 
 /// How many floors ([`SYNC_RATE_MIN_BYTES`]) a fresh peer must deliver per window: the ratio of

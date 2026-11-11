@@ -1,4 +1,3 @@
-use futures::{future::BoxFuture, AsyncReadExt as _, FutureExt as _};
 use libp2p::{core::UpgradeInfo, swarm::StreamProtocol, InboundUpgrade, OutboundUpgrade, Stream};
 use std::{
     convert::Infallible,
@@ -53,24 +52,22 @@ impl InboundUpgrade<Stream> for TNStreamProtocol {
 impl OutboundUpgrade<Stream> for TNStreamProtocol {
     type Output = Stream;
     type Error = std::io::Error;
-    type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
+    type Future = Ready<Result<Self::Output, Self::Error>>;
 
     // The caller chose the single advertised protocol, so the negotiated info is
     // redundant; correlation and framing are the application layer's concern.
     //
     // the swarm negotiates lazily (`V1Lazy`), which hands the stream back before the
-    // listener confirms the protocol and would defer a rejection to the caller's
-    // first read. a zero-length read drives negotiation to completion without
-    // consuming data, so a peer that does not speak sync still fails the open (the
-    // callers' capability signal) and the open costs the same round trip as strict
-    // negotiation.
-    fn upgrade_outbound(self, mut stream: Stream, _: Self::Info) -> Self::Future {
-        async move {
-            let consumed = stream.read(&mut []).await?;
-            debug_assert_eq!(consumed, 0, "an empty buffer reads no stream data");
-            Ok(stream)
-        }
-        .boxed()
+    // listener confirms the protocol. the upgrade returns it without reading, so the
+    // caller's request frame travels in the same flight as the protocol proposal and
+    // the open costs no round trip. the responder's opening lease starts when the
+    // stream arrives, and the request is then already buffered, so an honest opening
+    // holds the lease for about zero time instead of one round trip. a peer that does
+    // not speak sync rejects the proposal, and the rejection fails the caller's first
+    // read with an io error that wraps `NegotiationError::Failed`. callers detect it
+    // with `is_unsupported_protocol` (the capability signal).
+    fn upgrade_outbound(self, stream: Stream, _: Self::Info) -> Self::Future {
+        ready(Ok(stream))
     }
 }
 
@@ -78,7 +75,9 @@ impl OutboundUpgrade<Stream> for TNStreamProtocol {
 #[derive(Debug)]
 pub enum StreamError {
     /// The protocol upgrade failed during stream negotiation: the peer advertised
-    /// none of the offered protocols.
+    /// none of the offered protocols. The sync open negotiates lazily and does not
+    /// wait for the listener, so a peer that rejects the sync protocol is reported on
+    /// the first read instead; see [`is_unsupported_protocol`].
     UpgradeFailed,
     /// A transport I/O error occurred during stream negotiation. Distinct from
     /// [`StreamError::UpgradeFailed`]: the peer may well speak the protocol, so a
@@ -106,6 +105,24 @@ impl std::fmt::Display for StreamError {
 }
 
 impl std::error::Error for StreamError {}
+
+/// Whether a read on a sync stream failed because the peer does not serve the opener's
+/// sync protocol.
+///
+/// The outbound upgrade returns the stream before the listener confirms the protocol
+/// (`V1Lazy`), so an open to a peer without the protocol succeeds, and the listener's
+/// rejection reaches the caller on the first read of the response. multistream-select
+/// reports it as an [`std::io::Error`] of kind `Other` that wraps its
+/// `NegotiationError::Failed`. This is the first-read form of
+/// [`StreamError::UpgradeFailed`]: honest version, role, or chain skew, not a fault. On
+/// `true` a caller records that the peer does not speak sync and does not penalize it.
+/// Any other read error returns `false` and keeps its usual meaning.
+///
+/// Pass the error as the stream returned it. [`read_frame`](crate::read_frame) returns the
+/// error of its first read unchanged.
+pub fn is_unsupported_protocol(error: &std::io::Error) -> bool {
+    crate::error::is_negotiation_failure(error)
+}
 
 /// A classified stream failure used to score the remote peer.
 ///
@@ -162,9 +179,12 @@ impl StreamFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamFailure, TNStreamProtocol};
+    use super::{is_unsupported_protocol, StreamFailure, TNStreamProtocol};
     use crate::Penalty;
-    use libp2p::{core::UpgradeInfo, StreamProtocol};
+    use libp2p::{
+        core::{upgrade::NegotiationError, UpgradeInfo},
+        StreamProtocol,
+    };
     use std::io::ErrorKind;
 
     /// The upgrade advertises exactly the per-role sync protocol it was built
@@ -200,5 +220,16 @@ mod tests {
             StreamFailure::Io(ErrorKind::InvalidData).penalty(),
             Some(Penalty::Medium)
         ));
+    }
+
+    /// A listener's rejection of a lazily opened stream fails the first read with an io
+    /// error of kind `Other` that wraps `NegotiationError::Failed`. Only that error means
+    /// the peer does not speak the protocol; a transport error keeps its usual meaning.
+    #[test]
+    fn first_read_rejection_is_unsupported_protocol() {
+        let rejected = std::io::Error::from(NegotiationError::Failed);
+        assert_eq!(rejected.kind(), ErrorKind::Other);
+        assert!(is_unsupported_protocol(&rejected));
+        assert!(!is_unsupported_protocol(&std::io::Error::from(ErrorKind::ConnectionReset)));
     }
 }

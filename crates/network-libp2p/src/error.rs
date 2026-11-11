@@ -250,11 +250,13 @@ pub(crate) fn normalize_outbound_failure(failure: OutboundFailure) -> OutboundFa
 ///
 /// Two assumptions keep the classification sound, and both hold today. Codecs must pass the
 /// error of their first read through unwrapped: `TNCodec`, the codec of every request-response
-/// behaviour, reads its length prefix with `read_exact`, which returns the stream's io error
-/// as is. The outbound upgrades that finish negotiation with a zero-length read (the sync
-/// stream, and gossipsub in its vendored patch) rely on QUIC, the only transport, returning
-/// `Ok(0)` at once for an empty buffer on a negotiated stream (quinn 0.11) instead of waiting
-/// for data.
+/// behaviour, and [`read_frame`](crate::read_frame), the sync stream's frame reader, read
+/// their length prefix with `read_exact`, which returns the stream's io error as is. The
+/// vendored gossipsub's outbound upgrade, which finishes negotiation with a zero-length read,
+/// relies on QUIC, the only transport, returning `Ok(0)` at once for an empty buffer on a
+/// negotiated stream (quinn 0.11) instead of waiting for data. The sync stream's outbound
+/// upgrade does not read: its callers classify the first frame read with
+/// [`crate::stream::is_unsupported_protocol`].
 ///
 /// Two rejection shapes are deliberately left alone, and honest peers produce neither. A
 /// listener that closes the stream after the proposal instead of answering `na` surfaces

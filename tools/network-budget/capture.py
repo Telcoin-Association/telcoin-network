@@ -46,10 +46,12 @@ FAILURE_OUTCOMES = frozenset({"timeout", "omitted", "closed", "io", "unsupported
 REJECTION_REASONS = frozenset({"pending_incoming", "pending_outgoing", "established_incoming", "established_outgoing",
                                "established_per_peer", "established_total", "unknown"})
 # Inbound denials carry the limit reasons, the peer manager reasons, the snake-case source admission
-# errors, and unknown for any other cause.
+# errors, and unknown for any other cause. The two public share reasons come from the peer manager's
+# established-connection share for peers without privilege.
 DENIAL_REASONS = frozenset({"pending_incoming_limit", "established_per_peer_limit", "established_total_limit", "other_limit",
                             "peer_manager_local_peer", "peer_manager_banned_peer", "peer_manager_invalid_ip",
-                            "peer_manager_closed_admission", "invalid_limits", "process_full", "peer_full",
+                            "peer_manager_closed_admission", "peer_manager_public_share",
+                            "peer_manager_public_peer_connections", "invalid_limits", "process_full", "peer_full",
                             "address_full", "prefix_full", "sources_full", "unsupported_address",
                             "duplicate_connection", "poisoned", "unknown"})
 DENIAL_STAGES = frozenset({"pre_auth", "authenticated_policy", "transport_cap", "unknown"})

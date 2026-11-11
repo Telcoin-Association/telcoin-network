@@ -7,6 +7,13 @@ Omitting this section applies the built-in swarm bound: 128 established connecti
 eight per peer, and the `quic_config` defaults of 256 incoming streams, 2 MiB of stream credit and
 4 MiB of connection credit per connection.
 
+Each swarm keeps a privileged reserve of its established connections, 50 of the default 128.
+Peers without privilege (not committee members, trusted operator peers or Closed admission
+grants) share only the remainder, at most two connections each, so 78 of the default 128 are
+public. A `process_budget` keeps this split: the reserve of a swarm is its allocated total times
+50/128, rounded down. So a swarm with 12 established connections reserves 4, and a small budget
+still admits peers without privilege.
+
 ## Allocation
 
 The following is an arithmetic example, **not a calibrated production recommendation**:
@@ -202,7 +209,7 @@ rejection and denial counters also have a `reason` label:
 | `tn_network_inbound_streams_per_connection_limit` | Effective incoming stream capacity per connection |
 | `tn_network_receive_credit_per_connection_bytes` | Effective advertised credit per connection |
 | `tn_network_connection_limit_rejections_total` | Connections refused by a connection limit. `reason`: `pending_incoming`, `pending_outgoing`, `established_incoming`, `established_outgoing`, `established_per_peer`, `established_total` or `unknown` |
-| `tn_network_inbound_connections_denied_total` | Inbound connections the swarm refused, counted once per refusal. `stage`: `transport_cap` (a connection limit), `pre_auth` (before the peer is authenticated), `authenticated_policy` (a peer manager or source admission policy after authentication) or `unknown`. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` for a limit; `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip` or `peer_manager_closed_admission` for the peer manager; the snake-case `AdmissionError` variant (for example `peer_full`) for source admission; `unknown` for any other cause |
+| `tn_network_inbound_connections_denied_total` | Inbound connections the swarm refused, counted once per refusal. `stage`: `transport_cap` (a connection limit), `pre_auth` (before the peer is authenticated), `authenticated_policy` (a peer manager or source admission policy after authentication) or `unknown`. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` for a limit; `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip`, `peer_manager_closed_admission`, `peer_manager_public_share` or `peer_manager_public_peer_connections` for the peer manager; the snake-case `AdmissionError` variant (for example `peer_full`) for source admission; `unknown` for any other cause |
 | `tn_network_listener_errors_total` | Non-fatal listener errors by I/O error kind. `reason`: `address_in_use`, `address_not_available`, `permission_denied`, `connection`, `timed_out`, `invalid_data`, `other` or `unknown` |
 | `tn_network_listeners_closed_total` | Listeners that closed. `outcome`: `ok` or `error` |
 
