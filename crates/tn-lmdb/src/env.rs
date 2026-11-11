@@ -13,7 +13,10 @@
 //! boot that wrote it, and only once the pages it names since the last sync pass
 //! [`check::check_since`], else the last sync: [`opened_snapshot`]). Open never writes to an
 //! existing file: a file that is shorter than the chosen meta's page count, not a tn-lmdb file, or
-//! whose catalog or free-tree root fails its checks fails closed, unchanged.
+//! whose catalog or free-tree root fails its checks fails closed, unchanged. Before the metas are
+//! read, a writer open drops the file's cached pages unless the boot record beside it shows they
+//! equal the device's, and once everything has passed it marks that record "open"; a clean close
+//! marks it "clean" (`boot_record`).
 //!
 //! [`Env::open_read_only`] opens an existing file no writer holds (`O_RDONLY`, a shared
 //! `flock`), chooses the meta and checks the roots exactly as [`Env::open`] does, and maps the

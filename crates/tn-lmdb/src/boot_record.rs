@@ -34,7 +34,11 @@
 //! large folios, and the drop gives the open a cache of the device's bytes in the mapping's
 //! small pages, as at any first open. A rename of the directory keeps both. A device number that
 //! changes across a reboot (some volume managers number devices at mount) costs a drop in a new
-//! boot, whose cache holds nothing of the file anyway.
+//! boot, whose cache holds nothing of the file anyway. A record a removed file left, whose inode
+//! number a new file reuses, is caught too: a "clean" one by the ctime, an "open" one of this boot
+//! drops anyway, and one of another boot keeps a cache this boot filled only with what it read
+//! or what a create wrote and synced (an unsynced write's failed writeback is reported to the
+//! open's own `fsync`, as the kernel reports an error no one has seen to the next one).
 //!
 //! **Crash safety.** The record is advisory: every way it can go wrong drops the cache, which
 //! costs time, never data, except a record that says "clean" (or "another boot") wrongly, which

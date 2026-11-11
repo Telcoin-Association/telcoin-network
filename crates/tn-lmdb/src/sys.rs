@@ -370,7 +370,7 @@ pub(crate) fn drop_cached_pages(file: &File) -> io::Result<()> {
 /// gives it for the pages it is about to read (`check::check_since`), so the device reads them
 /// together rather than one fault at a time on a cold cache. A hint: an error is ignored, and the
 /// reads then fault in one by one as without it. Elsewhere a no-op. In tests each call is logged
-/// ([`take_will_need_log`]).
+/// (`take_will_need_log`).
 pub(crate) fn will_need(file: BorrowedFd<'_>, offset: u64, len: u64) {
     #[cfg(target_os = "linux")]
     if let Some(len) = std::num::NonZeroU64::new(len) {

@@ -662,9 +662,9 @@ extra bytes, and two system calls per gap filled.
   kernel starts a read of the gap that nothing waits for, and `POSIX_FADV_RANDOM` on the file (given
   at open when gap fill is on; the engine reads through the file only at open otherwise) keeps that
   read to the gap's pages. A commit stops trying once its misses exceed its fills by 16, so the
-  reads a commit's fill starts exceed the writes it saved by at most 16. Right after an open the
-  cache holds none of the file on Linux (open step 4 drops its pages), so the first commits' gaps
-  miss until the tree's reads and the commits' writes bring pages back; that bound caps what it
+  reads a commit's fill starts exceed the writes it saved by at most 16. Right after an open that
+  dropped the file's cached pages (Linux, open step 4: after an unclean end, or with no usable boot
+  record) the cache holds none of the file, so the first commits' gaps miss until the tree's reads and the commits' writes bring pages back; that bound caps what it
   costs, and no byte changes either way. A kernel or file system that refuses `RWF_NOWAIT`
   (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off for the environment at the
   first gap read, a fixed width and auto alike, with one warning and `IoStats::gap_fill_refusals` at
@@ -1183,7 +1183,7 @@ checks as `Cursor`'s.
    too. The locked file must be the one the path names, and non-empty. A creator may rename its
    new file over the path between this open and its lock, so the open is retried up to three
    times, then fails with `Locked`.
-4. **`fsync_file` once, then the directory, then the page cache dropped.** A crash may have left a meta in the page cache whose
+4. **`fsync_file` once, then the directory, then the page cache dropped when it can be stale.** A crash may have left a meta in the page cache whose
    msync never finished, a trusted weak head whose pages a dead writer left there, and a `create`
    that died or failed between its rename and its `fsync_directory` may have left the file's name
    not durable. What open reads, and the name it found it by, must be durable before anything is
@@ -1196,15 +1196,43 @@ checks as `Cursor`'s.
    the directory, or an `EINVAL`/`ENOTSUP` from its fsync, is skipped with a warning naming it
    (such a directory never could make a name durable; the file's own fsync still runs); any other
    error fails the open, naming the directory. Step 2's directory sync after the rename follows
-   the same rule. Then, on Linux, the file's cached pages are dropped (`sys::drop_cached_pages`,
+   the same rule. Then, on Linux, unless the boot record says the cache equals the device (below),
+   the file's cached pages are dropped (`sys::drop_cached_pages`,
    `posix_fadvise(POSIX_FADV_DONTNEED)`; an error fails the open), so everything this open reads,
    the metas (step 5) and the pages step 9 checks, is the device's: a page a failed writeback
    left clean in the cache, its bytes never on the device and its error reported to the writer
    that is gone, would otherwise pass from the cache
    (`a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync`). The `fsync` before it wrote
-   every page it could, so the drop removes clean pages only; the kernel keeps a dirty one. The
-   cost is a cold cache after every writer open: the pages the node reads come from the device
-   again.
+   every page it could, so the drop removes clean pages only; the kernel keeps a dirty one. A
+   dropped cache costs the reads after it: every page the node reads comes from the device again
+   (a steady open on a cloud disk at about 0.4 ms a cold 4 KiB read took about 100 ms instead of
+   1 ms).
+
+   **The boot record** (`boot_record.rs`) decides. It is a 64-byte file beside the data file,
+   `<path>.boot`: a magic, a version, the state ("open" or "clean"), the boot id of the writer
+   that wrote it (`sys::boot_id`), the data file's device and inode, the file's ctime at a clean
+   close, and a CRC. It is advisory: the data file's format and `FORMAT_VERSION` are unchanged, and
+   every way the record can go wrong costs a drop, never data. Only a writer leaves a stale page,
+   and only in its boot (a new boot's cache holds only what that boot read from the device), and
+   a clean close leaves none (its final sync would have failed). So at a writer open:
+
+   | the record | the cache |
+   |---|---|
+   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup) | dropped |
+   | this boot's id or the record's unknown (zeros) | dropped |
+   | "clean", but the file's ctime moved since (something wrote the file after the close) | dropped |
+   | another boot's | kept |
+   | this boot's, "open": its writer crashed, was killed, or closed latched | dropped |
+   | this boot's, "clean" | kept |
+
+   A copied file is another inode, so its first open drops the cache the copy filled (in large
+   folios, perhaps: [Platform notes](#platform-notes)) whatever record came with it
+   (`a_copied_datadir_drops_the_cache_its_copy_filled`). A device number that a volume manager
+   assigns anew at a reboot costs a drop in a boot whose cache is cold anyway. Step 10 writes
+   "open", and the close's last step "clean" ([Close](#close)). No clock is read; containers share
+   the host's boot id and its page cache, which is what the record means by a boot
+   (`a_writer_open_drops_the_cache_as_the_boot_record_says`, `boot_record::tests`). Only Linux
+   keeps the record (in tests every host, whose disk model mirrors the drop); macOS has no drop.
 5. **Choose a meta** (`choose_meta`):
    - Meta 0 is read at offset 0. If it is valid, meta 1 is read at its page size.
    - If meta 0 is invalid, meta 1 is the first record carrying the magic at an offset P for P in
@@ -1288,7 +1316,28 @@ checks as `Cursor`'s.
    and 115 ms for 463 MiB, about 4 GB/s of CRC, beside 0.4 and 12.5 ms for the steady open of
    the same files (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`).
 
-**Open never writes to an existing file.** Every failure above leaves the file unchanged.
+   On Linux an unclean end means step 4 dropped the cache, so the check reads from the device.
+   One fault at a time that is a device read per page in turn. So the walk starts its reads
+   ahead of itself (`check::Ahead`): before it descends from a branch it advises
+   `posix_fadvise(POSIX_FADV_WILLNEED)` (`sys::will_need`, through `rustix`) for every child it
+   will descend into, and before it reads a leaf's entries for each overflow run and nested root
+   it will read from them, each batch sorted and its adjacent pages merged into one range. The
+   advice queues the reads and returns; the walk's faults then find the pages read or in flight,
+   and the device reads a branch's children together
+   (`a_weak_head_check_reads_ahead_what_it_descends_into`). @@LINUX@@ A read-only open's check
+   advises the same (it reads, writes nothing); `Env::check` advises nothing.
+10. **Write the boot record's "open"** (`Writer::mark_open`): this boot's id and the file's
+   device and inode, synced (`fsync_file`), and the directory synced too when the record was
+   missing, before the writer can commit; an error fails the open, naming the record. Were "open"
+   only in the page cache, a failed writeback of it could bring back the device's "clean" of an
+   earlier close in this boot, and a crash after it would keep a cache it must drop. A crash
+   between this step and the first commit leaves "open": the next open drops, which costs only
+   its reads. The record is written only under the data file's exclusive lock (a writer open and
+   its close), so no two processes race on it; a symbolic link or anything but a regular file at
+   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed.
+
+**Open never writes to an existing file.** Every failure above leaves the file unchanged (the
+boot record beside it is written at step 10 only, once everything else has passed).
 Recovery is choosing a meta: there is no repair, no reinitialisation of a non-empty file, and no
 fallback past a short file. A torn or invalid slot counts as the lowest and is the first one a
 later commit overwrites. A weak head stays weak: the next sync (`Env::sync`, the close, a durable
@@ -1345,8 +1394,8 @@ msync, or a sync's data step, fails (say EIO), the environment latches. The page
 the new meta, or the weak head's pages, in pages now marked clean while the disk holds the old
 bytes, and the error is reported once, to the file already open, not to one opened later (the
 "fsyncgate" pattern, common to engines that rely on the page cache for writeback). On Linux a
-writer open in the same boot drops the file's cached pages after its `fsync` (step 4), so it reads
-the disk: a meta that never reached it is not seen, and a weak head whose record reached it but
+writer open in the same boot drops the file's cached pages after its `fsync` (step 4: the boot
+record still says "open", as a latched close never writes "clean"), so it reads the disk: a meta that never reached it is not seen, and a weak head whose record reached it but
 whose pages did not fails step 9's check; either way the open is at the last sync, whose pages and
 meta earlier syncs that succeeded wrote and no later write touched (the reuse gate and the slot
 rule), losing the commits since it
@@ -1376,11 +1425,15 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
    (`sys::flock_shared`), else `Locked`. Read-only opens coexist; a writer's `LOCK_EX` excludes
    them, and they exclude it (its open is `Locked`). The locked file must be the one the path
    names, retried up to three times as in step 3 above.
-4. **No fsync, no page cache dropped.** Nothing is built on what this open reads. A meta that a
-   crash left in the page cache unsynced (a trusted weak head among them) is the state it reads,
-   and a power loss afterwards can still lose that state; the next `Env::open` then makes
-   durable whichever meta it reads. What a failed writeback left clean in the cache is read as
-   it is (the writer open's drop is what finds it: the known limit above).
+4. **No fsync, no page cache dropped, no boot record.** Nothing is built on what this open reads.
+   A meta that a crash left in the page cache unsynced (a trusted weak head among them) is the
+   state it reads, and a power loss afterwards can still lose that state; the next `Env::open`
+   then makes durable whichever meta it reads. What a failed writeback left clean in the cache is
+   read as it is (the writer open's drop is what finds it: the known limit above). The boot
+   record is neither read nor written: this open drops nothing whatever it says, a stale cached
+   page can mislead only this open's own readers (the dead writer's readers saw the same state),
+   and the record keeps saying "open" for the next writer open, which drops. Reads change no
+   ctime, so a clean close's record stays valid across read-only opens.
 5. **Choose a meta**, 6. **txn check**, 7. **length check**: exactly as steps 5–7 above
    (`choose_state`):
    an invalid slot is skipped, a weak head is trusted only in the boot that wrote it (and with
@@ -1439,6 +1492,15 @@ in order:
    pages). A failure is logged (`tracing::warn!`, target `tn_lmdb`) and does not latch: the file
    only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
    own `page_count × P` bytes, all below the new length.
+6. **The boot record says "clean"** (`env::mark_clean`), once the sync and the trim both
+   succeeded (any earlier stop leaves "open", so the next writer open in this boot drops the
+   cache: `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
+   mappings are gone (an unmap can move the file's times: macOS's file systems update them for
+   pages written through a mapping), while a second descriptor of the file (`dup`) keeps the
+   lock; then the record takes the file's ctime and is written, with no sync. A power loss before
+   its writeback leaves "open" of a boot that is over, and the next boot keeps its cache either
+   way; a failed writeback of it leaves the device's "open", which drops. A failure is logged
+   (`tracing::warn!`) and changes nothing else.
 
 ---
 
@@ -2360,8 +2422,11 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
     still cached (what a copy leaves), 115 after a cold full sequential read with the default
     readahead, 4.2 after cold random reads with it, 4.0 with `MADV_RANDOM`.
   - The advice cannot help a file already cached in large folios by buffered writes (a copy, a
-    restore written with `write(2)`). Evict such a file from the page cache before opening it
-    (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`): a commit on a copy left cached grew
+    restore written with `write(2)`). A writer open evicts such a file itself: a copy or a restore
+    is another inode, which no boot record names, so open step 4 drops its cache. Evict it by hand
+    (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`) only for a file rewritten in place, whose
+    record a clean close left (the ctime check then drops it too, but a coarse-timestamp file
+    system may not tell): a commit on a copy left cached grew
     from 82 to 583 ms over 300 commits in one measured workload, all in its one
     `fdatasync`, as the disk wrote 199 to 532 MiB per commit.
   - A failed `madvise` is not an error: the advice is a hint, so it is logged (`tracing::warn!`)
@@ -2640,6 +2705,12 @@ argument and the measurements. Code and other docs cite the items by number, so 
     `MS_ASYNC` pass as redundant with the `MS_SYNC` one (it starts every range's writes at once).
     Linux keeps the `fdatasync`, which writes them. See [Platform notes](#platform-notes) and
     [Step 4](#step-4-one-msync-or-one-fdatasync).
+31. **The boot record's "clean" is not synced, and the record is advisory** (`boot_record.rs`).
+    Only "open" must be durable: its loss could bring back an earlier "clean" of the same boot.
+    A lost or torn "clean" leaves "open" or no record, which drops the cache: a cost, never data.
+    Do not flag the missing sync, a record that a datadir copy carries along (a copy is another
+    inode, which the record does not name), or the drop it costs after a reboot that renumbered
+    the device. See [Open and recovery](#open-and-recovery), step 4.
 
 ---
 
@@ -2665,10 +2736,11 @@ relies on and every platform switch in the code, for a port to another OS.
 | `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
 | `freelist.rs` | free-record codec, gated loading, the fixed-point save |
 | `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
-| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting; `check_since`, open's check of a trusted weak head since the last sync (the same walk, pruned by `named_after`, no accounting) |
+| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting; `check_since`, open's check of a trusted weak head since the last sync (the same walk, pruned by `named_after`, no accounting, its reads started ahead of it: `Ahead`) |
+| `boot_record.rs` | The boot record beside the data file (`<path>.boot`): its codec, `decide` (whether a writer open drops the file's cached pages), `BootFile`'s read and write |
 | `latch.rs` | the failure latch |
 | `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, the cut of an inherited tail `distrust_tail`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
-| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
+| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `drop_cached_pages`, `will_need`, `flock_exclusive`, `flock_shared`, `boot_id` |
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`crc.rs` differs in its docs, two `dead_code` allows and `#[inline]` on `crc_is_zero`, which a sync keeps; `page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
 | `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
