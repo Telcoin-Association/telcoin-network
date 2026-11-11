@@ -870,9 +870,15 @@ fn check_reports_damage_leaks_and_double_uses() {
     let entries = case("entries", &|p: &Path| patch(p, entries_at, 299));
     assert!(entries.contains("300 entries, not the 299 its root counts"), "{entries}");
 
+    // Both metas count one page more than the pages in use, a page the file holds. The close
+    // trimmed the file to its pages rounded up to the OS page, so with 4 KiB OS pages the file
+    // ends at the last page in use and must grow to hold it (an open refuses a file shorter
+    // than its meta's pages).
     let leak = case("leak", &|p: &Path| {
         let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
         let grown = Meta { page_count: meta.page_count + 1, ..meta };
+        let len = file.metadata().expect("metadata").len();
+        file.set_len(len.max(u64::from(grown.page_count) * 4096)).expect("set_len");
         file.write_all_at(&grown.encode(Tag::default()), 0).expect("write");
         file.write_all_at(&grown.encode(Tag::default()), 4096).expect("write");
     });
