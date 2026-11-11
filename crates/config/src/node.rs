@@ -337,6 +337,17 @@ pub struct Parameters {
     /// tips in the parents. Issue #1804.
     #[serde(default)]
     pub quorum_exec_block_starved_rounds: u32,
+
+    /// Keep vote requests queued behind the voter's per-author lock from each waiting out the
+    /// execution wait in turn.
+    ///
+    /// When `true`, the voter refuses at once, with a recoverable answer, a request older than the
+    /// newest it has received from the same author, and does its bounded wait for execution
+    /// before it takes the per-author lock; under the lock it only checks execution, without
+    /// waiting again. The default `false` keeps the previous behaviour: each request takes the
+    /// lock in turn and waits for execution while holding it. Issue #1804.
+    #[serde(default)]
+    pub vote_queue_fix: bool,
 }
 
 impl Parameters {
@@ -440,6 +451,7 @@ impl Default for Parameters {
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             quorum_exec_block: false,
             quorum_exec_block_starved_rounds: 0,
+            vote_queue_fix: false,
         }
     }
 }
@@ -597,6 +609,7 @@ impl Parameters {
                 "quorum_exec_block_starved_rounds",
                 SwitchValue::Count(u64::from(self.quorum_exec_block_starved_rounds)),
             ),
+            ("vote_queue_fix", SwitchValue::Bool(self.vote_queue_fix)),
         ]
     }
 }
@@ -1250,5 +1263,15 @@ mod test {
         let names: Vec<_> = params.switches().into_iter().map(|(name, _)| name).collect();
         let at = names.iter().position(|name| *name == "quorum_exec_block").expect("listed");
         assert_eq!(names.get(at + 1), Some(&"quorum_exec_block_starved_rounds"));
+    }
+
+    // ---- bench6 voter-lock ----
+
+    /// `vote_queue_fix` stays at the bench-5 behaviour unless the file turns it on.
+    #[test]
+    fn vote_queue_fix_parses() {
+        assert!(!parse_with("").vote_queue_fix);
+        assert!(parse_with("vote_queue_fix: true").vote_queue_fix);
+        assert_eq!(listed("vote_queue_fix: true", "vote_queue_fix"), "true");
     }
 }
