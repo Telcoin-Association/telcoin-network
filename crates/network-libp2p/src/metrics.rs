@@ -309,7 +309,8 @@ impl InboundRejection {
             Self::PeerManager(
                 PeerAdmissionDenied::LocalPeer
                 | PeerAdmissionDenied::BannedPeer
-                | PeerAdmissionDenied::ClosedAdmission,
+                | PeerAdmissionDenied::ClosedAdmission
+                | PeerAdmissionDenied::PublicShare(_),
             )
             | Self::Source(_) => RejectionStage::AuthenticatedPolicy,
             Self::Unknown => RejectionStage::Unknown,

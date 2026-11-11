@@ -235,8 +235,10 @@ enum RecordFreshness {
 /// outbound connection concurrently (this node dials with `PeerCondition::Disconnected`, so it does
 /// not stack redundant outbound dials), and brief reconnection churn adds only a small transient
 /// overlap. Eight leaves room for that churn while bounding a hostile peer to a fixed, small number
-/// of connections instead of an unbounded fan-out.
-const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
+/// of connections instead of an unbounded fan-out. Privileged peers keep this bound; a peer
+/// without privilege holds at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PUBLIC_PEER`] through the
+/// public connection share of the peer manager.
+pub(crate) const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
 /// Maximum number of concurrent established connections in one swarm, both directions and every
 /// peer class, when the operator sets no `process_budget`.
@@ -245,9 +247,33 @@ const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 /// receive credit of the QUIC config, so free peer ids could pin memory without limit. The value
 /// is two connections (one inbound, one outbound) for each of the 39 default `max_peers` plus a
 /// committee of 25, and it never takes room from the per-peer bound. Committee members have no
-/// bypass, by design: hostile peers can hold slots, and the admission policy, not this memory
-/// bound, decides who gets them. An operator `process_budget` replaces it.
+/// bypass of this total, by design, but the admission policy is no longer what keeps hostile
+/// peers out of the committee's slots: the public connection share of the peer manager does.
+/// It limits peers without privilege to the installed total minus
+/// [`PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE`] scaled to that total, so the reserve stays free
+/// whatever free identities do. An operator `process_budget` replaces this total.
 pub(crate) const MAX_ESTABLISHED_CONNECTIONS: u32 = 128;
+
+/// Established connections that peers without privilege can never hold, at the default total.
+///
+/// The value is two connections (one inbound, one outbound) per member of a committee of 25,
+/// the committee term of the [`MAX_ESTABLISHED_CONNECTIONS`] derivation (128 = 2 x 39 default
+/// `max_peers` + 2 x 25 committee). Peers without privilege share only the remainder (78 by
+/// default, 2 x the 39 default `max_peers`), so at least this many slots stay free to the
+/// committee, trusted operator peers and Closed admission grants, whatever free identities do.
+/// Bootstrap peers hold no such privilege. An operator `process_budget` keeps this split: its
+/// total times 50/128, rounded down, is the reserve, so a small total still admits peers without
+/// privilege.
+pub(crate) const PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE: u32 = 50;
+
+/// Maximum concurrent established connections that one peer without privilege may hold.
+///
+/// One inbound plus one outbound: a peer without privilege has no legitimate need of more
+/// (this node dials with `PeerCondition::Disconnected`), and 2 x 39 public identities exactly
+/// fill the public share, so the per-peer bound and the distinct-peer gate agree. The public
+/// connection share of the peer manager enforces it; privileged peers keep
+/// [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`].
+pub(crate) const MAX_ESTABLISHED_CONNECTIONS_PER_PUBLIC_PEER: u32 = 2;
 
 /// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
 /// established) for one swarm.
@@ -340,7 +366,11 @@ impl ListenerErrorLog {
 /// - at most the process allocation's established connections in total, or
 ///   [`MAX_ESTABLISHED_CONNECTIONS`] without an allocation;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
-///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]);
+/// - not installed here: the public connection share of the peer manager holds peers without
+///   privilege to the same total minus [`PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE`] scaled to
+///   that total, and to [`MAX_ESTABLISHED_CONNECTIONS_PER_PUBLIC_PEER`] each, from the same two
+///   numbers (see [`established_connection_bounds`]).
 ///
 /// Both directions and all peer classes consume the process allocation: this behaviour must never
 /// install bypass peer IDs.
@@ -371,18 +401,26 @@ fn connection_limits_behaviour(
     max_pending_incoming: u32,
     budget: Option<SwarmNetworkBudget>,
 ) -> connection_limits::Behaviour {
+    let (per_peer, total) = established_connection_bounds(budget);
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(
-                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
-                    budget.connections_per_peer()
-                }),
-            ))
-            .with_max_established(Some(
-                budget.map_or(MAX_ESTABLISHED_CONNECTIONS, |budget| budget.connections()),
-            ))
+            .with_max_established_per_peer(Some(per_peer))
+            .with_max_established(Some(total))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
+}
+
+/// The established-connection bounds of one swarm: the per-peer ceiling and the total.
+///
+/// The process allocation gives both numbers; without one the defaults
+/// [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] and [`MAX_ESTABLISHED_CONNECTIONS`] apply. The
+/// `connection_limits` behaviour and the public connection share of the peer manager read the
+/// same pair, so the public share is always the installed total minus the privileged reserve
+/// scaled to that total.
+fn established_connection_bounds(budget: Option<SwarmNetworkBudget>) -> (u32, u32) {
+    budget.map_or((MAX_ESTABLISHED_CONNECTIONS_PER_PEER, MAX_ESTABLISHED_CONNECTIONS), |budget| {
+        (budget.connections_per_peer(), budget.connections())
+    })
 }
 
 /// Custom network libp2p behaviour type for Telcoin Network.
@@ -861,6 +899,10 @@ where
         );
         behavior.connection_limits =
             connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
+        // The public share uses the same bounds. The swarm is not polled yet: no slot is held.
+        let (per_peer, total) = established_connection_bounds(budget);
+        let public_share = crate::peers::PublicConnectionShare::of(total, per_peer);
+        behavior.peer_manager.configure_public_share(public_share);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
