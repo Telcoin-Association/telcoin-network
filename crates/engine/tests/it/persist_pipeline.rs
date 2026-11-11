@@ -1611,3 +1611,641 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
         .expect("a tokio runtime")
         .block_on(future)
 }
+
+// ---- bench6 pipelined-persist ----
+
+use std::{sync::Mutex, time::Instant};
+use tracing::{
+    field::{Field, Visit},
+    level_filters::LevelFilter,
+    span,
+    subscriber::Interest,
+    Event, Metadata, Subscriber,
+};
+
+/// The most the pipelined commit interval may be, as a multiple of the median of
+/// `max(execute, persist)` per output (go/no-go gate 5).
+const CYCLE_BOUND: f64 = 1.1;
+
+/// Go/no-go gate 5 of the pipelined persist: the pipeline's cycle is at most [`CYCLE_BOUND`]
+/// times the longer of its two phases.
+///
+/// A heavy bench, not a correctness test: run it in the release profile on a CPU-quiet and
+/// disk-quiet host. By default 40 consensus outputs of 10 blocks, each block 200 one-wei transfers
+/// to fresh accounts and 20 store calls writing fresh slots ([`CycleShape`] lists the environment
+/// overrides), run first through a [`PersistPipeline`] on one node whose commits are never held,
+/// so each output starts building the moment the pipeline allows, and then through the sequential
+/// path ([`execute_consensus_output`], one output at a time on a blocking thread) on a second node
+/// from the same genesis.
+///
+/// Over the outputs after the warmup (6-40 by default):
+/// - pipelined, from the pipeline's own [`CommitReport`]s: the commit interval (`committed_at`
+///   minus the previous output's) and `max(execute, persist)` per output. Their medians are the
+///   gate: the interval must be at most 1.1 times the max.
+/// - sequential, from the `output executed` line the sequential path logs (its `execute_ms` and
+///   `persist_ms` are the two laps a `CommitReport` carries, at 1 ms resolution; the path returns
+///   only the tip): the cycle, the median of execute plus persist per output, and the speedup, that
+///   cycle over the pipelined interval.
+/// - the stretch: the median persist lap pipelined over sequential, and the same for execute, both
+///   in whole milliseconds. The bound compares the pipeline with its own phases, so a persist that
+///   slows down while a build overlaps it (both read the same memory map, and the seeded build pins
+///   a reader that defers page reuse by a commit) still passes the bound; only the stretch shows
+///   it. It is printed, not asserted.
+///
+/// The regime (execute-bound or persist-bound, from the pipelined medians) is printed because the
+/// bound means something different in each. Execute-bound, each persist hides inside the next
+/// build and the bound checks that builds follow each other closely; persist-bound, each build
+/// hides inside the previous persist and the bound checks that commits do. A run in which no
+/// measured output started building before the previous one committed says that it measured no
+/// pipelining. Before any number is printed, both chains must be equal (the file's own
+/// comparison) and every block must hold every generated transaction, so the bench never times a
+/// wrong chain.
+#[test]
+#[ignore = "heavy: release profile, CPU-quiet and disk-quiet host"]
+fn bench_pipeline_cycle_vs_max_phase() {
+    let _guard = IT_TEST_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let shape = CycleShape::from_env();
+    shape.print_header();
+    let cycle = block_on(run_cycle_bench(shape)).unwrap_or_else(|err| panic!("{err}"));
+    println!("{}", cycle.line(&shape));
+    println!("{}", cycle.note(&shape));
+    assert!(
+        cycle.passes(),
+        "median commit interval {:.3} ms exceeds {CYCLE_BOUND} x the median max(execute, persist) \
+         {:.3} ms",
+        cycle.interval_ms,
+        cycle.max_phase_ms
+    );
+}
+
+/// The shape of [`bench_pipeline_cycle_vs_max_phase`]; each field has an environment override.
+#[derive(Debug, Clone, Copy)]
+struct CycleShape {
+    /// Consensus outputs (`PIPELINE_CYCLE_OUTPUTS`, default 40).
+    outputs: usize,
+    /// Blocks per output, one batch each (`PIPELINE_CYCLE_BLOCKS`, default 10).
+    blocks: usize,
+    /// One-wei transfers to fresh accounts per block (`PIPELINE_CYCLE_TXS`, default 200; a block
+    /// holds about 1,200 before the store calls' gas limits crowd out the rest).
+    txs: usize,
+    /// Store-contract calls per block, each writing a fresh slot (`PIPELINE_CYCLE_STORES`,
+    /// default 20).
+    stores: usize,
+    /// Leading outputs left out of every median (`PIPELINE_CYCLE_WARMUP`, default 5).
+    warmup: usize,
+    /// Milliseconds every persist sleeps at its start, on both nodes, through the test-utils hook
+    /// (`PIPELINE_CYCLE_PERSIST_DELAY_MS`, default 0): forces a persist-bound regime on a lab
+    /// database whose real persist is far shorter than its execute.
+    persist_delay_ms: u64,
+}
+
+impl CycleShape {
+    /// The default shape with the environment's overrides; a value that is not a whole number
+    /// fails the bench.
+    fn from_env() -> Self {
+        let read = |name: &str, default: u64| match std::env::var(name) {
+            Ok(value) => value
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}={value} is not a whole number")),
+            Err(_) => default,
+        };
+        let count = |name: &str, default: u64| {
+            usize::try_from(read(name, default)).expect("a count that fits in usize")
+        };
+        let shape = Self {
+            outputs: count("PIPELINE_CYCLE_OUTPUTS", 40),
+            blocks: count("PIPELINE_CYCLE_BLOCKS", 10),
+            txs: count("PIPELINE_CYCLE_TXS", 200),
+            stores: count("PIPELINE_CYCLE_STORES", 20),
+            warmup: count("PIPELINE_CYCLE_WARMUP", 5),
+            persist_delay_ms: read("PIPELINE_CYCLE_PERSIST_DELAY_MS", 0),
+        };
+        assert!(shape.blocks > 0 && shape.txs > 0, "every output needs blocks and transfers");
+        assert!(
+            shape.outputs >= shape.first_measured(),
+            "{} outputs leave nothing to measure after a warmup of {}",
+            shape.outputs,
+            shape.warmup
+        );
+        shape
+    }
+
+    /// The first output measured: the one after the warmup, and never the first output, which
+    /// has no earlier commit to measure an interval from.
+    fn first_measured(&self) -> usize {
+        (self.warmup + 1).max(2)
+    }
+
+    /// Print the machine, the thread counts, the profile and the shape.
+    fn print_header(&self) {
+        let field = |value: Option<String>| {
+            value
+                .map(|value| value.split_whitespace().collect::<Vec<_>>().join("_"))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        let host = field(std::fs::read_to_string("/proc/sys/kernel/hostname").ok());
+        let cpu_model = field(std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
+            info.lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .map(|rest| rest.trim_start_matches([' ', '\t', ':']).to_string())
+        }));
+        let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(0);
+        let rayon_env = field(std::env::var("RAYON_NUM_THREADS").ok());
+        let profile = if cfg!(debug_assertions) { "debug-assertions" } else { "release" };
+        println!(
+            "# pipeline_cycle host={host} cpu_model={cpu_model} cpus={cpus} rayon_threads={} \
+             RAYON_NUM_THREADS={rayon_env} profile={profile} outputs={} blocks_per_output={} \
+             transfers_per_block={} stores_per_block={} txs_per_output={} warmup={} \
+             measured={}-{} forced_persist_delay_ms={} db_dir={}",
+            rayon::current_num_threads(),
+            self.outputs,
+            self.blocks,
+            self.txs,
+            self.stores,
+            self.blocks * (self.txs + self.stores),
+            self.warmup,
+            self.first_measured(),
+            self.outputs,
+            self.persist_delay_ms,
+            std::env::temp_dir().display(),
+        );
+    }
+}
+
+/// Build the two nodes and the outputs, run the pipeline and then the sequential path, check that
+/// both built every transaction into the same chain, and summarize the laps.
+async fn run_cycle_bench(shape: CycleShape) -> Result<CycleResult, TestCaseError> {
+    let senders = [TransactionFactory::new(), TransactionFactory::new_random()];
+    let chain = chain_for([senders[0].address(), senders[1].address()]);
+    let a = Node::new(&chain).await.map_err(fail)?;
+    let b = Node::new(&chain).await.map_err(fail)?;
+    let mut signers = Signers { chain: chain.clone(), senders, fresh: 0 };
+    let outputs = cycle_outputs(&shape, &mut signers, &a.committee);
+    // zero disarms the hook: both nodes persist alike in every run
+    let delay = Duration::from_millis(shape.persist_delay_ms);
+    a.reth_env.inject_persist_delay(delay);
+    b.reth_env.inject_persist_delay(delay);
+
+    let genesis = chain.sealed_genesis_header();
+    let (pipelined, announced) = run_pipeline_free(&b, &genesis, outputs.clone()).await?;
+    let (oracle, sequential) = run_sequential_timed(&a, genesis, &outputs).await?;
+
+    let per_block = shape.txs + shape.stores;
+    prop_assert_eq!(oracle.blocks.len(), shape.outputs * shape.blocks, "blocks built");
+    for block in &oracle.blocks {
+        prop_assert_eq!(
+            block.body().transactions.len(),
+            per_block,
+            "block {} left out a generated transaction",
+            block.number
+        );
+    }
+    let pair = Pair { chain, a, b, outputs, oracle };
+    pair.assert_same_chain(&pair.b.reth_env, &pair.b.gas, &announced)?;
+    CycleResult::new(&shape, &pipelined, &sequential)
+}
+
+/// The bench's outputs: `shape.blocks` batches each, every batch `shape.txs` one-wei transfers to
+/// fresh accounts followed by `shape.stores` store calls that each write a fresh slot, from the
+/// two senders in turn by block, led by the committee members in turn by output.
+fn cycle_outputs(
+    shape: &CycleShape,
+    signers: &mut Signers,
+    committee: &Committee,
+) -> Vec<ConsensusOutput> {
+    let mut slot = 0u64;
+    let mut outputs = Vec::with_capacity(shape.outputs);
+    for (number, index) in (1u64..).zip(0..shape.outputs) {
+        let (leader, producer) = leader(committee, index);
+        let mut batches = Vec::with_capacity(shape.blocks);
+        for block in 0..shape.blocks {
+            let from = block % 2;
+            let mut transactions = signers.bulk(from, shape.txs);
+            for _ in 0..shape.stores {
+                // slot zero is never written, so each call stores 1 in a new slot
+                slot += 1;
+                transactions.push(signers.op(&Op::Store { from, key: slot, value: 1, read: 0 }));
+            }
+            batches.push(Batch {
+                transactions,
+                epoch: 0,
+                beneficiary: producer,
+                base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+                worker_id: 0,
+                received_at: None,
+            });
+        }
+        outputs.push(consensus_output(number, &leader, producer, batches, false));
+    }
+    outputs
+}
+
+/// What the free-running pipeline reported.
+#[derive(Debug, Default)]
+struct PipelinedRun {
+    /// Build reports, by consensus number.
+    built: BTreeMap<u64, BuildReport>,
+    /// Commit reports, in commit order.
+    committed: Vec<CommitReport>,
+}
+
+impl PipelinedRun {
+    /// Keep the reports `event` carries.
+    fn record(&mut self, event: PipelineEvent) {
+        match event {
+            PipelineEvent::Built(report) => {
+                self.built.insert(report.consensus_number, *report);
+            }
+            PipelineEvent::PersistStarted { .. } => {}
+            PipelineEvent::Committed(report) => self.committed.push(*report),
+        }
+    }
+}
+
+/// Run `outputs` through a pipeline on `node` from `genesis` with no commit held: each output
+/// starts as soon as the pipeline can start one. Returns the reports and what the pipeline
+/// announced (checked).
+///
+/// Takes the outputs by value: a clone between two events would delay the next build's start.
+async fn run_pipeline_free(
+    node: &Node,
+    genesis: &SealedHeader,
+    outputs: Vec<ConsensusOutput>,
+) -> Result<(PipelinedRun, Announced), TestCaseError> {
+    let (watch, tx) = Watch::new(&node.reth_env);
+    let mut pipeline = PersistPipeline::new(
+        node.reth_env.clone(),
+        genesis.clone(),
+        node.tasks.get_spawner(),
+        node.gas.clone(),
+        RepackMonitor::default(),
+        tx,
+    );
+    let mut run = PipelinedRun::default();
+    for output in outputs {
+        while !pipeline.can_start() {
+            run.record(next_event(&mut pipeline).await?.map_err(fail)?);
+        }
+        pipeline.start_inline(output).map_err(fail)?;
+    }
+    while !pipeline.is_idle() {
+        run.record(next_event(&mut pipeline).await?.map_err(fail)?);
+    }
+    drop(pipeline);
+    Ok((run, watch.finish()?))
+}
+
+/// One sequential output's laps.
+#[derive(Debug, Default, Clone, Copy)]
+struct SequentialLaps {
+    /// The output's consensus number.
+    consensus_number: u64,
+    /// The line's `execute_ms`: the build's span, as a [`CommitReport`]'s `execute`.
+    execute_ms: u64,
+    /// The line's `persist_ms`: the persist with its retries, as a [`CommitReport`]'s `persist`.
+    persist_ms: u64,
+    /// The whole call, announce and finalize included.
+    wall: Duration,
+}
+
+impl Visit for SequentialLaps {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "consensus_number" => self.consensus_number = value,
+            "execute_ms" => self.execute_ms = value,
+            "persist_ms" => self.persist_ms = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// A subscriber for one thread that keeps the laps of the sequential path's `output executed`
+/// line (target `engine`, without the pipelined line's `pipelined` field) and nothing else.
+#[derive(Debug, Default)]
+struct LapCatcher {
+    /// The laps of every line caught.
+    caught: Arc<Mutex<Vec<SequentialLaps>>>,
+}
+
+impl LapCatcher {
+    /// Whether `metadata` is the sequential `output executed` line.
+    fn wants(metadata: &Metadata<'_>) -> bool {
+        let fields = metadata.fields();
+        metadata.is_event()
+            && metadata.target() == "engine"
+            && fields.field("execute_ms").is_some()
+            && fields.field("persist_ms").is_some()
+            && fields.field("pipelined").is_none()
+    }
+}
+
+impl Subscriber for LapCatcher {
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if Self::wants(metadata) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        Self::wants(metadata)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::DEBUG)
+    }
+
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut laps = SequentialLaps::default();
+        event.record(&mut laps);
+        self.caught.lock().unwrap_or_else(PoisonError::into_inner).push(laps);
+    }
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+/// Run `outputs` on `node` through [`execute_consensus_output`], one at a time on a blocking
+/// thread, timing each call and catching its laps from its `output executed` line. Returns the run
+/// as the oracle of the file's comparison and the laps.
+///
+/// The baseline is the sequential path itself, not the pipeline started one output at a time:
+/// the pipeline pins a read snapshot before every persist, one of the effects whose cost the
+/// stretch measures. The oracle keeps only its final snapshot, which is all
+/// [`Pair::assert_same_chain`] reads: a trie digest after each output would walk the growing trie
+/// between the timed outputs.
+async fn run_sequential_timed(
+    node: &Node,
+    genesis: SealedHeader,
+    outputs: &[ConsensusOutput],
+) -> Result<(OracleRun, Vec<SequentialLaps>), TestCaseError> {
+    let genesis_digest = node.reth_env.trie_tables_digest().map_err(fail)?;
+    let (watch, tx) = Watch::new(&node.reth_env);
+    let mut parent = genesis.clone();
+    let mut laps = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let number = output.number();
+        let args = BuildArguments::new(node.reth_env.clone(), output.clone(), parent);
+        let (gas, tx) = (node.gas.clone(), tx.clone());
+        let (tip, wall, caught) = tokio::task::spawn_blocking(move || {
+            let catcher = LapCatcher::default();
+            let caught = catcher.caught.clone();
+            let (tip, wall) = tracing::subscriber::with_default(catcher, || {
+                let started = Instant::now();
+                let tip = execute_consensus_output(args, gas, RepackMonitor::default(), tx);
+                (tip, started.elapsed())
+            });
+            (tip, wall, caught)
+        })
+        .await
+        .map_err(fail)?;
+        parent = tip.map_err(fail)?;
+        let caught = std::mem::take(&mut *caught.lock().unwrap_or_else(PoisonError::into_inner));
+        let [lap] = caught.as_slice() else {
+            return Err(fail(format!(
+                "output {number}: caught {} `output executed` lines instead of one",
+                caught.len()
+            )));
+        };
+        prop_assert_eq!(lap.consensus_number, number, "the laps of another output");
+        laps.push(SequentialLaps { wall, ..*lap });
+    }
+    drop(tx);
+    let announced = watch.finish()?;
+    let mut blocks = Vec::new();
+    for number in 1..=parent.number {
+        let block = node.reth_env.sealed_block_by_number(number).map_err(fail)?;
+        blocks.push(block.ok_or_else(|| fail(format!("sequential block {number} missing")))?);
+    }
+    let digest = node.reth_env.trie_tables_digest().map_err(fail)?;
+    let after = vec![Snapshot { tip: parent, digest }];
+    Ok((OracleRun { genesis, genesis_digest, after, blocks, announced }, laps))
+}
+
+/// The bench's medians over the measured outputs, in milliseconds.
+#[derive(Debug)]
+struct CycleResult {
+    /// Outputs measured.
+    measured: usize,
+    /// Measured outputs that started building before the previous output committed.
+    overlapped: usize,
+    /// Measured outputs built seeded with the committing output's deltas.
+    seeded: usize,
+    /// Commit interval.
+    interval_ms: f64,
+    /// Commit interval, 90th percentile.
+    interval_p90_ms: f64,
+    /// `max(execute, persist)` per output.
+    max_phase_ms: f64,
+    /// Pipelined execute lap.
+    execute_ms: f64,
+    /// Pipelined persist lap.
+    persist_ms: f64,
+    /// Pipelined wait of a built output for the commit slot.
+    persist_wait_ms: f64,
+    /// Pipelined announce and finalize.
+    announce_ms: f64,
+    /// Seeding a build's overlay.
+    seed_ms: f64,
+    /// Sequential execute lap.
+    seq_execute_ms: f64,
+    /// Sequential persist lap.
+    seq_persist_ms: f64,
+    /// Sequential execute plus persist per output.
+    seq_cycle_ms: f64,
+    /// Sequential call, end to end.
+    seq_wall_ms: f64,
+    /// Pipelined over sequential execute lap, whole milliseconds on both sides.
+    execute_stretch: Option<f64>,
+    /// Pipelined over sequential persist lap, whole milliseconds on both sides.
+    persist_stretch: Option<f64>,
+}
+
+impl CycleResult {
+    /// Summarize the measured outputs of both runs.
+    fn new(
+        shape: &CycleShape,
+        pipelined: &PipelinedRun,
+        sequential: &[SequentialLaps],
+    ) -> Result<Self, TestCaseError> {
+        let committed = &pipelined.committed;
+        prop_assert_eq!(committed.len(), shape.outputs, "outputs the pipeline committed");
+        prop_assert_eq!(sequential.len(), shape.outputs, "outputs the sequential path executed");
+        for (number, report) in (1u64..).zip(committed) {
+            prop_assert_eq!(report.consensus_number, number, "commit order");
+        }
+        let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1e3;
+        let whole_ms = |elapsed: Duration| elapsed.as_millis() as f64;
+        // index i holds output i + 1; an output's interval runs from the previous one's commit
+        let window = shape.first_measured() - 1..shape.outputs;
+        let pipe = |lap: &dyn Fn(&CommitReport) -> f64| {
+            window.clone().map(|i| lap(&committed[i])).collect::<Vec<_>>()
+        };
+        let seq = |lap: &dyn Fn(&SequentialLaps) -> f64| {
+            window.clone().map(|i| lap(&sequential[i])).collect::<Vec<_>>()
+        };
+        let intervals: Vec<f64> = window
+            .clone()
+            .map(|i| ms(committed[i].committed_at.duration_since(committed[i - 1].committed_at)))
+            .collect();
+        let overlapped = window
+            .clone()
+            .filter(|&i| committed[i].build_started < committed[i - 1].committed_at)
+            .count();
+        let seeded = window
+            .clone()
+            .filter(|&i| pipelined.built.get(&(i as u64 + 1)).is_some_and(|built| built.seeded))
+            .count();
+        let seed: Vec<f64> = window
+            .clone()
+            .filter_map(|i| pipelined.built.get(&(i as u64 + 1)).map(|built| ms(built.seed)))
+            .collect();
+        let stretch = |numerator: f64, denominator: f64| {
+            (denominator > 0.0).then_some(numerator / denominator)
+        };
+        let seq_execute_ms = median(seq(&|lap| lap.execute_ms as f64));
+        let seq_persist_ms = median(seq(&|lap| lap.persist_ms as f64));
+        Ok(Self {
+            measured: window.len(),
+            overlapped,
+            seeded,
+            interval_ms: median(intervals.clone()),
+            interval_p90_ms: nearest_rank(intervals, 0.90),
+            max_phase_ms: median(pipe(&|report| ms(report.execute.max(report.persist)))),
+            execute_ms: median(pipe(&|report| ms(report.execute))),
+            persist_ms: median(pipe(&|report| ms(report.persist))),
+            persist_wait_ms: median(pipe(&|report| ms(report.persist_wait))),
+            announce_ms: median(pipe(&|report| ms(report.announce))),
+            seed_ms: median(seed),
+            seq_execute_ms,
+            seq_persist_ms,
+            seq_cycle_ms: median(seq(&|lap| (lap.execute_ms + lap.persist_ms) as f64)),
+            seq_wall_ms: median(seq(&|lap| ms(lap.wall))),
+            execute_stretch: stretch(
+                median(pipe(&|report| whole_ms(report.execute))),
+                seq_execute_ms,
+            ),
+            persist_stretch: stretch(
+                median(pipe(&|report| whole_ms(report.persist))),
+                seq_persist_ms,
+            ),
+        })
+    }
+
+    /// Whether the gate holds: the median interval is at most [`CYCLE_BOUND`] times the median
+    /// `max(execute, persist)`.
+    fn passes(&self) -> bool {
+        self.interval_ms <= CYCLE_BOUND * self.max_phase_ms
+    }
+
+    /// The regime the pipeline ran in, by its median laps.
+    fn regime(&self) -> &'static str {
+        if self.execute_ms >= self.persist_ms {
+            "execute-bound"
+        } else {
+            "persist-bound"
+        }
+    }
+
+    /// The result line.
+    fn line(&self, shape: &CycleShape) -> String {
+        let ratio =
+            |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+        format!(
+            "BENCH pipeline_cycle measured={}-{} n={} regime={} overlapped={}/{} seeded={} \
+             interval_ms={:.3} interval_p90_ms={:.3} max_phase_ms={:.3} bound={CYCLE_BOUND} \
+             interval_over_max_phase={:.3} pass={} execute_ms={:.3} persist_ms={:.3} \
+             persist_wait_ms={:.3} announce_ms={:.3} seed_ms={:.3} seq_execute_ms={:.1} \
+             seq_persist_ms={:.1} seq_cycle_ms={:.1} seq_wall_ms={:.3} speedup={} \
+             execute_stretch={} persist_stretch={} forced_persist_delay_ms={}",
+            shape.first_measured(),
+            shape.outputs,
+            self.measured,
+            self.regime(),
+            self.overlapped,
+            self.measured,
+            self.seeded,
+            self.interval_ms,
+            self.interval_p90_ms,
+            self.max_phase_ms,
+            self.interval_ms / self.max_phase_ms,
+            self.passes(),
+            self.execute_ms,
+            self.persist_ms,
+            self.persist_wait_ms,
+            self.announce_ms,
+            self.seed_ms,
+            self.seq_execute_ms,
+            self.seq_persist_ms,
+            self.seq_cycle_ms,
+            self.seq_wall_ms,
+            ratio((self.interval_ms > 0.0).then_some(self.seq_cycle_ms / self.interval_ms)),
+            ratio(self.execute_stretch),
+            ratio(self.persist_stretch),
+            shape.persist_delay_ms,
+        )
+    }
+
+    /// What the regime makes the bound mean, and whether the pipeline overlapped at all.
+    fn note(&self, shape: &CycleShape) -> String {
+        let regime = if self.execute_ms >= self.persist_ms {
+            "each persist hides inside the next build, so the bound checks that builds follow each \
+             other closely and the speedup cannot pass 1 + persist/execute"
+        } else {
+            "each build hides inside the previous persist, so the bound checks that commits follow \
+             each other closely"
+        };
+        let overlap = if self.overlapped == 0 {
+            "the pipeline NEVER overlapped: no measured output started building before the \
+             previous one committed, so this run measured no pipelining"
+                .to_string()
+        } else if self.overlapped < self.measured {
+            format!(
+                "only {} of {} measured outputs started building before the previous one committed",
+                self.overlapped, self.measured
+            )
+        } else {
+            "every measured output started building before the previous one committed".to_string()
+        };
+        let delay = if shape.persist_delay_ms > 0 {
+            format!(
+                "; every persist on both nodes includes a forced {} ms sleep",
+                shape.persist_delay_ms
+            )
+        } else {
+            String::new()
+        };
+        format!("NOTE pipeline_cycle {}: {regime}; {overlap}{delay}", self.regime())
+    }
+}
+
+/// The median (the lower one for an even count) of `values`, NaN when empty.
+fn median(values: Vec<f64>) -> f64 {
+    nearest_rank(values, 0.50)
+}
+
+/// The nearest-rank `fraction` percentile of `values`: the smallest value with at least that
+/// fraction of the values at or below it (NaN when empty).
+fn nearest_rank(mut values: Vec<f64>, fraction: f64) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let Some(last) = values.len().checked_sub(1) else {
+        return f64::NAN;
+    };
+    // the rank is ceil(fraction × n), 1-based; the clamp keeps it within the slice
+    let rank = (fraction * values.len() as f64).ceil() as usize;
+    values[rank.saturating_sub(1).min(last)]
+}
