@@ -352,9 +352,11 @@ pub struct Parameters {
     /// Advise the kernel that the execution database's memory map is read at random.
     ///
     /// When `true`, the node applies `madvise(MADV_RANDOM)` to every mapping of `mdbx.dat` after
-    /// it opens the database and again when the database grows, so page faults stop pulling
-    /// read-ahead into the page cache. The default `false` keeps the previous behaviour: the map
-    /// keeps the kernel's default advice. Issue #1802.
+    /// it opens the database, and again if the map's upper limit changes (growth inside the limit
+    /// adds no mapping, so the first call covers it), so page faults stop pulling read-ahead into
+    /// the page cache. The default `false` keeps the previous behaviour: only libmdbx's own advice
+    /// applies, which covers the pages in use at open and at each growth step, not the whole
+    /// map. Issue #1802.
     #[serde(default, skip_serializing_if = "is_default")]
     pub mdbx_random_advice: bool,
 

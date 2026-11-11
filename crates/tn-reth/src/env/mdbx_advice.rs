@@ -15,7 +15,7 @@
 //! environment's `mdbx.dat` right after the open. Growth inside the upper limit adds no mapping, so
 //! one call covers it. Only a change of the upper limit remaps, so after each persist
 //! [`MdbxAdvice::finish_persist`] compares the map size with the one it advised and, when it
-//! changed, re-applies the advice to any mapping it has not advised yet. The mappings are found in
+//! changed, re-applies the advice to every mapping of the file. The mappings are found in
 //! `/proc/self/maps` by device and inode, taken from the mapping that holds one of this database's
 //! own records, never by path: one process can hold many environments (tests do).
 //!
@@ -120,9 +120,10 @@ impl MdbxAdvice {
         let info = advice.db.info().ok();
         if random_advice {
             let map_size = info.as_ref().map_or(0, Info::map_size);
-            // with no mapping found, `apply` has already warned
+            // with no mapping found, or with every `madvise` refused, `apply` has already warned:
+            // the line below is the proof that the advice is in force, so it needs advised bytes
             let mappings = advice.apply(map_size);
-            if mappings > 0 {
+            if mappings > 0 && advice.advised_bytes() > 0 {
                 info!(
                     target: "tn::reth",
                     mappings,
