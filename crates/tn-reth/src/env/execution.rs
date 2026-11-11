@@ -699,6 +699,18 @@ impl OutputBuildScope {
         Self::default()
     }
 
+    /// A scope for the first block of an output that builds on `tip`, an unpersisted block,
+    /// with `overlay` holding the trie deltas between the database anchor and `tip`.
+    ///
+    /// The scope starts with no cached reads and refuses a first payload on any parent other
+    /// than `tip` ([`TnRethError::ScopeParentMismatch`]), so an output seeded on one block cannot
+    /// build on another. The caller vouches for `overlay`: its runs must be exactly the deltas of
+    /// the unpersisted blocks up to `tip`, extended in order with
+    /// [`OutputTrieOverlay::extend_from_block`].
+    pub fn seeded(overlay: OutputTrieOverlay, tip: B256) -> Self {
+        Self { overlay, reads: CachedReads::default(), tip: Some(tip) }
+    }
+
     /// The read cache the next block of the output starts from (tests inspect it).
     #[cfg(any(feature = "test-utils", test))]
     pub fn reads(&self) -> &CachedReads {
@@ -1165,6 +1177,33 @@ mod tests {
             scope.check_parent(first),
             Err(TnRethError::ScopeParentMismatch { expected, got })
                 if expected == second && got == first
+        ));
+    }
+
+    // ---- bench6 pipelined-persist ----
+
+    /// A seeded scope keeps the overlay it was handed, starts with no cached reads, and builds
+    /// only on the tip it was seeded with, even for its first block.
+    #[test]
+    fn test_seeded_scope_keeps_its_overlay_and_builds_only_on_its_tip() {
+        let (tip, other) = (B256::with_last_byte(7), B256::with_last_byte(8));
+        let mut overlay = OutputTrieOverlay::new();
+        overlay.extend_from_block(&ComputedTrieData::default());
+        let handed = format!("{overlay:?}");
+        assert_ne!(
+            handed,
+            format!("{:?}", OutputTrieOverlay::new()),
+            "test setup: a non-empty run"
+        );
+
+        let scope = OutputBuildScope::seeded(overlay, tip);
+        assert_eq!(format!("{:?}", scope.overlay), handed, "the overlay is kept as handed");
+        assert!(scope.reads.accounts.is_empty() && scope.reads.contracts.is_empty());
+        assert!(scope.reads.block_hashes.is_empty());
+        assert!(scope.check_parent(tip).is_ok(), "the seeded tip is the first parent");
+        assert!(matches!(
+            scope.check_parent(other),
+            Err(TnRethError::ScopeParentMismatch { expected, got }) if expected == tip && got == other
         ));
     }
 
