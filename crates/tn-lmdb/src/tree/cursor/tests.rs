@@ -655,8 +655,12 @@ impl<S: PageRead + ?Sized> PageRead for LeafLog<'_, S> {
         self.store.page_count()
     }
 
-    fn page(&self, pgno: u32) -> Result<&[u8]> {
-        let page = self.store.page(pgno)?;
+    fn page_any(&self, pgno: u32) -> Result<&[u8]> {
+        self.store.page_any(pgno)
+    }
+
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]> {
+        let page = self.store.page(pgno, tag)?;
         if page::kind(page)? == Kind::Leaf {
             self.leaves.lock().expect("log").push(pgno);
         }
@@ -1962,7 +1966,7 @@ fn separators(mut cursor: Cursor<'_>) -> Vec<Vec<u8>> {
             let path = &cursor.tree;
             for (&pgno, &ci) in path.pages[..path.depth - 1].iter().zip(&path.slots) {
                 if ci > 0 {
-                    let branch = store.page(pgno).expect("branch");
+                    let branch = store.page_any(pgno).expect("branch");
                     seps.insert(page::branch_key(branch, usize::from(ci)).expect("key").to_vec());
                 }
             }
@@ -2046,7 +2050,7 @@ enum Against {
 
 /// Where `key` lies against the leaf `path` is at (`None` unless it is at an entry).
 fn against<S: PageRead + ?Sized>(path: &TreeCursor, store: &S, key: &[u8]) -> Option<Against> {
-    let leaf = LeafView::new(store.page(path.leaf_pgno()?).ok()?).ok()?;
+    let leaf = LeafView::new(store.page_any(path.leaf_pgno()?).ok()?).ok()?;
     let (first, last) = (leaf.key(0).ok()?, leaf.key(leaf.nkeys() - 1).ok()?);
     Some(if page::cmp_keys(key, first).is_lt() {
         Against::Below
@@ -2884,7 +2888,7 @@ fn a_seeks_leaf_stays_unchecked_until_a_read_past_its_landing() {
     let (leaf, slot) = path[path.len() - 1];
     let branches: Vec<_> =
         path[..path.len() - 1].iter().map(|&(p, i)| (p, usize::from(i))).collect();
-    c.place(&branches, leaf, usize::from(slot));
+    c.place(0, &branches, leaf, usize::from(slot));
     assert!(c.leaf_checked(), "place");
     unchecked(&mut c, "past the end");
     assert_eq!(c.seek(s, &root, None, &key_of(1_999)).expect("seek"), None);

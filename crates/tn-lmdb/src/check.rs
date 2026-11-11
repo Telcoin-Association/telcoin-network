@@ -33,7 +33,7 @@ use crate::{
     packed,
     page::{self, Kind, Val},
     sys,
-    tree::{PageRead, TreeRoot},
+    tree::{nested_tag, PageRead, TreeRoot},
 };
 
 /// What `Env::check` found in a sound state: how its pages are used, and each table's size.
@@ -316,7 +316,7 @@ impl Checker<'_> {
             if !self.claim(p, owner) {
                 continue;
             }
-            let page = snapshot.page(p).map_err(|e| corrupt(p, e.to_string()))?;
+            let page = snapshot.page(p, root.tag).map_err(|e| corrupt(p, e.to_string()))?;
             if page::crc_state(page) != CrcState::Valid {
                 return Err(corrupt(p, "fails its CRC".to_string()));
             }
@@ -334,7 +334,7 @@ impl Checker<'_> {
             }
             let n = page::nkeys(page);
             if leaf && self.ahead.is_some() {
-                self.read_ahead_of_leaf(page, n, policy)?;
+                self.read_ahead_of_leaf(page, n, policy, root.tag)?;
             }
             if leaf {
                 leaves += 1;
@@ -467,7 +467,7 @@ impl Checker<'_> {
                 }
                 _ => return Err(Error::Corrupt(NOT_NESTED.to_string())),
             };
-            let nested = TreeRoot::decode(cell).map_err(in_key)?;
+            let nested = TreeRoot::decode(cell, nested_tag(root.tag, k)).map_err(in_key)?;
             nested_pages += checker
                 .walk(&nested, owner, Leaves::Plain, |_, subkey, _| {
                     if (1..=max_subkey).contains(&subkey.len()) {
@@ -523,19 +523,29 @@ impl Checker<'_> {
     /// Start the reads of what the leaf `page` (of `n` entries) names that the walk will read
     /// next ([`Ahead`]): each overflow run it descends into, and in a dup table's outer tree
     /// each nested root. An entry that fails to decode is left to the walk, which reports it.
-    fn read_ahead_of_leaf(&mut self, page: &[u8], n: usize, policy: Leaves) -> Result<()> {
+    /// `tag` is the tree's own tag, from which a nested root's is derived (`nested_tag`), so the
+    /// root decoded here is the one the walk fetches through `checked_page`; this reads no page.
+    fn read_ahead_of_leaf(
+        &mut self,
+        page: &[u8],
+        n: usize,
+        policy: Leaves,
+        tag: u32,
+    ) -> Result<()> {
         let page_size = self.snapshot.geometry.page_size();
         for i in 0..n {
-            let (_, v) = page::leaf_entry(page, i)?;
+            let (k, v) = page::leaf_entry(page, i)?;
             let (pgno, pages, txn) = match v {
                 Val::Overflow(ovf) => {
                     let pages = overflow::run_pages(ovf.len as usize, page_size);
                     (ovf.pgno, u32::try_from(pages).unwrap_or(u32::MAX), ovf.txn)
                 }
-                Val::Nested(cell) if policy == Leaves::DupOuter => match TreeRoot::decode(cell) {
-                    Ok(root) if !root.is_empty() => (root.root, 1, root.root_txn),
-                    _ => continue,
-                },
+                Val::Nested(cell) if policy == Leaves::DupOuter => {
+                    match TreeRoot::decode(cell, nested_tag(tag, k)) {
+                        Ok(root) if !root.is_empty() => (root.root, 1, root.root_txn),
+                        _ => continue,
+                    }
+                }
                 _ => continue,
             };
             if self.descends(txn) {

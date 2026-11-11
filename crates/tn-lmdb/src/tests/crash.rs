@@ -27,7 +27,7 @@ use crate::{
     meta::{slot_to_write, META_LEN},
     packed::PackedView,
     page::{self, Find, Val},
-    tree::{read::descend, PageRead as _, TreeRoot},
+    tree::{nested_tag, read::descend, PageRead as _, TreeRoot},
 };
 
 /// How the machine went down once the process stopped.
@@ -1638,10 +1638,12 @@ fn cell(env: &Env, k: u32) -> Cell {
     let leaf = descend(&*snapshot, &tree(env, DUP), &key, |_, _, _, _| Ok(()))
         .expect("descend")
         .expect("a leaf");
-    match page::leaf_find(snapshot.page(leaf.pgno).expect("the outer leaf"), &key).expect("find") {
-        Find::Found { value: Val::Nested(root), .. } => {
-            Cell::Nested(TreeRoot::decode(root).expect("a nested root"))
-        }
+    match page::leaf_find(snapshot.page_any(leaf.pgno).expect("the outer leaf"), &key)
+        .expect("find")
+    {
+        Find::Found { value: Val::Nested(root), .. } => Cell::Nested(
+            TreeRoot::decode(root, nested_tag(tree(env, DUP).tag, &key)).expect("a nested root"),
+        ),
         Find::Found { value: Val::Inline(set), .. } if packed_max > 0 => {
             Cell::Packed(PackedView::new(set, packed_max).expect("a packed set").rows())
         }

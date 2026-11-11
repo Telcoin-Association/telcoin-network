@@ -563,7 +563,7 @@ fn tree_gaps(env: &Env, name: &str) -> (u64, u64) {
     let (mut pages, mut gaps) = (0, 0);
     let mut stack = vec![record.root.root];
     while let Some(pgno) = stack.pop() {
-        let page = snapshot.page(pgno).expect("a tree page");
+        let page = snapshot.page_any(pgno).expect("a tree page");
         pages += 1;
         gaps += page::free_gap(page).map_or(0, |gap| gap.len()) as u64;
         if page::kind(page).expect("kind") == page::Kind::Branch {

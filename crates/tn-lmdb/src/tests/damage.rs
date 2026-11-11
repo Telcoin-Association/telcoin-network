@@ -50,7 +50,7 @@ pub(super) fn tree(env: &Env, name: &str) -> TreeRoot {
 /// The children `(pgno, txn)` of branch page `pgno` in the newest state of `env`.
 fn children(env: &Env, pgno: u32) -> Vec<(u32, u32)> {
     let snapshot = env.inner().current();
-    let page = snapshot.page(pgno).expect("branch");
+    let page = snapshot.page_any(pgno).expect("branch");
     (0..page::nkeys(page)).map(|i| page::branch_child(page, i).expect("child")).collect()
 }
 
@@ -123,7 +123,7 @@ pub(super) fn places(path: &Path) -> Places {
     let meta = snapshot.meta;
     let catalog_leaf = children(&env, meta.catalog.root)[1].0;
     let free_leaf = children(&env, meta.free.root)[0].0;
-    let leaf = snapshot.page(free_leaf).expect("free leaf");
+    let leaf = snapshot.page_any(free_leaf).expect("free leaf");
     let (_, value) = page::leaf_inline_entry(leaf, 0).expect("record");
     assert!(value.len() >= 8, "the first record lists pages");
     let free_value = u64::from(free_leaf) * P + (value.as_ptr() as u64 - leaf.as_ptr() as u64);
@@ -447,6 +447,51 @@ fn a_crossing_into_a_redirected_leaf_is_corrupt() {
         drop(ro);
         assert!(env.failure().is_some(), "forward {forward}: the damage latched");
     }
+}
+
+/// A branch cell of table `t` redirected to a leaf of table `u` that the same commit wrote: the
+/// page passes its CRC, names itself and carries the txn the cell names, so only the tree tag in
+/// its header tells it is another tree's. A get routed through the cell, and a scan crossing into
+/// it, are `Corrupt` at the fetch, naming both tags, and latch; `Env::check` refuses the file.
+#[test]
+fn a_child_redirected_to_another_tables_page_of_its_commit_is_corrupt_at_the_fetch() {
+    let fx = fixture();
+    let at = places(&fx.path);
+    let (cell, _) = at.same_txn;
+    let (key, target, tags) = {
+        let env = open(&fx.path, SyncMode::Durable);
+        let (t, u) = (tree(&env, "t"), tree(&env, "u"));
+        let t_leaves = children(&env, at.t_branch);
+        let u_leaves = children(&env, u.root);
+        let (target, txn) = *u_leaves.last().expect("u's last leaf");
+        assert_eq!(txn, t_leaves[cell].1, "u's last leaf and t's redirected leaf: one commit");
+        let snapshot = env.inner().current();
+        let leaf = snapshot.page_any(t_leaves[cell].0).expect("t's leaf");
+        let key = page::leaf_key(leaf, 0).expect("a key of the leaf").to_vec();
+        (key, target, (u.tag, t.tag))
+    };
+    restamped(&fx.path, at.t_branch, |b| set_child(b, cell, target));
+    let want =
+        format!("page {target} belongs to the tree tagged {:#x}, not to {:#x}", tags.0, tags.1);
+    let env = open(&fx.path, SyncMode::Durable);
+    let ro = env.begin_ro().expect("ro");
+    let t = ro.open_table("t").expect("open").expect("t");
+    let got = ro.get(&t, &key);
+    assert!(matches!(&got, Err(Error::Corrupt(m)) if m == &want), "get: {got:?}");
+    let mut cursor = ro.cursor(&t).expect("cursor");
+    let mut seen = 0;
+    let scan = loop {
+        match cursor.next() {
+            Ok(Some(_)) => seen += 1,
+            Ok(None) => panic!("the scan ended after {seen} entries"),
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(&scan, Error::Corrupt(m) if m == &want), "scan: {scan}");
+    assert!(seen > 0, "the scan met the redirect at a crossing");
+    drop(ro);
+    assert!(env.failure().is_some(), "latched");
+    assert!(matches!(env.check(), Err(Error::Corrupt(m)) if m.contains(&want)), "check");
 }
 
 /// A table of 2000 keys (height 2) whose root's separators from the middle to the one before the
@@ -900,7 +945,7 @@ fn a_loose_page_at_the_page_count_is_refused_by_the_tree_walk() {
 /// The same damage across transactions: `w` takes `L` and commits, so `L` is published when a
 /// later transaction drops `u`. That drop cannot tell (it reads only `u`'s first leaf) and frees
 /// `L` again. Once a later write hands `L` to table `x`, `w`'s gets of the keys in `L` fail the
-/// identity check (the page is not the copy `w`'s branch names) and latch: `Corrupt`, never `x`'s
+/// tree-tag check (the page belongs to `x`'s tree now) and latch: `Corrupt`, never `x`'s
 /// entries.
 #[test]
 fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
@@ -935,7 +980,7 @@ fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
             Ok(got) => assert!(got == Some(&value(9, i, 900)[..]), "key {i}: the value as written"),
             Err(Error::Corrupt(e)) => {
                 assert!(e.contains(&format!("page {leaf} ")), "{e}");
-                assert!(e.contains("is not the copy its parent names"), "{e}");
+                assert!(e.contains("belongs to the tree tagged"), "{e}");
                 refused += 1;
             }
             Err(e) => panic!("key {i}: {e}"),
@@ -1032,77 +1077,34 @@ fn a_catalog_record_id_past_the_next_table_id_is_corrupt_at_first_use() {
     }
 }
 
-/// The rows a write transaction's detached cursor reads from its first row on.
-fn cursor_rows(txn: &RwTxn, cursor: &mut crate::TxnCursor) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut rows = Vec::new();
-    let mut row = cursor.first(txn).expect("first").map(|(k, v)| (k.to_vec(), v.to_vec()));
-    while let Some(r) = row {
-        rows.push(r);
-        row = cursor.next(txn).expect("next").map(|(k, v)| (k.to_vec(), v.to_vec()));
+/// Two catalog records of one id below the next table id, a plain table's and a dup table's
+/// (a crafted catalog: `d`'s record given `a`'s id): the table beside the crafted record works,
+/// every working record is its table's own, and the crafted record's first read of its tree is
+/// `Corrupt` and latches, because `d`'s pages carry `d`'s own tag, not `a`'s id (a get, a cursor
+/// or a write of `d` in either transaction; the table beside it reads and writes on until then).
+#[test]
+fn two_catalog_records_of_one_id_are_corrupt_at_the_first_read_of_the_crafted_tree() {
+    for dup in [false, true] {
+        let (_dir, path, [a, _], _) = two_tables(dup);
+        dup::restamp_record(&path, |record| record.id = a.id());
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let a = txn.open_table("a").expect("open").expect("a");
+        let d = txn.open_table("d").expect("open").expect("d");
+        assert_eq!(a.id(), d.id(), "dup {dup}: the crafted catalog gives both tables one id");
+        let key = |s: &[u8]| if dup { dup::dup_key(1, s) } else { s.to_vec() };
+        txn.put(&a, &key(b"two"), b"a").expect("a writes on");
+        assert_eq!(txn.get(&a, &key(b"two")).expect("get"), Some(&b"a"[..]), "dup {dup}: a");
+        let read = txn.get(&d, &first_key(dup));
+        let tagged = |r: &crate::Result<Option<&[u8]>>| matches!(r, Err(Error::Corrupt(m)) if m.contains("belongs to the tree tagged"));
+        assert!(tagged(&read), "dup {dup}: d's tree carries d's tag, not a's id: {read:?}");
+        assert!(env.failure().is_some(), "dup {dup}: latched");
+        drop(txn);
+        let ro = env.begin_ro().expect("ro");
+        let d = ro.open_table("d").expect("open").expect("d");
+        let read = ro.get(&d, &first_key(dup));
+        assert!(tagged(&read), "dup {dup}: a reader meets the same refusal: {read:?}");
     }
-    rows
-}
-
-/// Two catalog records of one id below the next table id (damage only `Env::check`, which scans
-/// the catalog, can see) are two tables in a write transaction, each with its own working
-/// record: a detached cursor of `d` reads `d`'s tree after writes to both tables, `a`'s first,
-/// never `a`'s; and dropping `a` after a write to `d` keeps `d`'s write, so the commit records
-/// `d`'s new tree and the file's accounting is exact (`d`'s old pages freed once, none leaked).
-#[test]
-fn two_catalog_records_of_one_id_keep_their_own_working_records() {
-    let (_dir, path, [a, _], _) = two_tables(false);
-    dup::restamp_record(&path, |record| record.id = a.id());
-    let env = open(&path, SyncMode::Durable);
-    let mut txn = env.begin_rw().expect("rw");
-    let a = txn.open_table("a").expect("open").expect("a");
-    let d = txn.open_table("d").expect("open").expect("d");
-    assert_eq!(a.id(), d.id(), "the crafted catalog gives both tables one id");
-    txn.put(&a, b"a2", b"a").expect("put");
-    let mut cursor = txn.cursor_detached(&d).expect("cursor");
-    txn.put(&d, b"d2", b"d").expect("put");
-    txn.put(&a, b"a3", b"a").expect("put");
-    let expected = [(b"d2".to_vec(), b"d".to_vec()), (b"key".to_vec(), b"d".to_vec())];
-    assert_eq!(cursor_rows(&txn, &mut cursor), expected, "d's cursor reads d's tree");
-
-    txn.drop_table(a).expect("drop");
-    txn.commit().expect("commit");
-    let state = newest_state(&env);
-    assert_eq!(state, State::from([("d".to_string(), expected.into_iter().collect())]));
-    assert!(env.failure().is_none());
-}
-
-/// Two dup tables of one id (a crafted catalog's, as in
-/// [`two_catalog_records_of_one_id_keep_their_own_working_records`]), written under one outer
-/// key, `a` first: a detached dup cursor of `d` takes the key's nested root from the cell while
-/// `d` has no working record (though `a`'s working map holds the key), then from `d`'s working
-/// map once `d` is written, never from `a`'s.
-#[test]
-fn a_dup_cursor_reads_its_own_working_map_beside_a_table_of_its_id() {
-    let (_dir, path, [a, _], _) = two_tables(true);
-    dup::restamp_record(&path, |record| record.id = a.id());
-    let env = open(&path, SyncMode::Durable);
-    let mut txn = env.begin_rw().expect("rw");
-    let a = txn.open_table("a").expect("open").expect("a");
-    let d = txn.open_table("d").expect("open").expect("d");
-    assert_eq!(a.id(), d.id(), "the crafted catalog gives both tables one id");
-    let two = dup::dup_key(1, b"two");
-    txn.put(&a, &two, b"a").expect("put");
-    let mut cursor = txn.dup_cursor_detached(&d).expect("cursor");
-    let mut rows = |txn: &RwTxn| {
-        let mut rows = Vec::new();
-        let mut row = cursor.first(txn).expect("first").map(|(k, v)| (k.to_vec(), v.to_vec()));
-        while let Some(r) = row {
-            rows.push(r);
-            row = cursor.next(txn).expect("next").map(|(k, v)| (k.to_vec(), v.to_vec()));
-        }
-        rows
-    };
-    let of_d = |key: Vec<u8>| (key, b"d".to_vec());
-    assert_eq!(rows(&txn), [of_d(first_key(true))], "d's committed rows");
-    txn.put(&d, &two, b"d").expect("put");
-    assert_eq!(rows(&txn), [of_d(first_key(true)), of_d(two)], "d's working rows");
-    assert_eq!(txn.dup_rows_for_test(&a).len(), 2, "a's rows");
-    assert!(env.failure().is_none());
 }
 
 /// A slot of the last txn id fails the open closed even when the open passes it over: here an

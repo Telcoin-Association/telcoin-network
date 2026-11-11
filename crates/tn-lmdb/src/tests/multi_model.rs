@@ -498,7 +498,7 @@ impl Run {
                 let k = outer_number(key);
                 if self.forms[j].nested.contains(&k) {
                     let cell = cell.as_slice().try_into().expect("a nested cell");
-                    nested = nested.max(TreeRoot::decode(cell).expect("a nested root").height);
+                    nested = nested.max(TreeRoot::decode(cell, 0).expect("a nested root").height);
                 } else {
                     let (n, len) = set_of(rows, k, klen);
                     let count =

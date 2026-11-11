@@ -9,6 +9,7 @@ use crate::{
     dup::DupLayout,
     env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
+    timeout::{ReaderState, ReaderTimeouts},
 };
 use parking_lot::Mutex;
 use reth_db_api::{
@@ -167,11 +168,20 @@ pub struct TnLmdbTx {
     txn: Arc<RoTxn>,
     tables: Arc<TableMap>,
     pool: Arc<ReadPool>,
+    /// The transaction's state under the read transaction timeout, shared with its cursors.
+    reader: Arc<ReaderState>,
+    /// The environment's timeout, which the transaction leaves when it ends; `None` when off.
+    timeouts: Option<Arc<ReaderTimeouts>>,
 }
 
 impl TnLmdbTx {
-    pub(crate) fn new(txn: RoTxn, tables: Arc<TableMap>) -> Self {
-        Self { txn: Arc::new(txn), tables, pool: Arc::default() }
+    pub(crate) fn new(
+        txn: RoTxn,
+        tables: Arc<TableMap>,
+        reader: Arc<ReaderState>,
+        timeouts: Option<Arc<ReaderTimeouts>>,
+    ) -> Self {
+        Self { txn: Arc::new(txn), tables, pool: Arc::default(), reader, timeouts }
     }
 
     /// Test-only: the engine cursors the transaction's pool holds.
@@ -199,6 +209,7 @@ impl DbTx for TnLmdbTx {
         &self,
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
+        self.reader.check(DatabaseError::Open)?;
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         get_value::<T>(&self.txn, entry.check::<T>()?, key.as_ref())
     }
@@ -211,6 +222,7 @@ impl DbTx for TnLmdbTx {
     fn abort(self) {}
 
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
+        self.reader.check(DatabaseError::InitCursor)?;
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         let (table, dup) = entry.check::<T>()?;
         let id = table.id();
@@ -221,7 +233,7 @@ impl DbTx for TnLmdbTx {
                     .map_err(|e| DatabaseError::InitCursor(error::info(&e)))?,
             ),
         };
-        Ok(TnLmdbCursor::new(cursor, dup, Arc::clone(&self.pool), id))
+        Ok(TnLmdbCursor::new(cursor, dup, Arc::clone(&self.pool), id, Arc::clone(&self.reader)))
     }
 
     fn cursor_dup_read<T: DupSort>(&self) -> Result<Self::DupCursor<T>, DatabaseError> {
@@ -229,6 +241,7 @@ impl DbTx for TnLmdbTx {
     }
 
     fn entries<T: Table>(&self) -> Result<usize, DatabaseError> {
+        self.reader.check(DatabaseError::Stats)?;
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         let stat =
             self.txn.table_stat(&entry.table).map_err(|e| DatabaseError::Stats(error::info(&e)))?;
@@ -238,7 +251,22 @@ impl DbTx for TnLmdbTx {
     /// Does nothing: tn-lmdb has no read timeout to disable. A long read transaction only holds
     /// back page reuse, so the file grows until it ends; a commit made while it has held a
     /// superseded snapshot for over a minute logs a warning instead (at most once a minute).
-    fn disable_long_read_transaction_safety(&mut self) {}
+    /// Takes the transaction out of the read transaction timeout, as on MDBX; one already timed
+    /// out stays so.
+    fn disable_long_read_transaction_safety(&mut self) {
+        if let Some(timeouts) = &self.timeouts {
+            timeouts.opt_out(&self.reader);
+        }
+    }
+}
+
+impl Drop for TnLmdbTx {
+    /// Leaves the read transaction timeout: the engine's reader ends with the last cursor.
+    fn drop(&mut self) {
+        if let Some(timeouts) = &self.timeouts {
+            timeouts.ended(&self.reader);
+        }
+    }
 }
 
 /// A read-write transaction. It and its cursors ([`TnLmdbCursorMut`]) share the engine's
@@ -454,7 +482,7 @@ impl DbTx for TnLmdbTxMut {
         })
     }
 
-    /// Does nothing: a write transaction has no timeout either.
+    /// Does nothing: a write transaction has no timeout, as on MDBX.
     fn disable_long_read_transaction_safety(&mut self) {}
 }
 

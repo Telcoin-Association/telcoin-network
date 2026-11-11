@@ -67,6 +67,10 @@ impl Mdbx {
     /// `MDBX_EINVAL` (the platform's `EINVAL`).
     pub(crate) const INVALID_PARAMETER: Self =
         Self { code: libc::EINVAL, message: "invalid parameter specified" };
+    /// `reth_libmdbx::Error::ReadTransactionTimeout`: reth's own code, not MDBX's, for a read
+    /// transaction past `max_read_transaction_duration` (`crate::timeout`).
+    pub(crate) const READ_TRANSACTION_TIMEOUT: Self =
+        Self { code: -96000, message: "read transaction has been timed out" };
 
     /// This error as reth's error information.
     pub(crate) fn info(self) -> DatabaseErrorInfo {

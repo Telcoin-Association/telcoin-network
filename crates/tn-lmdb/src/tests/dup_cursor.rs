@@ -24,6 +24,7 @@ use crate::{
             KeyTail, State,
         },
         dup_cursor::{InKey, LeafBounds},
+        nested_tag,
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         TreeRoot,
     },
@@ -609,8 +610,11 @@ pub(super) fn forms(env: &Env, d: &Table, bound: Bound) -> (BTreeSet<Vec<u8>>, O
     };
     let nested: Vec<u32> = (walk.entries.iter())
         .filter(|(k, _)| !walk.packed.contains(k))
-        .map(|(_, cell)| {
-            let root = TreeRoot::decode(cell.as_slice().try_into().expect("a nested cell"));
+        .map(|(k, cell)| {
+            let root = TreeRoot::decode(
+                cell.as_slice().try_into().expect("a nested cell"),
+                nested_tag(outer.tag, k),
+            );
             root.expect("a nested root").height
         })
         .collect();
@@ -1748,7 +1752,7 @@ fn seek_dup_past_a_packed_keys_last_row_is_unset() {
             .filter(|(k, _)| k[..] != 8u32.to_be_bytes())
             .map(|(_, cell)| {
                 let cell = cell.as_slice().try_into().expect("a nested cell");
-                TreeRoot::decode(cell).expect("a nested root").root
+                TreeRoot::decode(cell, 0).expect("a nested root").root
             })
             .collect();
         assert_eq!(garbled.len(), 2);

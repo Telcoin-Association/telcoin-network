@@ -43,6 +43,9 @@ fn dbg(error: DatabaseError) -> String {
 /// How long the long-read tests hold their transaction before reading.
 const LONG_READ: Duration = Duration::from_millis(200);
 
+/// The read transaction timeout of the long-read tests: well under [`LONG_READ`].
+const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// An MDBX environment with reth's tables, the oracle.
 pub(super) fn create_mdbx_db() -> (tempfile::TempDir, DatabaseEnv) {
     let dir = tempfile::TempDir::new().unwrap();
@@ -56,10 +59,13 @@ pub(super) fn create_mdbx_db() -> (tempfile::TempDir, DatabaseEnv) {
     (dir, db)
 }
 
+/// The port of reth's `long_read_transaction_safety_disabled`: a transaction that opted out of
+/// the timeout reads on past it.
 #[test]
 fn long_read_transaction_safety_disabled() {
     let dir = tempfile::tempdir().unwrap();
-    let db = super::open_env(dir.path(), TnLmdbEnvKind::RW, TnLmdbArgs::default()).unwrap();
+    let args = TnLmdbArgs::default().with_read_transaction_timeout(Some(SHORT_TIMEOUT));
+    let db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
     let mut tx = db.tx().unwrap();
     tx.disable_long_read_transaction_safety();
     thread::sleep(LONG_READ);
@@ -69,16 +75,85 @@ fn long_read_transaction_safety_disabled() {
         DatabaseError::Open(err) if err == Error::NotFound.into()));
 }
 
-/// MDBX times this transaction out (`ReadTransactionTimeout`); tn-lmdb times no transaction out,
-/// so it still reads.
+/// The port of reth's `long_read_transaction_safety_enabled`: a transaction past the timeout
+/// fails its next call with `ReadTransactionTimeout`, as on MDBX.
 #[test]
 fn long_read_transaction_safety_enabled() {
-    let (_dir, db) = create_test_db(TnLmdbEnvKind::RW);
-    db.update(|tx| tx.put::<CanonicalHeaders>(7, B256::with_last_byte(7))).unwrap().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let args = TnLmdbArgs::default().with_read_transaction_timeout(Some(SHORT_TIMEOUT));
+    let db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
     let tx = db.tx().unwrap();
     thread::sleep(LONG_READ);
-    assert_eq!(tx.get::<CanonicalHeaders>(7).unwrap(), Some(B256::with_last_byte(7)));
-    assert!(matches!(tx.get::<Transactions>(0), Ok(None)), "a read after the wait is no timeout");
+    // Transaction has timed out.
+    assert!(matches!(
+        tx.get::<Transactions>(0).unwrap_err(),
+        DatabaseError::Open(err) if err == Error::ReadTransactionTimeout.into()));
+}
+
+/// A read transaction past the timeout fails every later call of its own and of its cursors,
+/// those opened before the timeout included, each in reth's variant for the call with
+/// `ReadTransactionTimeout`; the gauge counts it while it is open and not after; a transaction
+/// within the limit, and every transaction of an environment opened without a timeout, read on;
+/// and a write transaction never times out.
+#[test]
+fn a_timed_out_read_transaction_fails_every_later_call_until_dropped() {
+    let timeout = |timeout| {
+        let dir = tempfile::tempdir().unwrap();
+        let args = TnLmdbArgs::default().with_read_transaction_timeout(timeout);
+        let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
+        db.create_tables().unwrap();
+        db.update(|tx| tx.put::<CanonicalHeaders>(7, B256::with_last_byte(7))).unwrap().unwrap();
+        (dir, db)
+    };
+    let timed_out =
+        |db: &TnLmdbEnv| gauges(db)[&("db.timed_out_not_aborted_transactions".to_string(), vec![])];
+    let is_timeout = |info: &reth_storage_errors::db::DatabaseErrorInfo| {
+        *info == Error::ReadTransactionTimeout.into()
+    };
+
+    let (_dir, db) = timeout(Some(SHORT_TIMEOUT));
+    assert_eq!(db.read_transaction_timeout(), Some(SHORT_TIMEOUT));
+    let tx = db.tx().unwrap();
+    let mut before = tx.cursor_read::<CanonicalHeaders>().unwrap();
+    assert_eq!(before.first().unwrap(), Some((7, B256::with_last_byte(7))), "within the limit");
+    assert_eq!(timed_out(&db), 0.0, "none timed out yet");
+    thread::sleep(LONG_READ);
+    assert_eq!(timed_out(&db), 1.0, "timed out and still open");
+    assert!(matches!(tx.get::<CanonicalHeaders>(7), Err(DatabaseError::Open(e)) if is_timeout(&e)));
+    assert!(
+        matches!(tx.entries::<CanonicalHeaders>(), Err(DatabaseError::Stats(e)) if is_timeout(&e))
+    );
+    assert!(
+        matches!(tx.cursor_read::<CanonicalHeaders>(), Err(DatabaseError::InitCursor(e)) if is_timeout(&e))
+    );
+    assert!(
+        matches!(before.first(), Err(DatabaseError::Read(e)) if is_timeout(&e)),
+        "a cursor opened before"
+    );
+    assert!(matches!(before.next(), Err(DatabaseError::Read(e)) if is_timeout(&e)));
+    let late = db.tx().unwrap();
+    assert_eq!(
+        late.get::<CanonicalHeaders>(7).unwrap(),
+        Some(B256::with_last_byte(7)),
+        "a new reader"
+    );
+    assert_eq!(timed_out(&db), 1.0, "still open");
+    drop(before);
+    drop(tx);
+    assert_eq!(timed_out(&db), 0.0, "dropped");
+    drop(late);
+    let rw = db.tx_mut().unwrap();
+    thread::sleep(LONG_READ);
+    assert_eq!(rw.get::<CanonicalHeaders>(7).unwrap(), Some(B256::with_last_byte(7)), "a writer");
+    rw.commit().unwrap();
+    drop(db);
+
+    let (_dir, db) = timeout(None);
+    assert_eq!(db.read_transaction_timeout(), None);
+    let tx = db.tx().unwrap();
+    thread::sleep(LONG_READ);
+    assert_eq!(tx.get::<CanonicalHeaders>(7).unwrap(), Some(B256::with_last_byte(7)), "no timeout");
+    assert_eq!(timed_out(&db), 0.0);
 }
 
 /// The first long-reader warning is due at once, and each later one a full interval after the
@@ -205,6 +280,8 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         assert_eq!(error::info(&engine), mdbx.into(), "{engine}");
     }
     assert_eq!(dbg(crate::tx::no_data()), dbg(DatabaseError::Delete(Error::NoData.into())));
+    // The adapter's own timeout carries reth's code and message for it.
+    assert_eq!(error::Mdbx::READ_TRANSACTION_TIMEOUT.info(), Error::ReadTransactionTimeout.into());
 
     // Their own message under MDBX's code.
     let own = [
@@ -1359,7 +1436,7 @@ fn tn_lmdb_cursors_stay_small() {
     assert!(size_of::<WriteCursor>() <= write + 8, "{}", size_of::<WriteCursor>());
     assert_eq!(size_of::<Option<Box<ReadCursor>>>(), 8);
     let cursor = size_of::<TnLmdbCursor<PlainStorageState>>();
-    assert!(cursor <= 8 + 96, "{cursor}");
+    assert!(cursor <= 8 + 8 + 96, "{cursor}");
     let cursor = size_of::<TnLmdbCursorMut<PlainStorageState>>();
     assert!(cursor <= write + 8 + 160, "{cursor} over {write}");
 }

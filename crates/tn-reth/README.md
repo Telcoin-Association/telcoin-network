@@ -748,7 +748,11 @@ Both run in the normal lanes in well under a second. When one fails:
 - an unintended change is a bug: fix the code, never the fixtures;
 - an intended format change bumps its marker, moves each old fixture to its own directory (for
   example `v2` to `v2-layout1`) with a test of what the new binary does with it (opens, converts or
-  refuses it), and then regenerates;
+  refuses it), and then regenerates. A format no release has written has no datadirs to keep
+  reading, so its fixtures are regenerated in place: tn-lmdb's format 7 (tree tags) replaced
+  format 6 before tn-lmdb shipped, and the engine's own tests pin the refusal of every earlier
+  version (`a_version_6_record_is_refused` and its siblings in `crates/tn-lmdb/src/meta.rs`;
+  `a_version_4_file_is_refused_at_open` in `crates/tn-lmdb/src/env/tests.rs` opens a whole file);
 - a block-hash difference is an execution change, not a format change (check `TN_*_FORK_EPOCH` in
   the environment first).
 

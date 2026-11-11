@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -55,10 +56,20 @@ class CaptureTests(unittest.TestCase):
             'tn_network_inbound_requests_failed_total{network="worker-0",class="batch",outcome="omitted"} 2',
             'tn_network_connection_limit_rejections_total{network="primary",reason="established_total"} 3',
             'tn_network_inbound_connections_denied_total{network="primary",reason="other_limit",stage="transport_cap"} 4',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="peer_manager_public_share",stage="authenticated_policy"} 6',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="peer_manager_public_peer_connections",stage="authenticated_policy"} 7',
             'tn_network_inbound_connections_denied_total{network="primary",reason="unknown",stage="unknown"} 5',
         ])
-        self.assertEqual([item["value"] for item in capture.observations(accepted, 1)], [1, 1, 2, 3, 4, 5])
+        self.assertEqual([item["value"] for item in capture.observations(accepted, 1)], [1, 1, 2, 3, 4, 6, 7, 5])
         self.assertTrue({capture.FAILED, capture.DENIALS} <= capture.REQUIRED_METRICS)
+
+    def test_denial_reasons_cover_every_peer_manager_label_in_the_crate(self):
+        """Every peer manager reason string in the Rust crate stays inside DENIAL_REASONS, so a new label cannot drift."""
+        crate = Path(__file__).resolve().parents[2] / "crates" / "network-libp2p" / "src"
+        sources = [*crate.glob("peers/*.rs"), crate / "metrics.rs"]
+        labels = {label for path in sources for label in re.findall(r'"(peer_manager_[a-z_]+)"', path.read_text())}
+        self.assertTrue(labels)
+        self.assertLessEqual(labels, capture.DENIAL_REASONS)
 
     def test_block_number_is_a_quantity_or_missing(self):
         replies = [io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":"0x2a"}'), io.BytesIO(b'{"result":null}'),

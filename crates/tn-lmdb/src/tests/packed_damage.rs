@@ -118,7 +118,7 @@ pub(super) fn packed_fixture() -> PackedFixture {
             .expect("descend")
             .expect("a leaf")
             .pgno;
-        let page = snapshot.page(leaf).expect("the outer leaf");
+        let page = snapshot.page_any(leaf).expect("the outer leaf");
         let Find::Found { value, .. } = page::leaf_find(page, &k.to_be_bytes()).expect("find")
         else {
             panic!("key {k}'s cell");

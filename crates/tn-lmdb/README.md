@@ -130,16 +130,18 @@ recovery](#open-and-recovery)).
 Decoding (`Meta::decode`) runs its checks in this order:
 
 1. The magic must match, else `NotTnLmdb`.
-2. The version must be 6, else `UnsupportedVersion`. This runs before the CRC check, because
+2. The version must be 7, else `UnsupportedVersion`. This runs before the CRC check, because
    another version may lay the record out differently. The format is pre-release: a file of
-   version 1 to 5 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(5)`), with no
+   version 1 to 6 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(6)`), with no
    migration and never as damage. Version 3 added the nested cell (leaf cell flags 2) and the
    96-byte catalog record. Version 4 changed the tree page's CRC to skip the page's free gap
    ([Tree pages](#tree-pages-pagers)), so a version-3 page's whole-page CRC would not check.
    Version 5 raised the leaf entry limit from `U / 4` to `U / 2` ([Limits](#limits)), so values
    that version 4 kept in overflow runs are inline: a version-4 overflow cell of such a value
    would fail `page::validate`'s canonical-length rule. Version 6 put the flags word and the boot
-   id in bytes 96..116, which version 5 reserved, for the weak record.
+   id in bytes 96..116, which version 5 reserved, for the weak record. Version 7 put the tree tag
+   in bytes 18..22 of every tree page's header, which version 6 reserved ([Tree
+   pages](#tree-pages-pagers)).
 3. The CRC must match, else `Corrupt`.
 4. The remaining fields must be possible, else `Corrupt`: a valid page size, no flag but bit 0,
    no non-zero reserved byte, well-formed tree roots, a `page_count` of at least 2, and a next
@@ -184,13 +186,22 @@ and the branches above it), so a handle past its bounds is `Corrupt` with the tr
 ### Tree pages (`page.rs`)
 
 ```text
-header (24):  pgno u32 | kind u8 (1 = branch, 2 = leaf) | flags u8 (0) | nkeys u16 | txn u64 | upper u16 | reserved [6]
+header (24):  pgno u32 | kind u8 (1 = branch, 2 = leaf) | flags u8 (0) | nkeys u16 | txn u64 | upper u16 | tag u32 | reserved [2]
 slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
 free space:   from the end of the slot array up to `upper`
 cells:        packed from `upper` up to P − 4, in no particular order
 trailer (4):  CRC32 over bytes 0..24+2·nkeys, then upper..P−4 (the page outside its free gap)
 ```
 
+- **Every page names its tree.** The header's `tag` is the tree's (`tree::TreeRoot::tag`): a
+  table's id, `u32::MAX` for the catalog, `u32::MAX − 1` for the free tree, and for a tree nested
+  in a dup table's outer cell the CRC-32 of the table's tag and the outer key
+  (`tree::nested_tag`). Every fetch through a pointer compares it with the tag of the tree being
+  read (`tree::read::checked_page`), so a pointer that damage redirects to a page of another
+  tree, or a nested root redirected to another key's tree, is `Corrupt` at the fetch, even when
+  the page is of the same commit and kind. A page laid out for a tree takes its tag, and a copy
+  keeps it; the tag is not part of a root's 32-byte encoding: a root is decoded with the tag its
+  holder knows.
 - **Cells tile `upper..P−4` exactly.** Deleting or shrinking a cell closes its gap at once, so a
   page never fragments. Free space is `upper − (24 + 2·nkeys)`, and `free + used == U` always
   holds.
@@ -2588,9 +2599,11 @@ argument and the measurements. Code and other docs cite the items by number, so 
 4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector: a
    sound tree never points at a reused page (the reuse gate guarantees it), and a pointer
    redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32. A
-   pointer redirected to another page of the right kind that the same commit wrote passes too: a
-   page header names no tree. That is damage at rest to a 4-byte field, which `Env::check` finds
-   (no page is reached twice). See [Tree pages](#tree-pages-pagers).
+   pointer redirected to a page of another tree that the same commit wrote fails the header's
+   tree tag instead (every page names its tree: a table's id, or a tag derived from the dup
+   table's and the outer key for a nested tree); one redirected to another page of the same tree
+   and commit is damage at rest to a 4-byte field, which the key-range checks of the descents and
+   `Env::check` find (no page is reached twice). See [Tree pages](#tree-pages-pagers).
 5. **The file can be longer than `page_count × P`.** That is growth slack; the meta's page count is
    authoritative. A clean close trims it; a crash, a latched close, a failed final sync or a failed
    trim keeps it, because the longer file is always valid while a trim whose length rests on state

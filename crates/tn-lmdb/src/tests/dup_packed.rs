@@ -809,7 +809,7 @@ fn packed_fixture(dir: &Path) -> (std::path::PathBuf, u32) {
 fn packed_set_of_key_2(path: &Path, leaf: u32) -> Vec<u8> {
     let env = open(path, SyncMode::Durable);
     let snapshot = env.inner().current();
-    let page = snapshot.page(leaf).expect("the outer leaf");
+    let page = snapshot.page_any(leaf).expect("the outer leaf");
     let Find::Found { value: Val::Inline(blob), .. } =
         page::leaf_find(page, &[2; K as usize]).expect("find")
     else {

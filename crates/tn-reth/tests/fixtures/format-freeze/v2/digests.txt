@@ -58,7 +58,7 @@ version jar/StorageChangeSets 2
 version jar/TransactionSenders 2
 version jar/Transactions 2
 version tn_layout 1
-version tn_lmdb_format 6
+version tn_lmdb_format 7
 version tn_lmdb_page_size 4096
 write file/db/database.version 4 b281bc2c616cb3c3a097215fdc9397ae87e6e06b156cc34e656be7a1a9ce8839
 write file/static_files/static_file_account-change-sets_0_499999 1748 484f1498490dab79bfdb90e79d78e277a8f9ffed36bd1b60a32ed979d968d73a

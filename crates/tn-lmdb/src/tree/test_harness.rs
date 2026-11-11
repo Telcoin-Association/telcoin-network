@@ -294,9 +294,10 @@ impl PageRead for MemStore {
         self.alloc.page_count()
     }
 
-    fn page(&self, pgno: u32) -> Result<&[u8]> {
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]> {
         checked_page(
             pgno,
+            tag,
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
@@ -304,15 +305,21 @@ impl PageRead for MemStore {
         )
     }
 
-    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+    fn child(&self, pgno: u32, want_txn: u32, tag: u32) -> Result<&[u8]> {
         checked_child(
             pgno,
             want_txn,
+            tag,
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
             |p| self.span(p, self.geometry.page_size()),
         )
+    }
+
+    fn page_any(&self, pgno: u32) -> Result<&[u8]> {
+        let tag = self.span(pgno, self.geometry.page_size()).map_or(0, page::tag);
+        self.page(pgno, tag)
     }
 
     fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
@@ -384,7 +391,7 @@ impl PageWrite for MemStore {
         if self.alloc.is_private(from) {
             return Err(Error::Failed(format!("page {from} is private: it needs no copy")));
         }
-        self.page(from)?;
+        self.page_any(from)?;
         self.page_mut(to)?;
         let size = self.geometry.page_size();
         let (src, dst) = (from as usize * size, to as usize * size);
@@ -467,16 +474,21 @@ impl PageRead for ReadView<'_> {
         self.store.alloc.page_count()
     }
 
-    fn page(&self, pgno: u32) -> Result<&[u8]> {
-        checked_page(pgno, self.store.alloc.page_count(), self.txn, false, |p| {
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]> {
+        checked_page(pgno, tag, self.store.alloc.page_count(), self.txn, false, |p| {
             self.store.span(p, self.store.geometry.page_size())
         })
     }
 
-    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
-        checked_child(pgno, want_txn, self.store.alloc.page_count(), self.txn, false, |p| {
+    fn child(&self, pgno: u32, want_txn: u32, tag: u32) -> Result<&[u8]> {
+        checked_child(pgno, want_txn, tag, self.store.alloc.page_count(), self.txn, false, |p| {
             self.store.span(p, self.store.geometry.page_size())
         })
+    }
+
+    fn page_any(&self, pgno: u32) -> Result<&[u8]> {
+        let tag = self.store.span(pgno, self.store.geometry.page_size()).map_or(0, page::tag);
+        self.page(pgno, tag)
     }
 
     fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
@@ -528,7 +540,7 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
     ) {
         assert!(self.seen.insert(p), "page {p} is reached twice");
         self.walk.pages.push(p);
-        let buf = self.store.page(p).unwrap_or_else(|e| panic!("page {p} is unreadable: {e}"));
+        let buf = self.store.page_any(p).unwrap_or_else(|e| panic!("page {p} is unreadable: {e}"));
         page::validate(buf, &self.geometry).unwrap_or_else(|e| panic!("page {p}: {e}"));
         assert_eq!(page::txn(buf) as u32, want_txn, "page {p}: txn is not its parent's child_txn");
         let state = page::crc_state(buf);
@@ -643,7 +655,7 @@ pub(crate) fn leaf_fill<S: PageRead + ?Sized>(store: &S, leaves: &[u32]) -> f64 
     let usable = store.geometry().usable();
     let used: usize = leaves
         .iter()
-        .map(|&p| usable - page::free_space(store.page(p).expect("leaf")).expect("free"))
+        .map(|&p| usable - page::free_space(store.page_any(p).expect("leaf")).expect("free"))
         .sum();
     used as f64 / (leaves.len() * usable) as f64
 }
@@ -675,7 +687,7 @@ fn levels<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Vec<Vec<u32>> {
         let mut next = Vec::new();
         if depth < root.height {
             for &p in &level {
-                let buf = store.page(p).expect("branch");
+                let buf = store.page_any(p).expect("branch");
                 next.extend(
                     (0..page::nkeys(buf)).map(|i| page::branch_child(buf, i).expect("c").0),
                 );
@@ -693,7 +705,9 @@ pub(crate) fn level_keys<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Ve
     levels.reverse();
     levels
         .iter()
-        .map(|level| level.iter().map(|&p| key_list_hash(store.page(p).expect("page"))).collect())
+        .map(|level| {
+            level.iter().map(|&p| key_list_hash(store.page_any(p).expect("page"))).collect()
+        })
         .collect()
 }
 
@@ -709,18 +723,18 @@ pub(crate) fn merge_open_pages<S: PageRead + ?Sized>(
     before: &[HashSet<u64>],
 ) -> Vec<u32> {
     let usable = store.geometry().usable();
-    let used = |p: u32| usable - page::free_space(store.page(p).expect("page")).expect("free");
+    let used = |p: u32| usable - page::free_space(store.page_any(p).expect("page")).expect("free");
     let mut open = Vec::new();
     let levels = levels(store, root);
     for (depth, level) in levels.iter().enumerate().take(levels.len().saturating_sub(1)) {
         // The level index of the children, counted from the leaves.
         let below = levels.len() - depth - 2;
         for &p in level {
-            let buf = store.page(p).expect("branch");
+            let buf = store.page_any(p).expect("branch");
             let n = page::nkeys(buf);
             let kids: Vec<u32> = (0..n).map(|i| page::branch_child(buf, i).expect("c").0).collect();
             for (i, &c) in kids.iter().enumerate() {
-                let cb = store.page(c).expect("child");
+                let cb = store.page_any(c).expect("child");
                 let changed = before.get(below).is_none_or(|set| !set.contains(&key_list_hash(cb)));
                 if !changed || 4 * used(c) >= usable {
                     continue;
@@ -753,7 +767,7 @@ pub(crate) fn page_fill<S: PageRead + ?Sized>(
     let usable = store.geometry().usable();
     let used: usize = pages
         .iter()
-        .map(|&p| usable - page::free_space(store.page(p).expect("page")).expect("free"))
+        .map(|&p| usable - page::free_space(store.page_any(p).expect("page")).expect("free"))
         .sum();
     used as f64 / (pages.len().max(1) * usable) as f64
 }

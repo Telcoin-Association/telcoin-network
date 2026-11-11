@@ -21,6 +21,7 @@ use crate::{
     overflow,
     page::{self, Find, Val},
     tree::{
+        nested_tag,
         read::descend,
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         PageRead as _, TreeRoot, MAX_TREE_PAGES,
@@ -1343,12 +1344,16 @@ pub(super) fn damaged(
                 .expect("descend")
                 .expect("an outer leaf")
                 .pgno;
-            let page = snapshot.page(leaf).expect("the outer leaf");
+            let page = snapshot.page_any(leaf).expect("the outer leaf");
             let found = page::leaf_find(page, &k.to_be_bytes()).expect("find");
             let Find::Found { value: Val::Nested(root), .. } = found else {
                 panic!("key {k}'s nested cell");
             };
-            (leaf, TreeRoot::decode(root).expect("a nested root"))
+            (
+                leaf,
+                TreeRoot::decode(root, nested_tag(outer.tag, &k.to_be_bytes()))
+                    .expect("a nested root"),
+            )
         };
         (0..40u32).map(|k| (k, cell(k))).collect::<BTreeMap<_, _>>()
     };
@@ -1570,13 +1575,17 @@ fn a_working_record_that_breaks_a_record_rule_is_corrupt_at_commit() {
                     let snapshot = env.inner().current();
                     let (d, b) = (tree(&env, "d"), tree(&env, "b"));
                     assert_eq!(d.height, 1, "d's outer tree is one leaf");
-                    let page = snapshot.page(b.root).expect("b's outer leaf");
+                    let page = snapshot.page_any(b.root).expect("b's outer leaf");
                     let Find::Found { value: Val::Nested(root), .. } =
                         page::leaf_find(page, &1u32.to_be_bytes()).expect("find")
                     else {
                         panic!("b's key 1 is nested");
                     };
-                    (d.root, TreeRoot::decode(root).expect("a nested root"))
+                    (
+                        d.root,
+                        TreeRoot::decode(root, nested_tag(b.tag, &1u32.to_be_bytes()))
+                            .expect("a nested root"),
+                    )
                 };
                 restamp_cell(&path, leaf, &1u32.to_be_bytes(), Val::Nested(&foreign.encode()));
             }
@@ -1592,7 +1601,15 @@ fn a_working_record_that_breaks_a_record_rule_is_corrupt_at_commit() {
         match case {
             "unpacked set" => txn.put(&d, &dup_key(1, b"b"), b"w").expect("packed put"),
             "foreign tree" => {
-                txn.delete_prefix(&d, &1u32.to_be_bytes()).expect("delete_prefix");
+                // Another table's nested tree carries another tag: refused at the first read of
+                // the cell's tree, before any record rule.
+                let read = txn.delete_prefix(&d, &1u32.to_be_bytes());
+                assert!(
+                    matches!(&read, Err(Error::Corrupt(m)) if m.contains("belongs to the tree tagged")),
+                    "{case}: {read:?}"
+                );
+                assert!(env.failure().is_some(), "{case}: latched");
+                continue;
             }
             _ => txn.put(&d, &dup_key(2, b"new"), b"w").expect("nested put"),
         }
@@ -1792,7 +1809,10 @@ fn private_leaf_holding(txn: &mut crate::RwTxn, key: &[u8]) -> u32 {
 /// copy would keep a cell naming another key's tree). Each write that copies the leaf meets it: a
 /// put of a new outer key, a delete emptying another key, a `delete_prefix` of another key, and a
 /// nested-only put to another key, whose cell the commit's flush rewrites. Each is `Corrupt` and
-/// latches; on the file before the forge the same writes commit and pass `Env::check`.
+/// latches; on the file before the forge the same writes commit and pass `Env::check`. The page
+/// the forged cell names is another key's tree, so the tree-tag check of the fetch refuses it
+/// first; the txn rule's own message is the MemStore test's
+/// (`write::tests::a_published_outer_cell_naming_this_txn_is_refused_at_copy`).
 #[test]
 fn a_published_outer_cell_naming_this_txn_is_corrupt_at_copy() {
     let dir = TempDir::with_prefix("tn_lmdb_dup_outer_this_txn").expect("temp dir");
@@ -1849,7 +1869,10 @@ fn a_published_outer_cell_naming_this_txn_is_corrupt_at_copy() {
                 drop(txn);
             }
             let latched = env.failure().is_some();
-            if !matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)) || !latched {
+            let refused = |m: &String| {
+                m.contains(&message) || m.contains(&format!("page {named} belongs to the tree"))
+            };
+            if !matches!(&result, Err(Error::Corrupt(m)) if refused(m)) || !latched {
                 wrong.push(format!("{case} {what}: {result:?}, latched {latched}"));
             }
         }
@@ -2100,13 +2123,16 @@ fn delete_prefix_refuses_a_nested_root_miscounting_its_pages() {
             let snapshot = env.inner().current();
             let outer = tree(&env, "d");
             assert_eq!(outer.height, 1, "the outer tree is one leaf");
-            let page = snapshot.page(outer.root).expect("the outer leaf");
+            let page = snapshot.page_any(outer.root).expect("the outer leaf");
             let Find::Found { value: Val::Nested(root), .. } =
                 page::leaf_find(page, &k(1)).expect("find")
             else {
                 panic!("key 1 is nested");
             };
-            (outer.root, TreeRoot::decode(root).expect("a nested root"))
+            (
+                outer.root,
+                TreeRoot::decode(root, nested_tag(outer.tag, &k(1))).expect("a nested root"),
+            )
         };
         assert!(root.height == 2 && root.leaf_pages >= 2, "{root:?}");
         let inflated = TreeRoot { leaf_pages: root.leaf_pages + 1, ..root };
@@ -2950,7 +2976,10 @@ impl Oracle {
             for ((key, cell), (&k, &(rows, len))) in walk.entries.iter().zip(&sets) {
                 assert_eq!(outer_of(key), k, "{name}: outer keys");
                 if forms.committed.contains(&k) {
-                    let root = TreeRoot::decode(cell.as_slice().try_into().expect("a nested cell"));
+                    let root = TreeRoot::decode(
+                        cell.as_slice().try_into().expect("a nested cell"),
+                        nested_tag(outer.tag, key),
+                    );
                     tallest = tallest.max(root.expect("a nested root").height);
                 } else {
                     let n = cell.get(..2).map(|n| usize::from(u16::from_le_bytes([n[0], n[1]])));

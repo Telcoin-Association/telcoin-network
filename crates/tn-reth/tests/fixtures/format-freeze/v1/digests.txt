@@ -52,7 +52,7 @@ version jar/Headers 1
 version jar/Receipts 1
 version jar/Transactions 1
 version tn_layout 1
-version tn_lmdb_format 6
+version tn_lmdb_format 7
 version tn_lmdb_page_size 4096
 write file/db/database.version 4 b281bc2c616cb3c3a097215fdc9397ae87e6e06b156cc34e656be7a1a9ce8839
 write file/static_files/static_file_headers_0_499999.conf 75 65ead95b1e3f30c89d94b4108a3adf614c3c2cb7b30e21464492b61ea09cde69

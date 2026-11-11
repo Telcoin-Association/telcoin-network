@@ -46,6 +46,7 @@
 use crate::{
     dup::{DupLayout, DUP_LAYOUTS},
     error::{self, Mdbx},
+    timeout::ReaderState,
     tx::{compressed, no_data, SharedTxn, TxnState},
 };
 use parking_lot::Mutex;
@@ -1418,6 +1419,9 @@ pub struct TnLmdbCursor<T: Table> {
     pool: Arc<ReadPool>,
     /// The engine table's id, with `T::NAME` the cursor's key in `pool`.
     table: u32,
+    /// The transaction's state under the read transaction timeout: a timed-out transaction's
+    /// cursor fails every call ([`Self::with`]).
+    reader: Arc<ReaderState>,
     _table: PhantomData<T>,
 }
 
@@ -1427,16 +1431,19 @@ impl<T: Table> TnLmdbCursor<T> {
         dup: Option<DupLayout>,
         pool: Arc<ReadPool>,
         table: u32,
+        reader: Arc<ReaderState>,
     ) -> Self {
-        Self { cursor: Some(cursor), rows: Rows::new(dup), pool, table, _table: PhantomData }
+        let rows = Rows::new(dup);
+        Self { cursor: Some(cursor), rows, pool, table, reader, _table: PhantomData }
     }
 
-    /// Run `f` on the cursor's rows and its engine cursor.
+    /// Run `f` on the cursor's rows and its engine cursor, unless the transaction timed out.
     #[inline]
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Rows, &mut ReadCursor) -> Result<R, DatabaseError>,
     ) -> Result<R, DatabaseError> {
+        self.reader.check(DatabaseError::Read)?;
         let cursor = self.cursor.as_deref_mut().expect("the engine cursor is held until drop");
         f(&mut self.rows, cursor)
     }

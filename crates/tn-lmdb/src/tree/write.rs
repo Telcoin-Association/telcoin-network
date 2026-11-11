@@ -43,6 +43,7 @@
 use std::time::Instant;
 
 use super::{
+    nested_tag,
     read::{self, check_miss, tighten},
     PageRead, PageWrite, TreeRoot, MAX_HEIGHT, MAX_TREE_PAGES,
 };
@@ -527,7 +528,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
             },
         };
         let leaf = store.page_mut(p)?;
-        page::init_leaf_header(leaf, p, txn);
+        page::init_leaf_header(leaf, p, txn, root.tag);
         if page::LeafMut::new(leaf)?.insert(0, key, val)? == Fit::Full {
             return Err(bug("an entry overflows an empty leaf"));
         }
@@ -538,7 +539,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
             overflow_pages: run_pages.unwrap_or(0),
             entries: 1,
             leaf_pages: 1,
-            ..TreeRoot::EMPTY
+            ..TreeRoot::empty(root.tag)
         };
         *trusted = true;
         if let Some(cache) = cache {
@@ -1287,7 +1288,7 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
             store.private_page(pgno)?
         } else {
             copies += 1;
-            store.page(pgno)?
+            store.page(pgno, root.tag)?
         };
         let txn = page::txn(page);
         if page::pgno(page) != pgno || txn as u32 != want_txn {
@@ -1310,7 +1311,7 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
                 match verify {
                     Verify::Now => {
                         verify_published(store, page, &geometry)?;
-                        check_cells_naming_this_txn(store, pgno, &view, cells)?;
+                        check_cells_naming_this_txn(store, root.tag, pgno, &view, cells)?;
                     }
                     Verify::Later => unverified = true,
                 }
@@ -1442,6 +1443,7 @@ fn find_at<'s>(view: &page::LeafView<'s>, slot: Option<usize>, key: &[u8]) -> Re
 /// cell is damage at rest.
 fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     pgno: u32,
     view: &page::View<'_>,
     cells: Cells,
@@ -1461,7 +1463,7 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
                 if child_txn != txn as u32 {
                     continue;
                 }
-                let header_txn = page::txn(store.page(child)?);
+                let header_txn = page::txn(store.page(child, tag)?);
                 if header_txn as u32 != child_txn || header_txn >= txn {
                     return Err(forged(format!("page {child}"), header_txn));
                 }
@@ -1469,8 +1471,9 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
         }
         page::View::Leaf(leaf) if cells != Cells::Plain => {
             for i in 0..leaf.nkeys() {
-                let root = match (cells, leaf.entry(i)?.1) {
-                    (_, Val::Nested(cell)) => TreeRoot::decode(cell)?,
+                let (key, val) = leaf.entry(i)?;
+                let root = match (cells, val) {
+                    (_, Val::Nested(cell)) => TreeRoot::decode(cell, nested_tag(tag, key))?,
                     // A packed set names no page.
                     (Cells::Packing, Val::Inline(_)) => continue,
                     (cells, other) => return Err(cells.refused(other)),
@@ -1478,7 +1481,7 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
                 if root.root_txn != txn as u32 {
                     continue;
                 }
-                let header_txn = page::txn(store.page(root.root)?);
+                let header_txn = page::txn(store.page(root.root, root.tag)?);
                 if header_txn as u32 != root.root_txn || header_txn >= txn {
                     return Err(forged(format!("nested root page {}", root.root), header_txn));
                 }
@@ -1526,6 +1529,7 @@ fn path_bounds<'s, S: PageWrite + ?Sized>(
 /// this writer did not stamp, root first. The descent made the other checks of every page.
 fn verify_path<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     path: &[(u32, usize)],
     leaf: u32,
     cells: Cells,
@@ -1535,9 +1539,9 @@ fn verify_path<S: PageWrite + ?Sized>(
         if store.is_private(p) || store.is_stamped(p) {
             continue;
         }
-        let page = store.page(p)?;
+        let page = store.page(p, tag)?;
         verify_published(store, page, &geometry)?;
-        check_cells_naming_this_txn(store, p, &page::View::new(page)?, cells)?;
+        check_cells_naming_this_txn(store, tag, p, &page::View::new(page)?, cells)?;
     }
     Ok(())
 }
@@ -1630,7 +1634,7 @@ fn plan<'s, S: PageWrite + ?Sized>(
                 // its rows arrive in key order) splits as an append: the leaf keeps its other
                 // cells and the entry starts the new right leaf, so an ascending load fills its
                 // leaves. The rightmost path is read only here, on the overflow path.
-                let append = i + 1 == view.nkeys() && is_rightmost(store, path)?;
+                let append = i + 1 == view.nkeys() && is_rightmost(store, root.tag, path)?;
                 LeafChange::Split { at: i, replace: true, append }
             }
         }
@@ -1642,11 +1646,12 @@ fn plan<'s, S: PageWrite + ?Sized>(
                 // refused above unless its range has no upper bound, which the descent leaves
                 // exactly when every branch routed to its last child ([`page::BranchView::route`]).
                 debug_assert!(
-                    kind != PutKind::Append || matches!(is_rightmost(store, path), Ok(true)),
+                    kind != PutKind::Append
+                        || matches!(is_rightmost(store, root.tag, path), Ok(true)),
                     "an append's unbounded leaf is not on the rightmost path"
                 );
-                let append =
-                    at == view.nkeys() && (kind == PutKind::Append || is_rightmost(store, path)?);
+                let append = at == view.nkeys()
+                    && (kind == PutKind::Append || is_rightmost(store, root.tag, path)?);
                 LeafChange::Split { at, replace: false, append }
             }
         }
@@ -1715,9 +1720,9 @@ fn check_published(page: &[u8], geometry: &Geometry) -> Result<()> {
 }
 
 /// True if `path` is the tree's rightmost path (every step takes the last child).
-fn is_rightmost<S: PageRead + ?Sized>(store: &S, path: &[(u32, usize)]) -> Result<bool> {
+fn is_rightmost<S: PageRead + ?Sized>(store: &S, tag: u32, path: &[(u32, usize)]) -> Result<bool> {
     for &(p, ci) in path {
-        if ci + 1 != page::nkeys(store.page(p)?) {
+        if ci + 1 != page::nkeys(store.page(p, tag)?) {
             return Ok(false);
         }
     }
@@ -1759,7 +1764,7 @@ fn split_pages<S: PageRead + ?Sized>(
     let mut sep_bound = if append { klen } else { klen.max(longest_key(leaf)?) };
     let mut needed = 1;
     for &(p, _) in path.iter().rev() {
-        let branch = store.page(p)?;
+        let branch = store.page(p, root.tag)?;
         if page::fits(branch, page::cell_size_branch(sep_bound))? {
             return Ok(needed);
         }
@@ -2081,7 +2086,7 @@ fn apply_split<S: PageWrite + ?Sized>(
     // leaf.
     let mut right = take()?;
     split.split_leaf(store.page_mut(leaf)?, at, key, value, append)?;
-    split.write_right(store.page_mut(right)?, right, txn)?;
+    split.write_right(store.page_mut(right)?, right, txn, root.tag)?;
     split.write_left(store.page_mut(leaf)?)?;
     root.add_page(Kind::Leaf)?;
 
@@ -2097,7 +2102,7 @@ fn apply_split<S: PageWrite + ?Sized>(
         }
         let q = take()?;
         split.split_branch(store.page_mut(p)?, ci + 1, right, txn32, append)?;
-        split.write_right(store.page_mut(q)?, q, txn)?;
+        split.write_right(store.page_mut(q)?, q, txn, root.tag)?;
         split.write_left(store.page_mut(p)?)?;
         root.add_page(Kind::Branch)?;
         right = q;
@@ -2114,7 +2119,16 @@ fn apply_split<S: PageWrite + ?Sized>(
         None => {
             let q = take()?;
             let sep = split.sep();
-            page::init_root(store.page_mut(q)?, q, txn, (root.root, txn32), sep, (right, txn32))?;
+            let tag = root.tag;
+            page::init_root(
+                store.page_mut(q)?,
+                q,
+                txn,
+                tag,
+                (root.root, txn32),
+                sep,
+                (right, txn32),
+            )?;
             (root.root, root.root_txn) = (q, txn32);
             root.height += 1;
             root.add_page(Kind::Branch)?;
@@ -2396,7 +2410,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
         }
     };
     if leaf.unverified {
-        verify_path(store, path, leaf.pgno, cells)?;
+        verify_path(store, root.tag, path, leaf.pgno, cells)?;
     }
     let run = match (cells, value) {
         (Cells::Plain | Cells::Packing, Val::Inline(_))
@@ -2410,7 +2424,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
     } else {
         let mut keeper = None;
         for (d, &(p, _)) in path.iter().enumerate().rev() {
-            if page::nkeys(store.page(p)?) > 1 {
+            if page::nkeys(store.page(p, root.tag)?) > 1 {
                 keeper = Some(d);
                 break;
             }
@@ -2419,11 +2433,11 @@ fn plan_delete<S: PageWrite + ?Sized>(
             None => DeleteShape::Empty,
             Some(d) => {
                 // The keeper's child beside the one it loses takes over that one's range.
-                check_widened_neighbour(store, path, d, root.height as usize)?;
+                check_widened_neighbour(store, root.tag, path, d, root.height as usize)?;
                 let (r, ci) = path[0];
-                if d == 0 && page::nkeys(store.page(r)?) == 2 {
-                    let child = page::branch_child(store.page(r)?, 1 - ci)?;
-                    collapse_to(store, child, root.height - 1, &mut dropped)?
+                if d == 0 && page::nkeys(store.page(r, root.tag)?) == 2 {
+                    let child = page::branch_child(store.page(r, root.tag)?, 1 - ci)?;
+                    collapse_to(store, root.tag, child, root.height - 1, &mut dropped)?
                 } else {
                     DeleteShape::Unlink(d)
                 }
@@ -2448,7 +2462,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
         DeleteShape::Leaf => Some((path.len(), leaf_used_after_delete(&leaf.view, key, value))),
         DeleteShape::Unlink(d) => {
             let (p, ci) = path[d];
-            let keeper = page::BranchView::new(path_page(store, p)?)?;
+            let keeper = page::BranchView::new(path_page(store, p, root.tag)?)?;
             let mut gone = page::cell_size_branch(keeper.key(ci)?.len()) + page::SLOT;
             if ci == 0 && keeper.nkeys() > 1 {
                 gone += keeper.key(1)?.len();
@@ -2460,7 +2474,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
     // Whether a sibling did not fit is read only by the test-only `MergeReport`.
     let (mut merges, mut merged_root, mut _refused) = (Vec::new(), false, false);
     if let Some((k, used)) = changed.filter(|_| merging(store)) {
-        (merged_root, _refused) = plan_merges(store, path, k, used, cells, &mut merges)?;
+        (merged_root, _refused) = plan_merges(store, root.tag, path, k, used, cells, &mut merges)?;
     }
     let kept = match shape {
         DeleteShape::Leaf => path.len() + 1,
@@ -2530,11 +2544,11 @@ fn merging<S: PageWrite + ?Sized>(store: &S) -> bool {
 
 /// A page on a write's path, which [`descend_write`] checked: a private page's bytes, or a
 /// published page through the checked fetch.
-fn path_page<S: PageWrite + ?Sized>(store: &S, p: u32) -> Result<&[u8]> {
+fn path_page<S: PageWrite + ?Sized>(store: &S, p: u32, tag: u32) -> Result<&[u8]> {
     if store.is_private(p) {
         store.private_page(p)
     } else {
-        store.page(p)
+        store.page(p, tag)
     }
 }
 
@@ -2567,6 +2581,7 @@ fn key1(page: &[u8]) -> Result<Option<&[u8]>> {
 /// bottom-up. Damage is [`Error::Corrupt`], found before anything changes.
 fn plan_merges<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     path: &[(u32, usize)],
     mut k: usize,
     mut used: usize,
@@ -2578,12 +2593,12 @@ fn plan_merges<S: PageWrite + ?Sized>(
     while merge_due(k, used, usable) {
         let (p, ci) = path[k - 1];
         let parent_trusted = store.is_private(p);
-        let parent = page::BranchView::new(path_page(store, p)?)?;
+        let parent = page::BranchView::new(path_page(store, p, tag)?)?;
         let n = parent.nkeys();
         let leaf_level = k == path.len();
         // Key 1 of the absorbing page's leftmost part: a key coming down from its left must sort
         // below it. (A branch the change shrank keeps key 1 or a greater one.)
-        let mut x_key1 = if leaf_level { None } else { key1(path_page(store, path[k].0)?)? };
+        let mut x_key1 = if leaf_level { None } else { key1(path_page(store, path[k].0, tag)?)? };
         let (mut lefts, mut rights, mut lost) = (0, 0, 0);
         let mut side = Side::Left;
         while merge_due(k, used, usable) {
@@ -2597,7 +2612,8 @@ fn plan_merges<S: PageWrite + ?Sized>(
                     let sep_i = if side == Side::Left { si + 1 } else { si };
                     let sep = parent.key(sep_i)?;
                     let (s, s_txn) = parent.child(si)?;
-                    let (page, view) = sibling_view(store, s, s_txn, parent_trusted, leaf_level)?;
+                    let (page, view) =
+                        sibling_view(store, tag, s, s_txn, parent_trusted, leaf_level)?;
                     let size = used + view.used() + if leaf_level { 0 } else { sep.len() };
                     refused |= size > usable;
                     (size <= usable).then_some((si, sep, s, page, view, size))
@@ -2611,7 +2627,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
                 side = Side::Right;
                 continue;
             };
-            check_sibling(store, path, k - 1, si, s, page, &view, cells)?;
+            check_sibling(store, tag, path, k - 1, si, s, page, &view, cells)?;
             if let page::View::Branch(_) = view {
                 let right_key1 = match side {
                     Side::Left => x_key1,
@@ -2653,6 +2669,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
 /// empty.
 fn sibling_view<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     s: u32,
     s_txn: u32,
     parent_trusted: bool,
@@ -2664,7 +2681,7 @@ fn sibling_view<S: PageWrite + ?Sized>(
             "page {s} is private to this transaction but named by a page it did not write"
         )));
     }
-    let page = if private { store.private_page(s)? } else { store.page(s)? };
+    let page = if private { store.private_page(s)? } else { store.page(s, tag)? };
     let txn = page::txn(page);
     if page::pgno(page) != s || txn as u32 != s_txn {
         return Err(read::identity_error(s, txn, s_txn));
@@ -2702,6 +2719,7 @@ fn sibling_view<S: PageWrite + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn check_sibling<'s, S: PageWrite + ?Sized>(
     store: &'s S,
+    tag: u32,
     path: &[(u32, usize)],
     level: usize,
     si: usize,
@@ -2715,12 +2733,12 @@ fn check_sibling<'s, S: PageWrite + ?Sized>(
     }
     if !store.is_stamped(s) {
         verify_published(store, page, &store.geometry())?;
-        check_cells_naming_this_txn(store, s, view, cells)?;
+        check_cells_naming_this_txn(store, tag, s, view, cells)?;
     }
     let (mut lo, mut hi) = (None, None);
     let steps = path[..level].iter().copied().chain([(path[level].0, si)]);
     for (p, ci) in steps {
-        tighten(&page::BranchView::new(path_page(store, p)?)?.route_at(ci)?, &mut lo, &mut hi);
+        tighten(&page::BranchView::new(path_page(store, p, tag)?)?.route_at(ci)?, &mut lo, &mut hi);
     }
     if !view.keys_in_range(lo, hi)? {
         return Err(Error::Corrupt(format!("page {s} holds keys outside its parents' separators")));
@@ -2729,7 +2747,16 @@ fn check_sibling<'s, S: PageWrite + ?Sized>(
         // The sibling is at depth `level + 2` of a tree whose leaves are at `path.len() + 1`, and
         // published (a private one returned above), so nothing below it is trusted.
         let route = branch.route_at(0)?;
-        check_edge_chain(store, route, (lo, hi), level + 3, path.len() + 1, Edge::First, false)?;
+        check_edge_chain(
+            store,
+            tag,
+            route,
+            (lo, hi),
+            level + 3,
+            path.len() + 1,
+            Edge::First,
+            false,
+        )?;
     }
     Ok(())
 }
@@ -2757,8 +2784,10 @@ enum Edge {
 /// descent reaching them: the child-0 chain below a branch a merge absorbs ([`check_sibling`])
 /// and the edge of the neighbour an unlink or a collapse widens toward the bound it loses
 /// ([`check_widened_neighbour`]). Both are rare, so the few page reads cost little.
+#[allow(clippy::too_many_arguments)]
 fn check_edge_chain<'s, S: PageWrite + ?Sized>(
     store: &'s S,
+    tag: u32,
     mut route: page::Route<'s>,
     (mut lo, mut hi): Bounds<'s>,
     mut depth: usize,
@@ -2776,7 +2805,7 @@ fn check_edge_chain<'s, S: PageWrite + ?Sized>(
                 "page {pgno} is private to this transaction but named by a page it did not write"
             )));
         }
-        let page = if trusted { store.private_page(pgno)? } else { store.page(pgno)? };
+        let page = if trusted { store.private_page(pgno)? } else { store.page(pgno, tag)? };
         let txn = page::txn(page);
         if page::pgno(page) != pgno || txn as u32 != want_txn {
             return Err(read::identity_error(pgno, txn, want_txn));
@@ -2829,20 +2858,21 @@ fn check_edge_chain<'s, S: PageWrite + ?Sized>(
 /// every other page below the neighbour, as before.
 fn check_widened_neighbour<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     path: &[(u32, usize)],
     d: usize,
     height: usize,
 ) -> Result<()> {
     let mut bounds = (None, None);
     for &(p, ci) in &path[..d] {
-        let route = page::BranchView::new(path_page(store, p)?)?.route_at(ci)?;
+        let route = page::BranchView::new(path_page(store, p, tag)?)?.route_at(ci)?;
         tighten(&route, &mut bounds.0, &mut bounds.1);
     }
     let (p, ci) = path[d];
     let (n, edge) = if ci == 0 { (1, Edge::First) } else { (ci - 1, Edge::Last) };
-    let route = page::BranchView::new(path_page(store, p)?)?.route_at(n)?;
+    let route = page::BranchView::new(path_page(store, p, tag)?)?.route_at(n)?;
     // The path's pages are trusted exactly when private (`descend_write` refused otherwise).
-    check_edge_chain(store, route, bounds, d + 2, height, edge, store.is_private(p))
+    check_edge_chain(store, tag, route, bounds, d + 2, height, edge, store.is_private(p))
 }
 
 /// The handle a delete of shape `shape` that drops `dropped` pages and a run of `run_pages`
@@ -2890,7 +2920,7 @@ fn handle_after(
         DeleteShape::Empty => (overflow_pages == Some(0)
             && root.leaf_pages == 1
             && usize::try_from(root.branch_pages).ok() == dropped.checked_sub(1))
-        .then_some(TreeRoot::EMPTY),
+        .then_some(TreeRoot::empty(root.tag)),
     };
     let after = after.and_then(|after| {
         let root_gone = u32::from(merged.root);
@@ -2921,12 +2951,13 @@ fn handle_after(
 /// not become the tree's root.
 fn collapse_to<S: PageWrite + ?Sized>(
     store: &S,
+    tag: u32,
     (mut pgno, mut txn): (u32, u32),
     mut height: u32,
     passed: &mut Vec<u32>,
 ) -> Result<DeleteShape> {
     loop {
-        let page = store.page(pgno)?;
+        let page = store.page(pgno, tag)?;
         if height == 1 || page::nkeys(page) > 1 {
             return Ok(DeleteShape::Collapse { root: pgno, root_txn: txn, height });
         }
@@ -2972,7 +3003,7 @@ fn apply_delete<S: PageWrite + ?Sized>(
         DeleteShape::Collapse { .. } | DeleteShape::Empty => None,
     };
     if let Some(changed) = changed.filter(|_| !plan.merges.is_empty()) {
-        apply_merges(store, path, changed, plan, &mut scratch.split)?;
+        apply_merges(store, root.tag, path, changed, plan, &mut scratch.split)?;
     }
     for &p in &plan.dropped {
         store.free(p);
@@ -3004,6 +3035,7 @@ fn apply_delete<S: PageWrite + ?Sized>(
 /// leaves the tree.
 fn apply_merges<S: PageWrite + ?Sized>(
     store: &mut S,
+    tag: u32,
     path: &[(u32, usize)],
     changed: u32,
     plan: &DeletePlan,
@@ -3024,7 +3056,7 @@ fn apply_merges<S: PageWrite + ?Sized>(
                 Side::Right if writable => (ci - lefts + 1, ci - lefts + 1),
                 Side::Right => (ci + rights + 1, ci + rights + 1),
             };
-            let parent = store.page(p)?;
+            let parent = store.page(p, tag)?;
             if page::branch_child(parent, si)?.0 != m.sibling {
                 return Err(bug(format!("merge sibling {} is not child {si} of {p}", m.sibling)));
             }
@@ -3033,7 +3065,7 @@ fn apply_merges<S: PageWrite + ?Sized>(
                 Side::Left => (m.sibling, x),
                 Side::Right => (x, m.sibling),
             };
-            split.merge(store.page(l)?, store.page(r)?, sep)?;
+            split.merge(store.page(l, tag)?, store.page(r, tag)?, sep)?;
             split.write_merged(store.page_mut(x)?)?;
             if writable {
                 let parent = store.page_mut(p)?;
@@ -3188,7 +3220,7 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
         let (store, page_count, base_count) = (self.store, self.page_count, self.base_count);
         let corrupt = |what: String| Error::Corrupt(format!("tree walk: {what}"));
         let check_header = |pgno: u32, txn: u32| -> Result<&'s [u8]> {
-            let page = store.page(pgno)?;
+            let page = store.page(pgno, root.tag)?;
             if page::pgno(page) != pgno || page::txn(page) as u32 != txn {
                 return Err(corrupt(format!(
                     "page {pgno} is not the copy its parent names (txn {txn})"
@@ -3461,7 +3493,7 @@ pub(crate) fn clear<S: PageWrite + ?Sized>(
     root_trusted: bool,
 ) -> Result<()> {
     free_subtree(store, root, root_trusted)?;
-    *root = TreeRoot::EMPTY;
+    *root = TreeRoot::empty(root.tag);
     Ok(())
 }
 
@@ -3897,6 +3929,7 @@ mod tests {
             let right = leaf_page(&mut store, &[b"m", b"n"]);
             let r = branch_page(&mut store, &[(Vec::new(), left), (b"m".to_vec(), right)]);
             let mut root = TreeRoot {
+                tag: 0,
                 root: r,
                 root_txn: store.txn() as u32,
                 height: 2,
@@ -4023,6 +4056,7 @@ mod tests {
         let r = branch_page(&mut store, &[(Vec::new(), left), (b"m".to_vec(), right)]);
         let txn = store.txn();
         let mut root = TreeRoot {
+            tag: 0,
             root: r,
             root_txn: txn as u32,
             height: 2,
@@ -4250,6 +4284,7 @@ mod tests {
                 let right = leaf_page(&mut store, &[b"m", b"n"]);
                 let r = branch_page(&mut store, &[(Vec::new(), left), (b"m".to_vec(), right)]);
                 let root = TreeRoot {
+                    tag: 0,
                     root: r,
                     root_txn: store.txn() as u32,
                     height: 2,
@@ -4966,7 +5001,7 @@ mod tests {
 
     /// The free space of the leaf `cache` names.
     fn free_in_cached_leaf(store: &MemStore, cache: &PathCache) -> usize {
-        page::free_space(store.page(cache.leaf()).expect("the cached leaf")).expect("a leaf")
+        page::free_space(store.page(cache.leaf(), 0).expect("the cached leaf")).expect("a leaf")
     }
 
     /// A packed set of `rows` rows: subkeys `0..rows` of one byte, each with a 30-byte value of
@@ -5031,7 +5066,7 @@ mod tests {
             assert_eq!(root.leaf_pages, leaf_pages + 1, "step {step}: one new leaf");
             let mut left = before;
             page::leaf_delete(&mut left, index).expect("delete the entry");
-            let kept = store.page(leaf).expect("left") == &left[..];
+            let kept = store.page(leaf, 0).expect("left") == &left[..];
             if !append {
                 assert!(!kept, "a middle split kept the leaf's other cells as they were");
                 assert_eq!((placed.slot(), cache.epoch), (None, 0), "a middle split left a cache");
@@ -6483,7 +6518,11 @@ mod tests {
                 leaf_pages: leaf_pages.unwrap_or(root.leaf_pages),
                 ..root
             };
-            assert_eq!(TreeRoot::decode(&handle.encode()).expect("decode"), handle, "it decodes");
+            assert_eq!(
+                TreeRoot::decode(&handle.encode(), handle.tag).expect("decode"),
+                handle,
+                "it decodes"
+            );
             let before = write_state(&store, &handle);
             let done = put(&mut store, &mut handle, &id_key(100, 200), &vec![1; len]);
             let msg = if entries.is_some() { "counts more entries" } else { "counts more pages" };
@@ -7832,8 +7871,11 @@ mod tests {
             model.insert(k, want);
         }
         if let Some(key) = forged {
-            let nested =
-                TreeRoot { root: root.root, ..some_nested_root(&mut rng, store.txn() + 1) };
+            // A leaf of the forged key's own tree (its tag), so the fetch passes and the cell's
+            // txn is what refuses it.
+            let (mut own, mut own_trusted) = (TreeRoot::empty(nested_tag(0, key)), false);
+            super::put(&mut store, &mut own, &mut own_trusted, b"k", b"v").expect("the key's tree");
+            let nested = TreeRoot { root: own.root, ..some_nested_root(&mut rng, store.txn() + 1) };
             put_outer_cell(
                 &mut store,
                 &mut root,
@@ -8045,12 +8087,12 @@ mod tests {
         let walk = walk_packing_tree(&store, &root);
         let (mut skipped, mut forged_met) = (0, 0);
         for &p in &walk.leaves {
-            let view = page::View::new(store.page(p).expect("leaf")).expect("view");
+            let view = page::View::new(store.page_any(p).expect("leaf")).expect("view");
             let page::View::Leaf(leaf) = &view else { panic!("leaf {p}") };
             let keys: Vec<_> =
                 (0..leaf.nkeys()).map(|i| leaf.key(i).expect("key").to_vec()).collect();
             let sets = keys.iter().filter(|k| matches!(model[*k], PackingCell::Packed(_))).count();
-            let packing = check_cells_naming_this_txn(&store, p, &view, Cells::Packing);
+            let packing = check_cells_naming_this_txn(&store, 0, p, &view, Cells::Packing);
             if keys.contains(&forged_key) {
                 forged_met += 1;
                 assert!(
@@ -8061,7 +8103,7 @@ mod tests {
                 packing.unwrap_or_else(|e| panic!("leaf {p}: {e}"));
                 skipped += usize::from(sets > 0);
             }
-            let outer = check_cells_naming_this_txn(&store, p, &view, Cells::Outer);
+            let outer = check_cells_naming_this_txn(&store, 0, p, &view, Cells::Outer);
             assert_eq!(
                 outer.is_err(),
                 sets > 0 || keys.contains(&forged_key),
@@ -8221,13 +8263,15 @@ mod tests {
 
     /// A published outer leaf whose cell names a root by this transaction's id is refused when a
     /// write copies the leaf ([`check_cells_naming_this_txn`] with [`Cells::Outer`]): whether the
-    /// page it names is private to this transaction (another tree's, allocated here) or a
-    /// published page of another txn. The same cell with an older txn id is copied as it is: the
-    /// rule reads a page only for a cell carrying this transaction's id.
+    /// page it names is private to this transaction (allocated here) or a published page of
+    /// another txn, each a leaf of the key's own tree, so the fetch's tag check passes and the
+    /// txn rule is what refuses it; a page of another tree is refused by its tag first
+    /// (`other tree`). The same cell with an older txn id is copied as it is: the rule reads a
+    /// page only for a cell carrying this transaction's id.
     #[test]
     fn a_published_outer_cell_naming_this_txn_is_refused_at_copy() {
         let (k1, k2) = (id_key(100, 8), id_key(101, 8));
-        for case in ["private", "published", "older"] {
+        for case in ["private", "published", "other tree", "older"] {
             let mut rng = Rng(0xC0FF_EE00);
             let mut store = MemStore::new(4096);
             let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
@@ -8256,14 +8300,20 @@ mod tests {
                 "one leaf"
             );
             let leaf = leaf.pgno;
+            let own = |store: &mut MemStore| {
+                let (mut own, mut own_trusted) = (TreeRoot::empty(nested_tag(0, &k1)), false);
+                super::put(store, &mut own, &mut own_trusted, b"own", b"t").expect("put");
+                own.root
+            };
             let (named, named_txn) = match case {
-                "private" => {
-                    let (mut other, mut other_trusted) = (TreeRoot::EMPTY, false);
-                    super::put(&mut store, &mut other, &mut other_trusted, b"other", b"t")
-                        .expect("put");
-                    (other.root, txn as u32)
+                "private" => (own(&mut store), txn as u32),
+                "published" => {
+                    let page = own(&mut store);
+                    page::set_pgno_txn(store.raw_mut(page), page, txn - 1);
+                    store.restamp(page);
+                    (page, txn as u32)
                 }
-                "published" => (root.root, txn as u32),
+                "other tree" => (root.root, txn as u32),
                 _ => (root.root, txn as u32 - 1),
             };
             let forged = TreeRoot {
@@ -8300,10 +8350,12 @@ mod tests {
             if case == "older" {
                 assert!(r.is_ok_and(|p| p.replaced()), "{case}");
             } else {
-                assert!(
-                    matches!(&r, Err(Error::Corrupt(m)) if m.contains(&format!("nested root page {named}"))),
-                    "{case}: {r:?}"
-                );
+                let want = if case == "other tree" {
+                    format!("page {named} belongs to the tree tagged 0x0")
+                } else {
+                    format!("nested root page {named}")
+                };
+                assert!(matches!(&r, Err(Error::Corrupt(m)) if m.contains(&want)), "{case}: {r:?}");
                 assert_eq!(root, before, "{case}");
             }
         }
@@ -8403,7 +8455,7 @@ mod tests {
     fn assert_one_copy_is_the_two_step_copy<S: PageWrite + ?Sized>(store: &mut S, p: u32) {
         let txn = store.txn();
         let q = store.alloc().expect("alloc");
-        let mut want = store.page(p).expect("a published page").to_vec();
+        let mut want = store.page_any(p).expect("a published page").to_vec();
         let gap = page::HEADER + page::SLOT * page::nkeys(&want)..page::upper(&want);
         let old = store.private_page(q).expect("the reserved page")[gap.clone()].to_vec();
         want[gap].copy_from_slice(&old);
@@ -8421,7 +8473,7 @@ mod tests {
     /// [`PageWrite::copy_published`] of page `p` into private page `q` returns what
     /// [`PageRead::page`] of `p` returns: its bytes, or its error, message and all.
     fn assert_copy_fails_as_page_fails<S: PageWrite + ?Sized>(store: &mut S, p: u32, q: u32) {
-        let want = store.page(p).map(<[u8]>::to_vec).map_err(|e| e.to_string());
+        let want = store.page_any(p).map(<[u8]>::to_vec).map_err(|e| e.to_string());
         let got = store.copy_published(p, q).map(|c| c.to_vec()).map_err(|e| e.to_string());
         assert_eq!(got, want, "copy of page {p}");
     }
@@ -8570,7 +8622,7 @@ mod tests {
         assert_copies_fail_as_pages_fail(w, leaf, first, raw);
 
         // A freed page past the published bytes, forged to pass the checks, then not.
-        let src = w.page(leaf).expect("leaf").to_vec();
+        let src = w.page_any(leaf).expect("leaf").to_vec();
         let freed = loop {
             let p = w.alloc().expect("alloc");
             if p >= w.last.page_count {
@@ -8584,7 +8636,7 @@ mod tests {
         let q = w.alloc().expect("alloc");
         w.free(freed);
         assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");
-        assert!(w.page(freed).is_ok(), "page reads it");
+        assert!(w.page_any(freed).is_ok(), "page reads it");
         assert_copy_fails_as_page_fails(w, freed, q);
         crc::zero_crc(raw(w, freed));
         assert_copy_fails_as_page_fails(w, freed, q);
@@ -8750,7 +8802,7 @@ mod tests {
     #[test]
     fn a_copy_with_its_change_is_the_copy_then_the_change() {
         fn assert_changes<S: PageWrite + ?Sized>(store: &mut S, p: u32, q: u32) {
-            let src = store.page(p).expect("a published leaf").to_vec();
+            let src = store.page_any(p).expect("a published leaf").to_vec();
             let n = page::nkeys(&src);
             for change in 0..3 {
                 let at = [0, n / 2, n - 1][change];
@@ -8800,12 +8852,12 @@ mod tests {
         let w = txn.writer_mut();
         let size = w.geometry.page_size();
         let pages = published_tree_pages(w);
-        let leaf = leaf_of(&pages, &|p| page::kind(w.page(p).expect("page")).expect("kind"));
+        let leaf = leaf_of(&pages, &|p| page::kind(w.page_any(p).expect("page")).expect("kind"));
         let q = w.alloc().expect("alloc");
         assert_changes(w, leaf, q);
 
         // A freed page past the published bytes, forged to pass the fetch checks.
-        let src = w.page(leaf).expect("leaf").to_vec();
+        let src = w.page_any(leaf).expect("leaf").to_vec();
         let freed = loop {
             let p = w.alloc().expect("alloc");
             if p >= w.last.page_count {

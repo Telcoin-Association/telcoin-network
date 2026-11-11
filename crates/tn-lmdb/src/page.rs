@@ -4,7 +4,7 @@
 //! 4 KiB..=64 KiB) holding variable-size cells addressed through a slot array kept in key order:
 //!
 //! ```text
-//! header (24):  pgno u32 | kind u8 (1 = branch, 2 = leaf) | flags u8 | nkeys u16 | txn u64 | upper u16 | reserved [6]
+//! header (24):  pgno u32 | kind u8 (1 = branch, 2 = leaf) | flags u8 | nkeys u16 | txn u64 | upper u16 | tag u32 | reserved [2]
 //! slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
 //! free space:   from the end of the slot array up to `upper`
 //! cells:        packed from `upper` up to P − 4, in no particular order
@@ -13,6 +13,12 @@
 //! leaf cell:    vlen u32 | klen u16 | flags u16 | key | value
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
 //! ```
+//!
+//! The `tag` names the tree the page belongs to ([`crate::tree::TreeRoot::tag`]): every fetch
+//! through a pointer compares it with the tag of the tree being read ([`crate::tree::read`]), so a
+//! pointer damage redirects to a page of another tree, even one of the same commit and kind, is
+//! refused. The page codec writes the tag of the tree a page is laid out for and copies it with
+//! the header; it never interprets it.
 //!
 //! A leaf cell's flags are 0 for a value held in the cell, 1 for an overflow cell, whose
 //! 12-byte value names the overflow run holding the value ([`Val`], [`crate::overflow`]), or 2 for
@@ -101,7 +107,8 @@ const FLAGS_OFF: usize = 5;
 const NKEYS_OFF: usize = 6;
 const TXN_OFF: usize = 8;
 const UPPER_OFF: usize = 16;
-const RESERVED_OFF: usize = 18;
+const TAG_OFF: usize = 18;
+const RESERVED_OFF: usize = 22;
 
 const KIND_BRANCH: u8 = 1;
 const KIND_LEAF: u8 = 2;
@@ -633,15 +640,21 @@ pub(crate) fn txn(page: &[u8]) -> u64 {
     get_u64(page, TXN_OFF).unwrap_or(0)
 }
 
+/// The tag of the tree the page was laid out for ([`crate::tree::TreeRoot::tag`]).
+#[inline]
+pub(crate) fn tag(page: &[u8]) -> u32 {
+    get_u32(page, TAG_OFF).unwrap_or(0)
+}
+
 /// The offset of the lowest cell (the page size minus the trailer when the page is empty).
 #[inline]
 pub(crate) fn upper(page: &[u8]) -> usize {
     get_u16(page, UPPER_OFF).map_or(0, usize::from)
 }
 
-fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
+fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64, tag: u32) {
     page.fill(0);
-    init_header(page, kind, pgno, txn);
+    init_header(page, kind, pgno, txn, tag);
 }
 
 /// [`init`] without the fill: lay out an empty page over whatever bytes `page` holds, such as a
@@ -649,7 +662,7 @@ fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
 /// every byte a reader of an empty page interprets, the whole header (its flags and reserved
 /// bytes zero) and the trailer (zero: dirty), and leaves the rest, the empty page's free gap, as
 /// it is: nothing reads the gap, and the CRC skips it ([`crc`]).
-fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
+fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64, tag: u32) {
     debug_assert!(valid_len(page.len()), "page buffer of {} bytes", page.len());
     let trailer = page.len() - TRAILER;
     page[..HEADER].fill(0);
@@ -658,25 +671,26 @@ fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
     page[KIND_OFF] = kind.tag();
     put_u64(page, TXN_OFF, txn);
     put_u16(page, UPPER_OFF, page.len() - TRAILER);
+    put_u32(page, TAG_OFF, tag);
 }
 
 /// Initialise `page` (all of it, trailer zeroed = dirty) as an empty leaf.
 #[cfg(test)]
 pub(crate) fn init_leaf(page: &mut [u8], pgno: u32, txn: u64) {
-    init(page, Kind::Leaf, pgno, txn);
+    init(page, Kind::Leaf, pgno, txn, 0);
 }
 
-/// Lay out `page`, whatever its bytes (a page just allocated), as an empty leaf: only the header
-/// and the trailer are written ([`init_header`]).
-pub(crate) fn init_leaf_header(page: &mut [u8], pgno: u32, txn: u64) {
-    init_header(page, Kind::Leaf, pgno, txn);
+/// Lay out `page`, whatever its bytes (a page just allocated), as an empty leaf of the tree
+/// tagged `tag`: only the header and the trailer are written ([`init_header`]).
+pub(crate) fn init_leaf_header(page: &mut [u8], pgno: u32, txn: u64, tag: u32) {
+    init_header(page, Kind::Leaf, pgno, txn, tag);
 }
 
 /// Initialise `page` (all of it, trailer zeroed = dirty) as a branch with no children yet: add
 /// child 0 with an empty key ([`branch_insert`]), or use [`init_root`].
 #[cfg(test)]
 pub(crate) fn init_branch(page: &mut [u8], pgno: u32, txn: u64) {
-    init(page, Kind::Branch, pgno, txn);
+    init(page, Kind::Branch, pgno, txn, 0);
 }
 
 /// Re-stamp a page's identity: a copy-on-write copy takes its new page number and the writing
@@ -1584,7 +1598,8 @@ impl<'a> BranchView<'a> {
 // ---- whole-page check ----
 
 /// Check every structural rule of a page, never panicking on any bytes: a buffer of the
-/// geometry's page size; a known kind, flags and reserved header bytes zero, the slot array below
+/// geometry's page size; a known kind, flags and reserved header bytes zero (the tree tag is the
+/// fetch's to compare), the slot array below
 /// `upper` and `upper` below the trailer; every slot addressing a cell that lies in the cell area
 /// with lengths inside the page; a leaf cell's flags 0, or 1 for an overflow cell, whose value is
 /// 12 bytes naming a length past the inline limit ([`Geometry::max_value`]) and within
@@ -1643,7 +1658,8 @@ pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
                     }
                 }
                 Val::Nested(root) => {
-                    if !TreeRoot::decode(root).is_ok_and(|r| !r.is_empty()) {
+                    // The structural check only: the tag is the nested tree's reader's to give.
+                    if !TreeRoot::decode(root, 0).is_ok_and(|r| !r.is_empty()) {
                         return Err(corrupt(
                             page,
                             format_args!("nested cell {i} holds an impossible or empty tree root"),
@@ -2109,17 +2125,18 @@ pub(crate) fn branch_delete(page: &mut [u8], i: usize) -> Result<()> {
 }
 
 /// Lay out `page`, whatever its bytes (a page just allocated), as a new root over two children:
-/// `left` (cell 0, from −∞) and `right` (from `sep`), each `(child_pgno, child_txn)`
-/// ([`init_header`], then the two cells).
+/// `left` (cell 0, from −∞) and `right` (from `sep`), each `(child_pgno, child_txn)`, in the
+/// tree tagged `tag` ([`init_header`], then the two cells).
 pub(crate) fn init_root(
     page: &mut [u8],
     pgno: u32,
     txn: u64,
+    tag: u32,
     left: (u32, u32),
     sep: &[u8],
     right: (u32, u32),
 ) -> Result<()> {
-    init_header(page, Kind::Branch, pgno, txn);
+    init_header(page, Kind::Branch, pgno, txn, tag);
     if branch_insert(page, 0, &[], left.0, left.1)? == Fit::Full
         || branch_insert(page, 1, sep, right.0, right.1)? == Fit::Full
     {
@@ -2329,13 +2346,14 @@ impl SplitBuf {
     }
 
     /// Write the planned right half into `dst`, page `pgno` just allocated (whatever its bytes),
-    /// as a page of transaction `txn`: the header and trailer ([`init_header`]) and every cell
-    /// and slot ([`place_cells`]), so only the free gap keeps `dst`'s old bytes.
-    pub(crate) fn write_right(&self, dst: &mut [u8], pgno: u32, txn: u64) -> Result<()> {
+    /// as a page of transaction `txn` in the tree tagged `tag`: the header and trailer
+    /// ([`init_header`]) and every cell and slot ([`place_cells`]), so only the free gap keeps
+    /// `dst`'s old bytes.
+    pub(crate) fn write_right(&self, dst: &mut [u8], pgno: u32, txn: u64, tag: u32) -> Result<()> {
         let Some(kind) = self.kind.filter(|_| dst.len() == self.page_size) else {
             return Err(invariant(dst, "split target is not a page of the planned source's size"));
         };
-        init_header(dst, kind, pgno, txn);
+        init_header(dst, kind, pgno, txn, tag);
         place_cells(dst, &self.copy, &self.cells[self.left..], kind == Kind::Branch);
         Ok(())
     }
@@ -2350,7 +2368,7 @@ impl SplitBuf {
         else {
             return Err(invariant(src, "split source is not the planned page"));
         };
-        init(src, kind, pgno(old), txn(old));
+        init(src, kind, pgno(old), txn(old), tag(old));
         place_cells(src, &self.copy, &self.cells[..self.left], false);
         Ok(())
     }
@@ -2408,7 +2426,7 @@ impl SplitBuf {
             return Err(invariant(dst, "merge target is not a page of the planned size"));
         };
         let (p, t) = (pgno(dst), txn(dst));
-        init(dst, kind, p, t);
+        init(dst, kind, p, t, tag(dst));
         place_cells(dst, &self.copy, &self.cells[..self.left], false);
         Ok(())
     }
@@ -2499,9 +2517,9 @@ fn split_into(buf: &SplitBuf, src: &mut [u8], dst: &mut [u8], kind: Kind) -> Res
     if dst.len() != src.len() || hdr_of(dst, kind)?.nkeys != 0 {
         return Err(corrupt(dst, "split target is not an empty page of the source's size"));
     }
-    let (p, t) = (pgno(dst), txn(dst));
+    let (p, t, g) = (pgno(dst), txn(dst), tag(dst));
     dst.fill(crate::tree::POISON);
-    buf.write_right(dst, p, t)?;
+    buf.write_right(dst, p, t, g)?;
     buf.write_left(src)?;
     Ok(buf.sep.clone())
 }
@@ -2650,7 +2668,7 @@ mod tests {
             }
             let sep = cells[m][key_off..key_off + klen].to_vec();
 
-            init(src, kind, pgno(&old), txn(&old));
+            init(src, kind, pgno(&old), txn(&old), tag(&old));
             for (j, cell) in cells.iter().enumerate() {
                 if j < m {
                     append_cell(src, cell)?;
@@ -2693,7 +2711,7 @@ mod tests {
 
     fn fresh(g: &Geometry, kind: Kind) -> Vec<u8> {
         let mut page = vec![0; g.page_size()];
-        init(&mut page, kind, 7, 3);
+        init(&mut page, kind, 7, 3, 0);
         page
     }
 
@@ -3553,7 +3571,7 @@ mod tests {
         let damages: [Damage; 14] = [
             ("unknown kind", |p| p[KIND_OFF] = 3),
             ("page flags", |p| p[FLAGS_OFF] = 1),
-            ("reserved header byte", |p| p[RESERVED_OFF + 5] = 1),
+            ("reserved header byte", |p| p[RESERVED_OFF + 1] = 1),
             ("one slot too many", |p| put_u16(p, NKEYS_OFF, 6)),
             ("upper past the trailer", |p| put_u16(p, UPPER_OFF, 4096 - TRAILER + 1)),
             ("keys out of order", |p| {
@@ -3620,7 +3638,7 @@ mod tests {
     fn root_and_range_helpers() {
         let g = geometry(4096);
         let mut root = vec![0; g.page_size()];
-        init_root(&mut root, 5, 9, (10, 1), b"m", (11, 2)).unwrap();
+        init_root(&mut root, 5, 9, 0, (10, 1), b"m", (11, 2)).unwrap();
         validate(&root, &g).unwrap();
         assert_eq!((pgno(&root), txn(&root), kind(&root).unwrap()), (5, 9, Kind::Branch));
         assert_eq!(cells(&root), vec![(Vec::new(), 10, 1), (b"m".to_vec(), 11, 2)]);
@@ -3819,7 +3837,7 @@ mod tests {
         let sep = [&[1][..], key].concat();
         let empty = |kind| {
             let mut page = vec![0; g.page_size()];
-            init(&mut page, kind, 1, 1);
+            init(&mut page, kind, 1, 1, 0);
             page
         };
         let _ = leaf_insert(&mut page.to_vec(), i, key, b"value");
@@ -4300,7 +4318,7 @@ mod tests {
                         }
                     }
                     .unwrap();
-                    buf.write_right(&mut got_dst, 7, 3).unwrap();
+                    buf.write_right(&mut got_dst, 7, 3, 0).unwrap();
                     buf.write_left(&mut got_src).unwrap();
                     prop_assert_eq!(buf.sep(), &want[..], "{} {:?}: separator", size, kind);
                     prop_assert!(got_src == want_src, "{size} {kind:?} at {at}: left halves differ");
@@ -4379,7 +4397,7 @@ mod tests {
                     (src.clone(), vec![crate::tree::POISON; size as usize]);
                 buf.split_leaf(&got_src, at, &key, Val::Inline(&value), append)
                     .unwrap_or_else(|e| panic!("{size} round {round}: {e}"));
-                buf.write_right(&mut got_dst, 7, 3).unwrap();
+                buf.write_right(&mut got_dst, 7, 3, 0).unwrap();
                 buf.write_left(&mut got_src).unwrap();
                 validate(&got_src, &g).unwrap();
                 validate(&got_dst, &g).unwrap();
@@ -4609,21 +4627,21 @@ mod tests {
             assert!(failed_with(past, "split inserting"), "{size}");
 
             let mut page = fresh(&g, Kind::Leaf);
-            let unplanned = SplitBuf::default().write_right(&mut page, 7, 3);
+            let unplanned = SplitBuf::default().write_right(&mut page, 7, 3, 0);
             assert!(failed_with(unplanned, "split target"), "{size}");
             let unplanned = SplitBuf::default().write_merged(&mut page);
             assert!(failed_with(unplanned, "merge target"), "{size}");
 
             buf.split_leaf(&src, at, &key, Val::Inline(b"v"), false).unwrap();
             let mut short = vec![0; size as usize / 2];
-            assert!(failed_with(buf.write_right(&mut short, 7, 3), "split target"), "{size}");
+            assert!(failed_with(buf.write_right(&mut short, 7, 3, 0), "split target"), "{size}");
             let mut other = src.clone();
             set_pgno_txn(&mut other, 8, 3);
             assert!(failed_with(buf.write_left(&mut other), "split source"), "{size}");
 
             let sep = vec![1; size as usize];
             let mut root = fresh(&g, Kind::Branch);
-            let overflow = init_root(&mut root, 9, 3, (1, 1), &sep, (2, 1));
+            let overflow = init_root(&mut root, 9, 3, 0, (1, 1), &sep, (2, 1));
             assert!(failed_with(overflow, "overflows a root"), "{size}");
         }
     }
@@ -4695,6 +4713,7 @@ mod tests {
             assert_eq!(free_space(&page).unwrap(), free - 8);
             validate(&page, &g).expect("inline again");
             let other = TreeRoot {
+                tag: 0,
                 root: 11,
                 root_txn: 8,
                 height: 2,

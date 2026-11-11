@@ -649,9 +649,9 @@ fn file_with_records(path: &Path) -> Records {
     let snapshot = env.inner().current();
     let free = snapshot.meta.free;
     assert_eq!(free.height, 2, "{free:?}");
-    let root = snapshot.page(free.root).expect("root");
+    let root = snapshot.page_any(free.root).expect("root");
     let leaf = page::branch_child(root, 0).expect("child").0;
-    let leaf_page = snapshot.page(leaf).expect("leaf");
+    let leaf_page = snapshot.page_any(leaf).expect("leaf");
     let base = leaf_page.as_ptr() as u64;
     let record = |i: usize| {
         let (k, v) = page::leaf_inline_entry(leaf_page, i).expect("entry");
@@ -812,18 +812,18 @@ fn check_reports_damage_leaks_and_double_uses_at(trim_unit: Option<u64>) {
     let snapshot = env.inner().current();
     let (free, meta) = (snapshot.meta.free, snapshot.meta);
     assert_eq!(free.height, 1, "{free:?}");
-    let leaf = snapshot.page(free.root).expect("free leaf");
+    let leaf = snapshot.page_any(free.root).expect("free leaf");
     let (_, v) = page::leaf_inline_entry(leaf, 0).expect("record");
     let listed = decode_pages(v, meta.page_count).expect("pages");
     let value_at = u64::from(free.root) * 4096 + (v.as_ptr() as u64 - leaf.as_ptr() as u64);
     let record = catalog::get(&*snapshot, &meta.catalog, "t").expect("get").expect("t");
-    let catalog_leaf = snapshot.page(meta.catalog.root).expect("catalog");
+    let catalog_leaf = snapshot.page_any(meta.catalog.root).expect("catalog");
     let (_, rec) = page::leaf_inline_entry(catalog_leaf, 0).expect("t's record");
     let entries_at = u64::from(meta.catalog.root) * 4096
         + (rec.as_ptr() as u64 - catalog_leaf.as_ptr() as u64)
         + 24;
     let table_leaf =
-        page::branch_child(snapshot.page(record.root.root).expect("root"), 0).expect("child").0;
+        page::branch_child(snapshot.page_any(record.root.root).expect("root"), 0).expect("child").0;
     // A tree page that can replace one listed page with the list still ascending.
     let (at, tree_page) = (0..listed.len())
         .find_map(|i| {
@@ -1008,7 +1008,7 @@ fn check_compares_the_page_counters() {
     let snapshot = env.inner().current();
     let catalog = snapshot.meta.catalog;
     assert_eq!(catalog.height, 1, "the catalog is one leaf");
-    let leaf = snapshot.page(catalog.root).expect("catalog");
+    let leaf = snapshot.page_any(catalog.root).expect("catalog");
     let (_, record) = page::leaf_inline_entry(leaf, 0).expect("t's record");
     let root_at =
         u64::from(catalog.root) * 4096 + (record.as_ptr() as u64 - leaf.as_ptr() as u64) + 8;
@@ -1038,7 +1038,7 @@ fn check_compares_the_page_counters() {
 fn tree_pages(env: &Env) -> Vec<u32> {
     let snapshot = env.inner().current();
     let record = catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
-    let root = snapshot.page(record.root.root).expect("root");
+    let root = snapshot.page_any(record.root.root).expect("root");
     let mut pages = vec![record.root.root, snapshot.meta.catalog.root];
     for i in 0..page::nkeys(root) {
         pages.push(page::branch_child(root, i).expect("child").0);
@@ -1176,15 +1176,15 @@ fn file_with_runs(path: &Path) -> RunsFile {
     let meta = snapshot.meta;
     assert_eq!((meta.catalog.height, meta.free.height), (1, 1), "{meta:?}");
     let record = catalog::get(&*snapshot, &meta.catalog, "t").expect("get").expect("t");
-    let catalog_leaf = snapshot.page(meta.catalog.root).expect("catalog");
+    let catalog_leaf = snapshot.page_any(meta.catalog.root).expect("catalog");
     let (_, rec) = page::leaf_inline_entry(catalog_leaf, 0).expect("t's record");
     let root_at = u64::from(meta.catalog.root) * 4096
         + (rec.as_ptr() as u64 - catalog_leaf.as_ptr() as u64)
         + 8;
-    let root = snapshot.page(record.root.root).expect("root");
+    let root = snapshot.page_any(record.root.root).expect("root");
     let mut runs = Vec::new();
     for c in 0..page::nkeys(root) {
-        let leaf = snapshot.page(page::branch_child(root, c).expect("child").0).expect("leaf");
+        let leaf = snapshot.page_any(page::branch_child(root, c).expect("child").0).expect("leaf");
         for i in 0..page::nkeys(leaf) {
             if let (_, page::Val::Overflow(ovf)) = page::leaf_entry(leaf, i).expect("entry") {
                 let n = crate::overflow::run_pages(ovf.len as usize, 4096) as u32;
@@ -1226,7 +1226,7 @@ fn a_damaged_run_or_counter_refuses_clear_and_drop() {
         let snapshot = env.inner().current();
         let record =
             catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
-        let root = snapshot.page(record.root.root).expect("root");
+        let root = snapshot.page_any(record.root.root).expect("root");
         page::branch_child(root, page::nkeys(root) - 1).expect("child").0
     };
     type Damage<'a> = &'a dyn Fn(&Path);

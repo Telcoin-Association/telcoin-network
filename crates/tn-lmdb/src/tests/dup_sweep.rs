@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     page::{self, Find, Val},
-    tree::{read::descend, PageRead as _, TreeRoot},
+    tree::{nested_tag, read::descend, PageRead as _, TreeRoot},
     Error,
 };
 
@@ -83,7 +83,7 @@ pub(super) fn dup_fixture() -> DupFixture {
     let snapshot = env.inner().current();
     let (catalog, free) = (snapshot.meta.catalog, snapshot.meta.free);
     assert!(catalog.height == 1 && free.height == 1, "{catalog:?} {free:?}");
-    let free_leaf = snapshot.page(free.root).expect("the free leaf");
+    let free_leaf = snapshot.page_any(free.root).expect("the free leaf");
     let free_leaf =
         (free.root, page::leaf_inline_entry(free_leaf, 0).expect("a record").0.to_vec());
     let leaf_of = |root: &TreeRoot, key: &[u8]| {
@@ -93,13 +93,20 @@ pub(super) fn dup_fixture() -> DupFixture {
     let cells = (0..OUTER)
         .map(|k| {
             let leaf = leaf_of(&outer, &k.to_be_bytes());
-            let page = snapshot.page(leaf).expect("the outer leaf");
+            let page = snapshot.page_any(leaf).expect("the outer leaf");
             let Find::Found { value: Val::Nested(root), .. } =
                 page::leaf_find(page, &k.to_be_bytes()).expect("find")
             else {
                 panic!("key {k}'s nested cell");
             };
-            (k, (leaf, TreeRoot::decode(root).expect("a nested root")))
+            (
+                k,
+                (
+                    leaf,
+                    TreeRoot::decode(root, nested_tag(outer.tag, &k.to_be_bytes()))
+                        .expect("a nested root"),
+                ),
+            )
         })
         .collect::<BTreeMap<_, _>>();
     let key = 150u32.to_be_bytes().to_vec();
@@ -479,44 +486,37 @@ fn rewrite(env: &Env, keys: &[u32]) -> crate::Result<()> {
     txn.commit().map(drop)
 }
 
-/// Two outer cells naming one committed nested root, both written in one transaction: each copy
-/// of the root frees it, and the commit refuses the page leaving the published trees twice
-/// (`Corrupt`, latched); writes then fail.
+/// Two outer cells naming one committed nested root: the tree's pages carry the tag of the key
+/// that owns them, so the forged key's first read of the tree (a get, a scan or a write of that
+/// key, in a write transaction or a read-only environment) is `Corrupt` and latches, naming the
+/// tag; the owning key reads and writes as before until then, and `Env::check` refuses the file.
 #[test]
-fn a_shared_nested_root_written_once_per_cell_in_one_transaction_is_corrupt() {
+fn a_shared_nested_root_is_corrupt_at_the_first_read_of_the_forged_key() {
     let fx = dup_fixture();
-    let (keys, env) = shared_root(&fx, "one");
-    let got = rewrite(&env, &keys);
-    assert!(
-        matches!(&got, Err(Error::Corrupt(m)) if m.contains("left the published trees 2 times")),
-        "{got:?}"
-    );
+    let tagged = |r: &crate::Result<()>| matches!(r, Err(Error::Corrupt(m)) if m.contains("belongs to the tree tagged"));
+    let (keys, env) = shared_root(&fx, "write");
+    let [forged, owner] = keys;
+    rewrite(&env, &[owner]).expect("the owning key writes on");
+    let got = rewrite(&env, &[forged]);
+    assert!(tagged(&got), "a write of the forged key: {got:?}");
     assert!(env.failure().is_some(), "latched");
     assert!(matches!(env.begin_rw(), Err(Error::Failed(_))), "writes fail");
-}
+    drop(env);
 
-/// Two outer cells naming one committed nested root, written in two transactions (either key
-/// first): the engine's documented limit, as for a forged shared pointer in a plain tree (README
-/// "Free list and page reuse"). The first commit frees the root; the second copies the published
-/// page and frees it again, which its free cannot tell, so both commit and nothing latches.
-/// `Env::check` afterwards reports the root used twice (both free records list it) and the
-/// nested root the forged cell no longer names leaked.
-#[test]
-fn a_shared_nested_root_across_transactions_is_found_by_check() {
-    let fx = dup_fixture();
-    let (shared, orphan) = (fx.cells[&11].1.root, fx.cells[&COLD].1.root);
-    let want = format!("leaked [{orphan}]; used twice [{shared} (free list and free list)]");
-    for (name, order) in [("ab", [0, 1]), ("ba", [1, 0])] {
-        let (keys, env) = shared_root(&fx, name);
-        rewrite(&env, &[keys[order[0]]]).expect("the first commit");
-        rewrite(&env, &[keys[order[1]]]).expect("the second commit cannot tell");
-        assert!(env.failure().is_none(), "{name}: nothing latched");
-        let check = env.check();
-        assert!(
-            matches!(&check, Err(Error::Corrupt(m)) if m.ends_with(&want)),
-            "{name}: {check:?}"
-        );
-    }
+    let (keys, env) = shared_root(&fx, "read");
+    let ro = env.begin_ro().expect("ro");
+    let d = ro.open_table("d").expect("open").expect("d");
+    let get = |k: u32| ro.get(&d, &dup_key(k, &[0])).map(drop);
+    get(keys[1]).expect("the owning key reads");
+    let got = get(keys[0]);
+    assert!(tagged(&got), "a get of the forged key: {got:?}");
+    drop(ro);
+    assert!(env.failure().is_some(), "latched by the read");
+    drop(env);
+
+    let (_, env) = shared_root(&fx, "check");
+    let check = env.check().map(drop);
+    assert!(tagged(&check), "check: {check:?}");
 }
 
 /// A nested leaf whose first subkey is empty (the damage of the sweeps' "empty subkey" case): a
