@@ -424,8 +424,15 @@ fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
         run_case(base, mode, by_msync, None);
     assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{mode:?}: pages were reused");
-    let filling = GAP_FILL.get() > 0;
-    assert_eq!(gaps_filled > 0, filling, "{mode:?}: by_msync={by_msync}: gaps filled");
+    // Off, no gap is filled; at the largest gap fill the crash commit's runs always leave gaps to
+    // fill. A smaller one fills those the layout leaves short enough, perhaps none.
+    let gap_fill = GAP_FILL.get();
+    let case = format!("{mode:?} page size {} gap fill {gap_fill}", base.page_size);
+    match gap_fill {
+        0 => assert_eq!(gaps_filled, 0, "{case}: by_msync={by_msync}: off fills nothing"),
+        MAX_GAP_FILL => assert!(gaps_filled > 0, "{case}: by_msync={by_msync}: gaps filled"),
+        _ => eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled"),
+    }
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;
     assert_eq!(grew, base.grows, "{mode:?}: the file grew");
