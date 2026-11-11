@@ -22,8 +22,9 @@ use std::{
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
-    db_table_stats, iter_static_files, refuse_pending_migration, snapshot::SnapshotRestorer,
-    DbTableStat, RethCommand, RethConfig, RethEnv, StaticFileProvider, TNPrimitives,
+    db_check, db_table_stats, iter_static_files, refuse_pending_migration,
+    snapshot::SnapshotRestorer, DbCheckReport, DbTableStat, RethCommand, RethConfig, RethEnv,
+    StaticFileProvider, TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE,
     DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
@@ -63,6 +64,14 @@ enum DbSubcommand {
     /// MDBX database not yet migrated to tn-lmdb (the node's first start migrates it), and an
     /// `mdbx.dat` the node refuses too.
     Stats,
+
+    /// Check the reth execution database at rest (a build with the `tn-lmdb` feature): the
+    /// engine's full check of its newest committed state, every page's checksum and structure,
+    /// every tree and overflow run, each table's counts and the file's page accounting, which
+    /// reads do not run. Read-only (changes no file); the node MUST be stopped: it refuses while
+    /// a node holds the datadir, and holds the datadir while it runs. Damage is an error naming
+    /// what failed. The default build refuses: MDBX keeps no page checksums.
+    Check,
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
     /// Read-only (never mutates). Validate the CURRENT/latest epoch only with the node STOPPED —
@@ -116,6 +125,14 @@ impl DbCommand {
                     println!();
                 }
                 println!("{}", stats_table(&db_stats));
+            }
+            DbSubcommand::Check => {
+                let _pid_lock =
+                    DB_CHECK_NEEDS_STOPPED_NODE.then(|| PidLock::acquire(&datadir)).transpose()?;
+                let report = db_check(&datadir.reth_db_path())?;
+                println!("{}", check_summary(&report));
+                println!();
+                println!("{}", check_table(&report));
             }
             DbSubcommand::Validate(args) => args.execute()?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
@@ -1326,6 +1343,36 @@ struct StaticFileSegmentStats {
     total_size: u64,
 }
 
+/// `db check`'s summary line: the state checked and the file's page accounting, which the check
+/// found exact.
+fn check_summary(report: &DbCheckReport) -> String {
+    format!(
+        "check passed at txn {}: {} pages (catalog {}, tables {}, free tree {}, free {}, metas 2)",
+        report.txn_id,
+        report.page_count,
+        report.catalog_pages,
+        report.table_pages,
+        report.free_tree_pages,
+        report.free_pages,
+    )
+}
+
+/// `db check`'s per-table figures.
+fn check_table(report: &DbCheckReport) -> ComfyTable {
+    let mut table = ComfyTable::new();
+    table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+    table.set_header(["Table Name", "# Entries", "Pages", "Height"]);
+    for checked in &report.tables {
+        let mut row = Row::new();
+        row.add_cell(Cell::new(&checked.name))
+            .add_cell(Cell::new(checked.entries))
+            .add_cell(Cell::new(checked.pages))
+            .add_cell(Cell::new(checked.height));
+        table.add_row(row);
+    }
+    table
+}
+
 fn stats_table(stats: &[DbTableStat]) -> ComfyTable {
     let mut table = ComfyTable::new();
     table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
@@ -1565,7 +1612,9 @@ fn tndb_tables_table(report: &tn_storage::tndb::EnvReport) -> ComfyTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_len_if_exists, repair_targets, static_files_summary_table};
+    use super::{
+        check_summary, check_table, file_len_if_exists, repair_targets, static_files_summary_table,
+    };
     use crate::{
         cli::{Cli, Commands},
         NoArgs,
@@ -1733,6 +1782,45 @@ mod tests {
         let err = format!("{:#}", stats().expect_err("no reth database"));
         assert!(!err.contains("another telcoin process"), "unexpected error: {err}");
         drop(PidLock::acquire(&datadir).expect("stats must release the lock on exit"));
+    }
+
+    /// `db check` holds the datadir lock as `db stats` does, and renders a report's figures.
+    #[test]
+    fn db_check_takes_the_datadir_lock_only_when_the_node_must_be_stopped() {
+        use tn_config::PidLock;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let check =
+            || super::DbCommand { command: super::DbSubcommand::Check }.execute(datadir.clone());
+
+        let held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = format!("{:#}", check().expect_err("no reth database"));
+        let refused = err.contains("another telcoin process");
+        assert_eq!(refused, tn_reth::DB_CHECK_NEEDS_STOPPED_NODE, "unexpected error: {err}");
+
+        drop(held);
+        let err = format!("{:#}", check().expect_err("no reth database"));
+        assert!(!err.contains("another telcoin process"), "unexpected error: {err}");
+        drop(PidLock::acquire(&datadir).expect("check must release the lock on exit"));
+
+        let report = tn_reth::DbCheckReport {
+            txn_id: 7,
+            page_count: 12,
+            catalog_pages: 1,
+            table_pages: 6,
+            free_tree_pages: 1,
+            free_pages: 2,
+            tables: vec![tn_reth::DbTableCheck {
+                name: "Headers".to_string(),
+                entries: 500,
+                pages: 6,
+                height: 2,
+            }],
+        };
+        let summary = check_summary(&report);
+        assert!(summary.contains("txn 7") && summary.contains("12 pages"), "{summary}");
+        let table = check_table(&report).to_string();
+        assert!(table.contains("Headers") && table.contains("500"), "{table}");
     }
 
     #[test]

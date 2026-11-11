@@ -321,11 +321,15 @@ impl RethEnv {
         // Reth's eth tasks run on the env's task manager, not on reth's default
         // `TokioTaskExecutor`: the state cache and the fee-history task (which follows the
         // canonical-state stream, open for the env's whole life) hold the provider, so untracked
-        // they would keep the database open after the node's tasks shut down.
+        // they would keep the database open after the node's tasks shut down. Reth spawns the
+        // cache as a critical task; here they are tracked as non-critical ones: they only serve
+        // RPC, and a panic in one leaves the RPC cache dead with the node running, as on reth's
+        // own executor, instead of ending the validator.
+        let rpc_tasks = self.inner.task_spawner.non_critical();
         let eth_cache = EthStateCache::spawn_with(
             self.inner.blockchain_provider.clone(),
             eth_config.cache,
-            self.inner.task_spawner.clone(),
+            rpc_tasks.clone(),
         );
         let eth_api = apply_eth_config(
             EthApi::builder(
@@ -336,7 +340,7 @@ impl RethEnv {
             ),
             eth_config,
         )
-        .task_spawner(self.inner.task_spawner.clone())
+        .task_spawner(rpc_tasks)
         .eth_cache(eth_cache)
         .build();
 

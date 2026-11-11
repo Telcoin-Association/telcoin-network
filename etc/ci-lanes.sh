@@ -115,7 +115,12 @@ lane_clippy() {
     # resolution, and was dropped for that reason.
     run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network -p tn-worker-gateway -p tn-node-record-api -- -D warnings
     run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
-    echo "clippy passed: release graph, workspace all targets with all features"
+    # 3. The shipped tn-lmdb graph: the node binary with `tn-lmdb` on and nothing else, as
+    #    `make build-e2e-bin-tn-lmdb` and a release with the feature build it. The all-features
+    #    pass compiles the feature only beside `test-utils`, so the `#[cfg(not(feature =
+    #    "test-utils"))]` arms under `tn-lmdb` (tn-reth's backend code) compiled in no lane.
+    run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network --features telcoin-network/tn-lmdb -- -D warnings
+    echo "clippy passed: release graph, workspace all targets with all features, the tn-lmdb release graph"
 }
 
 # Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
@@ -232,6 +237,11 @@ lane_test_tn_lmdb() {
     # holds a single test).
     run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
         --features tn-reth/tn-lmdb "${run_mode[@]}"
+    # The adiri-gated tn-reth suites on tn-lmdb: the consensus-registry fork tests and their
+    # determinism oracles read reth state through the database, and lane_test_adiri runs them
+    # on MDBX only. The other adiri packages have no database path of their own.
+    run cargo nextest run --locked -p tn-reth \
+        --features tn-reth/adiri,tn-reth/test-utils,tn-reth/tn-lmdb "${run_mode[@]}"
 }
 
 lane_test_vendor_reth() {

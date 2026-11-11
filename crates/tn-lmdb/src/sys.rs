@@ -328,6 +328,36 @@ pub(crate) fn os_page_size() -> u64 {
         .get_or_init(|| u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096))
 }
 
+/// Drop `file`'s cached pages, so later reads of it come from the device: Linux
+/// `posix_fadvise(POSIX_FADV_DONTNEED)` over the whole file. A writer open calls it at step 4,
+/// right after its `fsync` and before it reads the metas or maps the file: the kernel keeps a
+/// dirty page, and the `fsync` wrote every page it could, so what the drop removes is clean, and
+/// a meta or a page a failed writeback left clean in the cache (its bytes never reached the
+/// device, and the error was reported to the writer that is gone) is read again from the device,
+/// where the open does not see the meta, or step 9's check finds the page old and falls back to
+/// the last sync. The drop is advice: the kernel keeps a page
+/// that is dirty, locked, under writeback or mapped by another process, and nothing maps the
+/// file then (the writer's lock excludes every other open). On macOS a no-op: there is no such
+/// advice, and it is not a validator platform. In tests the disk model restores the device's
+/// bytes (`disk_model::cache_dropped`).
+pub(crate) fn drop_cached_pages(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall on a file descriptor `file` owns and keeps open for the call; it
+        // touches no Rust memory. Offset 0 with length 0 covers the whole file.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        // `posix_fadvise` returns the error number itself, not -1 with `errno` set.
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    #[cfg(test)]
+    crate::disk_model::cache_dropped(file);
+    Ok(())
+}
+
 /// Take an exclusive, non-blocking `flock` on `file`, held until every descriptor of its open file
 /// description is closed (a crash releases it with the process). `Ok(false)` when another open of
 /// the file (from this process or another) already holds it, exclusive or shared.

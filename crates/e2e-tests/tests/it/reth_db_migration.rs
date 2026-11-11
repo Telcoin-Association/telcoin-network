@@ -34,6 +34,7 @@ use crate::{
 };
 use alloy::providers::ProviderBuilder;
 use e2e_tests::{config_local_testnet_with_epoch_duration, TestBinary};
+use eyre::WrapErr as _;
 use jsonrpsee::rpc_params;
 use std::{
     cell::RefCell,
@@ -136,8 +137,14 @@ fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// The version a tn-lmdb reth database records in `db/database.version`: `TN_LMDB_DB_VERSION` in
+/// `tn_reth`'s `env::database` (reth's 2 plus 1000), which a binary running reth on MDBX alone
+/// refuses before it opens anything.
+const TN_LMDB_DB_VERSION: &str = "1002";
+
 /// Assert a restarted validator's reth database finished its migration: `db/tn-lmdb.dat` and the
-/// `db/mdbx-migrated` marker, none of MDBX's files, no temp directory, and the static files kept.
+/// `db/mdbx-migrated` marker, none of MDBX's files, no temp directory, the tn-lmdb version in
+/// `db/database.version`, and the static files kept.
 fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
     let db = datadir.join("db");
     eyre::ensure!(
@@ -157,6 +164,14 @@ fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
             db.display()
         );
     }
+    let version_file = db.join("database.version");
+    let version = std::fs::read_to_string(&version_file)
+        .wrap_err_with(|| format!("reading {}", version_file.display()))?;
+    eyre::ensure!(
+        version == TN_LMDB_DB_VERSION,
+        "{} holds {version:?} after the migration, not the tn-lmdb version {TN_LMDB_DB_VERSION}",
+        version_file.display()
+    );
     let static_files = datadir.join("static_files");
     eyre::ensure!(
         std::fs::metadata(&static_files)?.is_dir(),

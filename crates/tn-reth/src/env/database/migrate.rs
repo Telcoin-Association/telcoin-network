@@ -4,12 +4,14 @@
 //! moves it onto tn-lmdb when it first opens the database, before anything else reads the
 //! directory: the backend guard calls [`migrate_from_mdbx`]. The copy is raw: each of reth's
 //! tables is walked on MDBX as its encoded keys and compressed values (`RawTable`) and appended to
-//! tn-lmdb unchanged, so no row is decoded. reth's static files and its `database.version` file are
-//! not touched; the open that follows checks the version file and records the client version as
-//! on any open, after the `VersionHistory` rows the copy brought over.
+//! tn-lmdb unchanged, so no row is decoded. reth's static files are not touched; its
+//! `database.version` file gets tn-lmdb's version at the commit point (the rollback tripwire,
+//! `TN_LMDB_DB_VERSION`), and the open that follows records the client version as on any open,
+//! after the `VersionHistory` rows the copy brought over.
 //!
 //! **States.** The directory's files decide what an open does. Each is looked for with
-//! `try_exists`, so a stat error fails the open:
+//! `symlink_metadata` (a symbolic link counts as present, dangling or not), so a stat error fails
+//! the open:
 //!
 //! | `mdbx.dat` | `tn-lmdb.dat` | `mdbx-migrated` | the open |
 //! |---|---|---|---|
@@ -54,9 +56,14 @@
 //!    `TnLmdbEnv::sync`, the engine's full check of the file (`TnLmdbEnv::check`), and its entry
 //!    count of each table equal to the rows copied.
 //! 7. Close the tn-lmdb file, fsync the temp directory, and rename its `tn-lmdb.dat` into the
-//!    database directory: the commit point. Then fsync the database directory.
-//! 8. Remove MDBX's `mdbx.lck`, then `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a
-//!    migration unfinished), and fsync the directory.
+//!    database directory: the commit point. Then fsync the database directory, and record tn-lmdb's
+//!    version in reth's `database.version` (`TN_LMDB_DB_VERSION`, the rollback tripwire), so a
+//!    build running reth on MDBX alone refuses the directory from here on and never advances the
+//!    `mdbx.dat` that step 8 removes.
+//! 8. Fsync the database directory again (a later open finishing a stopped migration starts here,
+//!    and the rename must be durable before MDBX goes), then remove MDBX's `mdbx.lck`, then
+//!    `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a migration unfinished), and fsync
+//!    the directory.
 //! 9. Write the marker [`MIGRATED_MARKER`] atomically (a temp file, fsync, rename, fsync of the
 //!    directory). Its text lists the rows copied per table.
 //! 10. Remove the temp directory, the sign of an unfinished migration until the marker is written.
@@ -418,6 +425,10 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))
     };
     sync_rename().wrap_err_with(committed)?;
+    // The rollback tripwire from the commit point on: a build running reth on MDBX alone refuses
+    // the directory before it can open and advance the `mdbx.dat` that is still beside the new
+    // file, whose removal when the migration is finished later would silently roll it back.
+    super::write_db_version_file(path).wrap_err_with(committed)?;
 
     let total: u64 = copies.iter().map(|copy| copy.rows).sum();
     let mut summary = format!("migrated from MDBX to tn-lmdb: {total} rows\n");
@@ -648,11 +659,15 @@ impl<TX: DbTx> TableViewer<()> for VerifyTable<'_, TX> {
     }
 }
 
-/// Finish a migration whose `tn-lmdb.dat` is in place in `path`: remove MDBX's files (`mdbx.lck`,
-/// then `mdbx.dat` last), fsync the directory, write the marker with `summary` as its text, and
-/// remove the temp directory last: until the marker is written, the temp directory beside
-/// `tn-lmdb.dat` marks the migration unfinished ([`stopped_after_commit_point`]).
+/// Finish a migration whose `tn-lmdb.dat` is in place in `path`: fsync the directory first, so
+/// the rename that put it there is durable before MDBX goes (a later open finishes a migration
+/// stopped right after the rename, whose fsync may never have run); then remove MDBX's files
+/// (`mdbx.lck`, then `mdbx.dat` last), fsync the directory, write the marker with `summary` as its
+/// text, and remove the temp directory last: until the marker is written, the temp directory
+/// beside `tn-lmdb.dat` marks the migration unfinished ([`stopped_after_commit_point`]).
 fn finish(path: &Path, summary: &str) -> eyre::Result<()> {
+    fsync_directory(path)
+        .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))?;
     remove_file_if_present(&path.join(MDBX_LOCK_FILE))?;
     remove_file_if_present(&path.join(MDBX_DATA_FILE))?;
     fsync_directory(path)

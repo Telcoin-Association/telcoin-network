@@ -941,6 +941,71 @@ fn nosync_commits_survive_a_process_crash_and_roll_back_at_a_reboot() {
     assert_eq!(read, (past + 1, Some(b"5".to_vec())));
 }
 
+/// A reopen in the same boot after the device lost a writeback opens at the last sync, not at
+/// the cached head. A `NoSync` run whose syncs are lost (the disk model's lost flushes: as a
+/// kernel after a writeback error it reported once, every sync reports success and the device
+/// takes nothing, the pages staying clean in the cache) crashes with a trusted weak head whose
+/// pages the device never got. The next open's `fsync` (step 4) writes nothing; it then drops
+/// the file's cached pages (`sys::drop_cached_pages`), so what it reads is the device's. When
+/// the head's record never reached the device either, the open does not see the head and opens
+/// at the steady slot; when the kernel had written the record's page back before the loss
+/// (`record_on_device`: its meta page msynced first), the head is trusted, step 9's check finds
+/// its pages old and falls back to the last sync. Either way the state is the last sync's, whose
+/// pages the device holds; without the drop the cache would pass the check, and the next sync
+/// would write a steady meta naming pages the device lacks.
+#[test]
+fn a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync() {
+    for record_on_device in [false, true] {
+        let case = format!("record on device: {record_on_device}");
+        let (_dir, path) = temp();
+        let nosync = options(4096, SyncMode::NoSync);
+        let env = Env::open(&path, nosync).expect("open");
+        disk_model::track(&path);
+        let first = durable_first_commit(&env);
+        let synced = put_all(&env, "a", &[(b"k", b"synced")]);
+        env.sync().expect("sync");
+        let slots = env.with_writer(|w| w.slots);
+        assert!(slots.contains(&Slot::steady(synced)) && slots.contains(&Slot::steady(first)));
+        let head = put_all(&env, "a", &[(b"k", b"lost")]);
+        let slots = env.with_writer(|w| w.slots);
+        assert!(slots.contains(&Slot::weak(head)), "{case}: {slots:?}");
+        if record_on_device {
+            env.with_writer(|w| {
+                let slot = w.slots.iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
+                w.file.msync_page(slot as u32, 4096).expect("the meta page's writeback");
+            });
+        }
+        disk_model::set_flushes_lost(true);
+        env.crash();
+
+        let env = Env::open(&path, nosync).expect("reopen");
+        disk_model::set_flushes_lost(false);
+        let checked = take_weak_head_check();
+        if record_on_device {
+            assert_eq!(checked, Some(Err(())), "{case}: the head's pages are not the device's");
+        } else {
+            assert_eq!(checked, None, "{case}: the head's record is not the device's");
+        }
+        let ro = env.begin_ro().expect("ro");
+        let read = (ro.txn_id(), val(&ro, &table(&ro, "a"), b"k"));
+        assert_eq!(read, (synced, Some(b"synced".to_vec())), "{case}: the last sync");
+        drop(ro);
+        // The writer builds on the last sync: its next commit, durable, goes past the lost
+        // head's txn, and a power loss keeps it.
+        let next = put_all(&env, "a", &[(b"k", b"after")]);
+        assert_eq!(next, after_steady(synced), "{case}");
+        env.crash();
+        disk_model::power_loss(&path);
+        let env = open(&path);
+        let ro = env.begin_ro().expect("ro");
+        let read = (ro.txn_id(), val(&ro, &table(&ro, "a"), b"k"));
+        assert_eq!(read, (next, Some(b"after".to_vec())), "{case}");
+        drop(ro);
+        drop(env);
+        disk_model::untrack(&path);
+    }
+}
+
 /// `Env::sync` after a `NoSync` commit runs the durable steps although a slot already holds the
 /// commit's txn: that slot is weak, and the sync's check is against the newest steady slot. The
 /// sync counts a durable commit, syncs the commit's pages, makes both slots steady, and the commit
@@ -1968,7 +2033,7 @@ fn a_scattered_durable_commit_leaves_no_page_dirty() {
 }
 
 /// macOS: a writer open writes the pages another mapping of the file left dirty before it builds
-/// on them: those of a crashed writer, or here of a mapping still held. An `fsync` (open step 7)
+/// on them: those of a crashed writer, or here of a mapping still held. An `fsync` (open step 4)
 /// writes none of them there.
 #[test]
 #[cfg(target_os = "macos")]

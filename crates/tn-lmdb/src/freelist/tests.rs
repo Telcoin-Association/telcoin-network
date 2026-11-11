@@ -17,7 +17,7 @@ use crate::{
     catalog, crc, disk_model,
     env::{Env, EnvOptions, SyncMode},
     meta::{Meta, Tag, PAGE_SIZES},
-    tests::{after_steady, first_txn},
+    tests::{after_steady, first_txn, trim_units},
     tree::{
         test_harness::{ReportSeed, Rng},
         PageWrite,
@@ -792,11 +792,20 @@ fn power_loss_after_reuse_recovers_a_committed_state() {
 /// tree holding other than the entries its root counts.
 #[test]
 fn check_reports_damage_leaks_and_double_uses() {
+    for trim_unit in trim_units() {
+        check_reports_damage_leaks_and_double_uses_at(trim_unit);
+    }
+}
+
+/// [`check_reports_damage_leaks_and_double_uses`] on a base file whose clean close trimmed it to
+/// `trim_unit` ([`retrim`]): at 4 KiB the file holds no page past the ones in use.
+fn check_reports_damage_leaks_and_double_uses_at(trim_unit: Option<u64>) {
     let (dir, base) = temp();
     let env = open(&base, SyncMode::Durable);
     for generation in 0..4 {
         churn(&env, "t", 300, generation, 100);
     }
+    env.with_writer(|w| w.trim_unit = trim_unit);
     let report = check(&env);
     assert_eq!(report.tables["t"].entries, 300);
     assert!(report.free_pages > 0 && report.tables["t"].height == 2, "{report:?}");
@@ -873,6 +882,10 @@ fn check_reports_damage_leaks_and_double_uses() {
     let leak = case("leak", &|p: &Path| {
         let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
         let grown = Meta { page_count: meta.page_count + 1, ..meta };
+        // The leaked page must exist: the clean close trimmed the file to its pages in use, and
+        // open refuses a file shorter than its meta's pages.
+        let len = file.metadata().expect("metadata").len();
+        file.set_len(len.max(u64::from(grown.page_count) * 4096)).expect("extend");
         file.write_all_at(&grown.encode(Tag::default()), 0).expect("write");
         file.write_all_at(&grown.encode(Tag::default()), 4096).expect("write");
     });

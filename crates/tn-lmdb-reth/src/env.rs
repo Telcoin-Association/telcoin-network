@@ -671,6 +671,11 @@ impl DatabaseMetrics for TnLmdbEnv {
     /// `db.table_pages` (`type` = `leaf`, `branch`, `overflow`) and `db.table_entries`; then
     /// `db.freelist` (the pages the free list holds), `db.page_size`, and
     /// `db.timed_out_not_aborted_transactions` (always 0: tn-lmdb times no transaction out).
+    /// Then two of tn-lmdb's own: `db.oldest_reader_age_seconds`, how long the oldest read
+    /// transaction has held a superseded snapshot (0 when none has: such a reader holds every
+    /// page freed since back from reuse, so the file grows while it lives), and `db.latched`
+    /// (1 once the environment has latched on damage or an I/O error, and every write is refused
+    /// until the process restarts; else 0).
     fn gauge_metrics(&self) -> Vec<(&'static str, f64, Vec<Label>)> {
         let mut metrics = Vec::new();
         if let Err(error) = self.table_metrics(&mut metrics) {
@@ -682,6 +687,9 @@ impl DatabaseMetrics for TnLmdbEnv {
         }
         metrics.push(("db.page_size", f64::from(self.page_size()), vec![]));
         metrics.push(("db.timed_out_not_aborted_transactions", 0.0, vec![]));
+        let reader_age = self.env.oldest_reader_age().map_or(0.0, |age| age.as_secs_f64());
+        metrics.push(("db.oldest_reader_age_seconds", reader_age, vec![]));
+        metrics.push(("db.latched", f64::from(u8::from(self.env.failure().is_some())), vec![]));
         metrics
     }
 }

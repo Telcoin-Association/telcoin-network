@@ -3,7 +3,9 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+The e2e suites it runs are the `#[ignore]`d tests of `e2e-tests` on the default (MDBX) node binary, then `make test-e2e-reth-migration` (a committee on MDBX, each validator restarted onto the tn-lmdb binary; it skips, passing, under the generic selection, which sets neither its marker nor the previous binary).
+It does not run the restart, epoch and sigkill suites on the tn-lmdb binary (`make test-e2e-tn-lmdb`): the nightly `durable-e2e.yaml` does, after the same suites on MDBX, and the rolling-upgrade suite (`make test-upgrade`) stays manual.
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
 
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.

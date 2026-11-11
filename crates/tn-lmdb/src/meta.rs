@@ -310,7 +310,7 @@ pub(crate) fn weak_limit(slots: &[Option<Slot>; 2]) -> u64 {
     newest_steady(slots).map_or(0, |txn| txn.saturating_add(MAX_WEAK_RUN))
 }
 
-/// Choose the meta to open at (open step 4). `read(offset)` returns the 128-byte record at
+/// Choose the meta to open at (open step 5). `read(offset)` returns the 128-byte record at
 /// `offset` of the file, or `None` if the file ends before it. `trusted` is the boot whose weak
 /// records may be trusted: the running boot's id, or `None` to trust none (its id is unknown, or
 /// the open was asked not to: `EnvOptions::trust_unsynced`).

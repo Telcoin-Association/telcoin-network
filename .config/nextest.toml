@@ -59,3 +59,10 @@ slow-timeout = { period = "720s", terminate-after = 3 }
 [[profile.ci.overrides]]
 filter = "package(tn-storage) & not test(/_bench::/)"
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The engine's and the adapter's randomized tests take a new seed each run and print it, so a
+# retry runs other scripts and would pass a seed-dependent failure as FLAKY. Their suites are
+# deterministic otherwise: a failure is a bug to fix with the printed seed, never retried away.
+[[profile.ci.overrides]]
+filter = "package(tn-lmdb) | package(tn-lmdb-reth)"
+retries = 0

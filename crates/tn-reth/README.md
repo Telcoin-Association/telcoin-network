@@ -439,9 +439,20 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
 `src/env/database.rs`; other code names `RethDbEnv` and `RethDb` (`Arc<RethDbEnv>`).
 
 - **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
-  `init_db` with `with_metrics`. The tn-lmdb build maps the `--db.*` flags, writes or checks reth's
-  `database.version` file as reth's `create_db` does, opens `TnLmdbEnv`, creates reth's tables and
-  records the client version in `VersionHistory` as reth's `record_client_version` does.
+  `init_db` with `with_metrics`. The tn-lmdb build maps the `--db.*` flags, checks reth's
+  `database.version` file before anything else (below), runs the backend guard, records its own
+  version in the file, opens `TnLmdbEnv`, creates reth's tables and records the client version in
+  `VersionHistory` as reth's `record_client_version` does.
+- **Version file** (`check_db_version_file`, `record_db_version_file`, tn-lmdb build):
+  `db/database.version` holds `TN_LMDB_DB_VERSION` (1002: reth's version 2 plus 1000), never
+  reth's own. It is a rollback tripwire: a binary that runs reth on MDBX alone (a release from
+  before the backend guard) checks the file before it opens anything and stops with "breaking
+  database change detected: your database version (v1002) is incompatible with the latest database
+  version (v2)", where it would otherwise create an empty `mdbx.dat` beside `tn-lmdb.dat` and prune
+  the static files down to it. The check runs before the backend guard, so a directory another
+  binary wrote (any other version) is refused before a migration touches it; a missing file, or
+  one holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or one the migration just
+  moved), is rewritten atomically after the guard. A new `db/` is made durable in its parent.
 - **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
@@ -481,6 +492,16 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   `--db.page-size`. The MDBX build's is reth's own default, the OS page size clamped to 4 KiB..=64
   KiB (16 KiB on Apple Silicon, 4 KiB on x86 Linux), which its `open_rw` passes to MDBX explicitly;
   the tn-lmdb build's is the adapter's 4 KiB. The execution bench keys its cached bases by it.
+- **Check** (`db_check`, behind `telcoin-network db check`, tn-lmdb build): the engine's full
+  check of the database's newest committed state (`TnLmdbEnv::check`: every page's CRC and
+  structure, every tree and overflow run, each table's counts, the exact accounting of the file's
+  pages), which reads never run (a read checks a page's bounds and identity, its CRC only before
+  a copy or a reuse: tn-lmdb's README, do-not-flag item 3). Opens read-only through the same
+  state checks as the stats, with the node stopped (`DB_CHECK_NEEDS_STOPPED_NODE`; `db check`
+  holds the datadir lock). Damage is an error naming the directory and what failed, and the file
+  is never changed. The MDBX build refuses it: MDBX keeps no page checksums. Run it after a
+  migration (which runs the same check itself), after a disk or memory scare, and before trusting
+  a restored file.
 - **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
   database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
   size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build
@@ -526,7 +547,8 @@ one of reth's: its rows are not copied (reth does not read them either).
   the copy, and the synced file against the engine's full check. Then it renames the file to
   `db/tn-lmdb.dat` (the commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker
   `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
-  reth's static files and `database.version` file are not touched. The copy needs no case of its own
+  reth's static files and `database.version` file are not touched (the open after it writes the
+  tn-lmdb version into the latter, above). The copy needs no case of its own
   for the dup-sort tables' forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
   table, also when they span the copy's commits
@@ -569,10 +591,16 @@ one of reth's: its rows are not copied (reth does not read them either).
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
   | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
 
-- **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build refuses a
-  `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file and run a
-  tn-lmdb build), so going back means a fresh datadir (or `db load-state`). Problems are
-  fixed forward, as for the consensus DB.
+- **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build of this
+  tree refuses a `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file
+  and run a tn-lmdb build), so going back means a fresh datadir (or `db load-state`). A release
+  from before the backend guard has no such refusal; what stops it is the version file: it
+  refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything, so `db/` and
+  `static_files/` are left as they were and the tn-lmdb build still runs on them. Do not edit or
+  delete the file to get past it: the old binary would then create an empty MDBX database beside
+  `tn-lmdb.dat`, prune the static files down to it, and fail at genesis. Back up `db/` and
+  `static_files/` before the first tn-lmdb start of a datadir. Problems are fixed forward, as for
+  the consensus DB.
 - **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start has run
   the migration.
 - **`db load-state`** never migrates either: it refuses a `db/` holding `mdbx.dat`, whatever MDBX

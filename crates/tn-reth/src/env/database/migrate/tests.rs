@@ -378,9 +378,9 @@ fn the_tests_cover_every_dup_sort_table() {
 
 /// An MDBX database moves onto tn-lmdb at the first open: every table's raw rows are the same, row
 /// for row (a table MDBX lacks is empty), the file has the configured page size, MDBX's files and
-/// the temp directory are gone, the marker lists the rows copied, and reth's version file is
-/// kept. The client version is recorded after the copied `VersionHistory` rows. A second open is
-/// a normal open.
+/// the temp directory are gone, the marker lists the rows copied, and reth's version file holds
+/// tn-lmdb's version. The client version is recorded after the copied `VersionHistory` rows. A
+/// second open is a normal open.
 #[test]
 fn an_mdbx_database_migrates_row_for_row() {
     let tmp = TempDir::new().expect("tempdir");
@@ -407,7 +407,14 @@ fn an_mdbx_database_migrates_row_for_row() {
     for gone in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATING_DIR] {
         assert!(!exists(&path.join(gone)), "{gone} is removed");
     }
-    assert_eq!(std::fs::read(&version_file).expect("read"), version_bytes, "version file kept");
+    // MDBX had reth's version; the migration records tn-lmdb's at its commit point, which an
+    // MDBX-only binary refuses
+    assert_eq!(version_bytes, reth_db::version::DB_VERSION.to_string().as_bytes(), "MDBX's");
+    assert_eq!(
+        reth_db::version::get_db_version(&path).expect("a version"),
+        crate::env::database::TN_LMDB_DB_VERSION,
+        "the tn-lmdb version"
+    );
     let marker = std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("the marker");
     let total: usize = expected.values().map(Vec::len).sum();
     assert!(

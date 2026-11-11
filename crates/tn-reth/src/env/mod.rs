@@ -292,7 +292,7 @@ impl RethEnv {
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        info!(target: "tn::reth", path = ?db_path, "opening database");
+        info!(target: "tn::reth", path = ?db_path, backend = database::BACKEND, "opening database");
         database::open_rw(reth_config, db_path)
     }
 

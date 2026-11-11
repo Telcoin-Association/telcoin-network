@@ -124,6 +124,14 @@ fi
 ./etc/ci-lanes.sh test-tn-lmdb
 ./etc/ci-lanes.sh test-vendor-reth
 
+# The engine's and the adapter's heavy test variants (`#[ignore = "heavy: run with --release"]`:
+# the random workloads at size, the crash matrices, the differential test against MDBX at 2000
+# scripts, the crash test that kills a child inside a commit; about 12 minutes). No merge-queue
+# lane runs them (CI runs nextest in debug), so they run here, before the e2e suites. The
+# benchmark and the stamp probe guard nothing and are skipped, as the crates' CLAUDE.md say.
+cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe
+cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --skip tn_lmdb_vs_mdbx
+
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
@@ -143,6 +151,16 @@ esac
 cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$E2E_TARGET_ROOT"
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
+
+# The reth database migration suite (`reth_db_migration`): a committee starts on the default
+# (MDBX) build, and each validator in turn restarts on the tn-lmdb build in place, which must
+# migrate its reth database and follow the chain. The run above selects the test but it skips
+# (passing, with its message hidden by nextest's capture) without the TN_E2E_TN_LMDB_BIN marker
+# and the MDBX previous binary, which only its make target sets: the target builds the tn-lmdb
+# e2e binary (`tn-lmdb-e2e/` under the same target root) and passes both, so the lane has one
+# definition. The restart, epoch and sigkill suites on the tn-lmdb binary (`make
+# test-e2e-tn-lmdb`) run in the nightly durable-e2e workflow, not here.
+make test-e2e-reth-migration
 
 echo "all checks passed - submitting attestation on-chain..."
 

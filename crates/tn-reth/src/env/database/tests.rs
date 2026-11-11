@@ -64,6 +64,39 @@ fn open_rw_refuses_the_other_engines_database() {
     assert!(!version_exists, "no version file is written beside the other engine's file");
 }
 
+/// The MDBX build refuses `db check` without opening anything: MDBX keeps no page checksums.
+#[cfg(not(feature = "tn-lmdb"))]
+#[test]
+fn db_check_is_refused_on_the_mdbx_build() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let err = format!("{:#}", db_check(&path).expect_err("refused"));
+    assert!(err.contains("MDBX") && err.contains("tn-lmdb"), "{err}");
+    assert!(!path.try_exists().expect("stat"), "nothing created");
+}
+
+/// A dangling symbolic link named as the other engine's file counts as that file: the guard
+/// refuses it, and creates nothing. Followed, the link would read as no database, and the open
+/// would create one beside the datadir's static files.
+#[test]
+fn a_dangling_link_to_the_other_engines_file_is_refused() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    std::fs::create_dir(&path).expect("db dir");
+    let (own, other) = OWN_AND_OTHER_DATA_FILE;
+    std::os::unix::fs::symlink(tmp.path().join("gone"), path.join(other)).expect("link");
+
+    let err = open_rw(&config(test_db_args()), &path).expect_err("the other engine's file");
+    let msg = format!("{err:#}");
+    // the MDBX build refuses the tn-lmdb file as such; the tn-lmdb build takes the link for an
+    // MDBX database to migrate and fails reading it (No such file), before anything is written
+    assert!(msg.contains(other), "names the file: {msg}");
+    assert!(!path.join(own).try_exists().expect("stat"), "nothing is created beside the link");
+    let link = std::fs::symlink_metadata(path.join(other)).expect("the link is kept");
+    assert!(link.file_type().is_symlink());
+    assert!(!path.join(MIGRATING_DIR).try_exists().expect("stat"), "no migration left behind");
+}
+
 /// A stat error while looking for the other engine's file fails the guard: it is never read as
 /// an absent file. A path under a regular file stats with `ENOTDIR` on macOS and Linux.
 #[test]
@@ -93,7 +126,11 @@ fn open_rw_creates_and_reopens_this_engines_database() {
     drop(open_rw(&config, &path).expect("fresh open"));
     let own_exists = path.join(OWN_AND_OTHER_DATA_FILE.0).try_exists().expect("stat");
     assert!(own_exists, "this engine's data file");
+    // the MDBX build writes reth's version; the tn-lmdb build its own, which reth's check refuses
+    #[cfg(not(feature = "tn-lmdb"))]
     reth_db::version::check_db_version_file(&path).expect("reth's version file");
+    #[cfg(feature = "tn-lmdb")]
+    assert_eq!(reth_db::version::get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION);
 
     drop(open_rw(&config, &path).expect("reopen"));
     let other_exists = path.join(OWN_AND_OTHER_DATA_FILE.1).try_exists().expect("stat");
@@ -555,6 +592,52 @@ mod tn_lmdb {
         assert!(!db_table_stats(&path).expect("stats once the node stopped").is_empty());
     }
 
+    /// `db check` runs the engine's full check on a stopped node's database: it passes on a
+    /// healthy one, listing every table the node created with the file's page accounting;
+    /// it is refused while a read-write handle holds the database; and damage at rest (pages
+    /// overwritten) fails it with an error naming the directory, the file unchanged.
+    #[test]
+    fn db_check_reports_the_state_and_fails_on_damage() {
+        use std::os::unix::fs::FileExt as _;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        write_stats_rows(&path);
+        let db = open_rw(&config(test_db_args()), &path).expect("open");
+        let err = format!("{:#}", db_check(&path).expect_err("a held database"));
+        assert!(err.contains("is in use: stop the node first"), "{err}");
+        drop(db);
+
+        let report = db_check(&path).expect("a healthy database checks");
+        assert!(
+            report.tables.iter().any(|t| t.name == tables::CanonicalHeaders::NAME),
+            "{report:?}"
+        );
+        assert!(report.tables.windows(2).all(|w| w[0].name < w[1].name), "sorted: {report:?}");
+        let counted = 2
+            + report.catalog_pages
+            + report.table_pages
+            + report.free_tree_pages
+            + report.free_pages;
+        assert_eq!(counted, report.page_count, "the accounting is exact: {report:?}");
+
+        // Pages past the roots open checks (the 2000 `CanonicalHeaders` rows span many leaves),
+        // so the damage is the check's to find; an open that refuses the file is a refusal too.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(tn_lmdb_reth::DATA_FILE))
+            .expect("the data file");
+        file.write_all_at(&[0xFF; 4 * 4096], 8 * 4096).expect("overwrite pages 8 to 11");
+        let before = std::fs::read(path.join(tn_lmdb_reth::DATA_FILE)).expect("read");
+        let err = format!("{:#}", db_check(&path).expect_err("damaged pages fail the check"));
+        assert!(
+            err.contains("fails its check") || err.contains("corrupted"),
+            "the damage is reported: {err}"
+        );
+        assert!(err.contains(&path.display().to_string()), "names the directory: {err}");
+        assert_eq!(std::fs::read(path.join(tn_lmdb_reth::DATA_FILE)).expect("read"), before);
+    }
+
     /// A directory without either engine's file holds no reth database, and the stats say so.
     #[test]
     fn db_table_stats_refuses_a_directory_without_a_database() {
@@ -569,22 +652,115 @@ mod tn_lmdb {
         assert!(!path.join(tn_lmdb_reth::DATA_FILE).try_exists().expect("stat"), "nothing made");
     }
 
-    /// reth's database version file is checked on reopen: a missing one is written, another
-    /// version is refused.
+    /// reth's database version file is checked on reopen: a new database gets tn-lmdb's version;
+    /// a missing file, or reth's own version (a database from before the tripwire, or one the
+    /// migration moved), is rewritten with it; another version, or a file that does not parse, is
+    /// refused and left as it is.
     #[test]
     fn reopen_checks_the_database_version_file() {
+        use reth_db::version::{get_db_version, DB_VERSION};
+
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("db");
         let db_args = test_db_args();
         let version_file = reth_db::version::db_version_file_path(&path);
+        let open = || open_tn_lmdb(&path, &db_args, version("1.0.0"));
 
-        drop(open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("fresh open"));
+        drop(open().expect("fresh open"));
+        assert_eq!(get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION, "new");
+        drop(open().expect("reopen"));
+        assert_eq!(get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION, "reopened");
+
         std::fs::remove_file(&version_file).expect("remove the version file");
-        drop(open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("reopen without it"));
-        reth_db::version::check_db_version_file(&path).expect("written again");
+        drop(open().expect("reopen without it"));
+        assert_eq!(get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION, "written again");
 
-        std::fs::write(&version_file, "1").expect("another version");
-        let err = open_tn_lmdb(&path, &db_args, version("1.0.0")).expect_err("another version");
-        assert!(format!("{err:#}").contains("version"), "a version error: {err:#}");
+        std::fs::write(&version_file, DB_VERSION.to_string()).expect("reth's version");
+        drop(open().expect("reopen with reth's version"));
+        assert_eq!(get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION, "rewritten");
+        let tmp_file = path.join(format!("{}.tmp", reth_db::version::DB_VERSION_FILE_NAME));
+        assert!(!tmp_file.try_exists().expect("stat"), "the rewrite's temp file is renamed");
+
+        for (other, says) in [("1", "database version 1"), ("1002\n", "version file")] {
+            std::fs::write(&version_file, other).expect("another version");
+            let err = open().expect_err("another version");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(says), "{other:?}: {msg}");
+            assert_eq!(std::fs::read(&version_file).expect("read"), other.as_bytes(), "kept");
+        }
+    }
+
+    /// The version check runs before the backend guard: a directory another binary wrote (a
+    /// version this build does not read) is refused with `mdbx.dat` in it untouched, where the
+    /// guard would have migrated it.
+    #[test]
+    fn another_binarys_version_is_refused_before_the_migration() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        std::fs::create_dir(&path).expect("db dir");
+        std::fs::write(path.join(MDBX_DATA_FILE), b"planted").expect("plant MDBX's file");
+        let version_file = reth_db::version::db_version_file_path(&path);
+        std::fs::write(&version_file, "7").expect("another version");
+
+        let err = open_tn_lmdb(&path, &test_db_args(), version("1.0.0")).expect_err("refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("database version 7"), "the version check refused it: {msg}");
+        assert_eq!(std::fs::read(path.join(MDBX_DATA_FILE)).expect("read"), b"planted", "kept");
+        assert!(!path.join(tn_lmdb_reth::DATA_FILE).try_exists().expect("stat"), "nothing made");
+        assert!(!path.join(MIGRATING_DIR).try_exists().expect("stat"), "no migration started");
+    }
+
+    /// The rollback tripwire: reth's `create_db`, which a binary running reth on MDBX alone calls
+    /// first on every start (a release from before the backend guard has the same function),
+    /// refuses a tn-lmdb database before it creates anything, so it never opens an empty MDBX
+    /// database beside `tn-lmdb.dat` (whose consistency check would prune the static files down
+    /// to it). Run over a new tn-lmdb database and over one that held reth's version, as a
+    /// migrated one does.
+    #[test]
+    fn an_mdbx_only_binary_refuses_a_tn_lmdb_database() {
+        use reth_db::version::{db_version_file_path, DatabaseVersionError, DB_VERSION};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let db_args = test_db_args();
+        let open = || open_tn_lmdb(&path, &db_args, version("1.0.0"));
+        drop(open().expect("fresh open"));
+
+        for run in ["new", "migrated"] {
+            if run == "migrated" {
+                std::fs::write(db_version_file_path(&path), DB_VERSION.to_string())
+                    .expect("reth's version");
+                drop(open().expect("reopen with reth's version"));
+            }
+            let before = listing(&path);
+            let err = reth_db::mdbx::create_db(&path, reth_db::mdbx::DatabaseArguments::default())
+                .expect_err("reth's create_db refuses a tn-lmdb database");
+            let version_err = err.downcast_ref::<DatabaseVersionError>();
+            assert!(
+                matches!(
+                    version_err,
+                    Some(DatabaseVersionError::VersionMismatch { version: TN_LMDB_DB_VERSION })
+                ),
+                "{run}: refused by the version check: {err:#}"
+            );
+            assert_eq!(listing(&path), before, "{run}: nothing created or changed");
+            assert!(!path.join(MDBX_DATA_FILE).try_exists().expect("stat"), "{run}: no mdbx.dat");
+        }
+    }
+
+    /// The names and contents of the files directly in `dir`, sorted.
+    fn listing(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .expect("list the directory")
+            .map(|entry| {
+                let entry = entry.expect("a directory entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("read"),
+                )
+            })
+            .collect();
+        files.sort();
+        files
     }
 }

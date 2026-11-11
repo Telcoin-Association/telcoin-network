@@ -162,24 +162,75 @@ fn a_read_only_open_trusts_a_weak_head_of_its_boot_and_writes_nothing() {
 /// byte-identical with its modification time unchanged, and the next open falls back again. Commits
 /// that reuse free pages keep the file's length, so the pages' check finds the loss; commits that
 /// grow the file lose their growth with the volume, so the file is shorter than the head's pages.
+/// Both run on a file trimmed as a 4 KiB-page host trims it, with no page past the ones in use
+/// ([`trim_units`]): whether the commits grew the file is read from the page count, never assumed
+/// from the rows. The commits that must not grow it rewrite a few adjacent keys, one leaf's
+/// worth a commit, from the pages the dropped table and the deletes freed; the commits that grow
+/// it rewrite every seventh key, more leaves than the free list holds.
 #[test]
 fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
-    for (rows, grows) in [(97, false), (7, true)] {
+    for trim_unit in trim_units() {
+        for (keys, grows) in [(Keys::Adjacent, false), (Keys::EverySeventh, true)] {
+            a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing_at(
+                trim_unit, keys, grows,
+            );
+        }
+    }
+}
+
+/// The keys of table `a` a round of
+/// [`a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing`] rewrites.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    /// Two adjacent keys, in one leaf: `2 × round`, `2 × round + 1`.
+    Adjacent,
+    /// Every seventh key from `round`.
+    EverySeventh,
+}
+
+impl Keys {
+    fn of(self, round: u32) -> Vec<u32> {
+        match self {
+            Keys::Adjacent => vec![2 * round, 2 * round + 1],
+            Keys::EverySeventh => (round..1500).step_by(7).collect(),
+        }
+    }
+}
+
+/// One case of [`a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing`]: three
+/// `NoSync` commits of `keys` of table `a`, which `grows` says must grow the file (a commit that
+/// reuses free pages keeps it).
+fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing_at(
+    trim_unit: Option<u64>,
+    keys: Keys,
+    grows: bool,
+) {
+    {
+        let case = format!("{keys:?} keys, trim unit {trim_unit:?}");
         let (_dir, path) = temp("tn_lmdb_ro_lost");
         let mut state = written(&path);
+        retrim(&path, trim_unit);
         disk_model::track(&path);
         let env = open(&path, SyncMode::NoSync);
         let synced_txn = durable_first_commit(&env, &mut state);
         let synced = state.clone();
+        let synced_pages = env.stat().page_count;
+        let free_pages = env.check().expect("check").free_pages;
         for round in 0..3_u32 {
             let mut txn = env.begin_rw().expect("begin");
-            for i in (round..1500).step_by(rows) {
+            for i in keys.of(round) {
                 put(&mut txn, &mut state, "a", &i.to_be_bytes(), &value(10 + round, i, 60));
             }
             txn.commit().expect("a NoSync commit");
         }
         assert_eq!(env.stat().txn_id, synced_txn + 3);
         let head_pages = env.stat().page_count;
+        assert_eq!(
+            head_pages > synced_pages,
+            grows,
+            "{case}: the commits grew the file from {synced_pages} to {head_pages} pages, with \
+             {free_pages} free before them"
+        );
         env.with_writer(|w| {
             let slot = w.slots().iter().position(|s| s.is_some_and(|s| s.weak)).expect("weak");
             w.file.msync_page(slot as u32, P as usize).expect("the meta page's writeback");
@@ -187,11 +238,18 @@ fn a_read_only_open_falls_back_from_a_lost_weak_head_and_writes_nothing() {
         env.crash();
         disk_model::volume_loss(&path);
         disk_model::untrack(&path);
+        // The growth went with the volume: the file is shorter than the head's pages (a trim at
+        // the host's larger OS page may leave a few pages past the ones in use, so only a
+        // trim at the database's page says the file is exactly its pages).
         let short = fs::metadata(&path).expect("metadata").len() < u64::from(head_pages) * P;
-        assert_eq!(short, grows, "rows step {rows}");
+        if grows && trim_unit == Some(P) {
+            assert!(short, "{case}: the lost growth leaves the file short");
+        } else if !grows {
+            assert!(!short, "{case}: commits that reused pages kept the file's length");
+        }
         let before = bytes_and_mtime(&path);
         for reopen in 0..2 {
-            let case = format!("rows step {rows}, reopen {reopen}");
+            let case = format!("{case}, reopen {reopen}");
             let env = open_ro(&path);
             assert_eq!(env::take_weak_head_check(), Some(Err(())), "{case}: it falls back");
             assert_eq!(env.stat().txn_id, synced_txn, "{case}: the last sync");
