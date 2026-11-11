@@ -55,13 +55,27 @@ fn open_with(path: &Path, sync: SyncMode, gap_fill: GapFill) -> Env {
     Env::open(path, EnvOptions { sync, gap_fill, ..EnvOptions::default() }).expect("open")
 }
 
+/// The steps `GapFill::Auto` files in an interval `s` of at most one durable step (counters
+/// `before` it) of an environment whose gap reads are refused: a scattered step
+/// (`fdatasync_syncs`) until the first gap read, which turns gap fill off, and none from that one
+/// on, the refused step included. A step whose width is 0, or whose width finds no gap, reads
+/// none, so the refusal may come at a later step.
+fn filed_by_refused_auto(before: &IoStats, s: &IoStats) -> u64 {
+    assert!(s.fdatasync_syncs <= 1, "one durable step: {s:?}");
+    assert!(s.gap_fill_refusals <= s.fdatasync_syncs, "only a scattered step reads gaps: {s:?}");
+    match before.gap_fill_refusals {
+        0 => s.fdatasync_syncs - s.gap_fill_refusals,
+        _ => 0,
+    }
+}
+
 /// The same commits with gap fill off, at 4 pages, at `MAX_GAP_FILL` and at auto leave the four
 /// files identical, byte for byte, after every durable state (each `SyncMode::Durable` commit,
 /// each `Env::sync` of `SyncMode::NoSync` commits), while the fills rewrote gaps: the larger the
 /// width, the more, and auto at the widths its warm-up tried. Step 4 synced the same runs in all
 /// four. On a file system that refuses reads that do not wait for the disk (tmpfs) the three
-/// fills turn themselves off at their first gap instead, filling none (auto before it files a
-/// step): the files are identical all the same.
+/// fills turn themselves off at their first gap instead, filling none (auto files no step from
+/// the refused one on): the files are identical all the same.
 #[test]
 fn a_gap_fill_changes_no_byte_of_the_file() {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
@@ -108,7 +122,9 @@ fn a_gap_fill_changes_no_byte_of_the_file() {
                 let counts = (s.gaps_filled, s.gap_pages, s.gap_fill_refusals);
                 assert_eq!(counts, (0, 0, 1), "{sync:?} gap fill {g}: refused once: {s:?}");
             }
-            assert_eq!(auto.gap_auto_steps, 0, "{sync:?}: auto off at its first step: {auto:?}");
+            // The refused step and the scattered steps after it are not filed.
+            let off = auto.gap_auto_steps < auto.fdatasync_syncs;
+            assert!(off, "{sync:?}: auto off once refused: {auto:?}");
         } else {
             assert!(stats.iter().all(|s| s.gap_fill_refusals == 0), "{sync:?}: {stats:?}");
             assert!(stats[1].gaps_filled > 0, "{sync:?}: 4 pages filled gaps: {:?}", stats[1]);
@@ -197,8 +213,9 @@ fn a_fill_stops_once_its_misses_outnumber_its_fills_by_the_slack() {
 /// (`PageFile::refuse_reads`, as tmpfs refuses `RWF_NOWAIT`) turns gap fill off for the
 /// environment at the first gap a durable commit reads, at a fixed width and at auto alike: one
 /// refusal, so one warning, however many later commits have gaps to fill (each of the twin whose
-/// every read misses, `miss_reads`, tries some), no gap filled or missed, no step filed with auto,
-/// the bounce buffer given back, and the file byte for byte the one gap fill off leaves.
+/// every read misses, `miss_reads`, tries some), no gap filled or missed, no step filed by auto
+/// from the refused one on, the bounce buffer given back, and the file byte for byte the one gap
+/// fill off leaves.
 #[test]
 fn a_file_that_refuses_nowait_reads_turns_gap_fill_off_once() {
     let wide = GapFill::Pages(MAX_GAP_FILL);
@@ -229,8 +246,12 @@ fn a_file_that_refuses_nowait_reads_turns_gap_fill_off_once() {
             let r = envs[refusing].io_stats().since(&was[refusing]);
             let m = envs[missing].io_stats().since(&was[missing]);
             *tried += u32::from(m.gap_misses > 0);
+            let filed = match g {
+                GapFill::Auto => filed_by_refused_auto(&was[refusing], &r),
+                _ => 0,
+            };
             let counts = (r.gaps_filled, r.gap_pages, r.gap_misses, r.gap_auto_steps);
-            assert_eq!(counts, (0, 0, 0, 0), "{g} round {round}: {r:?}");
+            assert_eq!(counts, (0, 0, 0, filed), "{g} round {round}: {r:?}");
             let on = envs[refusing].with_writer(|w| (w.gap_fill.is_on(), w.gap_buf.capacity()));
             let refused = envs[refusing].io_stats().gap_fill_refusals;
             assert_eq!(on, (refused == 0, 0), "{g} round {round}");
@@ -323,8 +344,8 @@ fn a_gap_fill_parses_from_auto_off_or_a_page_count() {
 /// whose widths follow the warm-up (8, 0, 4, ...), each step at another width than the model's
 /// (0 before the warm-up ends) counted a probe; a step synced by one `msync` fills nothing and
 /// is not counted. The fill's cost per gap is published, and the file checks. On a file system
-/// that refuses reads that do not wait for the disk (tmpfs) the first scattered step's first gap
-/// read turns gap fill off instead, once: no step is filed and none fills.
+/// that refuses reads that do not wait for the disk (tmpfs) the first gap read turns gap fill off
+/// instead, once: no step fills, and none is filed from the refused one on.
 #[test]
 fn an_auto_gap_fill_publishes_its_width_and_its_fit() {
     let (dir, path) = temp();
@@ -344,7 +365,8 @@ fn an_auto_gap_fill_publishes_its_width_and_its_fit() {
         scatter(&env, round);
         let s = env.io_stats().since(&before);
         if refused {
-            assert_eq!((s.gap_auto_steps, s.gaps_filled), (0, 0), "round {round}: refused: {s:?}");
+            let want = (filed_by_refused_auto(&before, &s), 0);
+            assert_eq!((s.gap_auto_steps, s.gaps_filled), want, "round {round}: refused: {s:?}");
             continue;
         }
         assert_eq!(s.gap_auto_steps, s.fdatasync_syncs, "round {round}: {s:?}");
