@@ -283,17 +283,19 @@ fn with_max_growth_reaches_the_engine() {
 
 /// `TnLmdbArgs::with_gap_fill` reaches the engine's `EnvOptions::gap_fill`: more than
 /// `MAX_GAP_FILL` pages is refused at a read-write open (`MDBX_EINVAL`) before the file is
-/// created, and `MAX_GAP_FILL` itself opens.
+/// created, and `MAX_GAP_FILL` itself opens, as does `crate::GapFill::Auto`.
 #[test]
 fn with_gap_fill_reaches_the_engine() {
-    assert_eq!(TnLmdbArgs::default().gap_fill, 0, "off by default");
+    assert_eq!(TnLmdbArgs::default().gap_fill, crate::GapFill::OFF, "off by default");
     let dir = tempfile::tempdir().unwrap();
-    let args = TnLmdbArgs::default().with_gap_fill(crate::MAX_GAP_FILL + 1);
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Pages(crate::MAX_GAP_FILL + 1));
     assert!(matches!(
         super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap_err(),
         DatabaseError::Open(err) if err == Error::DecodeError.into()));
     assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
-    let args = TnLmdbArgs::default().with_gap_fill(crate::MAX_GAP_FILL);
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Pages(crate::MAX_GAP_FILL));
+    drop(super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap());
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Auto);
     super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
 }
 

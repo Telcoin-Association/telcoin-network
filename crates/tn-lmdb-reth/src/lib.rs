@@ -335,5 +335,8 @@ mod tests;
 
 pub use cursor::{TnLmdbCursor, TnLmdbCursorMut};
 pub use env::{RethTableStat, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
-pub use tn_lmdb::{CheckReport, IoStats, SyncMode, TableCheck, MAX_GAP_FILL, MIN_GROWTH};
+pub use tn_lmdb::{
+    CheckReport, GapFill, IoStats, ParseGapFillError, SyncMode, TableCheck, MAX_GAP_FILL,
+    MIN_GROWTH,
+};
 pub use tx::{TnLmdbTx, TnLmdbTxMut};

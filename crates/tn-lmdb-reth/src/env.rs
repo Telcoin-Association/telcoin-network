@@ -24,7 +24,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tn_lmdb::{CheckReport, DupOptions, Env, EnvOptions, IoStats, ReadTxn, SyncMode, Table};
+use tn_lmdb::{
+    CheckReport, DupOptions, Env, EnvOptions, GapFill, IoStats, ReadTxn, SyncMode, Table,
+};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tn-lmdb.dat";
@@ -155,12 +157,13 @@ pub struct TnLmdbArgs {
     /// commit that changes something writes over it, so a later open with `true` in the same boot
     /// can open at them again. Applies to read-only opens too.
     pub trust_unsynced: bool,
-    /// Gap fill, in pages (default 0: off): the engine's `EnvOptions::gap_fill`. A durable step
-    /// first rewrites each gap of at most this many clean pages between two runs of its dirty
-    /// pages with the bytes they hold, so the disk takes fewer, larger writes for more bytes: for
-    /// disks that cap I/Os per second (cloud block storage), not for local NVMe. An open refuses
-    /// more than [`tn_lmdb::MAX_GAP_FILL`] (`MDBX_EINVAL`).
-    pub gap_fill: u32,
+    /// Gap fill (default off): the engine's `EnvOptions::gap_fill`. A durable step first rewrites
+    /// each gap of at most so many clean pages between two runs of its dirty pages with the bytes
+    /// they hold, so the disk takes fewer, larger writes for more bytes: a fixed width
+    /// ([`GapFill::Pages`]) for disks that cap I/Os per second (cloud block storage), not for
+    /// local NVMe; [`GapFill::Auto`] chooses the width per scattered step from the syncs' measured
+    /// costs, for either. An open refuses a width past [`tn_lmdb::MAX_GAP_FILL`] (`MDBX_EINVAL`).
+    pub gap_fill: GapFill,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
@@ -246,8 +249,9 @@ impl TnLmdbArgs {
         self
     }
 
-    /// Set [`Self::gap_fill`], in pages (0: off), at most [`tn_lmdb::MAX_GAP_FILL`].
-    pub const fn with_gap_fill(mut self, gap_fill: u32) -> Self {
+    /// Set [`Self::gap_fill`]: a width in pages (0: off) of at most [`tn_lmdb::MAX_GAP_FILL`], or
+    /// [`GapFill::Auto`].
+    pub const fn with_gap_fill(mut self, gap_fill: GapFill) -> Self {
         self.gap_fill = gap_fill;
         self
     }

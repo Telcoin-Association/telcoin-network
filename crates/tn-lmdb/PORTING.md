@@ -287,7 +287,9 @@ Linux-only dependency, `Cargo.toml`); a kernel or file system that refuses it (`
 `EINVAL`, `ENOSYS`) turns gap fill off with a warning. `posix_fadvise(POSIX_FADV_RANDOM)` keeps the
 read a miss starts to the gap. **macOS.** No such read: a plain `pread` (a page not in memory
 costs a synchronous read), so gap fill there serves tests and measurement. A port without such a
-read does the same or refuses the option.
+read does the same or refuses the option. `GapFill::Auto` needs nothing more of the OS: it times
+the fill and the data sync with `Instant` and chooses a width (`env/gap_auto.rs`), the same on
+every port.
 
 ### Errors
 

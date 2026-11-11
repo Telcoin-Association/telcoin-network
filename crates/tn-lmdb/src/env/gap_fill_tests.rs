@@ -1,6 +1,7 @@
-//! Step 4's gap fill (`EnvOptions::gap_fill`): the option's bound, which gaps a fill rewrites,
-//! when it stops trying, and that it changes no byte of the file. The crash matrix runs with it
-//! on too (`tests/crash.rs`, `GAP_FILL`).
+//! Step 4's gap fill (`EnvOptions::gap_fill`): the option's bound and its parse, which gaps a
+//! fill rewrites, when it stops trying, that it changes no byte of the file, at a fixed width and
+//! at auto, and what auto publishes. The crash matrix runs with it on too (`tests/crash.rs`,
+//! `GAP_FILL`). The automatic width's chooser on modelled disks: `gap_auto_tests.rs`.
 
 use std::fs;
 
@@ -50,18 +51,19 @@ fn scatter(env: &Env, round: u32) {
     txn.commit().expect("commit");
 }
 
-fn open_with(path: &Path, sync: SyncMode, gap_fill: u32) -> Env {
+fn open_with(path: &Path, sync: SyncMode, gap_fill: GapFill) -> Env {
     Env::open(path, EnvOptions { sync, gap_fill, ..EnvOptions::default() }).expect("open")
 }
 
-/// The same commits with gap fill off, at 4 pages and at `MAX_GAP_FILL` leave the three files
-/// identical, byte for byte, after every durable state (each `SyncMode::Durable` commit, each
-/// `Env::sync` of `SyncMode::NoSync` commits), while the fills rewrote gaps: the larger the
-/// option, the more. Step 4 synced the same runs in all three.
+/// The same commits with gap fill off, at 4 pages, at `MAX_GAP_FILL` and at auto leave the four
+/// files identical, byte for byte, after every durable state (each `SyncMode::Durable` commit,
+/// each `Env::sync` of `SyncMode::NoSync` commits), while the fills rewrote gaps: the larger the
+/// width, the more, and auto at the widths its warm-up tried. Step 4 synced the same runs in all
+/// four.
 #[test]
 fn a_gap_fill_changes_no_byte_of_the_file() {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
-        let fills = [0, 4, MAX_GAP_FILL];
+        let fills = [GapFill::OFF, GapFill::Pages(4), GapFill::Pages(MAX_GAP_FILL), GapFill::Auto];
         let dirs: Vec<(TempDir, PathBuf)> = fills.iter().map(|_| temp()).collect();
         let envs: Vec<Env> =
             fills.iter().zip(&dirs).map(|(&g, (_, path))| open_with(path, sync, g)).collect();
@@ -102,6 +104,9 @@ fn a_gap_fill_changes_no_byte_of_the_file() {
             stats[1],
             stats[2]
         );
+        let auto = stats[3];
+        assert!(auto.gap_auto_steps > 0 && auto.gaps_filled > 0, "{sync:?}: auto filled: {auto:?}");
+        assert_eq!(auto.gap_auto_steps, auto.fdatasync_syncs, "{sync:?}: each scattered step");
         let empty = envs[0].with_writer(|w| w.gap_buf.capacity());
         assert_eq!(empty, 0, "{sync:?}: off, no buffer");
         for env in envs {
@@ -117,7 +122,7 @@ fn a_gap_fill_changes_no_byte_of_the_file() {
 #[test]
 fn a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider() {
     let (_dir, path) = temp();
-    let env = open_with(&path, SyncMode::Durable, 0);
+    let env = open_with(&path, SyncMode::Durable, GapFill::OFF);
     load(&env);
     let pages = [10u32, 12, 16, 24, 25, 34];
     let before = fs::read(&path).expect("read");
@@ -126,8 +131,8 @@ fn a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider() {
         env.with_writer(|w| {
             #[cfg(target_os = "macos")]
             assert_eq!(w.file.dirty_os_pages(), 0, "gap fill {g}: clean before the fill");
-            w.gap_fill = g;
-            w.fill_gaps(&pages).expect("fill");
+            let fill = w.fill_gaps(&pages, g).expect("fill");
+            assert_eq!(fill, Fill { filled, missed: 0, pages: pages_filled }, "gap fill {g}");
             #[cfg(target_os = "macos")]
             assert!(w.file.dirty_os_pages() > 0, "gap fill {g}: the fill wrote its gaps");
             // Write them now, so the next round starts clean.
@@ -146,13 +151,13 @@ fn a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider() {
 #[test]
 fn a_fill_stops_once_its_misses_outnumber_its_fills_by_the_slack() {
     let (_dir, path) = temp();
-    let env = open_with(&path, SyncMode::Durable, 4);
+    let env = open_with(&path, SyncMode::Durable, GapFill::Pages(4));
     load(&env);
     let pages: Vec<u32> = (0..200).map(|i| 10 + 2 * i).collect();
     let was = env.io_stats();
     env.with_writer(|w| {
         w.file.miss_reads = true;
-        w.fill_gaps(&pages).expect("fill");
+        w.fill_gaps(&pages, 4).expect("fill");
         w.file.miss_reads = false;
     });
     let s = env.io_stats().since(&was);
@@ -160,25 +165,26 @@ fn a_fill_stops_once_its_misses_outnumber_its_fills_by_the_slack() {
     assert_eq!(s.gap_misses, GAP_MISS_SLACK + 1, "it stopped after the slack");
 }
 
-/// `EnvOptions::gap_fill` defaults to 0 (off); past `MAX_GAP_FILL` it is refused at open as
+/// `EnvOptions::gap_fill` defaults to off; past `MAX_GAP_FILL` it is refused at open as
 /// `InvalidGapFill`, before the file is touched: a missing file is not created, an existing one
 /// keeps every byte. `MAX_GAP_FILL` itself opens, and a read-only open ignores the field.
 #[test]
 fn a_gap_fill_past_its_maximum_is_refused_at_open() {
-    assert_eq!(EnvOptions::default().gap_fill, 0);
+    assert_eq!(EnvOptions::default().gap_fill, GapFill::OFF);
+    assert_eq!(GapFill::default(), GapFill::Pages(0));
     let (dir, path) = temp();
-    let wide = EnvOptions { gap_fill: MAX_GAP_FILL + 1, ..EnvOptions::default() };
+    let wide = EnvOptions { gap_fill: GapFill::Pages(MAX_GAP_FILL + 1), ..EnvOptions::default() };
     assert!(matches!(
         Env::open(&path, wide),
         Err(Error::InvalidGapFill(g)) if g == MAX_GAP_FILL + 1
     ));
     assert_eq!(fs::read_dir(dir.path()).expect("dir").count(), 0, "the refusal created a file");
-    load(&open_with(&path, SyncMode::Durable, 0));
+    load(&open_with(&path, SyncMode::Durable, GapFill::OFF));
     let before = fs::read(&path).expect("read");
     assert!(matches!(Env::open(&path, wide), Err(Error::InvalidGapFill(_))));
     assert!(fs::read(&path).expect("read") == before, "the refused open changed the file");
     drop(Env::open_read_only(&path, wide).expect("a read-only open ignores gap_fill"));
-    let env = open_with(&path, SyncMode::Durable, MAX_GAP_FILL);
+    let env = open_with(&path, SyncMode::Durable, GapFill::Pages(MAX_GAP_FILL));
     let ro = env.begin_ro().expect("ro");
     let t = ro.open_table("t").expect("open").expect("t exists");
     assert_eq!(ro.get(&t, &key(7)).expect("get"), Some(&value(0, 7)[..]));
@@ -191,7 +197,7 @@ fn a_gap_fill_past_its_maximum_is_refused_at_open() {
 #[cfg(target_os = "macos")]
 fn a_gap_filled_scattered_commit_leaves_no_page_dirty() {
     let (_dir, path) = temp();
-    let env = open_with(&path, SyncMode::Durable, 8);
+    let env = open_with(&path, SyncMode::Durable, GapFill::Pages(8));
     load(&env);
     let mut filled = 0;
     for round in 1..8u32 {
@@ -207,4 +213,67 @@ fn a_gap_filled_scattered_commit_leaves_no_page_dirty() {
         assert_eq!(dirty, 0, "round {round}: OS pages left dirty after the commit returned");
     }
     assert!(filled > 0, "the commits filled gaps");
+}
+
+/// `GapFill` parses from `auto`, `off` and a page count of at most `MAX_GAP_FILL` (0 is off), and
+/// shows as it parses; anything else is refused, naming what it got.
+#[test]
+fn a_gap_fill_parses_from_auto_off_or_a_page_count() {
+    let parse = |s: &str| s.parse::<GapFill>();
+    assert_eq!(parse("auto"), Ok(GapFill::Auto));
+    assert_eq!(parse("off"), Ok(GapFill::OFF));
+    assert_eq!(parse("0"), Ok(GapFill::OFF));
+    assert_eq!(parse("8"), Ok(GapFill::Pages(8)));
+    assert_eq!(parse("64"), Ok(GapFill::Pages(MAX_GAP_FILL)));
+    for bad in ["65", "-1", "", "Auto", "8 pages"] {
+        let err = parse(bad).expect_err(bad);
+        assert!(err.to_string().contains(&format!("{bad:?}")), "{bad}: {err}");
+    }
+    for g in [GapFill::Auto, GapFill::OFF, GapFill::Pages(8)] {
+        assert_eq!(parse(&g.to_string()), Ok(g), "{g} round trips");
+    }
+    assert!(!GapFill::OFF.is_on() && GapFill::Pages(1).is_on() && GapFill::Auto.is_on());
+}
+
+/// Under `GapFill::Auto` every scattered durable step (synced by the `fdatasync`; on macOS by the
+/// `msync`s of `DataSync::Ranges`, which count there too) is one of `IoStats::gap_auto_steps`,
+/// whose widths follow the warm-up (8, 0, 4, ...), each step at another width than the model's
+/// (0 before the warm-up ends) counted a probe; a step synced by one `msync` fills nothing and
+/// is not counted. The fill's cost per gap is published, and the file checks.
+#[test]
+fn an_auto_gap_fill_publishes_its_width_and_its_fit() {
+    let (_dir, path) = temp();
+    let env = open_with(&path, SyncMode::Durable, GapFill::Auto);
+    load(&env);
+    let was = env.io_stats();
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.open_table("t").expect("open").expect("t exists");
+    txn.put(&t, &key(1), &value(9, 1)).expect("put");
+    txn.commit().expect("a commit of a few pages");
+    let few = env.io_stats().since(&was);
+    assert_eq!((few.gap_auto_steps, few.gaps_filled), (0, 0), "a step of few runs: {few:?}");
+    let (mut widths, mut filled) = (Vec::new(), 0);
+    for round in 1..=12u32 {
+        let before = env.io_stats();
+        scatter(&env, round);
+        let s = env.io_stats().since(&before);
+        assert_eq!(s.gap_auto_steps, s.fdatasync_syncs, "round {round}: {s:?}");
+        if s.gap_auto_steps == 0 {
+            assert_eq!(s.gaps_filled, 0, "round {round}: one msync fills nothing");
+            continue;
+        }
+        assert_eq!(s.gap_auto_width_sum, s.gap_auto_width, "round {round}");
+        assert_eq!(s.gap_auto_probes, u64::from(s.gap_auto_width != 0), "round {round}: {s:?}");
+        if s.gap_auto_width == 0 {
+            assert_eq!(s.gaps_filled, 0, "round {round}: width 0 fills nothing");
+        }
+        filled += s.gaps_filled;
+        widths.push(s.gap_auto_width);
+    }
+    assert!(widths.len() >= 6, "the later rounds are scattered: {widths:?}");
+    assert_eq!(widths, [8, 0, 4].repeat(4)[..widths.len()], "the warm-up's widths");
+    let s = env.io_stats();
+    assert!(filled > 0 && s.gap_auto_gap_ns > 0, "the warm-up filled gaps: {s:?}");
+    assert_eq!(env.io_stats().since(&was).gap_auto_readapts, 0);
+    env.check().expect("check");
 }

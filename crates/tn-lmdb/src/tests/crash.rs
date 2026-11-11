@@ -204,16 +204,17 @@ const AUTO_PERIOD: Duration = Duration::from_secs(3600);
 
 thread_local! {
     /// The `EnvOptions::gap_fill` every environment of this thread's matrix opens with
-    /// ([`open_in`]; 0, off, but under [`with_gap_fill`]).
-    static GAP_FILL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// ([`open_in`]; off, but under [`with_gap_fill`]).
+    static GAP_FILL: std::cell::Cell<GapFill> = const { std::cell::Cell::new(GapFill::OFF) };
 }
 
-/// Run `f` (a matrix) with every environment it opens filling gaps of up to `pages` pages, and
-/// its dry runs checking that the crash commit's durable steps filled some.
-pub(super) fn with_gap_fill(pages: u32, f: impl FnOnce()) {
-    GAP_FILL.set(pages);
+/// Run `f` (a matrix) with every environment it opens filling gaps as `gap_fill` says, and its
+/// dry runs checking that the durable steps filled some at the largest width, and that auto chose
+/// a width.
+pub(super) fn with_gap_fill(gap_fill: GapFill, f: impl FnOnce()) {
+    GAP_FILL.set(gap_fill);
     f();
-    GAP_FILL.set(0);
+    GAP_FILL.set(GapFill::OFF);
 }
 
 /// Open the file at `path` as `mode` commits.
@@ -306,9 +307,22 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     }
     let (by_file, reused, runs) =
         env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
-    let gaps_filled = env.io_stats().gaps_filled;
+    let io = env.io_stats();
+    let (gaps_filled, gap_auto_steps) = (io.gaps_filled, io.gap_auto_steps);
     env.crash();
-    Case { path, first, durable, latest, before, slot, by_file, reused, runs, gaps_filled }
+    Case {
+        path,
+        first,
+        durable,
+        latest,
+        before,
+        slot,
+        by_file,
+        reused,
+        runs,
+        gaps_filled,
+        gap_auto_steps,
+    }
 }
 
 /// What [`run_case`] left.
@@ -336,6 +350,8 @@ pub(super) struct Case {
     pub(super) runs: RunStats,
     /// The gaps the case's durable steps filled (`EnvOptions::gap_fill`, [`with_gap_fill`]).
     pub(super) gaps_filled: u64,
+    /// The case's scattered durable steps whose width `GapFill::Auto` chose.
+    pub(super) gap_auto_steps: u64,
 }
 
 /// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
@@ -420,18 +436,31 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
 /// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
 /// `msync` alone covers), and the base's `layout`.
 fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
-    let Case { path, latest, by_file, reused, gaps_filled, .. } =
+    let Case { path, latest, by_file, reused, gaps_filled, gap_auto_steps, .. } =
         run_case(base, mode, by_msync, None);
     assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{mode:?}: pages were reused");
     // Off, no gap is filled; at the largest gap fill the crash commit's runs always leave gaps to
-    // fill. A smaller one fills those the layout leaves short enough, perhaps none.
+    // fill. A smaller one fills those the layout leaves short enough, perhaps none. Auto chose the
+    // width of the crash commit's durable step, a scattered one (its warm-up's first, 8 pages,
+    // the crash commit's in `Mode::Durable`), and filled what that width finds.
     let gap_fill = GAP_FILL.get();
     let case = format!("{mode:?} page size {} gap fill {gap_fill}", base.page_size);
     match gap_fill {
-        0 => assert_eq!(gaps_filled, 0, "{case}: by_msync={by_msync}: off fills nothing"),
-        MAX_GAP_FILL => assert!(gaps_filled > 0, "{case}: by_msync={by_msync}: gaps filled"),
-        _ => eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled"),
+        GapFill::OFF => {
+            assert_eq!(gaps_filled, 0, "{case}: by_msync={by_msync}: off fills nothing")
+        }
+        GapFill::Pages(MAX_GAP_FILL) => {
+            assert!(gaps_filled > 0, "{case}: by_msync={by_msync}: gaps filled")
+        }
+        GapFill::Pages(_) => eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled"),
+        GapFill::Auto => {
+            assert!(gap_auto_steps > 0, "{case}: by_msync={by_msync}: auto chose a width");
+            eprintln!("{case}: by_msync={by_msync}: {gaps_filled} gaps filled");
+        }
+    }
+    if gap_fill != GapFill::Auto {
+        assert_eq!(gap_auto_steps, 0, "{case}: only auto chooses");
     }
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;
@@ -489,17 +518,26 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
 /// runs check that they filled some), and every cell recovers exactly as without it.
 #[test]
 fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill() {
-    with_gap_fill(MAX_GAP_FILL, || matrix(&base(4096), 3));
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix(&base(4096), 3));
 }
 
-/// The gap-filled matrix at two page sizes, at 4 pages and at the largest, with many random
-/// power losses.
+/// The matrix with `GapFill::Auto`: auto chooses the width of the crash commit's durable step
+/// (the warm-up's first, 8 pages, in `Mode::Durable`) before its data sync and files its outcome
+/// after, and every cell recovers exactly as without it. The fills' own crash safety at a width
+/// that always fills is the matrix at `MAX_GAP_FILL`'s.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_auto_gap_fill() {
+    with_gap_fill(GapFill::Auto, || matrix(&base(4096), 3));
+}
+
+/// The gap-filled matrix at two page sizes, at 4 pages, at the largest and at auto, with many
+/// random power losses.
 #[test]
 #[ignore = "heavy: run with --release"]
 fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill_heavy() {
     for page_size in [4096, 16384] {
-        for pages in [4, MAX_GAP_FILL] {
-            with_gap_fill(pages, || matrix(&base(page_size), 40));
+        for gap_fill in [GapFill::Pages(4), GapFill::Pages(MAX_GAP_FILL), GapFill::Auto] {
+            with_gap_fill(gap_fill, || matrix(&base(page_size), 40));
         }
     }
 }
@@ -518,7 +556,14 @@ fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows
 /// gaps between the runs of its own pages and the deferred commits' pages.
 #[test]
 fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_with_gap_fill() {
-    with_gap_fill(MAX_GAP_FILL, || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
+}
+
+/// The automatic sync's matrix with `GapFill::Auto`.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_with_auto_gap_fill(
+) {
+    with_gap_fill(GapFill::Auto, || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
 }
 
 /// The automatic sync's matrix at two page sizes, with many random power losses.
