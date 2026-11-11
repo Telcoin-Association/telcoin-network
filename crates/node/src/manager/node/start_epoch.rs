@@ -634,12 +634,20 @@ where
                 consensus_config.shutdown().subscribe(),
             )
             .await;
+        // the current committee's BLS keys, so each worker handle keeps the batch-sync
+        // stall mark inside the committee tier of its peer order (#1773)
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
+            .committee()
+            .authorities()
+            .into_iter()
+            .map(|a| *a.protocol_key())
+            .collect();
         self.worker_network_handles
             .iter_mut()
             .take(consensus_config.committee().number_of_workers())
             .for_each(|handle| {
                 handle.update_task_spawner(epoch_task_spawner.clone());
-                handle.update_epoch(consensus_config.committee().epoch());
+                handle.update_epoch(consensus_config.committee().epoch(), committee_keys.clone());
             });
 
         engine.deactivate_workers_above(consensus_config.committee().number_of_workers()).await;
@@ -1012,7 +1020,8 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
-        let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
+        let rx_event_stream =
+            self.consensus_bus.subscribe_primary_network_events(consensus_config.epoch());
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");

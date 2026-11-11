@@ -6,7 +6,7 @@ Each release is a signed git tag plus these files on the tag's [GitHub release](
 | File | Content |
 | --- | --- |
 | `telcoin-network-<TAG>-x86_64-unknown-linux-gnu.tar.gz` | The `telcoin-network` binary, with `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
-| `IMAGE_DIGEST` | The `linux/amd64` image at `ghcr.io/telcoin-association/telcoin-network`, named by its content digest |
+| `IMAGE_DIGEST` | The `linux/amd64` image, named by its content digest, in the network's package: `ghcr.io/telcoin-association/tn-mainnet` for a mainnet tag, `ghcr.io/telcoin-association/tn-testnet` for an Adiri tag |
 | `SHA256SUMS` | The SHA-256 of the tarball, of `IMAGE_DIGEST`, and of the network's three chain-config files |
 | `SHA256SUMS.asc` | A maintainer's detached OpenPGP signature over `SHA256SUMS` |
 
@@ -15,14 +15,17 @@ On those, build from source as the [README](https://github.com/Telcoin-Associati
 
 ## Release channels
 
-The tag name sets the network, the build features and the image tags.
+The tag name sets the network, the build features, the image package and the image tags.
 
-| Tag | Network | Build features | Image tags |
-| --- | --- | --- | --- |
-| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` |
-| `vX.Y.Z-rcN` | mainnet release candidate | none | `:vX.Y.Z-rcN` only |
-| `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `:vX.Y.Z-adiri`, `:adiri` |
-| `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `:vX.Y.Z-adiri-rcN` only |
+| Tag | Network | Build features | Image package | Image tags |
+| --- | --- | --- | --- | --- |
+| `vX.Y.Z` | mainnet | none | `tn-mainnet` | `:vX.Y.Z`, `:latest` |
+| `vX.Y.Z-rcN` | mainnet release candidate | none | `tn-mainnet` | `:vX.Y.Z-rcN` only |
+| `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `tn-testnet` | `:vX.Y.Z-adiri`, `:adiri` |
+| `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `tn-testnet` | `:vX.Y.Z-adiri-rcN` only |
+
+Both packages are under `ghcr.io/telcoin-association/`.
+A mainnet release never has its image in `tn-testnet`, and an Adiri release never in `tn-mainnet`; the image check below refuses either.
 
 Running with `--chain adiri` needs a build with the `adiri` feature, so Adiri nodes use the `-adiri` releases.
 Release candidates are for testing and do not belong in production.
@@ -187,26 +190,30 @@ Then check the key fingerprints as in [Path A](#check-the-key-fingerprints), and
 ### Check the image
 
 Run this only after the signature, the hash and the fingerprints have passed.
-It refuses an `IMAGE_DIGEST` that does not name the release repository by digest:
+It takes the image package from `TAG`, `tn-testnet` for an Adiri tag and `tn-mainnet` otherwise, and refuses an `IMAGE_DIGEST` that does not name an image in that package by digest, such as one in the other network's package:
 
 ```sh
+case "$TAG" in
+  *-adiri | *-adiri-rc*) PACKAGE=tn-testnet ;;
+  *) PACKAGE=tn-mainnet ;;
+esac
 IMAGE_REF=$(cat IMAGE_DIGEST)
 case "$IMAGE_REF" in
-  ghcr.io/telcoin-association/telcoin-network@sha256:*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/telcoin "$IMAGE_REF" --version ;;
-  *) echo "IMAGE_DIGEST does not name a telcoin-network image by digest: $IMAGE_REF" >&2 ;;
+  "ghcr.io/telcoin-association/$PACKAGE@sha256:"*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/telcoin "$IMAGE_REF" --version ;;
+  *) echo "IMAGE_DIGEST does not name an image in ghcr.io/telcoin-association/$PACKAGE by digest: $IMAGE_REF" >&2 ;;
 esac
 ```
 
 In the image the binary is `/usr/local/bin/telcoin`, and its `--version` output must show the same three lines as in [Path A](#check-the-binary), with the commit that `git -C tn-main rev-parse "refs/tags/$TAG^{commit}"` prints.
 
 Docker checks an image pulled by digest against that digest, so the image you pulled is the one the signature covers.
-Put the full content of `IMAGE_DIGEST` (`ghcr.io/telcoin-association/telcoin-network@sha256:...`) in compose files and systemd units, not a tag.
+Put the full content of `IMAGE_DIGEST` (`ghcr.io/telcoin-association/tn-mainnet@sha256:...` for mainnet, `ghcr.io/telcoin-association/tn-testnet@sha256:...` for Adiri) in compose files and systemd units, not a tag.
 The image is `linux/amd64` only.
 
-If you already pulled by tag, compare the two lines this prints; they must be equal:
+If you already pulled by tag, compare the two lines this prints, with `PACKAGE` set as in the block above; they must be equal:
 
 ```sh
-docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/telcoin-association/telcoin-network:$TAG"
+docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/telcoin-association/$PACKAGE:$TAG"
 cat IMAGE_DIGEST
 ```
 
@@ -244,7 +251,7 @@ Never extract, install or run anything from a release that failed one of these c
 | `sha256sum` prints `FAILED` | A file differs from its signed hash | Check `TAG` and run the block again in a new, empty directory; if it fails again, stop and report it. |
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
 | A fingerprint is missing from, or differs from, `SECURITY.md` or GitHub, or its `SECURITY.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
-| `IMAGE_DIGEST does not name a telcoin-network image by digest` | The signed `IMAGE_DIGEST` points outside the release repository | Stop and report it. |
+| `IMAGE_DIGEST does not name an image in ghcr.io/telcoin-association/<package> by digest` | The signed `IMAGE_DIGEST` points outside the tag's package, for example at the other network's package | Stop and report it. |
 | `Commit SHA` differs from the tag's commit, `Build Features` is not empty on a mainnet tag, or on an `-adiri` tag lacks `adiri` or lists anything but `adiri` and `faucet` | The binary does not match the release | Stop and report it. |
 | `exec format error`, or Docker warns that the image platform does not match the host | The release is built for Linux x86_64 only | Use an x86_64 host, or build from source. |
 | `docker pull` fails with `denied` or `unauthorized` | The image is not publicly readable | Tell the maintainers. |
