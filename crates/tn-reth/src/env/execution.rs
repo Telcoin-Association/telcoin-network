@@ -496,6 +496,13 @@ impl RethEnv {
         let _returned = self.inner.persist_holds.hold_persist();
         #[cfg(any(feature = "test-utils", test))]
         self.consume_injected_persist_fault()?;
+        // test hook (off without tn-types/test-utils): `TN_TEST_PERSIST_DELAY_MS` holds every
+        // persist, so an e2e test of the pipelined engine has a persist long enough to overlap
+        // the next build. It is read here and not through `inject_persist_delay`, which exists
+        // only with this crate's own `test-utils` and so is missing from the e2e node binary.
+        if let Some(delay) = tn_types::test_hooks::persist_delay() {
+            std::thread::sleep(delay);
+        }
 
         debug!(
             target: "engine",
