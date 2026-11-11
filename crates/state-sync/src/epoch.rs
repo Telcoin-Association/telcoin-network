@@ -389,20 +389,23 @@ pub async fn spawn_epoch_record_collector(
         // is cheap for nodes that are fully caught up.
         let mut last_epoch: Epoch = 0;
         loop {
-            let requested_epoch = *epoch_rx.borrow_and_update();
-            if requested_epoch >= last_epoch {
-                // An unanswered pass needs no special handling here: the retry timer below asks
-                // again.
-                last_epoch = collect_epoch_records(
-                    last_epoch,
-                    &consensus_chain,
-                    &primary_handle,
-                    &consensus_bus,
-                )
-                .await
-                .map_err(|e| TaskError::from_message(format!("{e:#}")))?
-                .epoch;
-            }
+            // Every wake-up runs a pass, whether the requested epoch moved or the retry timer
+            // fired. The pass starts at the last certified epoch, so on a caught-up node it costs
+            // a few store reads and one peer request, and it republishes each certified record it
+            // walks over. That republish is the heal for a last-published watch pinned by f+1
+            // gossip signatures (issues #1771 and #1796), so it must not wait on a requested epoch
+            // that can sit below the cursor. An unanswered pass needs no special handling here:
+            // the retry timer below asks again. The borrow clears the change flag.
+            let _ = epoch_rx.borrow_and_update();
+            last_epoch = collect_epoch_records(
+                last_epoch,
+                &consensus_chain,
+                &primary_handle,
+                &consensus_bus,
+            )
+            .await
+            .map_err(|e| TaskError::from_message(format!("{e:#}")))?
+            .epoch;
             // Wait until the watch is updated or a retry timer fires.
             // The retry timer ensures that a failed collection attempt (e.g. peers not yet
             // connected at startup) is re-attempted automatically without requiring a new
