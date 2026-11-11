@@ -1,7 +1,7 @@
 //! The adapter's own tests: MDBX's error codes, the metrics, a blocked second writer, cursors
 //! sharing a write transaction (run on MDBX too, which is the oracle), the long-read tests of
-//! `reth-db`'s `implementation/mdbx/tx.rs` (tn-lmdb has no read timeout), and the long-reader
-//! warning that replaces it.
+//! `reth-db`'s `implementation/mdbx/tx.rs` (the read transaction timeout and its opt-out), and the
+//! long-reader warning.
 
 use super::{dup::error_name, mdbx_port::create_test_db, Form};
 use crate::{

@@ -551,9 +551,12 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   - no per-operation latency metrics (MDBX's `with_metrics`). The sampled gauges keep MDBX's
     names (`db.table_size` and the rest), so dashboards and the e2e `reth_db_table_size` check
     hold;
-  - the snapshot export's long read (`RethEnv::pin_state_view`) has no timeout to disable, and
-    the adapter's long-reader warning can fire, at most once a minute, during a long export: the
-    export holds back page reuse while it runs, so the file grows until it ends.
+  - a read transaction past `--db.read-transaction-timeout` (MDBX's five minutes by default) is
+    marked, not aborted: its later calls fail with `ReadTransactionTimeout` as on MDBX, and its
+    pages return to reuse when reth drops it. The snapshot export (`RethEnv::pin_state_view`) and
+    the migration opt out (`disable_long_read_transaction_safety`), as on MDBX, and the adapter's
+    long-reader warning can fire, at most once a minute, during a long export: the export holds
+    back page reuse while it runs, so the file grows until it ends.
 
 ### Migrating from MDBX
 

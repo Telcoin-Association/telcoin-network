@@ -652,9 +652,12 @@ fn copy_table<T: Table, TX: DbTx, D: Database>(src: &TX, dst: &D) -> eyre::Resul
 }
 
 /// Read every table of `db` back, through one read transaction, and check each against its copy
-/// in `copies` (in the order of `Tables::ALL`): the same rows, hashing the same.
+/// in `copies` (in the order of `Tables::ALL`): the same rows, hashing the same. The read takes
+/// as long as the copy, so, like the copy's read of the source, it opts out of the read
+/// transaction timeout.
 fn verify_tables<D: Database>(db: &D, copies: &[TableCopy]) -> eyre::Result<()> {
-    let tx = db.tx().wrap_err("failed to begin a read of the tn-lmdb database")?;
+    let mut tx = db.tx().wrap_err("failed to begin a read of the tn-lmdb database")?;
+    tx.disable_long_read_transaction_safety();
     for (table, copy) in Tables::ALL.iter().zip(copies) {
         table.view(&VerifyTable { tx: &tx, copy })?;
     }

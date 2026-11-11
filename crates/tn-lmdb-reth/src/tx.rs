@@ -248,11 +248,10 @@ impl DbTx for TnLmdbTx {
         Ok(stat.entries as usize)
     }
 
-    /// Does nothing: tn-lmdb has no read timeout to disable. A long read transaction only holds
-    /// back page reuse, so the file grows until it ends; a commit made while it has held a
-    /// superseded snapshot for over a minute logs a warning instead (at most once a minute).
     /// Takes the transaction out of the read transaction timeout, as on MDBX; one already timed
-    /// out stays so.
+    /// out stays so. A long read transaction holds back page reuse, so the file grows until it
+    /// ends; a commit made while it has held a superseded snapshot for over a minute logs a
+    /// warning (at most once a minute).
     fn disable_long_read_transaction_safety(&mut self) {
         if let Some(timeouts) = &self.timeouts {
             timeouts.opt_out(&self.reader);

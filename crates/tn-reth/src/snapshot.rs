@@ -10,14 +10,14 @@
 //!
 //! [`RethEnv::pin_state_view`] opens a single reth read-only database provider on the reth
 //! database ([`RethDbEnv`]) and calls `disable_long_read_transaction_safety()` on its transaction.
-//! On MDBX (the `mdbx` feature) this matters: MDBX enforces a reader timeout (~5 minutes) that
-//! kills long-lived read transactions to keep the free list from stalling, and a full-state export
-//! can easily run longer than that. Disabling the guard exempts *only this one transaction* — it
-//! does not touch any env-wide configuration, so other readers and the writer keep their normal
-//! safety limits. On tn-lmdb (the default build) the call does nothing: the engine has no reader
-//! timeout. A long export only holds back page reuse while it runs, and the adapter
-//! (`tn_lmdb_reth`) logs a long-reader warning, at most once a minute, while a reader has held a
-//! superseded snapshot for over a minute.
+//! Both backends enforce a read transaction timeout (`--db.read-transaction-timeout`, MDBX's five
+//! minutes by default) so that a forgotten reader cannot stall page reuse: MDBX aborts a reader
+//! past it, tn-lmdb marks it, and either way its later calls fail with `ReadTransactionTimeout`. A
+//! full-state export can easily run longer than that. Disabling the guard exempts *only this one
+//! transaction*: it does not touch any env-wide configuration, so other readers and the writer
+//! keep their normal safety limits. A long export holds back page reuse while it runs, and on
+//! tn-lmdb the adapter (`tn_lmdb_reth`) logs a long-reader warning, at most once a minute, while a
+//! reader has held a superseded snapshot for over a minute.
 //!
 //! The returned [`PinnedStateView`] owns the provider (whose transaction itself keeps the database
 //! environment alive) and is [`Send`], so an uploader can move it into a background task and stream
@@ -134,7 +134,7 @@ const SCAFFOLD_LOG_INTERVAL: u64 = 500_000;
 /// A read-consistent view of reth's EVM state pinned to the tip at open time.
 ///
 /// Wraps a single reth read-only database provider whose transaction has been exempted from the
-/// long-read-transaction reader-kill (see the module docs). The view reads only database-resident
+/// read transaction timeout (see the module docs). The view reads only database-resident
 /// tables: the plain state tables under storage v1, the history indices and hashed state tables
 /// under storage v2, and `Bytecodes`, `HeaderNumbers` and `BlockBodyIndices` in both. The provider
 /// is kept for its storage layout and its latest state reads; nothing the view reads lives in
@@ -471,13 +471,13 @@ impl std::fmt::Debug for PinnedStateView {
 impl RethEnv {
     /// Open a read-only database provider pinned to the current tip for snapshot export.
     ///
-    /// Its transaction is exempted from the long-read-transaction reader-kill (see the module docs)
-    /// so a full-state export can run without racing MDBX's reader timeout (tn-lmdb has none). The
-    /// returned [`PinnedStateView`] is `Send` and self-contained, ready to be handed to a
-    /// background task.
+    /// Its transaction is exempted from the read transaction timeout (see the module docs) so a
+    /// full-state export can run past it, on either backend. The returned [`PinnedStateView`] is
+    /// `Send` and self-contained, ready to be handed to a background task.
     pub fn pin_state_view(&self) -> TnRethResult<PinnedStateView> {
-        // one RO transaction, exempted from the reader-kill. The view keeps the provider around it
-        // for the storage layout and the latest state reads; every table it reads lives in the db
+        // one RO transaction, exempted from the read transaction timeout. The view keeps the
+        // provider around it for the storage layout and the latest state reads; every table it
+        // reads lives in the db
         let provider = self
             .blockchain_provider()
             .database_provider_ro()?
