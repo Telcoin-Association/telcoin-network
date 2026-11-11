@@ -492,51 +492,70 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(
-                    Some(consensus_shutdown.clone()),
-                    &reth_env,
-                    &gas_accumulator,
-                    target_hash,
-                )
-                .await?;
+                // read before the close borrows `self`
+                let task_drain = self.builder.tn_config.parameters.epoch_close_task_drain;
+                // The close, the record and the export, as one future. With `task_drain` the
+                // epoch's task manager keeps tracking and reaping tasks while it runs (the
+                // closing epoch's network loops spawn one per message until the abort below);
+                // `track_while` never drops it half way, so the record is never left saved but
+                // not persisted.
+                let boundary = async {
+                    self.close_epoch(
+                        Some(consensus_shutdown.clone()),
+                        &reth_env,
+                        &gas_accumulator,
+                        target_hash,
+                    )
+                    .await?;
 
-                // Deactivate removed workers before writing records or exporting execution state.
-                // Admission is already closed by the accumulator resize inside close_epoch.
-                engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
+                    // Deactivate removed workers before writing records or exporting execution
+                    // state. Admission is already closed by the accumulator resize inside
+                    // close_epoch.
+                    engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
 
-                // e2e fault injection, always false without `tn-types/test-utils`: the closing
-                // block is executed and canonical, the record and the tables clear are not done
-                if tn_types::test_hooks::exit_before_epoch_record(current_epoch) {
-                    warn!(
-                        target: "epoch-manager",
-                        epoch = current_epoch,
-                        "test hook: exiting before the epoch record is written",
-                    );
-                    // stop where a SIGTERM inside this window stops: `run` sees the shutdown and
-                    // drops this future while it is parked, then runs the graceful exit path
-                    self.node_shutdown.notify();
-                    std::future::pending::<()>().await;
+                    // e2e fault injection, always false without `tn-types/test-utils`: the closing
+                    // block is executed and canonical, the record and the tables clear are not done
+                    if tn_types::test_hooks::exit_before_epoch_record(current_epoch) {
+                        warn!(
+                            target: "epoch-manager",
+                            epoch = current_epoch,
+                            "test hook: exiting before the epoch record is written",
+                        );
+                        // stop where a SIGTERM inside this window stops: `run` sees the shutdown
+                        // and drops this future while it is parked, then runs the graceful exit
+                        // path
+                        self.node_shutdown.notify();
+                        std::future::pending::<()>().await;
+                    }
+
+                    // Write the epoch record to DB and save in manager for next epoch.
+                    self.write_epoch_record(current_epoch, engine).await?;
+
+                    // e2e fault injection, always false without `tn-types/test-utils`: the record
+                    // is durable, the state export and the epoch tables clear that follow it are
+                    // not done
+                    if tn_types::test_hooks::exit_after_epoch_record(current_epoch) {
+                        warn!(
+                            target: "epoch-manager",
+                            epoch = current_epoch,
+                            "test hook: exiting after the epoch record is written",
+                        );
+                        // same stop as the before-record hook: `run` sees the shutdown and drops
+                        // this future while it is parked
+                        self.node_shutdown.notify();
+                        std::future::pending::<()>().await;
+                    }
+
+                    // Export the epoch's final execution state (no-op unless
+                    // --enable-state-export).
+                    self.export_epoch_state(&primary, &reth_env).await?;
+                    eyre::Ok(())
+                };
+                if task_drain {
+                    epoch_task_manager.track_while(boundary).await?;
+                } else {
+                    boundary.await?;
                 }
-
-                // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(current_epoch, engine).await?;
-
-                // e2e fault injection, always false without `tn-types/test-utils`: the record is
-                // durable, the state export and the epoch tables clear that follow it are not done
-                if tn_types::test_hooks::exit_after_epoch_record(current_epoch) {
-                    warn!(
-                        target: "epoch-manager",
-                        epoch = current_epoch,
-                        "test hook: exiting after the epoch record is written",
-                    );
-                    // same stop as the before-record hook: `run` sees the shutdown and drops this
-                    // future while it is parked
-                    self.node_shutdown.notify();
-                    std::future::pending::<()>().await;
-                }
-
-                // Export the epoch's final execution state (no-op unless --enable-state-export).
-                self.export_epoch_state(&primary, &reth_env).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
@@ -564,10 +583,21 @@ where
         // If the select exitted because of a join() then do not join() again- we are already
         // shutting down.
         consensus_shutdown.notify();
+        // With the task drain on, take in the handles still queued on every exit arm (the select
+        // stopped draining when an arm won), so the grace and the abort below reach every task
+        // of the epoch rather than only those tracked so far.
+        let task_drain = self.builder.tn_config.parameters.epoch_close_task_drain;
+        if task_drain {
+            epoch_task_manager.update_tasks();
+        }
         // Give the epoch's tasks a short window to exit on their own first, so their graceful
         // exits run (the subscriber saves the outputs it already holds; `finish_epoch` seals the
         // certificate pack once they are gone). Then abort whatever is still running.
         epoch_task_manager.wait_for_exit(EPOCH_TASK_EXIT_GRACE).await;
+        if task_drain {
+            // tasks spawned during the grace
+            epoch_task_manager.update_tasks();
+        }
         epoch_task_manager.abort_all_tasks();
         // Expect complaints from join so swallow those errors...
         // If we timeout here something is not playing nice and shutting down so return the
@@ -577,6 +607,13 @@ where
             epoch_task_manager.wait_for_task_shutdown(),
         )
         .await?;
+        if task_drain {
+            // the network loops that spawn per-message tasks run on other threads, so a handle
+            // can land between the update and the abort above; those loops were aborted there
+            // and joined by the wait, so this last sweep aborts what they queued before stopping
+            epoch_task_manager.update_tasks();
+            epoch_task_manager.abort_all_tasks();
+        }
         self.finish_epoch(
             engine,
             &reth_env,
