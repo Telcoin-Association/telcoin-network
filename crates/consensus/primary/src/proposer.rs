@@ -171,6 +171,10 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// The `parent_grace` switch's state: who the last own header built on, and the grace armed
     /// for the round being collected, if any. Epoch-scoped with the proposer.
     parent_grace: ParentGrace,
+    /// The `digest_dedupe` switch's index of the batch digests this proposer already holds, so a
+    /// digest reported again is dropped instead of riding a second header (issue #1807). `None`
+    /// while the switch is off. Epoch-scoped with the proposer.
+    digest_dedupe: Option<DigestDedupe>,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -287,6 +291,11 @@ impl<DB: Database> Proposer<DB> {
             config.parameters().max_header_delay,
             consensus_bus.app().metrics().parent_grace_wait_seconds.clone(),
         );
+        let digest_dedupe = config.parameters().digest_dedupe.then(|| {
+            DigestDedupe::new(
+                consensus_bus.app().metrics().duplicate_digest_suppressed_total.clone(),
+            )
+        });
 
         Self {
             authority_id,
@@ -319,6 +328,7 @@ impl<DB: Database> Proposer<DB> {
                 config.parameters().quorum_exec_block_starved_rounds,
             ),
             parent_grace,
+            digest_dedupe,
         }
     }
 
@@ -984,6 +994,12 @@ impl<DB: Database> Proposer<DB> {
         );
         self.digests_requeued.counter(cause).increment(u64::try_from(count).unwrap_or(u64::MAX));
 
+        // a re-queue moves digests out of a header that is no longer tracked, so they enter the
+        // pending index without a duplicate check
+        if let Some(dedupe) = self.digest_dedupe.as_mut() {
+            requeued.values().flatten().for_each(|requeued| dedupe.queued(requeued.digest));
+        }
+
         // prepend the re-queued digests to each worker's pending queue and update `self`
         std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
             requeued.entry(worker_id).or_default().append(&mut pending);
@@ -1029,10 +1045,53 @@ impl<DB: Database> Proposer<DB> {
             .take(self.max_header_num_of_batches)
             .collect();
         self.next_lane = order.last().map_or(self.next_lane, |last| last.wrapping_add(1));
-        order
+        let drained: VecDeque<ProposerDigest> = order
             .into_iter()
             .filter_map(|worker_id| self.digests.get_mut(&worker_id).and_then(VecDeque::pop_front))
-            .collect()
+            .collect();
+        if let Some(dedupe) = self.digest_dedupe.as_mut() {
+            dedupe.drained(drained.iter().map(|drained| drained.digest));
+        }
+        drained
+    }
+
+    /// Queue `digest`, just reported by its worker, for a future header.
+    ///
+    /// With `digest_dedupe` off the digest is always queued, as before the switch existed. With it
+    /// on, a digest this proposer already holds is dropped instead: one pending in any worker's
+    /// lane, or one in the payload of the own header being built or of an own header still tracked
+    /// in [`Self::proposed_headers`] (proposed, and neither committed nor re-queued yet). Each drop
+    /// is counted in `tn_primary_duplicate_digest_suppressed_total` and logged once at debug.
+    ///
+    /// Not deduplicated, on purpose:
+    /// - a digest whose own header was committed: the commit removed that header from the tracked
+    ///   headers, so a later report queues it again. Its transactions may already have executed;
+    ///   the worker's own check (the worker half of this switch) and execution's nonce checks
+    ///   handle that copy, and it can be the copy that lands transactions the first one skipped.
+    /// - the digests of an own header that was cancelled or fell behind a commit: both re-queue
+    ///   paths remove the header from the tracked headers before they prepend its digests, so the
+    ///   digests move to the pending lanes instead of being copied.
+    /// - a digest reported before a re-send of the stored header that carries it (after a restart,
+    ///   or by the max-delay tick): that header enters the tracked headers again without passing
+    ///   through here.
+    ///
+    /// The caller acks the report before this runs, whatever happens to the digest.
+    fn queue_digest(&mut self, digest: ProposerDigest) {
+        if let Some(dedupe) = self.digest_dedupe.as_mut() {
+            if let Some(held) = dedupe.held(&digest.digest, &self.proposed_headers) {
+                dedupe.suppressed.increment(1);
+                debug!(
+                    target: "primary::proposer",
+                    digest = %digest.digest,
+                    worker_id = digest.worker_id,
+                    "where" = held.as_str(),
+                    "batch digest already queued"
+                );
+                return;
+            }
+            dedupe.queued(digest.digest);
+        }
+        self.digests.entry(digest.worker_id).or_default().push_back(digest);
     }
 
     /// Conditions are met to propose the next header.
@@ -1185,6 +1244,10 @@ impl<DB: Database> Proposer<DB> {
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
+        // the digests drained for this header are now found in its tracked payload
+        if let Some(dedupe) = self.digest_dedupe.as_mut() {
+            dedupe.landed();
+        }
 
         Ok(())
     }
@@ -1285,6 +1348,9 @@ impl<DB: Database> Proposer<DB> {
                 // committed/sequenced in the DAG or the epoch concludes
                 //
                 // NOTE: this will not persist primary restarts
+                //
+                // with `digest_dedupe` on, a digest the proposer already holds is acked and
+                // dropped: the copy it holds is the one that rides a header
                 Some(msg) = rx_our_digests.recv() =>
                 {
                     debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "received digest");
@@ -1292,7 +1358,7 @@ impl<DB: Database> Proposer<DB> {
                     // parse message into parts
                     let (ack, digest) = msg.process();
                     let _ = ack.send(());
-                    self.digests.entry(digest.worker_id).or_default().push_back(digest);
+                    self.queue_digest(digest);
                 }
                 // check for new parent certificates
                 // synchronizer sends collection of certificates when there is quorum (2f+1)
@@ -2163,6 +2229,109 @@ impl ParentGrace {
         let present: BTreeSet<&AuthorityIdentifier> =
             parents.iter().map(Certificate::origin).collect();
         basis.authors.iter().filter(|author| !present.contains(author)).cloned().collect()
+    }
+}
+
+/// Where the proposer already holds a batch digest its worker reported again: the `where` field of
+/// the `batch digest already queued` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DigestHeld {
+    /// In a worker's pending lane, waiting for a header.
+    Pending,
+    /// In the payload of the own header being built, or of an own header that is proposed and
+    /// neither committed nor re-queued yet.
+    Proposed,
+}
+
+impl DigestHeld {
+    /// The static `where` value for this place.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Proposed => "proposed",
+        }
+    }
+}
+
+/// The `digest_dedupe` switch's index of the batch digests a proposer already holds (issue #1807).
+///
+/// A report is checked against three places, cheapest first:
+/// - the pending lanes, through [`Self::pending`], a count per digest kept in step with the lanes:
+///   one `BTreeMap` lookup, O(log n) in the n pending digests (about a dozen 32-byte comparisons at
+///   4,096);
+/// - the header being built, through [`Self::in_flight`]: a scan of at most
+///   `max_header_num_of_batches` digests;
+/// - each own header in `Proposer::proposed_headers`: one hash lookup in the header's payload
+///   `IndexMap`, so linear in the own headers that are proposed and neither committed nor
+///   re-queued. That is a few rounds' worth while own headers commit, and at most the epoch's
+///   rounds when they do not (a header that is certified but never in a leader's history stays
+///   tracked until the epoch ends).
+///
+/// It keeps nothing the proposer does not already hold: one entry per pending digest and the
+/// payload of at most one header in flight, each released when the digest leaves the lanes or the
+/// header's result returns. It is only ever looked up, so no iteration order reaches a header.
+struct DigestDedupe {
+    /// How many copies of each digest sit in the pending lanes. A count rather than a set keeps
+    /// the index exact even if a lane holds a digest twice, which only a re-send of the stored
+    /// header (after a restart, or by the max-delay tick) followed by its re-queue can cause.
+    pending: BTreeMap<BlockHash, usize>,
+    /// The digests drained into the header being built: out of the lanes, and not yet in
+    /// `proposed_headers` until the proposal's result returns.
+    in_flight: Vec<BlockHash>,
+    /// `tn_primary_duplicate_digest_suppressed_total`.
+    suppressed: Counter,
+}
+
+impl DigestDedupe {
+    /// An empty index for a new epoch's proposer, counting drops in `suppressed`.
+    fn new(suppressed: Counter) -> Self {
+        Self { pending: BTreeMap::new(), in_flight: Vec::new(), suppressed }
+    }
+
+    /// Where `digest` is already held, or `None` when the report is to be queued.
+    fn held(
+        &self,
+        digest: &BlockHash,
+        proposed_headers: &BTreeMap<Round, Header>,
+    ) -> Option<DigestHeld> {
+        if self.pending.contains_key(digest) {
+            return Some(DigestHeld::Pending);
+        }
+        let proposed = self.in_flight.contains(digest)
+            || proposed_headers.values().any(|header| header.payload().contains_key(digest));
+        proposed.then_some(DigestHeld::Proposed)
+    }
+
+    /// Note that `digest` entered a pending lane, from a report or a re-queue.
+    fn queued(&mut self, digest: BlockHash) {
+        *self.pending.entry(digest).or_default() += 1;
+    }
+
+    /// Note that `digests` left the pending lanes for the header being built.
+    fn drained(&mut self, digests: impl Iterator<Item = BlockHash>) {
+        self.in_flight.clear();
+        for digest in digests {
+            match self.pending.get_mut(&digest) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.pending.remove(&digest);
+                }
+                // every digest enters a lane through `queued`, so a miss here means the index
+                // drifted from the lanes
+                None => warn!(
+                    target: "primary::proposer",
+                    %digest,
+                    "drained batch digest missing from the dedupe index"
+                ),
+            }
+            self.in_flight.push(digest);
+        }
+    }
+
+    /// Note that the header being built is now tracked in `proposed_headers`, where its payload
+    /// answers for its digests.
+    fn landed(&mut self) {
+        self.in_flight.clear();
     }
 }
 

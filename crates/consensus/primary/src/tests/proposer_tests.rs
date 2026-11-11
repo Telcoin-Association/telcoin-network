@@ -3061,3 +3061,305 @@ async fn test_parent_grace_none_at_epoch_start_or_after_a_skipped_round() {
         GraceMetrics { outcomes: [0, 0, 1], late: [0, 1], waits_ms: vec![10] }
     );
 }
+
+// ---- bench6 digest-dedupe ----
+
+/// How long a digest-dedupe test lets the proposer settle after a header before it reports a digest
+/// or sends parents: on the paused clock this sleep ends only once the proposer is idle, so the
+/// header's result has been handled and the header is tracked.
+const DEDUPE_SETTLE: Duration = Duration::from_millis(1);
+
+/// A fixture of four authorities with the `digest_dedupe` switch set to `on`.
+fn dedupe_fixture(on: bool) -> CommitteeFixture<MemDatabase> {
+    let params = tn_config::Parameters { digest_dedupe: on, ..tn_config::Parameters::default() };
+    CommitteeFixture::builder(MemDatabase::default).with_consensus_parameters(params).build()
+}
+
+/// `tn_primary_duplicate_digest_suppressed_total` in `snapshotter`, `None` while unregistered.
+///
+/// A snapshot resets the debugging recorder's counters, so this is the count since the last one.
+fn suppressed_total(snapshotter: &metrics_util::debugging::Snapshotter) -> Option<u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(key, ..)| key.key().name() == "tn_primary.duplicate_digest_suppressed_total")
+        .and_then(|(.., value)| match value {
+            metrics_util::debugging::DebugValue::Counter(total) => Some(total),
+            _ => None,
+        })
+}
+
+/// The digests pending across `proposer`'s worker lanes, lane by lane.
+fn pending_digests(proposer: &Proposer<MemDatabase>) -> Vec<BlockHash> {
+    proposer.digests.values().flatten().map(|digest| digest.digest).collect()
+}
+
+/// I-2 S5 cases 1 and 2, switch on, through the run loop: a digest reported twice before the next
+/// header is acked twice, queued once and rides one header; reported again while that header is
+/// proposed and not certified, it is acked and dropped, and the next header does not carry it.
+/// Each drop counts once in `tn_primary_duplicate_digest_suppressed_total` and logs one
+/// `batch digest already queued` line naming the digest, its worker and where the proposer holds
+/// it.
+///
+/// Catches: a duplicate queued behind the first copy, a dropped report left without its ack (the
+/// worker's report would hang), a proposed header's payload missed by the check, and a drop that is
+/// not counted or not logged with its fields.
+#[tokio::test(start_paused = true)]
+async fn test_digest_dedupe_reported_twice_rides_one_header() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("primary::proposer");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = dedupe_fixture(true);
+    let epoch = fixture.committee().epoch();
+    let all = fixture.authorities().count();
+    let task_manager = TaskManager::default();
+    let (cb, mut rx_headers, _) =
+        spawn_with_first_header(&fixture, &task_manager, &recorder, &[]).await;
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+
+    // reported twice before the next header: both acked (`send_digest` waits for the ack)
+    let digest = B256::random();
+    send_digest(&cb, digest).await;
+    send_digest(&cb, digest).await;
+    cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
+    let carrying = next_header_at(&mut rx_headers, 2).await;
+    assert_eq!(payload_digests(&carrying), [digest], "one copy rides the header");
+    assert_eq!(suppressed_total(&snapshotter), Some(1));
+
+    // reported again while the header carrying it is proposed and not certified
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+    send_digest(&cb, digest).await;
+    cb.parents().send((parents_at(&fixture, 2, epoch, all), 2)).await.expect("parents sent");
+    let next = next_header_at(&mut rx_headers, 3).await;
+    assert!(payload_digests(&next).is_empty(), "the proposed copy is the only one");
+    assert_eq!(suppressed_total(&snapshotter), Some(1), "one more since the last snapshot");
+
+    let lines = capture.events("batch digest already queued");
+    assert_eq!(lines.len(), 2, "one line per dropped report");
+    for (line, held) in lines.iter().zip(["pending", "proposed"]) {
+        assert_eq!(line.field("where"), Some(held));
+        assert_eq!(line.field("digest"), Some(digest.to_string().as_str()));
+        assert_eq!(line.u64_field("worker_id"), Some(0));
+    }
+}
+
+/// I-2 S5 cases 2 and 3, switch on, on the proposer's state: a digest drained into the header being
+/// built is held from the drain until its result returns, and then through the header's payload
+/// while the header is tracked. Once its own header commits, the proposer holds it nowhere and a
+/// later report queues it again: that copy is left to the worker and to execution.
+///
+/// Catches: the window between the drain and the proposal's result (the header is in neither the
+/// lanes nor the tracked headers), and a committed digest blocked forever, which would strand a
+/// re-sealed batch whose transactions the committed copy skipped.
+#[tokio::test]
+async fn test_digest_dedupe_holds_a_proposed_digest_until_its_header_commits() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("primary::proposer");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = dedupe_fixture(true);
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = metrics::with_local_recorder(&recorder, || {
+        proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager)
+    });
+
+    let digest = B256::random();
+    proposer.queue_digest(queued(digest, 0));
+    let in_flight =
+        proposer.propose_next_header(ProposeReason::MinDelay).expect("proposal spawned");
+    proposer.queue_digest(queued(digest, 0));
+    assert!(pending_digests(&proposer).is_empty(), "the copy in flight is the only one");
+
+    let result = in_flight.await.expect("proposal task reported");
+    proposer.handle_proposal_result(result).expect("header proposed");
+    let round = proposer.round;
+    assert!(proposer.proposed_headers[&round].payload().contains_key(&digest));
+    proposer.queue_digest(queued(digest, 0));
+    assert!(pending_digests(&proposer).is_empty(), "the proposed copy is the only one");
+
+    // its own header commits: the proposer no longer holds the digest
+    proposer.process_committed_headers(round, vec![round]);
+    proposer.queue_digest(queued(digest, 0));
+    assert_eq!(pending_digests(&proposer), [digest], "a committed digest is queued again");
+
+    let lines = capture.events("batch digest already queued");
+    let held: Vec<_> = lines.iter().map(|line| line.field("where")).collect();
+    assert_eq!(held, [Some("proposed"), Some("proposed")]);
+    assert_eq!(suppressed_total(&snapshotter), Some(2));
+}
+
+/// I-2 S5 case 4, switch on, through the run loop: the certifier's cancel re-queues the cancelled
+/// header's digests without a duplicate check, and they ride the next header ahead of newer ones.
+/// Once re-queued they are pending again, so a fresh report of one of them is the duplicate.
+///
+/// Catches: a re-queue treated as a duplicate (the cancelled header's batches would never be
+/// proposed again), and re-queued digests missing from the pending index (a fresh report would
+/// put them in the next header twice).
+#[tokio::test(start_paused = true)]
+async fn test_digest_dedupe_requeue_of_a_canceled_header_is_not_a_duplicate() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("primary::proposer");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = dedupe_fixture(true);
+    let epoch = fixture.committee().epoch();
+    let all = fixture.authorities().count();
+    let task_manager = TaskManager::default();
+    let (d1, d2, d3, d4) = (B256::random(), B256::random(), B256::random(), B256::random());
+    let (cb, mut rx_headers, _) =
+        spawn_with_first_header(&fixture, &task_manager, &recorder, &[]).await;
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+
+    send_digest(&cb, d1).await;
+    send_digest(&cb, d2).await;
+    cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
+    let canceled = next_header_at(&mut rx_headers, 2).await;
+    assert_eq!(payload_digests(&canceled), [d1, d2]);
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+
+    // round 3 cancels round 2's vote collection in the certifier
+    send_digest(&cb, d3).await;
+    cb.parents().send((parents_at(&fixture, 2, epoch, all), 2)).await.expect("parents sent");
+    let newer = next_header_at(&mut rx_headers, 3).await;
+    assert_eq!(payload_digests(&newer), [d3]);
+    cb.uncertified_own_headers()
+        .try_send((canceled.round(), canceled.digest()))
+        .expect("report queued");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while requeued_totals(&snapshotter)[0] != Some(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the proposer re-queues the cancelled header's digests");
+
+    // d1 is pending again after the re-queue, so this report of it is the duplicate
+    send_digest(&cb, d1).await;
+    send_digest(&cb, d4).await;
+    cb.parents().send((parents_at(&fixture, 3, epoch, all), 3)).await.expect("parents sent");
+    let next = next_header_at(&mut rx_headers, 4).await;
+    assert_eq!(payload_digests(&next), [d1, d2, d4], "re-queued digests ride ahead of newer ones");
+
+    let lines = capture.events("batch digest already queued");
+    assert_eq!(lines.len(), 1, "only the fresh report of a re-queued digest is dropped");
+    assert_eq!(lines[0].field("where"), Some("pending"));
+    assert_eq!(lines[0].field("digest"), Some(d1.to_string().as_str()));
+    assert_eq!(suppressed_total(&snapshotter), Some(1));
+}
+
+/// Switch off pins today's behaviour through the run loop: every report is acked and queued. A
+/// digest reported twice is queued twice (the header's line counts both, and its payload map holds
+/// one), and a digest reported again while its header is proposed rides the next header as well,
+/// the duplicate carriage bench 5 measured. Nothing is counted as suppressed.
+///
+/// Catches: a default that turns the dedupe on, and any change to the queue or to a header's
+/// payload while the switch is off.
+#[tokio::test(start_paused = true)]
+async fn test_digest_dedupe_off_queues_every_report() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = dedupe_fixture(false);
+    assert!(!tn_config::Parameters::default().digest_dedupe, "the switch defaults to off");
+    let epoch = fixture.committee().epoch();
+    let all = fixture.authorities().count();
+    let task_manager = TaskManager::default();
+    let (cb, mut rx_headers, _) =
+        spawn_with_first_header(&fixture, &task_manager, &recorder, &[]).await;
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+
+    let digest = B256::random();
+    send_digest(&cb, digest).await;
+    send_digest(&cb, digest).await;
+    cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
+    let carrying = next_header_at(&mut rx_headers, 2).await;
+    assert_eq!(payload_digests(&carrying), [digest]);
+    let line = proposed_line(&capture, 2);
+    assert_eq!(line.u64_field("pending_before"), Some(2), "both reports were queued");
+    assert_eq!(line.u64_field("num_batches"), Some(2), "both copies were drained");
+
+    tokio::time::sleep(DEDUPE_SETTLE).await;
+    send_digest(&cb, digest).await;
+    cb.parents().send((parents_at(&fixture, 2, epoch, all), 2)).await.expect("parents sent");
+    let next = next_header_at(&mut rx_headers, 3).await;
+    assert_eq!(payload_digests(&next), [digest], "the digest rides a second header");
+    assert_eq!(suppressed_total(&snapshotter), Some(0));
+}
+
+/// The pending index of the `digest_dedupe` switch counts exactly the digests in the worker lanes,
+/// copy for copy, after every move: reports on two workers, a drain that a small header cap cuts
+/// short across both lanes, the commit path's re-queue of headers that fell behind an own commit,
+/// and a digest that sits in a lane twice (a pending digest whose stored header is re-sent and then
+/// re-queued) drained to the end.
+///
+/// Catches: a lane change that bypasses the index. A stale entry would drop every later report of
+/// that digest, so its batch would never ride a header; a missing entry would let a duplicate in.
+#[tokio::test]
+async fn test_digest_dedupe_pending_index_follows_the_lanes() {
+    let fixture = dedupe_fixture(true);
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let author = primary.id();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
+    proposer.max_header_num_of_batches = 3;
+    proposer.round = 5;
+    let index_matches = |proposer: &Proposer<MemDatabase>, step: &str| {
+        let mut lanes: BTreeMap<BlockHash, usize> = BTreeMap::new();
+        for digest in proposer.digests.values().flatten() {
+            *lanes.entry(digest.digest).or_default() += 1;
+        }
+        let dedupe = proposer.digest_dedupe.as_ref().expect("switch on");
+        assert_eq!(dedupe.pending, lanes, "{step}");
+    };
+
+    let (a0, a1, a2) = (B256::random(), B256::random(), B256::random());
+    let (b0, b1) = (B256::random(), B256::random());
+    for (digest, worker_id) in [(a0, 0), (a1, 0), (a2, 0), (b0, 1), (b1, 1)] {
+        proposer.queue_digest(queued(digest, worker_id));
+    }
+    index_matches(&proposer, "reports on two workers");
+
+    // three slots: a0 and b0, then a1; a2 and b1 stay pending
+    let first: Vec<_> = proposer.drain_digests_for_header().iter().map(|d| d.digest).collect();
+    assert_eq!(first, [a0, b0, a1]);
+    index_matches(&proposer, "a drain cut short by the cap");
+    assert_eq!(proposer.digest_dedupe.as_ref().expect("switch on").in_flight, first);
+    proposer.handle_proposal_result(Ok(build_test_header(&author, 3, &first))).expect("tracked");
+    assert!(proposer.digest_dedupe.as_ref().expect("switch on").in_flight.is_empty());
+
+    // a re-send of a stored header that carries the pending a2 tracks it a second time
+    proposer.handle_proposal_result(Ok(build_test_header(&author, 4, &[a2]))).expect("tracked");
+    // round 5 commits: rounds 3 and 4 fell behind it and go back to the front of the lanes
+    proposer.process_committed_headers(5, vec![5]);
+    index_matches(&proposer, "the commit path's re-queue");
+    assert_eq!(proposer.digest_dedupe.as_ref().expect("switch on").pending.get(&a2), Some(&2));
+
+    // each header takes what the cap allows; the index releases a2 only with its second copy
+    while proposer.pending_digests_len() > 0 {
+        proposer.drain_digests_for_header();
+        index_matches(&proposer, "a later drain");
+    }
+    assert!(proposer.digest_dedupe.as_ref().expect("switch on").pending.is_empty());
+}

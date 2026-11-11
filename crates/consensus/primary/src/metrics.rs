@@ -157,6 +157,12 @@ pub struct PrimaryMetrics {
     /// armed grace records a sample; the `outcome` of each is counted in
     /// `tn_primary_parent_grace_total`.
     pub(crate) parent_grace_wait_seconds: Histogram,
+    // bench6 digest-dedupe
+    /// Batch digests the proposer dropped because it already held them (the `digest_dedupe`
+    /// switch, issue #1807): pending for the next header, or in the payload of an own header that
+    /// is being built or is proposed and not yet committed. The worker still gets its ack for
+    /// each. Zero while the switch is off.
+    pub(crate) duplicate_digest_suppressed_total: Counter,
 }
 
 impl PrimaryMetrics {
