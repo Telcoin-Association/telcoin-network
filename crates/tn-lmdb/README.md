@@ -1325,9 +1325,10 @@ checks as `Cursor`'s.
    advice queues the reads and returns; the walk's faults then find the pages read or in flight,
    and the device reads a branch's children together
    (`a_weak_head_check_reads_ahead_what_it_descends_into`). On a cloud VM's disk (GCP
-   Hyperdisk, ext4, Linux 7.0) the check after a crash took 3.1 s for 61 MiB of pages and 21.7 s
-   for 463 MiB, about 5,000 pages a second, the disk's read IOPS, where one fault at a time took
-   86.8 s for the 61 MiB; the steady open of the same files keeps its cache and took 3 ms
+   Hyperdisk, ext4, Linux 7.0) the check after a crash took 1.3 to 3.1 s for 61 MiB of pages and
+   8.6 to 21.7 s for 463 MiB over two runs, 5,000 to 14,000 pages a second, bound by the disk's
+   reads, where one fault at a time took 86.8 s for the 61 MiB; the steady open of the same files
+   keeps its cache and took 3 ms
    (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`, `TMPDIR` on that disk). A
    read-only open's check advises the same (it reads, writes nothing); `Env::check` advises
    nothing.
