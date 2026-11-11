@@ -16,11 +16,12 @@ use tn_reth::{
     ProviderError, RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, ConsensusOutput,
-    EngineUpdate, Hash as _, Recovered, SealedHeader, TransactionSigned, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor,
+    ConsensusNumHash, ConsensusOutput, EngineUpdate, Hash as _, Recovered, Round, SealedHeader,
+    TransactionSigned, B256,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, field, info, info_span, trace, warn};
+use tracing::{debug, error, field, info, info_span, trace, warn, Span};
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -73,6 +74,11 @@ pub fn execute_consensus_output(
 /// later outputs' waits read about zero. A job that ended without a result falls back to inline
 /// recovery (see [`RecoveryHandle::wait`]), so the signers never fail the output. Must run on a
 /// blocking thread when `signers` is `Some`.
+///
+/// The strictly sequential path: [`build_output`] on a fresh [`OutputBuildScope`], then
+/// [`commit_output`], then on a persist failure the rollback of the output's in-memory advance
+/// to its pre-output tip, all on the calling thread, so nothing of the next output starts until
+/// this one is durable and announced.
 pub(crate) fn execute_consensus_output_with_signers(
     args: BuildArguments,
     signers: Option<RecoveryHandle>,
@@ -80,21 +86,59 @@ pub(crate) fn execute_consensus_output_with_signers(
     repack_monitor: RepackMonitor,
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 ) -> EngineResult<SealedHeader> {
+    let reth_env = args.reth_env.clone();
+    let built =
+        build_output(args, signers, gas_accumulator, repack_monitor, OutputBuildScope::new())?;
+    match commit_output(&reth_env, &built, &engine_update_tx) {
+        Ok(committed) => Ok(committed.tip),
+        Err(CommitFailure::Persist(e)) => {
+            // the database transaction never committed: compensate the output's speculative
+            // in-memory advance exactly as a failed block build does (see `build_output`)
+            let _guard = built.span.enter();
+            rollback_in_memory_output(
+                &reth_env.canonical_in_memory_state(),
+                &built.anchor,
+                &built.blocks,
+            );
+            Err(e)
+        }
+        // post-commit: the blocks are canonical for real and must not be rolled back
+        Err(CommitFailure::PostCommit(e)) => Err(e),
+    }
+}
+
+/// The build half of one consensus output: everything up to and including the output's
+/// evm/root/finish metrics, on the calling (blocking) thread.
+///
+/// Builds the output's blocks on `args.parent_header` with `scope` (a fresh
+/// [`OutputBuildScope::new`] when the parent is durable, or a seeded scope whose overlay holds
+/// the unpersisted ancestors' deltas), advancing reth's in-memory canonical chain per block. A
+/// failed block rolls the output's own blocks back to `args.parent_header` before the error
+/// returns. Reward accounting (`inc_leader_count`, `inc_block`) runs here, in build order, and
+/// is never rewound. An empty output that does not close the epoch builds nothing and sends NO
+/// engine update: [`commit_output`] sends it.
+pub(crate) fn build_output(
+    args: BuildArguments,
+    signers: Option<RecoveryHandle>,
+    gas_accumulator: GasAccumulator,
+    repack_monitor: RepackMonitor,
+    scope: OutputBuildScope,
+) -> EngineResult<BuiltOutput> {
     // observability only: start of the `execute_ms` span in the `output executed` line
     let execute_start = Instant::now();
     // rename canonical header for clarity
     let BuildArguments { reth_env, output, parent_header } = args;
     // Last canonical header executed.
     let mut canonical_header = parent_header;
-    // Reward accounting is advanced here, before this output is durably finalized at the end of
-    // this function, and is deliberately not rewound on any error path below. The ordering is safe
-    // by construction: any error returns from this function and halts the engine task in-process
-    // (the `?` on the execution result in `ExecutorEngine::run`), so no later output is ever
-    // processed and a premature increment can never be consumed. On restart the accumulator is
-    // rebuilt from the finalized tip by `catchup_accumulator`, whose replay boundary lines up with
-    // the executed tip, so an increment for a not-yet-finalized output is reconstructed from
-    // scratch rather than carried across the restart. Do not add a compensating decrement to the
-    // error paths below: it would double-subtract against that rebuild.
+    // Reward accounting is advanced here, before this output is durably finalized by
+    // `commit_output`, and is deliberately not rewound on any error path below or there. The
+    // ordering is safe by construction: any build or commit error returns to the engine and halts
+    // the engine task in-process (the `?` on the execution result in `ExecutorEngine::run`), so no
+    // later output is ever processed and a premature increment can never be consumed. On restart
+    // the accumulator is rebuilt from the finalized tip by `catchup_accumulator`, whose replay
+    // boundary lines up with the executed tip, so an increment for a not-yet-finalized output is
+    // reconstructed from scratch rather than carried across the restart. Do not add a compensating
+    // decrement to the error paths below: it would double-subtract against that rebuild.
     gas_accumulator.rewards_counter().inc_leader_count(output.leader().author());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
@@ -169,15 +213,15 @@ pub(crate) fn execute_consensus_output_with_signers(
     // If a later block fails, the earlier blocks' advance is rolled back to this header so no
     // phantom canonical head survives (see `rollback_in_memory_output`).
     let anchor_header = canonical_header.clone();
-    // ONE build scope for the whole output, anchored at the pre-output database tip: its trie
-    // overlay takes each built block's sorted deltas in place, so later blocks' state roots
-    // layer the accumulated deltas over the database instead of re-merging every unpersisted
-    // ancestor per block through reth's memory-overlay provider (#1301), and its read cache
-    // keeps the parent-state reads of earlier blocks, advanced past each block, so an account
-    // or slot read by several blocks of the output is loaded once. Dropped with this function:
-    // persistence uses the per-block deltas, never this accumulation, and every error path
-    // returns, discarding it together with the rolled-back in-memory advance.
-    let mut build_scope = OutputBuildScope::new();
+    // ONE build scope for the whole output, anchored at the database tip or at the snapshot the
+    // caller pinned: its trie overlay takes each built block's sorted deltas in place, so later
+    // blocks' state roots layer the accumulated deltas over the database instead of re-merging
+    // every unpersisted ancestor per block through reth's memory-overlay provider (#1301), and
+    // its read cache keeps the parent-state reads of earlier blocks, advanced past each block,
+    // so an account or slot read by several blocks of the output is loaded once. Dropped with
+    // this function: persistence uses the per-block deltas, never this accumulation, and every
+    // error path returns, discarding it together with the rolled-back in-memory advance.
+    let mut build_scope = scope;
 
     if batches.is_empty() {
         if !output.close_epoch() {
@@ -186,14 +230,22 @@ pub(crate) fn execute_consensus_output_with_signers(
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");
             crate::metrics::ENGINE_METRICS.empty_outputs_skipped_total.increment(1);
             span.record("executed_blocks", "0");
-            // Notify consensus that this round was processed (no block produced)
-            engine_update_tx.blocking_send((leader_round, consensus_num_hash, None)).map_err(
-                |e| {
-                    error!(target: "engine", ?e, "engine update channel send failed");
-                    TnEngineError::ChannelClosed
-                },
-            )?;
-            return Ok(canonical_header);
+            // consensus learns that this round was processed (no block produced) from
+            // `commit_output`, behind the commit of every output before this one
+            drop(_guard);
+            return Ok(BuiltOutput {
+                consensus_number: output.number(),
+                leader_round,
+                consensus_num_hash,
+                anchor: anchor_header,
+                tip: canonical_header,
+                blocks: executed_blocks,
+                txs: tx_count,
+                batches: batch_count,
+                timings,
+                execute: execute_start.elapsed(),
+                span,
+            });
         }
 
         // Execute single empty block to close the epoch.
@@ -382,26 +434,70 @@ pub(crate) fn execute_consensus_output_with_signers(
     } // end block execution for round
 
     span.record("executed_blocks", executed_blocks.len().to_string());
-    let execute_elapsed = execute_start.elapsed();
-    let block_count = executed_blocks.len();
+    let execute = execute_start.elapsed();
     // `tn_engine_recover_seconds` is recorded by the recovery itself (see `recover_signers`)
     crate::metrics::ENGINE_METRICS.evm_seconds.record(timings.evm);
     crate::metrics::ENGINE_METRICS.root_seconds.record(timings.root);
     crate::metrics::ENGINE_METRICS.finish_seconds.record(timings.finish);
 
+    drop(_guard);
+    Ok(BuiltOutput {
+        consensus_number: output.number(),
+        leader_round,
+        consensus_num_hash,
+        anchor: anchor_header,
+        tip: canonical_header,
+        blocks: executed_blocks,
+        txs: tx_count,
+        batches: batch_count,
+        timings,
+        execute,
+        span,
+    })
+}
+
+/// The commit half of one consensus output built by [`build_output`]: persist with retry,
+/// announce, finalize and the `output executed` line, on the calling (blocking) thread.
+///
+/// An output without blocks (the skipped empty output) only sends `(round, num_hash, None)` on
+/// `engine_update_tx`, so its update reaches consensus behind every earlier output's announce.
+/// This half never rolls anything back: on [`CommitFailure::Persist`] the database transaction
+/// did not commit and the caller must roll the output's in-memory advance back; on
+/// [`CommitFailure::PostCommit`] the blocks are durable and must stay. The reward accounting of
+/// the build stays in place on every path (see the note at the top of [`build_output`]).
+///
+/// Must run on a blocking thread: the persist retry sleeps and the engine update is a
+/// `blocking_send`.
+pub(crate) fn commit_output(
+    reth_env: &RethEnv,
+    built: &BuiltOutput,
+    engine_update_tx: &mpsc::Sender<EngineUpdate>,
+) -> Result<Committed, CommitFailure> {
+    let _guard = built.span.enter();
+    if built.blocks.is_empty() {
+        // Notify consensus that this round was processed (no block produced)
+        engine_update_tx
+            .blocking_send((built.leader_round, built.consensus_num_hash, None))
+            .map_err(|e| {
+                error!(target: "engine", ?e, "engine update channel send failed");
+                CommitFailure::PostCommit(TnEngineError::ChannelClosed)
+            })?;
+        return Ok(Committed { tip: built.tip.clone() });
+    }
+
     // Durably commit the output, then announce it. The two halves are called separately
     // (rather than through `finish_executing_output`) because their failure contracts
     // differ: a persist error leaves the database transaction uncommitted, so the
     // speculative in-memory advance must be compensated exactly as the in-loop error exits
-    // above do, and a node-local provider fault is worth a bounded retry first. An announce
-    // error is post-commit: the blocks are canonical for real and must NOT be rolled back. The
-    // reward accounting stays in place on every path; see the note at the top of this
-    // function.
+    // of the build do, and a node-local provider fault is worth a bounded retry first. An
+    // announce error is post-commit: the blocks are canonical for real and must NOT be rolled
+    // back. The reward accounting stays in place on every path; see the note at the top of
+    // `build_output`.
     let persist_start = Instant::now();
-    let persisted = persist_output_with_retry(&reth_env, &executed_blocks);
-    let persist_elapsed = persist_start.elapsed();
-    crate::metrics::ENGINE_METRICS.persist_duration_seconds.record(persist_elapsed);
-    persisted.inspect_err(|e| {
+    let persisted = persist_output_with_retry(reth_env, &built.blocks);
+    let persist = persist_start.elapsed();
+    crate::metrics::ENGINE_METRICS.persist_duration_seconds.record(persist);
+    persisted.map_err(|e| {
         error!(
             target: "engine",
             ?e,
@@ -409,43 +505,96 @@ pub(crate) fn execute_consensus_output_with_signers(
             "persisting executed consensus output failed - rolling back in-memory advance"
         );
         crate::metrics::ENGINE_METRICS.persist_failures_total.increment(1);
-        rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
+        CommitFailure::Persist(e.into())
     })?;
     let announce_start = Instant::now();
-    reth_env.announce_executed_output(
-        executed_blocks,
-        Some((leader_round, consensus_num_hash, engine_update_tx)),
-    )?;
+    // `announce_executed_output` consumes its blocks: every field of an `ExecutedBlock` is an
+    // `Arc`, so the clone shares the blocks the caller keeps for its own bookkeeping
+    reth_env
+        .announce_executed_output(
+            built.blocks.clone(),
+            Some((built.leader_round, built.consensus_num_hash, engine_update_tx.clone())),
+        )
+        .map_err(|e| CommitFailure::PostCommit(e.into()))?;
     // update the in-memory finalized/safe watches and prune persisted blocks from memory
     // (the database markers committed atomically with the blocks above)
-    reth_env.finalize_block(canonical_header.clone())?;
-    let announce_elapsed = announce_start.elapsed();
+    reth_env.finalize_block(built.tip.clone()).map_err(|e| CommitFailure::PostCommit(e.into()))?;
+    let announce = announce_start.elapsed();
 
     crate::metrics::ENGINE_METRICS
         .executed_transactions_total
-        .increment(u64::try_from(tx_count).unwrap_or(u64::MAX));
+        .increment(u64::try_from(built.txs).unwrap_or(u64::MAX));
+    let timings = &built.timings;
     debug!(
         target: "engine",
-        consensus_number = output.number(),
-        leader_round,
-        blocks = block_count,
-        batches = batch_count,
-        execute_ms = duration_ms(execute_elapsed),
-        persist_ms = duration_ms(persist_elapsed),
-        announce_ms = duration_ms(announce_elapsed),
-        txs = tx_count,
+        consensus_number = built.consensus_number,
+        leader_round = built.leader_round,
+        blocks = built.blocks.len(),
+        batches = built.batches,
+        execute_ms = duration_ms(built.execute),
+        persist_ms = duration_ms(persist),
+        announce_ms = duration_ms(announce),
+        txs = built.txs,
         recover_wait_ms = duration_ms(timings.recover_wait),
         evm_ms = duration_ms(timings.evm),
         root_ms = duration_ms(timings.root),
         finish_ms = duration_ms(timings.finish),
-        other_ms = duration_ms(execute_elapsed.saturating_sub(timings.laps())),
+        other_ms = duration_ms(built.execute.saturating_sub(timings.laps())),
         max_block_root_ms = duration_ms(timings.max_block_root),
         max_block_evm_ms = duration_ms(timings.max_block_evm),
         "output executed"
     );
 
-    // return new canonical header for next engine task
-    Ok(canonical_header)
+    Ok(Committed { tip: built.tip.clone() })
+}
+
+/// One consensus output, built and in memory, not yet committed.
+///
+/// Its blocks are on reth's in-memory canonical chain (advanced per block by the build) and in
+/// nobody's database until [`commit_output`] persists them.
+#[derive(Debug)]
+pub(crate) struct BuiltOutput {
+    /// The output's consensus number.
+    pub(crate) consensus_number: u64,
+    /// The round of the output's leader, reported with the engine update.
+    pub(crate) leader_round: Round,
+    /// The output's consensus number and header digest, reported with the engine update.
+    pub(crate) consensus_num_hash: ConsensusNumHash,
+    /// The pre-output tip: the parent of the output's first block.
+    pub(crate) anchor: SealedHeader,
+    /// The last block built, or `anchor` for an output without blocks.
+    pub(crate) tip: SealedHeader,
+    /// The blocks built, in order; empty for a skipped empty output.
+    pub(crate) blocks: Vec<ExecutedBlock>,
+    /// Transactions handed to the block builder across every batch of the output.
+    pub(crate) txs: usize,
+    /// The output's flattened batches.
+    pub(crate) batches: usize,
+    /// The block builds' laps, for the `output executed` line.
+    pub(crate) timings: OutputTimings,
+    /// Entry of the build to the end of its block loop: the line's `execute_ms`.
+    pub(crate) execute: Duration,
+    /// The output's `execute-consensus` span, entered again by the commit so the commit's lines
+    /// carry the output's context.
+    pub(crate) span: Span,
+}
+
+/// Why [`commit_output`] failed: before the database commit (the caller must roll the output's
+/// in-memory advance back) or after it (the blocks are durable and must stay).
+#[derive(Debug)]
+pub(crate) enum CommitFailure {
+    /// The persist failed after its retries; nothing of the output is durable.
+    Persist(TnEngineError),
+    /// The announce or the in-memory finalize failed after the commit (or the engine update of an
+    /// output without blocks could not be sent).
+    PostCommit(TnEngineError),
+}
+
+/// What [`commit_output`] did, for the caller's metrics.
+#[derive(Debug)]
+pub(crate) struct Committed {
+    /// The output's last block (its pre-output tip when it built none), now durable.
+    pub(crate) tip: SealedHeader,
 }
 
 /// The block builds' phase laps summed over one consensus output, plus the slowest block's
@@ -454,7 +603,7 @@ pub(crate) fn execute_consensus_output_with_signers(
 /// Observability only: it feeds the `output executed` line and the `tn_engine_*_seconds`
 /// split histograms, never block contents.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct OutputTimings {
+pub(crate) struct OutputTimings {
     /// Time the execution thread spent obtaining the output's recovered signers: blocked on the
     /// background recovery job, or recovering inline (the fallback, and callers without a job),
     /// plus any recovery lap inside the builds (zero: blocks build from recovered signers).
@@ -675,7 +824,7 @@ fn retryable_persist_fault(err: &ProviderError) -> bool {
 /// are canonical for real and must not be reverted; an `announce_executed_output` failure
 /// propagates WITHOUT compensation; the durable two-transaction commit/finalize window is a
 /// separate concern handled by `RethEnv::heal_finalized_to_persisted_tip`.
-fn rollback_in_memory_output(
+pub(crate) fn rollback_in_memory_output(
     canonical_in_memory_state: &CanonicalInMemoryState,
     anchor_header: &SealedHeader,
     advanced: &[ExecutedBlock],
