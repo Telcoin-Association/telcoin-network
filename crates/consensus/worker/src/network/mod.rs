@@ -10,9 +10,11 @@ pub use message::{WorkerRequest, WorkerResponse};
 use std::{collections::BTreeSet, future::Future, io::ErrorKind, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
-    read_frame, types::NetworkEvent, write_frame, DenyReason, GossipMessage, HoldBudget, HoldLease,
-    PeerSlot, PeerSlots, PeerTier, Penalty, ReservedPeers, ReservedPool, ResponseChannel,
-    ServiceClass, Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+    read_frame,
+    types::{GossipValidation, NetworkEvent},
+    write_frame, DenyReason, GossipMessage, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,
+    Penalty, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream, SyncFrame,
+    SyncFrameError, WorkerSyncRequest,
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
@@ -1166,7 +1168,12 @@ where
                 }
             },
             NetworkEvent::Gossip(gossip) => {
-                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
+                self.process_gossip(
+                    gossip.message,
+                    gossip.relayer,
+                    gossip.author,
+                    gossip.validation,
+                );
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -1278,11 +1285,14 @@ where
     }
 
     /// Process gossip from a worker.
+    ///
+    /// `validation` is the gossipsub verdict ticket for the message (#1772).
     fn process_gossip(
         &self,
         msg: GossipMessage,
         relayer: Option<BlsPublicKey>,
         author: Option<BlsPublicKey>,
+        mut validation: GossipValidation<Req, Res>,
     ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
@@ -1291,6 +1301,9 @@ where
             relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
         let task_name = format!("process-gossip-{relayer_label}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+            // The batch fetch can take longer than the about 12 s gossipsub validation window,
+            // so the worker accepts at delivery (#1772). Batch gossip forwards as before.
+            validation.accept().await;
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
                 // Charge the accountable peer, and only once its BLS identity has resolved: the

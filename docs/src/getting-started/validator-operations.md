@@ -79,7 +79,7 @@ BLS identity rotation affects committee registration and peer identity. Treat it
 ## Release and network update process
 
 Releases are published as signed git tags.
-Each release has a Linux x86_64 tarball on its GitHub release page and a `linux/amd64` image at `ghcr.io/telcoin-association/telcoin-network`.
+Each release has a Linux x86_64 tarball on its GitHub release page and a `linux/amd64` image in its network's package: `ghcr.io/telcoin-association/tn-mainnet` for mainnet releases, `ghcr.io/telcoin-association/tn-testnet` for Adiri releases.
 There is no automatic update: operators decide when to install a release.
 [Installing a release](installing-a-release.md) shows how to download and verify one, and [Release notes](release-notes.md) lists what changed in each.
 
