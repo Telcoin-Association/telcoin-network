@@ -425,8 +425,11 @@ pub struct Parameters {
     /// When above zero, the RPC submission guard answers "txpool is full" once execution trails
     /// the outputs forwarded to it by this many ([`tn_types::ExecutionBacklog::outputs_behind`]),
     /// and admits again once the backlog is below one less than this, or at zero when this is 1
-    /// ([`tn_types::AdmissionGate`]). Observer forwards and re-pooled transactions are not gated.
-    /// The default `0` keeps the previous behaviour: no bound.
+    /// ([`tn_types::AdmissionGate`]). Only an active validator's own RPC is gated: an observer's
+    /// submissions, the `--forward-txs` path and re-pooled transactions are not. The backlog
+    /// cannot exceed what the channel to the engine and the engine's queue hold (64 + 8 + the
+    /// output being executed), so a bound above that never closes the gate. The default `0`
+    /// keeps the previous behaviour: no bound.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rpc_admission_backlog_outputs: usize,
 
