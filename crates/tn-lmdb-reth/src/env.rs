@@ -3,6 +3,7 @@
 use crate::{
     dup::{dup_layout, DupLayout},
     error,
+    timeout::{ReaderState, ReaderTimeouts, DEFAULT_READ_TRANSACTION_TIMEOUT},
     tx::{TnLmdbTx, TnLmdbTxMut},
 };
 use metrics::Label;
@@ -155,6 +156,13 @@ pub struct TnLmdbArgs {
     /// commit that changes something writes over it, so a later open with `true` in the same boot
     /// can open at them again. Applies to read-only opens too.
     pub trust_unsynced: bool,
+    /// How long a read transaction may live (default [`DEFAULT_READ_TRANSACTION_TIMEOUT`], MDBX's
+    /// five minutes; `None`: for ever): past it, every call of the transaction and of its
+    /// cursors fails with MDBX's `ReadTransactionTimeout`, so that a reader held open by mistake
+    /// is dropped on the error and the pages freed since it began return to reuse (a timed-out
+    /// transaction holds them until it is dropped). `disable_long_read_transaction_safety` takes
+    /// a transaction out of it. Each environment with a timeout runs one thread for it.
+    pub read_transaction_timeout: Option<Duration>,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
     /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
@@ -185,6 +193,7 @@ impl Default for TnLmdbArgs {
             sync_period: engine.sync_period,
             sync_bytes: engine.sync_bytes,
             trust_unsynced: engine.trust_unsynced,
+            read_transaction_timeout: Some(DEFAULT_READ_TRANSACTION_TIMEOUT),
             #[cfg(test)]
             nested_dup: true,
             #[cfg(test)]
@@ -236,6 +245,13 @@ impl TnLmdbArgs {
     /// Set the largest growth step of the file, at least [`tn_lmdb::MIN_GROWTH`].
     pub const fn with_max_growth(mut self, max_growth: u64) -> Self {
         self.max_growth = max_growth;
+        self
+    }
+
+    /// Set how long a read transaction may live ([`Self::read_transaction_timeout`]); `None`
+    /// turns the timeout off.
+    pub const fn with_read_transaction_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.read_transaction_timeout = timeout;
         self
     }
 
@@ -471,6 +487,8 @@ pub struct TnLmdbEnv {
     tables: Arc<TableMap>,
     /// The long-reader warning, which each write transaction runs after its commit.
     watch: Arc<ReaderWatch>,
+    /// The read transaction timeout ([`TnLmdbArgs::read_transaction_timeout`]); `None` when off.
+    timeouts: Option<Arc<ReaderTimeouts>>,
 }
 
 impl TnLmdbEnv {
@@ -502,7 +520,13 @@ impl TnLmdbEnv {
         }
         let watch =
             ReaderWatch::new(env.clone(), LONG_READER_WARN_AFTER, LONG_READER_WARN_INTERVAL);
-        Ok(Self { env, tables: Arc::new(tables), watch: Arc::new(watch) })
+        let timeouts = args.read_transaction_timeout.map(ReaderTimeouts::start).transpose()?;
+        Ok(Self { env, tables: Arc::new(tables), watch: Arc::new(watch), timeouts })
+    }
+
+    /// The read transaction timeout this environment was opened with, if any.
+    pub fn read_transaction_timeout(&self) -> Option<Duration> {
+        self.timeouts.as_ref().map(|t| t.limit())
     }
 
     /// Test-only: warn about a reader older than `warn_after`, at most once per `interval`.
@@ -648,13 +672,26 @@ impl TnLmdbEnv {
     }
 }
 
+impl Drop for TnLmdbEnv {
+    /// Stops the timeout thread; a read transaction still open keeps its state.
+    fn drop(&mut self) {
+        if let Some(timeouts) = &self.timeouts {
+            timeouts.stop();
+        }
+    }
+}
+
 impl Database for TnLmdbEnv {
     type TX = TnLmdbTx;
     type TXMut = TnLmdbTxMut;
 
     fn tx(&self) -> Result<Self::TX, DatabaseError> {
         let txn = self.env.begin_ro().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
-        Ok(TnLmdbTx::new(txn, Arc::clone(&self.tables)))
+        let reader = match &self.timeouts {
+            Some(timeouts) => timeouts.begin(),
+            None => ReaderState::untimed(),
+        };
+        Ok(TnLmdbTx::new(txn, Arc::clone(&self.tables), reader, self.timeouts.clone()))
     }
 
     /// Waits while another write transaction is open, as MDBX does, holding no lock of this
@@ -670,7 +707,8 @@ impl DatabaseMetrics for TnLmdbEnv {
     /// reth's tables `db.table_size` (page size times its branch, leaf and overflow pages),
     /// `db.table_pages` (`type` = `leaf`, `branch`, `overflow`) and `db.table_entries`; then
     /// `db.freelist` (the pages the free list holds), `db.page_size`, and
-    /// `db.timed_out_not_aborted_transactions` (always 0: tn-lmdb times no transaction out).
+    /// `db.timed_out_not_aborted_transactions` (the read transactions past the timeout and still
+    /// open: tn-lmdb marks them instead of aborting them, `crate::timeout`).
     /// Then two of tn-lmdb's own: `db.oldest_reader_age_seconds`, how long the oldest read
     /// transaction has held a superseded snapshot (0 when none has: such a reader holds every
     /// page freed since back from reuse, so the file grows while it lives), and `db.latched`
@@ -686,7 +724,8 @@ impl DatabaseMetrics for TnLmdbEnv {
             Err(error) => tracing::error!(%error, "Failed to read db.freelist"),
         }
         metrics.push(("db.page_size", f64::from(self.page_size()), vec![]));
-        metrics.push(("db.timed_out_not_aborted_transactions", 0.0, vec![]));
+        let timed_out = self.timeouts.as_ref().map_or(0, |t| t.timed_out_open());
+        metrics.push(("db.timed_out_not_aborted_transactions", timed_out as f64, vec![]));
         let reader_age = self.env.oldest_reader_age().map_or(0.0, |age| age.as_secs_f64());
         metrics.push(("db.oldest_reader_age_seconds", reader_age, vec![]));
         metrics.push(("db.latched", f64::from(u8::from(self.env.failure().is_some())), vec![]));

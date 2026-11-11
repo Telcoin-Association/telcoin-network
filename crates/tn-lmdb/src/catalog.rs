@@ -31,7 +31,7 @@ use crate::{
     error::{Error, Result},
     packed::PACKED_MIN,
     page::Geometry,
-    tree::{read, write, PageRead, PageWrite, TreeRoot, MAX_TREE_PAGES},
+    tree::{read, table_tag, write, PageRead, PageWrite, TreeRoot, MAX_TREE_PAGES},
 };
 
 /// The longest table name, in bytes.
@@ -215,7 +215,7 @@ impl DupRecord {
 impl TableRecord {
     /// A new, empty plain table `id` created by transaction `txn`.
     pub(crate) fn new(id: u32, txn: u64) -> Self {
-        Self { id, root: TreeRoot::EMPTY, created_txn: txn, dup: None }
+        Self { id, root: TreeRoot::empty(table_tag(id)), created_txn: txn, dup: None }
     }
 
     /// A new, empty dup table `id` of shape `options` created by transaction `txn`.
@@ -286,7 +286,7 @@ impl TableRecord {
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4"));
         let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8"));
         let (id, flags) = (u32_at(0), u32_at(4));
-        let root = TreeRoot::decode(bytes[ROOT].try_into().expect("a tree root"))?;
+        let root = TreeRoot::decode(bytes[ROOT].try_into().expect("a tree root"), table_tag(id))?;
         if flags & !FLAG_DUP != 0 {
             return corrupt(&format!("unknown flags {flags:#x}"));
         }
@@ -381,6 +381,7 @@ mod tests {
         let record = TableRecord {
             id: 9,
             root: TreeRoot {
+                tag: table_tag(9),
                 root: 12,
                 root_txn: 7,
                 height: 2,
@@ -425,6 +426,7 @@ mod tests {
     #[test]
     fn dup_records_round_trip_and_refuse_damage() {
         let outer = TreeRoot {
+            tag: 0,
             root: 12,
             root_txn: 7,
             height: 1,

@@ -385,10 +385,6 @@ mod tn_lmdb {
     fn tn_lmdb_args_refuses_unsupported_flags() {
         let cases = [
             ("--db.exclusive", DatabaseArgs { exclusive: Some(false), ..Default::default() }),
-            (
-                "--db.read-transaction-timeout",
-                DatabaseArgs { read_transaction_timeout: Some(0), ..Default::default() },
-            ),
             ("--db.max-readers", DatabaseArgs { max_readers: Some(1), ..Default::default() }),
             (
                 "--db.log-level",
@@ -476,7 +472,22 @@ mod tn_lmdb {
                 },
                 default.with_max_growth(MIN_GROWTH),
             ),
+            (
+                "--db.read-transaction-timeout 0 (off)",
+                DatabaseArgs { read_transaction_timeout: Some(0), ..Default::default() },
+                default.with_read_transaction_timeout(None),
+            ),
+            (
+                "--db.read-transaction-timeout 90",
+                DatabaseArgs { read_transaction_timeout: Some(90), ..Default::default() },
+                default.with_read_transaction_timeout(Some(Duration::from_secs(90))),
+            ),
         ];
+        assert_eq!(
+            default.read_transaction_timeout,
+            Some(tn_lmdb_reth::DEFAULT_READ_TRANSACTION_TIMEOUT),
+            "unset, the flag keeps MDBX's default"
+        );
         let wrong: Vec<_> = cases
             .iter()
             .filter(|(_, args, expected)| tn_lmdb_args(args).ok().as_ref() != Some(expected))

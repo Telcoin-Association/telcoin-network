@@ -312,6 +312,9 @@ pub(crate) struct TreeCursor {
     slots: [u16; MAX_HEIGHT as usize],
     /// Levels of the path in use (the tree's height while [`State::At`]).
     depth: usize,
+    /// The tag of the tree the path belongs to ([`TreeRoot::tag`]): every fetch of a page of
+    /// the path names it, set by the descent that laid the path.
+    tag: u32,
     state: State,
     /// Whether the leaf of the path was entered by a seek's descent, which checks only the keys
     /// its search compared ([`Self::descend`]), and has not had the full range check since: set
@@ -327,6 +330,7 @@ impl Default for TreeCursor {
             pages: [0; MAX_HEIGHT as usize],
             slots: [0; MAX_HEIGHT as usize],
             depth: 0,
+            tag: 0,
             state: State::Unset,
             leaf_unchecked: false,
         }
@@ -459,7 +463,8 @@ impl TreeCursor {
     /// index taken)`), without reading a page: the caller is the writer that just put that entry
     /// there, on that path of its own pages, so a descent for the entry's key would take exactly
     /// this path, and the write's descent made the range checks of its rules.
-    pub(crate) fn place(&mut self, branches: &[(u32, usize)], leaf: u32, slot: usize) {
+    pub(crate) fn place(&mut self, tag: u32, branches: &[(u32, usize)], leaf: u32, slot: usize) {
+        self.tag = tag;
         let depth = branches.len() + 1;
         let steps = self.pages.iter_mut().zip(&mut self.slots);
         for ((page, step), &(pgno, ci)) in steps.zip(branches) {
@@ -498,10 +503,10 @@ impl TreeCursor {
         leaf: u32,
         slot: usize,
     ) -> Result<Option<EntryOf<'s, R>>> {
-        self.place(branches, leaf, slot);
+        self.place(root.tag, branches, leaf, slot);
         let read = |leaf: &LeafView<'s>, i| view_entry::<R, S>(store, leaf, i);
         self.guarded(|c| {
-            let view = LeafView::new(store.page(leaf)?)?;
+            let view = LeafView::new(store.page(leaf, c.tag)?)?;
             c.land(store, root, view, true, read)
         })
         .map(entry)
@@ -607,7 +612,7 @@ impl TreeCursor {
         let (pgno, slot) = self.top();
         let leaf = match leaf {
             Some(leaf) => leaf,
-            None => store.page(pgno)?,
+            None => store.page(pgno, self.tag)?,
         };
         Ok(Some(leaf_entry::<R, S>(store, leaf, slot)?))
     }
@@ -628,7 +633,7 @@ impl TreeCursor {
         let (pgno, slot) = self.top();
         let leaf = match leaf {
             Some(leaf) => leaf,
-            None => store.page(pgno)?,
+            None => store.page(pgno, self.tag)?,
         };
         Ok(Some(leaf_entry_with_key_tail(store, leaf, slot, t)?))
     }
@@ -756,7 +761,7 @@ impl TreeCursor {
             let (pgno, slot) = c.top();
             let leaf = match leaf {
                 Some(leaf) => leaf,
-                None => store.page(pgno)?,
+                None => store.page(pgno, c.tag)?,
             };
             // One header parse for the move. An empty prefix reads no cell: the cursor's own
             // entry was read, or written by the cursor, when the cursor came to it.
@@ -829,6 +834,10 @@ impl TreeCursor {
     /// seek's descent entered it and nothing read past its landing entry since
     /// ([`Self::check_leaf`]).
     #[inline]
+    pub(crate) fn tag(&self) -> u32 {
+        self.tag
+    }
+
     pub(crate) fn leaf_checked(&self) -> bool {
         !self.leaf_unchecked
     }
@@ -842,7 +851,7 @@ impl TreeCursor {
         store: &'s S,
     ) -> Result<Option<&'s [u8]>> {
         let Some(pgno) = self.leaf_pgno() else { return Ok(None) };
-        self.guarded(|_| store.page(pgno)).map(Some)
+        self.guarded(|c| store.page(pgno, c.tag)).map(Some)
     }
 
     /// [`Self::next`] (`forward`) or [`Self::prev`] for a cursor at an entry, from `leaf`: the page
@@ -972,7 +981,7 @@ impl TreeCursor {
         let levels = self.depth - 1;
         let path = self.pages[..levels].iter().zip(&self.slots[..levels]);
         for (level, (&pgno, &ci)) in path.enumerate() {
-            let page = store.page(pgno)?;
+            let page = store.page(pgno, self.tag)?;
             let n = BranchView::new(page)?.nkeys();
             let ci = usize::from(ci);
             if ci > 0 {
@@ -1206,7 +1215,7 @@ impl TreeCursor {
         root: &TreeRoot,
         forward: bool,
     ) -> Result<LandingOf<'s, R>> {
-        let leaf = store.page(self.pages[self.depth - 1])?;
+        let leaf = store.page(self.pages[self.depth - 1], self.tag)?;
         if let Some(entry) = self.step_in_leaf_in::<R, S>(store, leaf, forward)? {
             return Ok(Some((entry, leaf)));
         }
@@ -1286,7 +1295,7 @@ impl TreeCursor {
         self.depth -= 1;
         while self.depth > 0 {
             let (pgno, ci) = self.top();
-            let branch = store.page(pgno)?;
+            let branch = store.page(pgno, self.tag)?;
             let to = if forward {
                 (ci + 1 < page::nkeys(branch)).then_some(ci + 1)
             } else {
@@ -1323,6 +1332,7 @@ impl TreeCursor {
         mut want_txn: u32,
         edge: Edge<'_>,
     ) -> Result<Reached<'s>> {
+        self.tag = root.tag;
         let (mut lo, mut hi) = self.bounds(store, self.depth)?;
         let keyed = matches!(edge, Edge::Key(_) | Edge::Exact(_));
         loop {
@@ -1333,7 +1343,7 @@ impl TreeCursor {
                     root.height
                 )));
             }
-            let page = store.child(pgno, want_txn)?;
+            let page = store.child(pgno, want_txn, root.tag)?;
             let at_leaf_level = depth as u32 == root.height;
             let kind = page::kind(page)?;
             if (kind == Kind::Leaf) != at_leaf_level {
@@ -1426,7 +1436,7 @@ impl TreeCursor {
     fn bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S, levels: usize) -> Result<Bounds<'s>> {
         let (mut lo, mut hi): Bounds<'s> = (None, None);
         for (&pgno, &ci) in self.pages[..levels].iter().zip(&self.slots[..levels]) {
-            let route = page::branch_route_at(store.page(pgno)?, usize::from(ci))?;
+            let route = page::branch_route_at(store.page(pgno, self.tag)?, usize::from(ci))?;
             tighten(&route, &mut lo, &mut hi);
         }
         Ok((lo, hi))

@@ -38,14 +38,14 @@ const B_VALUE: usize = 827;
 /// The children `(pgno, txn)` of branch page `p` in the newest state of `env`.
 fn children(env: &Env, p: u32) -> Vec<(u32, u32)> {
     let snapshot = env.inner().current();
-    let page = snapshot.page(p).expect("branch");
+    let page = snapshot.page_any(p).expect("branch");
     (0..page::nkeys(page)).map(|i| page::branch_child(page, i).expect("child")).collect()
 }
 
 /// The keys of leaf page `p` in the newest state of `env`.
 fn leaf_keys(env: &Env, p: u32) -> Vec<Vec<u8>> {
     let snapshot = env.inner().current();
-    let page = snapshot.page(p).expect("leaf");
+    let page = snapshot.page_any(p).expect("leaf");
     (0..page::nkeys(page)).map(|i| page::leaf_key(page, i).expect("key").to_vec()).collect()
 }
 

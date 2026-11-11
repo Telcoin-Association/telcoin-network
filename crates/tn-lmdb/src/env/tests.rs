@@ -589,7 +589,7 @@ fn a_flip_the_page_crc_covers_fails_open_and_check() {
     let catalog_root = snapshot.meta.catalog.root;
     let record = catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
     assert!(record.root.height >= 2, "a branch root");
-    let root = snapshot.page(record.root.root).expect("root");
+    let root = snapshot.page_any(record.root.root).expect("root");
     let leaf = page::branch_child(root, 0).expect("child").0;
     drop(snapshot);
     env.check().expect("intact");

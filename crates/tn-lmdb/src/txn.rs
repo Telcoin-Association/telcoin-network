@@ -30,7 +30,7 @@ use crate::{
         dup_cursor::{
             nested_cell, DupHint, DupWalk, NestedRoots, Pick, PickTail, PickValue, Row, NO_DUP_HINT,
         },
-        read,
+        nested_tag, read, table_tag,
         write::{self, PutKind},
         PageRead, PageWrite, TreeRoot,
     },
@@ -309,7 +309,7 @@ fn packed_error(table: &Table, k: &[u8], e: Error) -> Error {
 /// The nested root an outer cell of key `k` holds (`b`), decoded and checked: a cell names a
 /// non-empty tree, else [`Error::Corrupt`].
 fn cell_root(table: &Table, k: &[u8], b: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
-    let root = TreeRoot::decode(b)?;
+    let root = TreeRoot::decode(b, nested_tag(table_tag(table.id), k))?;
     if root.is_empty() {
         return Err(Error::Corrupt(format!(
             "dup table {}: the outer cell of key {k:02x?} names an empty nested tree",
@@ -438,7 +438,7 @@ fn held_cell<'s>(
     k: &[u8],
 ) -> Result<Option<OuterVal<'s>>> {
     let Some((pgno, slot, checked)) = held else { return Ok(None) };
-    let view = page::LeafView::new(PageRead::page(writer, pgno)?)?;
+    let view = page::LeafView::new(PageRead::page(writer, pgno, table_tag(table.id))?)?;
     let n = view.nkeys();
     let val = match (slot < n).then(|| view.entry(slot)).transpose()? {
         Some((at, val)) if at == k => Some(val),
@@ -677,7 +677,8 @@ fn dup_put(
     let mut totals = *dup_mut(&mut w.record.dup);
     totals.nested_trees =
         totals.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
-    let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
+    let (mut root, mut root_trusted) =
+        (TreeRoot::empty(nested_tag(table_tag(w.table.id), k)), false);
     let mut cache = Box::<write::PathCache>::default();
     write::put_cached(
         writer,
@@ -689,7 +690,7 @@ fn dup_put(
         PutKind::Upsert,
         write::NO_HINT,
     )?;
-    apply_delta(&mut totals, &w.table, k, &TreeRoot::EMPTY, &root)?;
+    apply_delta(&mut totals, &w.table, k, &TreeRoot::empty(root.tag), &root)?;
     let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
     match write::put_outer_cell(
         writer,
@@ -853,7 +854,8 @@ fn promote(
         totals.packed_rows.checked_sub(n as u64).ok_or_else(|| totals_error(&w.table, k))?;
     totals.nested_trees =
         totals.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
-    let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
+    let (mut root, mut root_trusted) =
+        (TreeRoot::empty(nested_tag(table_tag(w.table.id), k)), false);
     let mut cache = Box::<write::PathCache>::default();
     let name = w.table.name();
     let mut append = |sj: &[u8], vj: &[u8]| match write::put_cached(
@@ -886,7 +888,7 @@ fn promote(
     if at == Search::NotFound(n) {
         append(s, v)?;
     }
-    apply_delta(&mut totals, &w.table, k, &TreeRoot::EMPTY, &root)?;
+    apply_delta(&mut totals, &w.table, k, &TreeRoot::empty(root.tag), &root)?;
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
     let placed = write::put_outer_cell(
         writer,
@@ -1177,7 +1179,11 @@ fn dup_rows<S: PageRead + ?Sized>(
             continue;
         }
         let root = working(&k).unwrap_or_else(|| {
-            TreeRoot::decode(cell.as_slice().try_into().expect("a 32-byte cell")).expect("a root")
+            TreeRoot::decode(
+                cell.as_slice().try_into().expect("a 32-byte cell"),
+                nested_tag(outer.tag, &k),
+            )
+            .expect("a root")
         });
         assert!(!root.is_empty(), "the outer cell of key {k:02x?} names an empty tree");
         sums.nested_trees += 1;
@@ -1265,7 +1271,7 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
     let mut totals = *dup_mut(&mut w.record.dup);
     totals.nested_trees =
         totals.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, key))?;
-    apply_delta(&mut totals, &w.table, key, &root, &TreeRoot::EMPTY)?;
+    apply_delta(&mut totals, &w.table, key, &root, &TreeRoot::empty(root.tag))?;
     write::free_subtree(writer, &root, root_trusted)?;
     let removed = write::delete_outer_cell(
         writer,
@@ -2241,13 +2247,13 @@ impl DupRoCursor {
 /// A snapshot's fetch of a leaf a dup cursor is at, for a move from it: the page again, without
 /// the per-fetch checks it passed when the cursor entered it ([`Snapshot::page_again`]).
 #[inline(always)]
-fn again<'s>(snapshot: &'s Snapshot) -> impl Fn(u32) -> Result<Option<&'s [u8]>> + 's {
-    move |pgno| Ok(snapshot.page_again(pgno))
+fn again<'s>(snapshot: &'s Snapshot) -> impl Fn(u32, u32) -> Result<Option<&'s [u8]>> + 's {
+    move |pgno, _tag| Ok(snapshot.page_again(pgno))
 }
 
 /// The leaf fetch of a cursor not at a row: no leaf, so a move descends from the roots.
 #[inline(always)]
-fn no_leaf<'s>(_: u32) -> Result<Option<&'s [u8]>> {
+fn no_leaf<'s>(_: u32, _: u32) -> Result<Option<&'s [u8]>> {
     Ok(None)
 }
 
@@ -2779,7 +2785,7 @@ impl RwTxn {
                 w.nested.clear();
                 let (key_len, packed_max) = (dup.key_len, dup.packed_max);
                 w.record.dup = Some(DupRecord { key_len, packed_max, ..DupRecord::default() });
-                work.set_dup_record(i, TreeRoot::EMPTY, false);
+                work.set_dup_record(i, TreeRoot::empty(root.tag), false);
                 return Ok(());
             }
             write::clear(work.writer_mut(), &mut root, trusted)?;
@@ -2876,7 +2882,7 @@ impl RwTxn {
             if let Some((tree, cursor_root)) = cursor {
                 *cursor_root = root;
                 if let Some(slot) = placed.slot() {
-                    tree.place(cache.branches(), cache.leaf(), slot);
+                    tree.place(root.tag, cache.branches(), cache.leaf(), slot);
                     at = true;
                 }
             }
@@ -4196,8 +4202,8 @@ impl NestedRoots for WorkRoots<'_> {
 /// A write transaction's fetch of a leaf a dup cursor is at, for a move from it: the page with
 /// the per-fetch checks ([`PageRead::page`]), as a [`TxnCursor`]'s moves fetch their leaf.
 #[inline(always)]
-fn checked<'s>(writer: &'s Writer) -> impl Fn(u32) -> Result<Option<&'s [u8]>> + 's {
-    move |pgno| PageRead::page(writer, pgno).map(Some)
+fn checked<'s>(writer: &'s Writer) -> impl Fn(u32, u32) -> Result<Option<&'s [u8]>> + 's {
+    move |pgno, tag| PageRead::page(writer, pgno, tag).map(Some)
 }
 
 /// A cursor over one dup table of a write transaction that holds no borrow of it (created by

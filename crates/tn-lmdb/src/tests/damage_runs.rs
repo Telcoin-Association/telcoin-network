@@ -86,7 +86,7 @@ fn cells(env: &Env) -> BTreeMap<u32, (Ovf, usize)> {
     let o = tree(env, "o");
     assert_eq!(o.height, 1, "{o:?}");
     let snapshot = env.inner().current();
-    let leaf = snapshot.page(o.root).expect("leaf");
+    let leaf = snapshot.page_any(o.root).expect("leaf");
     let mut cells = BTreeMap::new();
     for i in 0..page::nkeys(leaf) {
         let (k, val) = page::leaf_entry(leaf, i).expect("entry");
@@ -141,7 +141,7 @@ fn places(path: &Path) -> Places {
     let snapshot = env.inner().current();
     let meta = snapshot.meta;
     assert_eq!((meta.catalog.height, meta.free.height), (1, 1), "{meta:?}");
-    let catalog = snapshot.page(meta.catalog.root).expect("catalog");
+    let catalog = snapshot.page_any(meta.catalog.root).expect("catalog");
     let record = (0..page::nkeys(catalog))
         .map(|i| page::leaf_inline_entry(catalog, i).expect("entry"))
         .find(|(k, _)| *k == b"o")

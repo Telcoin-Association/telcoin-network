@@ -336,17 +336,17 @@ impl PageRead for Snapshot {
     }
 
     #[inline]
-    fn page(&self, pgno: u32) -> Result<&[u8]> {
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
-        checked_page(pgno, self.meta.page_count, self.meta.txn, false, |p| {
+        checked_page(pgno, tag, self.meta.page_count, self.meta.txn, false, |p| {
             self.view.slice(u64::from(p) * size as u64, size)
         })
     }
 
     #[inline]
-    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+    fn child(&self, pgno: u32, want_txn: u32, tag: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
-        checked_child(pgno, want_txn, self.meta.page_count, self.meta.txn, false, |p| {
+        checked_child(pgno, want_txn, tag, self.meta.page_count, self.meta.txn, false, |p| {
             self.view.slice(u64::from(p) * size as u64, size)
         })
     }
@@ -356,6 +356,13 @@ impl PageRead for Snapshot {
         checked_run(ovf, size, self.meta.page_count, self.meta.txn, false, verify, |p, len| {
             self.view.slice(u64::from(p) * size as u64, len)
         })
+    }
+
+    #[cfg(test)]
+    fn page_any(&self, pgno: u32) -> Result<&[u8]> {
+        let size = self.geometry.page_size();
+        let tag = self.view.slice(u64::from(pgno) * size as u64, size).map_or(0, page::tag);
+        self.page(pgno, tag)
     }
 }
 
@@ -1158,10 +1165,11 @@ impl PageRead for Writer {
         self.alloc.page_count()
     }
 
-    fn page(&self, pgno: u32) -> Result<&[u8]> {
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
         checked_page(
             pgno,
+            tag,
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
@@ -1169,11 +1177,12 @@ impl PageRead for Writer {
         )
     }
 
-    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+    fn child(&self, pgno: u32, want_txn: u32, tag: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
         checked_child(
             pgno,
             want_txn,
+            tag,
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
@@ -1192,6 +1201,12 @@ impl PageRead for Writer {
             verify,
             |p, len| self.file.pages(p, size, len),
         )
+    }
+
+    #[cfg(test)]
+    fn page_any(&self, pgno: u32) -> Result<&[u8]> {
+        let tag = self.file.page(pgno, self.geometry.page_size()).map_or(0, page::tag);
+        self.page(pgno, tag)
     }
 }
 
@@ -1273,8 +1288,13 @@ impl PageWrite for Writer {
         let Some(src) = self.view.slice(u64::from(from) * size as u64, size) else {
             return copy_unpublished(self, from, to, f);
         };
+        // The fetch that led the writer to `from` compared its tag with its tree's; the copy keeps
+        // the header, tag included, so the check here takes the page's own.
+        let tag = page::tag(src);
         let src =
-            checked_page(from, self.alloc.page_count(), self.alloc.txn(), false, |_| Some(src))?;
+            checked_page(from, tag, self.alloc.page_count(), self.alloc.txn(), false, |_| {
+                Some(src)
+            })?;
         if !self.alloc.is_private(to) {
             return Err(not_private(to));
         }
@@ -1395,7 +1415,9 @@ fn copy_unpublished<F>(writer: &mut Writer, from: u32, to: u32, f: F) -> Result<
 where
     F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
 {
-    let src = writer.page(from)?.to_vec();
+    // As for a published source: the tag was compared by the fetch that led here.
+    let tag = writer.file.page(from, writer.geometry.page_size()).map_or(0, page::tag);
+    let src = writer.page(from, tag)?.to_vec();
     let dst = writer.page_mut(to)?;
     f(&src, dst)?;
     Ok(dst)
@@ -2062,7 +2084,7 @@ fn check_root(snapshot: &Snapshot, root: &TreeRoot, what: &str) -> Result<()> {
         return Ok(());
     }
     let corrupt = |why: String| Error::Corrupt(format!("open: the {what} root: {why}"));
-    let page = snapshot.page(root.root).map_err(|e| corrupt(e.to_string()))?;
+    let page = snapshot.page(root.root, root.tag).map_err(|e| corrupt(e.to_string()))?;
     if page::crc_state(page) != CrcState::Valid {
         return Err(corrupt(format!("page {} fails its CRC", root.root)));
     }

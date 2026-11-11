@@ -80,7 +80,7 @@ pub(crate) trait Pick: Copy {
     where
         S: PageRead + ?Sized,
         N: NestedRoots,
-        A: Fn(u32) -> Result<Option<&'s [u8]>>;
+        A: Fn(u32, u32) -> Result<Option<&'s [u8]>>;
 }
 
 /// The value moves' [`Pick`]: the row's value ([`DupWalk::value_of`]).
@@ -106,7 +106,7 @@ impl Pick for PickValue {
     where
         S: PageRead + ?Sized,
         N: NestedRoots,
-        A: Fn(u32) -> Result<Option<&'s [u8]>>,
+        A: Fn(u32, u32) -> Result<Option<&'s [u8]>>,
     {
         walk.current(store, roots, again)
     }
@@ -136,7 +136,7 @@ impl Pick for PickTail {
     where
         S: PageRead + ?Sized,
         N: NestedRoots,
-        A: Fn(u32) -> Result<Option<&'s [u8]>>,
+        A: Fn(u32, u32) -> Result<Option<&'s [u8]>>,
     {
         walk.current_with_key_tail(store, roots, again, self.0)
     }
@@ -209,10 +209,10 @@ fn width_error(name: &str, len: usize, kl: usize) -> Error {
 #[inline]
 fn held<'s>(
     tree: &TreeCursor,
-    again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+    again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
 ) -> Result<Option<&'s [u8]>> {
     match tree.leaf_pgno() {
-        Some(pgno) => again(pgno),
+        Some(pgno) => again(pgno, tree.tag()),
         None => Ok(None),
     }
 }
@@ -289,7 +289,7 @@ impl DupWalk {
         Self {
             outer: TreeCursor::default(),
             inner: TreeCursor::default(),
-            nested: TreeRoot::EMPTY,
+            nested: TreeRoot::empty(0),
             key: Vec::new(),
             key_len,
             max_subkey: u16::try_from(max_subkey).unwrap_or(u16::MAX),
@@ -478,7 +478,7 @@ impl DupWalk {
         &self,
         store: &'s S,
         roots: &N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
     ) -> Result<PackedView<'s>> {
         let name = roots.name();
         let leaf = held(&self.outer, again)?;
@@ -562,7 +562,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
     ) -> Result<Option<Row<'s>>> {
         if let Some(to) = self.packed_neighbour(forward) {
@@ -582,7 +582,7 @@ impl DupWalk {
         &mut self,
         store: &'s S,
         roots: &N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         to: usize,
         n: usize,
         forward: bool,
@@ -606,7 +606,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         view: &PackedView<'s>,
         s: &[u8],
     ) -> Result<Option<Row<'s>>> {
@@ -623,7 +623,7 @@ impl DupWalk {
         &self,
         store: &'s S,
         roots: &N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         t: usize,
     ) -> Result<KeyTail<'s>> {
         let name = roots.name();
@@ -741,7 +741,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
     ) -> Result<Option<Row<'s>>> {
         match (self.state(), forward) {
@@ -777,7 +777,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
     ) -> Result<Option<Row<'s>>> {
         let landed = match held(&self.outer, again)? {
@@ -798,7 +798,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
     ) -> Result<Option<Row<'s>>> {
         let kl = self.kl();
@@ -849,7 +849,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
     ) -> Result<Option<Row<'s>>> {
         if x.len() <= self.kl() {
@@ -883,7 +883,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         k: &[u8],
         s: &[u8],
     ) -> Result<Option<Row<'s>>> {
@@ -923,7 +923,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         k: &[u8],
         inner: impl FnOnce(&mut Self, &'s S, &str, Inside<'s>) -> Result<Option<Row<'s>>>,
     ) -> Result<Option<Row<'s>>> {
@@ -979,7 +979,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         n: usize,
         forward: bool,
     ) -> Result<Option<Row<'s>>> {
@@ -1026,7 +1026,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         prefix: &[u8],
         forward: bool,
         spare: &mut Vec<u8>,
@@ -1061,7 +1061,7 @@ impl DupWalk {
         self.guarded(|w| {
             w.nested = nested;
             w.packed_rows = 0;
-            w.inner.place(branches, leaf, slot);
+            w.inner.place(w.nested.tag, branches, leaf, slot);
             w.set_sub(s)
         })
     }
@@ -1077,7 +1077,7 @@ impl DupWalk {
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         nested: TreeRoot,
         (branches, leaf, slot): (&[(u32, usize)], u32, usize),
     ) -> Result<Option<Row<'s>>> {
@@ -1146,7 +1146,7 @@ impl DupWalk {
         &self,
         store: &'s S,
         roots: &N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
     ) -> Result<Option<&'s [u8]>> {
         Ok(self.current_with_key_tail(store, roots, again, 0)?.map(|tail| match tail {
             KeyTail::Joined(v) | KeyTail::Apart(v) => v,
@@ -1162,7 +1162,7 @@ impl DupWalk {
         &self,
         store: &'s S,
         roots: &N,
-        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        again: &impl Fn(u32, u32) -> Result<Option<&'s [u8]>>,
         t: usize,
     ) -> Result<Option<KeyTail<'s>>> {
         if self.state() != State::At {
@@ -1188,7 +1188,7 @@ impl DupWalk {
     #[cfg(test)]
     pub(crate) fn leaf_bounds_for_test<S: PageRead + ?Sized>(&self, store: &S) -> [LeafBounds; 2] {
         let bounds = |tree: &TreeCursor| {
-            let leaf = page::LeafView::new(store.page(tree.leaf_pgno()?).ok()?).ok()?;
+            let leaf = page::LeafView::new(store.page_any(tree.leaf_pgno()?).ok()?).ok()?;
             let last = leaf.nkeys().checked_sub(1)?;
             Some((leaf.key(0).ok()?.to_vec(), leaf.key(last).ok()?.to_vec()))
         };
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     /// No held leaf: every move fetches its page.
-    fn no_leaf<'s>(_: u32) -> Result<Option<&'s [u8]>> {
+    fn no_leaf<'s>(_: u32, _: u32) -> Result<Option<&'s [u8]>> {
         Ok(None)
     }
 
@@ -1323,6 +1323,6 @@ mod tests {
     fn dup_walk_stays_small() {
         let most = 2 * size_of::<TreeCursor>() + size_of::<TreeRoot>() + 32;
         assert!(size_of::<DupWalk>() <= most, "{} > {most}", size_of::<DupWalk>());
-        assert_eq!(size_of::<DupWalk>(), 672);
+        assert_eq!(size_of::<DupWalk>(), 680);
     }
 }

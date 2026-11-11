@@ -1764,7 +1764,7 @@ fn misrouting_branch() -> (TempDir, std::path::PathBuf, [u8; 4]) {
         let root = super::damage::tree(&env, "d");
         assert_eq!(root.height, 2, "{root:?}");
         let snapshot = env.inner().current();
-        let page = snapshot.page(root.root).expect("the outer root");
+        let page = snapshot.page_any(root.root).expect("the outer root");
         let n = page::nkeys(page);
         assert!(n >= 4, "{n} children");
         let mid = 1 + (n - 1) / 2;

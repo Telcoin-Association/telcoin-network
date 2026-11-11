@@ -606,8 +606,12 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 /// - `--db.growth-step` is the largest growth step (`max_growth`; unset, the engine's 1 GiB): the
 ///   file grows by doubling up to it, then by it, each step preallocated. A step under the engine's
 ///   minimum (`MIN_GROWTH`, 1 MiB) is refused here.
-/// - `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers` and `--db.log-level`
-///   have no tn-lmdb equivalent and are refused when set.
+/// - `--db.read-transaction-timeout` is the adapter's read transaction timeout, as on MDBX: unset,
+///   MDBX's five minutes; `0`, no timeout; else that many seconds. A read transaction past it fails
+///   its later calls with `ReadTransactionTimeout` (tn-lmdb marks it, MDBX aborts it), and
+///   `disable_long_read_transaction_safety` opts a transaction out, as the state export does.
+/// - `--db.exclusive`, `--db.max-readers` and `--db.log-level` have no tn-lmdb equivalent and are
+///   refused when set.
 #[cfg(feature = "tn-lmdb")]
 fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
     use reth_db::mdbx::SyncMode as MdbxSyncMode;
@@ -627,9 +631,6 @@ fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
     } = *args;
     if exclusive.is_some() {
         return Err(refuse("--db.exclusive"));
-    }
-    if read_transaction_timeout.is_some() {
-        return Err(refuse("--db.read-transaction-timeout"));
     }
     if max_readers.is_some() {
         return Err(refuse("--db.max-readers"));
@@ -661,6 +662,13 @@ fn tn_lmdb_args(args: &DatabaseArgs) -> eyre::Result<tn_lmdb_reth::TnLmdbArgs> {
         }
         tn_lmdb = tn_lmdb.with_max_growth(step);
     }
+    tn_lmdb = match read_transaction_timeout {
+        None => tn_lmdb,
+        Some(0) => tn_lmdb.with_read_transaction_timeout(None),
+        Some(secs) => {
+            tn_lmdb.with_read_transaction_timeout(Some(std::time::Duration::from_secs(secs)))
+        }
+    };
     if let Some(sync_mode) = sync_mode {
         tn_lmdb = match sync_mode {
             MdbxSyncMode::Durable => tn_lmdb.with_sync_mode(SyncMode::Durable),

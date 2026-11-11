@@ -10,7 +10,9 @@
 //!
 //! Every descent checks that a child page is the copy its parent names: its header page number is
 //! the cell's child and its header txn (low 32 bits) is the cell's `child_txn`, which catches a
-//! pointer redirected to a stale copy that still has a valid CRC.
+//! pointer redirected to a stale copy that still has a valid CRC; and that it belongs to the tree
+//! being read: its header tag is the tree's ([`TreeRoot::tag`]), which catches a pointer
+//! redirected to a page of another tree, even one the same commit wrote.
 
 use crate::{
     error::{Error, Result},
@@ -34,6 +36,27 @@ pub(crate) const MAX_HEIGHT: u32 = 48;
 /// The most pages one tree can hold: every page number but the two meta pages and [`NULL_PGNO`].
 pub(crate) const MAX_TREE_PAGES: u64 = NULL_PGNO as u64 - 2;
 
+/// The tag of the catalog's tree ([`TreeRoot::tag`]).
+pub(crate) const CATALOG_TAG: u32 = u32::MAX;
+
+/// The tag of the free tree ([`TreeRoot::tag`]).
+pub(crate) const FREE_TAG: u32 = u32::MAX - 1;
+
+/// The tag of the tree of table `id` ([`TreeRoot::tag`]): the id itself, which is unique over
+/// the file's life (`meta::FIRST_TABLE_ID` on) and never reaches the two fixed tags.
+#[inline]
+pub(crate) const fn table_tag(id: u32) -> u32 {
+    id
+}
+
+/// The tag of the tree nested in the outer cell of key `key` of the dup table tagged `table`
+/// ([`TreeRoot::tag`]): the CRC-32 of the table's tag and the key, so a nested root redirected
+/// to another key's nested tree, of this table or another, is refused like any other tree.
+#[inline]
+pub(crate) fn nested_tag(table: u32, key: &[u8]) -> u32 {
+    crate::crc::crc32_update(crate::crc::crc32(&table.to_le_bytes()), key)
+}
+
 /// The byte debug builds fill every page [`PageWrite::alloc`] and [`PageWrite::alloc_run`] hand
 /// out with ([`poison`]): release builds leave a new page's old bytes, so no layout may rely on
 /// zeros, and the debug test suite runs every layout over this garbage to show none does.
@@ -47,6 +70,11 @@ pub(crate) fn poison(bytes: &mut [u8]) {
 }
 
 /// The handle of one B+tree: where its root is and what it holds. An empty tree costs no pages.
+///
+/// The tag names the tree in its pages' headers and is not part of the encoding: a handle is
+/// decoded with the tag its holder gives it ([`Self::decode`]): the catalog's and the free tree's
+/// are fixed ([`CATALOG_TAG`], [`FREE_TAG`]), a table's is its id ([`table_tag`]) and a nested
+/// tree's is derived from its table's and its outer key ([`nested_tag`]).
 ///
 /// Encoding (32 bytes, little-endian; [`Self::encode`]):
 ///
@@ -64,8 +92,12 @@ pub(crate) fn poison(bytes: &mut [u8]) {
 /// adds its new page, a new root adds a branch, a delete subtracts the pages it drops, and a
 /// clear resets them; a copy-on-write copy replaces a page and changes no count. `Env::check`
 /// compares them with the pages its walk finds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct TreeRoot {
+    /// The tag every page of the tree carries in its header (`page::tag`), compared on every
+    /// fetch; not encoded, and not compared by `==`, which compares the encoded fields: two
+    /// handles are equal when the file would store them alike.
+    pub(crate) tag: u32,
     /// The root page, or [`NULL_PGNO`] for an empty tree.
     pub(crate) root: u32,
     /// The low 32 bits of the root page's header txn (zero for an empty tree).
@@ -85,17 +117,32 @@ pub(crate) struct TreeRoot {
     pub(crate) leaf_pages: u32,
 }
 
+impl PartialEq for TreeRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.encode() == other.encode()
+    }
+}
+
+impl Eq for TreeRoot {}
+
 impl TreeRoot {
-    /// The empty tree.
-    pub(crate) const EMPTY: Self = Self {
-        root: NULL_PGNO,
-        root_txn: 0,
-        height: 0,
-        overflow_pages: 0,
-        entries: 0,
-        branch_pages: 0,
-        leaf_pages: 0,
-    };
+    /// The empty tree of the tests, tagged 0.
+    #[cfg(test)]
+    pub(crate) const EMPTY: Self = Self::empty(0);
+
+    /// The empty tree tagged `tag`.
+    pub(crate) const fn empty(tag: u32) -> Self {
+        Self {
+            tag,
+            root: NULL_PGNO,
+            root_txn: 0,
+            height: 0,
+            overflow_pages: 0,
+            entries: 0,
+            branch_pages: 0,
+            leaf_pages: 0,
+        }
+    }
 
     /// The size of the encoding (see the type's docs).
     pub(crate) const ENCODED_LEN: usize = 32;
@@ -114,7 +161,7 @@ impl TreeRoot {
     ///   2`).
     pub(crate) fn check(&self) -> Result<()> {
         let ok = if self.is_empty() {
-            *self == Self::EMPTY
+            *self == Self::empty(self.tag)
         } else {
             (1..=MAX_HEIGHT).contains(&self.height)
                 && self.pages() <= MAX_TREE_PAGES
@@ -221,11 +268,12 @@ impl TreeRoot {
 
     /// Decode [`Self::encode`]'s bytes, checking the shape ([`Self::check`]); else
     /// [`Error::Corrupt`].
-    pub(crate) fn decode(bytes: &[u8; Self::ENCODED_LEN]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8; Self::ENCODED_LEN], tag: u32) -> Result<Self> {
         let u32_at = |off: usize| {
             u32::from_le_bytes(bytes[off..off + 4].try_into().expect("a 4-byte field"))
         };
         let root = Self {
+            tag,
             root: u32_at(0),
             root_txn: u32_at(4),
             height: u32_at(8),
@@ -249,20 +297,26 @@ pub(crate) trait PageRead {
     /// through their parents' pointers without reading them checks each against it.
     fn page_count(&self) -> u32;
 
-    /// Page `pgno`, after the checks of [`read::checked_page`]: in range, not a meta page, a
-    /// non-zero CRC trailer unless the page is private to the writer, the header's page number
-    /// `pgno`, and the header's txn no later than the reading snapshot. Damage is
-    /// [`Error::Corrupt`].
-    fn page(&self, pgno: u32) -> Result<&[u8]>;
+    /// Page `pgno` of the tree tagged `tag`, after the checks of [`read::checked_page`]: in
+    /// range, not a meta page, a non-zero CRC trailer unless the page is private to the writer,
+    /// the header's page number `pgno`, its tag `tag`, and its txn no later than the reading
+    /// snapshot. Damage is [`Error::Corrupt`].
+    fn page(&self, pgno: u32, tag: u32) -> Result<&[u8]>;
 
-    /// Page `pgno` reached through a pointer that names it with `want_txn` (a branch cell's
-    /// `child_txn`, or a root's `root_txn`): the checks of [`Self::page`], then the identity check
-    /// of [`read::checked_child`]. A store that can read the header once for both overrides it.
-    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
-        let page = self.page(pgno)?;
+    /// Page `pgno` of the tree tagged `tag`, reached through a pointer that names it with
+    /// `want_txn` (a branch cell's `child_txn`, or a root's `root_txn`): the checks of
+    /// [`Self::page`], then the identity check of [`read::checked_child`]. A store that can read
+    /// the header once for both overrides it.
+    fn child(&self, pgno: u32, want_txn: u32, tag: u32) -> Result<&[u8]> {
+        let page = self.page(pgno, tag)?;
         read::check_identity(pgno, crate::page::txn(page), want_txn)?;
         Ok(page)
     }
+
+    /// Test-only: [`Self::page`] with the tag the page itself carries, for a test that inspects
+    /// a page by number outside any tree.
+    #[cfg(test)]
+    fn page_any(&self, pgno: u32) -> Result<&[u8]>;
 
     /// The overflow run `ovf` names (all its pages), after the checks of
     /// [`overflow::checked_run`] against this snapshot; `verify` says when to add the full CRC of
@@ -438,6 +492,7 @@ mod tests {
 
     /// A three-level tree's handle.
     const THREE: TreeRoot = TreeRoot {
+        tag: 0,
         root: 7,
         root_txn: 0xDEAD_BEEF,
         height: 3,
@@ -452,8 +507,8 @@ mod tests {
     #[test]
     fn tree_root_encoding_and_shape() {
         let bytes = THREE.encode();
-        assert_eq!(TreeRoot::decode(&bytes).expect("decode"), THREE);
-        assert_eq!(TreeRoot::decode(&TreeRoot::EMPTY.encode()).expect("empty"), TreeRoot::EMPTY);
+        assert_eq!(TreeRoot::decode(&bytes, 0).expect("decode"), THREE);
+        assert_eq!(TreeRoot::decode(&TreeRoot::EMPTY.encode(), 0).expect("empty"), TreeRoot::EMPTY);
         let mut expect = Vec::new();
         expect.extend_from_slice(&7_u32.to_le_bytes());
         expect.extend_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
@@ -471,7 +526,10 @@ mod tests {
             TreeRoot { height: 0, ..THREE },
             TreeRoot { height: MAX_HEIGHT + 1, ..THREE },
         ] {
-            assert!(matches!(TreeRoot::decode(&bad.encode()), Err(Error::Corrupt(_))), "{bad:?}");
+            assert!(
+                matches!(TreeRoot::decode(&bad.encode(), 0), Err(Error::Corrupt(_))),
+                "{bad:?}"
+            );
         }
         let tall = TreeRoot { height: MAX_HEIGHT, branch_pages: MAX_HEIGHT - 1, ..THREE };
         assert!(tall.check().is_ok());
@@ -510,7 +568,7 @@ mod tests {
             TreeRoot { overflow_pages: (MAX_TREE_PAGES - 3) as u32, ..shape(2, 1, 2) },
         ];
         for root in good {
-            assert!(TreeRoot::decode(&root.encode()).is_ok(), "{root:?}");
+            assert!(TreeRoot::decode(&root.encode(), 0).is_ok(), "{root:?}");
         }
         let bad = [
             TreeRoot { branch_pages: 1, ..TreeRoot::EMPTY },
@@ -529,7 +587,10 @@ mod tests {
             shape(2, u32::MAX, u32::MAX),
         ];
         for root in bad {
-            assert!(matches!(TreeRoot::decode(&root.encode()), Err(Error::Corrupt(_))), "{root:?}");
+            assert!(
+                matches!(TreeRoot::decode(&root.encode(), 0), Err(Error::Corrupt(_))),
+                "{root:?}"
+            );
         }
     }
 

@@ -147,11 +147,16 @@ The point gets are level within their spread in both shapes. `t4n`'s used span i
 
 `lib.rs` lists each one. reth's code reaches none of them.
 
-- **Environment:** no read transaction times out: a long reader keeps the pages freed since its
-  snapshot from reuse, so the file grows until it ends, and a write commit made once a reader has
-  held a superseded snapshot for over 60 s logs a `warn!` with its age, at most once a minute
-  (from the engine's lock-free `Env::oldest_reader_age`: readers pay nothing, a commit one atomic
-  load while no reader holds a superseded snapshot, plus a clock read while one does); one file
+- **Environment:** a read transaction past the timeout (`TnLmdbArgs::read_transaction_timeout`,
+  MDBX's five minutes by default, `--db.read-transaction-timeout` in the node) is marked, not
+  aborted: its later calls, and its cursors', fail with `ReadTransactionTimeout`, and the pages
+  freed since it began return to reuse once it is dropped (`db.timed_out_not_aborted_transactions`
+  counts the timed-out transactions still open; `disable_long_read_transaction_safety` opts a
+  transaction out, as on MDBX). A long reader also keeps the pages freed since its snapshot from
+  reuse, so the file grows until it ends, and a write commit made once a reader has held a
+  superseded snapshot for over 60 s logs a `warn!` with its age, at most once a minute (from the
+  engine's lock-free `Env::oldest_reader_age`: readers pay nothing, a commit one atomic load
+  while no reader holds a superseded snapshot, plus a clock read while one does); one file
   with an `flock`; the table stats and the metrics skip a table the file lacks; a write
   transaction dropped without a commit aborts at once though a cursor of it lives (the cursor's
   calls are then `MDBX_BAD_TXN`), where an MDBX cursor holds its transaction open.

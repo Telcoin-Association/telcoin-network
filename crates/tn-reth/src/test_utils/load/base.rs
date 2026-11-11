@@ -73,7 +73,10 @@ pub const META_FILE: &str = "bench-base.json";
 ///
 /// Version 4: the tn-lmdb engine's file format 5 keeps leaf values inline up to half a page and
 /// refuses a format-4 file at open, so every base rebuilds once, the MDBX ones with them.
-pub const LAYOUT_VERSION: u32 = 4;
+///
+/// Version 5: the tn-lmdb engine's file format 7 tags every tree page with its tree and refuses
+/// a format-6 file at open, so every base rebuilds once, the MDBX ones with them.
+pub const LAYOUT_VERSION: u32 = 5;
 
 /// The tn-lmdb backend's label: [`BACKEND`] in a `tn-lmdb` build.
 pub const TN_LMDB_BACKEND: &str = "tn-lmdb";

@@ -29,7 +29,7 @@ use crate::{
     overflow::{self, Ovf, RunCrc},
     packed,
     page::{self, Kind, Val},
-    tree::{PageRead, TreeRoot},
+    tree::{nested_tag, PageRead, TreeRoot},
 };
 
 /// What `Env::check` found in a sound state: how its pages are used, and each table's size.
@@ -274,7 +274,7 @@ impl Checker<'_> {
             if !self.claim(p, owner) {
                 continue;
             }
-            let page = snapshot.page(p).map_err(|e| corrupt(p, e.to_string()))?;
+            let page = snapshot.page(p, root.tag).map_err(|e| corrupt(p, e.to_string()))?;
             if page::crc_state(page) != CrcState::Valid {
                 return Err(corrupt(p, "fails its CRC".to_string()));
             }
@@ -416,7 +416,7 @@ impl Checker<'_> {
                 }
                 _ => return Err(Error::Corrupt(NOT_NESTED.to_string())),
             };
-            let nested = TreeRoot::decode(cell).map_err(in_key)?;
+            let nested = TreeRoot::decode(cell, nested_tag(root.tag, k)).map_err(in_key)?;
             nested_pages += checker
                 .walk(&nested, owner, Leaves::Plain, |_, subkey, _| {
                     if (1..=max_subkey).contains(&subkey.len()) {
