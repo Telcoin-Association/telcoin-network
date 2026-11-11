@@ -410,6 +410,7 @@ where
                 self.consensus_chain.epochs().get_epoch_by_number(epoch).await
             {
                 // We already have this record...
+                self.check_stored_record_final_state(&epoch_rec, true)?;
                 self.count_record_vote_skip(&epoch_rec, true);
                 self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
                 return Ok(());
@@ -418,6 +419,7 @@ where
             self.consensus_chain.epochs().get_epoch_by_number(epoch).await
         {
             // We already have this record...
+            self.check_stored_record_final_state(&epoch_rec, cert.is_some())?;
             self.count_record_vote_skip(&epoch_rec, cert.is_some());
             self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
             return Ok(());
@@ -505,6 +507,71 @@ where
         self.count_record_vote_skip(&epoch_rec, false);
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
+    }
+
+    /// With `epoch_record_state_check` on, compare the `final_state` of an epoch record already
+    /// stored when this node reaches its close with this node's own closing block, and halt on a
+    /// mismatch.
+    ///
+    /// A member that reaches the close late finds the record (certified by the members that
+    /// closed first) already stored, so it neither builds nor signs one; without this check
+    /// nothing at the boundary compares its execution with the record. The closing block is the
+    /// newest block in the bus's recent-blocks ring: every caller of
+    /// [`Self::write_epoch_record`] waits for the closing output's execution first and forwards
+    /// nothing past it (the `parent_state` comment there). With an empty ring there is no block to
+    /// compare, so the check is skipped, counted and logged. A mismatch returns the error, which
+    /// stops the node before the record is published. It does not survive a restart: the closing
+    /// block is executed by then, so the restarted node enters the next epoch and finds the record
+    /// stored without passing through here.
+    fn check_stored_record_final_state(
+        &self,
+        record: &EpochRecord,
+        certified: bool,
+    ) -> eyre::Result<()> {
+        if !self.builder.tn_config.parameters.epoch_record_state_check {
+            return Ok(());
+        }
+        let executed = {
+            let blocks = self.consensus_bus.recent_blocks().borrow();
+            (!blocks.is_empty()).then(|| blocks.latest_execution_block_num_hash())
+        };
+        let recorded = record.final_state;
+        match final_state_check(recorded, executed) {
+            FinalStateCheck::Matches => Ok(()),
+            FinalStateCheck::NoExecutedBlock => {
+                warn!(
+                    target: "epoch-manager",
+                    epoch = record.epoch,
+                    record_block = recorded.number,
+                    record_hash = %recorded.hash,
+                    "no executed block to compare with the stored epoch record's final state; \
+                     check skipped",
+                );
+                crate::metrics::record_epoch_record_state_check_skipped();
+                Ok(())
+            }
+            FinalStateCheck::Differs(executed) => {
+                error!(
+                    target: "epoch-manager",
+                    epoch = record.epoch,
+                    certified,
+                    record_block = recorded.number,
+                    record_hash = %recorded.hash,
+                    executed_block = executed.number,
+                    executed_hash = %executed.hash,
+                    "stored epoch record's final state is not this node's closing block; halting",
+                );
+                Err(eyre!(
+                    "epoch {} record names final state block {} ({}) but this node's closing \
+                     block is {} ({}): this node's execution diverged from the record, halting",
+                    record.epoch,
+                    recorded.number,
+                    recorded.hash,
+                    executed.number,
+                    executed.hash,
+                ))
+            }
+        }
     }
 
     /// Count the vote this node will not cast for `record`, which it is about to publish to its
@@ -1169,6 +1236,27 @@ pub(super) fn current_epoch_guard_row<DB: TNDatabase>(
         .then_some(LastProposed::NAME)
 }
 
+/// What comparing a stored epoch record's `final_state` with this node's closing block found.
+#[derive(Debug, PartialEq, Eq)]
+enum FinalStateCheck {
+    /// Number and hash both match.
+    Matches,
+    /// This node's closing block, which differs from the record's in number or hash.
+    Differs(BlockNumHash),
+    /// This node has executed no block yet, so there is nothing to compare.
+    NoExecutedBlock,
+}
+
+/// Compare the block a record names as its `final_state` with this node's closing block
+/// (`executed`, `None` when it has executed none). Number and hash must both agree.
+fn final_state_check(recorded: BlockNumHash, executed: Option<BlockNumHash>) -> FinalStateCheck {
+    match executed {
+        None => FinalStateCheck::NoExecutedBlock,
+        Some(executed) if executed == recorded => FinalStateCheck::Matches,
+        Some(executed) => FinalStateCheck::Differs(executed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,6 +1888,25 @@ mod tests {
         Ok(record)
     }
 
+    /// Make `block` this node's newest executed block.
+    fn execute(manager: &TestManager, block: BlockNumHash) {
+        manager.consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                0,
+                ConsensusNumHash::new(block.number, ConsensusHeaderDigest::default()),
+                Some(SealedHeader::new(
+                    ExecHeader { number: block.number, ..Default::default() },
+                    block.hash,
+                )),
+            );
+        });
+    }
+
+    /// The record this node published to its vote collector, if any.
+    fn published(manager: &TestManager) -> Option<EpochRecord> {
+        manager.consensus_bus.epoch_record_watch().borrow().clone()
+    }
+
     /// A counter series: its name, its `reason` label if any, and its value.
     type CounterSeries = (String, Option<String>, u64);
 
@@ -1832,6 +1939,119 @@ mod tests {
             .sum()
     }
 
+    /// The comparison: number and hash must both agree, and no executed block is its own verdict.
+    #[test]
+    fn final_state_check_compares_number_and_hash() {
+        let recorded = BlockNumHash::new(42, BlockHash::repeat_byte(7));
+        assert_eq!(final_state_check(recorded, Some(recorded)), FinalStateCheck::Matches);
+        let other_hash = BlockNumHash::new(42, BlockHash::repeat_byte(8));
+        assert_eq!(
+            final_state_check(recorded, Some(other_hash)),
+            FinalStateCheck::Differs(other_hash)
+        );
+        let other_number = BlockNumHash::new(41, BlockHash::repeat_byte(7));
+        assert_eq!(
+            final_state_check(recorded, Some(other_number)),
+            FinalStateCheck::Differs(other_number)
+        );
+        assert_eq!(final_state_check(recorded, None), FinalStateCheck::NoExecutedBlock);
+    }
+
+    /// With the check on, a late member whose closing block is not the stored certified record's
+    /// `final_state` halts: the error names both blocks and the record is not published.
+    #[tokio::test]
+    async fn stored_record_with_another_final_state_halts_with_the_check_on() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, true).await?;
+        let me = manager.key_config.primary_public_key();
+        let recorded = BlockNumHash::new(42, BlockHash::repeat_byte(7));
+        store_record(&manager, 1, recorded, vec![me], true).await?;
+        execute(&manager, BlockNumHash::new(42, BlockHash::repeat_byte(9)));
+
+        let err = manager.write_epoch_record(1, &engine).await.expect_err("a mismatch halts");
+        let err = format!("{err:#}");
+        assert!(err.contains(&format!("block 42 ({})", BlockHash::repeat_byte(7))), "{err}");
+        assert!(err.contains(&format!("is 42 ({})", BlockHash::repeat_byte(9))), "{err}");
+        assert_eq!(published(&manager), None, "a record that failed the check is not published");
+        Ok(())
+    }
+
+    /// With the check off, the same mismatch is not compared: the stored record is published as
+    /// before.
+    #[tokio::test]
+    async fn stored_record_with_another_final_state_is_published_with_the_check_off(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, false).await?;
+        let me = manager.key_config.primary_public_key();
+        let recorded = BlockNumHash::new(42, BlockHash::repeat_byte(7));
+        let record = store_record(&manager, 1, recorded, vec![me], true).await?;
+        execute(&manager, BlockNumHash::new(42, BlockHash::repeat_byte(9)));
+
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(published(&manager), Some(record));
+        Ok(())
+    }
+
+    /// With the check on, a stored record whose `final_state` is this node's closing block is
+    /// published, certified or not, and an uncertified one in a later epoch too.
+    #[tokio::test]
+    async fn stored_record_with_this_final_state_is_published_with_the_check_on() -> eyre::Result<()>
+    {
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, true).await?;
+        let me = manager.key_config.primary_public_key();
+        let closing = BlockNumHash::new(42, BlockHash::repeat_byte(7));
+        let record = store_record(&manager, 1, closing, vec![me], true).await?;
+        execute(&manager, closing);
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(published(&manager), Some(record));
+
+        let closing = BlockNumHash::new(84, BlockHash::repeat_byte(3));
+        let record = store_record(&manager, 2, closing, vec![me], false).await?;
+        execute(&manager, closing);
+        manager.write_epoch_record(2, &engine).await?;
+        assert_eq!(published(&manager), Some(record));
+        Ok(())
+    }
+
+    /// With the check on and nothing executed (the recent-blocks ring is empty), the comparison is
+    /// skipped and counted, and the record is published; the vote this node will not cast for the
+    /// certified record is counted as well.
+    #[tokio::test]
+    async fn stored_record_without_an_executed_block_skips_the_check() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, true).await?;
+        let me = manager.key_config.primary_public_key();
+        let record = store_record(
+            &manager,
+            1,
+            BlockNumHash::new(42, BlockHash::repeat_byte(7)),
+            vec![me],
+            true,
+        )
+        .await?;
+        assert!(manager.consensus_bus.recent_blocks().borrow().is_empty());
+
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(published(&manager), Some(record));
+        let counted = counters(&snapshotter);
+        assert_eq!(counter(&counted, "tn_node.epoch_record_state_check_skipped_total", None), 1);
+        assert_eq!(
+            counter(
+                &counted,
+                "tn_node.epoch_record_vote_skipped_total",
+                Some("certified_before_close")
+            ),
+            1
+        );
+        Ok(())
+    }
+
     /// The vote-skip counter follows the collector: a stored uncertified record of this node's
     /// committee skips nothing, one of a committee without this node is `not_in_committee`.
     #[tokio::test]
@@ -1856,6 +2076,43 @@ mod tests {
             counter(&counted, "tn_node.epoch_record_vote_skipped_total", Some("not_in_committee")),
             1
         );
+        Ok(())
+    }
+
+    /// The uncertified epoch-0 dummy record is never compared, even with the check on and a
+    /// different executed block: epoch 0 rebuilds its record instead (here it then stops for want
+    /// of a boundary consensus header, which this test does not set up).
+    #[tokio::test]
+    async fn epoch_zero_dummy_record_is_not_compared() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, true).await?;
+        let me = manager.key_config.primary_public_key();
+        store_record(&manager, 0, BlockNumHash::default(), vec![me], false).await?;
+        let genesis = engine.get_reth_env().await.lookup_head()?.num_hash();
+        execute(&manager, genesis);
+
+        let err = manager.write_epoch_record(0, &engine).await.expect_err("no boundary header");
+        let err = format!("{err:#}");
+        assert!(!err.contains("names final state"), "the dummy record was compared: {err}");
+        Ok(())
+    }
+
+    /// What a record built while this node has executed nothing would carry: the ring answers the
+    /// default header's number and hash, block 0 and the hash of an empty header, not the zero
+    /// hash. (`write_epoch_record` then pins its committee read to that hash, which names no
+    /// block, so such a record is never written: the read fails and the node halts.)
+    #[tokio::test]
+    async fn empty_ring_reads_as_the_default_header() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let (manager, _engine, _tasks) = manager_for_record_check(&temp, true).await?;
+        let parent_state = manager.consensus_bus.latest_execution_block_num_hash();
+        assert_eq!(parent_state, SealedHeader::<ExecHeader>::default().num_hash());
+        assert_eq!(parent_state.number, 0);
+        assert_ne!(parent_state.hash, B256::ZERO, "the empty ring is not the zero hash");
+        // keccak256 of the RLP of alloy's `Header::default()`
+        let empty_header_hash: B256 =
+            "0x78dec18c6d7da925bbe773c315653cdc70f6444ed6c1de9ac30bdb36cff74c3b".parse()?;
+        assert_eq!(parent_state.hash, empty_header_hash);
         Ok(())
     }
 }

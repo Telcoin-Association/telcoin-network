@@ -82,6 +82,10 @@ pub(crate) const EPOCH_CLOSE_DRAIN_GAUGE: &str = "tn_node.epoch_close_drain_seco
 /// Counter: epoch records this node published without casting its own vote, by `reason`.
 pub(crate) const EPOCH_RECORD_VOTE_SKIPPED_COUNTER: &str =
     "tn_node.epoch_record_vote_skipped_total";
+/// Counter: stored epoch records whose `final_state` could not be compared with this node's
+/// executed closing block because it had executed no block yet.
+pub(crate) const EPOCH_RECORD_STATE_CHECK_SKIPPED_COUNTER: &str =
+    "tn_node.epoch_record_state_check_skipped_total";
 
 /// Why this node casts no vote for an epoch record it publishes to its vote collector.
 ///
@@ -153,6 +157,12 @@ pub(crate) fn record_epoch_close_drain(drain: Duration) {
 /// Count one epoch record published without this node's vote.
 pub(crate) fn record_epoch_record_vote_skipped(reason: EpochRecordVoteSkip) {
     metrics::counter!(EPOCH_RECORD_VOTE_SKIPPED_COUNTER, "reason" => reason.as_str()).increment(1);
+}
+
+/// Count one stored epoch record whose `final_state` check was skipped for want of an executed
+/// block.
+pub(crate) fn record_epoch_record_state_check_skipped() {
+    metrics::counter!(EPOCH_RECORD_STATE_CHECK_SKIPPED_COUNTER).increment(1);
 }
 
 #[cfg(test)]
@@ -262,6 +272,7 @@ mod tests {
             record_epoch_record_vote_skipped(EpochRecordVoteSkip::CertifiedBeforeClose);
             record_epoch_record_vote_skipped(EpochRecordVoteSkip::CertifiedBeforeClose);
             record_epoch_record_vote_skipped(EpochRecordVoteSkip::NotInCommittee);
+            record_epoch_record_state_check_skipped();
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -289,6 +300,7 @@ mod tests {
             2.0
         );
         assert_eq!(value("tn_node.epoch_record_vote_skipped_total", Some("not_in_committee")), 1.0);
+        assert_eq!(value("tn_node.epoch_record_state_check_skipped_total", None), 1.0);
     }
 
     /// Before the engine has finished an output the backlog is the engine's own reading; after,
