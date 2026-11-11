@@ -251,6 +251,15 @@ where
             span.record("epoch", epoch.to_string());
             async move {
                 let pools = engine.get_all_worker_transaction_pools().await;
+                // an orphan never executes, so no canonical update clears the sealed marks its
+                // transactions carry (switch `sealed_tx_keep`); the re-pool below clears them one
+                // by one, but only where it runs, and recovery can stop partway, so clear every
+                // orphan digest on every pool first, before any builder of this epoch starts
+                orphan_batches.iter().for_each(|(digest, _)| {
+                    pools.iter().for_each(|pool| {
+                        pool.sealed_txs().clear_orphaned(digest);
+                    });
+                });
                 let is_cvv = consensus_bus.is_active_cvv();
                 recover_orphan_batches(&consensus_db, orphan_batches, |digest, batch| {
                     let pools = &pools;
@@ -2114,5 +2123,95 @@ mod tests {
             "0x78dec18c6d7da925bbe773c315653cdc70f6444ed6c1de9ac30bdb36cff74c3b".parse()?;
         assert_eq!(parent_state.hash, empty_header_hash);
         Ok(())
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// Orphan two of an epoch's batches whose transactions are pooled and marked as sealed
+    /// (switch `sealed_tx_keep`), run `orphan_batches` as a node in `mode`, and assert every mark
+    /// is gone.
+    ///
+    /// No worker runs this epoch, so neither branch re-pools a batch (each stays cached for the
+    /// next attempt) and only the per-digest clear can remove the marks. On the non-CVV branch
+    /// this is also the path of a node that left the committee and disbursed its orphans:
+    /// nothing re-pools there either.
+    async fn assert_orphan_clears_sealed_marks(mode: tn_primary::NodeMode) -> eyre::Result<()> {
+        use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
+        use tn_config::{Config, KeyConfig};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::gas_accumulator::GasAccumulator;
+        use tn_worker::quorum_waiter::QuorumWaiter;
+
+        let temp = tempfile::tempdir()?;
+        let datadir = temp.path().to_path_buf();
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let config = Config::default_for_test();
+        let chain: std::sync::Arc<RethChainSpec> = std::sync::Arc::new(config.chain_spec());
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(1);
+        let reth_env =
+            RethEnv::new(&node_config, &tasks, reth_db.clone(), None, accumulator.clone())?;
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let engine = ExecutionNode::new(&builder, reth_env)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(7)));
+        std::fs::create_dir_all(datadir.join("db"))?;
+        let db = tn_storage::open_db(datadir.join("db"));
+        let mut manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
+        engine
+            .initialize_worker_components(
+                0,
+                manager.engine_to_primary_rpc(&engine).await?,
+                accumulator.base_fee(0),
+                accumulator.worker_base_fee(0),
+            )
+            .await?;
+        let pool = engine.get_worker_transaction_pool(&0).await?;
+
+        // two pooled transactions, each sealed into a batch that never reached consensus
+        let mut factory = TransactionFactory::new();
+        let mut hashes = Vec::new();
+        for seed in [5, 6] {
+            let transaction = factory.create_eip1559(
+                chain.clone(),
+                None,
+                u128::from(MIN_PROTOCOL_BASE_FEE),
+                Some(Address::ZERO),
+                U256::ZERO,
+                Bytes::new(),
+            );
+            let hash = factory.submit_tx_to_pool(transaction.clone(), pool.clone()).await;
+            let digest = B256::repeat_byte(seed);
+            assert_eq!(pool.mark_sealed(pool.seal_ticket(), digest, vec![hash]).await?, 1);
+            let batch =
+                Batch { transactions: vec![transaction.encoded_2718()], ..Default::default() };
+            manager.consensus_db.insert::<OurNodeBatchesCache>(&digest, &batch)?;
+            hashes.push(hash);
+        }
+        manager.consensus_bus.node_mode().send_replace(mode);
+        assert_eq!(manager.consensus_bus.is_active_cvv(), mode.is_active_cvv());
+
+        manager.orphan_batches(engine, Vec::<Worker<_, QuorumWaiter>>::new(), 0).await?;
+
+        assert!(pool.sealed_txs().is_empty(), "every orphan's marks must clear");
+        for hash in &hashes {
+            assert!(pool.get(hash).is_some(), "the transaction stays pooled and buildable");
+        }
+        Ok(())
+    }
+
+    /// An active CVV clears an orphan's marks even when no pool can take the re-pool.
+    #[tokio::test]
+    async fn orphan_batches_clear_sealed_marks_on_the_cvv_branch() -> eyre::Result<()> {
+        assert_orphan_clears_sealed_marks(tn_primary::NodeMode::CvvActive).await
+    }
+
+    /// A node outside the committee, which disburses its orphans instead of re-pooling them,
+    /// clears their marks too.
+    #[tokio::test]
+    async fn orphan_batches_clear_sealed_marks_on_the_non_cvv_branch() -> eyre::Result<()> {
+        assert_orphan_clears_sealed_marks(tn_primary::NodeMode::Observer).await
     }
 }
