@@ -177,19 +177,40 @@ writes the dead writer's.
 
 **What it needs.** Advice that drops a file's clean cached pages, so later reads come from the
 device. A writer open gives it right after step 4's `fsync`, before it reads the metas or maps
-the file: a meta or a page a failed writeback left clean in the cache (its bytes never on the
-device, the error reported once to the writer that is gone) is then read from the device, where
-the open does not see the meta, or step 9's check finds the page old and falls back to the last
-sync.
+the file, when the boot record says the cache can be stale: a meta or a page a failed writeback
+left clean in the cache (its bytes never on the device, the error reported once to the writer
+that is gone) is then read from the device, where the open does not see the meta, or step 9's
+check finds the page old and falls back to the last sync. The record (`boot_record.rs`,
+`<path>.boot`) needs the host's boot id (`sys::boot_id`) and a file's device, inode and ctime
+(`fstat`); a port without a boot id gets a drop at every open.
 
-**Where.** `sys::drop_cached_pages`, called by `Env::open` at step 4. Without the advice the
-engine still works; it loses the fallback (README, "Known limit"), and
+**Where.** `sys::drop_cached_pages`, called by `Env::open` at step 4 when
+`boot_record::decide` says so; the record is written at step 10 (`Writer::mark_open`, synced) and
+at the close (`env::mark_clean`). Without the advice the engine still works; it loses the
+fallback (README, "Known limit"), and
 `a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync` passes only through the disk
-model, which restores the device's bytes at the call whatever the OS does.
+model, which restores the device's bytes at the call whatever the OS does. A port that keeps the
+record must keep its ctime stable from the close's `fstat` on: the close takes it once the
+mappings are gone, since an unmap may move it (macOS's file systems do).
 
 **Linux, macOS.** Linux: `posix_fadvise(POSIX_FADV_DONTNEED)` over the whole file; the kernel
 keeps a dirty page, and one mapped by another process (none: the writer's lock excludes every
-other open). macOS: no such advice; a no-op.
+other open); the boot record is kept (`boot_record::KEPT`). macOS: no such advice; a no-op, and
+no record (in tests every host keeps it, as the disk model mirrors the drop).
+
+### Reads started ahead of the weak-head check
+
+**What it needs.** Advice that starts reading a byte range of a file into the page cache and
+returns without waiting. Open step 9's check of a weak head reads every page written since the
+last sync, on a cache step 4 dropped; advised ahead, the device reads a branch's children
+together instead of one fault at a time.
+
+**Where.** `sys::will_need`, called by `check::Ahead` from `check::check_since` (a writer open's
+and a read-only open's). Without it the check is correct and slower on a cold cache.
+
+**Linux, macOS.** Linux: `posix_fadvise(POSIX_FADV_WILLNEED)` through `rustix` (no `unsafe`);
+an error is ignored. macOS: a no-op (its cache is not dropped at open, so the check reads it
+warm).
 
 ### Growth with real blocks, and the trim at close
 
@@ -267,6 +288,10 @@ weak meta is trusted, so a process crash recovers the last sync, as a reboot doe
 `sysctlbyname("kern.bootsessionuuid")`, each a UUID string (`the_host_boot_id_is_known_and_stable`).
 A boot time is not a safe substitute: a stepped clock moves it within a boot (safe: weak heads are
 then distrusted), and a host without a working clock can repeat it across boots (unsafe).
+The boot record (open step 4) reads the same id and needs the other half of the contract too: the
+id must not change within a boot. One that did would make a crash's "open" read as another boot's,
+and the open would keep a cache it must drop. An id that repeats across boots costs the record
+nothing: a new boot's cache holds nothing of the file, so keeping it is right either way.
 
 ### The OS page size and `msync` alignment
 
@@ -364,6 +389,8 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `sys.rs` | `fsync_file` | `macos` / `not(macos)` | plain `libc::fsync` (retried on `EINTR`) / `File::sync_all` |
 | `sys.rs` | `fdatasync_file` | `macos` / `not(macos)` | `fsync_file` / `File::sync_data` |
 | `sys.rs` | `drop_cached_pages` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_DONTNEED)` over the file / a no-op |
+| `sys.rs` | `will_need` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_WILLNEED)` over a range (`rustix`) / a no-op |
+| `boot_record.rs` | `KEPT` | `cfg!(any(target_os = "linux", test))` | the boot record kept beside the file / none, every open drops (a no-op off Linux) |
 | `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback |
 | `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback |
 | `env.rs` | `DataSync::Ranges` | `macos` | the variant exists on macOS only |

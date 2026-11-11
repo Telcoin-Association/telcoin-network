@@ -57,6 +57,7 @@ compile_error!(
 mod alloc;
 #[cfg(test)]
 mod bench;
+mod boot_record;
 mod catalog;
 mod check;
 mod crc;

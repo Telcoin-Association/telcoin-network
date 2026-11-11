@@ -18,7 +18,13 @@
 //!
 //! In tests every successful sync reports to the disk model (`disk_model`).
 
-use std::{fs::File, io, os::fd::AsRawFd, path::Path, sync::OnceLock};
+use std::{
+    fs::File,
+    io,
+    os::fd::{AsRawFd, BorrowedFd},
+    path::Path,
+    sync::OnceLock,
+};
 
 /// A boot id: 16 bytes that differ from one boot of the host to the next ([`boot_id`]). All zeros
 /// stands for an unknown one.
@@ -356,6 +362,39 @@ pub(crate) fn drop_cached_pages(file: &File) -> io::Result<()> {
     #[cfg(test)]
     crate::disk_model::cache_dropped(file);
     Ok(())
+}
+
+/// Start reading `len` bytes of `file` at `offset` into the page cache, without waiting for them:
+/// Linux `posix_fadvise(POSIX_FADV_WILLNEED)` (through `rustix`, so no `unsafe` here), which
+/// queues the reads and returns; pages already cached are skipped. Open's check of a weak head
+/// gives it for the pages it is about to read (`check::check_since`), so the device reads them
+/// together rather than one fault at a time on a cold cache. A hint: an error is ignored, and the
+/// reads then fault in one by one as without it. Elsewhere a no-op. In tests each call is logged
+/// (`take_will_need_log`).
+pub(crate) fn will_need(file: BorrowedFd<'_>, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    if let Some(len) = std::num::NonZeroU64::new(len) {
+        let _ = rustix::fs::fadvise(file, offset, Some(len), rustix::fs::Advice::WillNeed);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+    #[cfg(test)]
+    WILL_NEED_LOG.with(|log| log.borrow_mut().push((offset, len)));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the byte ranges [`will_need`] advised on this thread, `(offset, len)`, in order.
+    /// Read with [`take_will_need_log`].
+    static WILL_NEED_LOG: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: the ranges this thread advised since the last call, oldest first (see
+/// [`WILL_NEED_LOG`]).
+#[cfg(test)]
+pub(crate) fn take_will_need_log() -> Vec<(u64, u64)> {
+    WILL_NEED_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 /// Take an exclusive, non-blocking `flock` on `file`, held until every descriptor of its open file

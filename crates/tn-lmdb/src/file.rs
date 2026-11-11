@@ -71,6 +71,7 @@ use std::{
     fs::File,
     io,
     ops::Range,
+    os::fd::{AsFd as _, BorrowedFd},
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
         Arc,
@@ -296,6 +297,22 @@ impl PageFile {
             #[cfg(test)]
             refuse_reads: false,
         })
+    }
+
+    /// The file's metadata (`fstat`): the boot record's identity and ctime of it.
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    /// The file's descriptor, for advice on its page cache (`sys::will_need`).
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+
+    /// A second descriptor of the file (`dup`): it shares the open file description, so it holds
+    /// the file's lock after this page file drops, until it closes too.
+    pub(crate) fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     /// The physical file length in bytes.
@@ -761,7 +778,7 @@ pub(crate) struct ReadOnlyFile {
     _map: Mmap,
     /// The file, declared after the mapping so it unmaps before the file closes (fields drop in
     /// declaration order) and the shared lock lasts as long as the mapping.
-    _file: File,
+    file: File,
     /// The lock-free reader view of the mapping.
     view: Arc<MapView>,
 }
@@ -779,12 +796,17 @@ impl ReadOnlyFile {
         advise_access(readahead, |advice| map.advise(advice));
         let view = Arc::new(MapView::new());
         view.set_mapping(map.as_ptr(), map.len() as u64);
-        Ok(Self { _file: file, _map: map, view })
+        Ok(Self { file, _map: map, view })
     }
 
     /// The lock-free reader view of the mapping (see [`MapView`]).
     pub(crate) fn view(&self) -> Arc<MapView> {
         Arc::clone(&self.view)
+    }
+
+    /// The file's descriptor, for advice on its page cache (`sys::will_need`).
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 
