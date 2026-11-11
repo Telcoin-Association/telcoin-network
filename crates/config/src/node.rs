@@ -368,6 +368,15 @@ pub struct Parameters {
     /// leave the pool as soon as their batch is sealed. Issue #1807.
     #[serde(default)]
     pub sealed_tx_keep: bool,
+
+    /// Drop a batch digest this node already holds instead of handling it again.
+    ///
+    /// When `true`, the worker accepts a batch whose digest is already in its own batches cache
+    /// without reporting it to the primary again, and the proposer drops a digest that is already
+    /// pending or in one of its proposed headers. The default `false` keeps the previous
+    /// behaviour: a repeated digest is reported again and can be proposed twice. Issue #1807.
+    #[serde(default)]
+    pub digest_dedupe: bool,
 }
 
 impl Parameters {
@@ -474,6 +483,7 @@ impl Default for Parameters {
             vote_queue_fix: false,
             mdbx_random_advice: false,
             sealed_tx_keep: false,
+            digest_dedupe: false,
         }
     }
 }
@@ -634,6 +644,7 @@ impl Parameters {
             ("vote_queue_fix", SwitchValue::Bool(self.vote_queue_fix)),
             ("mdbx_random_advice", SwitchValue::Bool(self.mdbx_random_advice)),
             ("sealed_tx_keep", SwitchValue::Bool(self.sealed_tx_keep)),
+            ("digest_dedupe", SwitchValue::Bool(self.digest_dedupe)),
         ]
     }
 }
@@ -1317,5 +1328,15 @@ mod test {
         assert!(!parse_with("").sealed_tx_keep);
         assert!(parse_with("sealed_tx_keep: true").sealed_tx_keep);
         assert_eq!(listed("sealed_tx_keep: true", "sealed_tx_keep"), "true");
+    }
+
+    // ---- bench6 digest-dedupe ----
+
+    /// `digest_dedupe` stays at the bench-5 behaviour unless the file turns it on.
+    #[test]
+    fn digest_dedupe_parses() {
+        assert!(!parse_with("").digest_dedupe);
+        assert!(parse_with("digest_dedupe: true").digest_dedupe);
+        assert_eq!(listed("digest_dedupe: true", "digest_dedupe"), "true");
     }
 }
