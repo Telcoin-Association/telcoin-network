@@ -39,7 +39,12 @@ mkdir -p "$out" "$cache" "$dir/tmp"
 # The block device under the bench dir: its /proc/diskstats name (a partition's or a mapped
 # device's own line).
 source_dev=$(df --output=source "$dir" | tail -1)
-dev=$(basename "$(readlink -f "$source_dev")")
+# By the file system's device number, so a source the kernel names `/dev/root` (no such node)
+# still resolves to its block device.
+majmin=$(findmnt -no MAJ:MIN -T "$dir" 2>/dev/null | head -1 | tr -d ' ')
+dev=
+[ -n "$majmin" ] && [ -e "/sys/dev/block/$majmin" ] && dev=$(basename "$(readlink -f "/sys/dev/block/$majmin")")
+[ -n "$dev" ] || dev=$(basename "$(readlink -f "$source_dev")")
 grep -q " $dev " /proc/diskstats || { echo "no /proc/diskstats line for $dev ($source_dev)" >&2; exit 2; }
 echo "disk: $source_dev ($dev), bench dir $dir, logs $out"
 # writes completed, sectors written, ms writing, reads completed, sectors read
