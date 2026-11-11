@@ -357,6 +357,17 @@ pub struct Parameters {
     /// keeps the kernel's default advice. Issue #1802.
     #[serde(default)]
     pub mdbx_random_advice: bool,
+
+    /// Keep a sealed batch's transactions in the pool, marked, until they execute.
+    ///
+    /// When `true`, a batch that reaches the worker quorum marks its transactions as sealed
+    /// instead of removing them from the pool and advancing their senders' nonces. The batch
+    /// builder skips marked transactions, and the marks clear once the transactions execute or
+    /// their batch is orphaned at an epoch close, so the pool and the RPC still see a transaction
+    /// while its batch waits. The default `false` keeps the previous behaviour: the transactions
+    /// leave the pool as soon as their batch is sealed. Issue #1807.
+    #[serde(default)]
+    pub sealed_tx_keep: bool,
 }
 
 impl Parameters {
@@ -462,6 +473,7 @@ impl Default for Parameters {
             quorum_exec_block_starved_rounds: 0,
             vote_queue_fix: false,
             mdbx_random_advice: false,
+            sealed_tx_keep: false,
         }
     }
 }
@@ -621,6 +633,7 @@ impl Parameters {
             ),
             ("vote_queue_fix", SwitchValue::Bool(self.vote_queue_fix)),
             ("mdbx_random_advice", SwitchValue::Bool(self.mdbx_random_advice)),
+            ("sealed_tx_keep", SwitchValue::Bool(self.sealed_tx_keep)),
         ]
     }
 }
@@ -1294,5 +1307,15 @@ mod test {
         assert!(!parse_with("").mdbx_random_advice);
         assert!(parse_with("mdbx_random_advice: true").mdbx_random_advice);
         assert_eq!(listed("mdbx_random_advice: true", "mdbx_random_advice"), "true");
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// `sealed_tx_keep` stays at the bench-5 behaviour unless the file turns it on.
+    #[test]
+    fn sealed_tx_keep_parses() {
+        assert!(!parse_with("").sealed_tx_keep);
+        assert!(parse_with("sealed_tx_keep: true").sealed_tx_keep);
+        assert_eq!(listed("sealed_tx_keep: true", "sealed_tx_keep"), "true");
     }
 }
