@@ -9803,6 +9803,8 @@ dependencies = [
  "futures-util",
  "metrics",
  "metrics-util",
+ "proptest",
+ "rayon",
  "reth-metrics",
  "tempfile",
  "thiserror 1.0.69",

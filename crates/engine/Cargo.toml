@@ -23,6 +23,8 @@ tracing = { workspace = true }
 eyre = { workspace = true, optional = true }
 metrics = { workspace = true }
 reth-metrics = { workspace = true }
+# the dedicated signer recovery pool (`recovery_threads`)
+rayon = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
@@ -35,12 +37,17 @@ tn-config = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = []
 test-utils = ["dep:eyre"]
 # Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
 adiri = ["tn-types/adiri"]
+
+[[bench]]
+name = "engine_contention"
+harness = false
 
 [lints]
 workspace = true
