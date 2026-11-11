@@ -704,9 +704,18 @@ impl OutputBuildScope {
     ///
     /// The scope starts with no cached reads and refuses a first payload on any parent other
     /// than `tip` ([`TnRethError::ScopeParentMismatch`]), so an output seeded on one block cannot
-    /// build on another. The caller vouches for `overlay`: its runs must be exactly the deltas of
-    /// the unpersisted blocks up to `tip`, extended in order with
-    /// [`OutputTrieOverlay::extend_from_block`].
+    /// build on another. The caller vouches for the state behind the scope:
+    /// - `overlay` holds exactly the deltas of every block after the database anchor up to `tip`,
+    ///   in order, each added with [`OutputTrieOverlay::extend_from_block`]. A block whose persist
+    ///   is still in flight is unpersisted: leaving it out leaves a gap, and every state root built
+    ///   over the overlay is wrong.
+    /// - A persist of those blocks may commit while the scope builds, so later roots can read a
+    ///   database that already holds some of the overlay's runs. That reads the same state only
+    ///   because each run holds absolute values (accounts, slots, tombstones, wipes and trie
+    ///   nodes); a caller that lets a persist commit mid-output relies on it and must keep it
+    ///   pinned by a differential test.
+    /// - The blocks up to `tip` stay in reth's in-memory canonical state until their persist
+    ///   commits, since the build reads `tip`'s state through it.
     pub fn seeded(overlay: OutputTrieOverlay, tip: B256) -> Self {
         Self { overlay, reads: CachedReads::default(), tip: Some(tip) }
     }
