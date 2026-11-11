@@ -90,7 +90,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # Decides whether the test lanes, `test`, `adiri-test`, `tn-lmdb-test` and `vendor-reth-test`, run. No other job needs
+  # Decides whether the test lanes, `test`, `adiri-test`, `mdbx-test` and `vendor-reth-test`, run. No other job needs
   # it: fmt, clippy and the guards run for every author on both events, drafts included.
   #
   # On a `pull_request` the test lanes are skipped for a draft, and for a maintainer-authored
