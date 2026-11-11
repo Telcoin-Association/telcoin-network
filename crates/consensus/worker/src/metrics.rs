@@ -87,6 +87,11 @@ struct WorkerMetricHandles {
     batch_fetch_duration_seconds: Histogram,
     /// Time to report a sealed batch's digest to the primary (success or failure).
     batch_report_seconds: Histogram,
+    /// Own batches not sealed or reported again because this epoch's primary already acked their
+    /// digest and the batch is not yet committed (switch `digest_dedupe`, issue #1807). A
+    /// suppressed seal answers `Ok`, so the batch builder's sealed-batch count and seal-time
+    /// histogram include it.
+    duplicate_digest_suppressed_total: Counter,
 }
 
 /// Metrics for the worker batch pipeline.
@@ -170,6 +175,11 @@ impl WorkerMetrics {
     /// Record the time one report of a sealed batch to the primary took (success or failure).
     pub(crate) fn record_batch_report(&self, elapsed: Duration) {
         self.handles.batch_report_seconds.record(elapsed);
+    }
+
+    /// Record an own batch whose already-reported digest was not sealed or reported again.
+    pub(crate) fn record_duplicate_digest_suppressed(&self) {
+        self.handles.duplicate_digest_suppressed_total.increment(1);
     }
 
     /// Record a retry while reporting a batch to a single peer.
@@ -614,5 +624,29 @@ mod tests {
             assert_eq!(series.get(&(FAILED.to_string(), peer.clone())), Some(&0), "{peer}");
         }
         assert_eq!(series.len(), 8, "two counters for each of a, b, c and other: {series:?}");
+    }
+
+    // ---- bench6 digest-dedupe ----
+
+    /// The suppression counter registers under its frozen name with the `worker` label and
+    /// counts each suppressed seal once.
+    #[test]
+    fn duplicate_digest_suppressed_counts_under_worker_label() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = WorkerMetrics::new_for_worker(3);
+            metrics.record_duplicate_digest_suppressed();
+            metrics.record_duplicate_digest_suppressed();
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (key, _, _, value) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_worker.duplicate_digest_suppressed_total")
+            .expect("suppression counter registered");
+        assert!(matches!(value, DebugValue::Counter(2)), "unexpected value: {value:?}");
+        assert!(key.key().labels().any(|l| l.key() == "worker" && l.value() == "3"));
     }
 }
