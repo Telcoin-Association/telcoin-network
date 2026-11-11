@@ -18,6 +18,11 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# The gap fill's read that does not wait for the disk (`preadv2` with `RWF_NOWAIT`) and its
+# `POSIX_FADV_RANDOM`, as safe calls: no `unsafe` of this crate's own (`file.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }

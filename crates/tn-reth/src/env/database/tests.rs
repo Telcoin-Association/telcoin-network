@@ -422,6 +422,46 @@ mod tn_lmdb {
     }
 
     /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
+    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: 0, off) and reaches the
+    /// engine: more than its `MAX_GAP_FILL` is refused at the open, naming the flag, before the
+    /// database is created; at most it opens, and its durable commits fill gaps
+    /// (`IoStats::gaps_filled` is the engine's own count).
+    #[test]
+    fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
+        use clap::Parser as _;
+        let parse = |flags: &[&str]| {
+            let command = crate::RethCommand::try_parse_from(
+                std::iter::once("tn-reth").chain(flags.iter().copied()),
+            )
+            .expect("parse");
+            let chain = Arc::new(test_genesis().into());
+            RethConfig::new(command, None, TempDir::new().expect("tempdir").path(), true, chain)
+        };
+        assert_eq!(parse(&[]).db_gap_fill(), 0, "off by default");
+        assert_eq!(parse(&["--db.gap-fill", "4"]).db_gap_fill(), 4);
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let wide = config(test_db_args()).with_db_gap_fill(tn_lmdb_reth::MAX_GAP_FILL + 1);
+        let err = open_rw(&wide, &path).expect_err("past the maximum").to_string();
+        assert!(err.contains("--db.gap-fill"), "{err}");
+        assert!(!path.join(tn_lmdb_reth::DATA_FILE).exists(), "the refusal created the database");
+        let db = open_rw(&config(test_db_args()).with_db_gap_fill(4), &path).expect("opens");
+        for i in 0..64u64 {
+            db.update(|tx| {
+                for j in 0..64u64 {
+                    let k = (i * 64 + j).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+                    tx.put::<tables::CanonicalHeaders>(k, B256::with_last_byte(i as u8))?;
+                }
+                Ok::<_, reth_db::DatabaseError>(())
+            })
+            .expect("tx")
+            .expect("put");
+        }
+        let s = db.io_stats();
+        assert!(s.sync_runs > s.commits, "the commits' pages formed runs: {s:?}");
+        assert!(s.gaps_filled > 0, "the durable commits filled gaps: {s:?}");
+    }
+
     #[test]
     fn safe_no_sync_syncs_every_second_or_64_mib() {
         assert_eq!(SAFE_NO_SYNC_PERIOD, Duration::from_secs(1));

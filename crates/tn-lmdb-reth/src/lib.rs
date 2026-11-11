@@ -127,7 +127,7 @@
 //! | `TableNotFound`, `StaleTable`, a table never created | `MDBX_NOTFOUND` |
 //! | an unpositioned `delete_current` | `MDBX_ENODATA` |
 //! | `TableKind` | `MDBX_INCOMPATIBLE` |
-//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidMapReserve`, `InvalidDupOptions` | `MDBX_EINVAL` |
+//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidMapReserve`, `InvalidGapFill`, `InvalidDupOptions` | `MDBX_EINVAL` |
 //!
 //! A refused second value for a dup-sort row's subkey (below) is `MDBX_KEYEXIST` with a message of
 //! this crate's saying it stores one value per subkey. Six engine errors keep their own message,
@@ -335,5 +335,5 @@ mod tests;
 
 pub use cursor::{TnLmdbCursor, TnLmdbCursorMut};
 pub use env::{RethTableStat, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
-pub use tn_lmdb::{CheckReport, IoStats, SyncMode, TableCheck, MIN_GROWTH};
+pub use tn_lmdb::{CheckReport, IoStats, SyncMode, TableCheck, MAX_GAP_FILL, MIN_GROWTH};
 pub use tx::{TnLmdbTx, TnLmdbTxMut};

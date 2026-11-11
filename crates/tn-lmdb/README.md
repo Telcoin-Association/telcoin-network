@@ -522,7 +522,7 @@ committed tree, only one this transaction freed, and only damage names it: the c
 | 1 | Flush each dup table's working map into its outer tree (`Work::flush_nested`: each changed nested root into its outer cell, which can allocate, copy and free pages), write each changed table's root into the catalog (in name order), then save the free list (see below). |
 | 2 | Build meta M in memory: txn L+1 (the first after an open, `meta::MAX_WEAK_RUN` + 1 past the newest steady slot's and past every slot's: [Open and recovery](#open-and-recovery), step 5), both roots, the page count. |
 | 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
-| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
+| 4 | With `EnvOptions::gap_fill` set, first rewrite the short gaps between the dirty runs with their own bytes ([Gap fill](#gap-fill)). Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
 | 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too (on macOS, step 4's msyncs of a scattered commit leave the size to this step). |
 | 6 | Copy meta M, steady, into the slot that does not hold the newest steady meta (`meta::slot_to_write`: with both slots steady, the lower txn, an invalid slot first, on a tie slot 1; beside a weak slot, the weak one), msync that one page, then record M's txn as the slot's. |
 | 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
@@ -605,6 +605,73 @@ and whether the commit survives is unknown until a reopen. Validation errors (`K
 `KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, table errors, `TableKind`,
 `InvalidDupOptions`, `ReadOnly`, `WrongTxn`) happen in `put` and the other calls, before anything
 changes, and do not latch.
+
+### Gap fill
+
+`EnvOptions::gap_fill` (pages, default 0: off, at most `MAX_GAP_FILL`, 64, else
+`InvalidGapFill` at open) trades bytes written for writes. A durable commit's pages are
+scattered: in steady state nearly all of them (98-99% measured) are pages freed two commits
+earlier, which sit wherever their old copies were written, so most runs of adjacent dirty pages
+are one page long. Linux's writeback sends each run to the disk as its own write, so a commit
+costs about one write per run (`IoStats::sync_runs`): measured on the node's workloads, 636 runs
+for the persist benchmark's 796-page commit and 21,431 for the execution benchmark's 24,585-page
+busy commit, about 5 KiB per write. On a disk that caps writes per second (network block storage:
+a cloud disk at 4,500 to 20,000 IOPS) that is seconds of I/O per large commit, while its
+bandwidth sits idle.
+
+With `gap_fill` at `g`, step 4 first rewrites each gap of 1 to `g` clean pages between two runs
+with the bytes it holds (`Writer::fill_gaps`): it reads the gap through the file into a buffer
+(`PageFile::read_resident`) and writes the buffer back at the same offset (`PageFile::rewrite`,
+a `pwrite`), never through the mapping. The page cache then holds the two runs and the gap dirty,
+one run, and the sync (either of step 4's) writes it as one write. A replay of the measured
+commits' page sets predicted, against `g` = 0:
+
+| `g` | persist, writes | bytes | busy, writes | bytes | peak, writes | bytes |
+|---|---|---|---|---|---|---|
+| 4 | -53% | 1.94x | -34% | 1.68x | -49% | 1.89x |
+| 8 | -76% | 3.08x | -53% | 2.73x | -71% | 3.03x |
+| 16 | -90% | 4.62x | -73% | 4.90x | | |
+
+A commit's time on such a disk is about the larger of its writes over the IOPS cap and its bytes
+over the bandwidth cap, so gap fill wins while bandwidth is in hand, and a `g` past that point
+loses. It adds no file space. On a local NVMe drive, whose IOPS are plentiful, it only costs: the
+extra bytes, and two system calls per gap filled.
+
+- **No byte changes.** Only the writer changes pages, on its own thread, and nothing changes a
+  gap page between the fill's read and its write: a gap holds no page of the commit, and the
+  metas are never between two of its pages. So the write stores what the page cache holds, and
+  a clean cached page holds what the disk holds. A gap page may be a page of the last durable
+  state, of a reader's snapshot, a free page, one the transaction took and gave back, or one an
+  aborted transaction or a dead writer wrote: each keeps its bytes. Readers reading a gap page
+  meanwhile see each byte's own value: the kernel's copy stores nothing else.
+  `a_gap_fill_changes_no_byte_of_the_file` compares the files of the same commits at 0, 4 and
+  64 pages byte for byte, and the crash matrix runs with it on
+  (`every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill` and neighbours).
+- **A torn write.** A crash during the sync leaves each sector of a gap rewritten or not, and
+  both hold the same bytes, on a drive that writes each logical block atomically (NVMe's atomic
+  write unit is at least one logical block; cloud block storage writes whole blocks). Without gap
+  fill no commit writes a page the last durable state names, so a drive that can garble the
+  block it was writing at a power cut damages only free pages and a meta (see the page-size
+  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page,
+  which its CRC then reports as `Corrupt`. Leave gap fill off on such a drive.
+- **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous
+  random read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
+  `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap
+  it cannot read whole is skipped (`IoStats::gap_misses`). When the gap's first page is missing,
+  the kernel starts a read of the gap that nothing waits for, and `POSIX_FADV_RANDOM` on the file
+  (given at open when gap fill is on; the engine reads through the file only at open otherwise)
+  keeps that read to the gap's pages. A commit stops trying once its misses exceed its fills by
+  16, so the reads a commit's fill starts exceed the writes it saved by at most 16. A kernel or
+  file system that refuses `RWF_NOWAIT` (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`) turns gap fill off for
+  the environment with a warning. No safe call reports residency without reading (`mincore` would
+  be a raw call: new `unsafe`).
+- **macOS** has no `RWF_NOWAIT`: a gap is read with a plain `pread`, and a page not in memory
+  costs a synchronous read. Gap fill there serves the tests and measurement, not production.
+  Step 4's `msync`s of `DataSync::Ranges` write the rewritten gaps with the mapped pages (each
+  gap lies inside a merged range: `MAX_GAP_FILL` is `MERGE_GAP`),
+  `a_gap_filled_scattered_commit_leaves_no_page_dirty`.
+- **Errors.** An I/O error reading or writing a gap fails the commit (it latches) and poisons the
+  file. A failed write leaves each byte as it was or rewritten, the same bytes.
 
 ---
 
@@ -1934,9 +2001,9 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 | group | counters |
 |---|---|
 | commits | `commits` (each run of steps 4–6: a `Durable` commit, a `NoSync` commit that synced, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits` (`NoSync` commits that deferred their sync), `auto_syncs` (`NoSync` commits that synced their own pages and the deferred ones: past `sync_period` or `sync_bytes`, the first that changes something after an open, or one more than 2^20 txns past the last sync; each also counts in `commits`), `grown_commits` (the file grew since the last durable state) |
-| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages` and `gap_misses` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
-| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
+| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `gap_fill_ns` (4's gap fill, before its sync), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
 | free list | `records_loaded`, `refill_ns`; `runs_by_step` (the run policy's four steps); `gate_lag_sum`, `gate_lag_samples` and `max_gate_lag` (at each load of records, the writing txn minus the reuse gate: 2 in `Durable` with no reader on an old snapshot, more under a held reader or `NoSync` commits not yet synced; the txn ids an open skips are not counted) |
 

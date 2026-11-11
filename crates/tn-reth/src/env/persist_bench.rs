@@ -68,6 +68,12 @@
 //!   build instead opens its database with the engine's `SyncMode::NoSync` and no automatic syncs
 //!   through the test-only `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings, so its
 //!   no-sync rows time no sync at all.
+//! - `TN_PERSIST_BENCH_GAP_FILL` (0): tn-lmdb's gap fill in pages (`--db.gap-fill`; 0 off, at most
+//!   64). The tn-lmdb rows add the engine's counters per durable commit over the timed loop
+//!   (`IoStats`): `pages_per_commit`, `runs_per_commit` (runs of adjacent dirty pages, before the
+//!   fill), `gaps_filled_per_commit`, `gap_pages_per_commit`, `gap_misses`, `writes_per_commit`
+//!   (`runs - gaps filled + 1` for the meta: the writes Linux sends the disk, a run longer than its
+//!   largest write aside) and `gap_fill_us_per_commit`.
 //!
 //! **Caveats.**
 //!
@@ -149,6 +155,7 @@ struct Knobs {
     accounts: usize,
     durable: bool,
     layout: StorageLayout,
+    gap_fill: u32,
 }
 
 impl Knobs {
@@ -171,6 +178,9 @@ impl Knobs {
             txs,
             per_commit: knob("TN_PERSIST_BENCH_PER_COMMIT", 4),
             accounts: knob("TN_PERSIST_BENCH_ACCOUNTS", 10_000),
+            gap_fill: std::env::var("TN_PERSIST_BENCH_GAP_FILL").map_or(0, |v| {
+                v.parse().unwrap_or_else(|_| panic!("TN_PERSIST_BENCH_GAP_FILL: a number, got {v}"))
+            }),
             durable,
             layout,
         }
@@ -410,6 +420,9 @@ struct ModeRun {
     splits: Vec<Split>,
     db_bytes: u64,
     db_alloc_bytes: u64,
+    /// tn-lmdb: the engine's counters over the timed loop.
+    #[cfg(not(feature = "mdbx"))]
+    io: tn_lmdb_reth::IoStats,
 }
 
 /// The value at nearest rank `p` (0..=1) of `sorted`.
@@ -446,6 +459,7 @@ fn run_mode(
         rpc: RpcServerArgs { ipcdisable: true, ..Default::default() },
         txpool: TxPoolArgs::default(),
         db: DatabaseArgs { sync_mode, ..Default::default() },
+        db_gap_fill: (knobs.gap_fill > 0).then_some(knobs.gap_fill),
     };
     let reth_config = RethConfig::new(command, None, datadir, false, chain.clone())
         .with_new_datadir_layout(knobs.layout);
@@ -454,6 +468,8 @@ fn run_mode(
     let database = RethEnv::new_database(&reth_config, &db_dir).expect("open the database");
     #[cfg(not(feature = "mdbx"))]
     super::database::TEST_NO_SYNC.set(false);
+    #[cfg(not(feature = "mdbx"))]
+    let (engine, mut io_before) = (database.clone(), None);
     let reth_env =
         RethEnv::new(&reth_config, &task_manager, database, None, GasAccumulator::default())
             .expect("open the reth env");
@@ -504,6 +520,10 @@ fn run_mode(
             last = Some((parent.number, block_txs));
         }
 
+        #[cfg(not(feature = "mdbx"))]
+        if commit == WARMUP_COMMITS {
+            io_before = Some(engine.io_stats());
+        }
         let start = Instant::now();
         reth_env.persist_executed_output(&blocks).expect("persist");
         let elapsed = start.elapsed();
@@ -516,12 +536,23 @@ fn run_mode(
         reth_env.finalize_block(parent.clone()).expect("finalize");
     }
 
+    #[cfg(not(feature = "mdbx"))]
+    let io = engine.io_stats().since(&io_before.expect("the run timed a commit"));
     let (last_number, last_txs) = last.expect("the run persisted blocks");
     read_back(&reth_env, &parent, last_number, &last_txs);
     drop(reth_env);
+    #[cfg(not(feature = "mdbx"))]
+    drop(engine);
 
     let (db_bytes, db_alloc_bytes) = db_file_bytes(&db_dir).expect("database file");
-    ModeRun { commits, splits, db_bytes, db_alloc_bytes }
+    ModeRun {
+        commits,
+        splits,
+        db_bytes,
+        db_alloc_bytes,
+        #[cfg(not(feature = "mdbx"))]
+        io,
+    }
 }
 
 /// Assert the last persisted block is in the database tables: the last block number, the last
@@ -596,6 +627,31 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
         run.db_bytes,
         run.db_alloc_bytes,
     );
+    #[cfg(not(feature = "mdbx"))]
+    {
+        let io = &run.io;
+        let n = io.commits.max(1) as f64;
+        let per = |v: u64| v as f64 / n;
+        println!(
+            "persist_bench_io backend={BACKEND} sync={} per_commit={per_commit} gap_fill={} \
+             engine_commits={} pages_per_commit={:.1} runs_per_commit={:.1} \
+             gaps_filled_per_commit={:.1} gap_pages_per_commit={:.1} gap_misses={} \
+             writes_per_commit={:.1} write_pages_x={:.3} gap_fill_us_per_commit={:.0} \
+             data_sync_us_per_commit={:.0}",
+            knobs.sync_name(),
+            knobs.gap_fill,
+            io.commits,
+            per(io.pages_synced),
+            per(io.sync_runs),
+            per(io.gaps_filled),
+            per(io.gap_pages),
+            io.gap_misses,
+            per(io.sync_runs - io.gaps_filled) + 1.0,
+            (io.pages_synced + io.gap_pages) as f64 / io.pages_synced.max(1) as f64,
+            per(io.gap_fill_ns) / 1e3,
+            per(io.data_sync_ns) / 1e3,
+        );
+    }
 }
 
 /// TN's per-block persist on this build's engine: one block per commit, then

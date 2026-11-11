@@ -82,7 +82,7 @@ mod txn;
 
 pub use catalog::DupOptions;
 pub use check::{CheckReport, TableCheck};
-pub use env::{Env, EnvOptions, EnvStat, SyncMode};
+pub use env::{Env, EnvOptions, EnvStat, SyncMode, MAX_GAP_FILL};
 pub use error::{Error, Result};
 pub use file::MIN_GROWTH;
 pub use stats::IoStats;

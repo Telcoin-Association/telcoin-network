@@ -98,6 +98,7 @@ pub(crate) fn info(error: &tn_lmdb::Error) -> DatabaseErrorInfo {
         | E::InvalidPageSize(_)
         | E::InvalidMaxGrowth(_)
         | E::InvalidMapReserve(_)
+        | E::InvalidGapFill(_)
         | E::InvalidDupOptions(_) => Mdbx::INVALID_PARAMETER.info(),
         E::Failed(_) => Mdbx::PANIC.with_message(error.to_string()),
         E::Full(_) => Mdbx::MAP_FULL.with_message(error.to_string()),

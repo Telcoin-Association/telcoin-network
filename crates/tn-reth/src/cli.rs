@@ -64,12 +64,15 @@ use crate::{
 ///
 /// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
 /// `--sanitize-txs`), which reth's `NodeConfig` has no place for. The third is the storage layout
-/// a new datadir gets ([`RethConfig::new_datadir_layout`]).
+/// a new datadir gets ([`RethConfig::new_datadir_layout`]). The fourth is tn-lmdb's gap fill in
+/// pages, `--db.gap-fill` (0: off; [`RethConfig::db_gap_fill`]), which reth's `DatabaseArgs` has
+/// no place for.
 #[derive(Clone, Debug)]
 pub struct RethConfig(
     pub(crate) NodeConfig<RethChainSpec>,
     pub(crate) TxForwardConfig,
     pub(crate) StorageLayout,
+    pub(crate) u32,
 );
 
 /// Reth specific command line args.
@@ -93,6 +96,13 @@ pub struct RethCommand {
     /// All database related arguments
     #[clap(flatten)]
     pub db: DatabaseArgs,
+
+    /// tn-lmdb only: gap fill, in pages (unset or 0: off, at most 64). A durable commit first
+    /// rewrites each gap of at most this many clean pages between two runs of its dirty pages with
+    /// the bytes they hold, so the disk takes fewer, larger writes for more bytes written. For
+    /// disks that cap I/Os per second (cloud block storage), not for local NVMe. Refused on MDBX.
+    #[arg(long = "db.gap-fill", value_name = "PAGES", help_heading = "Database")]
+    pub db_gap_fill: Option<u32>,
 }
 
 /// The reth rpc modules an operator may enable at all.
@@ -296,7 +306,7 @@ impl RethConfig {
         // TN's per-sender slot default is seeded into reth's global pool defaults by
         // `init_reth_defaults` before parsing, so `txpool` already carries either that default
         // or the operator's explicit value. Nothing to override here.
-        let RethCommand { mut rpc, txpool, db } = reth_config;
+        let RethCommand { mut rpc, txpool, db, db_gap_fill } = reth_config;
 
         Self::validate_rpc_modules(rpc.http, &mut rpc.http_api);
         Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);
@@ -451,13 +461,13 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this, tx_forward, StorageLayout::for_new_datadirs())
+        Self(this, tx_forward, StorageLayout::for_new_datadirs(), db_gap_fill.unwrap_or(0))
     }
 
     /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
     /// restores, tests), with transaction forwarding off.
     pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
-        Self(node_config, TxForwardConfig::default(), StorageLayout::for_new_datadirs())
+        Self(node_config, TxForwardConfig::default(), StorageLayout::for_new_datadirs(), 0)
     }
 
     /// The storage layout a new datadir gets: [`StorageLayout::for_new_datadirs`] unless
@@ -471,6 +481,18 @@ impl RethConfig {
     /// layouts. The MDBX build refuses v2 when it creates the datadir.
     pub fn with_new_datadir_layout(mut self, layout: StorageLayout) -> Self {
         self.2 = layout;
+        self
+    }
+
+    /// tn-lmdb's gap fill in pages (`--db.gap-fill`; 0: off), which the database open passes to
+    /// the engine (`EnvOptions::gap_fill`). The MDBX build refuses any other than 0 at the open.
+    pub fn db_gap_fill(&self) -> u32 {
+        self.3
+    }
+
+    /// This config, with tn-lmdb's gap fill at `pages` (0: off): for benches.
+    pub fn with_db_gap_fill(mut self, pages: u32) -> Self {
+        self.3 = pages;
         self
     }
 

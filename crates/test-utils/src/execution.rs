@@ -70,9 +70,9 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { instance, ext, reth, healthcheck, .. } = command;
-    let RethCommand { rpc, txpool, db, .. } = reth;
+    let RethCommand { rpc, txpool, db, db_gap_fill } = reth;
 
-    let reth_command = RethCommand { rpc, txpool, db };
+    let reth_command = RethCommand { rpc, txpool, db, db_gap_fill };
 
     let mut tn_config = Config::default_for_test();
     if let Some(chain) = opt_chain {

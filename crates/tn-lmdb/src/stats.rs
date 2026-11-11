@@ -59,6 +59,19 @@ pub struct IoStats {
     /// The pages the `msync`s of [`Self::msync_syncs`] spanned, from each range's first dirty page
     /// to its last, the clean pages between included.
     pub msync_span_pages: u64,
+    /// Runs of adjacent pages among the pages step 4 made durable ([`Self::pages_synced`]),
+    /// summed over the runs of step 4, before any gap fill: on Linux about the writes the disk
+    /// took for them (a run longer than the device's largest write is split), and with
+    /// [`crate::EnvOptions::gap_fill`] on, `sync_runs - gaps_filled`.
+    pub sync_runs: u64,
+    /// Gaps of clean pages between two runs of [`Self::sync_runs`] that step 4 rewrote with their
+    /// own bytes before its sync ([`crate::EnvOptions::gap_fill`]): each joins two runs into one.
+    pub gaps_filled: u64,
+    /// The pages the gaps of [`Self::gaps_filled`] held: the extra pages step 4 wrote.
+    pub gap_pages: u64,
+    /// Gaps the gap fill skipped because the page cache did not hold them whole (Linux only: on
+    /// macOS every gap is read).
+    pub gap_misses: u64,
     /// Bytes the file grew by: its physical length, which grows geometrically, with real blocks,
     /// ahead of the pages in use ([`Self::pages_from_end`] counts those). A growth that first cut
     /// a tail the file had at open counts from the cut length.
@@ -74,6 +87,9 @@ pub struct IoStats {
     /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages (on macOS the
     /// `msync`s that take the `fdatasync`'s place).
     pub data_sync_ns: u64,
+    /// Time in step 4's gap fill ([`crate::EnvOptions::gap_fill`]), before its sync: the gaps'
+    /// reads and writes.
+    pub gap_fill_ns: u64,
     /// Time in step 5: the file's size sync (`fdatasync`) when it grew and step 4 did not already
     /// sync it; a check of a flag otherwise.
     pub size_sync_ns: u64,
@@ -135,11 +151,16 @@ impl IoStats {
             msync_syncs,
             fdatasync_syncs,
             msync_span_pages,
+            sync_runs,
+            gaps_filled,
+            gap_pages,
+            gap_misses,
             bytes_grown,
             free_list_save_rounds,
             save_ns,
             stamp_ns,
             data_sync_ns,
+            gap_fill_ns,
             size_sync_ns,
             meta_sync_ns,
             cow_copies,
@@ -163,11 +184,16 @@ impl IoStats {
             msync_syncs: d(msync_syncs, earlier.msync_syncs),
             fdatasync_syncs: d(fdatasync_syncs, earlier.fdatasync_syncs),
             msync_span_pages: d(msync_span_pages, earlier.msync_span_pages),
+            sync_runs: d(sync_runs, earlier.sync_runs),
+            gaps_filled: d(gaps_filled, earlier.gaps_filled),
+            gap_pages: d(gap_pages, earlier.gap_pages),
+            gap_misses: d(gap_misses, earlier.gap_misses),
             bytes_grown: d(bytes_grown, earlier.bytes_grown),
             free_list_save_rounds: d(free_list_save_rounds, earlier.free_list_save_rounds),
             save_ns: d(save_ns, earlier.save_ns),
             stamp_ns: d(stamp_ns, earlier.stamp_ns),
             data_sync_ns: d(data_sync_ns, earlier.data_sync_ns),
+            gap_fill_ns: d(gap_fill_ns, earlier.gap_fill_ns),
             size_sync_ns: d(size_sync_ns, earlier.size_sync_ns),
             meta_sync_ns: d(meta_sync_ns, earlier.meta_sync_ns),
             cow_copies: d(cow_copies, earlier.cow_copies),
