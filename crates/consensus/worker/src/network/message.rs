@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn reporter_over_quota_is_recoverable() {
         let err = WorkerNetworkError::ReporterOverQuota {
-            peer: tn_types::BlsPublicKey::default(),
+            peer: Box::new(tn_types::BlsPublicKey::default()),
             digest: tn_types::B256::ZERO,
         };
         assert!(matches!(
