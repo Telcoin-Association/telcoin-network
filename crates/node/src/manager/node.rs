@@ -753,6 +753,8 @@ where
         key_config: KeyConfig,
         version_str: &'static str,
     ) -> eyre::Result<Self> {
+        // once per process: the arm this node runs, for operators and the benchmark harness
+        announce_switches(&builder.tn_config.parameters);
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
         let committee_zero =
@@ -2055,6 +2057,41 @@ async fn seed_node_mode_on_startup(
     });
 }
 
+/// Log the runtime switches once and export each as a `tn_node_switch` gauge.
+///
+/// A mistyped switch key in `parameters.yaml` is ignored without an error, so this line and the
+/// gauges are how an operator, or the benchmark harness after every restart, confirms the arm a
+/// node runs. The line lists every switch of [`tn_config::Parameters::switches`], in its order,
+/// with its effective value in YAML form (`true`, `3`, `150ms`, `0s`), whether or not the file
+/// names it.
+fn announce_switches(parameters: &tn_config::Parameters) {
+    let switches = parameters.switches();
+    // every key below is listed by `switches()`; a test pins the names and their order
+    let value = |key: &str| {
+        switches
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map_or_else(|| "unlisted".to_string(), |(_, value)| value.to_string())
+    };
+    info!(
+        target: "node::switches",
+        quorum_exec_block = %value("quorum_exec_block"),
+        quorum_exec_block_starved_rounds = %value("quorum_exec_block_starved_rounds"),
+        vote_queue_fix = %value("vote_queue_fix"),
+        mdbx_random_advice = %value("mdbx_random_advice"),
+        sealed_tx_keep = %value("sealed_tx_keep"),
+        digest_dedupe = %value("digest_dedupe"),
+        recovery_threads = %value("recovery_threads"),
+        epoch_close_task_drain = %value("epoch_close_task_drain"),
+        epoch_record_state_check = %value("epoch_record_state_check"),
+        parent_grace = %value("parent_grace"),
+        rpc_admission_backlog_outputs = %value("rpc_admission_backlog_outputs"),
+        pipelined_persist = %value("pipelined_persist"),
+        "node switches"
+    );
+    crate::metrics::record_node_switches(&switches);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2646,5 +2683,139 @@ mod tests {
         );
         let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
         Ok((node_config, reth_db))
+    }
+
+    // ---- bench6 bench6-switches ----
+
+    /// One captured event: its level, target and fields rendered as the node's log files show
+    /// them.
+    type CapturedEvent = (tracing::Level, String, String);
+
+    /// A subscriber that renders each event's fields the way the node's log formatter does.
+    ///
+    /// The node logs through reth's `LogFormat::Terminal` for stdout and for the log file: a
+    /// `tracing_subscriber::fmt` layer with its default field formatter. That formatter writes
+    /// the message first, then ` name=value` per field, each value through its `Debug` form, a
+    /// string value quoted and a `%`-recorded value as its `Display` form. [`FieldLine`]
+    /// reproduces exactly that (without the ANSI styling stdout adds when colour is on), so the
+    /// rendered fields here are the `key=value` tokens the benchmark harness parses.
+    #[derive(Clone, Default)]
+    struct LineCapture(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = FieldLine::default();
+            event.record(&mut line);
+            let metadata = event.metadata();
+            self.0.lock().expect("capture lock").push((
+                *metadata.level(),
+                metadata.target().to_string(),
+                line.0,
+            ));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Event fields rendered like `tracing_subscriber::fmt::format::DefaultVisitor`.
+    #[derive(Default)]
+    struct FieldLine(String);
+
+    impl tracing::field::Visit for FieldLine {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.record_debug(field, &format_args!("{value}"))
+            } else {
+                self.record_debug(field, &value)
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let rendered = match field.name() {
+                "message" => format!("{value:?}"),
+                name => format!("{name}={value:?}"),
+            };
+            self.0.push_str(&rendered);
+        }
+    }
+
+    /// Capture the `node switches` events [`announce_switches`] logs for `parameters`.
+    fn captured_switch_lines(parameters: &tn_config::Parameters) -> Vec<CapturedEvent> {
+        let capture = LineCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || announce_switches(parameters));
+        let events = capture.0.lock().expect("capture lock").clone();
+        events
+    }
+
+    /// The `node switches` line is one info event on `node::switches` whose `key=value` tokens
+    /// name every switch in `Parameters::switches()` order, with YAML-form values.
+    #[test]
+    fn test_node_switches_line_renders_yaml_tokens() {
+        let defaults = tn_config::Parameters::default();
+        let events = captured_switch_lines(&defaults);
+        assert_eq!(events.len(), 1, "exactly one event: {events:?}");
+        let (level, target, line) = &events[0];
+        assert_eq!(*level, tracing::Level::INFO);
+        assert_eq!(target, "node::switches");
+        assert_eq!(
+            line,
+            "node switches quorum_exec_block=false quorum_exec_block_starved_rounds=0 \
+             vote_queue_fix=false mdbx_random_advice=false sealed_tx_keep=false \
+             digest_dedupe=false recovery_threads=0 epoch_close_task_drain=false \
+             epoch_record_state_check=false parent_grace=0s rpc_admission_backlog_outputs=0 \
+             pipelined_persist=false"
+        );
+
+        // an arm with every switch moved off its default
+        let arm = tn_config::Parameters {
+            quorum_exec_block: true,
+            quorum_exec_block_starved_rounds: 4,
+            vote_queue_fix: true,
+            mdbx_random_advice: true,
+            sealed_tx_keep: true,
+            digest_dedupe: true,
+            recovery_threads: 3,
+            epoch_close_task_drain: true,
+            epoch_record_state_check: true,
+            parent_grace: std::time::Duration::from_millis(150),
+            rpc_admission_backlog_outputs: 2,
+            pipelined_persist: true,
+            ..Default::default()
+        };
+        let events = captured_switch_lines(&arm);
+        assert_eq!(events.len(), 1, "exactly one event: {events:?}");
+        let line = &events[0].2;
+        assert_eq!(
+            line,
+            "node switches quorum_exec_block=true quorum_exec_block_starved_rounds=4 \
+             vote_queue_fix=true mdbx_random_advice=true sealed_tx_keep=true \
+             digest_dedupe=true recovery_threads=3 epoch_close_task_drain=true \
+             epoch_record_state_check=true parent_grace=150ms rpc_admission_backlog_outputs=2 \
+             pipelined_persist=true"
+        );
+
+        // the tokens after the message are exactly the enumeration, in order, with its values
+        let tokens: Vec<&str> =
+            line.strip_prefix("node switches ").expect("message first").split(' ').collect();
+        let expected: Vec<String> =
+            arm.switches().iter().map(|(name, value)| format!("{name}={value}")).collect();
+        assert_eq!(tokens, expected);
     }
 }
