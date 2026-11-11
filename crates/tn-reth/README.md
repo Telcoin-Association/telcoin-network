@@ -54,12 +54,20 @@ nothing, and neither do the stages after it.
 | `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer, in parallel on rayon. Part of execute. |
 | `tn_reth_block_finish_seconds` | The block builder's `finish`: the post-execution changes (on an epoch-closing block, the closing system calls), merging the state transitions, hashing the post-state, the state root, and assembling the block. |
 | `tn_reth_block_hashed_state_seconds` | Hashing the block's post-execution state (`hashed_post_state`). Part of finish. |
-| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay::layered_root_with_updates` in `src/env/output_overlay.rs`), from opening its read-only database transaction to closing it. Part of finish. |
+| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay` in `src/env/output_overlay.rs`, with the changed storage roots on parallel tasks: `parallel.rs` there), from opening its read-only database transaction to closing it, the tasks' own transactions included. Part of finish. |
 | `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
 
 None of them covers the persist, which runs once per output after every block is built; reth's
 `save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
 start at 5 ms, so a stage shorter than that reads only as "under 5 ms" on a dashboard.
+
+### Parallel storage roots
+
+A block's state root computes the storage roots of the accounts with changed storage on rayon's
+pool while the account walk runs (`src/env/output_overlay/parallel.rs`). One block in 256 is also
+computed serially and compared; a difference is logged with both roots, counted in
+`tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the block uses the
+serial result. `TN_PARALLEL_STATE_ROOT=0` in the node's environment computes every root serially.
 
 ## Header field mapping
 

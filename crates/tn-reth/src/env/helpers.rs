@@ -126,6 +126,25 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.database_provider_ro()?)
     }
 
+    /// TEST-ONLY: `overlay`'s layered root for `current` over this env's database with the
+    /// parallel storage-root tasks and no serial comparison (`output_overlay/parallel.rs`).
+    ///
+    /// The #1301 trie-level differential test checks it against the same oracle as the serial
+    /// root.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn parallel_layered_root_for_test(
+        &self,
+        overlay: &crate::OutputTrieOverlay,
+        current: reth_trie::HashedPostState,
+    ) -> TnRethResult<(B256, reth_trie::updates::TrieUpdates)> {
+        let provider = self.inner.blockchain_provider.database_provider_ro()?;
+        Ok(overlay.layered_root_with_updates_parallel(
+            &self.inner.blockchain_provider,
+            reth_provider::DBProvider::tx_ref(&provider),
+            current,
+        )?)
+    }
+
     /// Look up and return the sealed header for block number.
     pub fn sealed_header_by_number(&self, number: u64) -> TnRethResult<Option<SealedHeader>> {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.sealed_header(number)?)

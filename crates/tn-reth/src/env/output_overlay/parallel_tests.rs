@@ -1,0 +1,387 @@
+//! Parallel storage roots give the serial root and trie updates, and every failure falls back to
+//! the serial computation.
+//!
+//! The fixture persists a base state (a hot contract, many small contracts, EOAs) so the database
+//! holds real account and storage trie nodes, then drives multi-block outputs through the output
+//! overlay, comparing each block's parallel root with the serial one over the same transaction.
+
+use super::{
+    checked, storage_root_targets, ParallelRoots, StorageRootSource as _, StorageRootTasks,
+    TaskError, TASK_ROOTS_TAKEN,
+};
+use crate::{OutputTrieOverlay, RethChainSpec, RethEnv};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+use reth_chain_state::ComputedTrieData;
+use reth_primitives_traits::Account;
+use reth_provider::{
+    ChainStateBlockWriter as _, DBProvider as _, DatabaseProviderFactory as _, StateWriter as _,
+    TrieWriter as _,
+};
+use reth_trie::{updates::TrieUpdates, HashedPostState, HashedStorage};
+use std::sync::Arc;
+use tempfile::TempDir;
+use tn_types::{test_genesis, TaskManager, B256, U256};
+
+/// Slots of the hot contract in the base state.
+const HOT_SLOTS: u64 = 2_000;
+/// Small contracts in the base state, with one to three slots each.
+const SMALL_CONTRACTS: u64 = 300;
+/// EOAs in the base state.
+const EOAS: u64 = 2_000;
+
+/// A deterministic key from a domain tag and an index.
+fn key(domain: u8, index: u64) -> B256 {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&index.to_be_bytes());
+    bytes[8] = domain;
+    tn_types::keccak256(bytes)
+}
+
+/// The hot contract's hashed address.
+fn hot() -> B256 {
+    key(1, 0)
+}
+
+/// Small contract `i`'s hashed address.
+fn small(i: u64) -> B256 {
+    key(2, i)
+}
+
+/// EOA `i`'s hashed address.
+fn eoa(i: u64) -> B256 {
+    key(3, i)
+}
+
+/// Slot `i`'s hashed key.
+fn slot(i: u64) -> B256 {
+    key(4, i)
+}
+
+/// A contract account with nonce `nonce`.
+fn contract(nonce: u64) -> Option<Account> {
+    Some(Account { nonce, balance: U256::from(nonce), bytecode_hash: Some(key(5, 0)) })
+}
+
+/// An EOA with nonce `nonce`.
+fn account(nonce: u64) -> Option<Account> {
+    Some(Account { nonce, balance: U256::from(nonce * 7 + 1), bytecode_hash: None })
+}
+
+/// A temp chain with the base state persisted (finalized block 1).
+struct Fixture {
+    env: RethEnv,
+    _tmp: TempDir,
+    _tasks: TaskManager,
+    /// The finalized block number the next persist writes.
+    next_tip: u64,
+}
+
+impl Fixture {
+    fn new() -> eyre::Result<Self> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp = TempDir::new()?;
+        let tasks = TaskManager::new("parallel storage roots");
+        let env = RethEnv::new_for_temp_chain(chain, tmp.path(), &tasks, None)?;
+        let mut fixture = Self { env, _tmp: tmp, _tasks: tasks, next_tip: 1 };
+
+        let mut base =
+            HashedPostState::default().with_accounts([(hot(), contract(1))]).with_storages([(
+                hot(),
+                HashedStorage::from_iter(
+                    false,
+                    (0..HOT_SLOTS).map(|i| (slot(i), U256::from(i + 1))),
+                ),
+            )]);
+        for i in 0..SMALL_CONTRACTS {
+            base.accounts.insert(small(i), contract(i + 2));
+            base.storages.insert(
+                small(i),
+                HashedStorage::from_iter(
+                    false,
+                    (0..1 + i % 3).map(|s| (slot(s), U256::from(i + s + 1))),
+                ),
+            );
+        }
+        for i in 0..EOAS {
+            base.accounts.insert(eoa(i), account(i));
+        }
+        fixture.persist(&[base])?;
+        Ok(fixture)
+    }
+
+    /// Persist `blocks` as one output: each block's state and the trie updates of its serial root
+    /// over the output's earlier blocks, then advance the finalized block number, as a persist
+    /// does.
+    fn persist(&mut self, blocks: &[HashedPostState]) -> eyre::Result<()> {
+        let factory = self.env.blockchain_provider();
+        let provider = factory.database_provider_ro()?;
+        let mut overlay = OutputTrieOverlay::new();
+        let mut sealed = Vec::new();
+        for block in blocks {
+            let (_, updates) =
+                overlay.layered_root_with_updates(provider.tx_ref(), block.clone())?;
+            let state = Arc::new(block.clone().into_sorted());
+            let nodes = Arc::new(updates.into_sorted());
+            overlay.extend_from_block(&ComputedTrieData::without_trie_input(
+                Arc::clone(&state),
+                Arc::clone(&nodes),
+            ));
+            sealed.push((state, nodes));
+        }
+        drop(provider);
+        let rw = factory.database_provider_rw()?;
+        for (state, nodes) in &sealed {
+            rw.write_hashed_state(state)?;
+            rw.write_trie_updates_sorted(nodes)?;
+        }
+        rw.save_finalized_block_number(self.next_tip)?;
+        rw.commit()?;
+        self.next_tip += 1;
+        Ok(())
+    }
+
+    /// Run `blocks` as one output: each block's root serially, with the tasks unchecked and in
+    /// shadow mode, over one transaction; all three must agree. Returns the task results the walks
+    /// took.
+    fn check_output(&self, blocks: &[HashedPostState]) -> eyre::Result<usize> {
+        let factory = self.env.blockchain_provider();
+        let provider = factory.database_provider_ro()?;
+        let tx = provider.tx_ref();
+        let mut overlay = OutputTrieOverlay::new();
+        let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
+        for (i, block) in blocks.iter().enumerate() {
+            let serial = overlay.layered_root_with_updates(tx, block.clone())?;
+            let parallel =
+                overlay.layered_root_with_updates_parallel(factory, tx, block.clone())?;
+            assert_eq!(parallel.0, serial.0, "state root differs at block {i}");
+            assert_eq!(parallel.1, serial.1, "trie updates differ at block {i}");
+            let shadow = overlay.block_root_with_updates(
+                factory,
+                tx,
+                block.clone(),
+                ParallelRoots::Shadow,
+            )?;
+            assert_eq!(shadow, serial, "shadow result differs at block {i}");
+            overlay.extend_from_block(&ComputedTrieData::without_trie_input(
+                Arc::new(block.clone().into_sorted()),
+                Arc::new(serial.1.into_sorted()),
+            ));
+        }
+        Ok(TASK_ROOTS_TAKEN.with(|n| n.get()) - taken_before)
+    }
+}
+
+/// A random block over the fixture's keys plus new ones: account updates, creations and
+/// destructions, slot writes and deletions, storage wipes with and without new slots, destroyed
+/// contracts re-created with other storage, storage-only changes, and keys earlier blocks of the
+/// output changed.
+fn random_block(rng: &mut StdRng, block: u64) -> HashedPostState {
+    let mut state = HashedPostState::default();
+    let value = |rng: &mut StdRng| U256::from(rng.random_range(1..u64::MAX));
+    for _ in 0..rng.random_range(0..40) {
+        let i = rng.random_range(0..EOAS + 50);
+        let info = if rng.random_ratio(1, 8) { None } else { account(block * 1_000 + i) };
+        state.accounts.insert(eoa(i), info);
+    }
+    // the hot contract: many slots most blocks, sometimes untouched
+    if rng.random_ratio(4, 5) {
+        let slots = (0..rng.random_range(1..300)).map(|_| {
+            let s = rng.random_range(0..HOT_SLOTS + 200);
+            (slot(s), if rng.random_ratio(1, 6) { U256::ZERO } else { value(rng) })
+        });
+        let storage = HashedStorage::from_iter(false, slots.collect::<Vec<_>>());
+        state.storages.insert(hot(), storage);
+        if rng.random_bool(0.5) {
+            state.accounts.insert(hot(), contract(block));
+        }
+    }
+    for _ in 0..rng.random_range(0..30) {
+        let i = rng.random_range(0..SMALL_CONTRACTS + 20);
+        let roll = rng.random_range(0..10);
+        let (info, storage) = match roll {
+            // destroyed: account removed, storage wiped
+            0 => (Some(None), HashedStorage::from_iter(true, [])),
+            // wiped and re-created in this block with other slots
+            1 => (Some(contract(block)), HashedStorage::from_iter(true, [(slot(9), value(rng))])),
+            // a slot deleted
+            2 => (None, HashedStorage::from_iter(false, [(slot(0), U256::ZERO)])),
+            // storage-only change: the account leaf comes from earlier blocks or the database
+            3..=5 => (
+                None,
+                HashedStorage::from_iter(false, [(slot(rng.random_range(0..5)), value(rng))]),
+            ),
+            _ => (
+                Some(contract(block + i)),
+                HashedStorage::from_iter(false, [(slot(1), value(rng))]),
+            ),
+        };
+        if let Some(info) = info {
+            state.accounts.insert(small(i), info);
+        }
+        state.storages.insert(small(i), storage);
+    }
+    state
+}
+
+/// Random multi-block outputs, persisted between outputs so later outputs read their tries from
+/// the database: the parallel root equals the serial one on every block.
+#[tokio::test]
+async fn random_outputs_parallel_equals_serial() -> eyre::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let mut taken = 0;
+    for seed in 0..4u64 {
+        let mut rng = StdRng::seed_from_u64(0x7a5c_0000 + seed);
+        let blocks: Vec<_> = (0..10).map(|b| random_block(&mut rng, seed * 100 + b)).collect();
+        taken += fixture.check_output(&blocks)?;
+        fixture.persist(&blocks)?;
+    }
+    assert!(taken > 0, "no block took a task's storage root: the tasks were never exercised");
+    Ok(())
+}
+
+/// One hot contract: a single task with many slots, overlapped with the account walk.
+#[tokio::test]
+async fn one_hot_contract_parallel_equals_serial() -> eyre::Result<()> {
+    let fixture = Fixture::new()?;
+    let blocks: Vec<_> = (0..4u64)
+        .map(|b| {
+            HashedPostState::default()
+                .with_accounts((0..50).map(|i| (eoa(i * 13 + b), account(b + i))))
+                .with_storages([(
+                    hot(),
+                    HashedStorage::from_iter(
+                        false,
+                        (0..400).map(|s| (slot(s * 5 + b), U256::from(b * 1_000 + s))),
+                    ),
+                )])
+        })
+        .collect();
+    fixture.check_output(&blocks)?;
+    Ok(())
+}
+
+/// Many small contracts: one task each, one or two slots.
+#[tokio::test]
+async fn many_small_contracts_parallel_equals_serial() -> eyre::Result<()> {
+    let fixture = Fixture::new()?;
+    let blocks: Vec<_> = (0..3u64)
+        .map(|b| {
+            HashedPostState::default().with_storages((0..SMALL_CONTRACTS).map(|i| {
+                (small(i), HashedStorage::from_iter(false, [(slot(b), U256::from(b + i + 1))]))
+            }))
+        })
+        .collect();
+    let taken = fixture.check_output(&blocks)?;
+    assert!(taken > 0, "no block took a task's storage root: the tasks were never exercised");
+    Ok(())
+}
+
+/// No storage changes: no targets, the serial path, no task.
+#[tokio::test]
+async fn no_storage_changes_runs_serially() -> eyre::Result<()> {
+    let fixture = Fixture::new()?;
+    let blocks: Vec<_> = (0..3u64)
+        .map(|b| {
+            HashedPostState::default().with_accounts(
+                (0..100)
+                    .map(|i| (eoa(i + b), account(b * 10 + i)))
+                    .chain([(hot(), contract(b + 9))]),
+            )
+        })
+        .collect();
+    let block = blocks[0].clone();
+    assert!(storage_root_targets(&block.construct_prefix_sets().freeze()).is_empty());
+    assert_eq!(fixture.check_output(&blocks)?, 0, "a block without storage changes ran tasks");
+    Ok(())
+}
+
+/// A commit between the walk's transaction and the tasks' (it changes a slot of every target and
+/// advances the finalized block number, as a persist does): every task sees another tip and
+/// leaves its account to the walk, so the root is the serial one over the walk's transaction.
+/// Without the tip check any task result the walk took would carry the commit's slot.
+#[tokio::test]
+async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
+    let mut fixture = Fixture::new()?;
+    // the hot contract and 60 small ones (two or three slots each), one slot written in each
+    let targets = || std::iter::once(hot()).chain((0..60).map(|i| small(i * 5 + 1)));
+    let block = HashedPostState::default().with_storages(
+        targets().map(|a| (a, HashedStorage::from_iter(false, [(slot(0), U256::from(77))]))),
+    );
+    let factory = fixture.env.blockchain_provider();
+    let walk_provider = factory.database_provider_ro()?;
+    let walk_tx = walk_provider.tx_ref();
+    let overlay = OutputTrieOverlay::new();
+    let serial = overlay.layered_root_with_updates(walk_tx, block.clone())?;
+
+    // the commit: another value under a slot of each target the block does not write
+    let moved = HashedPostState::default().with_storages(
+        targets().map(|a| (a, HashedStorage::from_iter(false, [(slot(1), U256::from(999))]))),
+    );
+    fixture.persist(&[moved])?;
+    let factory = fixture.env.blockchain_provider();
+    let after = factory.database_provider_ro()?;
+    let moved_serial = overlay.layered_root_with_updates(after.tx_ref(), block.clone())?;
+    assert_ne!(moved_serial.0, serial.0, "the commit must change the block's root");
+    drop(after);
+
+    let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
+    let parallel = overlay.layered_root_with_updates_parallel(factory, walk_tx, block)?;
+    assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
+    assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
+    Ok(())
+}
+
+/// A task that fails or panics leaves its account to the walk, and a task the walk claimed
+/// before it started does nothing.
+#[test]
+fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
+    let mut targets = vec![(key(9, 1), Default::default()), (key(9, 2), Default::default())];
+    targets.sort_unstable_by_key(|(address, _)| *address);
+    let tasks = StorageRootTasks::new(targets);
+    let [first, second] = [&tasks.slots[0], &tasks.slots[1]];
+
+    tasks.run(first, || panic!("a task panics"));
+    assert!(tasks.storage_root(first.hashed_address).is_none(), "a panicked task's root");
+
+    assert!(tasks.storage_root(second.hashed_address).is_none(), "the walk claims a pending task");
+    tasks.run(second, || unreachable!("a claimed task must not run"));
+
+    let failed = StorageRootTasks::new(vec![(key(9, 3), Default::default())]);
+    failed.run(&failed.slots[0], || Err(TaskError::TipMoved { walk: Some(1), task: Some(2) }));
+    assert!(failed.storage_root(key(9, 3)).is_none(), "a failed task's root");
+    let done = StorageRootTasks::new(vec![(key(9, 4), Default::default())]);
+    done.run(&done.slots[0], || Ok((key(9, 5), 3, Default::default())));
+    assert_eq!(done.storage_root(key(9, 4)).map(|r| r.0), Some(key(9, 5)), "a finished task");
+    assert!(done.storage_root(key(9, 6)).is_none(), "an account without a task");
+    assert_eq!(tasks.failures.lock().0, 1, "the panic is counted as a failure");
+}
+
+/// A sampled comparison that finds a difference (in the root, or only in the trie updates)
+/// returns the serial result and counts it in `tn_reth.parallel_state_root_mismatches_total`.
+/// The counter binds to the recorder current when `RETH_METRICS` is first forced, so run it under
+/// nextest (one process per test).
+#[test]
+fn sampled_difference_uses_the_serial_result_and_counts_it() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let serial = (key(7, 1), TrieUpdates::default());
+    let mut other_updates = TrieUpdates::default();
+    other_updates.removed_nodes.insert(reth_trie::Nibbles::from_nibbles([1, 2]));
+    metrics::with_local_recorder(&recorder, || {
+        assert_eq!(checked(serial.clone(), serial.clone(), false), serial);
+        assert_eq!(checked(serial.clone(), (key(7, 2), TrieUpdates::default()), false), serial);
+        assert_eq!(checked(serial.clone(), (key(7, 1), other_updates), false), serial);
+    });
+    let counted = snapshotter.snapshot().into_vec().into_iter().find_map(|(k, _, _, value)| {
+        (k.key().name() == "tn_reth.parallel_state_root_mismatches_total").then_some(value)
+    });
+    assert!(matches!(counted, Some(DebugValue::Counter(2))), "counted: {counted:?}");
+}
+
+/// In shadow mode a difference panics.
+#[test]
+#[should_panic(expected = "differs from the serial root")]
+fn shadow_difference_panics() {
+    checked((key(7, 1), TrieUpdates::default()), (key(7, 2), TrieUpdates::default()), true);
+}

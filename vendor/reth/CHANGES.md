@@ -1301,3 +1301,28 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the same rows: the lookups return the typed error, the block read answers). Mutation-checked: no
   refusal (the account lookup then reports a corrupted changeset). *Upstream*: no (TN-0124's
   search is TN's).
+
+- **TN-0139** — `StateRoot` can take an account's storage root from a `StorageRootSource` instead
+  of computing it. *Kind*: feature (state root performance).
+  *Files*: `crates/trie/trie/src/trie.rs` (trait `StorageRootSource`; `StateRoot`'s field
+  `storage_roots`, set by `with_storage_roots` and carried by `with_hashed_cursor_factory` and
+  `with_trie_cursor_factory`; the account walk's leaf arm), `crates/trie/trie/src/lib.rs` (export).
+  *Why*: TN computes the storage roots of the accounts with changed storage on rayon tasks while
+  the account walk runs (`crates/tn-reth/src/env/output_overlay/parallel.rs`): at peak load two hot
+  contracts' storage roots are about half of a block's root, and overlapping them with the walk cut
+  the exec bench's root by 42% (peak) and 46% (busy) on a Mac. At each account leaf the walk asks
+  the source; on `None` it computes the root itself with the shared cursors, exactly as before (the
+  `else` arm is the old call, re-indented). A resumed in-progress storage root is always computed
+  in place. The walker, hash builder, trie updates and `finalize` are unchanged. Upstream's
+  `ParallelStateRoot` (reth-trie-parallel, not carried) does not fit TN: it opens its providers
+  through `DatabaseProviderROFactory` with no layered overlay and spawns a task per changed account,
+  not per changed storage trie. It can reach execution: without a source the root is computed as
+  before; with TN's, the block's root is right exactly when every root the source returns equals
+  what the walk would compute. TN checks that: one block in 256 compared with the serial root in
+  production (the serial result is used on a difference), every block in shadow mode, and its
+  tests. *Tests*: TN's `env::output_overlay::parallel::tests` (parallel equals serial with equal
+  trie updates on random multi-block outputs persisted between outputs, one hot contract, many
+  small contracts, no storage changes; a moved database tip and failed, panicked or unstarted tasks
+  fall back to the walk) and `tests/it/trie_overlay.rs` (the parallel root against reth's
+  merged-input oracle). Mutation-checked: the tip check removed, the tasks' prefix set emptied.
+  *Upstream*: no (TN's overlay and task model).

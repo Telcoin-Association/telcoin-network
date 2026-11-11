@@ -9,7 +9,9 @@
 //! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
 //! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics. A third series,
 //! `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked hits of the cross-block
-//! execution cache that differed from the parent state.
+//! execution cache that differed from the parent state, and a fourth,
+//! `tn_reth.parallel_state_root_mismatches_total` (alertable), sampled block roots whose parallel
+//! storage roots differed from the serial computation.
 //!
 //! Six histograms in the same group time the stages of each block that function builds, one
 //! sample per block each: `tn_reth.block_execute_seconds` (with
@@ -172,6 +174,15 @@ pub(crate) struct RethEnvMetrics {
     /// The block is built again without the cache, so this node still builds the right block, but
     /// unchecked stale hits of earlier blocks may already have forked it from its peers.
     pub(crate) exec_cache_stale_hits_total: Counter,
+
+    /// Compared block roots whose parallel storage roots gave another root or other trie updates
+    /// than the serial computation.
+    ///
+    /// Alert on any nonzero value. One block in `CHECK_ONE_BLOCK_IN` with storage-root tasks is
+    /// also computed serially (`env/output_overlay/parallel.rs`); a difference means the parallel
+    /// path is wrong. The block uses the serial result, but unchecked blocks may already have
+    /// forked this node from its peers: switch the tasks off (`TN_PARALLEL_STATE_ROOT=0`).
+    pub(crate) parallel_state_root_mismatches_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
     ///

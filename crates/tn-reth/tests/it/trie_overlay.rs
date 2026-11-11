@@ -114,9 +114,9 @@ fn seeded_deltas(rng: &mut StdRng) -> Vec<HashedPostState> {
     ]
 }
 
-/// Trie-level differential: per block, the layered-cursor root and updates equal
-/// reth's `overlay_root_from_nodes_with_updates` over the `prepend_self`-merged
-/// `TrieInput` built from the same deltas (#1301).
+/// Trie-level differential: per block, the layered-cursor root and updates, serial and with
+/// parallel storage roots, equal reth's `overlay_root_from_nodes_with_updates` over the
+/// `prepend_self`-merged `TrieInput` built from the same deltas (#1301).
 /// Includes interleaving distinct keys across carries at 8, 16, 32, and 64 blocks.
 #[test]
 fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<()> {
@@ -147,6 +147,12 @@ fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<
 
             assert_eq!(new_root, oracle_root, "state root diverged at block {i}");
             assert_eq!(new_updates, oracle_updates, "trie updates diverged at block {i}");
+
+            // the same root with the changed storage roots on parallel tasks
+            let (par_root, par_updates) =
+                env.reth_env.parallel_layered_root_for_test(&overlay, delta.clone())?;
+            assert_eq!(par_root, oracle_root, "parallel state root diverged at block {i}");
+            assert_eq!(par_updates, oracle_updates, "parallel trie updates diverged at block {i}");
 
             // advance both accumulations exactly as production does: the block's own
             // sorted deltas plus the updates its root computation produced

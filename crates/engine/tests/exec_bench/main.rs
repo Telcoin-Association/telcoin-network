@@ -17,7 +17,11 @@
 //! 1. A [`CaptureRecorder`] is installed before any env opens. It keeps every sample of the
 //!    per-block stages (`tn_reth.block_*_seconds`) and of reth's `save_blocks_*` split; with
 //!    `METRICS=prom` everything also goes to tn-metrics' Prometheus recorder, as on a node run with
-//!    `--metrics`.
+//!    `--metrics`. A global tracing subscriber is installed too (`init_test_tracing`: errors to
+//!    stdout unless `RUST_LOG` says otherwise), as the node installs reth's tracer at startup.
+//!    Without a global dispatcher every `trace`-level span of reth-trie's walk takes tracing's
+//!    `log` fallback, which cost about 9% of the state root; with one they are disabled at their
+//!    call sites, as on a node. Numbers from before the subscriber are not like for like.
 //! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend, storage layout
 //!    and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE` and reth's storage
 //!    layout `LAYOUT` ([`StorageLayout`]): both are fixed when the datadir is created, so the base,
@@ -3904,6 +3908,8 @@ async fn exec_bench() -> eyre::Result<()> {
         );
     }
 
+    // a global tracing dispatcher, as the node has (see the module docs, phase 1)
+    tn_types::test_utils::init_test_tracing();
     // the recorder goes first: reth's metric handles bind to the recorder current at their first
     // registration, which the first env open does
     let (inner, prometheus) = match knobs.metrics {
