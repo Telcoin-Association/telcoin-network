@@ -72,9 +72,10 @@ pub fn execute_consensus_output(
 /// The handle is resolved before the first block, blocking until the job finishes (it usually
 /// has, while earlier outputs executed); the wait is the `output executed` line's
 /// `recover_wait_ms`. On catch-up or replay up to `MAX_QUEUED_OUTPUTS` jobs start together and
-/// share the global rayon pool, with each other, batch validation and the build's own parallel
-/// phases, so the first output's wait can exceed what inline recovery would take while the
-/// later outputs' waits read about zero. A job that ended without a result falls back to inline
+/// share one rayon pool with each other: the global pool, which batch validation and the build's
+/// own parallel phases also use, unless `recovery_threads` gives recovery a dedicated pool. So
+/// the first output's wait can exceed what inline recovery would take while the later outputs'
+/// waits read about zero. A job that ended without a result falls back to inline
 /// recovery (see [`RecoveryHandle::wait`]), so the signers never fail the output. Must run on a
 /// blocking thread when `signers` is `Some`.
 ///
