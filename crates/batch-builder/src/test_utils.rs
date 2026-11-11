@@ -21,7 +21,7 @@ pub fn execute_test_batch(test_batch: &mut Batch) {
 
     let args =
         BatchBuilderArgs { pool, beneficiary: test_batch.beneficiary, epoch: test_batch.epoch };
-    let BatchBuilderOutput { batch, .. } = build_batch(args, 0, test_batch.base_fee_per_gas);
+    let BatchBuilderOutput { batch, .. } = build_batch(args, 0, test_batch.base_fee_per_gas, false);
     test_batch.beneficiary = batch.beneficiary;
     // Don't reset base_fee_per_gas, some tests need that value to remain.
 }

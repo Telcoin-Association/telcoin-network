@@ -191,8 +191,10 @@ impl SealedTxs {
     /// Apply one canonical update: remember each executed `digest`, unmark everything still marked
     /// under it, then drop the mark of every `mined` hash. Return the number of marks cleared.
     ///
-    /// The caller runs this after the pool update has removed the mined transactions, so the
-    /// builder cannot see a mined transaction as unmarked and still pooled.
+    /// The caller runs this after the pool update has removed the mined transactions, so the pool
+    /// never holds a mined transaction unmarked. A builder walking an older snapshot of the pool
+    /// can still meet one; it reads the mark first and then asks the pool whether it still holds
+    /// the transaction.
     pub(crate) fn clear_executed(
         &self,
         digests: impl IntoIterator<Item = BlockHash>,

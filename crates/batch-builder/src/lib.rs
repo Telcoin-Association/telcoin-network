@@ -400,7 +400,7 @@ impl BatchBuilder {
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable, sealed_skipped, stats } =
-                match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
+                match batch::spawn_batch_build(build_args, worker_id, base_fee, keeps_sealed).await {
                     Ok(output) => output,
                     Err(e) => {
                         error!(target: "worker::batch_builder", ?e, "blocking batch build failed");
@@ -2128,7 +2128,7 @@ mod tests {
                             beneficiary: Address::ZERO,
                             epoch: 0,
                         };
-                        let output = build_batch(args, 3, MIN_PROTOCOL_BASE_FEE);
+                        let output = build_batch(args, 3, MIN_PROTOCOL_BASE_FEE, false);
                         let batch = output.batch.seal_slow();
                         digests.push(batch.digest().to_string());
                         let trigger =
@@ -3322,6 +3322,133 @@ mod tests {
             assert_eq!(wakes, ["tick", "arrival"]);
             ack(b2_ack, Ok(()))?;
             task.abort();
+            Ok(())
+        }
+
+        /// A pool whose first selection snapshot is held until the test resumes it, so a
+        /// canonical update can land between the snapshot and the walk's mark reads. Every
+        /// other call goes to the worker pool.
+        struct RacingPool {
+            /// The pool the snapshot comes from.
+            inner: WorkerTxPool,
+            /// Told once the snapshot is taken.
+            taken: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            /// Released once the update has landed; a dropped sender ends the wait.
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl tn_reth::TxPool for RacingPool {
+            fn best_transactions(&self) -> tn_reth::BestTxns {
+                let snapshot = self.inner.best_transactions();
+                if let Some(taken) = self.taken.lock().unwrap().take() {
+                    let _ = taken.send(());
+                    let _ = self.resume.lock().unwrap().recv();
+                }
+                snapshot
+            }
+
+            fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+                self.inner.remove_eip4844_txs(blobs)
+            }
+
+            fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+                self.inner.remove_unsupported_txs(txs)
+            }
+
+            fn get_account_balances(
+                &self,
+                addresses: &[Address],
+            ) -> std::collections::HashMap<Address, U256> {
+                self.inner.get_account_balances(addresses)
+            }
+
+            fn record_peer_batch(&self, hashes: &[TxHash]) {
+                self.inner.record_peer_batch(hashes)
+            }
+
+            fn is_peer_deferred(&self, hash: &TxHash) -> bool {
+                self.inner.is_peer_deferred(hash)
+            }
+
+            fn is_sealed(&self, hash: &TxHash) -> bool {
+                self.inner.is_sealed(hash)
+            }
+
+            fn holds(&self, hash: &TxHash) -> bool {
+                self.inner.holds(hash)
+            }
+        }
+
+        /// Run one selection with `keeps_sealed` whose snapshot is taken while `txs` are
+        /// pooled, then let `executed` (the batch that carries them) execute and the pool
+        /// apply that block, prune `txs` and clear their marks before the walk reads any mark.
+        /// Return the hashes the selection packed.
+        async fn select_across_the_update(
+            bench: &mut Bench,
+            executed: &SealedBatch,
+            txs: &[TransactionSigned],
+            keeps_sealed: bool,
+        ) -> eyre::Result<Vec<TxHash>> {
+            let (taken, snapshot_taken) = oneshot::channel();
+            let (resume, resumed) = std::sync::mpsc::channel();
+            let pool = RacingPool {
+                inner: bench.txpool.clone(),
+                taken: std::sync::Mutex::new(Some(taken)),
+                resume: std::sync::Mutex::new(resumed),
+            };
+            let args = BatchBuilderArgs::new(pool, Address::ZERO, 0);
+            let selection = tokio::task::spawn_blocking(move || {
+                build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, keeps_sealed)
+            });
+            timeout(WAIT, snapshot_taken).await??;
+
+            bench.execute(&[executed]).await?;
+            bench.wait_gone(txs).await?;
+            bench.wait_marked(txs, false).await?;
+            resume.send(())?;
+            Ok(timeout(WAIT, selection).await??.mined_transactions)
+        }
+
+        /// M1 of the review: the selection walks a snapshot of the pending pool but reads the
+        /// marks live. B1's transactions are pooled and marked when the snapshot is taken; B1
+        /// then executes and the canonical update prunes and unmarks them before the walk
+        /// reaches them. The walk reads each mark and then whether the pool still holds the
+        /// transaction, so it packs none of them again (they would be skipped as `nonce too
+        /// low` on every node).
+        #[tokio::test]
+        async fn a_selection_across_its_batchs_execution_packs_nothing_again() -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 2);
+            bench.submit(&txs).await;
+            let args = BatchBuilderArgs::new(bench.txpool.clone(), Address::ZERO, 0);
+            let b1 = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, true).batch.seal_slow();
+            assert_eq!(hashes(&b1), tx_hashes(&txs));
+            let ticket = bench.txpool.seal_ticket();
+            assert_eq!(bench.txpool.mark_sealed(ticket, b1.digest(), tx_hashes(&txs)).await?, 2);
+
+            let packed = select_across_the_update(&mut bench, &b1, &txs, true).await?;
+            assert!(packed.is_empty(), "executed transactions packed again: {packed:?}");
+            assert_eq!(bench.nonce(bench.a.address())?, 2);
+            Ok(())
+        }
+
+        /// M1 pin (switch off): nothing is marked and selection does not ask the pool whether
+        /// it still holds a candidate, so a selection whose snapshot predates the update packs
+        /// the executed transactions, as before the switch existed.
+        #[tokio::test]
+        async fn switch_off_a_selection_across_the_update_packs_the_snapshot_as_before(
+        ) -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 2);
+            bench.submit(&txs).await;
+            let args = BatchBuilderArgs::new(bench.txpool.clone(), Address::ZERO, 0);
+            let b1 = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false).batch.seal_slow();
+            assert_eq!(hashes(&b1), tx_hashes(&txs));
+
+            let packed = select_across_the_update(&mut bench, &b1, &txs, false).await?;
+            assert_eq!(packed, tx_hashes(&txs));
             Ok(())
         }
     }

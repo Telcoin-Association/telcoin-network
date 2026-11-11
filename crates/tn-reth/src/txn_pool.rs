@@ -232,6 +232,16 @@ pub trait TxPool {
     fn is_sealed(&self, _hash: &TxHash) -> bool {
         false
     }
+    /// Return true if the pool still holds `hash`.
+    ///
+    /// With `sealed_tx_keep` on, the builder asks this about a candidate that
+    /// [`Self::is_sealed`] has just reported unmarked: selection walks a snapshot of the pending
+    /// set, while the canonical update that unmarks an executed batch first removes its
+    /// transactions from the pool, so a candidate marked when the snapshot was taken and
+    /// unmarked now is no longer held. The default is true, for pools that never mark.
+    fn holds(&self, _hash: &TxHash) -> bool {
+        true
+    }
 }
 
 /// A telcoin network transaction pool.
@@ -964,8 +974,10 @@ impl WorkerTxPool {
     /// After the pool update, clear the sealed marks the update settles: every block's
     /// `ommers_hash` is the digest of the batch it executed, so its batch's marks are cleared
     /// (what the block skipped becomes buildable again), and every mined hash loses its mark.
-    /// Clearing after the pool update means the builder never sees a mined transaction as
-    /// unmarked and still pooled.
+    /// Clearing after the pool update means the pool never holds a mined transaction unmarked.
+    /// The builder walks a snapshot of the pending set, which can still list such a
+    /// transaction, so with `sealed_tx_keep` it reads the mark first and then whether the pool
+    /// still holds the transaction ([`TxPool::holds`]).
     async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
         let pool = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1238,6 +1250,10 @@ impl TxPool for WorkerTxPool {
 
     fn is_sealed(&self, hash: &TxHash) -> bool {
         self.5.is_marked(hash)
+    }
+
+    fn holds(&self, hash: &TxHash) -> bool {
+        self.0.contains(hash)
     }
 }
 

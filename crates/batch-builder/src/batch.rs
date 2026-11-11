@@ -105,15 +105,19 @@ pub(crate) struct BuildStats {
 /// Build a batch on the blocking pool, including transaction encoding and sender balance reads.
 ///
 /// The caller awaits this task before proposing the batch and keeps at most one build in flight.
+/// `keeps_sealed` is passed to [`build_batch`].
 pub(crate) fn spawn_batch_build<P: TxPool + Send + 'static>(
     args: BatchBuilderArgs<P>,
     worker_id: WorkerId,
     base_fee: u64,
+    keeps_sealed: bool,
 ) -> tokio::task::JoinHandle<BatchBuilderOutput> {
     // `spawn_blocking` does not carry the caller's tracing span onto the blocking thread;
     // re-enter `propose-batch` so the build's log lines keep worker_id/base_fee/epoch.
     let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || span.in_scope(|| build_batch(args, worker_id, base_fee)))
+    tokio::task::spawn_blocking(move || {
+        span.in_scope(|| build_batch(args, worker_id, base_fee, keeps_sealed))
+    })
 }
 
 /// Construct an TN batch using the best transactions from the pool.
@@ -127,11 +131,16 @@ pub(crate) fn spawn_batch_build<P: TxPool + Send + 'static>(
 /// NOTE: it's possible to under utilize resources if users submit transactions
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
+///
+/// `keeps_sealed` is true when this node keeps a quorum-acked batch's transactions pooled and
+/// marked (switch `sealed_tx_keep` on a worker that seals by quorum). Selection then also skips
+/// a transaction the pool no longer holds; with it false, selection is as before the switch.
 #[inline]
 pub fn build_batch<P: TxPool>(
     args: BatchBuilderArgs<P>,
     worker_id: WorkerId,
     base_fee: u64,
+    keeps_sealed: bool,
 ) -> BatchBuilderOutput {
     let build_start = Instant::now();
     let BatchBuilderArgs { mut pool, beneficiary, epoch } = args;
@@ -174,6 +183,17 @@ pub fn build_batch<P: TxPool>(
         // peer-deferred counts and out of the sender's optimistic nonce.
         if pool.is_sealed(pool_tx.hash()) {
             sealed_skipped = sealed_skipped.saturating_add(1);
+            continue;
+        }
+
+        // `best_txs` is a snapshot of the pending set, but the marks are read live. A canonical
+        // update during this walk removes an executed batch's transactions from the pool and
+        // only then unmarks them, and the eviction sweep unmarks only transactions the pool no
+        // longer holds, so a candidate read as unmarked above and absent here has left the pool
+        // since the snapshot. Packing it would seal a copy that every node skips as `nonce too
+        // low`. The same plain skip as a sealed one keeps the sender's later nonces buildable.
+        // Only with sealed-keep: otherwise the snapshot is packed as before the switch.
+        if keeps_sealed && !pool.holds(pool_tx.hash()) {
             continue;
         }
 
@@ -403,7 +423,7 @@ mod tests {
         let mut pool = TestPool::new(&[valid.clone(), invalid, successor]);
 
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
         assert_eq!(output.batch.transactions, vec![valid.clone()]);
         assert_eq!(output.mined_transactions.len(), 1);
@@ -422,7 +442,7 @@ mod tests {
         // the rejected sender again.
         pool.prune_mined(output.mined_transactions);
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        assert!(build_batch(args, 0, MIN_PROTOCOL_BASE_FEE).batch.transactions.is_empty());
+        assert!(build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false).batch.transactions.is_empty());
     }
 
     /// A gas limit above the whole batch is evicted, including one that would overflow an
@@ -465,7 +485,7 @@ mod tests {
 
                 let args =
                     BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-                let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+                let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
                 assert!(output.batch.transactions.is_empty());
                 assert!(pending_encoded(&pool).is_empty());
@@ -488,7 +508,7 @@ mod tests {
 
                 let args =
                     BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-                let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+                let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
                 assert_eq!(output.batch.transactions, vec![first.clone()]);
                 assert_eq!(pending_encoded(&pool), vec![first]);
@@ -505,7 +525,7 @@ mod tests {
         let all = vec![first.clone(), deferred.clone(), successor.clone()];
         let mut pool = TestPool::new(&all);
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
         assert_eq!(output.batch.transactions, vec![first]);
         assert_eq!(pending_encoded(&pool), all);
@@ -513,7 +533,7 @@ mod tests {
         pool.prune_mined(output.mined_transactions);
 
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
         assert_eq!(output.batch.transactions, vec![deferred, successor]);
         assert_eq!(output.unpackable, 0);
     }
@@ -613,7 +633,7 @@ mod tests {
 
         let BatchBuilderOutput {
             batch, mined_transactions, changed_accounts, peer_deferred, ..
-        } = spawn_batch_build(args, 0, MIN_PROTOCOL_BASE_FEE).await?;
+        } = spawn_batch_build(args, 0, MIN_PROTOCOL_BASE_FEE, false).await?;
 
         assert_eq!(batch.transactions, vec![transaction]);
         assert_eq!(mined_transactions.len(), 1);
@@ -672,7 +692,7 @@ mod tests {
 
         let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
         let BatchBuilderOutput { batch, mined_transactions, peer_deferred, .. } =
-            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
         // only B's transaction is packed
         assert_eq!(batch.transactions, vec![b_nonce_0]);
@@ -721,7 +741,7 @@ mod tests {
 
         let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
         let BatchBuilderOutput { changed_accounts, .. } =
-            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
         let changed = changed_accounts
             .iter()
@@ -799,7 +819,7 @@ mod tests {
 
         let pool = TestPool::new(&transactions).with_balance(sender, U256::MAX);
         let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: EPOCH };
-        let BatchBuilderOutput { batch, .. } = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let BatchBuilderOutput { batch, .. } = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
 
         // the producer packed at least one transaction (the assertion below is not vacuous)
         assert!(!batch.transactions.is_empty(), "the producer must pack some transactions");
@@ -822,7 +842,7 @@ mod tests {
         let mut pool = TestPool::new(txs);
         std::thread::sleep(wait);
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, false);
         (output, admitted.elapsed())
     }
 
@@ -919,7 +939,7 @@ mod tests {
         pool.seal([&a[0], &a[1], &b[0], &b[1]].map(|tx| hash_of(tx)));
 
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, true);
 
         assert_eq!(output.batch.transactions, a[2..].to_vec(), "A's later nonces stay buildable");
         assert_eq!(output.mined_transactions, vec![hash_of(&a[2]), hash_of(&a[3])]);
@@ -946,7 +966,7 @@ mod tests {
         pool.record_peer_batch(&[first]);
 
         let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
-        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, true);
 
         assert_eq!(output.batch.transactions, vec![txs[1].clone()]);
         assert_eq!((output.sealed_skipped, output.peer_deferred), (1, 0));
