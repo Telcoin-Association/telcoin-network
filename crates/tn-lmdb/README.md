@@ -1324,8 +1324,13 @@ checks as `Cursor`'s.
    it will read from them, each batch sorted and its adjacent pages merged into one range. The
    advice queues the reads and returns; the walk's faults then find the pages read or in flight,
    and the device reads a branch's children together
-   (`a_weak_head_check_reads_ahead_what_it_descends_into`). @@LINUX@@ A read-only open's check
-   advises the same (it reads, writes nothing); `Env::check` advises nothing.
+   (`a_weak_head_check_reads_ahead_what_it_descends_into`). On a cloud VM's disk (GCP
+   Hyperdisk, ext4, Linux 7.0) the check after a crash took 3.1 s for 61 MiB of pages and 21.7 s
+   for 463 MiB, about 5,000 pages a second, the disk's read IOPS, where one fault at a time took
+   86.8 s for the 61 MiB; the steady open of the same files keeps its cache and took 3 ms
+   (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`, `TMPDIR` on that disk). A
+   read-only open's check advises the same (it reads, writes nothing); `Env::check` advises
+   nothing.
 10. **Write the boot record's "open"** (`Writer::mark_open`): this boot's id and the file's
    device and inode, synced (`fsync_file`), and the directory synced too when the record was
    missing, before the writer can commit; an error fails the open, naming the record, but for a
