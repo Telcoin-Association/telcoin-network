@@ -121,6 +121,7 @@ pub mod dirs;
 pub mod payload;
 pub mod peer_batch;
 pub use peer_batch::{PeerBatchTxs, PEER_BATCH_DEFER_TTL, PEER_BATCH_SEEN_MAX_TXS};
+pub mod sealed_txs;
 pub mod traits;
 pub mod txn_pool;
 pub use txn_pool::*;

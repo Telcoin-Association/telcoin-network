@@ -27,6 +27,11 @@
 //!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
+//! - With `sealed_tx_keep` on, the batch builder keeps a quorum-acked batch's transactions in the
+//!   pool and marks them in [`SealedTxs`] instead of removing them (issue #1807). The canonical
+//!   update clears the marks of each executed block's batch digest (`ommers_hash`) and of every
+//!   mined hash, re-pooling clears a transaction's mark, and lost canonical notifications clear
+//!   them all. With the switch off nothing is ever marked.
 
 use crate::metrics::{
     record_retired_pool_txns_dropped, record_retired_pool_txns_moved, HandoffDropReason,
@@ -60,7 +65,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
+    gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlockHash, BlsPublicKey,
     Decodable2718 as _, EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError,
     TaskSpawner, TransactionSigned, TxHash, U256,
 };
@@ -75,6 +80,7 @@ use crate::{
     forward_pending::{PendingForwards, RetentionLimits, SubmissionHead},
     metrics::{ForwarderMetrics, RETH_METRICS},
     peer_batch::PeerBatchTxs,
+    sealed_txs::{SealTicket, SealedTxs},
     traits::TelcoinNode,
     PoolTxn, PoolTxnId,
 };
@@ -207,6 +213,16 @@ pub trait TxPool {
     fn record_peer_batch(&self, hashes: &[TxHash]);
     /// Return true if `hash` is still deferred by a validated peer batch.
     fn is_peer_deferred(&self, hash: &TxHash) -> bool;
+    /// Return true if `hash` is sealed into one of this node's batches that has not executed yet
+    /// (switch `sealed_tx_keep`, see [`SealedTxs`]).
+    ///
+    /// The builder skips such a transaction without calling any [`BestTxns`] method. A plain skip
+    /// leaves the sender's later nonces in the iterator, so they can go into the next batch while
+    /// the earlier nonces execute from the sealed one. The default is false, for pools that never
+    /// mark.
+    fn is_sealed(&self, _hash: &TxHash) -> bool {
+        false
+    }
 }
 
 /// A telcoin network transaction pool.
@@ -226,6 +242,9 @@ pub struct WorkerTxPool(
     PeerBatchTxs,
     /// Observer transactions awaiting canonical inclusion, shared across epoch forwarders.
     Arc<Mutex<PendingForwards<TxHash, BlsPublicKey, B256>>>,
+    /// The transactions this node sealed into a quorum-acked batch that has not executed yet,
+    /// kept in the pool and skipped by the builder (switch `sealed_tx_keep`, issue #1807).
+    SealedTxs,
 );
 
 impl From<WorkerTxPool>
@@ -379,6 +398,7 @@ impl WorkerTxPool {
             base_fee,
             PeerBatchTxs::default(),
             Arc::new(Mutex::new(PendingForwards::new(forward_limits))),
+            SealedTxs::new(),
         ))
     }
 
@@ -535,6 +555,7 @@ impl WorkerTxPool {
                 })
             };
             self.retry_forwarded(Instant::now(), max_reload).await;
+            self.sweep_sealed_marks(Instant::now()).await;
         }
         Err(TaskError::from_message("canonical txn pool task ended because state_stream closed"))
     }
@@ -630,6 +651,11 @@ impl WorkerTxPool {
     /// transactions and changed accounts can never be replayed: treat every sender with
     /// transactions in the pool as dirty, exactly like reth's
     /// `MaintainedPoolState::Drifted`.
+    ///
+    /// The lost `Commit`s also carried the batch digests that executed, so the sealed marks they
+    /// would have cleared are unknown: drop every mark. A mark that outlived its batch would keep
+    /// the transaction, and every later nonce of its sender, out of all future batches; dropping
+    /// a live mark costs at most a duplicate copy that execution skips (see [`SealedTxs`]).
     fn mark_drifted(&self, missed: u64) -> AddressSet {
         warn!(
             target: "txpool",
@@ -639,6 +665,14 @@ impl WorkerTxPool {
         );
         RETH_METRICS.canon_state_lagged_total.increment(1);
         RETH_METRICS.canon_state_notifications_missed_total.increment(missed);
+        let marks = self.5.clear_all_lag();
+        if marks > 0 {
+            warn!(
+                target: "txpool",
+                marks,
+                "sealed transaction marks dropped after canonical state broadcast lag"
+            );
+        }
         self.0.unique_senders()
     }
 
@@ -862,6 +896,12 @@ impl WorkerTxPool {
     ///
     /// Collect account changes and mined hashes on the blocking executor, borrowing the tip
     /// from the shared chain. Await completion before receiving another notification.
+    ///
+    /// After the pool update, clear the sealed marks the update settles: every block's
+    /// `ommers_hash` is the digest of the batch it executed, so its batch's marks are cleared
+    /// (what the block skipped becomes buildable again), and every mined hash loses its mark.
+    /// Clearing after the pool update means the builder never sees a mined transaction as
+    /// unmarked and still pooled.
     async fn process_canon_state_update(&self, update: Arc<Chain>) -> Result<(), JoinError> {
         let pool = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -901,6 +941,11 @@ impl WorkerTxPool {
                 Some(u128::MAX), // set max fee for blobs
                 mined_transactions,
                 changed_accounts,
+            );
+
+            pool.5.clear_executed(
+                blocks.iter().map(|(_, block)| block.ommers_hash),
+                blocks.transaction_hashes(),
             );
         })
         .await
@@ -946,12 +991,20 @@ impl WorkerTxPool {
     }
 
     /// Adds an already-recovered external transaction to the pool, avoiding redundant ECDSA
-    /// recovery. Used to submit gossipped transactions.
+    /// recovery.
+    ///
+    /// The node calls this to re-pool: the epoch orphan path (`repool_batch_txns` in
+    /// `close_epoch.rs`) and the forwarder's requeue of undelivered transactions. So the
+    /// transaction's sealed mark is cleared first, whatever the add returns: a marked transaction
+    /// is still pooled, answers `AlreadyImported`, and becomes buildable again. A client resend
+    /// reaches the pool through reth's RPC handle, never through this method, so it cannot clear
+    /// a mark. A gossip path that called this for client transactions would clear marks too.
     pub async fn add_recovered_transaction_external(
         &self,
         recovered: Recovered<TransactionSigned>,
     ) -> Result<AddedTransactionOutcome, crate::PoolError> {
         let hash = *recovered.hash();
+        self.5.clear_repooled(&hash);
         let eth_tx = EthPooledTransaction::try_from_consensus(recovered)
             .map_err(|_| PoolError::other(hash, "Failed to create pooled tx".to_string()))?;
         self.0.add_transaction(TransactionOrigin::External, eth_tx).await
@@ -981,6 +1034,83 @@ impl WorkerTxPool {
     /// transaction a peer is already proposing is not packed again here (issue #1329).
     pub fn peer_batch_txs(&self) -> &PeerBatchTxs {
         &self.3
+    }
+
+    /// The marks for transactions this node sealed into a batch that has not executed yet
+    /// (switch `sealed_tx_keep`, issue #1807).
+    pub fn sealed_txs(&self) -> &SealedTxs {
+        &self.5
+    }
+
+    /// Take a ticket for a batch whose transaction selection has just finished.
+    ///
+    /// Take it after the build returns and before the batch goes to the worker, and pass it to
+    /// [`Self::mark_sealed`] when the quorum ack arrives (see [`SealTicket`]).
+    pub fn seal_ticket(&self) -> SealTicket {
+        self.5.ticket()
+    }
+
+    /// Mark the transactions of the quorum-acked batch `digest` as sealed, keeping them in the
+    /// pool, and return how many were newly marked (switch `sealed_tx_keep`).
+    ///
+    /// This replaces the post-seal [`Self::update_canonical_state`] call: the transactions stay
+    /// pooled, so they are found by hash, a resend of their bytes answers `AlreadyImported`, and
+    /// the pending nonce counts them. Only `hashes` the pool still holds are marked. Nothing is
+    /// marked if `digest` executed, or canonical notifications were lost, after `ticket` was
+    /// taken, because no later canonical update would clear those marks. The marks clear when a
+    /// block whose `ommers_hash` is `digest` executes, when a hash is mined, when a transaction
+    /// is re-pooled, or when it leaves the pool.
+    ///
+    /// Only for batches sealed by quorum (`Worker::seals_via_quorum`). A non-committee worker
+    /// forwards its batch to the committee, which re-packs the transactions under its own
+    /// digests, so this node's digest never executes and a mark would only clear by mined hash
+    /// or requeue; a forward whose tracking expires would leave its transactions marked for good.
+    ///
+    /// The pool lookup can wait on reth's pool lock behind a canonical update, so it runs on the
+    /// blocking executor, like [`Self::update_canonical_state`].
+    pub async fn mark_sealed(
+        &self,
+        ticket: SealTicket,
+        digest: BlockHash,
+        hashes: Vec<TxHash>,
+    ) -> Result<usize, JoinError> {
+        let pool = self.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.5.mark_present(ticket, digest, &hashes, |candidates| pool.held(candidates))
+        })
+        .await
+    }
+
+    /// Drop the marks of transactions the pool no longer holds (evicted, expired, or removed by
+    /// a nonce reload), and return how many were dropped.
+    pub(crate) fn drop_evicted_marks(&self) -> usize {
+        self.5.drop_missing(|marked| self.held(marked))
+    }
+
+    /// Run [`Self::drop_evicted_marks`] on the blocking executor if anything is marked and the
+    /// last sweep was at least
+    /// [`SEALED_TXS_SWEEP_INTERVAL`](crate::sealed_txs::SEALED_TXS_SWEEP_INTERVAL) before `now`.
+    ///
+    /// The maintenance loop calls this after every event, retry ticks included, so the marks of
+    /// evicted transactions are dropped even while canonical updates stall.
+    async fn sweep_sealed_marks(&self, now: Instant) {
+        if self.5.sweep_due(now) {
+            let pool = self.clone();
+            // the sweep reads every marked hash under reth's pool lock
+            if let Err(error) = tokio::task::spawn_blocking(move || pool.drop_evicted_marks()).await
+            {
+                warn!(
+                    target: "txpool",
+                    ?error,
+                    "sealed transaction mark sweep failed; retrying after the next interval"
+                );
+            }
+        }
+    }
+
+    /// Return the subset of `hashes` the pool holds, under one pool read lock.
+    fn held(&self, hashes: Vec<TxHash>) -> Vec<TxHash> {
+        self.0.get_all(hashes).into_iter().map(|transaction| *transaction.hash()).collect()
     }
 }
 
@@ -1040,6 +1170,10 @@ impl TxPool for WorkerTxPool {
 
     fn is_peer_deferred(&self, hash: &TxHash) -> bool {
         self.3.is_deferred(hash)
+    }
+
+    fn is_sealed(&self, hash: &TxHash) -> bool {
+        self.5.is_marked(hash)
     }
 }
 
@@ -2093,5 +2227,368 @@ mod tests {
             assert_eq!(seq.hash(), par.hash(), "transaction hashes must match in order");
             assert_eq!(seq.signer(), par.signer(), "recovered signers must match in order");
         }
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    use reth_transaction_pool::error::PoolErrorKind;
+
+    /// A pool WITHOUT its maintenance task over a chain that funds the given senders, so a test
+    /// applies every canonical notification itself, in order.
+    struct SealedBench {
+        chain: Arc<RethChainSpec>,
+        reth_env: RethEnv,
+        pool: WorkerTxPool,
+        notifications: tokio::sync::broadcast::Receiver<CanonStateNotification>,
+        tip: SealedHeader,
+        outputs: u64,
+        // dropped last: the manager shuts down the env's tasks, the directory holds its database
+        _task_manager: TaskManager,
+        _tmp_dir: TempDir,
+    }
+
+    impl SealedBench {
+        fn new(senders: &[&TransactionFactory]) -> eyre::Result<Self> {
+            let tmp_dir = TempDir::new()?;
+            let task_manager = TaskManager::default();
+            let genesis = test_genesis().extend_accounts(senders.iter().map(|sender| {
+                (sender.address(), GenesisAccount::default().with_balance(U256::MAX))
+            }));
+            let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+            let reth_env =
+                RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+            let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+            let notifications = pool.1.subscribe_to_canonical_state();
+            let tip = chain.sealed_genesis_header();
+            Ok(Self {
+                chain,
+                reth_env,
+                pool,
+                notifications,
+                tip,
+                outputs: 0,
+                _task_manager: task_manager,
+                _tmp_dir: tmp_dir,
+            })
+        }
+
+        /// Sign `count` transfers from `sender` at its next nonces.
+        fn transfers(
+            &self,
+            sender: &mut TransactionFactory,
+            count: usize,
+        ) -> Vec<TransactionSigned> {
+            (0..count)
+                .map(|_| {
+                    sender.create_eip1559(
+                        self.chain.clone(),
+                        Some(21_000),
+                        7,
+                        Some(Address::ZERO),
+                        U256::from(1),
+                        Bytes::new(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Submit `txs` as an RPC client's raw transactions and return their hashes.
+        async fn submit(&self, txs: &[TransactionSigned]) -> eyre::Result<Vec<TxHash>> {
+            for tx in txs {
+                self.pool.add_raw_transaction_external(tx.clone()).await?;
+            }
+            Ok(hashes(txs))
+        }
+
+        /// Mark `txs` as sealed under `digest` with a fresh ticket, as the builder does on ack.
+        async fn seal(&self, digest: BlockHash, txs: &[TransactionSigned]) -> eyre::Result<usize> {
+            Ok(self.pool.mark_sealed(self.pool.seal_ticket(), digest, hashes(txs)).await?)
+        }
+
+        /// Execute `txs` as the block of batch `digest` (its `ommers_hash`) and apply the
+        /// canonical notification to the pool.
+        async fn execute(
+            &mut self,
+            digest: BlockHash,
+            txs: &[TransactionSigned],
+        ) -> eyre::Result<()> {
+            self.outputs += 1;
+            let output = consensus_output_for_tests(1, 0, self.outputs, false);
+            let payload = TNPayload::new_for_test_with(
+                self.tip.clone(),
+                &output,
+                Address::random(),
+                digest,
+                B256::random(),
+            );
+            let encoded = txs.iter().map(|tx| tx.encoded_2718()).collect();
+            let block =
+                execute_payload_and_update_canonical_chain(&self.reth_env, payload, encoded)?;
+            self.tip = block.recovered_block.clone_sealed_header();
+            let notification =
+                tokio::time::timeout(Duration::from_secs(5), self.notifications.recv()).await??;
+            self.pool.apply_canon_notification(notification).await?;
+            Ok(())
+        }
+
+        /// The sender's nonce as `eth_getTransactionCount(.., "pending")` computes it: one past
+        /// the highest pooled nonce consecutive from the canonical nonce.
+        fn pending_nonce(&self, sender: Address) -> eyre::Result<u64> {
+            let state = self.pool.1.latest()?;
+            let canonical = WorkerTxPool::load_changed_account(&state, sender)
+                .map_err(|address| eyre::eyre!("cannot read account {address}"))?
+                .nonce;
+            Ok(self
+                .pool
+                .0
+                .get_highest_consecutive_transaction_by_sender(sender, canonical)
+                .map_or(canonical, |tx| tx.nonce() + 1))
+        }
+
+        /// What `build_batch` may select with sealed-keep on: the best transactions in order,
+        /// marked ones skipped without `mark_invalid`.
+        fn selectable(&self) -> Vec<TxHash> {
+            self.pool
+                .best_transactions()
+                .filter(|tx| !self.pool.is_sealed(tx.hash()))
+                .map(|tx| *tx.hash())
+                .collect()
+        }
+    }
+
+    /// The hashes of `txs`, in order.
+    fn hashes(txs: &[TransactionSigned]) -> Vec<TxHash> {
+        txs.iter().map(|tx| *tx.hash()).collect()
+    }
+
+    /// A sender with a fixed key, so each test's chain is reproducible.
+    fn sender(seed: u64) -> TransactionFactory {
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(seed))
+    }
+
+    /// I-2 S2/S3: a sealed transaction stays visible by hash, a resend of its bytes answers
+    /// `AlreadyImported`, the pending nonce counts it, and the builder offers none of it.
+    #[tokio::test]
+    async fn sealed_transactions_stay_visible_known_and_counted() -> eyre::Result<()> {
+        let mut a = sender(61);
+        let bench = SealedBench::new(&[&a])?;
+        let txs = bench.transfers(&mut a, 4);
+        let sealed = bench.submit(&txs).await?;
+        assert_eq!(bench.seal(B256::repeat_byte(1), &txs).await?, 4);
+
+        sealed.iter().for_each(|hash| {
+            assert!(bench.pool.get(hash).is_some(), "a sealed transaction is found by hash");
+            assert!(bench.pool.is_sealed(hash));
+        });
+        let resend = bench.pool.add_raw_transaction_external(txs[0].clone()).await;
+        assert!(
+            matches!(&resend, Err(error) if matches!(error.kind, PoolErrorKind::AlreadyImported)),
+            "a resend of sealed bytes must answer already known, got {resend:?}"
+        );
+        assert_eq!(bench.pending_nonce(a.address())?, 4, "the pending nonce counts sealed nonces");
+        assert!(bench.selectable().is_empty(), "the builder offers no sealed transaction");
+        Ok(())
+    }
+
+    /// Pin of the switch-off path: the builder's post-seal update (mined hashes plus the
+    /// optimistic nonce) removes the sealed transactions, so a lookup misses, the pending nonce
+    /// falls back to the canonical one, and a resend is accepted as new (bench 5's 300-s repair).
+    #[tokio::test]
+    async fn switch_off_post_seal_update_forgets_sealed_transactions() -> eyre::Result<()> {
+        let mut a = sender(62);
+        let bench = SealedBench::new(&[&a])?;
+        let txs = bench.transfers(&mut a, 4);
+        let sealed = bench.submit(&txs).await?;
+        let optimistic = ChangedAccount { address: a.address(), nonce: 4, balance: U256::MAX };
+        bench
+            .pool
+            .update_canonical_state(&bench.tip, Some(u128::MAX), sealed.clone(), vec![optimistic])
+            .await?;
+
+        assert!(bench.pool.get(&sealed[0]).is_none());
+        assert_eq!(bench.pending_nonce(a.address())?, 0);
+        assert!(bench.pool.add_raw_transaction_external(txs[0].clone()).await.is_ok());
+        assert!(bench.pool.sealed_txs().is_empty(), "the switch-off path never marks");
+        Ok(())
+    }
+
+    /// The update for the block whose `ommers_hash` is the sealed batch's digest removes the
+    /// batch and clears its marks. An update for another digest leaves them, and the sender's
+    /// next nonces are pending and selectable, not queued behind a gap (I-2 S8).
+    #[tokio::test]
+    async fn only_its_own_batch_execution_clears_a_mark() -> eyre::Result<()> {
+        let (mut a, mut b) = (sender(63), sender(64));
+        let mut bench = SealedBench::new(&[&a, &b])?;
+        let (sealed_digest, other_digest) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        let sealed = bench.transfers(&mut a, 4);
+        bench.submit(&sealed).await?;
+        bench.seal(sealed_digest, &sealed).await?;
+
+        let other = bench.transfers(&mut b, 1);
+        bench.submit(&other).await?;
+        bench.execute(other_digest, &other).await?;
+        assert_eq!(bench.pool.sealed_txs().len(), 4, "another digest's block clears nothing");
+        assert!(hashes(&sealed).iter().all(|hash| bench.pool.get(hash).is_some()));
+
+        let next = bench.transfers(&mut a, 4);
+        bench.submit(&next).await?;
+        assert_eq!(bench.pool.pool_size().queued, 0, "later nonces are not gapped");
+        assert_eq!(
+            bench.selectable(),
+            hashes(&next),
+            "descendants of sealed nonces are selectable"
+        );
+
+        bench.execute(sealed_digest, &sealed).await?;
+        assert!(bench.pool.sealed_txs().is_empty());
+        assert!(hashes(&sealed).iter().all(|hash| bench.pool.get(hash).is_none()));
+        assert_eq!(bench.selectable(), hashes(&next));
+        assert_eq!(bench.pending_nonce(a.address())?, 8);
+        Ok(())
+    }
+
+    /// I-2 S1 at pool level: the batch with the later nonces executes first and skips them
+    /// (nonce too high). Its update unmarks them, still pooled, while the earlier batch stays
+    /// marked; once the earlier batch executes, the later nonces are the next selection.
+    #[tokio::test]
+    async fn out_of_order_execution_unmarks_the_skipped_batch() -> eyre::Result<()> {
+        let mut a = sender(65);
+        let mut bench = SealedBench::new(&[&a])?;
+        let (first_digest, second_digest) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        let first = bench.transfers(&mut a, 4);
+        let second = bench.transfers(&mut a, 4);
+        bench.submit(&first).await?;
+        bench.submit(&second).await?;
+        bench.seal(first_digest, &first).await?;
+        bench.seal(second_digest, &second).await?;
+        assert!(bench.selectable().is_empty());
+
+        bench.execute(second_digest, &second).await?;
+        assert!(hashes(&second).iter().all(|hash| bench.pool.get(hash).is_some()));
+        assert!(hashes(&second).iter().all(|hash| !bench.pool.is_sealed(hash)));
+        assert!(hashes(&first).iter().all(|hash| bench.pool.is_sealed(hash)));
+        assert_eq!(bench.selectable(), hashes(&second));
+        assert_eq!(bench.pending_nonce(a.address())?, 8);
+
+        bench.execute(first_digest, &first).await?;
+        assert!(bench.pool.sealed_txs().is_empty());
+        assert_eq!(bench.selectable(), hashes(&second));
+        Ok(())
+    }
+
+    /// The epoch orphan path re-pools through `add_recovered_transaction_external`: it clears
+    /// the mark even though the transaction is still pooled and the add answers already known.
+    #[tokio::test]
+    async fn repooling_clears_the_mark() -> eyre::Result<()> {
+        let mut a = sender(66);
+        let bench = SealedBench::new(&[&a])?;
+        let txs = bench.transfers(&mut a, 2);
+        bench.submit(&txs).await?;
+        bench.seal(B256::repeat_byte(1), &txs).await?;
+
+        let recovered = recover_raw_transaction(&txs[0].encoded_2718())?;
+        let repooled = bench.pool.add_recovered_transaction_external(recovered).await;
+        assert!(
+            matches!(&repooled, Err(error) if matches!(error.kind, PoolErrorKind::AlreadyImported))
+        );
+        assert!(!bench.pool.is_sealed(txs[0].hash()));
+        assert!(bench.pool.is_sealed(txs[1].hash()), "only the re-pooled transaction is unmarked");
+        assert_eq!(bench.selectable(), vec![*txs[0].hash()]);
+        Ok(())
+    }
+
+    /// A marked transaction that leaves the pool without executing (reth's eviction, simulated
+    /// by a direct removal) loses its mark and moves the eviction counter. The maintenance loop
+    /// runs the same sweep on its retry ticks, with no canonical update at all.
+    #[tokio::test]
+    async fn an_evicted_marked_transaction_drops_its_mark() -> eyre::Result<()> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let mut a = sender(67);
+        let bench = SealedBench::new(&[&a])?;
+        let txs = bench.transfers(&mut a, 4);
+        bench.submit(&txs).await?;
+        bench.seal(B256::repeat_byte(1), &txs).await?;
+
+        assert_eq!(bench.pool.0.remove_transactions(vec![*txs[3].hash()]).len(), 1);
+        let recorder = DebuggingRecorder::new();
+        let dropped = metrics::with_local_recorder(&recorder, || bench.pool.drop_evicted_marks());
+        assert_eq!(dropped, 1);
+        let evicted = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_reth.sealed_txs_dropped_evicted_total")
+            .map(|(.., value)| value);
+        assert_eq!(evicted, Some(DebugValue::Counter(1)));
+        assert!(!bench.pool.is_sealed(txs[3].hash()));
+        assert_eq!(bench.pool.sealed_txs().len(), 3);
+
+        assert_eq!(bench.pool.0.remove_transactions(vec![*txs[2].hash()]).len(), 1);
+        let maintenance = tokio::spawn(bench.pool.clone().maintain_pool(
+            stream::pending::<Result<CanonStateNotification, BroadcastStreamRecvError>>(),
+            Duration::from_millis(50),
+            MAX_RELOAD_ACCOUNTS,
+        ));
+        let mut poll = pin!(stream::iter(0..200u32)
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                bench.pool.is_sealed(txs[2].hash())
+            })
+            .skip_while(|sealed| std::future::ready(*sealed)));
+        let swept = tokio::time::timeout(Duration::from_secs(10), poll.next()).await?;
+        maintenance.abort();
+        // join the aborted task so test teardown cannot race the maintenance loop
+        let _ = maintenance.await;
+        assert_eq!(swept, Some(false), "a retry tick sweeps without any canonical update");
+        assert_eq!(bench.pool.sealed_txs().len(), 2);
+        Ok(())
+    }
+
+    /// Lost canonical notifications drop every mark: the executed digests are unknown, and a
+    /// mark that outlived its batch would block its sender for good.
+    #[tokio::test]
+    async fn broadcast_lag_drops_every_mark() -> eyre::Result<()> {
+        let mut a = sender(68);
+        let bench = SealedBench::new(&[&a])?;
+        let txs = bench.transfers(&mut a, 2);
+        bench.submit(&txs).await?;
+        bench.seal(B256::repeat_byte(1), &txs[..1]).await?;
+        // a batch whose selection finished before the lag, acked after it
+        let in_flight = bench.pool.seal_ticket();
+
+        let dirty = bench.pool.mark_drifted(3);
+        assert!(dirty.contains(&a.address()));
+        assert!(bench.pool.sealed_txs().is_empty());
+        assert_eq!(bench.selectable(), hashes(&txs));
+        let late = bench.pool.mark_sealed(in_flight, B256::repeat_byte(2), hashes(&txs[1..]));
+        assert_eq!(late.await?, 0, "it may have executed in the lost rounds");
+        Ok(())
+    }
+
+    /// The late-ack race: a batch's block executes, skipping nonce-gapped transactions, before
+    /// the builder handles its quorum ack. A ticket taken before the execution refuses the mark,
+    /// so nothing is left marked with no execution to clear it; an identical batch selected
+    /// after that execution is marked normally.
+    #[tokio::test]
+    async fn a_mark_after_its_batch_executed_is_refused() -> eyre::Result<()> {
+        let mut a = sender(69);
+        let mut bench = SealedBench::new(&[&a])?;
+        let digest = B256::repeat_byte(1);
+        let gap = bench.transfers(&mut a, 2);
+        let gapped = bench.transfers(&mut a, 2);
+        bench.submit(&gap).await?;
+        bench.submit(&gapped).await?;
+
+        let ticket = bench.pool.seal_ticket();
+        bench.execute(digest, &gapped).await?;
+        assert!(hashes(&gapped).iter().all(|hash| bench.pool.get(hash).is_some()));
+        assert_eq!(bench.pool.mark_sealed(ticket, digest, hashes(&gapped)).await?, 0);
+        assert!(bench.pool.sealed_txs().is_empty());
+
+        let reseal = bench.pool.seal_ticket();
+        assert_eq!(bench.pool.mark_sealed(reseal, digest, hashes(&gapped)).await?, 2);
+        Ok(())
     }
 }
