@@ -368,9 +368,9 @@ impl ListenerErrorLog {
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]);
 /// - not installed here: the public connection share of the peer manager holds peers without
-///   privilege to the same total minus [`PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE`] scaled to
-///   that total, and to [`MAX_ESTABLISHED_CONNECTIONS_PER_PUBLIC_PEER`] each, from the same two
-///   numbers (see [`established_connection_bounds`]).
+///   privilege to the same total minus [`PRIVILEGED_ESTABLISHED_CONNECTION_RESERVE`] scaled to that
+///   total, and to [`MAX_ESTABLISHED_CONNECTIONS_PER_PUBLIC_PEER`] each, from the same two numbers
+///   (see [`established_connection_bounds`]).
 ///
 /// Both directions and all peer classes consume the process allocation: this behaviour must never
 /// install bypass peer IDs.

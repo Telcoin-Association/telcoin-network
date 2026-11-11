@@ -1024,14 +1024,15 @@ fn try_admit_opening(
                 slot,
             })
         })
-        .map_or_else(OpeningDecision::Shed, OpeningDecision::Admit)
+        .map_or_else(OpeningDecision::Shed, |admission| OpeningDecision::Admit(Box::new(admission)))
 }
 
 /// What the opening admission decided for one inbound sync stream.
 #[derive(Debug)]
 enum OpeningDecision {
-    /// The stream holds its per-peer slot and its opening-read grants.
-    Admit(SyncAdmission),
+    /// The stream holds its per-peer slot and its opening-read grants. Boxed: the grants are
+    /// several hundred bytes, the shed reason one.
+    Admit(Box<SyncAdmission>),
     /// The stream takes the shed path and is answered `Deny` with this reason:
     /// [`DenyReason::Busy`] for the per-peer stream cap or the opening hold budget, and
     /// [`DenyReason::AtCapacity`] for a full opening-read pool.
@@ -1043,7 +1044,7 @@ impl OpeningDecision {
     /// The admission, or `None` for a shed stream.
     fn admitted(self) -> Option<SyncAdmission> {
         match self {
-            Self::Admit(admission) => Some(admission),
+            Self::Admit(admission) => Some(*admission),
             Self::Shed(_) => None,
         }
     }
@@ -3076,6 +3077,7 @@ where
     /// per node process and shared by the network of every epoch, so an epoch boundary does not
     /// refill the public hold budgets or the per-key serve cap. The committee tier is captured
     /// here, per epoch.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network_events: Events,
         network_handle: PrimaryNetworkHandle,
@@ -3385,7 +3387,7 @@ where
                         )
                         .await
                     };
-                    admit_and_serve_sync_stream(stream, admission, serve_pools, handle, serve)
+                    admit_and_serve_sync_stream(stream, *admission, serve_pools, handle, serve)
                         .await;
                     Ok(())
                 });

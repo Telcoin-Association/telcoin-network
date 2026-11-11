@@ -4,7 +4,7 @@
 //! ([`DEFAULT_ROOT_DIR`]) and maps TN's per-chain datadir layout through the
 //! `tn_config::TelcoinDirs` impl on [`DataDirChainPath`]: `parameters.yaml`, `node-info.yaml`,
 //! `node-keys/`, `genesis/` (holding `committee.yaml` and `genesis.yaml`), `consensus-db/`
-//! (consensus storage), `db/` (reth MDBX), and `network-config`.
+//! (consensus storage), `db/` (the reth execution database), and `network-config`.
 use reth_chainspec::Chain;
 use reth_node_core::{
     args::DatadirArgs,
