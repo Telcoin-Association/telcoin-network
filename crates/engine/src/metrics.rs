@@ -93,6 +93,23 @@ pub(crate) struct EngineMetrics {
     /// panicked), so the execution task recovered the signers inline from the same bytes.
     /// Nonzero is a bug signal; the blocks built are the same either way.
     pub(crate) recovery_fallback_total: Counter,
+    // bench6 pipelined-persist: set by the pipelined loop only (`pipelined_persist: true`); the
+    // sequential loop leaves these series unset
+    /// Consensus outputs started and not yet committed: building, built and waiting for the commit
+    /// slot, or committing. Zero to two.
+    pub(crate) unpersisted_outputs: Gauge,
+    /// The engine's in-memory tip: the last block built, which leads `canonical_height` (the
+    /// durable tip) by up to two outputs and equals it once the engine is idle.
+    pub(crate) built_height: Gauge,
+    /// Time from the end of an output's build to the start of its commit: the wait for the
+    /// previous output's commit to finish (back-pressure of the single commit slot).
+    pub(crate) persist_wait_seconds: Histogram,
+    /// Time between two consecutive commits, recorded only when the later output had started
+    /// building before the earlier one committed (the engine was saturated): the pipelined cycle.
+    pub(crate) commit_interval_seconds: Histogram,
+    /// Outputs held in the engine queue because a closing output had not committed yet (each held
+    /// output counts once per close). Expected zero: the node forwards nothing past a close.
+    pub(crate) close_barrier_holds_total: Counter,
 }
 
 #[cfg(test)]
@@ -130,6 +147,11 @@ mod tests {
             metrics.forward_wait_seconds.record(0.05);
             metrics.channel_depth.set(64.0);
             metrics.recovery_fallback_total.increment(1);
+            metrics.unpersisted_outputs.set(2.0);
+            metrics.built_height.set(130.0);
+            metrics.persist_wait_seconds.record(0.06);
+            metrics.commit_interval_seconds.record(1.17);
+            metrics.close_barrier_holds_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -178,6 +200,16 @@ mod tests {
         let (_, _, _, value) = find("tn_engine.channel_depth");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 64.0));
         let (_, _, _, value) = find("tn_engine.recovery_fallback_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_engine.unpersisted_outputs");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 2.0));
+        let (_, _, _, value) = find("tn_engine.built_height");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 130.0));
+        let (_, _, _, value) = find("tn_engine.persist_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.06));
+        let (_, _, _, value) = find("tn_engine.commit_interval_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 1.17));
+        let (_, _, _, value) = find("tn_engine.close_barrier_holds_total");
         assert!(matches!(value, DebugValue::Counter(1)));
     }
 }
