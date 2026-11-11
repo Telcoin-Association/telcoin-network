@@ -123,6 +123,7 @@ impl ExecutionNodeInner {
             base_fee,
             epoch,
         )?;
+        let batch_builder = configure_batch_builder(batch_builder, &self.tn_config.parameters);
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
@@ -559,6 +560,11 @@ fn configure_engine(engine: ExecutorEngine, parameters: &Parameters) -> Executor
     engine.with_recovery_threads(parameters.recovery_threads)
 }
 
+/// Hand the batch builder the runtime switches it reads from the node's `parameters.yaml`.
+fn configure_batch_builder(builder: BatchBuilder, parameters: &Parameters) -> BatchBuilder {
+    builder.with_sealed_tx_keep(parameters.sealed_tx_keep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +687,50 @@ mod tests {
         let engine = engine_on_temp_chain(arm_dir.path(), &task_manager)?;
         let engine = configure_engine(engine, &parameters);
         assert_eq!(engine.recovery_threads(), 3);
+        Ok(())
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// A batch builder for worker 0 on a fresh temp chain at `path`, built as
+    /// [`ExecutionNodeInner::start_batch_builder`] builds it, before any switch is applied.
+    fn batch_builder_on_temp_chain(
+        path: &std::path::Path,
+        task_manager: &tn_types::TaskManager,
+    ) -> eyre::Result<BatchBuilder> {
+        let chain: Arc<tn_reth::RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain(chain, path, task_manager, None)?;
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default())?;
+        let (to_worker, _from_builder) = mpsc::channel(1);
+        Ok(BatchBuilder::new(
+            &reth_env,
+            pool,
+            to_worker,
+            Address::ZERO,
+            std::time::Duration::from_secs(1),
+            task_manager.get_spawner(),
+            0,
+            tn_types::MIN_PROTOCOL_BASE_FEE,
+            0,
+        )?)
+    }
+
+    /// The batch builder reads `sealed_tx_keep` as set in the node's parameters, and `false` when
+    /// the parameters leave it at its default.
+    #[tokio::test]
+    async fn test_configure_batch_builder_hands_sealed_tx_keep_to_the_builder() -> eyre::Result<()>
+    {
+        let task_manager = tn_types::TaskManager::new("configure batch builder");
+        let default_dir = tempfile::TempDir::new()?;
+        let builder = batch_builder_on_temp_chain(default_dir.path(), &task_manager)?;
+        let builder = configure_batch_builder(builder, &Parameters::default());
+        assert!(!builder.sealed_tx_keep());
+
+        let parameters = Parameters { sealed_tx_keep: true, ..Default::default() };
+        let arm_dir = tempfile::TempDir::new()?;
+        let builder = batch_builder_on_temp_chain(arm_dir.path(), &task_manager)?;
+        let builder = configure_batch_builder(builder, &parameters);
+        assert!(builder.sealed_tx_keep());
         Ok(())
     }
 }

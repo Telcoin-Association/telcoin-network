@@ -2095,7 +2095,10 @@ fn announce_switches(parameters: &tn_config::Parameters) {
 
 /// The runtime switches the reth environment reads, taken from the node's parameters.
 fn reth_switches(parameters: &tn_config::Parameters) -> RethSwitches {
-    RethSwitches { mdbx_random_advice: parameters.mdbx_random_advice }
+    RethSwitches {
+        mdbx_random_advice: parameters.mdbx_random_advice,
+        sealed_tx_keep: parameters.sealed_tx_keep,
+    }
 }
 
 #[cfg(test)]
@@ -2837,5 +2840,16 @@ mod tests {
         let parameters = tn_config::Parameters { mdbx_random_advice: true, ..Default::default() };
         let switches = reth_switches(&parameters);
         assert!(switches.mdbx_random_advice);
+    }
+
+    // ---- bench6 sealed-keep ----
+
+    /// `sealed_tx_keep` reaches the reth switches the node passes to its env.
+    #[test]
+    fn test_reth_switches_carry_sealed_tx_keep() {
+        assert!(!reth_switches(&tn_config::Parameters::default()).sealed_tx_keep);
+
+        let parameters = tn_config::Parameters { sealed_tx_keep: true, ..Default::default() };
+        assert!(reth_switches(&parameters).sealed_tx_keep);
     }
 }

@@ -251,6 +251,9 @@ pub struct BatchBuilder {
     arrivals: Arrivals,
     /// The fill delay armed by the first arrival at an idle builder, `None` while disarmed.
     fill_delay: Option<Pin<Box<Sleep>>>,
+    /// Keep a sealed batch's transactions in the pool, marked, until they execute
+    /// (`sealed_tx_keep` in `parameters.yaml`).
+    sealed_tx_keep: bool,
 }
 
 impl BatchBuilder {
@@ -291,7 +294,23 @@ impl BatchBuilder {
             refusal_backoff: None,
             arrivals,
             fill_delay: None,
+            sealed_tx_keep: false,
         })
+    }
+
+    /// Set whether a sealed batch's transactions stay in the pool, marked, until they execute
+    /// (`sealed_tx_keep` in `parameters.yaml`).
+    ///
+    /// `false`, the value [`BatchBuilder::new`] starts with, removes them from the pool once the
+    /// batch is sealed. The node applies the configured value right after construction.
+    pub fn with_sealed_tx_keep(mut self, keep: bool) -> Self {
+        self.sealed_tx_keep = keep;
+        self
+    }
+
+    /// Whether a sealed batch's transactions stay in the pool, marked, until they execute.
+    pub fn sealed_tx_keep(&self) -> bool {
+        self.sealed_tx_keep
     }
 
     /// Spawns a task to build the batch and propose to peers.

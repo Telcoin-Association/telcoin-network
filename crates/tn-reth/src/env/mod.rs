@@ -141,6 +141,9 @@ pub struct RethSwitches {
     /// Advise the kernel that the execution database's memory map is read at random
     /// (`mdbx_random_advice`; default `false`).
     pub mdbx_random_advice: bool,
+    /// Keep a sealed batch's transactions in the pool, marked, until they execute
+    /// (`sealed_tx_keep`; default `false`).
+    pub sealed_tx_keep: bool,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -267,6 +270,13 @@ impl RethEnv {
     /// [`RethEnv::new_with_switches`]).
     pub fn mdbx_random_advice(&self) -> bool {
         self.inner.switches.mdbx_random_advice
+    }
+
+    /// Whether the worker pools keep a sealed batch's transactions, marked, until they execute
+    /// (`sealed_tx_keep` in `parameters.yaml`; `false` unless the node set it through
+    /// [`RethEnv::new_with_switches`]).
+    pub fn sealed_tx_keep(&self) -> bool {
+        self.inner.switches.sealed_tx_keep
     }
 
     /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
@@ -803,18 +813,21 @@ mod tests {
     async fn test_new_with_switches_hands_each_switch_to_the_env() -> eyre::Result<()> {
         let tm = TaskManager::new("switches");
         let on = TempDir::new()?;
-        let switches = RethSwitches { mdbx_random_advice: true };
+        let switches = RethSwitches { mdbx_random_advice: true, sealed_tx_keep: true };
         let env = env_with_switches(on.path(), &tm, switches)?;
         assert!(env.mdbx_random_advice());
+        assert!(env.sealed_tx_keep());
 
         let off = TempDir::new()?;
         let env = env_with_switches(off.path(), &tm, RethSwitches::default())?;
         assert!(!env.mdbx_random_advice());
+        assert!(!env.sealed_tx_keep());
 
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let temp = TempDir::new()?;
         let env = RethEnv::new_for_temp_chain(chain, temp.path(), &tm, None)?;
         assert!(!env.mdbx_random_advice(), "RethEnv::new passes the defaults");
+        assert!(!env.sealed_tx_keep(), "RethEnv::new passes the defaults");
         Ok(())
     }
 }
