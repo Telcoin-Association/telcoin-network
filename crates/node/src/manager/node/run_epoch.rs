@@ -492,6 +492,20 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
+                // Detection, for the drain's gauges and log line, is taken here, once the closing
+                // output has been handed to the engine: a send blocked on a full engine channel
+                // counts in the detection lag, not the drain. How far execution trails the closing
+                // output and how long after its commit it got here.
+                let detected_at = Instant::now();
+                let closing = self.last_consensus_header.as_ref().map(|header| {
+                    let backlog_outputs = crate::metrics::epoch_close_backlog_outputs(
+                        header.number,
+                        &self.execution_backlog,
+                    );
+                    let detect_lag = header.sub_dag.commit_timestamp_ms().elapsed();
+                    crate::metrics::record_epoch_close_detected(backlog_outputs, detect_lag);
+                    (header.number, backlog_outputs, detect_lag)
+                });
                 // read before the close borrows `self`
                 let task_drain = self.builder.tn_config.parameters.epoch_close_task_drain;
                 // The close, the record and the export, as one future. With `task_drain` the
@@ -507,6 +521,19 @@ where
                         target_hash,
                     )
                     .await?;
+                    let drain = detected_at.elapsed();
+                    crate::metrics::record_epoch_close_drain(drain);
+                    if let Some((closing_number, backlog_outputs, detect_lag)) = closing {
+                        info!(
+                            target: "epoch-manager",
+                            epoch = current_epoch,
+                            closing_number,
+                            backlog_outputs,
+                            detect_lag_ms = detect_lag.as_millis() as u64,
+                            drain_ms = drain.as_millis() as u64,
+                            "epoch close drained",
+                        );
+                    }
 
                     // Deactivate removed workers before writing records or exporting execution
                     // state. Admission is already closed by the accumulator resize inside

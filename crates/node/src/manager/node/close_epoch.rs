@@ -410,13 +410,15 @@ where
                 self.consensus_chain.epochs().get_epoch_by_number(epoch).await
             {
                 // We already have this record...
+                self.count_record_vote_skip(&epoch_rec, true);
                 self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
                 return Ok(());
             }
-        } else if let Some((epoch_rec, _)) =
+        } else if let Some((epoch_rec, cert)) =
             self.consensus_chain.epochs().get_epoch_by_number(epoch).await
         {
             // We already have this record...
+            self.count_record_vote_skip(&epoch_rec, cert.is_some());
             self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
             return Ok(());
         }
@@ -500,8 +502,20 @@ where
         // the record just saved — fatal for epoch 0, which has no peer-fetch anchor — so
         // flush it durably here before publishing
         self.consensus_chain.epochs().persist().await?;
+        self.count_record_vote_skip(&epoch_rec, false);
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
+    }
+
+    /// Count the vote this node will not cast for `record`, which it is about to publish to its
+    /// vote collector, under the reason the collector skips it for.
+    fn count_record_vote_skip(&self, record: &EpochRecord, certified: bool) {
+        let me = self.key_config.primary_public_key();
+        if let Some(skip) =
+            crate::metrics::EpochRecordVoteSkip::for_record(certified, &record.committee, &me)
+        {
+            crate::metrics::record_epoch_record_vote_skipped(skip);
+        }
     }
 
     /// Re-derive the previous epoch's [`EpochRecord`] locally when a restart finds it missing.
@@ -1709,5 +1723,139 @@ mod tests {
             assert_eq!(stale_epoch_table_row(&db, 9), Some((Certificates::NAME, 8)));
             assert_eq!(current_epoch_guard_row(&db, 9), Some(guard), "guard in {guard}");
         }
+    }
+
+    // ---- bench6 tracker-drain ----
+
+    type TestManager = EpochManager<std::path::PathBuf, DatabaseType>;
+
+    /// An [`EpochManager`] with `epoch_record_state_check` set to `state_check`, an engine over its
+    /// reth database (unused on the stored-record path), and the task manager holding the reth
+    /// environment's tasks.
+    async fn manager_for_record_check(
+        temp: &tempfile::TempDir,
+        state_check: bool,
+    ) -> eyre::Result<(TestManager, ExecutionNode, TaskManager)> {
+        use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
+        use tn_config::{Config, KeyConfig};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::gas_accumulator::GasAccumulator;
+
+        let datadir = temp.path().to_path_buf();
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let mut config = Config::default_for_test();
+        config.parameters.epoch_record_state_check = state_check;
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let tasks = TaskManager::default();
+        let reth_env =
+            RethEnv::new(&node_config, &tasks, reth_db.clone(), None, GasAccumulator::new(1))?;
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let engine = ExecutionNode::new(&builder, reth_env)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(5)));
+        std::fs::create_dir_all(datadir.join("db"))?;
+        let db = tn_storage::open_db(datadir.join("db"));
+        let manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
+        Ok((manager, engine, tasks))
+    }
+
+    /// Store a record of `epoch` naming `final_state` and `committee`, with a certificate when
+    /// `certified` (storage checks only that the certificate names the record). Storage keeps
+    /// records in epoch order, so any earlier epoch not stored yet gets a plain record first.
+    async fn store_record(
+        manager: &TestManager,
+        epoch: Epoch,
+        final_state: BlockNumHash,
+        committee: Vec<BlsPublicKey>,
+        certified: bool,
+    ) -> eyre::Result<EpochRecord> {
+        for earlier in 0..epoch {
+            if manager.consensus_chain.epochs().get_epoch_by_number(earlier).await.is_none() {
+                let record = EpochRecord { epoch: earlier, ..Default::default() };
+                manager.consensus_chain.epochs().save_record(record).await?;
+            }
+        }
+        let record = EpochRecord {
+            epoch,
+            next_committee: committee.clone(),
+            committee,
+            final_state,
+            ..Default::default()
+        };
+        if certified {
+            let mut signed_authorities = roaring::RoaringBitmap::new();
+            signed_authorities.insert(0);
+            let cert = tn_types::EpochCertificate {
+                epoch_hash: record.digest(),
+                signature: record.sign_vote(&manager.key_config).signature,
+                signed_authorities,
+            };
+            manager.consensus_chain.epochs().save(record.clone(), cert).await?;
+            let stored = manager.consensus_chain.epochs().get_epoch_by_number(epoch).await;
+            eyre::ensure!(matches!(stored, Some((_, Some(_)))), "the certificate reads back");
+        } else {
+            manager.consensus_chain.epochs().save_record(record.clone()).await?;
+        }
+        Ok(record)
+    }
+
+    /// A counter series: its name, its `reason` label if any, and its value.
+    type CounterSeries = (String, Option<String>, u64);
+
+    /// Every counter series `snapshotter` holds now. A series is read once per snapshot, so take
+    /// one snapshot per point in the test and query it with [`counter`].
+    fn counters(snapshotter: &metrics_util::debugging::Snapshotter) -> Vec<CounterSeries> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(value) => Some((
+                    key.key().name().to_string(),
+                    key.key().labels().find(|l| l.key() == "reason").map(|l| l.value().to_string()),
+                    value,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The counter `name` labelled `reason` (summed over its labels when `None`), zero when absent.
+    fn counter(counters: &[CounterSeries], name: &str, reason: Option<&str>) -> u64 {
+        counters
+            .iter()
+            .filter(|(series, label, _)| {
+                series == name && reason.is_none_or(|reason| label.as_deref() == Some(reason))
+            })
+            .map(|(.., value)| value)
+            .sum()
+    }
+
+    /// The vote-skip counter follows the collector: a stored uncertified record of this node's
+    /// committee skips nothing, one of a committee without this node is `not_in_committee`.
+    #[tokio::test]
+    async fn stored_record_vote_skips_follow_the_collector() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let temp = tempfile::TempDir::new()?;
+        let (mut manager, engine, _tasks) = manager_for_record_check(&temp, false).await?;
+        let me = manager.key_config.primary_public_key();
+        let closing = BlockNumHash::new(42, BlockHash::repeat_byte(7));
+        store_record(&manager, 1, closing, vec![me], false).await?;
+        manager.write_epoch_record(1, &engine).await?;
+        let counted = counters(&snapshotter);
+        assert_eq!(counter(&counted, "tn_node.epoch_record_vote_skipped_total", None), 0);
+
+        store_record(&manager, 2, closing, keys(1..4), false).await?;
+        manager.write_epoch_record(2, &engine).await?;
+        let counted = counters(&snapshotter);
+        assert_eq!(
+            counter(&counted, "tn_node.epoch_record_vote_skipped_total", Some("not_in_committee")),
+            1
+        );
+        Ok(())
     }
 }
