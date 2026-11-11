@@ -4874,9 +4874,10 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
     // the background recovery job started when the output was queued logs once per output
     let recovered = captured_engine_events("signers recovered");
     assert_eq!(recovered.len(), 1, "one line per output");
-    assert_eq!(field_names(&recovered[0]), ["consensus_number", "txs", "recover_ms"]);
+    assert_eq!(field_names(&recovered[0]), ["consensus_number", "txs", "recover_ms", "pool"]);
     assert_eq!(field_value(&recovered[0], "consensus_number"), Some(number.as_str()));
     assert_eq!(field_value(&recovered[0], "txs"), Some(expected_txs.to_string().as_str()));
+    assert_eq!(field_value(&recovered[0], "pool"), Some("global"), "recovery_threads: 0");
 
     Ok(())
 }
@@ -4892,7 +4893,16 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
 /// with the repeated transaction executed once and the undecodable bytes dropped by the job.
 #[tokio::test]
 async fn test_queued_recovery_matches_inline_recovery() -> eyre::Result<()> {
+    queued_recovery_matches_inline_recovery(0).await
+}
+
+/// The body of [`test_queued_recovery_matches_inline_recovery`], with the queued node's engine
+/// set to `recovery_threads`: its job recovers on the dedicated pool when that is above zero
+/// (its `signers recovered` line says `pool=dedicated`) and on the global pool otherwise, while
+/// the inline path always recovers on the global pool.
+async fn queued_recovery_matches_inline_recovery(recovery_threads: u16) -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
+    capture_engine_events();
     let chain = test_chain_spec_arc();
     let mut batches = tn_reth::test_utils::batches(chain.clone(), 3);
     let genesis = test_genesis_with_consensus_registry(4);
@@ -4977,7 +4987,8 @@ async fn test_queued_recovery_matches_inline_recovery() -> eyre::Result<()> {
         queued_gas,
         tn_types::repack_monitor::RepackMonitor::default(),
         engine_update_tx,
-    );
+    )
+    .with_recovery_threads(recovery_threads);
     to_engine.send(consensus_output.clone()).await?;
     drop(to_engine);
     let res = timeout(Duration::from_secs(30), engine.run()).await?;
@@ -5021,5 +5032,24 @@ async fn test_queued_recovery_matches_inline_recovery() -> eyre::Result<()> {
         .collect::<Result<_, _>>()?;
     assert_eq!(block_txs, executed_txs);
 
+    // the queued job recovered on the pool `recovery_threads` selects, the inline path on the
+    // global pool
+    let job_pool = if recovery_threads > 0 { "dedicated" } else { "global" };
+    let pools: Vec<Option<String>> = captured_engine_events("signers recovered")
+        .iter()
+        .map(|fields| field_value(fields, "pool").map(str::to_string))
+        .collect();
+    assert_eq!(pools, [Some(job_pool.to_string()), Some("global".to_string())]);
+
     Ok(())
+}
+
+// ---- bench6 recovery-pool ----
+
+/// [`test_queued_recovery_matches_inline_recovery`] with the queued engine's signer recovery on a
+/// dedicated pool of three threads: the pool decides only which threads recover the signers, so
+/// both chains are still the same chain, block for block.
+#[tokio::test]
+async fn test_queued_recovery_on_dedicated_pool_matches_inline_recovery() -> eyre::Result<()> {
+    queued_recovery_matches_inline_recovery(3).await
 }

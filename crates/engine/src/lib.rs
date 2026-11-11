@@ -31,6 +31,7 @@ pub use error::TnEngineError;
 use futures::{future::OptionFuture, StreamExt};
 use payload_builder::execute_consensus_output_with_signers;
 pub use payload_builder::{execute_consensus_output, PERSIST_OUTPUT_ATTEMPTS};
+pub use recovery::run_on_recovery_pool;
 use recovery::RecoveryHandle;
 use std::{
     collections::VecDeque,
@@ -310,6 +311,10 @@ impl ExecutorEngine {
     /// Push `output` to the back of the queue, stamped `queued_at`, and start recovering its
     /// signers on a blocking job so the work overlaps the execution of the outputs ahead of it.
     ///
+    /// The job recovers on the process-wide dedicated pool of `recovery_threads` threads, away
+    /// from the global rayon pool the block builds use, or on that global pool when
+    /// `recovery_threads` is zero (see [`run_on_recovery_pool`]).
+    ///
     /// An output with no batches has no signers to recover and gets an already-resolved handle
     /// instead of a job, so the empty outputs committed at idle record no
     /// `tn_engine_recover_seconds` sample and log no `signers recovered` line.
@@ -317,7 +322,12 @@ impl ExecutorEngine {
         let signers = if output.batches().iter().all(|cert| cert.batches.is_empty()) {
             RecoveryHandle::resolved(Vec::new())
         } else {
-            RecoveryHandle::spawn(&output, &self.task_spawner, &ENGINE_METRICS)
+            RecoveryHandle::spawn(
+                &output,
+                &self.task_spawner,
+                &ENGINE_METRICS,
+                self.recovery_threads,
+            )
         };
         self.queued.push_back((queued_at, output, signers));
     }
