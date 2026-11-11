@@ -524,18 +524,22 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
-    let assert_str = match res1 {
-        Ok(mut child2_restarted) => {
-            kill_child(&mut child2_restarted);
-            "".to_string()
-        }
-        Err(err) => {
+    let assert_str = res1.map_or_else(
+        |err| {
             tracing::error!(target: "restart-test", "Got error: {err}");
             err.to_string()
-        }
-    };
+        },
+        |child2_restarted| {
+            // Hand the restarted node back to its slot: `kill_all` below then stops all four
+            // nodes in parallel under one wait, instead of this one alone first.
+            guard.replace(2, child2_restarted);
+            String::new()
+        },
+    );
 
-    // Kill all remaining children (child2 slot is already None from take)
+    // Stop every node gracefully, so phase 2 restarts from a clean shutdown: the three that ran
+    // all along, plus the restarted child2 on the success path (its slot is still empty on the
+    // error path, where phase 1 took it).
     guard.kill_all();
 
     // Make sure we shutdown nodes even if an error in first testing.
@@ -558,8 +562,9 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     let res2 = run_restart_tests2(&client_urls);
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
-    // guard.drop() handles final cleanup
-    res2
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    res2.inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
@@ -655,8 +660,9 @@ fn test_restarts_observer() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
-    // Guard cleanup handles all process shutdown on drop
-    run_observer_tests(&client_urls, &obs_url)
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    run_observer_tests(&client_urls, &obs_url).inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
