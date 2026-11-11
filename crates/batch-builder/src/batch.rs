@@ -134,7 +134,8 @@ pub(crate) fn spawn_batch_build<P: TxPool + Send + 'static>(
 ///
 /// `keeps_sealed` is true when this node keeps a quorum-acked batch's transactions pooled and
 /// marked (switch `sealed_tx_keep` on a worker that seals by quorum). Selection then also skips
-/// a transaction the pool no longer holds; with it false, selection is as before the switch.
+/// a transaction the pool no longer holds, and holds back its sender's later nonces when a
+/// replacement took its nonce; with it false, selection is as before the switch.
 #[inline]
 pub fn build_batch<P: TxPool>(
     args: BatchBuilderArgs<P>,
@@ -191,9 +192,15 @@ pub fn build_batch<P: TxPool>(
         // only then unmarks them, and the eviction sweep unmarks only transactions the pool no
         // longer holds, so a candidate read as unmarked above and absent here has left the pool
         // since the snapshot. Packing it would seal a copy that every node skips as `nonce too
-        // low`. The same plain skip as a sealed one keeps the sender's later nonces buildable.
+        // low`. If its nonce is gone (executed, or evicted with its descendants), the same plain
+        // skip as a sealed one keeps the sender's later nonces buildable. If a replacement holds
+        // the nonce, it is still to execute: hold the sender's later nonces back for this build,
+        // or they would land ahead of the replacement and be skipped as `nonce too high`.
         // Only with sealed-keep: otherwise the snapshot is packed as before the switch.
         if keeps_sealed && !pool.holds(pool_tx.hash()) {
+            if pool.holds_nonce(pool_tx.sender(), pool_tx.nonce()) {
+                best_txs.replaced_since_snapshot(&pool_tx);
+            }
             continue;
         }
 

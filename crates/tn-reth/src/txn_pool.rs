@@ -242,6 +242,15 @@ pub trait TxPool {
     fn holds(&self, _hash: &TxHash) -> bool {
         true
     }
+    /// Return true if the pool holds a transaction of `sender` at `nonce`.
+    ///
+    /// The builder asks this, with `sealed_tx_keep` on, about a candidate the pool no longer
+    /// holds ([`Self::holds`]): a transaction at the same nonce means a replacement took the
+    /// candidate's place after the snapshot, so the nonce is still to execute. The default is
+    /// true, for pools that never mark.
+    fn holds_nonce(&self, _sender: Address, _nonce: u64) -> bool {
+        true
+    }
 }
 
 /// A telcoin network transaction pool.
@@ -1255,6 +1264,10 @@ impl TxPool for WorkerTxPool {
     fn holds(&self, hash: &TxHash) -> bool {
         self.0.contains(hash)
     }
+
+    fn holds_nonce(&self, sender: Address, nonce: u64) -> bool {
+        self.0.get_transaction_by_sender_and_nonce(sender, nonce).is_some()
+    }
 }
 
 /// An iterator that produces the best transactions from a pool.
@@ -1325,6 +1338,20 @@ impl BestTxns {
             &InvalidPoolTransactionError::Other(Box::new(PeerBatchDeferred)),
         );
     }
+
+    /// Skip a candidate whose place in the pool a replacement took after this snapshot
+    /// (switch `sealed_tx_keep`).
+    ///
+    /// The iterator has already unlocked the sender's next nonce, but the replaced nonce is still
+    /// to execute: marking the candidate invalid for this build also skips the sender's later
+    /// nonces and the replacement, so no later nonce lands ahead of it. The next build packs the
+    /// replacement first.
+    pub fn replaced_since_snapshot(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::Other(Box::new(ReplacedSinceSnapshot)),
+        );
+    }
 }
 
 /// The pool error reported when the builder skips a transaction already packed by a validated
@@ -1344,6 +1371,31 @@ impl std::fmt::Display for PeerBatchDeferred {
 impl std::error::Error for PeerBatchDeferred {}
 
 impl PoolTransactionError for PeerBatchDeferred {
+    fn is_bad_transaction(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The pool error reported when the builder skips a candidate a replacement took the place of
+/// after the selection's snapshot (switch `sealed_tx_keep`).
+///
+/// A local scheduling decision like [`PeerBatchDeferred`]: `is_bad_transaction` is false.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReplacedSinceSnapshot;
+
+impl std::fmt::Display for ReplacedSinceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transaction skipped: replaced in the pool after selection began")
+    }
+}
+
+impl std::error::Error for ReplacedSinceSnapshot {}
+
+impl PoolTransactionError for ReplacedSinceSnapshot {
     fn is_bad_transaction(&self) -> bool {
         false
     }

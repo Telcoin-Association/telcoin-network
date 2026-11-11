@@ -3377,18 +3377,20 @@ mod tests {
             fn holds(&self, hash: &TxHash) -> bool {
                 self.inner.holds(hash)
             }
+
+            fn holds_nonce(&self, sender: Address, nonce: u64) -> bool {
+                self.inner.holds_nonce(sender, nonce)
+            }
         }
 
-        /// Run one selection with `keeps_sealed` whose snapshot is taken while `txs` are
-        /// pooled, then let `executed` (the batch that carries them) execute and the pool
-        /// apply that block, prune `txs` and clear their marks before the walk reads any mark.
-        /// Return the hashes the selection packed.
-        async fn select_across_the_update(
-            bench: &mut Bench,
-            executed: &SealedBatch,
-            txs: &[TransactionSigned],
+        /// A selection with `keeps_sealed` over the bench's pool, started on the blocking pool
+        /// and held once its snapshot is taken. Returns when the snapshot is taken; the walk runs
+        /// when the returned sender sends (or is dropped).
+        async fn held_selection(
+            bench: &Bench,
             keeps_sealed: bool,
-        ) -> eyre::Result<Vec<TxHash>> {
+        ) -> eyre::Result<(tokio::task::JoinHandle<BatchBuilderOutput>, std::sync::mpsc::Sender<()>)>
+        {
             let (taken, snapshot_taken) = oneshot::channel();
             let (resume, resumed) = std::sync::mpsc::channel();
             let pool = RacingPool {
@@ -3401,7 +3403,20 @@ mod tests {
                 build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, keeps_sealed)
             });
             timeout(WAIT, snapshot_taken).await??;
+            Ok((selection, resume))
+        }
 
+        /// Run one selection with `keeps_sealed` whose snapshot is taken while `txs` are
+        /// pooled, then let `executed` (the batch that carries them) execute and the pool
+        /// apply that block, prune `txs` and clear their marks before the walk reads any mark.
+        /// Return the hashes the selection packed.
+        async fn select_across_the_update(
+            bench: &mut Bench,
+            executed: &SealedBatch,
+            txs: &[TransactionSigned],
+            keeps_sealed: bool,
+        ) -> eyre::Result<Vec<TxHash>> {
+            let (selection, resume) = held_selection(bench, keeps_sealed).await?;
             bench.execute(&[executed]).await?;
             bench.wait_gone(txs).await?;
             bench.wait_marked(txs, false).await?;
@@ -3449,6 +3464,41 @@ mod tests {
 
             let packed = select_across_the_update(&mut bench, &b1, &txs, false).await?;
             assert_eq!(packed, tx_hashes(&txs));
+            Ok(())
+        }
+
+        /// A candidate the pool stopped holding because a fee bump replaced it after the
+        /// snapshot: its nonce is still to execute, so the walk holds back the sender's later
+        /// nonces for this build instead of packing them ahead of the replacement (they would
+        /// be skipped as `nonce too high`). The next selection packs the replacement, then the
+        /// later nonce.
+        #[tokio::test]
+        async fn a_candidate_replaced_after_the_snapshot_holds_back_its_later_nonces(
+        ) -> eyre::Result<()> {
+            let tmp_dir = TempDir::new()?;
+            let mut bench = Bench::new(tmp_dir.path())?;
+            let txs = transfers(&mut bench.a, &bench.chain, 2);
+            bench.submit(&txs).await;
+
+            let (selection, resume) = held_selection(&bench, true).await?;
+            bench.a.set_nonce(0);
+            let replacement = bench.a.create_eip1559(
+                bench.chain.clone(),
+                None,
+                u128::from(MIN_PROTOCOL_BASE_FEE) * 2,
+                Some(Address::ZERO),
+                U256::from(10),
+                Bytes::new(),
+            );
+            bench.txpool.add_raw_transaction_external(replacement.clone()).await?;
+            assert!(bench.txpool.get(txs[0].hash()).is_none(), "the bump replaced nonce 0");
+            resume.send(())?;
+            let packed = timeout(WAIT, selection).await??.mined_transactions;
+            assert!(packed.is_empty(), "packed ahead of the replacement: {packed:?}");
+
+            let args = BatchBuilderArgs::new(bench.txpool.clone(), Address::ZERO, 0);
+            let next = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE, true).mined_transactions;
+            assert_eq!(next, vec![*replacement.hash(), *txs[1].hash()]);
             Ok(())
         }
     }
