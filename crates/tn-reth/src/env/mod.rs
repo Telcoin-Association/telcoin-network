@@ -293,10 +293,10 @@ impl RethEnv {
         self.inner.switches.rpc_admission_backlog_outputs
     }
 
-    /// The node's shared [`ExecutionBacklog`]: the node records the outputs it forwards to the
-    /// engine, the engine the outputs it holds and finishes, and the RPC submission guard reads
-    /// how far execution trails. An env built through [`RethEnv::new`] holds a fresh handle that
-    /// nothing else writes.
+    /// The node's shared [`ExecutionBacklog`], the count of consensus outputs execution trails
+    /// behind. The engine built on this env records into it, and the RPC submission guard is the
+    /// reader it exists for. An env built through [`RethEnv::new`] holds a fresh handle that
+    /// nothing outside the env shares.
     pub fn execution_backlog(&self) -> &ExecutionBacklog {
         &self.inner.switches.execution_backlog
     }

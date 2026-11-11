@@ -147,6 +147,8 @@ impl ExecutorEngine {
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
+        // the node's env carries the node's backlog, so the engine records into it by default
+        let execution_backlog = reth_env.execution_backlog().clone();
 
         Self {
             queued: Default::default(),
@@ -161,7 +163,7 @@ impl ExecutorEngine {
             engine_update_tx,
             repack_monitor,
             recovery_threads: 0,
-            execution_backlog: ExecutionBacklog::default(),
+            execution_backlog,
             pipelined_persist: false,
         }
     }
@@ -185,8 +187,9 @@ impl ExecutorEngine {
     /// Share the node's [`ExecutionBacklog`] with the engine, which records into it how many
     /// outputs it holds and every output it finishes.
     ///
-    /// [`ExecutorEngine::new`] starts with a fresh handle that nothing else reads. The node
-    /// passes the handle its reth environment holds right after construction.
+    /// [`ExecutorEngine::new`] starts with the handle its reth environment holds, which on the
+    /// node's env is the node's own; this overrides it. The node passes that same handle right
+    /// after construction.
     pub fn with_execution_backlog(mut self, backlog: ExecutionBacklog) -> Self {
         self.execution_backlog = backlog;
         self
@@ -695,7 +698,9 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let (engine, to_engine, mut engine_updates, _shutdown) =
             engine_on_temp_chain(dir.path(), &task_manager);
-        assert_eq!(engine.execution_backlog().last_executed(), None, "a fresh handle by default");
+        // by default the engine records into the handle its env holds
+        engine.reth_env.execution_backlog().record_executed(1);
+        assert_eq!(engine.execution_backlog().last_executed(), Some(1), "the env's handle");
 
         let backlog = ExecutionBacklog::new();
         let engine = engine.with_execution_backlog(backlog.clone());
