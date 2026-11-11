@@ -323,7 +323,7 @@ pub struct Parameters {
     /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
     /// keeps the previous behaviour: every header names this node's own newest executed block.
     /// Issue #1804.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub quorum_exec_block: bool,
 
     /// When the proposer applies the [`Self::quorum_exec_block`] rule. Only matters while that
@@ -335,7 +335,7 @@ pub struct Parameters {
     /// keeps happening. With the rule on every header, the blocks parents name are earlier picks
     /// of the same rule rather than tips, so every proposer settles at the ring floor; `K` keeps
     /// tips in the parents. Issue #1804.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub quorum_exec_block_starved_rounds: u32,
 
     /// Keep vote requests queued behind the voter's per-author lock from each waiting out the
@@ -346,7 +346,7 @@ pub struct Parameters {
     /// before it takes the per-author lock; under the lock it only checks execution, without
     /// waiting again. The default `false` keeps the previous behaviour: each request takes the
     /// lock in turn and waits for execution while holding it. Issue #1804.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub vote_queue_fix: bool,
 
     /// Advise the kernel that the execution database's memory map is read at random.
@@ -355,7 +355,7 @@ pub struct Parameters {
     /// it opens the database and again when the database grows, so page faults stop pulling
     /// read-ahead into the page cache. The default `false` keeps the previous behaviour: the map
     /// keeps the kernel's default advice. Issue #1802.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub mdbx_random_advice: bool,
 
     /// Keep a sealed batch's transactions in the pool, marked, until they execute.
@@ -366,7 +366,7 @@ pub struct Parameters {
     /// their batch is orphaned at an epoch close, so the pool and the RPC still see a transaction
     /// while its batch waits. The default `false` keeps the previous behaviour: the transactions
     /// leave the pool as soon as their batch is sealed. Issue #1807.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub sealed_tx_keep: bool,
 
     /// Drop a batch digest this node already holds instead of handling it again.
@@ -375,7 +375,7 @@ pub struct Parameters {
     /// without reporting it to the primary again, and the proposer drops a digest that is already
     /// pending or in one of its proposed headers. The default `false` keeps the previous
     /// behaviour: a repeated digest is reported again and can be proposed twice. Issue #1807.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub digest_dedupe: bool,
 
     /// Threads in a dedicated pool for recovering transaction signers.
@@ -384,7 +384,7 @@ pub struct Parameters {
     /// threads, so it no longer competes with the executing output's work on the global rayon
     /// pool. The default `0` keeps the previous behaviour: recovery runs on the global pool.
     /// Issue #1805.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub recovery_threads: u16,
 
     /// Keep the epoch's task manager tracking and reaping tasks while the node handles the epoch
@@ -395,7 +395,7 @@ pub struct Parameters {
     /// reaping finished ones. The default `false` keeps the previous behaviour: the task manager
     /// does neither until the boundary handler returns, and tasks spawned meanwhile can fail to
     /// be tracked. Issue #1806.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub epoch_close_task_drain: bool,
 
     /// Check the block an epoch record names as its final state before writing the record.
@@ -404,7 +404,7 @@ pub struct Parameters {
     /// `final_state` is not the epoch's closing block, rather than sign a record for the wrong
     /// block. The default `false` keeps the previous behaviour: the pinned block is used without
     /// the check. Issue #1806.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub epoch_record_state_check: bool,
 
     /// How long the proposer waits for late parents before it proposes a header.
@@ -414,7 +414,7 @@ pub struct Parameters {
     /// header forced by `max_header_delay` never waits. Written like the other durations
     /// (`150ms`). The default `0ms` keeps the previous behaviour: propose as soon as ready.
     /// Issue #1803.
-    #[serde(with = "humantime_serde", default)]
+    #[serde(with = "humantime_serde", default, skip_serializing_if = "is_default")]
     pub parent_grace: Duration,
 
     /// Refuse RPC transaction submissions while execution is this many consensus outputs behind.
@@ -424,7 +424,7 @@ pub struct Parameters {
     /// and admits again once the backlog is below one less than this, or at zero when this is 1
     /// ([`tn_types::AdmissionGate`]). Observer forwards and re-pooled transactions are not gated.
     /// The default `0` keeps the previous behaviour: no bound.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub rpc_admission_backlog_outputs: usize,
 
     /// Persist one consensus output's blocks while the next output executes.
@@ -434,7 +434,7 @@ pub struct Parameters {
     /// durable, and an output that closes an epoch is never overlapped with the next. The default
     /// `false` keeps the previous behaviour: each output executes, persists and commits before
     /// the next one starts.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub pipelined_persist: bool,
 }
 
@@ -696,7 +696,8 @@ impl Parameters {
     /// A switch turns one behaviour change on or off per benchmark arm, and its default is the
     /// behaviour from before the switch existed. A mistyped key is ignored without an error, like
     /// any unknown key, so the node logs this list once at start and exports it as a gauge: that
-    /// shows which arm a node actually runs.
+    /// shows which arm a node actually runs. A switch at its default is left out when the
+    /// parameters are written, so a key absent from a node's file means the default.
     ///
     /// Every switch field must be listed here. A test fails while one is missing.
     pub fn switches(&self) -> Vec<(&'static str, SwitchValue)> {
@@ -762,6 +763,13 @@ impl std::fmt::Display for SwitchValue {
             }
         }
     }
+}
+
+/// Whether `value` is its type's default. A runtime switch at its default is left out when
+/// [`Parameters`] are written, so a written `parameters.yaml` matches one from before the switch
+/// existed.
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 #[cfg(test)]
@@ -1217,36 +1225,83 @@ mod test {
         serde_yaml::from_value(yaml).expect("flipped switches parse")
     }
 
-    /// The switch list names every field that is not a plain parameter, once, by its YAML key.
+    /// A deserializer that records the field names a struct's `Deserialize` impl asks for, then
+    /// stops. It sees every field, including those a serializer leaves out.
+    struct FieldNames<'a>(&'a mut Vec<&'static str>);
+
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("only a struct's field names are collected"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0.extend_from_slice(fields);
+            Err(serde::de::Error::custom("field names collected"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+            option unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier
+            ignored_any
+        }
+    }
+
+    /// The switch list names every field that is not a plain parameter, once, by its YAML key,
+    /// and a default `Parameters` writes only the plain parameters.
     #[test]
     fn switches_list_every_switch_field() {
-        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
-        let fields: std::collections::BTreeSet<String> = yaml
-            .as_mapping()
-            .expect("parameters serialize as a mapping")
-            .iter()
-            .map(|(key, _)| key.as_str().expect("parameter keys are strings").to_string())
-            .filter(|key| !NON_SWITCH_KEYS.contains(&key.as_str()))
-            .collect();
+        let mut names = Vec::new();
+        <Parameters as serde::Deserialize>::deserialize(FieldNames(&mut names))
+            .expect_err("the probe stops once it has the field names");
+        assert!(names.len() > NON_SWITCH_KEYS.len(), "field names must be collected: {names:?}");
+        let fields: std::collections::BTreeSet<&str> =
+            names.into_iter().filter(|name| !NON_SWITCH_KEYS.contains(name)).collect();
         let switches = Parameters::default().switches();
-        let listed: std::collections::BTreeSet<String> =
-            switches.iter().map(|(name, _)| name.to_string()).collect();
+        let listed: std::collections::BTreeSet<&str> =
+            switches.iter().map(|(name, _)| *name).collect();
         assert_eq!(listed.len(), switches.len(), "a switch is listed twice: {switches:?}");
         assert_eq!(
             listed, fields,
             "every Parameters field must be listed by Parameters::switches or in NON_SWITCH_KEYS"
         );
+
+        // the genesis ceremony writes `Parameters::default()`; it must match the pre-switch file
+        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        let written: std::collections::BTreeSet<String> = yaml
+            .as_mapping()
+            .expect("parameters serialize as a mapping")
+            .iter()
+            .map(|(key, _)| key.as_str().expect("parameter keys are strings").to_string())
+            .collect();
+        let plain: std::collections::BTreeSet<String> =
+            NON_SWITCH_KEYS.iter().map(|key| key.to_string()).collect();
+        assert_eq!(written, plain, "a default switch must not be written");
     }
 
-    /// Each listed value is the value of its own field, rendered as the YAML serializer writes it,
-    /// at the defaults and with every switch flipped.
+    /// Each listed value is the value of its own field. Away from its default it renders as the
+    /// YAML serializer writes it; at its default it is not written, and its rendering parses back
+    /// to the default.
     #[test]
     fn switch_values_render_as_their_yaml() {
-        for params in [Parameters::default(), every_switch_flipped()] {
-            let yaml = serde_yaml::to_value(&params).expect("parameters serialize");
-            for (name, value) in params.switches() {
-                assert_eq!(value.to_string(), yaml_scalar(&yaml[name]), "switch {name}");
-            }
+        let flipped = every_switch_flipped();
+        let yaml = serde_yaml::to_value(&flipped).expect("parameters serialize");
+        for (name, value) in flipped.switches() {
+            assert_eq!(value.to_string(), yaml_scalar(&yaml[name]), "switch {name}");
+        }
+        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        for (name, value) in Parameters::default().switches() {
+            assert_eq!(yaml.get(name), None, "default switch {name} is written");
+            assert_eq!(parse_with(&format!("{name}: {value}")), parse_with(""), "switch {name}");
         }
         let defaults = Parameters::default().switches();
         for ((name, default), (_, flipped)) in
@@ -1290,7 +1345,7 @@ mod test {
     }
 
     /// Re-serializing a file that predates the switches keeps every key it held at the same
-    /// value, and the result parses back to the same parameters.
+    /// value, adds no switch key, and the result parses back to the same parameters.
     ///
     /// Strings compare without case: an address is written back in lowercase hex whatever its
     /// checksum case in the file, which is the same address.
@@ -1316,6 +1371,9 @@ mod test {
                     Some(lowercase(value)),
                     "key {key:?} changed on re-serialization"
                 );
+            }
+            for (name, _) in params.switches() {
+                assert_eq!(output.get(name), None, "re-serialization added switch {name}");
             }
             let reparsed: Parameters = serde_yaml::from_value(output).expect("output parses");
             assert_eq!(reparsed, params);
