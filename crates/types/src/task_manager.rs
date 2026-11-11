@@ -440,6 +440,73 @@ impl TaskManager {
         }
     }
 
+    /// Run `fut` to completion while this manager keeps tracking newly spawned tasks and reaping
+    /// finished ones, and return its output.
+    ///
+    /// The tracking channel holds 1,000 handles and only this method, [`Self::update_tasks`] and
+    /// the `until_*`/`join*` loops empty it. A caller that awaits a long future between those
+    /// (the epoch close waits for execution, writes the record and exports state) would let the
+    /// channel fill: every later spawn is then untracked and escapes [`Self::abort_all_tasks`].
+    ///
+    /// Unlike [`Self::until_task_ends`] this has no exit condition of its own: no shutdown notice,
+    /// no signal, no task exit ends it. Critical tasks are expected to end while it runs (the epoch
+    /// close notifies the consensus shutdown first), so one that ends `Ok` is logged and reaped,
+    /// and one that ends with an error or a panic is logged as a warning and reaped; neither is
+    /// reported as a failure. Non-critical tasks are reaped silently. `fut` is polled first on
+    /// every wake-up and is never dropped before it completes, so a future that must not stop
+    /// half way (a record saved but not yet persisted) is safe here. Dropping the call itself still
+    /// drops `fut`, as with any future.
+    ///
+    /// Tasks spawned after `fut`'s last poll can still be queued when this returns: call
+    /// [`Self::update_tasks`] before aborting.
+    pub async fn track_while<F: Future>(&mut self, fut: F) -> F::Output {
+        let mut fut = pin!(fut);
+        let mut tracked = 0usize;
+        let mut reaped = 0usize;
+        let output = loop {
+            tokio::select! {
+                biased;
+                output = &mut fut => break output,
+                // a closed channel disables this arm for one pass; the loop retries it
+                Some(task) = self.new_task_rx.recv() => {
+                    self.tasks.push(task);
+                    tracked += 1;
+                    while let Ok(task) = self.new_task_rx.try_recv() {
+                        self.tasks.push(task);
+                        tracked += 1;
+                    }
+                },
+                Some(res) = self.tasks.next() => {
+                    reaped += 1;
+                    match res {
+                        Ok(info) if info.critical => tracing::info!(
+                            target: "tn::tasks",
+                            "{}: {} returned Ok while tracking",
+                            self.name,
+                            info.name,
+                        ),
+                        Err((info, err)) if info.critical => tracing::warn!(
+                            target: "tn::tasks",
+                            "{}: {} returned error {err} while tracking",
+                            self.name,
+                            info.name,
+                        ),
+                        _ => {}
+                    }
+                },
+            }
+        };
+        tracing::info!(
+            target: "tn::tasks",
+            tracked,
+            reaped,
+            running = self.tasks.len(),
+            "{}: task tracking finished",
+            self.name,
+        );
+        output
+    }
+
     /// Resolves when the task manager should exit.
     async fn until_exit_internal(
         &mut self,
@@ -516,12 +583,16 @@ impl TaskManager {
     }
 
     /// Join the tasks as they finish, logging each, for up to `wait`. True when all of them did.
+    ///
+    /// A critical task's exit is logged at info, a non-critical one's at debug: an epoch's manager
+    /// can hold many short per-message tasks when it aborts (see [`Self::track_while`]), and one
+    /// info line each would flood the log at every epoch close.
     async fn join_tasks_within(&mut self, wait: Duration) -> bool {
         tokio::time::timeout(wait, async move {
             tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
-                    Ok(info) => {
+                    Ok(info) if info.critical => {
                         tracing::info!(
                             target: "tn::tasks",
                             "{}: {} shutdown successfully",
@@ -529,13 +600,30 @@ impl TaskManager {
                             info.name,
                         )
                     }
-                    Err((info, TaskJoinError::CriticalJoinError(_, err))) if err.is_cancelled() => {
-                        tracing::info!(
+                    Ok(info) => {
+                        tracing::debug!(
                             target: "tn::tasks",
-                            "{}: {} was cancelled",
+                            "{}: {} shutdown successfully",
                             self.name,
                             info.name,
                         )
+                    }
+                    Err((info, TaskJoinError::CriticalJoinError(_, err))) if err.is_cancelled() => {
+                        if info.critical {
+                            tracing::info!(
+                                target: "tn::tasks",
+                                "{}: {} was cancelled",
+                                self.name,
+                                info.name,
+                            )
+                        } else {
+                            tracing::debug!(
+                                target: "tn::tasks",
+                                "{}: {} was cancelled",
+                                self.name,
+                                info.name,
+                            )
+                        }
                     }
                     Err((info, err)) => {
                         if !info.critical {
@@ -950,5 +1038,205 @@ mod test {
             "{registered} entries left by {} finished tasks",
             3 * N
         );
+    }
+
+    // ---- bench6 tracker-drain ----
+
+    /// Spawn `count` tasks that run until the manager aborts them or shuts down, yielding after
+    /// each spawn the way a network loop does between messages.
+    async fn spawn_waiting_tasks(spawner: &crate::TaskSpawner, count: usize) {
+        for i in 0..count {
+            spawner.spawn_task(format!("per-message-{i}"), std::future::pending());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A task body that panics.
+    fn panics(task: &str) -> Result<(), TaskError> {
+        panic!("{task} panicked")
+    }
+
+    /// Abort every tracked task and count the ones that ended cancelled.
+    async fn abort_and_count_cancelled(task_manager: &mut TaskManager) -> usize {
+        use futures::StreamExt as _;
+        task_manager.abort_all_tasks();
+        let mut cancelled = 0;
+        while let Some(res) = task_manager.tasks.next().await {
+            if matches!(res, Err((_, TaskJoinError::CriticalJoinError(_, ref e))) if e.is_cancelled())
+            {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// Nothing drains the channel while a future runs outside `track_while`: of 2,000 spawns only
+    /// the channel's 1,000 are ever tracked and the rest can never be aborted. This is the
+    /// overflow the next test proves `track_while` prevents.
+    #[tokio::test]
+    async fn spawns_overflow_the_channel_without_track_while() {
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        spawn_waiting_tasks(&spawner, 2_000).await;
+        task_manager.update_tasks();
+        assert_eq!(task_manager.tasks.len(), 1_000, "the channel holds 1,000 handles");
+        assert_eq!(abort_and_count_cancelled(&mut task_manager).await, 1_000);
+    }
+
+    /// Every task spawned while `track_while` runs is tracked, 2,000 of them through the
+    /// 1,000-slot channel, and every one is aborted with the manager's other tasks.
+    #[tokio::test]
+    async fn track_while_tracks_tasks_spawned_while_it_runs() {
+        const SPAWNS: usize = 2_000;
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        // spawned on the runtime directly, like the network loop it stands for
+        let network_loop = tokio::spawn(async move { spawn_waiting_tasks(&spawner, SPAWNS).await });
+        let output = task_manager
+            .track_while(async {
+                network_loop.await.expect("the spawning loop ran");
+                7
+            })
+            .await;
+        assert_eq!(output, 7, "the future's output is returned");
+        // the boundary handler takes in what is still queued before it aborts
+        task_manager.update_tasks();
+        assert_eq!(task_manager.tasks.len(), SPAWNS, "no spawn overflowed the channel");
+        assert_eq!(abort_and_count_cancelled(&mut task_manager).await, SPAWNS);
+    }
+
+    /// A task that finishes while `track_while` runs is reaped, so short tasks do not pile up in
+    /// the tracked set however many of them run.
+    #[tokio::test]
+    async fn track_while_reaps_finished_tasks() {
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        task_manager
+            .track_while(async {
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                spawner.spawn_task("short", async move {
+                    let _ = done_tx.send(());
+                    Ok(())
+                });
+                done_rx.await.expect("the task ran");
+                // park a few times so the finished task's handle is polled
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        task_manager.update_tasks();
+        assert_eq!(task_manager.tasks.len(), 0, "the finished task was reaped");
+
+        const SHORT: usize = 10_000;
+        let short_loop = tokio::spawn(async move {
+            for i in 0..SHORT {
+                spawner.spawn_task(format!("short-{i}"), async { Ok(()) });
+                tokio::task::yield_now().await;
+            }
+        });
+        task_manager
+            .track_while(async {
+                short_loop.await.expect("the spawning loop ran");
+            })
+            .await;
+        task_manager.update_tasks();
+        assert!(
+            task_manager.tasks.len() < 1_000,
+            "{} of {SHORT} finished tasks left in the tracked set",
+            task_manager.tasks.len()
+        );
+    }
+
+    /// The future is the epoch close: it writes the record and then persists it, and dropping it
+    /// between the two leaves the record half written. `track_while` must run it to completion
+    /// through every event that ends `until_exit_internal` (a critical task ending `Ok`, with an
+    /// error or with a panic, a non-critical panic) and keep tracking new tasks after them.
+    #[tokio::test]
+    async fn track_while_never_cancels_the_future() {
+        use std::sync::{Arc, Mutex};
+
+        /// Records the future's steps; its drop is the last step only when the future finished.
+        struct Steps(Arc<Mutex<Vec<&'static str>>>);
+        impl Steps {
+            fn push(&self, step: &'static str) {
+                self.0.lock().expect("steps lock").push(step);
+            }
+        }
+        impl Drop for Steps {
+            fn drop(&mut self) {
+                self.push("dropped");
+            }
+        }
+
+        const SPAWNS_AFTER_EVENTS: usize = 1_500;
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (persist_tx, persist_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let events = tokio::spawn(async move {
+            parked_rx.await.expect("the close parked between the record and its persist");
+            spawner.spawn_critical_task("primary", async { Ok(()) });
+            spawner.spawn_critical_task("certifier", async {
+                Err(TaskError::from_message("certifier failed"))
+            });
+            spawner.spawn_critical_task("proposer", async { panics("proposer") });
+            spawner.spawn_task("vote-request", async { panics("vote request") });
+            spawn_waiting_tasks(&spawner, SPAWNS_AFTER_EVENTS).await;
+            persist_tx.send(()).expect("the close is still waiting");
+        });
+
+        let steps = Steps(log.clone());
+        let output = task_manager
+            .track_while(async move {
+                steps.push("close");
+                steps.push("save_record");
+                parked_tx.send(()).expect("the event task waits");
+                persist_rx.await.expect("the event task releases the persist");
+                steps.push("persist");
+                42
+            })
+            .await;
+        events.await.expect("the event task ran");
+
+        assert_eq!(output, 42, "the future's output is returned");
+        assert_eq!(
+            *log.lock().expect("steps lock"),
+            ["close", "save_record", "persist", "dropped"],
+            "the future ran to completion before it was dropped"
+        );
+        task_manager.update_tasks();
+        assert_eq!(
+            task_manager.tasks.len(),
+            SPAWNS_AFTER_EVENTS,
+            "the ended tasks were reaped and every later spawn was tracked"
+        );
+        assert_eq!(abort_and_count_cancelled(&mut task_manager).await, SPAWNS_AFTER_EVENTS);
+    }
+
+    /// `track_while` resolves only with its future: with the channel closed and nothing tracked,
+    /// it waits for the future instead of returning or panicking, and while the future is pending
+    /// it stays pending.
+    #[tokio::test]
+    async fn track_while_waits_for_the_future_when_the_channel_closes() {
+        let mut task_manager = TaskManager::default();
+        task_manager.new_task_rx.close();
+        let output = task_manager
+            .track_while(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                5
+            })
+            .await;
+        assert_eq!(output, 5);
+
+        let mut task_manager = TaskManager::default();
+        let parked = tokio::time::timeout(
+            Duration::from_millis(50),
+            task_manager.track_while(std::future::pending::<()>()),
+        )
+        .await;
+        assert!(parked.is_err(), "pending while its future is pending");
     }
 }
