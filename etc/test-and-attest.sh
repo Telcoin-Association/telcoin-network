@@ -121,7 +121,6 @@ fi
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
-./etc/ci-lanes.sh test-mdbx
 ./etc/ci-lanes.sh test-vendor-reth
 
 # The engine's and the adapter's heavy test variants (`#[ignore = "heavy: run with --release"]`:

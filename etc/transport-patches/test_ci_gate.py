@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # ci-scope gates only the test lanes; the compile lanes run for every author on both events.
 ALWAYS_RUN = ("archive-mode-gate", "clippy", "fmt")
-GATED = ("adiri-test", "mdbx-test", "test", "vendor-reth-test")
+GATED = ("adiri-test", "test", "vendor-reth-test")
 EVERY_PAIR = (("pull_request", False), ("pull_request", True), ("merge_group", True))
 
 
@@ -30,12 +30,12 @@ def gate_needs():
 
 def fixture(event, run_tests, transport, connection_limits="success", pins="success", quinn_proto="success",
             gossipsub_patch="success", revm_inspectors="success", fmt=None, clippy=None, archive_mode_gate=None,
-            test=None, adiri_test=None, mdbx_test=None, vendor_reth_test=None):
+            test=None, adiri_test=None, vendor_reth_test=None):
     """The `needs` context handed to the gate; a lane keyword left as None keeps the fixture's result for that lane."""
     results = {name: {"result": "success"} for name in ALWAYS_RUN}
     results.update({name: {"result": "success" if run_tests else "skipped"} for name in GATED})
     overrides = {"fmt": fmt, "clippy": clippy, "archive-mode-gate": archive_mode_gate, "test": test,
-                 "adiri-test": adiri_test, "mdbx-test": mdbx_test, "vendor-reth-test": vendor_reth_test}
+                 "adiri-test": adiri_test, "vendor-reth-test": vendor_reth_test}
     results.update({name: {"result": outcome} for name, outcome in overrides.items() if outcome is not None})
     results.update({"ci-scope": {"result": "success", "outputs": {"run_tests": str(run_tests).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
@@ -143,7 +143,7 @@ class CompileGate(unittest.TestCase):
 
     def test_test_lanes_skip_only_when_ci_scope_says_so(self):
         self.assertEqual(execute("pull_request", False, "success", test="skipped", adiri_test="skipped",
-                                 mdbx_test="skipped", vendor_reth_test="skipped").returncode, 0)
+                                 vendor_reth_test="skipped").returncode, 0)
         for lane in GATED:
             with self.subTest(lane=lane):
                 result = execute("pull_request", True, "success", **{lane_keyword(lane): "skipped"})

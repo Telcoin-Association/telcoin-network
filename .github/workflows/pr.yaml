@@ -90,7 +90,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # Decides whether the test lanes, `test`, `adiri-test`, `mdbx-test` and `vendor-reth-test`, run. No other job needs
+  # Decides whether the test lanes, `test`, `adiri-test` and `vendor-reth-test`, run. No other job needs
   # it: fmt, clippy and the guards run for every author on both events, drafts included.
   #
   # On a `pull_request` the test lanes are skipped for a draft, and for a maintainer-authored
@@ -489,53 +489,6 @@ jobs:
           NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh test-adiri
 
-  # MDBX feature lane: the default-feature test job above runs every reth database on tn-lmdb,
-  # so it never runs reth on MDBX, the legacy backend kept until testnet has resynced. This
-  # lane reruns the workspace with tn-reth's opt-in `mdbx` feature, less the packages the
-  # feature cannot change; the reasons live in etc/ci-lanes.sh. Same 45-minute ceiling as
-  # `test`, for the same reasons.
-  mdbx-test:
-    needs: ci-scope
-    if: needs.ci-scope.outputs.run_tests == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-          fetch-depth: 1
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest
-
-      # The runner image's own stable Rust would be hashed into the cache key, so it goes
-      # after the last toolchain install and before the cache step (cache-deps.yaml's
-      # header says why). The list that follows is the set the key hashes.
-      - name: Remove the runner image's Rust
-        run: |
-          rustup toolchain uninstall stable
-          rustup toolchain list
-
-      # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
-      # the test lanes into one target dir, where the MDBX variants of the shared
-      # dependencies coexist with the default ones.
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: v1-rust
-          shared-key: test-cache
-          save-if: "false"
-
-      - name: Run tests on MDBX
-        env:
-          NEXTEST_PROFILE: ci
-        run: ./etc/ci-lanes.sh test-mdbx
-
   # reth's own tests for the vendored crates, in the nested workspace, and the opt-in
   # js-tracer build (etc/ci-lanes.sh test-vendor-reth). The root lanes above cannot reach
   # reth's tests: their dev-dependencies resolve only inside vendor/reth. The regression tests
@@ -631,7 +584,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, mdbx-test, vendor-reth-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, gossipsub-patch, revm-inspectors-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, vendor-reth-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, gossipsub-patch, revm-inspectors-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -659,7 +612,7 @@ jobs:
           # `needs` would otherwise leave this check silently. Every job has its own arm
           # below and there is no catch-all for success, so a job added to `needs`
           # without an arm fails at `*)`.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt gossipsub-patch mdbx-test quic-profile-pins quinn-proto-patch revm-inspectors-patch test transport-evidence vendor-reth-test"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt gossipsub-patch quic-profile-pins quinn-proto-patch revm-inspectors-patch test transport-evidence vendor-reth-test"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -721,13 +674,13 @@ jobs:
                 echo "::error::${job}: ${result} on ${EVENT_NAME}"
                 failed=1
                 ;;
-              *:test:success | *:adiri-test:success | *:mdbx-test:success | *:vendor-reth-test:success) echo "  ok       ${job}" ;;
+              *:test:success | *:adiri-test:success | *:vendor-reth-test:success) echo "  ok       ${job}" ;;
               # A skipped test lane is the maintainer/draft bypass and nothing else:
               # ci-scope must have said the tests were not to run. Only pull_request has
               # this arm. In the queue nothing may be skipped, so a skip there falls to
               # `*)`: it would mean the merged commit went untested, which is the one thing
               # the queue exists to prevent.
-              pull_request:test:skipped | pull_request:adiri-test:skipped | pull_request:mdbx-test:skipped | pull_request:vendor-reth-test:skipped)
+              pull_request:test:skipped | pull_request:adiri-test:skipped | pull_request:vendor-reth-test:skipped)
                 if [[ "${run_tests}" == "false" ]]; then
                   echo "  skipped  ${job} (ci-scope: maintainer or draft PR)"
                 else

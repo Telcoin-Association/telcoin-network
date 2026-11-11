@@ -266,6 +266,10 @@ lane_test_adiri() {
 }
 
 lane_test_mdbx() {
+    # Not part of CI, the merge queue, the attestation or `all`: MDBX is the legacy backend, kept
+    # unchanged until testnet has resynced and then removed, and the migration and resync e2e
+    # suites (make test-e2e-reth-migration, test-e2e-resync) cover the move off it. Run by hand.
+    #
     # lane_test_default runs every reth database on tn-lmdb, the default backend, so it never
     # runs reth on MDBX. This is the same workspace run with tn-reth's opt-in `mdbx` feature,
     # the legacy backend kept until testnet has resynced: feature unification switches every
@@ -332,7 +336,6 @@ all)
     lane_clippy
     lane_test_default
     lane_test_adiri
-    lane_test_mdbx
     lane_test_vendor_reth
     ;;
 *) usage ;;

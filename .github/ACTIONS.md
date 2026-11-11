@@ -22,7 +22,7 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `mdbx-test`, `vendor-reth-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `vendor-reth-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
@@ -41,7 +41,7 @@ Three consequences worth remembering:
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
 - **The maintainer and draft skips cover the four test lanes only, and never apply in the queue.**
-  On a pull request, `ci-scope` skips `test`, `adiri-test`, `mdbx-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
+  On a pull request, `ci-scope` skips `test`, `adiri-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
   `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
   In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
   `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the four test lanes only, and only when `ci-scope` asked for it.

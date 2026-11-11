@@ -443,7 +443,7 @@ TN's reth execution database lives in `<datadir>/db`. The default build runs it 
 engine (`tn_lmdb_reth::TnLmdbEnv`, `db/tn-lmdb.dat`); every release, mainnet's included, is this
 build. The opt-in `mdbx` feature (forwarded by `tn-node`, `telcoin-network-cli` and
 `telcoin-network`) runs it on MDBX instead (`reth_db::DatabaseEnv`, `db/mdbx.dat`): the legacy
-backend, kept until testnet has resynced, for the tests of that path (`./etc/ci-lanes.sh test-mdbx`)
+backend, kept until testnet has resynced, for the tests of that path (`./etc/ci-lanes.sh test-mdbx`, run by hand: not in CI or the attestation)
 and as the previous binary of the migration e2e lanes. reth is not patched: it is generic over the
 database on every path TN uses, and MDBX stays compiled in both builds (reth's crates require it,
 and the default build reads an MDBX database to migrate it). Every backend difference lives in

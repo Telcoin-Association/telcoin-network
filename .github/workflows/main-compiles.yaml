@@ -192,11 +192,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-adiri --build-only
 
-      # The workspace on tn-reth's `mdbx` feature, likewise.
-      - name: Build the MDBX lane's test binaries
-        if: ${{ !cancelled() }}
-        run: ./etc/ci-lanes.sh test-mdbx --build-only
-
       # The nested vendor/reth workspace's tests and the js-tracer build, likewise.
       - name: Build the vendored reth lane's test binaries
         if: ${{ !cancelled() }}
