@@ -425,6 +425,16 @@ pub struct Parameters {
     /// transactions are not gated. The default `0` keeps the previous behaviour: no bound.
     #[serde(default)]
     pub rpc_admission_backlog_outputs: usize,
+
+    /// Persist one consensus output's blocks while the next output executes.
+    ///
+    /// When `true`, the engine hands output N's persist to a background task and starts N+1 on
+    /// N's in-memory state. Persists stay in order, consensus sees a block only once it is
+    /// durable, and an output that closes an epoch is never overlapped with the next. The default
+    /// `false` keeps the previous behaviour: each output executes, persists and commits before
+    /// the next one starts.
+    #[serde(default)]
+    pub pipelined_persist: bool,
 }
 
 impl Parameters {
@@ -537,6 +547,7 @@ impl Default for Parameters {
             epoch_record_state_check: false,
             parent_grace: Duration::ZERO,
             rpc_admission_backlog_outputs: 0,
+            pipelined_persist: false,
         }
     }
 }
@@ -708,6 +719,7 @@ impl Parameters {
                     u64::try_from(self.rpc_admission_backlog_outputs).unwrap_or(u64::MAX),
                 ),
             ),
+            ("pipelined_persist", SwitchValue::Bool(self.pipelined_persist)),
         ]
     }
 }
@@ -1453,5 +1465,15 @@ mod test {
             listed("rpc_admission_backlog_outputs: 2", "rpc_admission_backlog_outputs"),
             "2"
         );
+    }
+
+    // ---- bench6 pipelined-persist ----
+
+    /// `pipelined_persist` stays at the bench-5 behaviour unless the file turns it on.
+    #[test]
+    fn pipelined_persist_parses() {
+        assert!(!parse_with("").pipelined_persist);
+        assert!(parse_with("pipelined_persist: true").pipelined_persist);
+        assert_eq!(listed("pipelined_persist: true", "pipelined_persist"), "true");
     }
 }
