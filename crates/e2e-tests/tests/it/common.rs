@@ -491,12 +491,13 @@ pub(crate) fn start_validator_with_env(
 /// for it, looked up by its datadir name `validator-<instance + 1>`.
 ///
 /// Its `parameters.yaml` entries are merged into `base_dir/validator-<instance + 1>` before it
-/// starts (see [`NodeOverrides::apply_parameters`]): every start writes the harness's file plus
+/// starts, after the fleet-wide entries of `TN_E2E_PARAMETERS` (see
+/// [`NodeOverrides::apply_with_e2e_parameters`]): every start writes the harness's file plus
 /// that start's entries, so a restart with the same fleet leaves the file as it was, and a restart
-/// through any other start helper puts the harness's file back. Its environment variables are set
-/// on the spawned command after the variables [`TestBinary::command`] forwards
-/// ([`start_validator_with_env`] delegates here with a one-node fleet). A node the fleet sets
-/// nothing for starts exactly as [`start_validator_with_args`] starts it.
+/// through any other start helper puts the harness's file back (with the fleet-wide entries). Its
+/// environment variables are set on the spawned command after the variables [`TestBinary::command`]
+/// forwards ([`start_validator_with_env`] delegates here with a one-node fleet). A node the fleet
+/// sets nothing for starts exactly as [`start_validator_with_args`] starts it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_validator_with_overrides(
     instance: usize,
@@ -511,7 +512,7 @@ pub(crate) fn start_validator_with_overrides(
     let name = format!("validator-{}", instance + 1);
     let overrides = fleet.node(&name);
     let data_dir = base_dir.join(&name);
-    overrides.apply_parameters(&data_dir)?;
+    overrides.apply_with_e2e_parameters(&data_dir)?;
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
@@ -695,6 +696,9 @@ pub(crate) fn start_observer_with_args(
 
 /// Start a process running the observer node whose datadir is `base_dir/<name>`, as set up by
 /// [`e2e_tests::config_observer`], with additional CLI arguments.
+///
+/// The entries of `TN_E2E_PARAMETERS` are merged into its `parameters.yaml` first (see
+/// [`NodeOverrides::apply_with_e2e_parameters`]); a value the node cannot read panics here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_named_observer(
     instance: usize,
@@ -707,6 +711,9 @@ pub(crate) fn start_named_observer(
     extra_args: &[&str],
 ) -> Child {
     let data_dir = base_dir.join(name);
+    NodeOverrides::default()
+        .apply_with_e2e_parameters(&data_dir)
+        .expect("TN_E2E_PARAMETERS applies to the observer's parameters.yaml");
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("{name}.ipc"));
@@ -1174,8 +1181,9 @@ pub(crate) fn start_nodes(
 /// `validators` (its datadir under `temp_path`), so a restart of a subset finds the same nodes'
 /// overrides.
 ///
-/// A node's `parameters.yaml` entries are merged into `temp_path/<name>` before it starts (see
-/// [`NodeOverrides::apply_parameters`]; a start without entries puts the harness's file back), and
+/// A node's `parameters.yaml` entries are merged into `temp_path/<name>` before it starts, after
+/// the fleet-wide entries of `TN_E2E_PARAMETERS` (see [`NodeOverrides::apply_with_e2e_parameters`];
+/// a start without entries puts the harness's file back), and
 /// its environment variables are set on its process only. A node the fleet sets nothing for
 /// starts exactly as [`start_nodes`] starts it.
 pub(crate) fn start_nodes_with_overrides(
@@ -1192,7 +1200,7 @@ pub(crate) fn start_nodes_with_overrides(
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
         let node_overrides = fleet.node(v);
-        node_overrides.apply_parameters(&dir)?;
+        node_overrides.apply_with_e2e_parameters(&dir)?;
 
         if *v == NEW_VALIDATOR {
             info!(target: "epoch-test", ?v, "starting new validator");

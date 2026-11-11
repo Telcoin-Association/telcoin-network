@@ -1,6 +1,28 @@
 //! End-to-end tests for Telcoin Network
 //!
 //! Utilities for it tests.
+//!
+//! # Fleet-wide parameters: `TN_E2E_PARAMETERS`
+//!
+//! `TN_E2E_PARAMETERS` holds top-level `parameters.yaml` entries that every start helper merges
+//! into the `parameters.yaml` of every node it starts, restarts included, so a lane can run an
+//! existing test set with a node switch on without editing a test:
+//!
+//! ```text
+//! TN_E2E_PARAMETERS='pipelined_persist: true; recovery_threads: 4' cargo nextest run ...
+//! ```
+//!
+//! The value is a list of `key: value` entries separated by `;`. A key is a plain top-level name
+//! (ASCII letters, digits and `_`) and a value is one line of YAML written into the file as given,
+//! so it cannot itself hold a `;`. Whitespace around an entry, its key and its value is trimmed,
+//! an empty entry (a trailing `;`) is skipped, and an unset or blank variable means no entries.
+//!
+//! The entries go in before the test's own [`NodeOverrides`] for that node, so a test that sets
+//! the same key keeps its value (see [`NodeOverrides::layered_over`]). The variable is read once
+//! per test process, and the first start that applies it prints what it applies. A value that is
+//! not a list of entries, or that the node's loader cannot read as `Parameters`, fails the start
+//! with an error naming the variable. As with any [`NodeOverrides`] entry, a key the node does not
+//! know is ignored by the node, so check the node's `node switches` log line, not the merge.
 
 // ignore for IT test
 #![allow(unused_crate_dependencies)]
@@ -395,7 +417,9 @@ pub fn config_observer(
 ///
 /// Both lists are empty by default, and an empty [`NodeOverrides`] starts the node exactly as the
 /// harness does without one: on a datadir no earlier start gave entries to, its `parameters.yaml`
-/// is neither read nor rewritten, and its process gets no extra variable.
+/// is neither read nor rewritten, and its process gets no extra variable. The one exception is
+/// `TN_E2E_PARAMETERS` (see the crate docs), whose entries every start helper puts in before the
+/// node's own (see [`NodeOverrides::apply_with_e2e_parameters`]).
 ///
 /// - `parameters` holds top-level `parameters.yaml` entries as `(key, raw YAML value)` pairs. The
 ///   start helpers merge them into the node's own `parameters.yaml`, the file the `config_*`
@@ -449,6 +473,48 @@ impl NodeOverrides {
         self.parameters.is_empty() && self.env.is_empty()
     }
 
+    /// These overrides with the `parameters.yaml` entries of `fleet_wide` placed before their own.
+    ///
+    /// Entries merge in order and a later entry for a key wins (see [`merge_parameters_yaml`]), so
+    /// a key this node sets keeps this node's value and every other `fleet_wide` entry is added.
+    /// The environment variables are kept as they are.
+    pub fn layered_over(&self, fleet_wide: &[(String, String)]) -> NodeOverrides {
+        let parameters = fleet_wide.iter().chain(&self.parameters).cloned().collect();
+        NodeOverrides { parameters, env: self.env.clone() }
+    }
+
+    /// [`NodeOverrides::apply_parameters`] with the entries of `TN_E2E_PARAMETERS` placed before
+    /// this node's own (see [`NodeOverrides::layered_over`]); the start helpers call this before
+    /// every start of a node, restarts included.
+    ///
+    /// With the variable unset or blank this is [`NodeOverrides::apply_parameters`]. The first call
+    /// in a test process that applies entries prints them once.
+    ///
+    /// # Errors
+    ///
+    /// A variable that is not a list of `key: value` entries, or a merged file the node's loader
+    /// cannot read, fails with an error naming `TN_E2E_PARAMETERS`; the node's file is then left
+    /// as it was.
+    pub fn apply_with_e2e_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
+        self.apply_layered(node_dir, e2e_parameters()?)
+    }
+
+    /// [`NodeOverrides::apply_parameters`] of these overrides layered over `fleet_wide`, the
+    /// entries of `TN_E2E_PARAMETERS`, with an error that names the variable when it set any.
+    fn apply_layered(&self, node_dir: &Path, fleet_wide: &[(String, String)]) -> eyre::Result<()> {
+        if fleet_wide.is_empty() {
+            return self.apply_parameters(node_dir);
+        }
+        self.layered_over(fleet_wide).apply_parameters(node_dir).wrap_err_with(|| {
+            format!(
+                "{E2E_PARAMETERS_VAR} entries {fleet_wide:?} (merged first) and the test's own \
+                 entries {:?} do not apply to {}",
+                self.parameters,
+                node_dir.display()
+            )
+        })
+    }
+
     /// Write `<node_dir>/parameters.yaml` as the harness wrote it plus
     /// [`NodeOverrides::parameters`] (see [`merge_parameters_yaml`]).
     ///
@@ -465,6 +531,8 @@ impl NodeOverrides {
     /// proves the file deserializes, not that the node accepts every value: the epoch timing
     /// checks, for one, run when the node enters an epoch it can vote in, so a duration of the
     /// right type that those checks refuse still fails there.
+    ///
+    /// The start helpers reach this through [`NodeOverrides::apply_with_e2e_parameters`].
     pub fn apply_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
         let path = node_dir.join("parameters.yaml");
         let harness_base = node_dir.join("parameters.yaml.harness-base");
@@ -640,6 +708,75 @@ fn continues_block_value(line: &str) -> bool {
     line.trim().is_empty() || line.starts_with([' ', '\t']) || line == "-" || line.starts_with("- ")
 }
 
+/// The environment variable whose `parameters.yaml` entries every start helper merges into every
+/// node it starts (see the crate docs).
+pub const E2E_PARAMETERS_VAR: &str = "TN_E2E_PARAMETERS";
+
+/// The entries of [`E2E_PARAMETERS_VAR`], read and parsed once per test process (see
+/// [`parse_e2e_parameters`]); empty when the variable is unset or blank.
+///
+/// The first call prints the entries it read, once, on stderr and to the test's tracing, so a
+/// lane's output shows what every node of the test was given.
+///
+/// # Errors
+///
+/// A value [`parse_e2e_parameters`] refuses, on this and every later call.
+pub fn e2e_parameters() -> eyre::Result<&'static [(String, String)]> {
+    /// The parsed variable, or the parse error as text (a report is not `Sync`).
+    static PARSED: OnceLock<Result<Vec<(String, String)>, String>> = OnceLock::new();
+    let parsed = PARSED.get_or_init(|| {
+        // a non-unicode value is read lossily so it fails the parse rather than reading as unset
+        let raw = std::env::var_os(E2E_PARAMETERS_VAR)
+            .map(|raw| raw.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parsed = parse_e2e_parameters(&raw).map_err(|e| format!("{e:#}"))?;
+        if !parsed.is_empty() {
+            let applied =
+                parsed.iter().map(|(key, value)| format!("{key}: {value}")).collect::<Vec<_>>();
+            eprintln!(
+                "e2e: {E2E_PARAMETERS_VAR} applies {applied:?} to every node this test starts \
+                 (a test's own entry for a key wins)"
+            );
+            info!(?applied, "e2e: {E2E_PARAMETERS_VAR} applies to every node this test starts");
+        }
+        Ok(parsed)
+    });
+    parsed.as_deref().map_err(|e| eyre::eyre!("{e}"))
+}
+
+/// Parse a value of [`E2E_PARAMETERS_VAR`] into `(key, value)` entries, in order.
+///
+/// The value is `key: value` entries separated by `;`. Each entry is split at its first `:`, and
+/// its key and value are trimmed; an entry that is empty after trimming is skipped, so a blank
+/// value yields no entries. A key must be a plain top-level name (ASCII letters, digits and `_`)
+/// and a value one non-empty line. The value is not read as YAML here: the start helpers check the
+/// merged file against the node's loader.
+///
+/// # Errors
+///
+/// An entry without a `:`, with a key that is not a plain name, or with an empty or multi-line
+/// value; the error names [`E2E_PARAMETERS_VAR`] and the entry.
+pub fn parse_e2e_parameters(raw: &str) -> eyre::Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let (key, value) = entry.split_once(':').ok_or_else(|| {
+            eyre::eyre!("{E2E_PARAMETERS_VAR} entry {entry:?} is not `key: value` (in {raw:?})")
+        })?;
+        let (key, value) = (key.trim(), value.trim());
+        eyre::ensure!(
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "{E2E_PARAMETERS_VAR} entry {entry:?} needs a plain top-level key (ASCII letters, \
+             digits and `_`), got {key:?} (in {raw:?})"
+        );
+        eyre::ensure!(
+            !value.is_empty() && !value.contains(['\n', '\r']),
+            "{E2E_PARAMETERS_VAR} entry {entry:?} needs a one-line value (in {raw:?})"
+        );
+        entries.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(entries)
+}
+
 /// Create validator info, genesis ceremony, and spawn node command.
 pub fn spawn_local_testnet(
     temp_path: &Path,
@@ -653,6 +790,7 @@ pub fn spawn_local_testnet(
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
+        NodeOverrides::default().apply_with_e2e_parameters(&dir)?;
         let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port");
 
@@ -918,7 +1056,10 @@ pub async fn ensure_account_balance_infinite_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_parameters_yaml, FleetOverrides, NodeOverrides};
+    use super::{
+        merge_parameters_yaml, parse_e2e_parameters, FleetOverrides, NodeOverrides,
+        E2E_PARAMETERS_VAR,
+    };
     use std::time::Duration;
     use tn_config::{Config, ConfigFmt, ConfigTrait as _, Parameters};
 
@@ -1087,5 +1228,101 @@ mod tests {
 
         let replaced = fleet.set_node("validator-2", NodeOverrides::default());
         assert!(replaced.node("validator-2").is_empty());
+    }
+
+    #[test]
+    fn parse_e2e_parameters_reads_entries_in_order() {
+        assert_eq!(
+            parse_e2e_parameters("pipelined_persist: true; recovery_threads: 4").unwrap(),
+            pairs(&[("pipelined_persist", "true"), ("recovery_threads", "4")])
+        );
+        // whitespace is trimmed, empty entries are skipped, a value keeps its own colons and
+        // spaces, and a repeated key stays repeated (the merge lets the later one win)
+        assert_eq!(
+            parse_e2e_parameters(" a:1 ;; nested : {x: 1, y: [2]} ;a: two words; ").unwrap(),
+            pairs(&[("a", "1"), ("nested", "{x: 1, y: [2]}"), ("a", "two words")])
+        );
+        for blank in ["", "  ", ";", " ; ;"] {
+            assert!(parse_e2e_parameters(blank).unwrap().is_empty(), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn parse_e2e_parameters_rejects_malformed_entries_naming_the_variable() {
+        for raw in [
+            "pipelined_persist",
+            "pipelined_persist true",
+            "pipelined_persist=true",
+            ": true",
+            "two words: true",
+            "nested.inner: 3",
+            "pipelined_persist:",
+            "pipelined_persist:   ; recovery_threads: 4",
+            "a: 1\nb: 2",
+            "ok: 1; broken",
+        ] {
+            let err = parse_e2e_parameters(raw).expect_err(raw);
+            assert!(err.to_string().contains(E2E_PARAMETERS_VAR), "{raw:?}: {err}");
+        }
+    }
+
+    /// The fleet-wide entries go in first, so the test's own entry for a key wins and every
+    /// other fleet-wide entry is still merged; the node's environment is kept.
+    #[test]
+    fn layered_over_puts_the_test_entries_last() {
+        let fleet_wide = pairs(&[("pipelined_persist", "true"), ("recovery_threads", "4")]);
+        let node = NodeOverrides::default()
+            .parameter("pipelined_persist", "false")
+            .env("TN_TEST_EXECUTION_DELAY_MS", "400");
+        let layered = node.layered_over(&fleet_wide);
+        assert_eq!(
+            layered.parameters,
+            pairs(&[
+                ("pipelined_persist", "true"),
+                ("recovery_threads", "4"),
+                ("pipelined_persist", "false")
+            ])
+        );
+        assert_eq!(layered.env, node.env);
+        let merged = merge_parameters_yaml(BASE, &layered.parameters).unwrap();
+        assert!(merged.ends_with("recovery_threads: 4\npipelined_persist: false\n"), "{merged}");
+        assert_eq!(merged.matches("pipelined_persist:").count(), 1, "{merged}");
+
+        // nothing fleet-wide leaves the node's overrides as they are
+        assert_eq!(node.layered_over(&[]), node);
+    }
+
+    /// Applied to a datadir, the fleet-wide entries reach the node's loader beneath the test's
+    /// own; a fleet-wide value the loader cannot read fails with the variable's name and leaves
+    /// the file alone; with no fleet-wide entries the apply is the plain one.
+    #[test]
+    fn apply_layered_merges_fleet_wide_entries_under_the_test_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        let fleet_wide = pairs(&[("max_header_delay", "750ms"), ("bench6_switch", "true")]);
+        let node = NodeOverrides::default().parameter("max_header_delay", "900ms");
+        node.apply_layered(dir.path(), &fleet_wide).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert!(merged.contains("\nbench6_switch: true\n"), "{merged}");
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(900));
+
+        // a node with no entries of its own still gets the fleet-wide ones
+        NodeOverrides::default().apply_layered(dir.path(), &fleet_wide).unwrap();
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(750));
+        let applied = std::fs::read_to_string(&path).unwrap();
+
+        let bad = pairs(&[("max_header_delay", "soon")]);
+        let err = NodeOverrides::default().apply_layered(dir.path(), &bad).unwrap_err();
+        assert!(format!("{err:#}").contains(E2E_PARAMETERS_VAR), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), applied);
+
+        // no fleet-wide entries and none of its own: the harness's file comes back
+        NodeOverrides::default().apply_layered(dir.path(), &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
     }
 }
