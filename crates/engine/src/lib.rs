@@ -114,6 +114,9 @@ pub struct ExecutorEngine {
     /// (an epoch boundary) starts a fresh window, which at worst misses a poach racing across
     /// the boundary.
     repack_monitor: RepackMonitor,
+    /// Threads in the dedicated signer recovery pool (`recovery_threads` in `parameters.yaml`);
+    /// zero keeps signer recovery on the global rayon pool.
+    recovery_threads: u16,
 }
 
 impl ExecutorEngine {
@@ -149,7 +152,24 @@ impl ExecutorEngine {
             gas_accumulator,
             engine_update_tx,
             repack_monitor,
+            recovery_threads: 0,
         }
+    }
+
+    /// Set the number of threads in the dedicated signer recovery pool (`recovery_threads` in
+    /// `parameters.yaml`).
+    ///
+    /// Zero, the value [`ExecutorEngine::new`] starts with, keeps signer recovery on the global
+    /// rayon pool. The node applies the configured value right after construction.
+    pub fn with_recovery_threads(mut self, threads: u16) -> Self {
+        self.recovery_threads = threads;
+        self
+    }
+
+    /// The number of threads in the dedicated signer recovery pool; zero means the global rayon
+    /// pool.
+    pub fn recovery_threads(&self) -> u16 {
+        self.recovery_threads
     }
 
     /// Spawns a blocking task to execute consensus output.

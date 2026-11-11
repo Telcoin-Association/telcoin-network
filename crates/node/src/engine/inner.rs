@@ -8,7 +8,7 @@ use jsonrpsee::http_client::HttpClient;
 use std::{collections::BTreeSet, net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
-use tn_config::Config;
+use tn_config::{Config, Parameters};
 use tn_engine::ExecutorEngine;
 use tn_reth::{
     error::{StateReadError, StateReadResult},
@@ -75,6 +75,7 @@ impl ExecutionNodeInner {
             repack_monitor,
             engine_update_tx,
         );
+        let tn_engine = configure_engine(tn_engine, &self.tn_config.parameters);
 
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
@@ -553,6 +554,11 @@ fn collect_last_output_blocks(
     Ok(collected.into_iter().rev().collect())
 }
 
+/// Hand the engine the runtime switches it reads from the node's `parameters.yaml`.
+fn configure_engine(engine: ExecutorEngine, parameters: &Parameters) -> ExecutorEngine {
+    engine.with_recovery_threads(parameters.recovery_threads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +637,50 @@ mod tests {
         // exactly once, terminates at genesis, and keeps one head per output
         assert_eq!(reads.get(), tip + 1);
         assert_eq!(result.len(), 4);
+        Ok(())
+    }
+
+    // ---- bench6 recovery-pool ----
+
+    /// An engine on a fresh temp chain at `path`, built as [`ExecutionNodeInner::start_engine`]
+    /// builds it, before any switch is applied.
+    fn engine_on_temp_chain(
+        path: &std::path::Path,
+        task_manager: &tn_types::TaskManager,
+    ) -> eyre::Result<ExecutorEngine> {
+        let chain: Arc<tn_reth::RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain(chain, path, task_manager, None)?;
+        let parent_header = reth_env.lookup_head()?;
+        let (_to_engine, rx_output) = mpsc::channel(1);
+        let (engine_update_tx, _engine_update_rx) = mpsc::channel(1);
+        Ok(ExecutorEngine::new(
+            reth_env,
+            None,
+            rx_output,
+            parent_header,
+            tn_types::Notifier::new().subscribe(),
+            task_manager.get_spawner(),
+            GasAccumulator::default(),
+            RepackMonitor::default(),
+            engine_update_tx,
+        ))
+    }
+
+    /// The engine reads `recovery_threads` as set in the node's parameters, and zero (the global
+    /// rayon pool) when the parameters leave it at its default.
+    #[tokio::test]
+    async fn test_configure_engine_hands_recovery_threads_to_the_engine() -> eyre::Result<()> {
+        let task_manager = tn_types::TaskManager::new("configure engine");
+        let default_dir = tempfile::TempDir::new()?;
+        let engine = engine_on_temp_chain(default_dir.path(), &task_manager)?;
+        let engine = configure_engine(engine, &Parameters::default());
+        assert_eq!(engine.recovery_threads(), 0);
+
+        let parameters = Parameters { recovery_threads: 3, ..Default::default() };
+        let arm_dir = tempfile::TempDir::new()?;
+        let engine = engine_on_temp_chain(arm_dir.path(), &task_manager)?;
+        let engine = configure_engine(engine, &parameters);
+        assert_eq!(engine.recovery_threads(), 3);
         Ok(())
     }
 }
