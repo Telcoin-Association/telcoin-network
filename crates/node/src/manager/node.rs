@@ -42,8 +42,9 @@ use tn_types::{
     repack_monitor::RepackMonitor,
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, P2pNode, Protocol, SealedHeader, ShutdownNotifier, TaskError,
-    TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    ExecutionBacklog, Multiaddr, NetworkPublicKey, P2pNode, Protocol, SealedHeader,
+    ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
+    DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -318,6 +319,11 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
+
+    /// How many consensus outputs execution trails behind: the one handle per process that this
+    /// manager, the engine and the RPC submission guard share. It reaches the engine and the
+    /// guard through every [`RethEnv`] this manager builds.
+    execution_backlog: ExecutionBacklog,
 }
 
 /// Restore the [`GasAccumulator`]'s gas stats and leader counts after a mid-epoch restart.
@@ -827,6 +833,7 @@ where
             exec_state_exporter,
             state_export_retention,
             metrics: EpochMetrics::default(),
+            execution_backlog: ExecutionBacklog::new(),
         })
     }
 
@@ -1809,7 +1816,7 @@ where
             self.reth_db.clone(),
             Some(basefee_address),
             gas_accumulator.clone(),
-            reth_switches(&self.builder.tn_config.parameters),
+            reth_switches(&self.builder.tn_config.parameters, &self.execution_backlog),
         )?;
         // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):
         // an execution tip evicted from the in-memory `recent_blocks` ring but still persisted as
@@ -2093,11 +2100,17 @@ fn announce_switches(parameters: &tn_config::Parameters) {
     crate::metrics::record_node_switches(&switches);
 }
 
-/// The runtime switches the reth environment reads, taken from the node's parameters.
-fn reth_switches(parameters: &tn_config::Parameters) -> RethSwitches {
+/// The runtime switches the reth environment reads, taken from the node's parameters, with the
+/// node's shared execution backlog.
+fn reth_switches(
+    parameters: &tn_config::Parameters,
+    execution_backlog: &ExecutionBacklog,
+) -> RethSwitches {
     RethSwitches {
         mdbx_random_advice: parameters.mdbx_random_advice,
         sealed_tx_keep: parameters.sealed_tx_keep,
+        rpc_admission_backlog_outputs: parameters.rpc_admission_backlog_outputs,
+        execution_backlog: execution_backlog.clone(),
     }
 }
 
@@ -2834,11 +2847,11 @@ mod tests {
     /// its parameters.
     #[test]
     fn test_reth_switches_follow_parameters() {
-        let defaults = reth_switches(&tn_config::Parameters::default());
+        let defaults = reth_switches(&tn_config::Parameters::default(), &ExecutionBacklog::new());
         assert!(!defaults.mdbx_random_advice);
 
         let parameters = tn_config::Parameters { mdbx_random_advice: true, ..Default::default() };
-        let switches = reth_switches(&parameters);
+        let switches = reth_switches(&parameters, &ExecutionBacklog::new());
         assert!(switches.mdbx_random_advice);
     }
 
@@ -2847,9 +2860,28 @@ mod tests {
     /// `sealed_tx_keep` reaches the reth switches the node passes to its env.
     #[test]
     fn test_reth_switches_carry_sealed_tx_keep() {
-        assert!(!reth_switches(&tn_config::Parameters::default()).sealed_tx_keep);
+        let backlog = ExecutionBacklog::new();
+        assert!(!reth_switches(&tn_config::Parameters::default(), &backlog).sealed_tx_keep);
 
         let parameters = tn_config::Parameters { sealed_tx_keep: true, ..Default::default() };
-        assert!(reth_switches(&parameters).sealed_tx_keep);
+        assert!(reth_switches(&parameters, &backlog).sealed_tx_keep);
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// `rpc_admission_backlog_outputs` reaches the reth switches, and the switches carry the
+    /// node's own backlog handle rather than a fresh one.
+    #[test]
+    fn test_reth_switches_carry_admission_bound_and_shared_backlog() {
+        let backlog = ExecutionBacklog::new();
+        let defaults = reth_switches(&tn_config::Parameters::default(), &backlog);
+        assert_eq!(defaults.rpc_admission_backlog_outputs, 0);
+
+        let parameters =
+            tn_config::Parameters { rpc_admission_backlog_outputs: 2, ..Default::default() };
+        let switches = reth_switches(&parameters, &backlog);
+        assert_eq!(switches.rpc_admission_backlog_outputs, 2);
+        backlog.record_forwarded(9);
+        assert_eq!(switches.execution_backlog.last_forwarded(), Some(9));
     }
 }

@@ -21,8 +21,8 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, ExecutionBacklog, Noticer, SealedHeader,
+    TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -75,7 +75,11 @@ impl ExecutionNodeInner {
             repack_monitor,
             engine_update_tx,
         );
-        let tn_engine = configure_engine(tn_engine, &self.tn_config.parameters);
+        let tn_engine = configure_engine(
+            tn_engine,
+            &self.tn_config.parameters,
+            self.reth_env.execution_backlog(),
+        );
 
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
@@ -555,9 +559,16 @@ fn collect_last_output_blocks(
     Ok(collected.into_iter().rev().collect())
 }
 
-/// Hand the engine the runtime switches it reads from the node's `parameters.yaml`.
-fn configure_engine(engine: ExecutorEngine, parameters: &Parameters) -> ExecutorEngine {
-    engine.with_recovery_threads(parameters.recovery_threads)
+/// Hand the engine the runtime switches it reads from the node's `parameters.yaml`, and the
+/// node's shared execution backlog.
+fn configure_engine(
+    engine: ExecutorEngine,
+    parameters: &Parameters,
+    execution_backlog: &ExecutionBacklog,
+) -> ExecutorEngine {
+    engine
+        .with_recovery_threads(parameters.recovery_threads)
+        .with_execution_backlog(execution_backlog.clone())
 }
 
 /// Hand the batch builder the runtime switches it reads from the node's `parameters.yaml`.
@@ -679,14 +690,32 @@ mod tests {
         let task_manager = tn_types::TaskManager::new("configure engine");
         let default_dir = tempfile::TempDir::new()?;
         let engine = engine_on_temp_chain(default_dir.path(), &task_manager)?;
-        let engine = configure_engine(engine, &Parameters::default());
+        let engine = configure_engine(engine, &Parameters::default(), &ExecutionBacklog::new());
         assert_eq!(engine.recovery_threads(), 0);
 
         let parameters = Parameters { recovery_threads: 3, ..Default::default() };
         let arm_dir = tempfile::TempDir::new()?;
         let engine = engine_on_temp_chain(arm_dir.path(), &task_manager)?;
-        let engine = configure_engine(engine, &parameters);
+        let engine = configure_engine(engine, &parameters, &ExecutionBacklog::new());
         assert_eq!(engine.recovery_threads(), 3);
+        Ok(())
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// The engine records into the backlog handle the node's reth environment holds, not a copy.
+    #[tokio::test]
+    async fn test_configure_engine_shares_the_node_backlog() -> eyre::Result<()> {
+        let task_manager = tn_types::TaskManager::new("configure engine backlog");
+        let dir = tempfile::TempDir::new()?;
+        let node_backlog = ExecutionBacklog::new();
+        let engine = engine_on_temp_chain(dir.path(), &task_manager)?;
+        let engine = configure_engine(engine, &Parameters::default(), &node_backlog);
+
+        engine.execution_backlog().record_executed(4);
+        assert_eq!(node_backlog.last_executed(), Some(4));
+        node_backlog.record_queued(2);
+        assert_eq!(engine.execution_backlog().queued(), 2);
         Ok(())
     }
 

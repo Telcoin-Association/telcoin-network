@@ -38,7 +38,7 @@ use std::{
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
     gas_accumulator::GasAccumulator, repack_monitor::RepackMonitor, ConsensusOutput, EngineUpdate,
-    Noticer, SealedHeader, TaskSpawner,
+    ExecutionBacklog, Noticer, SealedHeader, TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -117,6 +117,10 @@ pub struct ExecutorEngine {
     /// Threads in the dedicated signer recovery pool (`recovery_threads` in `parameters.yaml`);
     /// zero keeps signer recovery on the global rayon pool.
     recovery_threads: u16,
+    /// The node's shared count of outputs execution trails behind: the engine records how many
+    /// outputs it holds and the last one it finished. Observability for the RPC submission
+    /// guard only; nothing here reads it.
+    execution_backlog: ExecutionBacklog,
 }
 
 impl ExecutorEngine {
@@ -153,6 +157,7 @@ impl ExecutorEngine {
             engine_update_tx,
             repack_monitor,
             recovery_threads: 0,
+            execution_backlog: ExecutionBacklog::default(),
         }
     }
 
@@ -170,6 +175,21 @@ impl ExecutorEngine {
     /// pool.
     pub fn recovery_threads(&self) -> u16 {
         self.recovery_threads
+    }
+
+    /// Share the node's [`ExecutionBacklog`] with the engine, which records into it how many
+    /// outputs it holds and every output it finishes.
+    ///
+    /// [`ExecutorEngine::new`] starts with a fresh handle that nothing else reads. The node
+    /// passes the handle its reth environment holds right after construction.
+    pub fn with_execution_backlog(mut self, backlog: ExecutionBacklog) -> Self {
+        self.execution_backlog = backlog;
+        self
+    }
+
+    /// The [`ExecutionBacklog`] the engine records into.
+    pub fn execution_backlog(&self) -> &ExecutionBacklog {
+        &self.execution_backlog
     }
 
     /// Spawns a blocking task to execute consensus output.
@@ -193,6 +213,7 @@ impl ExecutorEngine {
             let gas_accumulator = self.gas_accumulator.clone();
             let repack_monitor = self.repack_monitor.clone();
             let engine_update_tx = self.engine_update_tx.clone();
+            let execution_backlog = self.execution_backlog.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 let execution_start = Instant::now();
@@ -213,6 +234,10 @@ impl ExecutorEngine {
                 .inspect_err(|e| {
                     error!(target: "engine", ?e, "error executing consensus output");
                 });
+                // every finished output counts, an empty skipped one included
+                if result.is_ok() {
+                    execution_backlog.record_executed(consensus_number);
+                }
                 let task_elapsed = execution_start.elapsed();
                 ENGINE_METRICS.execution_duration_seconds.record(task_elapsed);
                 ENGINE_METRICS.busy_milliseconds_total.increment(duration_ms(task_elapsed));
@@ -271,6 +296,13 @@ impl ExecutorEngine {
             RecoveryHandle::spawn(&output, &self.task_spawner, &ENGINE_METRICS)
         };
         self.queued.push_back((queued_at, output, signers));
+    }
+
+    /// Record in the shared [`ExecutionBacklog`] how many outputs the engine holds: the queued
+    /// ones plus the one executing.
+    fn record_held_outputs(&self) {
+        let executing = usize::from(self.pending_task.is_some());
+        self.execution_backlog.record_queued(self.queued.len() + executing);
     }
 
     /// TESTING ONLY
@@ -367,6 +399,7 @@ impl ExecutorEngine {
                             );
                             // backlog growth means execution is falling behind consensus
                             ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                            self.record_held_outputs();
                         })
                         .unwrap_or_else(|| {
                             // the stream has ended; the top-of-loop check returns the error once
@@ -387,6 +420,7 @@ impl ExecutorEngine {
                     ENGINE_METRICS.outputs_executed_total.increment(1);
                     ENGINE_METRICS.canonical_height.set(self.parent_header.number as f64);
                     ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                    self.record_held_outputs();
                     // the stream is not polled while the queue is full, so the channel depth
                     // also refreshes here, once per executed output
                     ENGINE_METRICS
@@ -595,5 +629,72 @@ mod tests {
     fn test_duration_ms_truncates() {
         assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
         assert_eq!(duration_ms(Duration::ZERO), 0);
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// An engine fed by the returned sender, on a fresh temp chain at `path`. The returned
+    /// receiver takes the engine's per-output updates and the notifier holds off shutdown.
+    fn engine_on_temp_chain(
+        path: &std::path::Path,
+        task_manager: &tn_types::TaskManager,
+    ) -> (
+        ExecutorEngine,
+        mpsc::Sender<ConsensusOutput>,
+        mpsc::Receiver<EngineUpdate>,
+        tn_types::Notifier,
+    ) {
+        let chain: std::sync::Arc<tn_reth::RethChainSpec> =
+            std::sync::Arc::new(tn_types::test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain, path, task_manager, None).expect("temp chain env");
+        let parent_header = reth_env.lookup_head().expect("genesis head");
+        let (to_engine, rx_output) = mpsc::channel(MAX_QUEUED_OUTPUTS);
+        let (engine_update_tx, engine_updates) = mpsc::channel(MAX_QUEUED_OUTPUTS);
+        let shutdown = tn_types::Notifier::new();
+        let engine = ExecutorEngine::new(
+            reth_env,
+            None,
+            rx_output,
+            parent_header,
+            shutdown.subscribe(),
+            task_manager.get_spawner(),
+            GasAccumulator::default(),
+            RepackMonitor::default(),
+            engine_update_tx,
+        );
+        (engine, to_engine, engine_updates, shutdown)
+    }
+
+    /// The engine records into the backlog it was handed: every finished output, empty skipped
+    /// ones included, and the held count, which reads zero once the engine has drained.
+    #[tokio::test]
+    async fn test_engine_records_finished_and_held_outputs_into_the_backlog() {
+        let task_manager = tn_types::TaskManager::new("engine backlog");
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (engine, to_engine, mut engine_updates, _shutdown) =
+            engine_on_temp_chain(dir.path(), &task_manager);
+        assert_eq!(engine.execution_backlog().last_executed(), None, "a fresh handle by default");
+
+        let backlog = ExecutionBacklog::new();
+        let engine = engine.with_execution_backlog(backlog.clone());
+        for number in 1..=3 {
+            to_engine.send(output(number)).await.expect("engine receives");
+            backlog.record_forwarded(number);
+        }
+        drop(to_engine);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), engine.run())
+            .await
+            .expect("engine drains within the timeout");
+        assert!(matches!(result, Err(TnEngineError::ConsensusOutputStreamClosed)), "{result:?}");
+        // the three empty outputs were skipped, each reported once
+        for _ in 1..=3 {
+            let (_, _, tip) = engine_updates.try_recv().expect("one update per output");
+            assert!(tip.is_none(), "an empty output builds no block");
+        }
+        assert_eq!(backlog.last_executed(), Some(3));
+        assert_eq!(backlog.queued(), 0);
+        assert_eq!(backlog.outputs_behind(), 0);
     }
 }

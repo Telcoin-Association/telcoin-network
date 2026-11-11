@@ -36,7 +36,7 @@ use reth_rpc_builder::config::RethRpcServerConfig as _;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, SealedHeader, TaskManager, TaskSpawner,
+    Address, ExecutionBacklog, SealedHeader, TaskManager, TaskSpawner,
 };
 use tracing::{debug, info, warn};
 
@@ -144,6 +144,13 @@ pub struct RethSwitches {
     /// Keep a sealed batch's transactions in the pool, marked, until they execute
     /// (`sealed_tx_keep`; default `false`).
     pub sealed_tx_keep: bool,
+    /// Refuse RPC transaction submissions while execution is this many consensus outputs behind
+    /// (`rpc_admission_backlog_outputs`; default `0`, no bound).
+    pub rpc_admission_backlog_outputs: usize,
+    /// The node's shared count of consensus outputs execution trails behind. Not a switch: the
+    /// one handle the node, its engine and the RPC submission guard share. The default is a
+    /// fresh handle that nothing else writes.
+    pub execution_backlog: ExecutionBacklog,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -277,6 +284,21 @@ impl RethEnv {
     /// [`RethEnv::new_with_switches`]).
     pub fn sealed_tx_keep(&self) -> bool {
         self.inner.switches.sealed_tx_keep
+    }
+
+    /// How many consensus outputs execution may trail before the RPC submission guard refuses
+    /// new transactions (`rpc_admission_backlog_outputs` in `parameters.yaml`; zero, no bound,
+    /// unless the node set it through [`RethEnv::new_with_switches`]).
+    pub fn rpc_admission_backlog_outputs(&self) -> usize {
+        self.inner.switches.rpc_admission_backlog_outputs
+    }
+
+    /// The node's shared [`ExecutionBacklog`]: the node records the outputs it forwards to the
+    /// engine, the engine the outputs it holds and finishes, and the RPC submission guard reads
+    /// how far execution trails. An env built through [`RethEnv::new`] holds a fresh handle that
+    /// nothing else writes.
+    pub fn execution_backlog(&self) -> &ExecutionBacklog {
+        &self.inner.switches.execution_backlog
     }
 
     /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
@@ -813,21 +835,36 @@ mod tests {
     async fn test_new_with_switches_hands_each_switch_to_the_env() -> eyre::Result<()> {
         let tm = TaskManager::new("switches");
         let on = TempDir::new()?;
-        let switches = RethSwitches { mdbx_random_advice: true, sealed_tx_keep: true };
+        let backlog = ExecutionBacklog::new();
+        let switches = RethSwitches {
+            mdbx_random_advice: true,
+            sealed_tx_keep: true,
+            rpc_admission_backlog_outputs: 2,
+            execution_backlog: backlog.clone(),
+        };
         let env = env_with_switches(on.path(), &tm, switches)?;
         assert!(env.mdbx_random_advice());
         assert!(env.sealed_tx_keep());
+        assert_eq!(env.rpc_admission_backlog_outputs(), 2);
+        // the env holds the node's handle, not a copy of its counters
+        backlog.record_forwarded(7);
+        assert_eq!(env.execution_backlog().last_forwarded(), Some(7));
+        env.execution_backlog().record_executed(5);
+        assert_eq!(backlog.outputs_behind(), 2);
 
         let off = TempDir::new()?;
         let env = env_with_switches(off.path(), &tm, RethSwitches::default())?;
         assert!(!env.mdbx_random_advice());
         assert!(!env.sealed_tx_keep());
+        assert_eq!(env.rpc_admission_backlog_outputs(), 0);
 
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let temp = TempDir::new()?;
         let env = RethEnv::new_for_temp_chain(chain, temp.path(), &tm, None)?;
         assert!(!env.mdbx_random_advice(), "RethEnv::new passes the defaults");
         assert!(!env.sealed_tx_keep(), "RethEnv::new passes the defaults");
+        assert_eq!(env.rpc_admission_backlog_outputs(), 0, "RethEnv::new passes the defaults");
+        assert_eq!(env.execution_backlog().outputs_behind(), 0);
         Ok(())
     }
 }
