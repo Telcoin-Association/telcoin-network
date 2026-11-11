@@ -416,6 +416,15 @@ pub struct Parameters {
     /// Issue #1803.
     #[serde(with = "humantime_serde", default)]
     pub parent_grace: Duration,
+
+    /// Refuse RPC transaction submissions while execution is this many consensus outputs behind.
+    ///
+    /// When above zero, the RPC submission guard answers "txpool is full" once execution trails
+    /// the outputs forwarded to it by this many, and admits again once the backlog is below one
+    /// less than this (see [`tn_types::AdmissionGate`]). Observer forwards and re-pooled
+    /// transactions are not gated. The default `0` keeps the previous behaviour: no bound.
+    #[serde(default)]
+    pub rpc_admission_backlog_outputs: usize,
 }
 
 impl Parameters {
@@ -527,6 +536,7 @@ impl Default for Parameters {
             epoch_close_task_drain: false,
             epoch_record_state_check: false,
             parent_grace: Duration::ZERO,
+            rpc_admission_backlog_outputs: 0,
         }
     }
 }
@@ -692,6 +702,12 @@ impl Parameters {
             ("epoch_close_task_drain", SwitchValue::Bool(self.epoch_close_task_drain)),
             ("epoch_record_state_check", SwitchValue::Bool(self.epoch_record_state_check)),
             ("parent_grace", SwitchValue::Duration(self.parent_grace)),
+            (
+                "rpc_admission_backlog_outputs",
+                SwitchValue::Count(
+                    u64::try_from(self.rpc_admission_backlog_outputs).unwrap_or(u64::MAX),
+                ),
+            ),
         ]
     }
 }
@@ -1424,5 +1440,18 @@ mod test {
         assert_eq!(parse_with("parent_grace: \"100ms\"").parent_grace, Duration::from_millis(100));
         assert_eq!(listed("parent_grace: 150ms", "parent_grace"), "150ms");
         assert_eq!(listed("", "parent_grace"), "0s");
+    }
+
+    // ---- bench6 inflight-bound ----
+
+    /// `rpc_admission_backlog_outputs` stays off (0) unless the file sets a bound.
+    #[test]
+    fn rpc_admission_backlog_outputs_parses() {
+        assert_eq!(parse_with("").rpc_admission_backlog_outputs, 0);
+        assert_eq!(parse_with("rpc_admission_backlog_outputs: 2").rpc_admission_backlog_outputs, 2);
+        assert_eq!(
+            listed("rpc_admission_backlog_outputs: 2", "rpc_admission_backlog_outputs"),
+            "2"
+        );
     }
 }
