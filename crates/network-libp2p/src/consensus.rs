@@ -925,9 +925,11 @@ where
                 // listener's confirmation first, which made every vote request cost two round
                 // trips on a 10-region bench while gossiped certificates arrived in half of one.
                 // a lazy rejection surfaces on the first read as an io error: see
-                // `normalize_outbound_failure`. the sync stream and the vendored gossipsub finish
-                // negotiation with a zero-length read in their outbound upgrades, so a peer
-                // without the protocol still fails the open. gossipsub's first proposal (`1.1.0`)
+                // `normalize_outbound_failure`. the sync stream also sends its request frame
+                // with the proposal, and its callers classify a rejection on the first read
+                // with `stream::is_unsupported_protocol`. the vendored gossipsub finishes
+                // negotiation with a zero-length read in its outbound upgrade, so a peer without
+                // gossipsub still fails the open. gossipsub's first proposal (`1.1.0`)
                 // stays strict and only its `1.0.0` fallback is lazy. kad may report
                 // `ProtocolConfirmed` for a peer before the listener confirms, which is harmless
                 // while kad bucket inserts are manual.

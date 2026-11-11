@@ -14,9 +14,9 @@ use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use tn_network_libp2p::{
     error::NetworkError,
-    read_frame,
+    is_unsupported_protocol, read_frame,
     types::{NetworkHandle, NetworkResult},
-    write_frame, Penalty, StreamError, SyncFrame, WorkerSyncRequest,
+    write_frame, DenyReason, Penalty, StreamError, SyncFrame, WorkerSyncRequest,
 };
 use tn_types::{
     encode, max_batch_size, try_decode, AuthorityIdentifier, Batch, BlockHash, BlsPublicKey, Epoch,
@@ -187,11 +187,15 @@ pub(crate) enum SyncAttempt {
     /// The peer answered `Ack` and the stream was read: the batches that arrived,
     /// and whether the stream completed or stalled.
     Fetched(SyncRead),
-    /// The peer did not answer the sync exchange; skip it (no legacy fallback).
+    /// The peer rejected the sync protocol (an `UpgradeFailed` open, or an
+    /// unsupported-protocol error on the first read); skip it (no legacy fallback).
     Unsupported,
-    /// The peer answered with `Deny` (shedding load or lacking the data); try the
-    /// next peer, and this peer again on a later pass.
+    /// The peer answered `Deny` with `AtCapacity` or `Unavailable` (shedding load or
+    /// lacking the data); try the next peer, and this peer again on a later pass.
     Denied(NetworkError),
+    /// The peer answered `Deny(Busy)`: the responder is serving this key or its hold
+    /// budget is spent. Retry later, with no stall mark.
+    Busy,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
 }
@@ -199,16 +203,20 @@ pub(crate) enum SyncAttempt {
 /// Why one peer did not supply batches to `request_batches()`.
 #[derive(Debug)]
 enum PeerFetchError {
-    /// The peer is sync-capable but answered `Deny`. It stays eligible for later
-    /// retry passes, because the retry delay lets its semaphores release. A
+    /// The peer answered `Deny` with `AtCapacity` or `Unavailable`. It stays eligible
+    /// for later retry passes, because the retry delay lets its semaphores release. A
     /// `Deny` that took [`SLOW_EMPTY_EXCHANGE`] or longer marks the peer for later
     /// calls this epoch.
     Denied(NetworkError),
+    /// The peer answered `Deny(Busy)`: it is serving this key or its hold budget is
+    /// spent. It stays eligible for later retry passes, and the answer never marks
+    /// it, whatever time it took.
+    Busy,
     /// Any other failure (open error, unsupported protocol, write or read
     /// timeout, protocol error, or an empty answer). The peer is skipped for the
-    /// rest of the call. A deadline or an error after negotiation also marks it
-    /// for later calls this epoch; an empty answer marks it only when it took
-    /// [`SLOW_EMPTY_EXCHANGE`] or longer.
+    /// rest of the call. A deadline or an exchange error other than a rejected
+    /// protocol also marks it for later calls this epoch; an empty answer marks it
+    /// only when it took [`SLOW_EMPTY_EXCHANGE`] or longer.
     Failed(NetworkError),
 }
 
@@ -261,16 +269,18 @@ pub struct WorkerNetworkHandle {
     /// Per-peer sync-protocol capability, learned by probing.
     ///
     /// Absent means not yet probed (try the sync protocol); `false` means the
-    /// peer did not answer a sync open (a pre-item-4 peer that fails negotiation,
-    /// or an item-4 peer that registered the protocol but does not serve it), so
-    /// it is skipped this epoch (there is no legacy fallback); `true` means the
-    /// peer served a sync exchange. The cache is reset each epoch
+    /// peer rejected the sync protocol (a pre-item-4 peer: the first read after
+    /// the lazy open reports an unsupported protocol), so it is skipped this epoch
+    /// (there is no legacy fallback); `true` means the peer `Ack`ed a sync
+    /// exchange. A `Deny`, a failed exchange or an open writes no entry. The
+    /// cache is reset each epoch
     /// ([`Self::update_epoch`]) so a peer upgraded over the rotation boundary is
     /// re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
-    /// Peers whose last sync exchange this epoch hit a deadline, failed after
-    /// negotiation, or wasted the caller's time: an empty answer or `Deny` that
-    /// took [`SLOW_EMPTY_EXCHANGE`] or longer, or a complete exchange slower than
+    /// Peers whose last sync exchange this epoch hit a deadline, failed for a
+    /// reason other than a rejected protocol, or wasted the caller's time: an
+    /// empty answer or a `Deny` other than `Deny(Busy)` that took
+    /// [`SLOW_EMPTY_EXCHANGE`] or longer, or a complete exchange slower than
     /// [`slow_exchange_allowance`].
     ///
     /// [`Self::request_batches`] still asks a marked peer, but after the unmarked
@@ -383,11 +393,12 @@ impl WorkerNetworkHandle {
     /// first, because it is the peer most likely to hold them.
     ///
     /// A peer that answers `Deny` stays eligible for later passes; a peer that
-    /// fails in any other way (a deadline, an error after negotiation, or `Ack`
-    /// then `End` with none of the requested batches) is skipped for the rest of
-    /// the call. A deadline, an error after negotiation, an empty answer or `Deny`
-    /// that took [`SLOW_EMPTY_EXCHANGE`] or longer, and a complete exchange
-    /// slower than [`slow_exchange_allowance`] mark the peer. On later calls this
+    /// fails in any other way (a rejected protocol, a deadline, an exchange error,
+    /// or `Ack` then `End` with none of the requested batches) is skipped for the
+    /// rest of the call. A deadline, an exchange error, an empty answer or a
+    /// `Deny` other than `Deny(Busy)` that took [`SLOW_EMPTY_EXCHANGE`] or longer,
+    /// and a complete exchange slower than [`slow_exchange_allowance`] mark the
+    /// peer; a `Deny(Busy)` answer never does. On later calls this
     /// epoch a marked peer is tried after the unmarked peers of its tier, so a
     /// marked committee peer still comes before every non-committee peer (see
     /// [`order_peers`]). The network layer shuffles each tier of the peer list
@@ -497,6 +508,13 @@ impl WorkerNetworkHandle {
                                 "peer denied batch request, trying next"
                             );
                         }
+                        PeerFetchError::Busy => {
+                            debug!(
+                                target: "worker::network",
+                                %peer,
+                                "peer busy, trying next and this peer on a later pass"
+                            );
+                        }
                         PeerFetchError::Failed(e) => {
                             warn!(
                                 target: "worker::network",
@@ -559,14 +577,17 @@ impl WorkerNetworkHandle {
     ///
     /// Opens a `/tn-worker-{id}-sync` exchange that folds the request into the
     /// opening stream frame. There is no legacy fallback (#739, step 9c): a peer
-    /// that does not answer the sync protocol (negotiation fails, or it negotiated
-    /// but never `Ack`ed) is cached unsyncable this epoch and skipped, and the
-    /// caller tries the next peer. The sync probe is penalty-exempt, so skipping
-    /// never lowers the peer's score.
+    /// that rejects the sync protocol (the first read reports an unsupported
+    /// protocol) is cached unsyncable this epoch and skipped, and the caller tries
+    /// the next peer. The sync probe is penalty-exempt, so skipping never lowers
+    /// the peer's score. Only an `Ack`ed exchange caches the peer sync-capable.
     ///
-    /// Returns [`PeerFetchError::Denied`] when the peer answered `Deny`, so the
-    /// caller may try it again on a later pass, and [`PeerFetchError::Failed`] for
-    /// every other failure, so the caller skips the peer for the rest of the call.
+    /// Returns [`PeerFetchError::Denied`] when the peer answered `Deny` with
+    /// `AtCapacity` or `Unavailable`, so the caller may try it again on a later
+    /// pass, [`PeerFetchError::Busy`] when it answered `Deny(Busy)`, so the caller
+    /// tries it again on a later pass with no stall mark, and
+    /// [`PeerFetchError::Failed`] for every other failure, so the caller skips the
+    /// peer for the rest of the call.
     /// The exchange is timed from the open, and the time and the outcome decide
     /// the peer's stall mark (see [`Self::record_sync_read`] and
     /// [`Self::record_empty_exchange`]).
@@ -611,17 +632,25 @@ impl WorkerNetworkHandle {
                 ))))
             }
             SyncAttempt::Denied(e) => {
-                // the peer speaks sync but is shedding load or lacks the data; it
-                // stays eligible for a later pass, and a slow `Deny` marks it for
-                // later calls (#1773)
-                self.sync_capability.lock().insert(peer, true);
+                // the peer is shedding load or lacks the data; it stays eligible
+                // for a later pass, and a slow `Deny` marks it for later calls
+                // (#1773)
                 self.record_empty_exchange(peer, elapsed);
                 Err(PeerFetchError::Denied(e))
             }
+            SyncAttempt::Busy => {
+                // the responder is serving this key or its hold budget is spent:
+                // retry later, with no stall mark and no capability entry
+                debug!(
+                    target: "worker::network",
+                    %peer,
+                    "peer answered the batch sync request busy, retry later"
+                );
+                Err(PeerFetchError::Busy)
+            }
             SyncAttempt::Failed(e) => {
-                // the peer speaks sync but this exchange failed; try the next peer,
-                // and mark this peer for later calls (#1773)
-                self.sync_capability.lock().insert(peer, true);
+                // this exchange failed; try the next peer, and mark this peer for
+                // later calls (#1773)
                 self.mark_stalled(peer);
                 Err(PeerFetchError::Failed(e))
             }
@@ -698,10 +727,10 @@ impl WorkerNetworkHandle {
     /// Opens a `/tn-worker-{id}-sync` stream, writes the request in the opening
     /// [`SyncFrame::Req`] frame, and reads the response: an [`SyncFrame::Ack`]
     /// followed by [`SyncFrame::Data`] frames terminated by [`SyncFrame::End`].
-    /// Returns [`SyncAttempt::Unsupported`] when the peer does not answer (so the
-    /// caller skips it), [`SyncAttempt::Fetched`] on success,
-    /// [`SyncAttempt::Denied`] when the peer answered `Deny`, or
-    /// [`SyncAttempt::Failed`] when the peer answered but the exchange failed.
+    /// Returns [`SyncAttempt::Unsupported`] when the peer rejects the protocol (so
+    /// the caller skips it), [`SyncAttempt::Fetched`] on success,
+    /// [`SyncAttempt::Denied`] or [`SyncAttempt::Busy`] when the peer answered
+    /// `Deny`, or [`SyncAttempt::Failed`] when the exchange failed.
     async fn request_batches_from_peer_sync(
         &self,
         peer: BlsPublicKey,
@@ -715,12 +744,15 @@ impl WorkerNetworkHandle {
     /// Run one sync exchange, yielding the stream read (the batches that arrived
     /// and how the stream ended) or the classified non-fetch outcome.
     ///
-    /// `Err(SyncAttempt::Unsupported)` means the peer did not answer the protocol
-    /// (negotiation failed, or it negotiated but never sent `Ack`), so the caller
-    /// skips it (there is no legacy fallback). `Err(SyncAttempt::Failed(_))` means
-    /// a transient or exchange-level error once the peer has proved sync-capable, so
-    /// the caller keeps it sync-capable and tries the next peer.
-    /// `Err(SyncAttempt::Denied(_))` means the peer answered `Deny`. A transport I/O
+    /// The outbound open is lazy: a successful open says nothing about the peer,
+    /// and the first read after the request carries the capability signal.
+    /// `Err(SyncAttempt::Unsupported)` means the peer rejected the protocol (the
+    /// first read error satisfies [`is_unsupported_protocol`], or the open failed
+    /// with `UpgradeFailed`), so the caller skips it (there is no legacy fallback).
+    /// `Err(SyncAttempt::Failed(_))` means a transient or exchange-level error, so
+    /// the caller tries the next peer. `Err(SyncAttempt::Denied(_))` means the peer
+    /// answered `Deny` with `AtCapacity` or `Unavailable`, and
+    /// `Err(SyncAttempt::Busy)` means it answered `Deny(Busy)`. A transport I/O
     /// error during the open (`UpgradeIo`) is transient rather than a protocol
     /// mismatch, so it maps to `Failed` instead of poisoning the capability cache.
     async fn try_sync_batch_exchange(
@@ -729,11 +761,11 @@ impl WorkerNetworkHandle {
         batch_digests: &BTreeSet<BlockHash>,
     ) -> Result<SyncRead, SyncAttempt> {
         // open the sync stream, flattening the command-channel and stream-open
-        // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
-        // pre-item-4 peer that does not advertise the protocol -> Unsupported
-        // (penalty-exempt, cached unsyncable this epoch). A transient upgrade I/O
-        // error or any other open error is not proof the peer lacks sync -> try
-        // next peer.
+        // results. The open is lazy, so its success says nothing about the peer.
+        // An `UpgradeFailed` error (the lazy open no longer raises it) is a peer
+        // that does not advertise the protocol -> Unsupported (penalty-exempt,
+        // cached unsyncable this epoch). Any other open error is not proof the
+        // peer lacks sync -> try next peer.
         let mut stream =
             self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
                 () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
@@ -742,19 +774,19 @@ impl WorkerNetworkHandle {
                 () => SyncAttempt::Failed(e),
             })?;
 
-        // write the request in the opening frame. Negotiation already succeeded,
-        // so the peer is sync-capable; a write failure or a stalled write is
-        // transient -> try next.
+        // write the request in the opening frame. The open is lazy, so the write
+        // can complete before the peer answers the protocol proposal; a write
+        // failure or a stalled write is transient -> try next.
         self.write_sync_request(&mut stream, batch_digests).await?;
         let max_frame = max_sync_frame_size(self.epoch());
 
-        // read the responder's first frame. Negotiation already succeeded, so the
-        // peer IS sync-capable: a missing `Ack` (timeout) or any read error is a
-        // transient exchange failure, not a capability signal. Both map to `Failed`
-        // (try the next peer, keep the peer sync-capable) rather than `Unsupported`,
-        // which would cache the peer unsyncable for the whole epoch with no fallback
-        // (#739, step 9c removed the legacy path). Only a negotiation failure at open
-        // time (`UpgradeFailed`, above) proves the peer lacks the sync protocol.
+        // read the responder's first frame. This read carries the capability
+        // signal: an error that `is_unsupported_protocol` accepts means the peer
+        // rejected the protocol -> Unsupported (cached unsyncable this epoch, no
+        // stall mark). A missing `Ack` (timeout) or any other read error is a
+        // transient exchange failure and maps to `Failed` (try the next peer)
+        // rather than `Unsupported`, which would skip the peer for the whole epoch
+        // with no fallback (#739, step 9c removed the legacy path).
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
@@ -772,9 +804,18 @@ impl WorkerNetworkHandle {
             ))
         })?
         .map_err(|e| {
-            SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
-                "failed to read sync ack frame: {e}"
-            )))
+            if is_unsupported_protocol(&e) {
+                debug!(
+                    target: "worker::network",
+                    %peer,
+                    "peer rejected the batch sync protocol on the first read"
+                );
+                SyncAttempt::Unsupported
+            } else {
+                SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
+                    "failed to read sync ack frame: {e}"
+                )))
+            }
         })?;
 
         match first {
@@ -782,11 +823,16 @@ impl WorkerNetworkHandle {
                 .read_sync_batches(&mut stream, batch_digests)
                 .await
                 .map_err(SyncAttempt::Failed),
-            // sync-capable, but shedding load or lacking the data: try next peer,
-            // and this peer again on a later pass
-            SyncFrame::Deny(reason) => Err(SyncAttempt::Denied(NetworkError::RPCRetryable(
-                format!("peer denied sync batch request: {reason:?}"),
-            ))),
+            // the responder is serving this key or its hold budget is spent: retry
+            // this peer later, with no stall mark
+            SyncFrame::Deny(DenyReason::Busy) => Err(SyncAttempt::Busy),
+            // shedding load or lacking the data: try next peer, and this peer again
+            // on a later pass
+            SyncFrame::Deny(reason @ (DenyReason::AtCapacity | DenyReason::Unavailable)) => {
+                Err(SyncAttempt::Denied(NetworkError::RPCRetryable(format!(
+                    "peer denied sync batch request: {reason:?}"
+                ))))
+            }
             SyncFrame::Err(err) => Err(SyncAttempt::Failed(NetworkError::RPCError(format!(
                 "peer aborted sync batch exchange: {err:?}"
             )))),
@@ -802,8 +848,8 @@ impl WorkerNetworkHandle {
     ///
     /// The responder controls stream credit, so a peer that never reads would
     /// otherwise hold the write open with no bound. A write error and an expired
-    /// write both map to [`SyncAttempt::Failed`]: negotiation already succeeded,
-    /// so the peer is sync-capable and the caller tries the next peer.
+    /// write both map to [`SyncAttempt::Failed`], and the caller tries the next
+    /// peer. The open is lazy, so a completed write says nothing about the peer.
     pub(crate) async fn write_sync_request<S: AsyncWrite + Unpin + Send>(
         &self,
         stream: &mut S,
