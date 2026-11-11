@@ -551,29 +551,26 @@ impl Reservoir {
 }
 
 impl Shared {
-    /// Wait at the gate: `true` once this thread may make a call (it is then `busy` until
-    /// [`Self::leave`]), `false` once the threads stop.
-    fn enter(&self) -> bool {
+    /// Wait at the gate: the thread's place once it may make a call (it is `busy` until the
+    /// place drops, so a call that panics leaves too and `Readers::set_on(false)` never waits on
+    /// a dead thread), `None` once the threads stop.
+    fn enter(&self) -> Option<Entered<'_>> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
-                return false;
+                return None;
             }
             if self.on.load(Ordering::SeqCst) {
                 self.busy.fetch_add(1, Ordering::SeqCst);
+                let entered = Entered(self);
                 // recheck after counting: `Readers::set_on(false)` waits only for counted calls,
                 // so a thread that counted itself after it looked must see the closed gate
                 if self.on.load(Ordering::SeqCst) {
-                    return true;
+                    return Some(entered);
                 }
-                self.busy.fetch_sub(1, Ordering::SeqCst);
+                drop(entered);
             }
             thread::park_timeout(IDLE);
         }
-    }
-
-    /// The call this thread entered for is recorded.
-    fn leave(&self) {
-        self.busy.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Record a reader's call of `kind`: its latency and answer, or its error.
@@ -644,13 +641,24 @@ struct Reader {
     shared: Arc<Shared>,
 }
 
+/// A thread's place at the gate ([`Shared::enter`]): the call it entered for is in flight, and
+/// counted, until this drops.
+struct Entered<'a>(&'a Shared);
+
+impl Drop for Entered<'_> {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Reader {
     /// Call while the gate is open until the readers stop.
     fn run(mut self) {
-        while self.shared.enter() {
+        let shared = Arc::clone(&self.shared);
+        while let Some(entered) = shared.enter() {
             let kind = self.mix.kinds[self.rng.random_range(0..self.mix.kinds.len())];
             self.read(kind);
-            self.shared.leave();
+            drop(entered);
         }
     }
 
@@ -803,7 +811,7 @@ impl Readers {
     ) -> eyre::Result<()> {
         let shared = self.shared.clone();
         self.spawn("load-balance-poller".to_string(), move || {
-            while shared.enter() {
+            while let Some(entered) = shared.enter() {
                 let started = Instant::now();
                 let balances = pool.get_account_balances(&addresses);
                 let latency = started.elapsed();
@@ -811,7 +819,7 @@ impl Readers {
                 samples.polls.latencies.push(latency);
                 samples.polls.last = balances;
                 drop(samples);
-                shared.leave();
+                drop(entered);
                 shared.pause(started + interval);
             }
         })

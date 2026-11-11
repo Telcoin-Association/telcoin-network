@@ -29,8 +29,11 @@ TMPDIR=/path/on/disk taskset -c 0-7 cargo test --release -p tn-lmdb-reth tn_lmdb
 For the durable rows, also turn off the drive's autonomous power states and set the CPU governor
 and energy preference to `performance` (this crate's README gives the commands under its Linux
 gate). Even then a consumer NVMe drive syncs a commit at one of two speeds and switches between
-them during a run, for every engine at once; judge a durable row against MDBX's time for it in the
-same run.
+them during a run. The bench runs its columns to completion in order (`t4d`, `t16d`, `t4n`, `md`,
+`md4`, `mn`), so a switch hits the column running at the time, not every engine at once: a
+durable row can compare two engines at different drive speeds. Judge a durable row against
+MDBX's time for it in the same run, and rerun the pair when one side's rows all moved together
+(the reth db bench, `tn_lmdb_reth_vs_mdbx`, alternates its engines instead).
 
 ## Selecting what runs
 

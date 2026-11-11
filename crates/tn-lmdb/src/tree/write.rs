@@ -5462,6 +5462,9 @@ mod tests {
         let (mut failures, mut leaf, mut branch, mut merged_root) = (0, 0, 0, 0);
         for (d, k) in (0..keys.len()).map(|i| &keys[i * 37 % keys.len()]).enumerate() {
             let mut failed = 0;
+            // A delete that merges nothing leaves the report as it was: reset it, so the counts
+            // below are this delete's.
+            store.merge_report = MergeReport::default();
             for fail_at in 0.. {
                 let before = (root, store.reachable(&root), store.alloc.freed().to_vec());
                 let (pool, count) = (store.alloc.pool().to_vec(), store.alloc.page_count());

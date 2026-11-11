@@ -278,6 +278,42 @@ fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
 }
 
 /// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
+/// A subscriber keeping the text of every WARN event's fields, for a test asserting a warning.
+#[cfg(feature = "mdbx")]
+#[derive(Clone, Default)]
+struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[cfg(feature = "mdbx")]
+impl WarnCapture {
+    /// The first warning whose text holds `text`.
+    fn find(&self, text: &str) -> Option<String> {
+        self.0.lock().expect("warnings").iter().find(|w| w.contains(text)).cloned()
+    }
+}
+
+#[cfg(feature = "mdbx")]
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut text = String::new();
+            event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                text += &format!("{}={value:?} ", field.name());
+            });
+            self.0.lock().expect("warnings").push(text);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[cfg(feature = "mdbx")]
 mod mdbx {
     use super::*;
@@ -321,11 +357,19 @@ mod mdbx {
         std::fs::write(temp.join(TN_LMDB_DATA_FILE), b"a stopped copy").expect("partial copy");
         std::fs::write(temp.join("other"), b"more").expect("another file");
 
-        drop(open_rw(&config, &path).expect("the MDBX database opens beside it"));
+        let warnings = WarnCapture::default();
+        let opened =
+            tracing::subscriber::with_default(warnings.clone(), || open_rw(&config, &path));
+        drop(opened.expect("the MDBX database opens beside it"));
         db_table_stats(&path).expect("the stats read beside it");
         let copy = std::fs::read(temp.join(TN_LMDB_DATA_FILE)).expect("the temp directory is kept");
         assert_eq!(copy, b"a stopped copy", "its copy is unchanged");
         assert_eq!(dir_bytes(&temp).expect("size"), 18, "the size the warning names");
+        let warned = warnings
+            .find("a stopped MDBX to tn-lmdb migration left its temp directory")
+            .expect("the guard warns");
+        assert!(warned.contains(&temp.display().to_string()), "names the directory: {warned}");
+        assert!(warned.contains("18 bytes"), "names its size: {warned}");
     }
 }
 

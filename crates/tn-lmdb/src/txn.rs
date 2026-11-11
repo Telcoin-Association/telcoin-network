@@ -2287,6 +2287,8 @@ impl ReadTxn for RoTxn {
 ///
 /// Any I/O error, growth failure or damage met by an operation latches the environment: that
 /// operation returns the error, and every later write and commit returns [`Error::Failed`].
+/// Reads of the working state (and its cursors' moves) are not refused after a latch: they
+/// serve what the failed operation left, which the refused commit never publishes.
 /// Validation errors ([`Error::KeyTooLarge`], [`Error::KeyTooShort`], [`Error::ValueTooLarge`],
 /// [`Error::AppendOutOfOrder`], [`Error::KeyExists`], table errors, [`Error::TableKind`],
 /// [`Error::InvalidDupOptions`]) change nothing and do not latch.

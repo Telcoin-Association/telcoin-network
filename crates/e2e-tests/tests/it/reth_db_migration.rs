@@ -192,9 +192,14 @@ fn migrated_log_line(instance: usize, run: u32) -> eyre::Result<String> {
         .ok_or_else(|| eyre::eyre!("{} has no `{MIGRATED_LOG}` line", path.display()))
 }
 
-/// The highest block number among the validators at `instances`.
-fn tip(client_urls: &[String; 4], instances: impl IntoIterator<Item = usize>) -> u64 {
-    instances.into_iter().filter_map(|i| get_block_number(&client_urls[i]).ok()).max().unwrap_or(0)
+/// The highest block number among the validators at `instances`; an error when none answers,
+/// so a wait to pass it never passes on nothing.
+fn tip(client_urls: &[String; 4], instances: impl IntoIterator<Item = usize>) -> eyre::Result<u64> {
+    instances
+        .into_iter()
+        .filter_map(|i| get_block_number(&client_urls[i]).ok())
+        .max()
+        .ok_or_else(|| eyre::eyre!("no validator answered eth_blockNumber"))
 }
 
 /// Stop validator `instance` with SIGTERM and wait for it to exit on its own. A validator that
@@ -255,7 +260,7 @@ fn upgrade_validator(
     stop_validator(guard, instance)?;
     assert_mdbx_layout(&datadir)?;
     let peers = (0..4).filter(|i| *i != instance);
-    let tip_at_stop = tip(client_urls, peers);
+    let tip_at_stop = tip(client_urls, peers)?;
 
     guard.replace(
         instance,
