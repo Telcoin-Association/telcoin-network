@@ -2767,6 +2767,8 @@ struct GraceRun<R> {
     _task_manager: TaskManager,
     /// Every authority, in fixture order.
     all: Vec<AuthorityIdentifier>,
+    /// The proposer's authority.
+    own: AuthorityIdentifier,
     /// The authority that is neither the proposer nor a leader of round 2 or 4, so a quorum
     /// without it still lets the proposer advance.
     late: AuthorityIdentifier,
@@ -2852,7 +2854,7 @@ async fn start_grace_run(
     let round_two_at = tokio::time::Instant::now();
     tokio::time::sleep(GRACE_SETTLE).await;
 
-    GraceRun { fixture, cb, rx_headers, _task_manager: task_manager, all, late, round_two_at }
+    GraceRun { fixture, cb, rx_headers, _task_manager: task_manager, all, own, late, round_two_at }
 }
 
 /// The parent-grace metrics, read from one snapshot.
@@ -3081,30 +3083,36 @@ async fn test_parent_grace_zero_keeps_todays_timing() {
         GraceMetrics { outcomes: [0, 0, 0], late: [1, 0], waits_ms: vec![] }
     );
 
-    // the state itself: nothing is kept, nothing is armed, no deadline
-    let mut grace = ParentGrace::new(Duration::ZERO, GRACE_MAX_DELAY, Histogram::noop());
+    // the state itself: nothing is kept, nothing is armed, no deadline, also after a late
+    // certificate of the round the proposal built on
+    let mut grace = grace_for(&run.fixture, Duration::ZERO, Histogram::noop());
     let round_one = grace_certs(&run.fixture, 1, &run.all);
-    let header = HeaderBuilder::default()
-        .author(run.all[0].clone())
-        .round(2)
-        .epoch(run.fixture.committee().epoch())
-        .parents(round_one.iter().map(|cert| cert.digest()).collect())
-        .build();
-    grace.on_propose(&round_one, Duration::from_millis(5));
-    assert_eq!(grace.in_flight_wait(), Duration::ZERO, "nothing kept for the proposal");
-    grace.on_proposed(&header);
+    grace.on_propose(&round_one[..3], Duration::from_millis(5));
+    assert_eq!(grace.proposal_wait(), Duration::ZERO, "nothing kept for the proposal");
+    grace.on_late_parents(1, 2, &round_one[3..]);
     let quorum = grace_certs(&run.fixture, 2, &run.all_but_late());
     assert_eq!(grace.hold(&quorum), GraceHold::Propose(Duration::ZERO));
     assert_eq!(grace.deadline(), None, "no timer");
 }
 
-/// An author that was not among the last header's parents is never waited for: round 2 built on
-/// three round-1 certificates, so round 3 goes out at the min delay without the fourth author.
+/// The parent grace of `fixture`'s first authority, `grace` long, recording its waits in `wait`.
+fn grace_for(
+    fixture: &CommitteeFixture<MemDatabase>,
+    grace: Duration,
+    wait: Histogram,
+) -> ParentGrace {
+    let own = fixture.authorities().next().expect("an authority").id();
+    ParentGrace::new(grace, GRACE_MAX_DELAY, fixture.committee(), own, wait)
+}
+
+/// An author whose certificate of the round the last header built on never reached the proposer
+/// is never waited for: round 2 built on three round-1 certificates and the fourth never came, so
+/// round 3 goes out at the min delay without the fourth author.
 ///
-/// Catches: a grace that waits for every committee member instead of last round's authors, which
-/// would charge G every round for a crashed validator.
+/// Catches: a grace that waits for every committee member instead of the authors live last
+/// round, which would charge G every round for a crashed validator.
 #[tokio::test(start_paused = true)]
-async fn test_parent_grace_ignores_authors_absent_from_last_header() {
+async fn test_parent_grace_ignores_authors_absent_last_round() {
     use crate::log_capture::LogCapture;
     use metrics_util::debugging::DebuggingRecorder;
 
@@ -3124,33 +3132,23 @@ async fn test_parent_grace_ignores_authors_absent_from_last_header() {
         GraceMetrics { outcomes: [0, 0, 0], late: [0, 0], waits_ms: vec![] }
     );
 
-    // a restart's re-proposal sends the stored header, not the parents just collected: the basis
-    // is what that header carries (three of the four round-1 certificates here), so the fourth
-    // author is not waited for, and a header carrying none of them leaves no basis at all
+    // on the state: the basis is the certificates handed to the proposal (the stored header a
+    // restart re-sends may carry others), so the fourth author is not waited for while the third
+    // is; genesis parents leave no basis at all
     let all = &run.all;
     let round_one = grace_certs(&run.fixture, 1, all);
-    let stored = |carried: &[Certificate]| {
-        HeaderBuilder::default()
-            .author(all[0].clone())
-            .round(2)
-            .epoch(run.fixture.committee().epoch())
-            .parents(carried.iter().map(|cert| cert.digest()).collect())
-            .build()
-    };
     let without_fourth = grace_certs(&run.fixture, 2, &all[..3]);
-    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
-    grace.on_propose(&round_one, Duration::ZERO);
-    grace.on_proposed(&stored(&round_one[..3]));
+    let mut grace = grace_for(&run.fixture, GRACE, Histogram::noop());
+    grace.on_propose(&round_one[..3], Duration::ZERO);
     assert_eq!(grace.hold(&without_fourth), GraceHold::Propose(Duration::ZERO));
-    assert_eq!(grace.deadline(), None, "the fourth author was not carried");
+    assert_eq!(grace.deadline(), None, "the fourth author was not live in round 1");
     let without_third = grace_certs(&run.fixture, 2, &[&all[..2], &all[3..]].concat());
-    assert_eq!(grace.hold(&without_third), GraceHold::Wait, "the third author was carried");
+    assert_eq!(grace.hold(&without_third), GraceHold::Wait, "the third author was");
 
-    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
-    grace.on_propose(&round_one, Duration::ZERO);
-    grace.on_proposed(&stored(&[]));
+    let mut grace = grace_for(&run.fixture, GRACE, Histogram::noop());
+    grace.on_propose(&Certificate::genesis(&run.fixture.committee()), Duration::ZERO);
     assert_eq!(grace.hold(&without_fourth), GraceHold::Propose(Duration::ZERO));
-    assert_eq!(grace.deadline(), None, "no carried parent, no basis");
+    assert_eq!(grace.deadline(), None, "genesis parents, no basis");
 }
 
 /// The grace never proposes a header that is not ready. The proposer's quorum is the aggregator's
@@ -3207,20 +3205,13 @@ async fn test_parent_grace_arms_once_per_round() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
     let round_one = grace_certs(&fixture, 1, &all);
-    let header = HeaderBuilder::default()
-        .author(all[0].clone())
-        .round(2)
-        .epoch(fixture.committee().epoch())
-        .parents(round_one.iter().map(|cert| cert.digest()).collect())
-        .build();
     let quorum = grace_certs(&fixture, 2, &all[..3]);
     let new_grace = || {
         let mut grace = metrics::with_local_recorder(&recorder, || {
             let wait = metrics::histogram!("tn_primary.parent_grace_wait_seconds");
-            ParentGrace::new(GRACE, GRACE_MAX_DELAY, wait)
+            grace_for(&fixture, GRACE, wait)
         });
         grace.on_propose(&round_one, Duration::ZERO);
-        grace.on_proposed(&header);
         grace
     };
 
@@ -3277,16 +3268,9 @@ async fn test_parent_grace_none_at_epoch_start_or_after_a_skipped_round() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let all: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
     let genesis = Certificate::genesis(&fixture.committee());
-    let mut grace = ParentGrace::new(GRACE, GRACE_MAX_DELAY, Histogram::noop());
+    let mut grace = grace_for(&fixture, GRACE, Histogram::noop());
     assert_eq!(grace.hold(&genesis), GraceHold::Propose(Duration::ZERO), "round 1 at once");
     grace.on_propose(&genesis, Duration::ZERO);
-    let round_one_header = HeaderBuilder::default()
-        .author(all[0].clone())
-        .round(1)
-        .epoch(fixture.committee().epoch())
-        .parents(genesis.iter().map(|cert| cert.digest()).collect())
-        .build();
-    grace.on_proposed(&round_one_header);
     let three = grace_certs(&fixture, 1, &all[..3]);
     assert_eq!(grace.hold(&three), GraceHold::Propose(Duration::ZERO), "round 2 at once");
     assert_eq!(grace.deadline(), None, "nothing armed at the epoch start");
@@ -3294,13 +3278,6 @@ async fn test_parent_grace_none_at_epoch_start_or_after_a_skipped_round() {
     // the empty-parents jump: armed for round 2, then the parents are replaced by none
     let round_one = grace_certs(&fixture, 1, &all);
     grace.on_propose(&round_one, Duration::ZERO);
-    let round_two_header = HeaderBuilder::default()
-        .author(all[0].clone())
-        .round(2)
-        .epoch(fixture.committee().epoch())
-        .parents(round_one.iter().map(|cert| cert.digest()).collect())
-        .build();
-    grace.on_proposed(&round_two_header);
     let round_two = grace_certs(&fixture, 2, &all[..3]);
     assert_eq!(grace.hold(&round_two), GraceHold::Wait, "armed for the fourth author");
     grace.end_if_round_moved(&round_two);
@@ -3328,6 +3305,160 @@ async fn test_parent_grace_none_at_epoch_start_or_after_a_skipped_round() {
         grace_metrics(&snapshotter),
         GraceMetrics { outcomes: [0, 0, 1], late: [0, 1], waits_ms: vec![10] }
     );
+}
+
+/// The re-entry sequence of review finding M1. The late author's round-2 certificate misses the
+/// round-3 header (that grace expires) and arrives afterwards. The arrival puts the author back
+/// in the basis, so the round-4 header waits for its round-3 certificate and carries it.
+///
+/// Catches: a late certificate that is only counted, which drops a live far author from every
+/// later grace after its first excursion (the drift of bench 5).
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_late_certificate_puts_its_author_back() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    run.send(2, &run.all_but_late()).await;
+    let (header, three_at) = run.next(3).await;
+    assert_eq!(three_at, GRACE_MIN_DELAY + GRACE, "round 3 went out when its grace expired");
+    assert_eq!(header.parents().len(), 3);
+
+    // the round-2 certificate that missed the round-3 header, then the round-3 quorum without
+    // the late author, whose own round-3 certificate lands 40 ms after the header is ready
+    run.send(2, &[run.late.clone()]).await;
+    tokio::time::sleep(GRACE_SETTLE).await;
+    run.send(3, &run.all_but_late()).await;
+    let arrival = three_at + GRACE_MIN_DELAY + Duration::from_millis(40);
+    let early = tokio::time::timeout_at(run.round_two_at + arrival, run.rx_headers.recv()).await;
+    assert!(early.is_err(), "no round-4 header before the late author's certificate");
+    let late = run.send(3, &[run.late.clone()]).await;
+
+    let (header, four_at) = run.next(4).await;
+    assert_eq!(four_at, arrival, "round 4 waited for the author that came back");
+    assert_eq!(header.parents().len(), 4);
+    assert!(header.parents().contains(&late[0].digest()), "its certificate rides the header");
+    assert_eq!(proposed_line(&capture, 4).u64_field("grace_ms"), Some(40));
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [1, 1, 0], late: [1, 0], waits_ms: vec![150, 40] }
+    );
+}
+
+/// A far author that is always later than the quorum but inside G stays in the basis round after
+/// round: the headers of rounds 3, 4 and 5 each wait 40 ms for its certificate and carry it.
+///
+/// Catches: a basis that loses an author whose certificate rides every header late.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_far_author_inside_the_grace_stays_in() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let mut last_at = Duration::ZERO;
+    for round in 2..=4 {
+        run.send(round, &run.all_but_late()).await;
+        let arrival = last_at + GRACE_MIN_DELAY + Duration::from_millis(40);
+        let early =
+            tokio::time::timeout_at(run.round_two_at + arrival, run.rx_headers.recv()).await;
+        assert!(early.is_err(), "round {} waits for the far author", round + 1);
+        let late = run.send(round, &[run.late.clone()]).await;
+        let (header, at) = run.next(round + 1).await;
+        assert_eq!(at, arrival, "round {} goes out on the far certificate", round + 1);
+        assert!(header.parents().contains(&late[0].digest()), "round {} carries it", round + 1);
+        last_at = at;
+        tokio::time::sleep(GRACE_SETTLE).await;
+    }
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [3, 0, 0], late: [0, 0], waits_ms: vec![40, 40, 40] }
+    );
+}
+
+/// An author that stops sending costs one grace and is then dropped: the round-3 header waits G
+/// for it, and since none of its round-2 certificate ever arrives, the headers of rounds 4 and 5
+/// go out at the min delay.
+///
+/// Catches: a re-entry rule that keeps a crashed validator in the basis and charges G every round.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_crashed_author_costs_one_grace() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let mut last_at = Duration::ZERO;
+    for round in 2..=4 {
+        run.send(round, &run.all_but_late()).await;
+        let (header, at) = run.next(round + 1).await;
+        let wait = if round == 2 { GRACE } else { Duration::ZERO };
+        assert_eq!(at, last_at + GRACE_MIN_DELAY + wait, "round {}", round + 1);
+        assert_eq!(header.parents().len(), 3);
+        last_at = at;
+        tokio::time::sleep(GRACE_SETTLE).await;
+    }
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 1, 0], late: [0, 0], waits_ms: vec![150] }
+    );
+}
+
+/// The proposer never waits for its own certificate. Its round-2 header carried its own round-1
+/// certificate, yet the round-3 header goes out at the min delay over a quorum without it, and its
+/// own round-2 certificate turning up late does not make round 4 wait either. On the state, only
+/// committee members other than the proposer enter the basis, from the proposal's parents or from
+/// late certificates, while a late member does come back.
+///
+/// Catches: a node that delays its next header for its own certificate, and a basis that admits
+/// a certificate from outside the committee.
+#[tokio::test(start_paused = true)]
+async fn test_parent_grace_never_waits_for_itself() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut run = start_grace_run(GRACE, &recorder, false).await;
+
+    let others: Vec<_> = run.all.iter().filter(|id| **id != run.own).cloned().collect();
+    run.send(2, &others).await;
+    let (header, three_at) = run.next(3).await;
+    assert_eq!(three_at, GRACE_MIN_DELAY, "round 3 does not wait for the own certificate");
+    assert_eq!(header.parents().len(), 3);
+    run.send(2, &[run.own.clone()]).await;
+    tokio::time::sleep(GRACE_SETTLE).await;
+    run.send(3, &others).await;
+    let (_, four_at) = run.next(4).await;
+    assert_eq!(four_at, three_at + GRACE_MIN_DELAY, "nor does round 4 after it came late");
+    assert_eq!(
+        grace_metrics(&snapshotter),
+        GraceMetrics { outcomes: [0, 0, 0], late: [1, 0], waits_ms: vec![] }
+    );
+
+    // the state of the first authority: its own certificate and a stranger's (another
+    // committee's) never enter the basis, handed to the proposal or late
+    let all = &run.all;
+    let strangers = CommitteeFixture::builder(MemDatabase::default).build();
+    let stranger_id = strangers.authorities().next().expect("an authority").id();
+    let stranger = grace_certs(&strangers, 1, &[stranger_id]);
+    let mut grace = grace_for(&run.fixture, GRACE, Histogram::noop());
+    let mut round_one = grace_certs(&run.fixture, 1, &all[..3]);
+    round_one.extend(stranger.iter().cloned());
+    grace.on_propose(&round_one, Duration::ZERO);
+    grace.on_late_parents(1, 2, &stranger);
+    grace.on_late_parents(1, 2, &round_one[..1]);
+    let round_two = grace_certs(&run.fixture, 2, &all[1..3]);
+    assert_eq!(grace.hold(&round_two), GraceHold::Propose(Duration::ZERO), "nobody to wait for");
+    assert_eq!(grace.deadline(), None);
+    grace.on_late_parents(1, 2, &grace_certs(&run.fixture, 1, &all[3..]));
+    assert_eq!(grace.hold(&round_two), GraceHold::Wait, "a late member comes back");
 }
 
 // ---- bench6 digest-dedupe ----
