@@ -129,6 +129,11 @@ struct RethEnvInner {
     /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
     #[cfg(any(feature = "test-utils", test))]
     persist_attempts: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: the persist delay and the persist/build interleaving armed through
+    /// `RethEnv::inject_persist_delay` and `RethEnv::interleave_next_persist` (see
+    /// `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_holds: execution::PersistHolds,
     /// The node's runtime switches for this env, fixed at construction.
     switches: RethSwitches,
     /// The execution database's map advice (`mdbx_random_advice`) and the storage counters each
@@ -277,6 +282,8 @@ impl RethEnv {
                 persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                persist_holds: execution::PersistHolds::default(),
                 switches,
                 mdbx,
             }),

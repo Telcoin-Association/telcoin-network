@@ -271,9 +271,13 @@ impl RethEnv {
         scope: &mut OutputBuildScope,
     ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
         scope.check_parent(payload.parent_header.hash())?;
+        #[cfg(any(feature = "test-utils", test))]
+        self.inner.persist_holds.hold_block_build();
         let OutputBuildScope { overlay, reads, tip } = scope;
         let (block, timings) = self.build_recovered_block(payload, recovered, overlay, reads)?;
         *tip = Some(block.recovered_block.hash());
+        #[cfg(any(feature = "test-utils", test))]
+        self.inner.persist_holds.block_built();
         Ok((block, timings))
     }
 
@@ -457,6 +461,8 @@ impl RethEnv {
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(any(feature = "test-utils", test))]
+        let _returned = self.inner.persist_holds.hold_persist();
         #[cfg(any(feature = "test-utils", test))]
         self.consume_injected_persist_fault()?;
 
@@ -653,6 +659,158 @@ impl RethEnv {
     #[cfg(any(feature = "test-utils", test))]
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// TEST-ONLY: sleep `delay` at the start of every following call to
+    /// [`Self::persist_executed_output`]; [`Duration::ZERO`] disarms it.
+    ///
+    /// Holds each output in a pipelined engine's commit slot for at least `delay`, so an
+    /// engine-level test can have the next output build while the previous one commits without
+    /// reaching inside the engine. Whole milliseconds; the sleep runs on the persisting thread
+    /// before any injected fault is consumed.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn inject_persist_delay(&self, delay: Duration) {
+        self.inner.persist_holds.set_delay(delay);
+    }
+
+    /// TEST-ONLY: make the next persist commit between two block builds.
+    ///
+    /// The next call to [`Self::persist_executed_output`] waits at its start until `blocks` more
+    /// blocks have been built (counted from now, by every caller of
+    /// [`Self::build_block_from_recovered_payload`]), and the first block build that starts after
+    /// those blocks waits until that persist has returned. With `blocks` set to output N's blocks
+    /// plus `k`, a pipelined engine therefore commits N after the `k`-th block of N+1 and before
+    /// its next one, and the announce and finalize of N run while that next block builds. The
+    /// rendezvous disarms once the held block build proceeds.
+    ///
+    /// Each wait gives up after `deadline` and counts in [`Self::persist_interleave_expired`]. A
+    /// sequential engine never builds while it persists, so there the persist waits for the whole
+    /// deadline; a test can use that to prove nothing built during a commit.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn interleave_next_persist(&self, blocks: u64, deadline: Duration) {
+        self.inner.persist_holds.arm(blocks, deadline);
+    }
+
+    /// TEST-ONLY: how many waits armed by [`Self::interleave_next_persist`] gave up at their
+    /// deadline.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn persist_interleave_expired(&self) -> u32 {
+        self.inner.persist_holds.expired()
+    }
+}
+
+/// TEST-ONLY: the persist delay and the persist/build rendezvous behind
+/// [`RethEnv::inject_persist_delay`] and [`RethEnv::interleave_next_persist`].
+#[cfg(any(feature = "test-utils", test))]
+#[derive(Debug, Default)]
+pub(crate) struct PersistHolds {
+    /// Milliseconds every persist sleeps at its start (zero: none).
+    delay_ms: std::sync::atomic::AtomicU64,
+    /// Blocks built by [`RethEnv::build_block_from_recovered_payload`].
+    blocks_built: std::sync::atomic::AtomicU64,
+    /// Calls of [`RethEnv::persist_executed_output`] that have returned, with or without an
+    /// error.
+    persists_returned: Arc<std::sync::atomic::AtomicU64>,
+    /// The armed rendezvous, if any.
+    armed: parking_lot::Mutex<Option<Rendezvous>>,
+    /// Waits that gave up at their deadline.
+    expired: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(any(feature = "test-utils", test))]
+impl PersistHolds {
+    /// Store the per-persist delay.
+    fn set_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.delay_ms.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arm the rendezvous `blocks` builds from now.
+    fn arm(&self, blocks: u64, deadline: Duration) {
+        use std::sync::atomic::Ordering::SeqCst;
+        *self.armed.lock() = Some(Rendezvous {
+            release_at_block: self.blocks_built.load(SeqCst).saturating_add(blocks),
+            returned_at_arm: self.persists_returned.load(SeqCst),
+            deadline,
+        });
+    }
+
+    /// The waits that gave up at their deadline.
+    fn expired(&self) -> u32 {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count one built block.
+    pub(crate) fn block_built(&self) {
+        self.blocks_built.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// At the start of a persist: sleep the delay, then wait for the armed rendezvous' blocks.
+    /// The returned guard counts the persist as returned when it drops, on every return path.
+    pub(crate) fn hold_persist(&self) -> PersistReturned {
+        use std::sync::atomic::Ordering::SeqCst;
+        let delay = self.delay_ms.load(SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        let armed = *self.armed.lock();
+        if let Some(rendezvous) = armed {
+            let built = || self.blocks_built.load(SeqCst) >= rendezvous.release_at_block;
+            self.wait_until(rendezvous.deadline, built);
+        }
+        PersistReturned(self.persists_returned.clone())
+    }
+
+    /// At the start of a block build: once the rendezvous' blocks are built, wait until the
+    /// held persist has returned, then disarm.
+    pub(crate) fn hold_block_build(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let armed = *self.armed.lock();
+        let Some(rendezvous) = armed else {
+            return;
+        };
+        if self.blocks_built.load(SeqCst) < rendezvous.release_at_block {
+            return;
+        }
+        let returned = || self.persists_returned.load(SeqCst) > rendezvous.returned_at_arm;
+        self.wait_until(rendezvous.deadline, returned);
+        *self.armed.lock() = None;
+    }
+
+    /// Poll `ready` every millisecond for at most `deadline`, counting a wait that gives up.
+    fn wait_until(&self, deadline: Duration, ready: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            if start.elapsed() >= deadline {
+                self.expired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// TEST-ONLY: the rendezvous armed by [`RethEnv::interleave_next_persist`].
+#[cfg(any(feature = "test-utils", test))]
+#[derive(Debug, Clone, Copy)]
+struct Rendezvous {
+    /// The held persist proceeds once this many blocks have been built in all.
+    release_at_block: u64,
+    /// The held block build proceeds once more persists than this have returned.
+    returned_at_arm: u64,
+    /// How long each side waits at most.
+    deadline: Duration,
+}
+
+/// TEST-ONLY: counts one returned persist when dropped (see [`PersistHolds::hold_persist`]).
+#[cfg(any(feature = "test-utils", test))]
+#[derive(Debug)]
+pub(crate) struct PersistReturned(Arc<std::sync::atomic::AtomicU64>);
+
+#[cfg(any(feature = "test-utils", test))]
+impl Drop for PersistReturned {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1341,5 +1499,59 @@ mod tests {
         let always: Vec<&str> =
             PERSISTED_OUTPUT_FIELDS[..11].iter().copied().chain(["mdbx_advised_bytes"]).collect();
         assert_eq!(names(PersistStorage::default()), always);
+    }
+
+    // ---- bench6 pipelined-persist ----
+
+    /// The rendezvous: the held persist proceeds only after the armed number of blocks, the next
+    /// block build only after that persist returned, and nothing expires when both sides come.
+    #[test]
+    fn test_persist_holds_interleave_persist_between_two_blocks() {
+        let holds = Arc::new(PersistHolds::default());
+        holds.block_built();
+        holds.arm(1, Duration::from_secs(30));
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let persist = {
+            let (holds, order) = (holds.clone(), order.clone());
+            std::thread::spawn(move || {
+                let returned = holds.hold_persist();
+                order.lock().push("persist");
+                drop(returned);
+            })
+        };
+        // the persist waits for one more block than were built when it was armed
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(order.lock().is_empty(), "the persist proceeded before the armed block");
+        order.lock().push("block");
+        holds.block_built();
+        // the next block build waits for the persist to return, then disarms
+        holds.hold_block_build();
+        order.lock().push("next block");
+        persist.join().expect("persist thread");
+        assert_eq!(*order.lock(), vec!["block", "persist", "next block"]);
+        assert_eq!(holds.expired(), 0);
+        assert!(holds.armed.lock().is_none(), "the held block build disarms");
+        // disarmed: neither side waits any more
+        drop(holds.hold_persist());
+        holds.hold_block_build();
+        assert_eq!(holds.expired(), 0);
+    }
+
+    /// A persist armed for a block that never comes waits for its deadline and counts it.
+    #[test]
+    fn test_persist_holds_expire_at_deadline() {
+        let holds = PersistHolds::default();
+        holds.arm(1, Duration::from_millis(30));
+        let start = Instant::now();
+        drop(holds.hold_persist());
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        assert_eq!(holds.expired(), 1);
+        holds.set_delay(Duration::from_millis(15));
+        holds.arm(0, Duration::from_secs(30));
+        let start = Instant::now();
+        drop(holds.hold_persist());
+        assert!(start.elapsed() >= Duration::from_millis(15), "the delay sleeps first");
+        assert_eq!(holds.expired(), 1, "an armed count already reached does not wait");
     }
 }
