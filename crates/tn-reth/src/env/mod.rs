@@ -800,6 +800,10 @@ mod tests {
 
     // ---- bench6 mdbx-advice ----
 
+    /// The genesis time of every env [`env_with_switches`] opens, so that a second open of one
+    /// datadir reads the genesis the first one wrote.
+    const REOPEN_GENESIS_TIMESTAMP: u64 = 1_700_000_000;
+
     /// Open an env over a fresh datadir at `dir` through [`RethEnv::new_with_switches`], the way
     /// the node opens its own.
     fn env_with_switches(
@@ -812,7 +816,10 @@ mod tests {
             dirs::MaybePlatformPath,
         };
         crate::init_reth_defaults();
-        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        // a fixed genesis time: `test_genesis()` stamps the current second, so a test that opens
+        // the same datadir twice would see two genesis hashes whenever a second ticks in between
+        let chain: Arc<RethChainSpec> =
+            Arc::new(tn_types::test_genesis_at(REOPEN_GENESIS_TIMESTAMP).into());
         let config = RethConfig::from_node_config(NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(dir.to_path_buf()),
