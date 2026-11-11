@@ -527,3 +527,17 @@ Constraints unchanged: no execution-path behaviour change, no RocksDB, no tndb-b
   the PR text is reused.
 - Previous-binary build needs `GIT_CONFIG_COUNT=2` with `url.<repo>/.git/modules/tn-contracts.insteadOf`
   and `protocol.file.allow=always` in an agent session (no SSH hardware key).
+
+### Hand-off (2026-11-10, end of the review-fix work)
+- `sls_reth_vendor2` is at b4a6e6028: all review fixes (TN-0054 to TN-0085 plus the TN-side
+  commits), the lane results, and the merge of main 9aa1d6139. Local only, not pushed; the user
+  pushes and opens the PR. `tasks/pr-sls_reth_vendor2.md` (untracked) is the PR text draft.
+- main squash-merged `sls_reth_vendor` as c2fffa5f2, so a merge of main conflicts on every
+  vendored file. Resolve against the fork point 5ded13999: ours for files main did not change
+  after the squash, `git merge-file` against 5ded13999 for the rest (the merge commit says so).
+- Verified on the merged tree: root and nested `cargo check --workspace --all-targets`, the
+  vendor/lockfile/rocksdb/fmt gates, tn-reth and tn-batch-builder (509 tests). Not rerun after
+  the merge: the full nested test lane, the clippy lanes, `make test-upgrade`.
+- Still separate: T2-1 pool half on `sls_t2_1`; open issues O1 to O11 in
+  `vendor/reth/tn/notes/open-issues.md`.
+
