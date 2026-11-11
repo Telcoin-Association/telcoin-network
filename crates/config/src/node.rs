@@ -406,6 +406,16 @@ pub struct Parameters {
     /// the previous behaviour: the pinned block is used without the check. Issue #1806.
     #[serde(default)]
     pub epoch_record_state_check: bool,
+
+    /// How long the proposer waits for late parents before it proposes a header.
+    ///
+    /// When the proposer is ready to propose but an author whose certificate its last header
+    /// used is missing from the new parents, it waits up to this long for that certificate. A
+    /// header forced by `max_header_delay` never waits. Written like the other durations
+    /// (`150ms`). The default `0ms` keeps the previous behaviour: propose as soon as ready.
+    /// Issue #1803.
+    #[serde(with = "humantime_serde", default)]
+    pub parent_grace: Duration,
 }
 
 impl Parameters {
@@ -516,6 +526,7 @@ impl Default for Parameters {
             recovery_threads: 0,
             epoch_close_task_drain: false,
             epoch_record_state_check: false,
+            parent_grace: Duration::ZERO,
         }
     }
 }
@@ -680,6 +691,7 @@ impl Parameters {
             ("recovery_threads", SwitchValue::Count(u64::from(self.recovery_threads))),
             ("epoch_close_task_drain", SwitchValue::Bool(self.epoch_close_task_drain)),
             ("epoch_record_state_check", SwitchValue::Bool(self.epoch_record_state_check)),
+            ("parent_grace", SwitchValue::Duration(self.parent_grace)),
         ]
     }
 }
@@ -1398,5 +1410,19 @@ mod test {
         assert!(params.epoch_record_state_check);
         assert_eq!(listed("epoch_close_task_drain: true", "epoch_close_task_drain"), "true");
         assert_eq!(listed("epoch_record_state_check: true", "epoch_record_state_check"), "true");
+    }
+
+    // ---- bench6 parent-grace ----
+
+    /// `parent_grace` stays at zero unless the file sets it, and parses both arm values written
+    /// bare or quoted.
+    #[test]
+    fn parent_grace_parses() {
+        assert_eq!(parse_with("").parent_grace, Duration::ZERO);
+        assert_eq!(parse_with("parent_grace: 0ms").parent_grace, Duration::ZERO);
+        assert_eq!(parse_with("parent_grace: 150ms").parent_grace, Duration::from_millis(150));
+        assert_eq!(parse_with("parent_grace: \"100ms\"").parent_grace, Duration::from_millis(100));
+        assert_eq!(listed("parent_grace: 150ms", "parent_grace"), "150ms");
+        assert_eq!(listed("", "parent_grace"), "0s");
     }
 }
