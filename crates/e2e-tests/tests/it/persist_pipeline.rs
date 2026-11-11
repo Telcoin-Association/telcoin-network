@@ -20,7 +20,7 @@
 //! [`PERSIST_DELAY_LOG`], and every test here fails on that.
 
 use super::common::{
-    acquire_test_permit, address_from_word, call_rpc, current_epoch,
+    acquire_test_permit, address_from_word, call_rpc, current_epoch, fetch_verified_epoch_record,
     force_kill_and_reap, get_block, get_block_number, get_key, kill_child, log_field,
     log_line_matches, network_advancing, node_log_lines, node_log_path, plain_log_lines,
     scrape_metric_value, send_tel, start_validator_with_overrides, wait_for_node_log_line,
@@ -672,6 +672,105 @@ async fn mixed_fleet(fleet: &mut PipelineFleet) -> eyre::Result<String> {
         "epochs {start_epoch}->{end_epoch}, {sent} transfers, {head} blocks identical on all \
          four; {}; {}",
         restarts.join("; "),
+        evidence.join("; ")
+    ))
+}
+
+/// All four nodes pipelined with the persist delay, under load across an epoch boundary: every
+/// node certifies the same epoch records, the next epoch starts and builds blocks, the chains are
+/// identical, and each node's `tn_engine_close_barrier_holds_total` is reported (the design
+/// expects 0: the forwarder sends nothing past a close).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "four-node pipelined persist fleet; run through the e2e lane"]
+async fn test_pipelined_epoch_close_under_load() -> eyre::Result<()> {
+    let _permit = acquire_test_permit();
+    let test = "persist_pipeline_epoch_close";
+    let tmp = tempfile::TempDir::with_prefix(test)?;
+    configure(tmp.path(), 15)?;
+    let delay = PERSIST_DELAY_MS.to_string();
+    let overrides = FleetOverrides::default()
+        .parameter(VALIDATORS, SWITCH, "true")
+        .env(VALIDATORS, PERSIST_DELAY_ENV, delay.as_str())
+        .env(VALIDATORS, "RUST_LOG", NODE_LOG_FILTER);
+    let mut fleet = PipelineFleet::start(test, tmp.path(), overrides)?;
+    let result = epoch_close_under_load(&mut fleet).await;
+    fleet.guard.kill_all();
+    let summary = result.wrap_err(format!("{test} failed, check logs in test_logs/{test}/"))?;
+    eprintln!("{test}: {summary}");
+    Ok(())
+}
+
+/// The body of [`test_pipelined_epoch_close_under_load`]; returns the evidence.
+async fn epoch_close_under_load(fleet: &mut PipelineFleet) -> eyre::Result<String> {
+    network_advancing(&fleet.urls())?;
+    for instance in 0..4 {
+        fleet.wait_for_switch(instance, true).await?;
+    }
+    let load = Load::start(fleet.url(0));
+    load.wait_flowing().await?;
+    let start_epoch = epoch_of(&fleet.url(0)).await?;
+    // the pipeline must be busy when the boundary arrives: wait for overlapped outputs first
+    wait_until(Duration::from_secs(120), "overlapped outputs before the boundary", || async {
+        tokio::time::sleep(POLL).await;
+        Ok(OutputLines::read(&fleet.stdout_lines(0)?).overlapped >= MIN_OVERLAPPED_OUTPUTS)
+    })
+    .await?;
+    let closed = epoch_of(&fleet.url(0)).await?;
+    let next = wait_for_epoch(&fleet.url(0), closed + 1, Duration::from_secs(120)).await?;
+    // the next epoch builds blocks under the same load
+    let provider = ProviderBuilder::new().connect_http(fleet.url(0).parse()?);
+    let first_block = current_epoch(&provider).await?.block_height;
+    let url = fleet.url(0);
+    wait_until(Duration::from_secs(120), "a block of the new epoch", || async {
+        tokio::time::sleep(POLL).await;
+        Ok(get_block_number(&url).is_ok_and(|height| height >= first_block))
+    })
+    .await?;
+    let sent = load.finish()?;
+    let head = fleet.wait_for_common_head().await?;
+    assert_same_chain(&fleet.urls(), head)?;
+
+    // every node certifies and holds the same records for every closed epoch
+    let mut records = Vec::new();
+    for epoch in 0..next {
+        let mut reference = None;
+        for (instance, url) in fleet.urls().iter().enumerate() {
+            let record = fetch_verified_epoch_record(url, epoch, 60).await?;
+            let block = get_block(url, Some(record.final_state.number))?;
+            eyre::ensure!(
+                block_field(&block, "hash") == record.final_state.hash.to_string(),
+                "node {instance}'s block {} is not the final state of its epoch {epoch} record",
+                record.final_state.number
+            );
+            match &reference {
+                None => reference = Some(record),
+                Some(first) => eyre::ensure!(
+                    *first == record,
+                    "node {instance}'s epoch {epoch} record differs from node 0's"
+                ),
+            }
+        }
+        if let Some(record) = reference {
+            records.push(format!("epoch {epoch} final block {}", record.final_state.number));
+        }
+    }
+
+    assert_switch_lines(fleet, [true; 4])?;
+    assert_no_forbidden_lines(fleet)?;
+    let mut evidence = Vec::new();
+    for instance in 0..4 {
+        let lines = assert_engine_lines(fleet, instance, true, true)?;
+        let barrier =
+            scrape_metric_value(&fleet.metrics[instance], "tn_engine_close_barrier_holds_total")?;
+        evidence.push(format!(
+            "node {instance} close_barrier_holds_total={barrier} {}",
+            lines.summary()
+        ));
+    }
+    Ok(format!(
+        "epochs {start_epoch}->{next} (boundary crossed under load at {closed}->{next}), {sent} \
+         transfers, {head} blocks identical; records equal: {}; {}",
+        records.join(", "),
         evidence.join("; ")
     ))
 }
