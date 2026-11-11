@@ -50,7 +50,7 @@ pub mod state;
 pub mod workload;
 
 pub use base::{build_base, slim_chain, BaseMeta};
-pub use db_counters::{db_counters, db_page_size, DbCounters};
+pub use db_counters::{db_counters, db_page_size, DbCounters, NOT_DIFFERENCES};
 pub use env::{
     announce_temp_dir, clone_datadir, db_file_bytes, dir_bytes, open_production_env,
     open_production_env_with_db, open_production_env_with_layout, static_file_sizes, SegmentFiles,

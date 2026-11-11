@@ -217,7 +217,13 @@ fn every_crash_point_recovers_a_workload_of_overflow_runs() {
 /// the crash commit's runs and pages, rewritten before the data sync, recover as without it.
 #[test]
 fn every_crash_point_recovers_a_workload_of_overflow_runs_with_gap_fill() {
-    with_gap_fill(MAX_GAP_FILL, || matrix(&runs_base(4096), 2));
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix(&runs_base(4096), 2));
+}
+
+/// The run workload's matrix with `GapFill::Auto`.
+#[test]
+fn every_crash_point_recovers_a_workload_of_overflow_runs_with_auto_gap_fill() {
+    with_gap_fill(GapFill::Auto, || matrix(&runs_base(4096), 2));
 }
 
 /// The run workload's matrix at two page sizes, with many random power losses.

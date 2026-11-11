@@ -85,6 +85,7 @@ use std::{
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
+use self::gap_auto::{AutoGap, Choice, Gaps, Outcome};
 use crate::{
     alloc::{Allocator, PrivatePages, RUN_LOAD_RECORDS},
     check::{self, CheckReport},
@@ -128,6 +129,99 @@ const _: () = assert!(MAX_GAP_FILL <= MERGE_GAP, "a filled gap must stay inside 
 /// stops trying ([`Writer::fill_gaps`]): on Linux a miss starts a read of the gap's pages, so the
 /// reads a commit's fill starts exceed the writes it saved by at most this many.
 const GAP_MISS_SLACK: u64 = 16;
+
+mod gap_auto;
+
+/// [`EnvOptions::gap_fill`]: how wide a gap of clean pages step 4 may rewrite before its data
+/// sync (README, "Gap fill"). Parsed from `auto`, `off` or a page count ([`std::str::FromStr`]),
+/// and shown the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GapFill {
+    /// Every gap of at most this many pages; 0 (the default) is off. At most [`MAX_GAP_FILL`],
+    /// else [`Env::open`] refuses it ([`Error::InvalidGapFill`]).
+    Pages(u32),
+    /// A width per scattered durable step, from the disk's measured costs: the width that
+    /// predicts the least time for step 4, from a cost per write and a cost per page fitted to
+    /// the recent steps' syncs, and the fill's own timed cost (README, "Automatic width"). It
+    /// settles at 0 on a drive whose writes are cheap beside its bytes (local NVMe), and fills
+    /// on one that caps its writes per second (cloud block storage). [`IoStats`]'s `gap_auto_*`
+    /// fields report its choice and its fit.
+    Auto,
+}
+
+impl GapFill {
+    /// Off: no gap filled.
+    pub const OFF: GapFill = GapFill::Pages(0);
+
+    /// Whether any gap may be filled: a width of at least 1 page, or [`GapFill::Auto`].
+    pub const fn is_on(self) -> bool {
+        !matches!(self, GapFill::Pages(0))
+    }
+}
+
+impl Default for GapFill {
+    fn default() -> Self {
+        GapFill::OFF
+    }
+}
+
+impl std::fmt::Display for GapFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GapFill::Pages(pages) => write!(f, "{pages}"),
+            GapFill::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+impl std::str::FromStr for GapFill {
+    type Err = ParseGapFillError;
+
+    /// `auto`, `off` (0) or a page count of at most [`MAX_GAP_FILL`] (0 is off).
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(GapFill::Auto),
+            "off" => Ok(GapFill::OFF),
+            _ => match s.parse::<u32>() {
+                Ok(pages) if pages <= MAX_GAP_FILL => Ok(GapFill::Pages(pages)),
+                _ => Err(ParseGapFillError(s.to_owned())),
+            },
+        }
+    }
+}
+
+/// A gap fill that is not `auto`, `off` or a page count of at most [`MAX_GAP_FILL`]
+/// ([`GapFill`]'s `FromStr`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid gap fill {0:?}: expected auto, off, or a page count of at most {MAX_GAP_FILL}")]
+pub struct ParseGapFillError(String);
+
+/// The writer's gap fill ([`EnvOptions::gap_fill`]) as it runs.
+#[derive(Debug)]
+enum GapWidth {
+    /// Every gap of at most this many pages; 0: off.
+    Fixed(u32),
+    /// Chosen per scattered step ([`GapFill::Auto`]).
+    Auto(Box<AutoGap>),
+}
+
+impl GapWidth {
+    /// Whether any gap may be filled.
+    fn is_on(&self) -> bool {
+        !matches!(self, GapWidth::Fixed(0))
+    }
+}
+
+/// What one gap fill did ([`Writer::fill_gaps`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fill {
+    /// Gaps rewritten.
+    pub(crate) filled: u64,
+    /// Gaps skipped as not in memory.
+    pub(crate) missed: u64,
+    /// The pages of the gaps rewritten.
+    pub(crate) pages: u64,
+}
 
 /// How step 4 makes a commit's dirty pages durable ([`data_sync`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -254,7 +348,7 @@ pub struct EnvOptions {
     /// boot can open at them again, once they pass its check (README, Open and recovery).
     /// Applies to [`Env::open_read_only`] too, which never writes that slot.
     pub trust_unsynced: bool,
-    /// Gap fill, in pages (default 0: off): the most clean pages between two runs of a durable
+    /// Gap fill (default [`GapFill::OFF`]): the most clean pages between two runs of a durable
     /// step's dirty pages that step 4 rewrites, with the bytes they already hold, before its data
     /// sync, so that writeback finds one run where it found two and the disk takes one write
     /// for both (README, "Gap fill"). A commit's pages are scattered (nearly all are reused from
@@ -262,24 +356,26 @@ pub struct EnvOptions {
     /// a durable commit costs about one write per run: fewer, larger writes for more bytes. It
     /// adds no file space and changes no byte.
     ///
-    /// Use it where the disk's I/Os per second, not its bytes per second, bound a durable commit:
-    /// network block storage with an IOPS cap (cloud disks). Leave it at 0 on a local NVMe
-    /// drive, whose IOPS are plentiful: there the extra bytes and the copies (two system calls
-    /// per gap filled) only cost. At most [`MAX_GAP_FILL`], else [`Env::open`] refuses it
-    /// ([`Error::InvalidGapFill`]).
+    /// A fixed width ([`GapFill::Pages`]) suits a disk whose I/Os per second, not its bytes per
+    /// second, bound a durable commit: network block storage with an IOPS cap (cloud disks). On a
+    /// local NVMe drive, whose IOPS are plentiful, the extra bytes and the copies (two system
+    /// calls per gap filled) only cost. [`GapFill::Auto`] chooses the width per scattered step
+    /// from the syncs' measured costs, so one setting serves both (README, "Automatic width").
+    /// A width past [`MAX_GAP_FILL`] is refused by [`Env::open`] ([`Error::InvalidGapFill`]).
     ///
     /// Linux reads a gap with `RWF_NOWAIT` and fills it only when the page cache holds it whole:
     /// a gap not in memory is skipped (its read, which the kernel starts, is not waited for), and
     /// a commit stops trying once its gaps not in memory outnumber those it filled by 16. A
     /// kernel or file system that refuses `RWF_NOWAIT` (tmpfs is one) turns it off for the
-    /// environment at the first gap it reads, with one warning ([`IoStats::gap_fill_refusals`]).
-    /// macOS reads a gap with a plain `pread`, so a gap page not in memory costs a
-    /// synchronous read there: it serves tests and measurement, not production. A fill rewrites
+    /// environment, a fixed width and auto alike, at the first gap it reads, with one warning
+    /// ([`IoStats::gap_fill_refusals`]). macOS reads a gap with a plain `pread`, so a gap page not
+    /// in memory costs a synchronous read there: it serves tests and measurement, not production,
+    /// at a fixed width and at auto alike. A fill rewrites
     /// pages of the last durable state too, which no commit otherwise writes: it relies on the
     /// drive writing each logical block atomically (README, "Gap fill"). Applies to every run of
     /// the durable steps ([`SyncMode::Durable`] commits, [`SyncMode::NoSync`]'s syncs); ignored
     /// by [`Env::open_read_only`].
-    pub gap_fill: u32,
+    pub gap_fill: GapFill,
 }
 
 impl Default for EnvOptions {
@@ -293,7 +389,7 @@ impl Default for EnvOptions {
             sync_period: None,
             sync_bytes: None,
             trust_unsynced: true,
-            gap_fill: 0,
+            gap_fill: GapFill::OFF,
         }
     }
 }
@@ -642,9 +738,9 @@ pub(crate) struct Writer {
     /// The tree writes' reused buffers ([`PageWrite::take_scratch`]), boxed at the first write
     /// that takes them.
     scratch: Option<Box<Scratch>>,
-    /// [`EnvOptions::gap_fill`]: 0 when off, and from a commit on whose gap fill met a kernel or
-    /// file system that refuses `RWF_NOWAIT` ([`Self::fill_gaps`]).
-    pub(crate) gap_fill: u32,
+    /// [`EnvOptions::gap_fill`]: `Fixed(0)` when off, and from a commit on whose gap fill met a
+    /// kernel or file system that refuses `RWF_NOWAIT` ([`Self::fill_gaps`]).
+    gap_fill: GapWidth,
     /// [`Self::fill_gaps`]' bounce buffer: a gap's bytes, read from the file and written back to
     /// it, never through the mapping. Grown to the largest gap filled, empty while off.
     gap_buf: Vec<u8>,
@@ -912,6 +1008,10 @@ impl Writer {
     pub(crate) fn make_durable(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         let size = self.geometry.page_size();
         let (plan, runs) = data_sync_runs(pages, size as u64);
+        // Auto chooses for a scattered step only, one whose pages `data_sync` syncs by the
+        // `fdatasync` (on macOS the `msync`s of `DataSync::Ranges`), and learns from those
+        // alone: one range of a few runs has a few writes to save. The plan's, not the tests'.
+        let scattered = !matches!(plan, DataSync::Nothing | DataSync::Range(_));
         #[cfg(test)]
         let plan = match (pages.first(), pages.last()) {
             _ if self.data_by_fdatasync => DataSync::File,
@@ -931,10 +1031,22 @@ impl Writer {
         let grown = self.file.size_unsynced();
         let mut clock = Instant::now();
         self.stats.sync_runs += runs as u64;
-        if self.gap_fill > 0 && plan != DataSync::Nothing {
-            self.fill_gaps(pages)?;
-            self.stats.gap_fill_ns += lap(&mut clock);
-        }
+        let choice = match &mut self.gap_fill {
+            GapWidth::Auto(auto) if scattered => Some(auto.choose(&Gaps::of(pages))),
+            _ => None,
+        };
+        let choose_ns = if choice.is_some() { lap(&mut clock) } else { 0 };
+        let width = match (&self.gap_fill, choice) {
+            (GapWidth::Fixed(width), _) => *width,
+            (GapWidth::Auto(_), choice) => choice.map_or(0, |c| c.width),
+        };
+        let fill = if width > 0 && plan != DataSync::Nothing {
+            Some(self.fill_gaps(pages, width)?)
+        } else {
+            None
+        };
+        let fill_ns = if fill.is_some() { lap(&mut clock) } else { 0 };
+        self.stats.gap_fill_ns += choose_ns + fill_ns;
         match plan {
             DataSync::Nothing => {}
             DataSync::Range(range) => {
@@ -954,7 +1066,8 @@ impl Writer {
             }
         }
         self.stats.pages_synced += pages.len() as u64;
-        self.stats.data_sync_ns += lap(&mut clock);
+        let sync_ns = lap(&mut clock);
+        self.stats.data_sync_ns += sync_ns;
         #[cfg(test)]
         self.crash_point(CrashAt::AfterDataSync)?;
         self.file.sync_size_if_grown()?;
@@ -976,15 +1089,28 @@ impl Writer {
         self.durable_at = clock;
         self.stats.commits += 1;
         self.stats.grown_commits += u64::from(grown);
+        if let Some(choice) = choice {
+            // After the meta's sync, so the fit's time never delays the state's durability.
+            let fill = fill.unwrap_or_default();
+            let outcome = Outcome {
+                runs: runs as u64 - fill.filled,
+                pages: pages.len() as u64 + fill.pages,
+                sync_ns,
+                fill_ns,
+                tried: fill.filled + fill.missed,
+                filled: fill.filled,
+            };
+            self.observe_auto(choice, outcome);
+        }
         #[cfg(test)]
         self.crash_point(CrashAt::AfterMetaMsync)?;
         Ok(())
     }
 
     /// Step 4's gap fill ([`EnvOptions::gap_fill`]), before the data sync: rewrite each gap of
-    /// at most [`Self::gap_fill`] clean pages between two of `pages` (ascending: the pages the
-    /// sync makes durable) with the bytes it holds, so the sync writes the runs on either side
-    /// and the gap as one run (README, "Gap fill").
+    /// at most `width` clean pages between two of `pages` (ascending: the pages the sync makes
+    /// durable) with the bytes it holds, so the sync writes the runs on either side and the gap
+    /// as one run (README, "Gap fill"). Returns what it did, which [`IoStats`] counts too.
     ///
     /// Each gap is read into [`Self::gap_buf`] through the file, not the mapping
     /// (`PageFile::read_resident`: on Linux only a gap the page cache holds whole), then written
@@ -1016,12 +1142,12 @@ impl Writer {
     /// [`IoStats::gap_fill_refusals`], once: no later commit calls this. The gaps filled so far
     /// keep their bytes. An I/O error reading or writing a gap fails the
     /// commit and poisons the file (a failed write leaves each byte as it was or rewritten).
-    fn fill_gaps(&mut self, pages: &[u32]) -> Result<()> {
+    fn fill_gaps(&mut self, pages: &[u32], width: u32) -> Result<Fill> {
         let size = self.geometry.page_size();
         let (mut filled, mut missed, mut filled_pages) = (0u64, 0u64, 0u64);
         for w in pages.windows(2) {
             let clean = w[1] - w[0] - 1;
-            if clean == 0 || clean > self.gap_fill {
+            if clean == 0 || clean > width {
                 continue;
             }
             if missed > filled + GAP_MISS_SLACK {
@@ -1045,7 +1171,7 @@ impl Writer {
                         "tn-lmdb: gap fill turned off: the file refuses reads with RWF_NOWAIT \
                          ({err})"
                     );
-                    self.gap_fill = 0;
+                    self.gap_fill = GapWidth::Fixed(0);
                     self.gap_buf = Vec::new();
                     self.stats.gap_fill_refusals += 1;
                     break;
@@ -1055,7 +1181,26 @@ impl Writer {
         self.stats.gaps_filled += filled;
         self.stats.gap_pages += filled_pages;
         self.stats.gap_misses += missed;
-        Ok(())
+        Ok(Fill { filled, missed, pages: filled_pages })
+    }
+
+    /// File a scattered step's `outcome` with the automatic width ([`GapFill::Auto`]) that chose
+    /// `choice` for it, and publish its choice and fit in [`IoStats`]'s `gap_auto_*` fields. Does
+    /// nothing once gap fill turned itself off ([`Self::fill_gaps`]).
+    fn observe_auto(&mut self, choice: Choice, outcome: Outcome) {
+        let GapWidth::Auto(auto) = &mut self.gap_fill else { return };
+        let readapted = auto.observe(outcome);
+        let model = auto.model();
+        let s = &mut self.stats;
+        s.gap_auto_steps += 1;
+        s.gap_auto_probes += u64::from(choice.probe);
+        s.gap_auto_readapts += u64::from(readapted);
+        s.gap_auto_width_sum += u64::from(choice.width);
+        s.gap_auto_width = u64::from(choice.width);
+        s.gap_auto_run_ns = model.per_run.round() as u64;
+        s.gap_auto_page_ns = model.per_page.round() as u64;
+        s.gap_auto_gap_ns = auto.fill_cost_ns().round() as u64;
+        s.gap_auto_capped = u64::from(model.capped);
     }
 
     /// The I/O and allocation counters' totals so far ([`Env::io_stats`]).
@@ -1604,8 +1749,10 @@ impl Env {
         if options.map_reserve > isize::MAX as u64 {
             return Err(Error::InvalidMapReserve(options.map_reserve));
         }
-        if options.gap_fill > MAX_GAP_FILL {
-            return Err(Error::InvalidGapFill(options.gap_fill));
+        if let GapFill::Pages(pages) = options.gap_fill {
+            if pages > MAX_GAP_FILL {
+                return Err(Error::InvalidGapFill(pages));
+            }
         }
         let file = open_locked(path, options.page_size)?;
         let boot_id = sys::boot_id();
@@ -1647,7 +1794,10 @@ impl Env {
             readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
             scratch: None,
-            gap_fill: options.gap_fill,
+            gap_fill: match options.gap_fill {
+                GapFill::Pages(pages) => GapWidth::Fixed(pages),
+                GapFill::Auto => GapWidth::Auto(Box::default()),
+            },
             gap_buf: Vec::new(),
             stats: IoStats::default(),
             verifies: AtomicU64::new(0),
@@ -1685,7 +1835,7 @@ impl Env {
         // past those pages cuts it and grows again, preallocated. Nothing is written here.
         let used = writer.used_len()?;
         writer.file.distrust_tail(used);
-        if writer.gap_fill > 0 {
+        if writer.gap_fill.is_on() {
             // A gap fill's read that misses the page cache starts a read of the gap: with this
             // advice, of the gap's pages only. The engine reads the file only through the
             // mapping otherwise, which the advice does not touch.

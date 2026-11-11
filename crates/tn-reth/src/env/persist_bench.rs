@@ -68,12 +68,15 @@
 //!   build instead opens its database with the engine's `SyncMode::NoSync` and no automatic syncs
 //!   through the test-only `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings, so its
 //!   no-sync rows time no sync at all.
-//! - `TN_PERSIST_BENCH_GAP_FILL` (0): tn-lmdb's gap fill in pages (`--db.gap-fill`; 0 off, at most
-//!   64). The tn-lmdb rows add the engine's counters per durable commit over the timed loop
-//!   (`IoStats`): `pages_per_commit`, `runs_per_commit` (runs of adjacent dirty pages, before the
-//!   fill), `gaps_filled_per_commit`, `gap_pages_per_commit`, `gap_misses`, `writes_per_commit`
-//!   (`runs - gaps filled + 1` for the meta: the writes Linux sends the disk, a run longer than its
-//!   largest write aside) and `gap_fill_us_per_commit`.
+//! - `TN_PERSIST_BENCH_GAP_FILL` (0): tn-lmdb's gap fill (`--db.gap-fill`): a width in pages (0
+//!   off, at most 64) or `auto`. The tn-lmdb rows add the engine's counters per durable commit over
+//!   the timed loop (`IoStats`): `pages_per_commit`, `runs_per_commit` (runs of adjacent dirty
+//!   pages, before the fill), `gaps_filled_per_commit`, `gap_pages_per_commit`, `gap_misses`,
+//!   `writes_per_commit` (`runs - gaps filled + 1` for the meta: the writes Linux sends the disk, a
+//!   run longer than its largest write aside) and `gap_fill_us_per_commit`; under `auto` also the
+//!   mean width chosen (`auto_mean_width`), the last width and the fit at the run's end
+//!   (`auto_width`, `auto_run_ns`, `auto_page_ns`, `auto_gap_ns`, `auto_capped`), and its probes
+//!   and re-adaptations over the loop.
 //!
 //! **Caveats.**
 //!
@@ -99,8 +102,8 @@ use crate::{
         load::{announce_temp_dir, base::BACKEND, db_file_bytes},
         TransactionFactory,
     },
-    ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethCommand, RethConfig,
-    StorageLayout,
+    ExecutedBlock, GapFill, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethCommand,
+    RethConfig, StorageLayout,
 };
 use alloy::primitives::keccak256;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -155,7 +158,7 @@ struct Knobs {
     accounts: usize,
     durable: bool,
     layout: StorageLayout,
-    gap_fill: u32,
+    gap_fill: GapFill,
 }
 
 impl Knobs {
@@ -178,8 +181,8 @@ impl Knobs {
             txs,
             per_commit: knob("TN_PERSIST_BENCH_PER_COMMIT", 4),
             accounts: knob("TN_PERSIST_BENCH_ACCOUNTS", 10_000),
-            gap_fill: std::env::var("TN_PERSIST_BENCH_GAP_FILL").map_or(0, |v| {
-                v.parse().unwrap_or_else(|_| panic!("TN_PERSIST_BENCH_GAP_FILL: a number, got {v}"))
+            gap_fill: std::env::var("TN_PERSIST_BENCH_GAP_FILL").map_or(GapFill::OFF, |v| {
+                v.parse().unwrap_or_else(|e| panic!("TN_PERSIST_BENCH_GAP_FILL: {e}"))
             }),
             durable,
             layout,
@@ -459,7 +462,7 @@ fn run_mode(
         rpc: RpcServerArgs { ipcdisable: true, ..Default::default() },
         txpool: TxPoolArgs::default(),
         db: DatabaseArgs { sync_mode, ..Default::default() },
-        db_gap_fill: (knobs.gap_fill > 0).then_some(knobs.gap_fill),
+        db_gap_fill: knobs.gap_fill.is_on().then_some(knobs.gap_fill),
     };
     let reth_config = RethConfig::new(command, None, datadir, false, chain.clone())
         .with_new_datadir_layout(knobs.layout);
@@ -637,7 +640,9 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
              engine_commits={} pages_per_commit={:.1} runs_per_commit={:.1} \
              gaps_filled_per_commit={:.1} gap_pages_per_commit={:.1} gap_misses={} \
              writes_per_commit={:.1} write_pages_x={:.3} gap_fill_us_per_commit={:.0} \
-             data_sync_us_per_commit={:.0}",
+             data_sync_us_per_commit={:.0} auto_steps={} auto_mean_width={:.2} auto_width={} \
+             auto_probes={} auto_readapts={} auto_run_ns={} auto_page_ns={} auto_gap_ns={} \
+             auto_capped={}",
             knobs.sync_name(),
             knobs.gap_fill,
             io.commits,
@@ -650,6 +655,15 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
             (io.pages_synced + io.gap_pages) as f64 / io.pages_synced.max(1) as f64,
             per(io.gap_fill_ns) / 1e3,
             per(io.data_sync_ns) / 1e3,
+            io.gap_auto_steps,
+            io.gap_auto_width_sum as f64 / io.gap_auto_steps.max(1) as f64,
+            io.gap_auto_width,
+            io.gap_auto_probes,
+            io.gap_auto_readapts,
+            io.gap_auto_run_ns,
+            io.gap_auto_page_ns,
+            io.gap_auto_gap_ns,
+            io.gap_auto_capped,
         );
     }
 }

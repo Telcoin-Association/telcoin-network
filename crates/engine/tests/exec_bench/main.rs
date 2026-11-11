@@ -116,11 +116,12 @@
 //!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tn-lmdb 4096): the database page size in
 //!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
 //!   every open. Each page size has its own base and aged base.
-//! - `TN_EXEC_BENCH_GAP_FILL` (0): tn-lmdb's gap fill in pages, passed as `--db.gap-fill` to the
-//!   run's open (not the bases'): 0 is off, at most 64; refused on MDBX. Its counters
-//!   (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`, `tn_lmdb_gap_misses`,
-//!   `tn_lmdb_gap_fill_refusals`, `tn_lmdb_gap_fill_ns`) are among the per-output database
-//!   counters.
+//! - `TN_EXEC_BENCH_GAP_FILL` (0): tn-lmdb's gap fill, a width in pages or `auto`, passed as
+//!   `--db.gap-fill` to the run's open (not the bases'): 0 (or `off`) is off, at most 64; refused
+//!   on MDBX. Its counters (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`,
+//!   `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_refusals`, `tn_lmdb_gap_fill_ns`, and under `auto` the
+//!   `tn_lmdb_gap_auto_*` counters and gauges: the width chosen and the fit) are among the
+//!   per-output database counters.
 //! - `TN_EXEC_BENCH_READERS` (0): reader threads, plus the balance poller when above 0; 0 runs no
 //!   side load.
 //! - `TN_EXEC_BENCH_SUBMIT_FRACTION` (0.25): the fraction, from 0 to 1, of each on-window output's
@@ -333,7 +334,7 @@ use tn_reth::{
         SubmitSamples, Submitter,
     },
     worker::WorkerNetwork,
-    DbTableStat, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
+    DbTableStat, GapFill, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
 };
 use tn_storage::{
     disk::{fsync_directory, fsync_file},
@@ -768,8 +769,8 @@ struct Knobs {
     sync: SyncMode,
     /// The requested page size in bytes; `None` for the backend's default ([`Knobs::page_size`]).
     page_size: Option<u32>,
-    /// tn-lmdb's gap fill in pages for the run's open (`--db.gap-fill`; 0: off).
-    gap_fill: u32,
+    /// tn-lmdb's gap fill for the run's open (`--db.gap-fill`; off by default).
+    gap_fill: GapFill,
     readers: usize,
     submit_fraction: f64,
     window: usize,
@@ -951,8 +952,12 @@ impl Knobs {
             metrics,
             sync,
             page_size,
-            gap_fill: u32::try_from(number("GAP_FILL", 0, 0)?)
-                .map_err(|_| eyre::eyre!("{KNOB_PREFIX}GAP_FILL does not fit in 32 bits"))?,
+            gap_fill: match get("GAP_FILL") {
+                None => GapFill::OFF,
+                Some(value) => {
+                    value.parse().map_err(|e| eyre::eyre!("{KNOB_PREFIX}GAP_FILL: {e}"))?
+                }
+            },
             readers: count("READERS", 0, 0)?,
             submit_fraction,
             window: count("WINDOW", 20, 1)?,
@@ -3512,7 +3517,7 @@ fn json_report(
         "diff": knobs.diff.as_ref().map(|path| path.display().to_string()),
         "diff_against": knobs.diff_against.as_ref().map(|path| path.display().to_string()),
         "diff_queries": knobs.diff_queries,
-        "gap_fill": knobs.gap_fill,
+        "gap_fill": knobs.gap_fill.to_string(),
     });
     json!({
         "report_version": JSON_REPORT_VERSION,
@@ -3998,7 +4003,7 @@ async fn exec_bench() -> eyre::Result<()> {
     let page_text = page_size.to_string();
     let gap_text = knobs.gap_fill.to_string();
     let mut flags = db_flags(knobs.sync, &page_text).to_vec();
-    if knobs.gap_fill > 0 {
+    if knobs.gap_fill.is_on() {
         flags.extend(["--db.gap-fill", gap_text.as_str()]);
     }
     let node = BenchNode::open_at(&datadir, slim_chain(&base), &flags, layout, None)?;
@@ -4196,7 +4201,7 @@ mod tests {
             metrics: MetricsMode::Off,
             sync: SyncMode::Durable,
             page_size: None,
-            gap_fill: 0,
+            gap_fill: GapFill::OFF,
             readers: 0,
             submit_fraction: 0.25,
             window: 20,

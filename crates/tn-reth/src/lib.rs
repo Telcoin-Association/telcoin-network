@@ -115,6 +115,9 @@ pub use reth_transaction_pool::{
     identifier::{SenderId, SenderIdentifiers},
     BestTransactions, EthPooledTransaction,
 };
+/// tn-lmdb's gap fill setting (`--db.gap-fill`, [`RethConfig::db_gap_fill`]): off, a width in
+/// pages, or `auto`.
+pub use tn_lmdb_reth::GapFill;
 
 mod cli;
 pub mod dirs;

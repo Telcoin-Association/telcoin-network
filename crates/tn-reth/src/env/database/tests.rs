@@ -421,49 +421,77 @@ mod tn_lmdb {
         );
     }
 
-    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: 0, off) and reaches the
-    /// engine: more than its `MAX_GAP_FILL` is refused at the open, naming the flag, before the
-    /// database is created; at most it opens, and its durable commits fill gaps
-    /// (`IoStats::gaps_filled` is the engine's own count). On a file system that refuses reads
-    /// that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first commit with a gap to
-    /// fill turns gap fill off instead (`IoStats::gap_fill_refusals`, the engine's documented
-    /// fallback), filling none: the option reached the engine either way.
+    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: off; a width in pages, `off`
+    /// or `auto`; past `MAX_GAP_FILL` or anything else refused at the parse, naming the flag) and
+    /// reaches the engine: a width past its `MAX_GAP_FILL` given by `with_db_gap_fill` is refused
+    /// at the open, naming the flag, before the database is created; a width or `auto` opens, and
+    /// its durable commits fill gaps (`IoStats::gaps_filled` is the engine's own count; `auto`'s
+    /// warm-up fills from its first scattered commit, `IoStats::gap_auto_steps`). On a file system
+    /// that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first
+    /// commit with a gap to fill turns gap fill off instead, a width and `auto` alike
+    /// (`IoStats::gap_fill_refusals`, the engine's documented fallback), filling none: the option
+    /// reached the engine either way.
     #[test]
     fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
         use clap::Parser as _;
-        let parse = |flags: &[&str]| {
-            let command = crate::RethCommand::try_parse_from(
+        use tn_lmdb_reth::GapFill;
+        let command = |flags: &[&str]| {
+            crate::RethCommand::try_parse_from(
                 std::iter::once("tn-reth").chain(flags.iter().copied()),
             )
-            .expect("parse");
+        };
+        let parse = |flags: &[&str]| {
             let chain = Arc::new(test_genesis().into());
+            let command = command(flags).expect("parse");
             RethConfig::new(command, None, TempDir::new().expect("tempdir").path(), true, chain)
         };
-        assert_eq!(parse(&[]).db_gap_fill(), 0, "off by default");
-        assert_eq!(parse(&["--db.gap-fill", "4"]).db_gap_fill(), 4);
+        assert_eq!(parse(&[]).db_gap_fill(), GapFill::OFF, "off by default");
+        assert_eq!(parse(&["--db.gap-fill", "4"]).db_gap_fill(), GapFill::Pages(4));
+        assert_eq!(parse(&["--db.gap-fill", "off"]).db_gap_fill(), GapFill::OFF);
+        assert_eq!(parse(&["--db.gap-fill", "auto"]).db_gap_fill(), GapFill::Auto);
+        for bad in ["65", "fast"] {
+            let err = command(&["--db.gap-fill", bad]).expect_err(bad).to_string();
+            assert!(err.contains("--db.gap-fill") && err.contains(bad), "{bad}: {err}");
+        }
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("db");
-        let wide = config(test_db_args()).with_db_gap_fill(tn_lmdb_reth::MAX_GAP_FILL + 1);
+        let wide =
+            config(test_db_args()).with_db_gap_fill(GapFill::Pages(tn_lmdb_reth::MAX_GAP_FILL + 1));
         let err = open_rw(&wide, &path).expect_err("past the maximum").to_string();
         assert!(err.contains("--db.gap-fill"), "{err}");
         assert!(!path.join(tn_lmdb_reth::DATA_FILE).exists(), "the refusal created the database");
-        let db = open_rw(&config(test_db_args()).with_db_gap_fill(4), &path).expect("opens");
-        for i in 0..64u64 {
-            db.update(|tx| {
-                for j in 0..64u64 {
-                    let k = (i * 64 + j).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
-                    tx.put::<tables::CanonicalHeaders>(k, B256::with_last_byte(i as u8))?;
+        for (gap_fill, dir) in [(GapFill::Pages(4), "fixed"), (GapFill::Auto, "auto")] {
+            let path = tmp.path().join(dir);
+            let db =
+                open_rw(&config(test_db_args()).with_db_gap_fill(gap_fill), &path).expect("opens");
+            for i in 0..64u64 {
+                db.update(|tx| {
+                    for j in 0..64u64 {
+                        let k = (i * 64 + j).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+                        tx.put::<tables::CanonicalHeaders>(k, B256::with_last_byte(i as u8))?;
+                    }
+                    Ok::<_, reth_db::DatabaseError>(())
+                })
+                .expect("tx")
+                .expect("put");
+            }
+            let s = db.io_stats();
+            assert!(s.sync_runs > s.commits, "{gap_fill}: the commits formed runs: {s:?}");
+            let auto = gap_fill == GapFill::Auto;
+            assert!(auto || s.gap_auto_steps == 0, "{gap_fill}: only auto chooses: {s:?}");
+            match s.gap_fill_refusals {
+                0 => {
+                    assert!(
+                        s.gaps_filled > 0,
+                        "{gap_fill}: the durable commits filled gaps: {s:?}"
+                    );
+                    assert!(!auto || s.gap_auto_steps > 0, "{gap_fill}: auto chose: {s:?}");
                 }
-                Ok::<_, reth_db::DatabaseError>(())
-            })
-            .expect("tx")
-            .expect("put");
-        }
-        let s = db.io_stats();
-        assert!(s.sync_runs > s.commits, "the commits' pages formed runs: {s:?}");
-        match s.gap_fill_refusals {
-            0 => assert!(s.gaps_filled > 0, "the durable commits filled gaps: {s:?}"),
-            _ => assert_eq!((s.gap_fill_refusals, s.gaps_filled), (1, 0), "refused once: {s:?}"),
+                _ => {
+                    let counts = (s.gap_fill_refusals, s.gaps_filled);
+                    assert_eq!(counts, (1, 0), "{gap_fill}: refused once: {s:?}");
+                }
+            }
         }
     }
 

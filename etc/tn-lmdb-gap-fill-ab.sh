@@ -7,11 +7,15 @@
 # timed loop alone), plus `iostat -dxk 1` beside it when installed. The engine's counters per
 # durable commit are in the persist bench's `persist_bench_io` lines and the execution bench's
 # JSON report (`db_writes.counters_mean_per_output`: `tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`,
-# `tn_lmdb_gap_pages`, `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_ns`). Prints a summary and leaves
-# every log in the bench dir.
+# `tn_lmdb_gap_pages`, `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_ns`; under `auto` also the mean
+# width it chose and its fit, `tn_lmdb_gap_auto_*`). Prints a summary and leaves every log in the
+# bench dir.
 #
 # Usage: etc/tn-lmdb-gap-fill-ab.sh <dir on the disk under test>
-#   GAPS="0 4 8"   the gap fills to compare, in pages (0 is off)
+#   GAPS="0 4 8"   the gap fills to compare: widths in pages (0 is off) or `auto`, as in
+#                  GAPS="0 8 auto" (auto chooses each commit's width from the disk's measured
+#                  costs: its summary adds the mean width, the last fit's cost per write and per
+#                  page, and whether the fit is the capped form)
 #   ROUNDS=2       passes over GAPS; even passes run it reversed
 #   PERSIST=1      run the persist bench (TN_PERSIST_BENCH_*: 400 blocks, 200 txs; both modes,
 #                  1 and 4 blocks per commit)
@@ -104,7 +108,12 @@ run() {
         jq -c '.db_writes.counters_mean_per_output | {commits: .tn_lmdb_commits,
             pages: .tn_lmdb_pages_synced, runs: .tn_lmdb_sync_runs, gaps: .tn_lmdb_gaps_filled,
             gap_pages: .tn_lmdb_gap_pages, misses: .tn_lmdb_gap_misses,
-            gap_fill_ms: (.tn_lmdb_gap_fill_ns / 1e6), data_sync_ms: (.tn_lmdb_data_sync_ns / 1e6)}' \
+            gap_fill_ms: (.tn_lmdb_gap_fill_ns / 1e6), data_sync_ms: (.tn_lmdb_data_sync_ns / 1e6),
+            auto_mean_width: ((.tn_lmdb_gap_auto_width_sum // 0) / ([.tn_lmdb_gap_auto_steps // 0, 1e-9] | max)),
+            auto_probes: (.tn_lmdb_gap_auto_probes // 0), auto_readapts: (.tn_lmdb_gap_auto_readapts // 0),
+            auto_run_us: ((.tn_lmdb_gap_auto_run_ns // 0) / 1e3),
+            auto_page_us: ((.tn_lmdb_gap_auto_page_ns // 0) / 1e3),
+            auto_capped: (.tn_lmdb_gap_auto_capped // 0)}' \
             "$report" | sed 's/^/  per output: /' | tee -a "$out/summary.txt" || true
     fi
 }

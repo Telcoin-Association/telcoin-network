@@ -74,9 +74,38 @@ pub struct IoStats {
     pub gap_misses: u64,
     /// Commits whose gap fill met a kernel or file system that refuses reads that do not wait for
     /// the disk (Linux's `RWF_NOWAIT`; tmpfs is one) and so turned
-    /// [`crate::EnvOptions::gap_fill`] off for the environment, with a warning: 0 or 1 per open
-    /// (always 0 on macOS, and while gap fill is off).
+    /// [`crate::EnvOptions::gap_fill`] off for the environment, a fixed width and
+    /// [`crate::GapFill::Auto`] alike, with a warning: 0 or 1 per open (always 0 on macOS, and
+    /// while gap fill is off).
     pub gap_fill_refusals: u64,
+    /// Scattered durable steps (more than 16 runs) whose width [`crate::GapFill::Auto`] chose:
+    /// the steps it learns from. A step of fewer runs fills nothing under auto.
+    pub gap_auto_steps: u64,
+    /// Of [`Self::gap_auto_steps`], those at another width than the model's choice: the warm-up's
+    /// and the probes' (README, "Automatic width").
+    pub gap_auto_probes: u64,
+    /// Times the automatic width found the disk's costs changed (steps in a row off its
+    /// prediction the same way) and started its warm-up again.
+    pub gap_auto_readapts: u64,
+    /// The widths of [`Self::gap_auto_steps`], summed: over an interval ([`IoStats::since`]),
+    /// `gap_auto_width_sum / gap_auto_steps` is the mean width.
+    pub gap_auto_width_sum: u64,
+    /// A gauge, not a counter ([`IoStats::since`] keeps the later value): the width the last of
+    /// [`Self::gap_auto_steps`] used, in pages (0: no fill).
+    pub gap_auto_width: u64,
+    /// A gauge: the automatic width's fitted cost per run written (per write the disk takes), in
+    /// nanoseconds, at the last of [`Self::gap_auto_steps`] (0 before a fit).
+    pub gap_auto_run_ns: u64,
+    /// A gauge: its fitted cost per page written, in nanoseconds.
+    pub gap_auto_page_ns: u64,
+    /// A gauge: its running cost of the fill per gap tried (the fill's timed reads and writes),
+    /// in nanoseconds.
+    pub gap_auto_gap_ns: u64,
+    /// A gauge: 1 when the fit combines the run and page costs by their maximum (a disk capped
+    /// on writes and on bytes per second, whichever binds: [`Self::gap_auto_run_ns`] is then the
+    /// time per write at the write cap, [`Self::gap_auto_page_ns`] per page at the byte cap), 0
+    /// when by their sum (README, "Automatic width").
+    pub gap_auto_capped: u64,
     /// Bytes the file grew by: its physical length, which grows geometrically, with real blocks,
     /// ahead of the pages in use ([`Self::pages_from_end`] counts those). A growth that first cut
     /// a tail the file had at open counts from the cut length.
@@ -93,7 +122,8 @@ pub struct IoStats {
     /// `msync`s that take the `fdatasync`'s place).
     pub data_sync_ns: u64,
     /// Time in step 4's gap fill ([`crate::EnvOptions::gap_fill`]), before its sync: the gaps'
-    /// reads and writes.
+    /// reads and writes, and under [`crate::GapFill::Auto`] the choice of a scattered step's
+    /// width.
     pub gap_fill_ns: u64,
     /// Time in step 5: the file's size sync (`fdatasync`) when it grew and step 4 did not already
     /// sync it; a check of a flag otherwise.
@@ -143,8 +173,10 @@ pub struct IoStats {
 impl IoStats {
     /// What happened between `earlier` and `self`, two reads of one environment's counters
     /// (`earlier` first): each counter's difference (saturating, so a pair from different
-    /// environments gives no wrap), except [`Self::max_gate_lag`], a maximum since the open, which
-    /// is `self`'s.
+    /// environments gives no wrap), except [`Self::max_gate_lag`], a maximum since the open, and
+    /// the gauges ([`Self::gap_auto_width`], [`Self::gap_auto_run_ns`],
+    /// [`Self::gap_auto_page_ns`], [`Self::gap_auto_gap_ns`], [`Self::gap_auto_capped`]), which are
+    /// `self`'s.
     pub fn since(&self, earlier: &IoStats) -> IoStats {
         let d = |now: u64, then: u64| now.saturating_sub(then);
         let IoStats {
@@ -161,6 +193,15 @@ impl IoStats {
             gap_pages,
             gap_misses,
             gap_fill_refusals,
+            gap_auto_steps,
+            gap_auto_probes,
+            gap_auto_readapts,
+            gap_auto_width_sum,
+            gap_auto_width,
+            gap_auto_run_ns,
+            gap_auto_page_ns,
+            gap_auto_gap_ns,
+            gap_auto_capped,
             bytes_grown,
             free_list_save_rounds,
             save_ns,
@@ -195,6 +236,15 @@ impl IoStats {
             gap_pages: d(gap_pages, earlier.gap_pages),
             gap_misses: d(gap_misses, earlier.gap_misses),
             gap_fill_refusals: d(gap_fill_refusals, earlier.gap_fill_refusals),
+            gap_auto_steps: d(gap_auto_steps, earlier.gap_auto_steps),
+            gap_auto_probes: d(gap_auto_probes, earlier.gap_auto_probes),
+            gap_auto_readapts: d(gap_auto_readapts, earlier.gap_auto_readapts),
+            gap_auto_width_sum: d(gap_auto_width_sum, earlier.gap_auto_width_sum),
+            gap_auto_width,
+            gap_auto_run_ns,
+            gap_auto_page_ns,
+            gap_auto_gap_ns,
+            gap_auto_capped,
             bytes_grown: d(bytes_grown, earlier.bytes_grown),
             free_list_save_rounds: d(free_list_save_rounds, earlier.free_list_save_rounds),
             save_ns: d(save_ns, earlier.save_ns),
@@ -238,7 +288,7 @@ pub(crate) fn lap(since: &mut Instant) -> u64 {
 mod tests {
     use super::*;
 
-    /// `since` subtracts every counter but keeps the later maximum.
+    /// `since` subtracts every counter but keeps the later maximum and the later gauges.
     #[test]
     fn since_subtracts_every_counter_but_the_maximum() {
         let earlier = IoStats {
@@ -247,6 +297,10 @@ mod tests {
             pages_synced: 10,
             runs_by_step: [1, 2, 3, 4],
             max_gate_lag: 7,
+            gap_auto_steps: 2,
+            gap_auto_width_sum: 8,
+            gap_auto_width: 4,
+            gap_auto_run_ns: 50,
             ..IoStats::default()
         };
         let later = IoStats {
@@ -256,6 +310,13 @@ mod tests {
             runs_by_step: [2, 2, 5, 9],
             max_gate_lag: 9,
             verify_ns: 4,
+            gap_auto_steps: 5,
+            gap_auto_width_sum: 20,
+            gap_auto_width: 2,
+            gap_auto_run_ns: 40,
+            gap_auto_page_ns: 3,
+            gap_auto_gap_ns: 9,
+            gap_auto_capped: 1,
             ..IoStats::default()
         };
         let d = later.since(&earlier);
@@ -268,6 +329,13 @@ mod tests {
                 runs_by_step: [1, 0, 2, 5],
                 max_gate_lag: 9,
                 verify_ns: 4,
+                gap_auto_steps: 3,
+                gap_auto_width_sum: 12,
+                gap_auto_width: 2,
+                gap_auto_run_ns: 40,
+                gap_auto_page_ns: 3,
+                gap_auto_gap_ns: 9,
+                gap_auto_capped: 1,
                 ..IoStats::default()
             }
         );

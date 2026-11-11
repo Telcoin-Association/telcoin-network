@@ -522,7 +522,7 @@ committed tree, only one this transaction freed, and only damage names it: the c
 | 1 | Flush each dup table's working map into its outer tree (`Work::flush_nested`: each changed nested root into its outer cell, which can allocate, copy and free pages), write each changed table's root into the catalog (in name order), then save the free list (see below). |
 | 2 | Build meta M in memory: txn L+1 (the first after an open, `meta::MAX_WEAK_RUN` + 1 past the newest steady slot's and past every slot's: [Open and recovery](#open-and-recovery), step 5), both roots, the page count. |
 | 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
-| 4 | With `EnvOptions::gap_fill` set, first rewrite the short gaps between the dirty runs with their own bytes ([Gap fill](#gap-fill)). Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
+| 4 | With `EnvOptions::gap_fill` set, first rewrite the short gaps between the dirty runs with their own bytes ([Gap fill](#gap-fill); under `GapFill::Auto` at a width chosen per scattered step from the measured sync costs, [Automatic width](#automatic-width)). Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
 | 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too (on macOS, step 4's msyncs of a scattered commit leave the size to this step). |
 | 6 | Copy meta M, steady, into the slot that does not hold the newest steady meta (`meta::slot_to_write`: with both slots steady, the lower txn, an invalid slot first, on a tie slot 1; beside a weak slot, the weak one), msync that one page, then record M's txn as the slot's. |
 | 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
@@ -608,8 +608,9 @@ changes, and do not latch.
 
 ### Gap fill
 
-`EnvOptions::gap_fill` (pages, default 0: off, at most `MAX_GAP_FILL`, 64, else
-`InvalidGapFill` at open) trades bytes written for writes. A durable commit's pages are
+`EnvOptions::gap_fill` (a `GapFill`: `Pages(g)`, default 0: off, at most `MAX_GAP_FILL`, 64,
+else `InvalidGapFill` at open; or `Auto`, [Automatic width](#automatic-width); parsed from
+`auto`, `off` or a page count) trades bytes written for writes. A durable commit's pages are
 scattered: in steady state nearly all of them (98-99% measured) are pages freed two commits
 earlier, which sit wherever their old copies were written, so most runs of adjacent dirty pages
 are one page long. Linux's writeback sends each run to the disk as its own write, so a commit
@@ -663,8 +664,8 @@ extra bytes, and two system calls per gap filled.
   keeps that read to the gap's pages. A commit stops trying once its misses exceed its fills by
   16, so the reads a commit's fill starts exceed the writes it saved by at most 16. A kernel or
   file system that refuses `RWF_NOWAIT` (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap
-  fill off for the environment at the first gap read, with one warning and
-  `IoStats::gap_fill_refusals` at 1: no later commit tries
+  fill off for the environment at the first gap read, a fixed width and auto alike, with one
+  warning and `IoStats::gap_fill_refusals` at 1: no later commit tries
   (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap fill tests assert that
   fallback on such a file system (`file::refuses_nowait_reads`, a probe of their own), so they
   fill gaps only where the temp dir is on a disk. No safe call reports residency without reading
@@ -676,6 +677,68 @@ extra bytes, and two system calls per gap filled.
   `a_gap_filled_scattered_commit_leaves_no_page_dirty`.
 - **Errors.** An I/O error reading or writing a gap fails the commit (it latches) and poisons the
   file. A failed write leaves each byte as it was or rewritten, the same bytes.
+
+#### Automatic width
+
+A fixed width suits one kind of disk: measured on the Mac's SSD, filling costs about 4.7 µs of
+the writer's time per gap and the extra bytes cost more than the writes saved (the execution
+benchmark's busy output took 454 ms at 0 and 513 ms at 4), while on a 4,500-IOPS cloud disk the
+busy commit's 21,400 writes take about 4.8 s, and at 8 pages about 2.2 s. `GapFill::Auto`
+(`--db.gap-fill auto`) chooses the width per scattered durable step (one step 4 syncs by the
+`fdatasync`, or on macOS the `msync`s of `DataSync::Ranges`; a step synced by one `msync` fills
+nothing under auto) from what the disk's syncs were measured to cost (`env/gap_auto.rs`):
+
+- **Its counts.** From the step's sorted pages, one pass counts its runs, pages and the sizes of
+  its gaps (`Gaps::of`); one pass over the sizes gives, at each candidate width (0, 1, 2, 4, 8,
+  16, 32, 64), the gaps it would fill and their pages: the runs it would write are the runs less
+  those gaps, the pages the pages plus theirs. Measured: about 1 ns a page (31 µs for a
+  30,000-page step), the choice 0.04 µs.
+- **Its cost model.** Each scattered step's runs written, pages written and data sync time are a
+  sample. Two forms are fitted to the latest samples, robustly (non-negative least squares,
+  reweighted by Huber's and then Tukey's weights of the residuals, so a stalled sync or a
+  latency spike moves the fit little): the sum `c + a·runs + b·pages` (a drive that pays per
+  write and per byte, such as local NVMe) and the capped form `c + max(a·runs, b·pages)` (a disk
+  capped on writes per second and on bytes per second, whichever binds, such as network block
+  storage, whose best width balances the two caps: the sum, a plane, can only straddle it). The
+  capped form is kept only when it fits markedly better (its trimmed error under 0.7 of the
+  sum's). The fill's own cost per gap tried and the share of gaps it fills are running means of
+  the fill's timer. A fit costs about 20 µs a step.
+- **Its choice.** The width whose predicted step 4, the model's sync time for the runs and pages
+  it would write plus the fill's cost of its gaps, is least (the smaller on a tie). On a drive
+  whose writes are cheap beside its bytes and the fill's cost it is 0; on one that caps its
+  writes, a fill.
+- **Exploration.** At one width a step's runs and pages move together, so steps at one width
+  cannot tell `a` from `b`. An open starts with a warm-up of 12 scattered steps at 8, 0 and 4
+  pages in turn; after it, a step is now and then a probe at half the choice or twice it (at
+  least 2), alternately. Probes start 16 steps apart and the interval doubles after each, up to
+  128, while the choice holds; a new choice brings it back to 16. So a disk whose choice moves is
+  explored often and one that settles seldom: on the Mac's SSD, where the choice is 0, a probe's
+  fill costs about half its step's sync (a fill costs about 3.7 µs a gap there), a 128th of that
+  over all steps once settled. The fit keeps the latest 48 steps at the choice and, apart, the
+  latest 16 probes, so the probes keep their say.
+- **Re-adaptation.** The windows forget old samples as new ones come. A disk whose costs change
+  at once (a cloud disk's limits raised, a drive that changed speed) is seen sooner: 8 steps in a
+  row whose sync took more than 1.5 times the prediction, or less than 1/1.5 of it, the same way,
+  empty both windows and start the warm-up again. The model is in memory only: each open starts
+  cold.
+- **No byte changes, at any width.** The width only says which clean gaps step 4 rewrites with
+  their own bytes, so no choice changes a byte of the file (`a_gap_fill_changes_no_byte_of_the_file`
+  runs auto beside 0, 4 and 64; the crash matrices run under auto too,
+  `every_crash_point_recovers_the_state_the_protocol_allows_with_auto_gap_fill` and neighbours).
+  The fill's guards (a gap read only from memory on Linux, the miss slack) hold at every width,
+  and a file system that refuses `RWF_NOWAIT` turns auto off as it turns a fixed width off, once:
+  the step refused is not filed and no later step chooses.
+- **Reading its choice.** `IoStats::gap_auto_steps` (scattered steps it chose for),
+  `gap_auto_width_sum` (their widths summed: over an interval, the sum over the steps is the mean
+  width), `gap_auto_probes`, `gap_auto_readapts`; and gauges, which `IoStats::since` keeps as the
+  later read's: `gap_auto_width` (the last step's width), `gap_auto_run_ns` and `gap_auto_page_ns`
+  (the fitted `a` and `b`, per write and per page), `gap_auto_gap_ns` (the fill's cost per gap)
+  and `gap_auto_capped` (1 for the capped form). The model's chooser tests (`env/gap_auto/tests.rs`)
+  run it on modelled disks: per write only (64), per byte only (0), mixed costs (the predicted
+  crossover), noise and stalls, both caps, and costs that change mid-run.
+- **macOS** runs auto as Linux does, for tests and measurement like any gap fill there: its gap
+  reads are plain `pread`s, so a gap not in memory costs a synchronous read, which shows in the
+  fill's timed cost per gap and so in the choice.
 
 ---
 
@@ -2005,9 +2068,9 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 | group | counters |
 |---|---|
 | commits | `commits` (each run of steps 4–6: a `Durable` commit, a `NoSync` commit that synced, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits` (`NoSync` commits that deferred their sync), `auto_syncs` (`NoSync` commits that synced their own pages and the deferred ones: past `sync_period` or `sync_bytes`, the first that changes something after an open, or one more than 2^20 txns past the last sync; each also counts in `commits`), `grown_commits` (the file grew since the last durable state) |
-| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages`, `gap_misses` and `gap_fill_refusals` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`; a refusal turned gap fill off) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages`, `gap_misses` and `gap_fill_refusals` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`; a refusal turned gap fill off, auto too); under `GapFill::Auto` `gap_auto_steps`, `gap_auto_probes`, `gap_auto_readapts`, `gap_auto_width_sum` and the gauges `gap_auto_width`, `gap_auto_run_ns`, `gap_auto_page_ns`, `gap_auto_gap_ns`, `gap_auto_capped` ([Automatic width](#automatic-width): `since` keeps the gauges' later value) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
-| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `gap_fill_ns` (4's gap fill, before its sync), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
+| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `gap_fill_ns` (4's gap fill, before its sync, and under auto its choice), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
 | free list | `records_loaded`, `refill_ns`; `runs_by_step` (the run policy's four steps); `gate_lag_sum`, `gate_lag_samples` and `max_gate_lag` (at each load of records, the writing txn minus the reuse gate: 2 in `Durable` with no reader on an old snapshot, more under a held reader or `NoSync` commits not yet synced; the txn ids an open skips are not counted) |
 
