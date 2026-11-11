@@ -97,3 +97,5 @@ adiri = ["faucet", "tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-typ
 # Faucet build (devnet): the instant, role-gated TEL mint in tn-reth. Declared on this crate
 # because vergen reads this crate's features for the `--version` "Build Features" line.
 faucet = ["tn-node/faucet", "tn-reth/faucet"]
+# Run the reth execution database on tn-lmdb: propagate to the node graph.
+tn-lmdb = ["tn-node/tn-lmdb", "tn-reth/tn-lmdb"]

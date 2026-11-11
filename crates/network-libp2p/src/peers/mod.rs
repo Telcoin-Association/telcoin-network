@@ -9,6 +9,7 @@ mod manager;
 mod peer;
 mod penalty;
 mod policy;
+mod public_share;
 mod score;
 mod status;
 mod tracked;
@@ -18,6 +19,7 @@ pub(crate) use behavior::PeerAdmissionDenied;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;
+pub(crate) use public_share::PublicConnectionShare;
 pub use tracked::{EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedSlot};
 pub(crate) use types::{LookupClass, PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
 pub use types::{
@@ -28,6 +30,10 @@ pub use types::{
 // visibility for tests
 #[cfg(test)]
 pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
+
+/// The public share refusal, named by the peer manager tests.
+#[cfg(test)]
+pub(crate) use public_share::PublicShareExceeded;
 
 /// Shared production thresholds used by the consensus call-site regression tests.
 #[cfg(test)]

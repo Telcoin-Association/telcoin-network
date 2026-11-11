@@ -48,6 +48,12 @@ pub struct NetworkConfig {
     /// The configurations for quic protocol.
     quic_config: QuicConfig,
     /// Optional process-wide allocation. Omission preserves the existing transport defaults.
+    ///
+    /// Each swarm keeps a privileged reserve of established connections (committee members,
+    /// trusted operator peers and Closed admission grants): peers without privilege share only
+    /// the connections above it. The reserve is 50 of the default 128 and scales with the
+    /// allocated total: the total times 50/128, rounded down. So a small allocation still admits
+    /// peers without privilege.
     process_budget: Option<NetworkProcessBudget>,
     /// Opt-in per-class serve permit budget. Omission leaves every class unbounded.
     serve_budget: ServeBudget,

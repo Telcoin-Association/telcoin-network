@@ -19,6 +19,9 @@ members = [
     "crates/kad-client",
     "crates/state-sync",
     "crates/tn-metrics",
+    "crates/tn-lmdb",
+    "crates/tn-lmdb-bench",
+    "crates/tn-lmdb-reth",
     "crates/tn-reth",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
@@ -133,10 +136,16 @@ zeroize = "1.8.2"
 # RocksDB is not part of TN in any configuration: the vendored reth has its RocksDB backend,
 # `rocksdb`/`edge` features and the `rocksdb` crate removed (vendor/reth CHANGES.md TN-0014),
 # and etc/rocksdb-gate.sh fails if a rocksdb package ever enters Cargo.lock again.
+#
+# The off-by-default `tn-lmdb` feature on tn-reth / tn-node / telcoin-network-cli /
+# telcoin-network swaps TN's reth database from MDBX to the tn-lmdb engine (`tn-lmdb-reth`,
+# which also needs reth-db-api, reth-storage-errors and reth-trie-common); MDBX stays compiled
+# either way.
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }
 reth-db = { path = "vendor/reth/crates/storage/db" }
+reth-db-api = { path = "vendor/reth/crates/storage/db-api" }
 reth-db-common = { path = "vendor/reth/crates/storage/db-common" }
 reth-engine-primitives = { path = "vendor/reth/crates/engine/primitives" }
 # Without `std`, as every reth crate takes it: tn-reth only names its payload types.
@@ -157,9 +166,11 @@ reth-rpc-eth-api = { path = "vendor/reth/crates/rpc/rpc-eth-api" }
 reth-rpc-eth-types = { path = "vendor/reth/crates/rpc/rpc-eth-types" }
 reth-tracing = { path = "vendor/reth/crates/tracing" }
 reth-provider = { path = "vendor/reth/crates/storage/provider" }
+reth-storage-errors = { path = "vendor/reth/crates/storage/errors" }
 reth-prune-types = { path = "vendor/reth/crates/prune/types" }
 reth-stages-types = { path = "vendor/reth/crates/stages/types" }
 reth-trie = { path = "vendor/reth/crates/trie/trie" }
+reth-trie-common = { path = "vendor/reth/crates/trie/common" }
 reth-trie-db = { path = "vendor/reth/crates/trie/db" }
 reth-trie-sparse = { path = "vendor/reth/crates/trie/sparse" }
 reth-tasks = { path = "vendor/reth/crates/tasks" }
@@ -202,6 +213,8 @@ assert_matches = { version = "1.5.0" }
 tn-types = { path = "./crates/types" }
 tn-metrics = { path = "./crates/tn-metrics" }
 tn-reth = { path = "./crates/tn-reth" }
+tn-lmdb = { path = "./crates/tn-lmdb" }
+tn-lmdb-reth = { path = "./crates/tn-lmdb-reth" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }

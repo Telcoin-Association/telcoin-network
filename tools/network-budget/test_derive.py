@@ -43,17 +43,26 @@ class DeriveTests(unittest.TestCase):
     def test_derivation_scales_peaks_and_stays_proposed(self):
         self.honest()
         result = derive.derive(self.root, self.transport, 1.5)
-        self.assertEqual(result["process_budget"], {"swarm_count": 2, "max_established_connections": 16,
+        # The public peak scales to 8, and the smallest per-swarm total whose public share holds 8 is 12.
+        self.assertEqual(result["process_budget"], {"swarm_count": 2, "max_established_connections": 24,
                                                     "max_established_connections_per_peer": 3,
-                                                    "max_inbound_streams": 240, "max_receive_credit_bytes": 24000})
-        self.assertEqual(result["allocation"], {"connections": 8, "connections_per_peer": 3,
+                                                    "max_inbound_streams": 360, "max_receive_credit_bytes": 36000})
+        self.assertEqual(result["allocation"], {"connections": 12, "connections_per_peer": 3,
                                                 "streams_per_connection": 15, "receive_credit_per_connection": 1500})
+        self.assertEqual(result["public_share_per_swarm"], 8)
         self.assertEqual((result["status"], result["acceptance"]), ("proposed", "pending maintainer decision"))
         self.assertEqual(len(result["inputs"]["baseline"]), 3)
         output = self.root / "derived.json"
         self.assertEqual(derive.main([str(self.root), str(self.transport), "--headroom", "1.5", "--output", str(output)]), 0)
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             derive.main([str(self.root), str(self.transport), "--headroom", "1.5", "--output", str(output)])
+
+    def test_derived_total_keeps_the_privileged_reserve_above_the_public_peak(self):
+        for peak in (1, 8, 16, 50, 78, 128):
+            total = derive.total_for_public(peak)
+            self.assertGreaterEqual(derive.public_share(total), peak)
+            self.assertLess(derive.public_share(total - 1), peak)
+        self.assertEqual((derive.public_share(128), derive.public_share(72), derive.public_share(12)), (78, 44, 8))
 
     def test_refuses_missing_or_invalid_inputs(self):
         with self.assertRaisesRegex(ValueError, "reconnect"):

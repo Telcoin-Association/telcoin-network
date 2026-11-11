@@ -106,6 +106,12 @@ The remaining three values — 45 priority peers, 9 target outbound, and 6 minim
 A separate per-peer ceiling caps concurrent established connections from a single peer at **8**.
 A peer needs at most one inbound and one outbound connection at a time, so eight is headroom for reconnection churn while bounding a hostile peer to a fixed, small fan-out.
 
+Peers without privilege also share a public connection share: each such peer holds at most **2** established connections, and together they hold at most the swarm total minus a privileged reserve of **50** at the default total of 128, so 78 of those connections are public.
+Privileged peers (members of the previous, current and next committees, trusted operator peers, and peers that an effective Closed admission policy authorizes) take no public slot, so the reserve stays free to them whatever free identities do; they keep the per-peer ceiling of 8 and the swarm total.
+Bootstrap peers hold no such privilege.
+A `process_budget` keeps this split: the reserve is the swarm total times 50/128, rounded down, so a small budget still admits peers without privilege.
+A refusal counts as `peer_manager_public_share` when the share is full and as `peer_manager_public_peer_connections` when the peer already holds its 2 connections.
+
 Each swarm also caps pending inbound connections (handshakes that are not yet established) at **1024**.
 This cap is a memory bound only, not an admission policy.
 QUIC Retry, enabled by default, validates the source address before a handshake can occupy a slot.
@@ -201,7 +207,7 @@ Every series below is exported under the `tn_network` prefix and carries a `netw
 | `connections_closed_total` | Connections closed, all directions. |
 | `dial_failures_total` | Failed dial attempts. |
 | `inbound_connections_denied_total` | Inbound connections refused, counted once per refusal and labelled `stage` and `reason`. `stage` is `transport_cap` for a connection limit (`reason` `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit`), `pre_auth` for `peer_manager_invalid_ip`, `authenticated_policy` for the other `peer_manager_*` reasons and the source admission reasons, and `unknown` for `reason` `unknown`. A sustained `pending_incoming_limit` rate means the pending ceiling is full. |
-| `listen_failures_total` | Failed inbound attempts that the peer manager observes, labelled `reason`: `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip`, `peer_manager_closed_admission`, `other_behaviour_denied`, `transport`, `wrong_peer_id`, `local_peer_id` or `aborted`. Every reason is registered at zero. The `peer_manager_*` reasons also count in `inbound_connections_denied_total`. |
+| `listen_failures_total` | Failed inbound attempts that the peer manager observes, labelled `reason`: `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip`, `peer_manager_closed_admission`, `peer_manager_public_share`, `peer_manager_public_peer_connections`, `other_behaviour_denied`, `transport`, `wrong_peer_id`, `local_peer_id` or `aborted`. Every reason is registered at zero. The `peer_manager_*` reasons also count in `inbound_connections_denied_total`. |
 | `closed_admission_denied_total` | Connections refused by Closed admission, labelled `direction` (`in` or `out`). Both directions are registered at zero. |
 | `listener_errors_total` | Non-fatal listener errors, labelled `reason` with the I/O error kind: `address_in_use`, `address_not_available`, `permission_denied`, `connection`, `timed_out`, `invalid_data`, `other` or `unknown`. Every error is counted. The log line fires at most once per interval and reports how many errors it skipped. |
 | `listeners_closed_total` | Closed listeners, labelled `outcome` (`ok` or `error`). |

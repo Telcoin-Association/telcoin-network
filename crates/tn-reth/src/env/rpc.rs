@@ -39,7 +39,7 @@ use reth_rpc_builder::{
     config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle,
 };
 use reth_rpc_eth_api::RpcNodeCore;
-use reth_rpc_eth_types::EthConfig;
+use reth_rpc_eth_types::{EthConfig, EthStateCache};
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 
@@ -312,6 +312,25 @@ impl RethEnv {
         } else {
             modules_config
         };
+        // RPC transaction pool insertion batching is configured by the txpool CLI args.
+        let eth_config = self
+            .node_config()
+            .rpc
+            .eth_config()
+            .max_batch_size(self.node_config().txpool.max_batch_size);
+        // Reth's eth tasks run on the env's task manager, not on reth's default
+        // `TokioTaskExecutor`: the state cache and the fee-history task (which follows the
+        // canonical-state stream, open for the env's whole life) hold the provider, so untracked
+        // they would keep the database open after the node's tasks shut down. Reth spawns the
+        // cache as a critical task; here they are tracked as non-critical ones: they only serve
+        // RPC, and a panic in one leaves the RPC cache dead with the node running, as on reth's
+        // own executor, instead of ending the validator.
+        let rpc_tasks = self.inner.task_spawner.non_critical();
+        let eth_cache = EthStateCache::spawn_with(
+            self.inner.blockchain_provider.clone(),
+            eth_config.cache,
+            rpc_tasks.clone(),
+        );
         let eth_api = apply_eth_config(
             EthApi::builder(
                 self.inner.blockchain_provider.clone(),
@@ -319,12 +338,10 @@ impl RethEnv {
                 network,
                 self.inner.evm_config.clone(),
             ),
-            // RPC transaction pool insertion batching is configured by the txpool CLI args.
-            self.node_config()
-                .rpc
-                .eth_config()
-                .max_batch_size(self.node_config().txpool.max_batch_size),
+            eth_config,
         )
+        .task_spawner(rpc_tasks)
+        .eth_cache(eth_cache)
         .build();
 
         let engine_events = reth_tokio_util::EventSender::default();

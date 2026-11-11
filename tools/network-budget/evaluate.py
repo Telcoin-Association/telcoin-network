@@ -6,14 +6,16 @@ import json
 import math
 from pathlib import Path
 
-from capture import CRITICAL_CLASSES, FAILED, REJECTIONS, SERVICE, SHED, expected_down
+from capture import CRITICAL_CLASSES, DENIALS, FAILED, REJECTIONS, SERVICE, SHED, expected_down
 
 PHASES = ("steady", "catch-up", "reconnect", "hostile", "mixed")
 ACCEPTANCE = "pending maintainer decision"
 ESTABLISHED = "tn_network_established_connections"
 LIMIT = "tn_network_established_connection_limit"
-# Hostile pressure on established connections shows up under these rejection reasons only.
+# Hostile pressure on established connections shows up under these rejection reasons, or as denials by the
+# peer manager's public share, which refuses peers without privilege before the connection limits do.
 ESTABLISHED_REASONS = ("established_total", "established_per_peer", "established_incoming")
+SHARE_REASONS = ("peer_manager_public_share",)
 RSS = "reth_process_resident_memory_bytes"
 CPU = "reth_process_cpu_seconds_total"
 
@@ -224,18 +226,23 @@ def within_allocation(threshold, root):
 
 
 def hostile_recovery(threshold, root):
-    """Hostile rejections must rise, and final occupancy must return to the steady peak."""
+    """Hostile rejections or public share denials must rise, and final occupancy must return to the steady peak.
+
+    Established-stage rejections need two samples per reason on every swarm. Public share denials count when they
+    are captured and are never required, because a node built before the share existed exports no such label.
+    """
     runs, missing = captured(root, "candidate", ("steady", "hostile"))
     if missing:
         return "pending", missing
-    # pending_* rejections are handshake state; only established-stage reasons show pressure on the allocation.
+    # pending_* rejections are handshake state; established-stage reasons and share denials show pressure on the allocation.
     missing = (metric_gap(runs["steady"], ESTABLISHED) or metric_gap(runs["hostile"], ESTABLISHED)
                or next((gap for reason in ESTABLISHED_REASONS
                         if (gap := metric_gap(runs["hostile"], REJECTIONS, minimum=2, reason=reason))), None))
     if missing:
         return "pending", missing
     found = [increases(runs["hostile"], REJECTIONS, reason=reason) for reason in ESTABLISHED_REASONS]
-    rejections = None if None in found else {key: value for part in found for key, value in part.items()}
+    denied = [increases(runs["hostile"], DENIALS, reason=reason) or {} for reason in SHARE_REASONS]
+    rejections = None if None in found else {key: value for part in [*found, *denied] for key, value in part.items()}
     ceiling, final = {}, {}
     for node, found, _, value in samples(runs["steady"], ESTABLISHED):
         ceiling[(node, found["network"])] = max(ceiling.get((node, found["network"]), 0), value)

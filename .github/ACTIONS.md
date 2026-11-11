@@ -3,7 +3,9 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the three test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+The e2e suites it runs are the `#[ignore]`d tests of `e2e-tests` on the default (MDBX) node binary, then `make test-e2e-reth-migration` (a committee on MDBX, each validator restarted onto the tn-lmdb binary; it skips, passing, under the generic selection, which sets neither its marker nor the previous binary).
+It does not run the restart, epoch and sigkill suites on the tn-lmdb binary (`make test-e2e-tn-lmdb`): the nightly `durable-e2e.yaml` does, after the same suites on MDBX, and the rolling-upgrade suite (`make test-upgrade`) stays manual.
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
 
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
@@ -20,7 +22,7 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `vendor-reth-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `tn-lmdb-test`, `vendor-reth-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
@@ -38,11 +40,11 @@ Three consequences worth remembering:
   ejects the PR. `pr.yaml` triggers on both events, and `CI Success` is the only required
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
-- **The maintainer and draft skips cover the three test lanes only, and never apply in the queue.**
-  On a pull request, `ci-scope` skips `test`, `adiri-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
+- **The maintainer and draft skips cover the four test lanes only, and never apply in the queue.**
+  On a pull request, `ci-scope` skips `test`, `adiri-test`, `tn-lmdb-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
   `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
   In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
-  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the three test lanes only, and only when `ci-scope` asked for it.
+  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the four test lanes only, and only when `ci-scope` asked for it.
 - **The attestation is checked on the pull request only, never in the queue.** GitHub
   creates the merge group's commit seconds before CI starts, so no local run could have
   covered it and nothing can attest it; a lane that demanded one would hang the queue until
@@ -93,7 +95,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the four test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -189,7 +191,7 @@ Nothing stops either route beforehand.
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for the three test lanes: default and adiri features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for the four test lanes: default, adiri and tn-lmdb features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
 rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
@@ -483,6 +485,33 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
    The earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
 4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
    `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
+
+## tn-lmdb regression bench
+
+`.github/workflows/tn-lmdb-bench.yaml` runs `etc/tn-lmdb-bench-compare.sh --tier quick <base sha> <head sha>`: the tn-lmdb engine bench (`crates/tn-lmdb-bench`) built against both commits, run as interleaved rounds and compared row by row.
+The script's header comment is the reference for what it builds, runs and reports.
+
+It runs only when asked:
+
+- on a pull request labeled `bench`, against what merging it changes: its merge commit (`github.sha`) against that commit's first parent, the base branch's tip it merges onto, so changes made on the base after the branch point do not show as the pull request's. It runs when the label is added, and again on every push or reopen while it stays. Adding some other label does not run it, nor cancel a running one: a run that skips takes a concurrency group of its own. The label has to exist in the repository (Issues -> Labels) before it can be applied;
+- by hand (*tn-lmdb bench* -> *Run workflow*), with a `base` (required), a `head` (empty: the commit the run is on) and a `tier` (`quick`, `default` or `full`). A `base` or `head` that does not resolve as given is read as `origin/<branch>` when that resolves, since the checkout has a local branch for the run's own ref only.
+
+It is optional by construction, and must stay so.
+It is not in `pr.yaml`, never runs on `merge_group`, and is not a required check; `CI Success` stays the only one (item 1 of "Repository settings this requires"), and the job's name is not `CI Success`.
+A red run blocks nothing: it is information for the reviewer.
+It is still not `continue-on-error`, so the pull request shows a red check when the script exits non-zero: 1 for a gated regression, 2 for a refusal, a build or run error, or any failure the script does not expect (never 1).
+A run with nothing to compare (tn-lmdb and the root `Cargo.toml` unchanged, or a change that does not reach the bench binary) is green, and its job summary gives the one-line reason.
+A pull request whose base has no tn-lmdb (no `crates/tn-lmdb/Cargo.toml`) gets exit 2 from the base check; dispatch it by hand with a base that has tn-lmdb instead.
+
+The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
+Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
+
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable time rows, and the quick tier's two single-commit rows, reported, not gated) catches large regressions only.
+For anything finer, run the script locally, with more rounds, on an idle machine.
+
+The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.
+It has no dependency cache: the bench builds as two small standalone packages in their own target directories under `runner.temp`, so it neither reads nor writes the entries in "Caches" (and is not one of the cache steps counted there).
+It triggers on `pull_request`, never `pull_request_target`: it compiles and runs the pull request's code, with a read-only token and no secrets, like every other pull request job.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.

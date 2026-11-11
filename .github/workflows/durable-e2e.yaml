@@ -78,6 +78,7 @@ jobs:
         run: |
           cargo fetch --locked
           make build-e2e-bin
+          make build-e2e-bin-tn-lmdb
           cargo nextest run --no-run --locked --workspace
           cargo nextest run --no-run --locked -p e2e-tests --test it
 
@@ -89,6 +90,23 @@ jobs:
 
       - name: Run direct SIGKILL epoch-boundary recovery tests
         run: make test-sigkill
+
+      # The same three suites on the node binary whose reth database runs on tn-lmdb (the
+      # off-by-default `tn-lmdb` feature; crates/tn-reth/README.md, "Database backend"), then the
+      # MDBX to tn-lmdb migration on a live committee (crates/e2e-tests/tests/it/reth_db_migration.rs).
+      # No merge-queue lane runs a node on the engine; this run is the gate for it, and a
+      # precondition for turning the feature on.
+      - name: Run restart e2e tests on tn-lmdb
+        run: make test-restarts-tn-lmdb
+
+      - name: Run epoch e2e tests on tn-lmdb
+        run: make test-epochs-tn-lmdb
+
+      - name: Run direct SIGKILL epoch-boundary recovery tests on tn-lmdb
+        run: make test-sigkill-tn-lmdb
+
+      - name: Run the MDBX to tn-lmdb migration e2e test
+        run: make test-e2e-reth-migration
 
       - name: Archive retained data from a failed SIGKILL reproduction
         if: failure()

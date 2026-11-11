@@ -71,7 +71,7 @@ pub(super) fn lock_dir_shared(root: &Path) -> eyre::Result<fs::File> {
 
 /// Bytes available to this process on the filesystem holding `dir` (`statvfs`: free blocks
 /// available to unprivileged users times the fragment size).
-pub(super) fn available_bytes(dir: &Path) -> io::Result<u64> {
+pub fn available_bytes(dir: &Path) -> io::Result<u64> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;

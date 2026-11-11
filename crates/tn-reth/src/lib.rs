@@ -91,12 +91,9 @@ pub use alloy::primitives::FixedBytes;
 pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::parse_socket_address;
-pub use reth_db::{
-    mdbx::{open_db_read_only, DatabaseArguments, Error as RethMdbxError},
-    static_file::iter_static_files,
-    Database as RethDatabaseT, DatabaseEnv, Tables,
-};
+pub use reth_db::{static_file::iter_static_files, Database as RethDatabaseT};
 pub use reth_errors::{ProviderError, RethError};
+pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
     dirs::MaybePlatformPath,
@@ -147,7 +144,14 @@ pub mod worker;
 pub use cli::{
     init_reth_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
-pub use env::*;
+pub use env::{
+    database::{
+        db_check, db_table_stats, default_page_size, refuse_pending_migration, DbCheckReport,
+        DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
+        DB_TABLE_STATS_NEEDS_STOPPED_NODE,
+    },
+    *,
+};
 #[cfg(feature = "faucet")]
 pub use evm::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
