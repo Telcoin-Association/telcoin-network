@@ -294,15 +294,18 @@ impl BatchBuilder {
             refusal_backoff: None,
             arrivals,
             fill_delay: None,
-            sealed_tx_keep: false,
+            // the env builds the worker pools from the same switch, so both sides agree
+            sealed_tx_keep: reth_env.sealed_tx_keep(),
         })
     }
 
     /// Set whether a sealed batch's transactions stay in the pool, marked, until they execute
     /// (`sealed_tx_keep` in `parameters.yaml`).
     ///
-    /// `false`, the value [`BatchBuilder::new`] starts with, removes them from the pool once the
-    /// batch is sealed. The node applies the configured value right after construction.
+    /// [`BatchBuilder::new`] starts with the value of [`RethEnv::sealed_tx_keep`], the switch the
+    /// env's worker pools are built with; this overrides it. `false` removes the transactions
+    /// from the pool once the batch is sealed. The node applies the configured value right after
+    /// construction.
     pub fn with_sealed_tx_keep(mut self, keep: bool) -> Self {
         self.sealed_tx_keep = keep;
         self
