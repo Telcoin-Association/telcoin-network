@@ -553,6 +553,58 @@ impl Parameters {
             self.basefee_address
         );
     }
+
+    /// The runtime switches in these parameters, each with its `parameters.yaml` key, in a fixed
+    /// order.
+    ///
+    /// A switch turns one behaviour change on or off per benchmark arm, and its default is the
+    /// behaviour from before the switch existed. A mistyped key is ignored without an error, like
+    /// any unknown key, so the node logs this list once at start and exports it as a gauge: that
+    /// shows which arm a node actually runs.
+    ///
+    /// Every switch field must be listed here. A test fails while one is missing.
+    pub fn switches(&self) -> Vec<(&'static str, SwitchValue)> {
+        vec![]
+    }
+}
+
+/// The value of one runtime switch, as listed by [`Parameters::switches`].
+///
+/// [`Display`](std::fmt::Display) renders the value the way `parameters.yaml` holds it (`true`,
+/// `3`, `150ms`), so a logged value can be written back into the file unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchValue {
+    /// An on/off switch.
+    Bool(bool),
+    /// A count, such as a number of threads or outputs.
+    Count(u64),
+    /// A duration, written in `humantime` form.
+    Duration(Duration),
+}
+
+impl SwitchValue {
+    /// The value as a gauge sample: 0 or 1 for a boolean, the count itself, and a duration in
+    /// milliseconds.
+    pub fn gauge(&self) -> f64 {
+        match self {
+            Self::Bool(on) => f64::from(u8::from(*on)),
+            Self::Count(count) => *count as f64,
+            Self::Duration(duration) => duration.as_secs_f64() * 1_000.0,
+        }
+    }
+}
+
+impl std::fmt::Display for SwitchValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool(on) => write!(f, "{on}"),
+            Self::Count(count) => write!(f, "{count}"),
+            // the rendering `humantime_serde` writes for a duration field
+            Self::Duration(duration) => {
+                write!(f, "{}", humantime_serde::re::humantime::format_duration(*duration))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -950,5 +1002,187 @@ mod test {
              128: peers prune the certificate rounds a rejoining validator rebuilds its DAG from, \
              so a gc_depth above 64 refuses to start"
         );
+    }
+
+    // ---- bench6 bench6-switches ----
+
+    /// The parameters keys that are not runtime switches.
+    ///
+    /// A new `Parameters` field is either a switch, listed by [`Parameters::switches`], or a
+    /// plain parameter listed here. [`switches_list_every_switch_field`] fails until it is one or
+    /// the other.
+    const NON_SWITCH_KEYS: &[&str] = &[
+        "header_num_of_batches_threshold",
+        "max_header_num_of_batches",
+        "max_header_delay",
+        "min_header_delay",
+        "vote_timeout",
+        "gc_depth",
+        "sync_retry_delay",
+        "sync_retry_nodes",
+        "max_batch_delay",
+        "max_concurrent_requests",
+        "batch_vote_timeout",
+        "basefee_address",
+        "parallel_fetch_request_delay_interval",
+        "allow_private_forward_targets",
+    ];
+
+    /// Parses a parameters file that holds the one required key plus the `extra` lines.
+    fn parse_with(extra: &str) -> Parameters {
+        let yaml = format!("basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"\n{extra}");
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("{extra:?} must parse: {e}"))
+    }
+
+    /// Renders a scalar YAML value the way it is written in `parameters.yaml`.
+    fn yaml_scalar(value: &serde_yaml::Value) -> String {
+        match value {
+            serde_yaml::Value::Bool(on) => on.to_string(),
+            serde_yaml::Value::Number(number) => number.to_string(),
+            serde_yaml::Value::String(text) => text.clone(),
+            other => panic!("a switch must serialize as a yaml scalar, got {other:?}"),
+        }
+    }
+
+    /// Parameters with every switch set away from its default: booleans on, counts 3, durations
+    /// 150 ms.
+    fn every_switch_flipped() -> Parameters {
+        let mut yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        let mapping = yaml.as_mapping_mut().expect("parameters serialize as a mapping");
+        for (name, value) in Parameters::default().switches() {
+            let flipped = match value {
+                super::SwitchValue::Bool(_) => serde_yaml::Value::Bool(true),
+                super::SwitchValue::Count(_) => serde_yaml::Value::Number(3.into()),
+                super::SwitchValue::Duration(_) => serde_yaml::Value::String("150ms".into()),
+            };
+            mapping.insert(name.into(), flipped);
+        }
+        serde_yaml::from_value(yaml).expect("flipped switches parse")
+    }
+
+    /// The switch list names every field that is not a plain parameter, once, by its YAML key.
+    #[test]
+    fn switches_list_every_switch_field() {
+        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        let fields: std::collections::BTreeSet<String> = yaml
+            .as_mapping()
+            .expect("parameters serialize as a mapping")
+            .iter()
+            .map(|(key, _)| key.as_str().expect("parameter keys are strings").to_string())
+            .filter(|key| !NON_SWITCH_KEYS.contains(&key.as_str()))
+            .collect();
+        let switches = Parameters::default().switches();
+        let listed: std::collections::BTreeSet<String> =
+            switches.iter().map(|(name, _)| name.to_string()).collect();
+        assert_eq!(listed.len(), switches.len(), "a switch is listed twice: {switches:?}");
+        assert_eq!(
+            listed, fields,
+            "every Parameters field must be listed by Parameters::switches or in NON_SWITCH_KEYS"
+        );
+    }
+
+    /// Each listed value is the value of its own field, rendered as the YAML serializer writes it,
+    /// at the defaults and with every switch flipped.
+    #[test]
+    fn switch_values_render_as_their_yaml() {
+        for params in [Parameters::default(), every_switch_flipped()] {
+            let yaml = serde_yaml::to_value(&params).expect("parameters serialize");
+            for (name, value) in params.switches() {
+                assert_eq!(value.to_string(), yaml_scalar(&yaml[name]), "switch {name}");
+            }
+        }
+        let defaults = Parameters::default().switches();
+        for ((name, default), (_, flipped)) in
+            defaults.iter().zip(every_switch_flipped().switches())
+        {
+            assert_ne!(*default, flipped, "switch {name} must read its own field");
+        }
+    }
+
+    /// Display gives the YAML form and the gauge a number for every kind of switch value.
+    #[test]
+    fn switch_value_display_and_gauge() {
+        #[derive(serde::Serialize)]
+        struct Humantime(#[serde(with = "humantime_serde")] Duration);
+        let cases = [
+            (super::SwitchValue::Bool(false), "false", 0.0),
+            (super::SwitchValue::Bool(true), "true", 1.0),
+            (super::SwitchValue::Count(0), "0", 0.0),
+            (super::SwitchValue::Count(3), "3", 3.0),
+            (super::SwitchValue::Duration(Duration::ZERO), "0s", 0.0),
+            (super::SwitchValue::Duration(Duration::from_millis(150)), "150ms", 150.0),
+            (super::SwitchValue::Duration(Duration::from_millis(1_500)), "1s 500ms", 1_500.0),
+        ];
+        for (value, yaml, gauge) in cases {
+            assert_eq!(value.to_string(), yaml, "{value:?}");
+            assert_eq!(value.gauge(), gauge, "{value:?}");
+            if let super::SwitchValue::Duration(duration) = value {
+                let written =
+                    serde_yaml::to_value(Humantime(duration)).expect("duration serializes");
+                assert_eq!(yaml_scalar(&written), yaml, "humantime_serde writes {duration:?}");
+            }
+        }
+    }
+
+    /// A file without any switch key, such as a bench-5 `parameters.yaml`, loads every switch at
+    /// its default, and the struct's `Default` agrees with the serde defaults.
+    #[test]
+    fn absent_switch_keys_load_the_defaults() {
+        assert_eq!(parse_with("").switches(), Parameters::default().switches());
+        assert_eq!(parse_with("gc_depth: 40").switches(), Parameters::default().switches());
+    }
+
+    /// Re-serializing a file that predates the switches keeps every key it held at the same
+    /// value, and the result parses back to the same parameters.
+    ///
+    /// Strings compare without case: an address is written back in lowercase hex whatever its
+    /// checksum case in the file, which is the same address.
+    #[test]
+    fn reserializing_keeps_the_existing_keys() {
+        let lowercase = |value: &serde_yaml::Value| match value {
+            serde_yaml::Value::String(text) => serde_yaml::Value::String(text.to_lowercase()),
+            other => other.clone(),
+        };
+        let bench5 = format!(
+            "basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"\nmax_header_delay: 300ms\n\
+             min_header_delay: 250ms\nvote_timeout: 5s\ngc_depth: 50\n\
+             header_num_of_batches_threshold: 1\nmax_header_num_of_batches: 10\n\
+             max_batch_delay: 200ms\nsync_retry_delay: 5s\n"
+        );
+        for text in [bench5.as_str(), MAINNET_PARAMETERS, TESTNET_PARAMETERS] {
+            let input: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml parses");
+            let params: Parameters = serde_yaml::from_str(text).expect("parameters parse");
+            let output = serde_yaml::to_value(&params).expect("parameters serialize");
+            for (key, value) in input.as_mapping().expect("a parameters file is a mapping") {
+                assert_eq!(
+                    output.get(key).map(lowercase),
+                    Some(lowercase(value)),
+                    "key {key:?} changed on re-serialization"
+                );
+            }
+            let reparsed: Parameters = serde_yaml::from_value(output).expect("output parses");
+            assert_eq!(reparsed, params);
+        }
+    }
+
+    /// An unknown key is ignored, so a mistyped switch leaves the node at its defaults. This pins
+    /// today's behaviour: the `node switches` log line and gauge exist because of it.
+    #[test]
+    fn unknown_keys_are_ignored() {
+        assert_eq!(parse_with("no_such_switch: true\nanother_unknown: 3ms"), parse_with(""));
+    }
+
+    /// The `--chain adiri` and `--chain mainnet` presets hold no switch, so both run every switch
+    /// at its default.
+    #[test]
+    fn chain_presets_leave_every_switch_at_its_default() {
+        let defaults = Parameters::default().switches();
+        for (chain, text) in [("mainnet", MAINNET_PARAMETERS), ("adiri", TESTNET_PARAMETERS)] {
+            let preset: Parameters = serde_yaml::from_str(text).expect("preset parses");
+            assert_eq!(preset.switches(), defaults, "{chain} preset");
+            for (name, _) in &defaults {
+                assert!(!text.contains(name), "{chain} preset sets switch {name}");
+            }
+        }
     }
 }
