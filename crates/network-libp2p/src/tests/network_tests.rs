@@ -1287,10 +1287,14 @@ async fn lazy_negotiation_sync_stream_to_wrong_role_fails_on_first_read() -> eyr
         "a rejected sync open must not change the peer's score"
     );
 
-    // positive control: the same-role open negotiates and the listener receives the stream
-    let _stream = timeout(max_time, opener.open_stream(primary_bls))
+    // positive control: the same-role open negotiates and the listener receives the stream.
+    // the lazy dialer buffers its proposal until the opener's first write (the request frame
+    // in production), so the opener writes before the listener can see the stream
+    let mut stream = timeout(max_time, opener.open_stream(primary_bls))
         .await??
         .expect("same-role sync open must succeed");
+    stream.write_all(&[0u8; 8]).await?;
+    stream.flush().await?;
     let inbound = timeout(max_time, primary_events.recv()).await?;
     assert_matches!(
         inbound,
