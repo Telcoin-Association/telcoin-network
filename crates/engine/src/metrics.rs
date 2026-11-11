@@ -93,8 +93,9 @@ pub(crate) struct EngineMetrics {
     /// panicked), so the execution task recovered the signers inline from the same bytes.
     /// Nonzero is a bug signal; the blocks built are the same either way.
     pub(crate) recovery_fallback_total: Counter,
-    // bench6 pipelined-persist: set by the pipelined loop only (`pipelined_persist: true`); the
-    // sequential loop leaves these series unset
+    // bench6 pipelined-persist: updated by the pipelined loop only (`pipelined_persist: true`);
+    // registered with the rest at first use, so a sequential node exports them at zero
+    // (`built_height` then reads 0, below `canonical_height`)
     /// Consensus outputs started and not yet committed: building, built and waiting for the commit
     /// slot, or committing. Zero to two.
     pub(crate) unpersisted_outputs: Gauge,
