@@ -192,15 +192,17 @@ const MAX_CONTROL_SHARE: f64 = 0.85;
 const MIN_CERTIFIED_SHARE: f64 = 0.93;
 
 /// The fewest own headers, as a share of those it proposed in the window, the fast validator must
-/// certify under the adaptive policy (measured 0.81 to 0.84 in five runs). It must also certify
-/// more than in the control of the same run.
+/// certify under the adaptive policy (measured 0.922, 0.931 and 0.923 in three runs; 0.81 to 0.82
+/// when one certified tip header reset the window). It must also certify more than in the control
+/// of the same run.
 ///
-/// Below [`MIN_CERTIFIED_SHARE`] by construction at this scale: each return to the own tip costs
-/// about two cancelled headers, and the window only doubles while those returns fail. Here the tip
-/// header certifies about every other time (the control's share), and a certified tip header
-/// resets the window to `quorum_exec_block_starved_rounds`, so the fast node returns to its tip
-/// every 4 to 16 rounds instead of every 128.
-const MIN_ADAPTIVE_SHARE: f64 = 0.75;
+/// Below [`MIN_CERTIFIED_SHARE`] and the bench-6 target of 0.98 by construction at this scale: the
+/// window opens with the load, and the climb from `quorum_exec_block_starved_rounds` (4) to the
+/// bound of 128 rounds takes five failed returns to the own tip, each costing one or two headers
+/// (7 or 8 in the three runs, all of them in the climb). That is 5 to 10 of the window's ~100
+/// headers; once at the bound the node loses 2 headers every 130 rounds. The margin below the
+/// measured shares allows the full 10 on a loaded machine that proposes fewer headers.
+const MIN_ADAPTIVE_SHARE: f64 = 0.88;
 
 /// The fewest of the headers built under the quorum rule (`exec_policy=starved`) that must certify
 /// (measured all of them).
@@ -225,7 +227,7 @@ const MIN_FLOOR_SHARE: f64 = 0.5;
 ///   fails the test: without it the other arms prove nothing;
 /// - `quorum_exec_block` + `quorum_exec_block_starved_rounds: 4` + `vote_queue_fix`: the fast node
 ///   certifies at least [`MIN_ADAPTIVE_SHARE`] of its headers and more than in the control (the
-///   gain measured 0.10 to 0.28), at least [`MIN_STARVED_SHARE`] of its headers built under the
+///   gain measured 0.20 to 0.30), at least [`MIN_STARVED_SHARE`] of its headers built under the
 ///   quorum rule certify, its `header proposed` lines show both `exec_policy=tip` (the returns to
 ///   its own tip) and `exec_policy=starved` (the windows a cancelled tip header opens), and the
 ///   slow nodes certify at least [`MIN_CERTIFIED_SHARE`];
