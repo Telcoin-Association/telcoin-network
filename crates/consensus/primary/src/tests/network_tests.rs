@@ -6,10 +6,10 @@ use crate::{
         gossip_author_to_strike,
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
         try_admit_epoch_record, try_admit_shed, GossipSlots, MissingCertificatesRequest,
-        PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, ProbeWalk, RequestHandler,
-        RequestVoteResult, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS,
-        MAX_CONSENSUS_CERTS, MAX_PENDING_GOSSIP_PER_PEER, MAX_PENDING_REQUESTS_PER_PEER,
-        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, PrimarySyncLedgers, ProbeWalk,
+        RequestHandler, RequestVoteResult, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_GOSSIP_PER_PEER,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -1469,6 +1469,8 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     // receiver bound so any stray send cannot error.
     let (handle_tx, _handle_rx) = tokio::sync::mpsc::channel(10);
     let network_handle = PrimaryNetworkHandle::new_for_test(handle_tx);
+    // The node-scope sync ledgers, shared by the network of both epochs as the node shares them.
+    let sync_ledgers = PrimarySyncLedgers::new();
 
     // Observe forwarded epoch votes. `new_epoch_votes` is a plain `QueChannel`, so hold this one
     // subscription for the whole test (a second concurrent subscribe would panic).
@@ -1482,6 +1484,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     PrimaryNetwork::new(
         app.subscribe_primary_network_events(epoch0_record.epoch),
         network_handle.clone(),
+        sync_ledgers.clone(),
         config.clone(),
         app.clone(),
         state_sync.clone(),
@@ -1544,6 +1547,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     PrimaryNetwork::new(
         app.subscribe_primary_network_events(epoch0_record.epoch.saturating_add(1)),
         network_handle.clone(),
+        sync_ledgers.clone(),
         config.clone(),
         app.clone(),
         state_sync.clone(),

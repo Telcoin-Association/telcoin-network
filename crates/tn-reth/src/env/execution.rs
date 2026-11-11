@@ -55,7 +55,7 @@
 //! in-memory only (the finalized/safe watches plus pruning persisted blocks from
 //! the in-memory state); its database half happens inside the atomic commit above.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use alloy::primitives::FixedBytes;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
@@ -157,6 +157,9 @@ impl RethEnv {
         // copy in case of error
         let batch_digest = payload.batch_digest;
 
+        // Stage timings (`RethEnvMetrics::block_*_seconds`). Execute, finish and overlay extend
+        // run back to back, so each boundary is one `Instant` shared by the stages either side.
+        let execute_started = Instant::now();
         let mut builder =
             self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
 
@@ -177,6 +180,7 @@ impl RethEnv {
         // transactions from the same certified bytes, so the resulting block stays
         // deterministic (issue #933). The primary defense is validating batches before
         // they can be certified; this only bounds the blast radius if one ever is.
+        let recovery_started = Instant::now();
         let recovered_txs = transactions
             .par_iter()
             .filter_map(|tx_bytes| {
@@ -192,6 +196,7 @@ impl RethEnv {
                     .ok()
             })
             .collect::<Vec<_>>();
+        RETH_METRICS.block_signer_recovery_seconds.record(recovery_started.elapsed());
 
         // Recovery failures are the signal that a batch carrying undecodable transaction bytes
         // was certified, so make them alertable instead of log-only. Count once, after the
@@ -228,6 +233,9 @@ impl RethEnv {
             }
         }
 
+        let finish_started = Instant::now();
+        RETH_METRICS.block_execute_seconds.record(finish_started.duration_since(execute_started));
+
         // Scope the wrapper so its borrows of the overlay are dropped before the
         // overlay is extended below (`Arc::make_mut` must not see a live borrow).
         let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
@@ -238,6 +246,8 @@ impl RethEnv {
             );
             builder.finish(&root_provider)?
         };
+        let finish_ended = Instant::now();
+        RETH_METRICS.block_finish_seconds.record(finish_ended.duration_since(finish_started));
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
@@ -253,6 +263,7 @@ impl RethEnv {
         // (#1301). One linear merge pass; the `Arc`s are shared with the block's
         // `ComputedTrieData`, so nothing is recomputed.
         overlay.extend_from_block(&computed_trie_data);
+        RETH_METRICS.block_overlay_extend_seconds.record(finish_ended.elapsed());
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
@@ -495,5 +506,122 @@ impl RethEnv {
     #[cfg(any(feature = "test-utils", test))]
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        payload::TNPayload,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            TransactionFactory,
+        },
+        RethChainSpec,
+    };
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use tempfile::TempDir;
+    use tn_types::{test_genesis, Address, Bytes, TaskManager, U256};
+
+    /// Every block `build_block_from_batch_payload` builds records exactly one sample in each
+    /// `RethEnvMetrics::block_*_seconds` histogram, and each nested stage fits inside the stage
+    /// that contains it.
+    ///
+    /// The histograms record through the `RETH_METRICS` static, whose handles bind to the
+    /// recorder current when it is first forced. `RethEnv::new` forces it, so the environment is
+    /// built inside this test's local recorder scope, and every later sample lands in that
+    /// recorder whichever thread records it. nextest runs each test in its own process, so
+    /// nothing has forced the static before; in a single-process `cargo test` run something may
+    /// have, and the test then fails on the absent series rather than on a wrong count.
+    #[tokio::test]
+    async fn test_block_build_records_one_timing_sample_per_stage() -> eyre::Result<()> {
+        const BLOCKS: usize = 3;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("block timing metrics");
+        let mut factory = TransactionFactory::new();
+        let recipient = Address::from_slice(&[0xcc; 20]);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || -> eyre::Result<()> {
+            let reth_env =
+                RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+            let mut parent = chain.sealed_genesis_header();
+            for index in 1..=BLOCKS as u64 {
+                // two transfers per block, so signer recovery and the transaction loop do work
+                let transactions = (0..2)
+                    .map(|_| {
+                        factory.create_eip1559_encoded(
+                            chain.clone(),
+                            None,
+                            100,
+                            Some(recipient),
+                            U256::from(1_000_000),
+                            Bytes::new(),
+                        )
+                    })
+                    .collect();
+                let output = consensus_output_for_tests(2, 0, index, false);
+                let payload = TNPayload::new_for_test(parent, &output);
+                let block =
+                    execute_payload_and_update_canonical_chain(&reth_env, payload, transactions)?;
+                assert_eq!(block.recovered_block.body().transactions.len(), 2);
+                parent = block.recovered_block.clone_sealed_header();
+            }
+            Ok(())
+        })?;
+
+        // one snapshot: taking it drains the samples it reads
+        let snapshot = snapshotter.snapshot().into_vec();
+        let samples = |name: &str| -> Vec<f64> {
+            let (.., value) =
+                snapshot.iter().find(|(key, ..)| key.key().name() == name).unwrap_or_else(|| {
+                    panic!(
+                        "{name} is not registered with this test's recorder: `RETH_METRICS` was \
+                         forced before the test (run it under nextest, one process per test)"
+                    )
+                });
+            match value {
+                DebugValue::Histogram(values) => values.iter().map(|v| v.into_inner()).collect(),
+                other => panic!("{name} must be a histogram, got {other:?}"),
+            }
+        };
+        let names = [
+            "tn_reth.block_execute_seconds",
+            "tn_reth.block_signer_recovery_seconds",
+            "tn_reth.block_finish_seconds",
+            "tn_reth.block_hashed_state_seconds",
+            "tn_reth.block_state_root_seconds",
+            "tn_reth.block_overlay_extend_seconds",
+        ];
+        let [execute, recovery, finish, hashed_state, state_root, overlay_extend] =
+            names.map(samples);
+
+        for (name, values) in names.iter().zip([
+            &execute,
+            &recovery,
+            &finish,
+            &hashed_state,
+            &state_root,
+            &overlay_extend,
+        ]) {
+            assert_eq!(values.len(), BLOCKS, "{name} must record one sample per block: {values:?}");
+            assert!(values.iter().all(|v| *v > 0.0), "{name} must time real work: {values:?}");
+        }
+        // every histogram records its blocks in build order, so index `i` is block `i + 1` in all
+        for block in 0..BLOCKS {
+            assert!(
+                execute[block] >= recovery[block],
+                "signer recovery runs inside execute: {execute:?} vs {recovery:?}"
+            );
+            assert!(
+                finish[block] >= hashed_state[block] + state_root[block],
+                "hashing and the state root run one after the other inside finish: {finish:?} vs \
+                 {hashed_state:?} + {state_root:?}"
+            );
+        }
+        Ok(())
     }
 }

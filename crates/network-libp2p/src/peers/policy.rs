@@ -1,6 +1,8 @@
 //! Independent peer privileges, composed from live trust bases.
 //!
-//! These privileges never change connection, stream, memory, or per-source message budgets.
+//! The one budget these privileges change is the public connection share: a protected
+//! (important) or Closed-authorized peer takes no slot of it. Otherwise they never change
+//! connection, stream, memory, or per-source message budgets.
 //! A trusted source only bypasses the inbound kad `PutRecord` budget that untrusted sources
 //! share.
 

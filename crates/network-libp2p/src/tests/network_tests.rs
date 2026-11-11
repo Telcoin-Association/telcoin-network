@@ -7,11 +7,12 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     freshness::RecordTimestamp,
+    is_unsupported_protocol,
     types::{EpochPosition, GossipValidation, GossipVerdict, RecordDomain},
-    StreamError,
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
@@ -1197,22 +1198,21 @@ async fn spawn_listening_network(
     Ok((handle, events))
 }
 
-/// A sync stream opened to a peer that does not serve the opener's sync protocol fails at
-/// open under the swarm's lazy substream negotiation (`V1Lazy`).
+/// A sync stream opened to a peer that does not serve the opener's sync protocol opens under
+/// the swarm's lazy substream negotiation (`V1Lazy`), and the rejection fails the first read.
 ///
-/// `V1Lazy` hands an outbound substream back before the listener confirms the protocol, so
-/// a rejection would otherwise surface only on the caller's first read, after the open had
-/// "succeeded". `TNStreamProtocol::upgrade_outbound` finishes the negotiation with a
-/// zero-length read; the rejection then reaches `classify_outbound` as an `Apply` error and
-/// is classified `(StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)`, the
-/// penalty-exempt pair. The caller observes the `UpgradeFailed` half (callers read it as
-/// "this peer does not speak sync") and the connection is neither dropped nor scored.
+/// `V1Lazy` hands an outbound substream back before the listener confirms the protocol, and
+/// `TNStreamProtocol::upgrade_outbound` returns it without reading, so the opener's request
+/// travels in the same flight as the proposal. A write before the confirmation passes through
+/// to the transport. The listener's rejection reaches the first read as an io error that wraps
+/// `NegotiationError::Failed`, and `is_unsupported_protocol` classifies it (callers read it as
+/// "this peer does not speak sync"). The connection is neither dropped nor scored.
 ///
 /// A primary and a worker connect at the transport but serve different per-role sync
 /// protocols (`/tn-primary-sync-*` vs `/tn-worker-0-sync-*`). An open from the same primary
 /// to another primary is the positive control.
 #[tokio::test]
-async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Result<()> {
+async fn lazy_negotiation_sync_stream_to_wrong_role_fails_on_first_read() -> eyre::Result<()> {
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     let all_nodes =
@@ -1261,14 +1261,19 @@ async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Res
     })
     .await?;
 
-    // the worker does not serve the primary's sync protocol: the open itself fails, as an
-    // unsupported protocol, instead of returning a stream that fails on its first read
+    // the worker does not serve the primary's sync protocol: the open returns the stream, the
+    // request bytes go out with the proposal, and the first read reports the rejection
     let score_before = opener.peer_score(worker_peer_id).await?.expect("worker tracked");
-    let rejected = timeout(max_time, opener.open_stream(worker_bls)).await??;
-    assert_matches!(
-        rejected,
-        Err(NetworkError::Stream(StreamError::UpgradeFailed)),
-        "a cross-role sync open must fail at open with UpgradeFailed"
+    let mut rejected = timeout(max_time, opener.open_stream(worker_bls))
+        .await??
+        .expect("a lazy sync open returns the stream before the listener answers");
+    rejected.write_all(&[0u8; 8]).await?;
+    rejected.flush().await?;
+    let first_read = timeout(max_time, rejected.read(&mut [0u8; 1])).await?;
+    let error = first_read.expect_err("a rejected sync protocol must fail the first read");
+    assert!(
+        is_unsupported_protocol(&error),
+        "the first read must report an unsupported protocol, got {error:?}"
     );
 
     // unsupported protocol is honest role skew: the worker stays connected and unscored
@@ -1282,10 +1287,14 @@ async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Res
         "a rejected sync open must not change the peer's score"
     );
 
-    // positive control: the same-role open negotiates and the listener receives the stream
-    let _stream = timeout(max_time, opener.open_stream(primary_bls))
+    // positive control: the same-role open negotiates and the listener receives the stream.
+    // the lazy dialer buffers its proposal until the opener's first write (the request frame
+    // in production), so the opener writes before the listener can see the stream
+    let mut stream = timeout(max_time, opener.open_stream(primary_bls))
         .await??
         .expect("same-role sync open must succeed");
+    stream.write_all(&[0u8; 8]).await?;
+    stream.flush().await?;
     let inbound = timeout(max_time, primary_events.recv()).await?;
     assert_matches!(
         inbound,

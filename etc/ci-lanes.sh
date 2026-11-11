@@ -29,11 +29,11 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-vendor-reth|all>
-#        etc/ci-lanes.sh <test-default|test-adiri|test-vendor-reth> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
-# the three test lanes and nothing else, and it is the only option there is: no flag passes
+# the four test lanes and nothing else, and it is the only option there is: no flag passes
 # through to cargo, so a caller still cannot weaken a lane, only skip the run.
 #
 # NEXTEST_PROFILE selects a profile from .config/nextest.toml. CI sets it to `ci`
@@ -63,8 +63,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-vendor-reth|all>" >&2
-    echo "       $0 <test-default|test-adiri|test-vendor-reth> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only" >&2
     exit 2
 }
 
@@ -115,7 +115,12 @@ lane_clippy() {
     # resolution, and was dropped for that reason.
     run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network -p tn-worker-gateway -p tn-node-record-api -- -D warnings
     run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
-    echo "clippy passed: release graph, workspace all targets with all features"
+    # 3. The shipped tn-lmdb graph: the node binary with `tn-lmdb` on and nothing else, as
+    #    `make build-e2e-bin-tn-lmdb` and a release with the feature build it. The all-features
+    #    pass compiles the feature only beside `test-utils`, so the `#[cfg(not(feature =
+    #    "test-utils"))]` arms under `tn-lmdb` (tn-reth's backend code) compiled in no lane.
+    run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network --features telcoin-network/tn-lmdb -- -D warnings
+    echo "clippy passed: release graph, workspace all targets with all features, the tn-lmdb release graph"
 }
 
 # Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
@@ -218,6 +223,28 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
+lane_test_tn_lmdb() {
+    # lane_test_default runs every reth database on MDBX, the default backend, so it never
+    # runs reth on tn-lmdb. This is the same workspace run with tn-reth's `tn-lmdb` feature:
+    # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
+    # the CLI and every test built on them) to tn-lmdb, so between the two lanes each of those
+    # tests runs once against each engine. The feature changes only tn-reth (it adds tn-lmdb-reth
+    # as tn-reth's dependency, with no feature change on any other package), so a package with no
+    # dependency path to tn-reth, dev-dependencies included (`cargo tree --workspace -i tn-reth
+    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's,
+    # the adapter's and the engine bench's suites are such packages and are excluded. Every
+    # other package reaches tn-reth, if only through a dev-dependency, and reruns here
+    # (tn-utils, with no path either, holds a single test).
+    run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
+        --exclude tn-lmdb-bench \
+        --features tn-reth/tn-lmdb "${run_mode[@]}"
+    # The adiri-gated tn-reth suites on tn-lmdb: the consensus-registry fork tests and their
+    # determinism oracles read reth state through the database, and lane_test_adiri runs them
+    # on MDBX only. The other adiri packages have no database path of their own.
+    run cargo nextest run --locked -p tn-reth \
+        --features tn-reth/adiri,tn-reth/test-utils,tn-reth/tn-lmdb "${run_mode[@]}"
+}
+
 lane_test_vendor_reth() {
     # The vendoring tools (tn/vendor.py, tn/graph.py) and the RocksDB gate, against synthetic
     # repositories, workspaces and lockfiles.
@@ -244,7 +271,7 @@ case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri | test-vendor-reth) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-tn-lmdb | test-vendor-reth) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -256,12 +283,14 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
+test-tn-lmdb) lane_test_tn_lmdb ;;
 test-vendor-reth) lane_test_vendor_reth ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
+    lane_test_tn_lmdb
     lane_test_vendor_reth
     ;;
 *) usage ;;
