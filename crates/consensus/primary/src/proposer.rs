@@ -19,12 +19,12 @@ use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
     metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
-    ConsensusBus,
+    ConsensusBus, RecentBlocks,
 };
 use reth_metrics::metrics::Counter;
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     time::Instant,
 };
@@ -32,9 +32,9 @@ use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
-    now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
-    EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer, Round, TaskManager, TaskSpawner,
-    TnReceiver, TnSender, VotingPower, WorkerId,
+    now_ms, AuthorityIdentifier, BlockHash, BlockNumHash, BlockNumber, Certificate, Committee,
+    Database, Epoch, EpochDigest, EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer,
+    Round, TaskManager, TaskSpawner, TnReceiver, TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -165,6 +165,9 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     headers_proposed: HeadersProposedHandles,
     /// The `tn_primary_digests_requeued_total{cause}` counters, resolved once per epoch.
     digests_requeued: DigestsRequeuedHandles,
+    /// Which rule names the execution block of each new header (the `quorum_exec_block`
+    /// switches), and the adaptive policy's window state. Epoch-scoped with the proposer.
+    exec_block_policy: ExecBlockPolicy,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -301,6 +304,10 @@ impl<DB: Database> Proposer<DB> {
             key_config: config.key_config().clone(),
             headers_proposed: HeadersProposedHandles::new(),
             digests_requeued: DigestsRequeuedHandles::new(),
+            exec_block_policy: ExecBlockPolicy::new(
+                config.parameters().quorum_exec_block,
+                config.parameters().quorum_exec_block_starved_rounds,
+            ),
         }
     }
 
@@ -310,6 +317,8 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
+    /// - exec_inputs: what [`ExecBlockInputs::choose`] needs to pick the header's execution block;
+    ///   the ring is read once, right before [`Header::new`], where the tip was read before.
     #[instrument(level = "debug", skip_all, fields(round = identity.round, epoch = identity.epoch, num_digests = digests.len()))]
     async fn propose_header(
         identity: HeaderIdentity,
@@ -318,6 +327,7 @@ impl<DB: Database> Proposer<DB> {
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
         trigger: ProposalTrigger,
+        exec_inputs: ExecBlockInputs,
     ) -> ProposerResult<Header> {
         let HeaderIdentity {
             round: current_round,
@@ -376,13 +386,16 @@ impl<DB: Database> Proposer<DB> {
         // while `now_ms` reads the wall clock, and the two can disagree (e.g. after a clock step)
         let created_at = now_ms().max(min_created_at.unwrap_or_default());
 
+        // synchronous: the ring's read guard is released before the next await
+        let exec = exec_inputs.choose(consensus_bus);
+
         let header = Header::new(
             author,
             current_round,
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.header().digest()).collect(),
-            consensus_bus.app().latest_execution_block_num_hash(),
+            exec.block,
             seed_signature,
             created_at,
         );
@@ -407,6 +420,10 @@ impl<DB: Database> Proposer<DB> {
             oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
             requeued = digests.iter().filter(|d| d.requeued).count(),
             pending_before = trigger.pending_before,
+            exec_block = exec.block.number,
+            exec_tip = exec.tip.number,
+            exec_basis = exec.basis.as_str(),
+            exec_policy = exec_inputs.policy.as_str(),
             "header proposed"
         );
         trigger.proposed.increment(1);
@@ -899,7 +916,14 @@ impl<DB: Database> Proposer<DB> {
     /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
     /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
     /// does to transaction nonces.
+    ///
+    /// Every report, acted on here or not, also reaches [`ExecBlockPolicy::on_cancelled`]: under
+    /// the adaptive `quorum_exec_block` policy a cancelled own header opens a window of rounds in
+    /// which the next headers name a block a quorum already holds.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
+        // every cancel report is evidence for the execution-block policy, whatever happens to the
+        // header's digests below
+        self.exec_block_policy.on_cancelled(round, self.round);
         let mut requeued = BTreeMap::new();
         match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
@@ -1081,6 +1105,19 @@ impl<DB: Database> Proposer<DB> {
                 let authority_id = self.authority_id.clone();
                 let prior_epoch_record = self.prior_epoch_record;
                 let key_config = self.key_config.clone();
+                // an own certificate among the parents is the previous own header, certified
+                if let Some(own) = parents
+                    .iter()
+                    .find(|parent| parent.round() > 0 && parent.origin() == &authority_id)
+                {
+                    self.exec_block_policy.on_certified(own.round());
+                }
+                let exec_inputs = ExecBlockInputs::new(
+                    self.exec_block_policy.for_round(current_round),
+                    &self.committee,
+                    &authority_id,
+                    &parents,
+                );
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
@@ -1099,6 +1136,7 @@ impl<DB: Database> Proposer<DB> {
                         parents,
                         digests,
                         trigger,
+                        exec_inputs,
                     )
                     .await;
 
@@ -1402,6 +1440,344 @@ fn push_payload(
 /// proposer's log lines.
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How far below its own tip the quorum rule may name a block, in entries of the recent-blocks
+/// ring (executed outputs, not block numbers).
+///
+/// The ring's capacity is `gc_depth`, so the floor is its own constant. Under the `always` policy
+/// every proposer of an in-step fleet settles exactly here: the blocks its parents name are earlier
+/// picks of the same rule, not tips, so the quorum value can only rise through the floor.
+pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
+
+/// The bound on the adaptive policy's window, in rounds: repeated cancels double the configured
+/// `quorum_exec_block_starved_rounds` up to this value.
+///
+/// Each failed return to the own tip costs about two cancelled headers (the probe, and the next
+/// header, proposed before the probe's cancel report arrives). At this bound a proposer that stays
+/// ahead of its quorum loses about 2 of every 130 headers, under the 2 % the bench-6 certification
+/// target (98 %) leaves. A configured value above the bound is used as is and never doubled.
+pub(crate) const QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS: Round = 128;
+
+/// The rule that names a header's execution block, as the `quorum_exec_block` switches and the
+/// adaptive window select it for one header. Reported as `exec_policy` on `header proposed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecPolicy {
+    /// `quorum_exec_block: false`: the own tip, read exactly as before the switch existed.
+    Off,
+    /// `quorum_exec_block: true`, `quorum_exec_block_starved_rounds: 0`: the quorum rule on every
+    /// header.
+    Always,
+    /// The adaptive policy outside a window: the own tip.
+    Tip,
+    /// The adaptive policy inside a window opened by a cancelled own header: the quorum rule.
+    Starved,
+}
+
+impl ExecPolicy {
+    /// The value of the `exec_policy` field on `header proposed`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Always => "always",
+            Self::Tip => "tip",
+            Self::Starved => "starved",
+        }
+    }
+
+    /// Whether the header's block comes from the quorum rule rather than the own tip.
+    fn applies_quorum_rule(self) -> bool {
+        matches!(self, Self::Always | Self::Starved)
+    }
+}
+
+/// Why a header names the execution block it names. Reported as `exec_basis` on `header proposed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecBasis {
+    /// The own tip: the policy names the tip, the ring is empty, fewer than a quorum of voting
+    /// power named usable blocks, or the quorum value is at or above the own tip (the cap).
+    Tip,
+    /// The quorum value is below the own tip and no older than the floor; the block is the newest
+    /// own ring entry at or below it.
+    Quorum,
+    /// The quorum value is older than the floor: the ring entry
+    /// [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip, or the oldest entry of a shorter
+    /// ring.
+    Floor,
+}
+
+impl ExecBasis {
+    /// The value of the `exec_basis` field on `header proposed`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Tip => "tip",
+            Self::Quorum => "quorum",
+            Self::Floor => "floor",
+        }
+    }
+}
+
+/// The proposer's state for the `quorum_exec_block` switches.
+///
+/// With the switch off every header is [`ExecPolicy::Off`]; with a window of 0 every header is
+/// [`ExecPolicy::Always`]. Otherwise headers name the own tip until the certifier reports an own
+/// header cancelled uncertified; the next rounds, as many as the current window, use the quorum
+/// rule, and the policy returns to the tip when those rounds have elapsed. The return is by round
+/// number, never by comparing blocks: once several proposers use the rule, the blocks they name
+/// ratchet down, so a test such as "the quorum value reached my tip" would never pass.
+///
+/// A cancel that is counted doubles the next window, up to
+/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]. An own header proposed outside a window (under the tip
+/// policy) that certified resets the next window to the configured value. A header certified
+/// inside a window does not, even when its quorum value reached the tip:
+/// it shows the quorum rule works, not that the tip would, and resetting there would make every
+/// return to the tip fail at the configured window's rate (about one probe and two lost headers
+/// every `K + 2` rounds) while the proposer stays ahead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecBlockPolicy {
+    /// `quorum_exec_block`.
+    enabled: bool,
+    /// `quorum_exec_block_starved_rounds`: 0 for the quorum rule on every header, otherwise the
+    /// window a first cancel opens.
+    base_window: Round,
+    /// The window the next counted cancel opens.
+    next_window: Round,
+    /// The proposer's round when the current run of windows opened; rounds above it and at or
+    /// below [`Self::starved_through`] use the quorum rule. A header at or below it was built
+    /// before that run, so its cancel belongs to the episode that opened the run and is not
+    /// counted again.
+    window_start: Round,
+    /// The last round of the current window; 0 before any window.
+    starved_through: Round,
+}
+
+impl ExecBlockPolicy {
+    /// The policy for the switch values `quorum_exec_block` and
+    /// `quorum_exec_block_starved_rounds`.
+    pub(crate) fn new(enabled: bool, starved_rounds: u32) -> Self {
+        Self {
+            enabled,
+            base_window: starved_rounds,
+            next_window: starved_rounds,
+            window_start: 0,
+            starved_through: 0,
+        }
+    }
+
+    /// Whether the adaptive policy (own tip, quorum rule in windows) is in force.
+    fn adaptive(&self) -> bool {
+        self.enabled && self.base_window > 0
+    }
+
+    /// Whether a header at `round` falls in the current window.
+    fn in_window(&self, round: Round) -> bool {
+        round > self.window_start && round <= self.starved_through
+    }
+
+    /// The rule for the header proposed at `round`.
+    pub(crate) fn for_round(&self, round: Round) -> ExecPolicy {
+        if !self.enabled {
+            ExecPolicy::Off
+        } else if self.base_window == 0 {
+            ExecPolicy::Always
+        } else if self.in_window(round) {
+            ExecPolicy::Starved
+        } else {
+            ExecPolicy::Tip
+        }
+    }
+
+    /// The certifier cancelled the own header at `header_round` uncertified while the proposer is
+    /// at `proposer_round` (the round of its newest header, whose block is already chosen).
+    ///
+    /// A header built before the current run of windows opened is ignored: the cancel of the
+    /// header that opened the run lags the next header by a round, and that next header named its
+    /// tip too. Any other cancel, of a tip header after a window or of a header inside one, opens
+    /// a window for the rounds after `proposer_round` (or extends the current one) and doubles the
+    /// next window.
+    pub(crate) fn on_cancelled(&mut self, header_round: Round, proposer_round: Round) {
+        if !self.adaptive() || header_round <= self.window_start {
+            return;
+        }
+        // a cancel that arrives at the window's last round extends the run instead: that round's
+        // header was built under the rule and must stay inside it, or its certificate would read
+        // as a certified tip header and reset the window it just doubled
+        if proposer_round > self.starved_through {
+            // the previous window is spent: a new run starts after the proposer's round
+            self.window_start = proposer_round;
+        }
+        self.starved_through =
+            self.starved_through.max(proposer_round.saturating_add(self.next_window));
+        self.next_window = self
+            .next_window
+            .saturating_mul(2)
+            .min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS)
+            .max(self.base_window);
+    }
+
+    /// The own header at `header_round` certified: its certificate is a parent of the next header.
+    ///
+    /// Resets the next window to the configured value when that header was proposed outside a
+    /// window, under the tip policy. A header inside a window whose quorum value reached the own
+    /// tip (`exec_basis=tip`) does not reset it; the next certified tip header does.
+    pub(crate) fn on_certified(&mut self, header_round: Round) {
+        if self.adaptive() && !self.in_window(header_round) {
+            self.next_window = self.base_window;
+        }
+    }
+}
+
+/// One parent certificate's named execution block, as the quorum rule reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParentExecBlock {
+    /// The certificate's author.
+    pub(crate) author: AuthorityIdentifier,
+    /// The author's voting power in the proposer's committee.
+    pub(crate) power: VotingPower,
+    /// The certificate's epoch.
+    pub(crate) epoch: Epoch,
+    /// The certificate's round; 0 for a genesis certificate.
+    pub(crate) round: Round,
+    /// The number of the execution block the certificate's header names.
+    pub(crate) number: BlockNumber,
+}
+
+impl ParentExecBlock {
+    /// The named block of `parent`, weighted by its author's power in `committee`.
+    fn new(parent: &Certificate, committee: &Committee) -> Self {
+        Self {
+            author: parent.origin().clone(),
+            power: committee.voting_power_by_id(parent.origin()),
+            epoch: parent.epoch(),
+            round: parent.round(),
+            number: parent.header().latest_execution_block().number,
+        }
+    }
+}
+
+/// Everything the execution-block choice needs except the ring, fixed when the proposal is
+/// spawned.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecBlockInputs {
+    /// The rule for this header.
+    pub(crate) policy: ExecPolicy,
+    /// This proposer's authority: its tip stands for it, and its own certificate is skipped.
+    pub(crate) author: AuthorityIdentifier,
+    /// This proposer's voting power.
+    pub(crate) own_power: VotingPower,
+    /// The header's epoch: parents from another epoch are skipped.
+    pub(crate) epoch: Epoch,
+    /// The committee's quorum threshold (2f+1) in voting power.
+    pub(crate) quorum_threshold: VotingPower,
+    /// The header's parents' named blocks; empty unless the policy applies the quorum rule.
+    pub(crate) parents: Vec<ParentExecBlock>,
+}
+
+impl ExecBlockInputs {
+    /// The inputs for a header by `author` on `parents` under `policy`.
+    fn new(
+        policy: ExecPolicy,
+        committee: &Committee,
+        author: &AuthorityIdentifier,
+        parents: &[Certificate],
+    ) -> Self {
+        let parents = if policy.applies_quorum_rule() {
+            parents.iter().map(|parent| ParentExecBlock::new(parent, committee)).collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            policy,
+            author: author.clone(),
+            own_power: committee.voting_power_by_id(author),
+            epoch: committee.epoch(),
+            quorum_threshold: committee.quorum_threshold(),
+            parents,
+        }
+    }
+
+    /// Choose the header's execution block from the bus's recent-blocks ring.
+    ///
+    /// Synchronous on purpose: the ring is read once per proposal and the watch's read guard is
+    /// dropped on return, before the caller reaches an await.
+    fn choose(&self, consensus_bus: &ConsensusBus) -> ExecBlockChoice {
+        if self.policy == ExecPolicy::Off {
+            // the switch is off: the call headers have always used, so their bytes do not change
+            let tip = consensus_bus.app().latest_execution_block_num_hash();
+            return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+        }
+        let ring = consensus_bus.app().recent_blocks().borrow();
+        choose_exec_block(&ring, self)
+    }
+}
+
+/// The execution block a header names, the own tip it was chosen against and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecBlockChoice {
+    /// The block the header names.
+    pub(crate) block: BlockNumHash,
+    /// The proposer's own executed tip when the block was chosen.
+    pub(crate) tip: BlockNumHash,
+    /// Why this block.
+    pub(crate) basis: ExecBasis,
+}
+
+/// Choose the execution block for a header from this node's recent-blocks `ring` (its newest
+/// entry is the own tip) and the header's parents (issue #1804, design D).
+///
+/// Under a policy that applies the quorum rule:
+/// - the own tip counts once, for the own authority; each parent from another author counts when it
+///   is of the header's epoch and not genesis (round 0). An own certificate among the parents is
+///   skipped, and an author is counted at most once (its first certificate);
+/// - the values are ranked by number and weighted by voting power: the quorum value is the highest
+///   number that holders of at least `quorum_threshold` power have reached. With less usable power
+///   than that the own tip is named;
+/// - the quorum value is capped at the own tip: a higher block is one this node cannot vouch for,
+///   and letting f Byzantine parents pick it would bring the starvation back;
+/// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
+///   oldest entry of a shorter ring);
+/// - the block is the newest own ring entry at or below the value, so the number and the hash are
+///   always this node's own execution, never a parent's hash.
+///
+/// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
+/// An empty ring names the default block, as the tip read did before the switch existed.
+pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
+    let tip = ring.latest_execution_block_num_hash();
+    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    if !inputs.policy.applies_quorum_rule() || ring.is_empty() {
+        return own_tip;
+    }
+
+    let mut counted = BTreeSet::from([&inputs.author]);
+    let mut values = vec![(tip.number, inputs.own_power)];
+    for parent in &inputs.parents {
+        if parent.epoch == inputs.epoch && parent.round > 0 && counted.insert(&parent.author) {
+            values.push((parent.number, parent.power));
+        }
+    }
+    // highest first; the order among equal numbers cannot change the number the walk returns
+    values.sort_unstable_by_key(|(number, _)| Reverse(*number));
+    let mut holders: VotingPower = 0;
+    let quorum_value = values.iter().find_map(|(number, power)| {
+        holders = holders.saturating_add(*power);
+        (holders >= inputs.quorum_threshold).then_some(*number)
+    });
+    let Some(quorum_value) = quorum_value.filter(|value| *value < tip.number) else {
+        // too little usable power, or the cap: the own tip
+        return own_tip;
+    };
+
+    let Some(floor) = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES) else {
+        return own_tip;
+    };
+    if quorum_value < floor.number {
+        return ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor };
+    }
+    // the floor entry is at or below the value, so the lookup always finds an entry
+    match ring.newest_at_or_below(quorum_value) {
+        Some(block) => ExecBlockChoice { block, tip, basis: ExecBasis::Quorum },
+        None => ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor },
+    }
 }
 
 #[cfg(test)]

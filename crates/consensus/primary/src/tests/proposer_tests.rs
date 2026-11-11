@@ -83,6 +83,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         proposer.last_parents,
         selected,
         untracked_trigger(),
+        exec_off(&committee, &primary.id()),
     )
     .await?;
 
@@ -564,6 +565,7 @@ async fn propose_round_two(
         parents,
         VecDeque::new(),
         untracked_trigger(),
+        exec_off(committee, &primary.id()),
     )
     .await
     .expect("header proposed");
@@ -1768,4 +1770,676 @@ async fn test_requeue_causes_move_each_header_once() {
     assert_eq!(lines[1].u64_field("from_round"), Some(2));
     assert_eq!(lines[1].u64_field("round"), Some(5));
     assert_eq!(requeued_totals(&snapshotter), [Some(2), Some(1)]);
+}
+
+// ---- bench6 quorum-exec-block ----
+
+/// [`ExecBlockInputs`] with the `quorum_exec_block` switch off, for tests that drive
+/// [`Proposer::propose_header`] directly: the header names the own tip exactly as before.
+fn exec_off(committee: &Committee, author: &AuthorityIdentifier) -> ExecBlockInputs {
+    ExecBlockInputs::new(ExecPolicy::Off, committee, author, &[])
+}
+
+/// The final block of executed output `output` in the quorum-exec-block models: three blocks per
+/// output, so ring entries and block numbers differ.
+fn exec_output_block(output: u64) -> tn_types::SealedHeader {
+    tn_types::SealedHeader::seal_slow(tn_types::ExecHeader {
+        number: 100 + 3 * output,
+        ..Default::default()
+    })
+}
+
+/// Push executed output `output` onto `ring` and return its final block.
+fn push_exec_output(ring: &mut RecentBlocks, output: u64) -> BlockNumHash {
+    let block = exec_output_block(output);
+    let num_hash = block.num_hash();
+    let consensus =
+        tn_types::ConsensusNumHash::new(output, tn_types::ConsensusHeaderDigest::from([7u8; 32]));
+    ring.push_latest(Round::try_from(output).expect("small model"), consensus, Some(block));
+    num_hash
+}
+
+/// A ring of capacity 50 (a `gc_depth`-sized ring) holding outputs `0..outputs`: block numbers
+/// 100, 103, 106, ...
+fn exec_ring(outputs: u64) -> RecentBlocks {
+    let mut ring = RecentBlocks::new(50);
+    for output in 0..outputs {
+        push_exec_output(&mut ring, output);
+    }
+    ring
+}
+
+/// The quorum-rule inputs of authority 0 in a ten-member, equal-power committee of epoch 3
+/// (quorum 7), on `parents`.
+fn table_inputs(policy: ExecPolicy, parents: Vec<ParentExecBlock>) -> ExecBlockInputs {
+    ExecBlockInputs {
+        policy,
+        author: AuthorityIdentifier::dummy_for_test(0),
+        own_power: 1,
+        epoch: 3,
+        quorum_threshold: 7,
+        parents,
+    }
+}
+
+/// A round-5, epoch-3 parent of power 1 by authority `id` naming block `number`.
+fn table_parent(id: u8, number: BlockNumber) -> ParentExecBlock {
+    ParentExecBlock {
+        author: AuthorityIdentifier::dummy_for_test(id),
+        power: 1,
+        epoch: 3,
+        round: 5,
+        number,
+    }
+}
+
+/// `count` parents by authorities `first..first + count`, each naming `number`.
+fn table_parents(first: u8, count: u8, number: BlockNumber) -> Vec<ParentExecBlock> {
+    (first..first + count).map(|id| table_parent(id, number)).collect()
+}
+
+/// The quorum rule, case by case, on a 20-output ring (blocks 100, 103, ..., 157; the floor entry
+/// eight back is 133) for authority 0 of a ten-member committee (quorum 7).
+///
+/// Catches: a rank by count instead of power, a missing cap or floor, a floor counted in block
+/// numbers, other-epoch, genesis, own or repeated parents counted, a hostile number moving the
+/// choice past the cap or the floor, and an empty or short ring mishandled. (The parents carry no
+/// hash here; `test_quorum_exec_block_switch_off_keeps_header_bytes` checks the header's hash is
+/// the own ring's.)
+#[test]
+fn test_quorum_exec_block_choice_table() {
+    let ring = exec_ring(20);
+    let tip = ring.latest_execution_block_num_hash();
+    assert_eq!(tip.number, 157);
+    let entry = |number: BlockNumber| ring.newest_at_or_below(number).expect("ring entry");
+    let other_epoch = |id: u8, number| ParentExecBlock { epoch: 2, ..table_parent(id, number) };
+    let genesis = |id: u8| ParentExecBlock { round: 0, number: 0, ..table_parent(id, 0) };
+    let weighted = |id: u8, power, number| ParentExecBlock { power, ..table_parent(id, number) };
+
+    let cases: Vec<(&str, ExecPolicy, Vec<ParentExecBlock>, BlockNumber, ExecBasis)> = vec![
+        ("in step", ExecPolicy::Always, table_parents(1, 9, 157), 157, ExecBasis::Tip),
+        (
+            "ahead by one output",
+            ExecPolicy::Always,
+            table_parents(1, 9, 154),
+            154,
+            ExecBasis::Quorum,
+        ),
+        (
+            "ahead by six outputs",
+            ExecPolicy::Always,
+            table_parents(1, 9, 139),
+            139,
+            ExecBasis::Quorum,
+        ),
+        (
+            "three parents at the tip are not a quorum with the own tip",
+            ExecPolicy::Always,
+            [table_parents(1, 3, 157), table_parents(4, 6, 139)].concat(),
+            139,
+            ExecBasis::Quorum,
+        ),
+        (
+            "six parents at the tip are a quorum with the own tip",
+            ExecPolicy::Always,
+            [table_parents(1, 6, 157), table_parents(7, 3, 139)].concat(),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "own node behind: the cap",
+            ExecPolicy::Always,
+            table_parents(1, 9, 170),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "a quorum value between entries resolves to the own entry below it",
+            ExecPolicy::Always,
+            table_parents(1, 9, 150),
+            148,
+            ExecBasis::Quorum,
+        ),
+        (
+            "older than the floor",
+            ExecPolicy::Always,
+            table_parents(1, 9, 120),
+            133,
+            ExecBasis::Floor,
+        ),
+        ("exactly the floor", ExecPolicy::Always, table_parents(1, 9, 133), 133, ExecBasis::Quorum),
+        (
+            "fewer than a quorum of usable parents",
+            ExecPolicy::Always,
+            table_parents(1, 5, 139),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "other-epoch and genesis parents are not usable",
+            ExecPolicy::Always,
+            [
+                table_parents(1, 4, 139),
+                vec![other_epoch(5, 139), other_epoch(6, 139), genesis(7), genesis(8), genesis(9)],
+            ]
+            .concat(),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "the own certificate among the parents is skipped",
+            ExecPolicy::Always,
+            [vec![table_parent(0, 139)], table_parents(1, 5, 139)].concat(),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "an author counts once",
+            ExecPolicy::Always,
+            [table_parents(1, 4, 139), vec![table_parent(1, 139), table_parent(2, 139)]].concat(),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "ranked by voting power, not by count",
+            ExecPolicy::Always,
+            vec![weighted(1, 4, 139), weighted(2, 1, 139), weighted(3, 1, 139)],
+            139,
+            ExecBasis::Quorum,
+        ),
+        (
+            "f hostile parents naming a huge number do not move the choice",
+            ExecPolicy::Always,
+            [table_parents(1, 3, u64::MAX), table_parents(4, 6, 151)].concat(),
+            151,
+            ExecBasis::Quorum,
+        ),
+        (
+            "f low parents beside six honest ones at the tip do not move the choice",
+            ExecPolicy::Always,
+            [table_parents(1, 3, 0), table_parents(4, 6, 157)].concat(),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "f low parents in a minimal parent set drag the choice to the floor and no lower",
+            ExecPolicy::Always,
+            [table_parents(1, 3, 0), table_parents(4, 3, 157)].concat(),
+            133,
+            ExecBasis::Floor,
+        ),
+        (
+            "the starved window applies the rule",
+            ExecPolicy::Starved,
+            table_parents(1, 9, 139),
+            139,
+            ExecBasis::Quorum,
+        ),
+        (
+            "the tip policy ignores the parents",
+            ExecPolicy::Tip,
+            table_parents(1, 9, 139),
+            157,
+            ExecBasis::Tip,
+        ),
+        (
+            "the switch off ignores the parents",
+            ExecPolicy::Off,
+            table_parents(1, 9, 139),
+            157,
+            ExecBasis::Tip,
+        ),
+    ];
+    for (name, policy, parents, number, basis) in cases {
+        let choice = choose_exec_block(&ring, &table_inputs(policy, parents));
+        assert_eq!(choice.block, entry(number), "{name}: the own ring's number and hash");
+        assert_eq!(choice.tip, tip, "{name}");
+        assert_eq!(choice.basis, basis, "{name}");
+    }
+
+    // a short ring floors at its oldest entry
+    let short = exec_ring(4);
+    let choice =
+        choose_exec_block(&short, &table_inputs(ExecPolicy::Always, table_parents(1, 9, 50)));
+    assert_eq!(choice.block, short.nth_newest(3).expect("oldest"), "the oldest of four entries");
+    assert_eq!((choice.block.number, choice.basis), (100, ExecBasis::Floor));
+
+    // an empty ring keeps the default block the tip read returned before the switch
+    let empty = RecentBlocks::new(50);
+    let choice =
+        choose_exec_block(&empty, &table_inputs(ExecPolicy::Always, table_parents(1, 9, 139)));
+    assert_eq!(choice.block, empty.latest_execution_block_num_hash());
+    assert_eq!(choice.block.number, 0, "the default header's block");
+    assert_eq!(choice.basis, ExecBasis::Tip);
+}
+
+/// What one in-step fleet run of the self-feeding model records per round and node: how many
+/// outputs the named block trails the tip, the policy and the basis.
+type FleetRound = Vec<(usize, ExecPolicy, ExecBasis)>;
+
+/// Ten in-step proposers (one ring stands for all ten: they executed the same outputs), one new
+/// output executed before every round, each round's headers the next round's parents. Round 1
+/// builds on genesis parents. After round `r`'s proposals, each `(r, node)` in `cancels` reports
+/// that node's round-`r - 1` header cancelled; every other node's round-`r` header certifies.
+fn self_feeding_fleet(
+    starved_rounds: u32,
+    rounds: Round,
+    cancels: &[(Round, usize)],
+) -> Vec<FleetRound> {
+    const FLEET: u8 = 10;
+    let ids: Vec<_> = (0..FLEET).map(AuthorityIdentifier::dummy_for_test).collect();
+    let mut policies = vec![ExecBlockPolicy::new(true, starved_rounds); ids.len()];
+    // the fleet has been running: twelve outputs before round 1
+    let mut ring = exec_ring(12);
+    let mut history: Vec<BlockNumHash> = (0..12).map(|o| exec_output_block(o).num_hash()).collect();
+    let mut named = vec![BlockNumHash::default(); ids.len()];
+    let mut out = Vec::new();
+    for round in 1..=rounds {
+        let output = u64::try_from(history.len()).expect("small model");
+        history.push(push_exec_output(&mut ring, output));
+        let parents: Vec<ParentExecBlock> = ids
+            .iter()
+            .zip(&named)
+            .map(|(author, block)| ParentExecBlock {
+                author: author.clone(),
+                power: 1,
+                epoch: 3,
+                // genesis parents for round 1
+                round: round - 1,
+                number: block.number,
+            })
+            .collect();
+        let mut this_round = Vec::new();
+        let mut next_named = Vec::new();
+        for (author, policy) in ids.iter().zip(&policies) {
+            let inputs = ExecBlockInputs {
+                policy: policy.for_round(round),
+                author: author.clone(),
+                own_power: 1,
+                epoch: 3,
+                quorum_threshold: 7,
+                parents: parents.clone(),
+            };
+            let choice = choose_exec_block(&ring, &inputs);
+            let at = history.iter().position(|b| *b == choice.block).expect("an executed output");
+            this_round.push((history.len() - 1 - at, inputs.policy, choice.basis));
+            next_named.push(choice.block);
+        }
+        named = next_named;
+        for (node, policy) in policies.iter_mut().enumerate() {
+            if cancels.contains(&(round, node)) {
+                policy.on_cancelled(round - 1, round);
+            } else {
+                policy.on_certified(round);
+            }
+        }
+        out.push(this_round);
+    }
+    out
+}
+
+/// I-4 item 1: the choice function fed its own outputs as the next round's parents. An in-step
+/// ten-node fleet over 20 rounds settles exactly [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] outputs
+/// below its tip under `always` (the quorum value can only rise through the floor), and names its
+/// tip under the adaptive policy. Three nodes whose header was cancelled rank the other seven's
+/// fresh tips for their four-round window: they trail by the one output executed since the
+/// parents were proposed, without ratcheting, and return to the tip when the rounds are spent.
+/// With the whole fleet in a window at once the lag climbs as under `always` and drops back to 0
+/// when the window ends.
+///
+/// Catches: a rule that ranks the parents' tips it does not have (the model would show lag 0
+/// under `always`), a floor that does not hold the ratchet at N, a window that never closes or
+/// returns by value, and a starved node beside tip nodes whose lag grows round by round.
+#[test]
+fn test_quorum_exec_block_self_feeding_fleet() {
+    let n = QUORUM_EXEC_BLOCK_FLOOR_ENTRIES;
+    let always = self_feeding_fleet(0, 20, &[]);
+    for (round, nodes) in (1..).zip(&always) {
+        // round r trails by r - 1 outputs until the floor holds it at N
+        let expected = usize::min(round - 1, n);
+        for (node, (lag, policy, basis)) in nodes.iter().enumerate() {
+            assert_eq!(*policy, ExecPolicy::Always);
+            assert_eq!(*lag, expected, "always: round {round}, node {node}");
+            if round > n + 1 {
+                assert_eq!(*basis, ExecBasis::Floor, "always: round {round} sits on the floor");
+            }
+        }
+    }
+    assert!(always[n..].iter().flatten().all(|(lag, ..)| *lag == n), "lag exactly N from round 9");
+
+    let adaptive = self_feeding_fleet(4, 20, &[]);
+    assert!(
+        adaptive.iter().flatten().all(|entry| *entry == (0, ExecPolicy::Tip, ExecBasis::Tip)),
+        "adaptive, in step and certified: every header names its tip"
+    );
+
+    // nodes 0-2 learn after round 5 that their round-4 header was cancelled: rounds 6-9 use the
+    // rule
+    let cancels = [(5, 0), (5, 1), (5, 2)];
+    let windowed = self_feeding_fleet(4, 20, &cancels);
+    for (round, nodes) in (1..).zip(&windowed) {
+        for (node, (lag, policy, basis)) in nodes.iter().enumerate() {
+            let starved = node < 3 && (6..=9).contains(&round);
+            if starved {
+                assert_eq!(
+                    (*lag, *policy, *basis),
+                    (1, ExecPolicy::Starved, ExecBasis::Quorum),
+                    "round {round}, node {node}"
+                );
+            } else {
+                assert_eq!(
+                    (*lag, *policy, *basis),
+                    (0, ExecPolicy::Tip, ExecBasis::Tip),
+                    "round {round}, node {node}"
+                );
+            }
+        }
+    }
+
+    // every node learns after round 5 that its round-4 header was cancelled: for the window the
+    // parents are earlier picks of the rule, so the lag climbs one output a round as under
+    // `always`, and every node is back on its tip when the rounds are spent
+    let whole_fleet: Vec<(Round, usize)> = (0..10).map(|node| (5, node)).collect();
+    let fleet_window = self_feeding_fleet(4, 20, &whole_fleet);
+    for (round, nodes) in (1..).zip(&fleet_window) {
+        let expected = if (6..=9).contains(&round) {
+            (round - 5, ExecPolicy::Starved, ExecBasis::Quorum)
+        } else {
+            (0, ExecPolicy::Tip, ExecBasis::Tip)
+        };
+        for (node, entry) in nodes.iter().enumerate() {
+            assert_eq!(*entry, expected, "whole fleet in a window: round {round}, node {node}");
+        }
+    }
+}
+
+/// The adaptive policy's state machine: a cancel opens a window of K rounds after the proposer's
+/// round and the policy returns to the tip when they have elapsed; the lagging cancel of the
+/// header built before the window is not counted again; repeated cancels double K up to
+/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a certified tip header resets K, a header certified
+/// inside a window does not, including the window's last header when a cancel reported at that
+/// round extends the run. The switch off and the `always` policy keep no window.
+#[test]
+fn test_quorum_exec_block_adaptive_policy_state_machine() {
+    let mut policy = ExecBlockPolicy::new(true, 4);
+    assert!((1..=50).all(|round| policy.for_round(round) == ExecPolicy::Tip));
+
+    // round 3 is cancelled when round 4 is proposed: rounds 5-8 use the rule
+    policy.on_cancelled(3, 4);
+    let window = |p: &ExecBlockPolicy| -> Vec<Round> {
+        (1..=300).filter(|r| p.for_round(*r) == ExecPolicy::Starved).collect()
+    };
+    assert_eq!(window(&policy), (5..=8).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 8);
+    // round 4 named its tip before the window opened: its cancel is the same episode
+    policy.on_cancelled(4, 5);
+    assert_eq!(window(&policy), (5..=8).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 8);
+    // a header certified inside the window does not reset K
+    policy.on_certified(6);
+    assert_eq!(policy.next_window, 8);
+
+    // the rounds are spent: the round-9 tip probe is cancelled at round 10, so the doubled window
+    // covers rounds 11-18
+    assert_eq!(policy.for_round(9), ExecPolicy::Tip);
+    policy.on_cancelled(9, 10);
+    assert_eq!(window(&policy), (11..=18).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 16);
+
+    // a header inside the window cancelled: the window extends from the proposer's round
+    policy.on_cancelled(12, 13);
+    assert_eq!(window(&policy), (11..=29).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 32);
+
+    // more cancels double K up to the bound and no further
+    let mut round = 30;
+    for expected in [64, 128, 128, 128] {
+        policy.on_cancelled(round, round + 1);
+        round = policy.starved_through + 1;
+        assert_eq!(policy.next_window, expected);
+    }
+    assert_eq!(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS, 128);
+    let last = policy.starved_through;
+    assert_eq!(policy.for_round(last), ExecPolicy::Starved);
+    assert_eq!(policy.for_round(last + 1), ExecPolicy::Tip, "returns by rounds elapsed");
+
+    // a certified header that named its tip resets K to the configured value
+    policy.on_certified(last + 1);
+    assert_eq!(policy.next_window, 4);
+    policy.on_cancelled(last + 2, last + 3);
+    assert_eq!(policy.for_round(last + 4), ExecPolicy::Starved);
+    assert_eq!(policy.for_round(last + 7), ExecPolicy::Starved);
+    assert_eq!(policy.for_round(last + 8), ExecPolicy::Tip, "a fresh window of K = 4");
+
+    // round 7, inside the window 5-8, is cancelled when round 8 is proposed: the run extends, so
+    // round 8 stays a rule header and its certificate keeps the doubled K
+    let mut edge = ExecBlockPolicy::new(true, 4);
+    edge.on_cancelled(3, 4);
+    edge.on_cancelled(7, 8);
+    assert_eq!(window(&edge), (5..=16).collect::<Vec<_>>());
+    assert_eq!(edge.next_window, 16);
+    edge.on_certified(8);
+    assert_eq!(edge.next_window, 16, "a rule header's certificate does not reset K");
+
+    // a configured window above the bound is used as is
+    let mut wide = ExecBlockPolicy::new(true, 200);
+    wide.on_cancelled(1, 2);
+    wide.on_cancelled(250, 251);
+    assert_eq!(wide.next_window, 200);
+
+    // the switch off and the `always` policy ignore the reports
+    for (mut p, expected) in [
+        (ExecBlockPolicy::new(false, 4), ExecPolicy::Off),
+        (ExecBlockPolicy::new(true, 0), ExecPolicy::Always),
+    ] {
+        let before = p.clone();
+        p.on_cancelled(3, 4);
+        p.on_certified(5);
+        assert_eq!(p, before);
+        assert!((1..=50).all(|round| p.for_round(round) == expected));
+    }
+}
+
+/// A fixture of four authorities (quorum 3) whose consensus config carries `params`.
+fn exec_fixture(params: tn_config::Parameters) -> CommitteeFixture<MemDatabase> {
+    CommitteeFixture::builder(MemDatabase::default).with_consensus_parameters(params).build()
+}
+
+/// Round-`round` parents by every authority of `fixture` but the first (the proposer), each
+/// naming block `number` under a hash no ring holds.
+fn exec_parents(
+    fixture: &CommitteeFixture<MemDatabase>,
+    round: Round,
+    number: BlockNumber,
+) -> Vec<Certificate> {
+    let committee = fixture.committee();
+    fixture
+        .authorities()
+        .skip(1)
+        .map(|authority| {
+            let header = HeaderBuilder::default()
+                .author(authority.id())
+                .round(round)
+                .epoch(committee.epoch())
+                .parents(BTreeSet::new())
+                .latest_execution_block(BlockNumHash::new(number, B256::repeat_byte(0xee)))
+                .build();
+            Certificate::new_unsigned_for_test(&committee, header, Vec::new())
+                .expect("unsigned parent certificate")
+        })
+        .collect()
+}
+
+/// A bus whose ring holds twelve executed outputs: blocks 100, 103, ..., 133.
+fn exec_bus() -> ConsensusBus {
+    let cb = ConsensusBus::new_with_args(50);
+    cb.app().recent_blocks().send_modify(|ring| {
+        for output in 0..12 {
+            push_exec_output(ring, output);
+        }
+    });
+    cb
+}
+
+/// The proposer of `fixture`'s first authority on `cb`, at round 1 with `parents` (of round 1).
+fn exec_proposer(
+    fixture: &CommitteeFixture<MemDatabase>,
+    cb: &ConsensusBus,
+    task_manager: &TaskManager,
+    parents: Vec<Certificate>,
+) -> Proposer<MemDatabase> {
+    let config = fixture.first_authority().consensus_config();
+    let mut proposer = proposer_on(&config, &fixture.committee(), cb, task_manager);
+    proposer.round = 1;
+    proposer.last_parents = parents;
+    proposer
+}
+
+/// The header `proposer` builds next, and its `header proposed` line.
+async fn exec_propose(
+    proposer: &mut Proposer<MemDatabase>,
+    capture: &crate::log_capture::LogCapture,
+) -> (Header, crate::log_capture::CapturedEvent) {
+    let header = proposer
+        .propose_next_header(ProposeReason::MinDelay)
+        .expect("proposal spawned")
+        .await
+        .expect("proposal task reported")
+        .expect("header proposed");
+    let line = capture.events("header proposed").pop().expect("a header proposed line");
+    (header, line)
+}
+
+/// I-4 item 9, switch off: with the default parameters a header names
+/// `latest_execution_block_num_hash()` exactly as before, whatever its parents name, and its bytes
+/// equal the header `Header::new` builds from today's call; the `header proposed` line reports
+/// `exec_policy=off`, `exec_basis=tip`. The same ring and parents with `quorum_exec_block: true`
+/// name the quorum block, resolved from the own ring (never the parents' hash), so the switch is
+/// what decides.
+///
+/// Catches: the switch-off path reading anything but the previous call, a default that turns the
+/// rule on, a parent's hash in a header, and the four new fields missing or misnamed.
+#[tokio::test]
+async fn test_quorum_exec_block_switch_off_keeps_header_bytes() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let task_manager = TaskManager::default();
+
+    // switch off (the default parameters)
+    let fixture = exec_fixture(tn_config::Parameters::default());
+    let cb = exec_bus();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
+    assert_eq!(proposer.exec_block_policy, ExecBlockPolicy::new(false, 0));
+    let (header, line) = exec_propose(&mut proposer, &capture).await;
+
+    let today = cb.app().latest_execution_block_num_hash();
+    assert_eq!(today.number, 133);
+    assert_eq!(header.latest_execution_block(), today);
+    let rebuilt = Header::new(
+        header.author().clone(),
+        header.round(),
+        header.epoch(),
+        header.payload().clone(),
+        header.parents().clone(),
+        today,
+        header.seed_signature().cloned().unwrap_or_default(),
+        header.created_at_ms(),
+    );
+    assert_eq!(tn_types::encode(&header), tn_types::encode(&rebuilt), "header bytes unchanged");
+    assert_eq!(header.digest(), rebuilt.digest());
+    assert_eq!(line.u64_field("exec_block"), Some(133));
+    assert_eq!(line.u64_field("exec_tip"), Some(133));
+    assert_eq!(line.field("exec_basis"), Some("tip"));
+    assert_eq!(line.field("exec_policy"), Some("off"));
+
+    // switch on, rule on every header: the same ring and parents name the quorum block
+    let fixture = exec_fixture(tn_config::Parameters {
+        quorum_exec_block: true,
+        ..tn_config::Parameters::default()
+    });
+    let cb = exec_bus();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
+    let (header, line) = exec_propose(&mut proposer, &capture).await;
+    let own = cb.app().recent_blocks().borrow().newest_at_or_below(112).expect("own entry");
+    assert_eq!(own.number, 112);
+    assert_eq!(header.latest_execution_block(), own, "the own ring's hash, not the parents'");
+    assert_ne!(own.hash, B256::repeat_byte(0xee));
+    assert_eq!(line.u64_field("exec_block"), Some(112));
+    assert_eq!(line.u64_field("exec_tip"), Some(133));
+    assert_eq!(line.field("exec_basis"), Some("quorum"));
+    assert_eq!(line.field("exec_policy"), Some("always"));
+}
+
+/// The adaptive policy through the proposer: the certifier's cancel report, handled by
+/// `process_uncertified_header`, moves the next headers onto the quorum rule
+/// (`exec_policy=starved`) for K rounds, and an own certificate among a new header's parents resets
+/// K.
+///
+/// Catches: a cancel report that never reaches the policy, a window counted from anything but the
+/// proposer's round, and an own certificate that is not seen as a certified header.
+#[tokio::test]
+async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let task_manager = TaskManager::default();
+    let fixture = exec_fixture(tn_config::Parameters {
+        quorum_exec_block: true,
+        quorum_exec_block_starved_rounds: 4,
+        ..tn_config::Parameters::default()
+    });
+    let cb = exec_bus();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
+
+    // round 2 names the tip
+    let (round_two, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_two.round(), 2);
+    assert_eq!(line.field("exec_policy"), Some("tip"));
+    assert_eq!(line.u64_field("exec_block"), Some(133));
+
+    // the certifier reports a round-1 header cancelled: rounds 3-6 use the rule
+    proposer.process_uncertified_header(1, HeaderDigest::default());
+    proposer.last_parents = exec_parents(&fixture, 2, 112);
+    let (round_three, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_three.round(), 3);
+    assert_eq!(line.field("exec_policy"), Some("starved"));
+    assert_eq!(line.field("exec_basis"), Some("quorum"));
+    assert_eq!(line.u64_field("exec_block"), Some(112));
+    assert_eq!(proposer.exec_block_policy.for_round(6), ExecPolicy::Starved);
+    assert_eq!(proposer.exec_block_policy.for_round(7), ExecPolicy::Tip);
+
+    // two more counted cancels, with no certified tip header between them, double K twice; a
+    // cancel of round 3 arrives once the proposer has moved on to round 4
+    assert_eq!(proposer.exec_block_policy.next_window, 8);
+    proposer.round = 4;
+    proposer.process_uncertified_header(3, round_three.digest());
+    assert_eq!(proposer.exec_block_policy.next_window, 16);
+    proposer.round = 20;
+    proposer.process_uncertified_header(19, HeaderDigest::default());
+    assert_eq!(proposer.exec_block_policy.next_window, 32);
+
+    // the own round-40 certificate, a tip header, among the parents of round 41 resets K
+    let own = Certificate::new_unsigned_for_test(
+        &fixture.committee(),
+        HeaderBuilder::default()
+            .author(fixture.first_authority().id())
+            .round(40)
+            .epoch(fixture.committee().epoch())
+            .parents(BTreeSet::new())
+            .build(),
+        Vec::new(),
+    )
+    .expect("own certificate");
+    proposer.round = 40;
+    proposer.last_parents = [vec![own], exec_parents(&fixture, 40, 112)].concat();
+    let (round_41, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_41.round(), 41);
+    assert_eq!(line.field("exec_policy"), Some("tip"));
+    assert_eq!(proposer.exec_block_policy.next_window, 4);
 }
