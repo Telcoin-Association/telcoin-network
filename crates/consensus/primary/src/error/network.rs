@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::{consensus::ConsensusChainError, StoreError};
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
+    BcsError, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest, Round,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -65,6 +65,27 @@ pub(crate) enum PrimaryNetworkError {
     InvalidTopic,
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
+    /// A vote request that a newer request from the same author has superseded.
+    ///
+    /// The voter already received a request from this author for a later `(epoch, round)`. An
+    /// honest proposer cancels its outstanding vote requests when it proposes its next header, so
+    /// nobody waits for this answer; it is refused at once instead of being evaluated behind the
+    /// newer one. The refusal is recoverable and carries no penalty: a requester that does still
+    /// wait for it retries.
+    #[error(
+        "Vote request for epoch {epoch} round {round} superseded by a newer request from the same \
+         author for epoch {newest_epoch} round {newest_round}"
+    )]
+    SupersededRequest {
+        /// The epoch of the refused request's header.
+        epoch: Epoch,
+        /// The round of the refused request's header.
+        round: Round,
+        /// The epoch of the newest request received from the same author.
+        newest_epoch: Epoch,
+        /// The round of the newest request received from the same author.
+        newest_round: Round,
+    },
     /// Pass through from the consesus chain.
     #[error("ConsensusChainError {0}")]
     ConsensusChainError(ConsensusChainError),
@@ -133,6 +154,7 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::Timeout(_)
+            | PrimaryNetworkError::SupersededRequest { .. }
             | PrimaryNetworkError::ConsensusChainError(_) => false,
         }
     }
@@ -201,6 +223,12 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::Internal(_) => None,
+            // ignore (stale request, not a fault)
+            //
+            // the author has sent a newer request, so this one is stale, the same reason
+            // `AlreadyVotedForLaterRound` carries no penalty. only the author's own requests move
+            // the mark it is refused against, so it says nothing about another peer
+            PrimaryNetworkError::SupersededRequest { .. } => None,
         }
     }
 }
@@ -468,5 +496,31 @@ mod tests {
         let error = PrimaryNetworkError::InvalidHeader(error);
         assert!(Option::<Penalty>::from(&error).is_none());
         assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
+    }
+
+    /// A request superseded by a newer one from the same author is stale, not a fault: no penalty,
+    /// and a retryable answer, so a requester that still waits for it asks again instead of
+    /// logging `fatal request for requested vote` and giving up on this voter.
+    #[test]
+    fn superseded_request_is_recoverable_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let error = PrimaryNetworkError::SupersededRequest {
+            epoch: 3,
+            round: 7,
+            newest_epoch: 3,
+            newest_round: 9,
+        };
+        assert!(Option::<Penalty>::from(&error).is_none());
+        assert!(!error.is_author_content_fault());
+        assert!(matches!(
+            PrimaryResponse::into_error_ref(&error),
+            PrimaryResponse::RecoverableError(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Vote request for epoch 3 round 7 superseded by a newer request from the same author \
+             for epoch 3 round 9"
+        );
     }
 }

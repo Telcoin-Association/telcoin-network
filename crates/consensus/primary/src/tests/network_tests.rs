@@ -4793,3 +4793,669 @@ async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<(
     assert!(vote_info.is_none(), "a refused header stores no vote");
     Ok(())
 }
+
+// ---- bench6 voter-lock ----
+
+/// A handler for the first authority with [`Parameters::vote_queue_fix`] set to `on`.
+async fn create_test_types_vote_queue_fix(path: &Path, on: bool) -> TestTypes {
+    let params = Parameters { vote_queue_fix: on, ..Default::default() };
+    create_test_types_with_params(path, Some(params)).await
+}
+
+/// A header from `author` at `round` that names `block`, created long before the clock's now.
+fn header_at(
+    committee: &CommitteeFixture<MemDatabase>,
+    author: &AuthorityFixture<MemDatabase>,
+    round: Round,
+    block: BlockNumHash,
+) -> Header {
+    author
+        .header_builder_at_round(&committee.committee(), round)
+        .latest_execution_block(block)
+        .build()
+}
+
+/// The counter `name` in `snapshotter`'s next snapshot, zero while unregistered.
+fn counter_value(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count) if key.key().name() == name => Some(count),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Records every event at one level on one target as `message key=value ...` on the thread it is
+/// installed on with [`tracing::subscriber::set_default`].
+struct LinesAt {
+    /// The target recorded.
+    target: &'static str,
+    /// The level recorded.
+    level: tracing::Level,
+    /// The lines recorded, in order.
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for LinesAt {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == self.target && *metadata.level() == self.level
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LineVisitor(&mut line));
+        self.lines.lock().push(line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Five requests queued for one author whose block has not executed are all answered one
+/// execution wait after they arrive, not one wait after another.
+///
+/// The same header five times (retries piling up): every request waits before the author lock,
+/// side by side, then each takes the lock in turn and finds the block still missing without
+/// waiting again, so all five are refused `ExecutionBehind` at one second. Rounds 1 to 5 from
+/// another author, arriving in order: after the shared wait the four older rounds are refused as
+/// superseded by round 5, which alone reaches the lock.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    let behind = |res: &Result<PrimaryResponse, PrimaryNetworkError>| {
+        matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+                header_block: 1,
+                local_block: 0
+            }))
+        )
+    };
+
+    let author = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let peer = *author.authority().protocol_key();
+    let header = header_at(&committee, author, 1, unexecuted);
+    let start = tokio::time::Instant::now();
+    let results =
+        futures::future::join_all((0..5).map(|_| handler.vote(peer, header.clone(), Vec::new())))
+            .await;
+    let waited = start.elapsed();
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "five copies must be answered after one execution wait, took {waited:?}"
+    );
+    assert!(results.iter().all(behind), "every copy is behind: {results:?}");
+
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let start = tokio::time::Instant::now();
+    let results = futures::future::join_all((1..=5).map(|round| {
+        handler.vote(peer, header_at(&committee, author, round, unexecuted), Vec::new())
+    }))
+    .await;
+    let waited = start.elapsed();
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "five rounds must be answered after one execution wait, took {waited:?}"
+    );
+    for (round, res) in (1..).zip(&results[..4]) {
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::SupersededRequest {
+                epoch: 0,
+                round: refused,
+                newest_epoch: 0,
+                newest_round: 5
+            }) if *refused == round,
+            "round {round} is superseded by round 5"
+        );
+    }
+    assert!(behind(&results[4]), "round 5 reaches the lock and is behind: {:?}", results[4]);
+
+    Ok(())
+}
+
+/// With the switch off the voter keeps the previous behaviour: requests queued for one author take
+/// the lock in turn and each waits out the execution wait under it, five seconds for five rounds,
+/// and none is refused as superseded.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_off_queued_requests_wait_in_turn() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), false).await;
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+
+    let start = tokio::time::Instant::now();
+    let results = futures::future::join_all((1..=5).map(|round| {
+        handler.vote(peer, header_at(&committee, author, round, unexecuted), Vec::new())
+    }))
+    .await;
+    let waited = start.elapsed();
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT * 5 && waited < VOTE_EXECUTION_WAIT * 6,
+        "each request waits under the lock in turn, took {waited:?}"
+    );
+    for res in &results {
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind { .. }))
+        );
+    }
+
+    Ok(())
+}
+
+/// A request for a round below the newest its author has sent is refused at once with
+/// `SupersededRequest`, before any wait: its block is not executed, and the paused clock does not
+/// move. The refusal carries no penalty and is recoverable, so the requester's `request_vote`
+/// retries it (seven sends) and reports it retryable, never the fatal `RPCError`. It is not written
+/// to the author's vote-cache entry: the newer header is still answered from that entry.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_stale_round_refused_at_once() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+
+    let newer = header_at(&committee, author, 3, executed);
+    let first = handler.vote(peer, newer.clone(), Vec::new()).await;
+    assert!(
+        !matches!(first, Err(PrimaryNetworkError::SupersededRequest { .. })),
+        "the newest request is not superseded: {first:?}"
+    );
+
+    let stale = header_at(&committee, author, 2, unexecuted);
+    let start = tokio::time::Instant::now();
+    let err =
+        handler.vote(peer, stale.clone(), Vec::new()).await.expect_err("a stale round is refused");
+    assert_eq!(start.elapsed(), Duration::ZERO, "the refusal must not wait on execution");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::SupersededRequest {
+            epoch: 0,
+            round: 2,
+            newest_epoch: 0,
+            newest_round: 3
+        }
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "the refusal must answer the requester with a retryable response"
+    );
+
+    let voter = *committee.first_authority().authority().protocol_key();
+    let (result, responses) = request_vote_in_process(&handler, voter, peer, stale).await;
+    assert_matches!(result, Err(NetworkError::RPCRetryable(_)), "the vote must stay retryable");
+    assert_eq!(responses.len(), 7, "the requester sends once and retries six times");
+    assert!(
+        responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "every refusal is recoverable: {responses:?}"
+    );
+
+    // a request at the newest round passes the mark, and the author's vote-cache entry still
+    // holds the newer header's decision: a different header for that round is refused against it
+    let again = handler.vote(peer, newer, Vec::new()).await;
+    assert_matches!(again, Ok(_), "the newer header is answered from its vote-cache entry");
+    let rival = author
+        .header_builder_at_round(&committee.committee(), 3)
+        .latest_execution_block(executed)
+        .created_at(2)
+        .build();
+    assert_matches!(
+        handler.vote(peer, rival, Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 3,
+            ours: 3
+        })),
+        "the stale refusal must leave the entry at round 3"
+    );
+
+    Ok(())
+}
+
+/// Only a header inside the window `vote_inner` would vote on moves its author's mark: one round
+/// past the committed round plus `gc_depth` is refused as too new and leaves the mark alone, so a
+/// lower round reaches the author lock (refused there by the vote cache, as without the switch)
+/// instead of being refused as superseded. A header at the window's last round does move it.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_far_future_round_does_not_move_mark() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let gc_depth = committee.first_authority().consensus_config().parameters().gc_depth;
+
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(peer, header_at(&committee, author, gc_depth + 1, executed), Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. }))
+    );
+    assert_matches!(
+        handler.vote(peer, header_at(&committee, author, 2, executed), Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "a far-future round must not move the mark"
+    );
+
+    let other = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let other_peer = *other.authority().protocol_key();
+    let at_bound = handler
+        .vote(other_peer, header_at(&committee, other, gc_depth, executed), Vec::new())
+        .await;
+    assert!(
+        !matches!(at_bound, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. }))),
+        "the window's last round is not too new: {at_bound:?}"
+    );
+    assert_matches!(
+        handler.vote(other_peer, header_at(&committee, other, 2, executed), Vec::new()).await,
+        Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round, .. })
+            if newest_round == gc_depth,
+        "the window's last round moves the mark"
+    );
+
+    Ok(())
+}
+
+/// A request that fails the peer-is-author check does not move the author's mark, and one that
+/// names another epoch's committee is outside the window, so it is refused without the wait
+/// before the author lock: the author's own round-1 header still earns a vote after both.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_unauthenticated_request_does_not_move_mark() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+
+    // another committee member relays the author's round-10 header
+    let impostor =
+        *committee.authority_fixture_by_idx(1).expect("a second").authority().protocol_key();
+    assert_matches!(
+        handler.vote(impostor, header_at(&committee, author, 10, executed), Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor))
+    );
+
+    // the author's own header for the next epoch, which this committee does not run, naming a
+    // block not executed here: refused without waiting for it
+    let next_epoch = author
+        .header_builder_at_round(&committee.committee(), 10)
+        .epoch(1)
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .build();
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler.vote(peer, next_epoch, Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { theirs: 1, ours: 0 }))
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO, "a header outside the window must not wait");
+
+    let first = committee
+        .header_builder_last_authority()
+        .latest_execution_block(executed)
+        .created_at(1)
+        .build();
+    assert_matches!(
+        handler.vote(peer, first, Vec::new()).await?,
+        PrimaryResponse::Vote(_),
+        "neither request may move the author's mark"
+    );
+
+    Ok(())
+}
+
+/// Under the author lock the voter checks the header's execution block without waiting again:
+/// an executed block votes at once; a block the canonical database cannot answer for at or below
+/// the tip is behind (`ExecutionBehind`, counted), never a fork, and the request is answered one
+/// execution wait after it arrived, not two; a block of another hash at the height is the existing
+/// fork refusal, logged once for the request; a block below the restored-state floor is the
+/// existing `BelowRestoreFloor` refusal, also without a wait.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_checks_execution_under_lock_without_waiting() -> eyre::Result<()> {
+    /// A canonical database that answers `hash` at every height, or nothing, above an optional
+    /// restored-state floor.
+    struct Canonical(Option<BlockHash>, Option<u64>);
+    impl tn_types::CanonicalExecutionReader for Canonical {
+        fn canonical_execution_hash(&self, _: u64) -> Option<BlockHash> {
+            self.0
+        }
+        fn restored_state_floor(&self) -> Option<u64> {
+            self.1
+        }
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await
+    };
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(LinesAt {
+        target: "primary",
+        level: tracing::Level::ERROR,
+        lines: lines.clone(),
+    });
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+
+    let executed = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler.vote(peer, executed, Vec::new()).await?,
+        PrimaryResponse::Vote(_),
+        "an executed block votes"
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO, "an executed block is not waited for");
+
+    // block 0 with another hash is not in the ring, and the database cannot answer for it
+    let other_hash = BlockHash::random();
+    consensus_bus.set_canonical_reader(Arc::new(Canonical(None, None)));
+    let other = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let other_peer = *other.authority().protocol_key();
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(
+            other_peer,
+            header_at(&committee, other, 1, BlockNumHash::new(0, other_hash)),
+            Vec::new(),
+        )
+        .await
+        .expect_err("an unconfirmed block cannot be voted on");
+    let waited = start.elapsed();
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+            header_block: 0,
+            local_block: 0
+        }),
+        "a database miss is behind, never a fork"
+    );
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "the request must wait once, took {waited:?}"
+    );
+    assert_eq!(
+        counter_value(&snapshotter, "tn_primary.votes_refused_execution_behind_total"),
+        1,
+        "the behind refusal is counted"
+    );
+    let logged = lines.lock().clone();
+    assert!(logged.is_empty(), "a database miss logs no fork: {logged:?}");
+
+    // the database holds another block at the height: the fork refusal, logged once
+    consensus_bus.set_canonical_reader(Arc::new(Canonical(Some(parent.hash()), None)));
+    let third = committee.authority_fixture_by_idx(2).expect("a third authority");
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler
+            .vote(
+                *third.authority().protocol_key(),
+                header_at(&committee, third, 1, BlockNumHash::new(0, other_hash)),
+                Vec::new()
+            )
+            .await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(block)))
+            if block.hash == other_hash
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO, "a fork is not waited for");
+    let logged = lines.lock().clone();
+    let forks = logged
+        .iter()
+        .filter(|line| line.starts_with("unexpected execution result received"))
+        .count();
+    assert_eq!(forks, 1, "one fork line for the request: {logged:?}");
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&third.id())?;
+    assert!(vote_info.is_none(), "a failed fork check must store no vote");
+
+    // a snapshot-restored database that holds nothing below block 1: the header's block 0 cannot
+    // be checked, the existing final refusal
+    consensus_bus.set_canonical_reader(Arc::new(Canonical(None, Some(1))));
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler
+            .vote(
+                other_peer,
+                header_at(&committee, other, 2, BlockNumHash::new(0, other_hash)),
+                Vec::new()
+            )
+            .await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+            header_block: 0,
+            floor: 1
+        }))
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO, "a block below the floor is not waited for");
+
+    Ok(())
+}
+
+/// The switch leaves the equivocation guards as they are: the same header is answered again with
+/// the vote stored for it (the recast before the author lock), a different header for the same
+/// round is refused `AlreadyVotedForLaterRound` under the lock (it passes the mark, which refuses
+/// only strictly older rounds), and a durable vote for the round refuses a different header
+/// `AlreadyVoted`.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_keeps_equivocation_refusals() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let builder =
+        || committee.header_builder_last_authority().latest_execution_block(executed).created_at(1);
+
+    let header = builder().build();
+    let PrimaryResponse::Vote(vote) = handler.vote(peer, header.clone(), Vec::new()).await? else {
+        panic!("a valid header earns a vote");
+    };
+    let PrimaryResponse::Vote(again) = handler.vote(peer, header, Vec::new()).await? else {
+        panic!("the same header is answered with the same vote");
+    };
+    assert_eq!(again.signature(), vote.signature());
+    assert_matches!(
+        handler.vote(peer, builder().created_at(2).build(), Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "a different header for the same round is equivocation"
+    );
+
+    // a fresh handler (after a restart) with the vote durable on disk
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let author_id = committee.last_authority().id();
+    let seeded = VoteInfo {
+        epoch: committee.committee().epoch(),
+        round: 1,
+        vote_digest: VoteDigest::default(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author_id, &seeded)?;
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    assert_matches!(
+        handler
+            .vote(*committee.last_authority().authority().protocol_key(), header, Vec::new())
+            .await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
+        "a durable vote for the round refuses a different header"
+    );
+
+    Ok(())
+}
+
+/// A whole-number field `name` of a recorded line.
+fn line_field(line: &str, name: &str) -> u64 {
+    let key = format!(" {name}=");
+    let at = line.find(&key).unwrap_or_else(|| panic!("no {name} in: {line}")) + key.len();
+    line[at..]
+        .split(' ')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{name} is not a number in: {line}"))
+}
+
+/// The `vote path timing` line carries `prelock_wait_ms` with the switch on or off, so parsers see
+/// one shape: with it off the field is 0 and the execution wait shows in `exec_wait_ms`; with it
+/// on the wait shows in `prelock_wait_ms`, `exec_wait_ms` is 0, and the `prelock_wait` stage
+/// histogram records it. A superseded refusal is logged with `outcome="superseded"`.
+///
+/// The stage stamps read the wall clock, so this test runs on it: about two seconds.
+#[tokio::test]
+async fn vote_path_timing_line_carries_prelock_wait() -> eyre::Result<()> {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(LinesAt {
+        target: "primary::network",
+        level: tracing::Level::DEBUG,
+        lines: lines.clone(),
+    });
+    let timing_lines = || {
+        let lines = lines.lock();
+        lines
+            .iter()
+            .filter(|line| line.starts_with("vote path timing"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let wait_ms = u64::try_from(VOTE_EXECUTION_WAIT.as_millis()).expect("a short wait");
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), false).await;
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let _ = handler.vote(peer, header_at(&committee, author, 1, unexecuted), Vec::new()).await;
+    let off = timing_lines();
+    assert_eq!(off.len(), 1, "{off:?}");
+    assert!(off[0].contains(" outcome=\"behind\" prelock_wait_ms=0 lock_ms="), "{}", off[0]);
+    assert!(line_field(&off[0], "exec_wait_ms") >= wait_ms, "{}", off[0]);
+    lines.lock().clear();
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } = {
+        // the handler resolves its vote metric handles with the recorder active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await
+    };
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let _ = handler.vote(peer, header_at(&committee, author, 2, unexecuted), Vec::new()).await;
+    let _ = handler.vote(peer, header_at(&committee, author, 1, unexecuted), Vec::new()).await;
+    let on = timing_lines();
+    assert_eq!(on.len(), 2, "{on:?}");
+    assert!(on[0].contains(" outcome=\"behind\" prelock_wait_ms="), "{}", on[0]);
+    assert!(line_field(&on[0], "prelock_wait_ms") >= wait_ms, "{}", on[0]);
+    assert_eq!(line_field(&on[0], "exec_wait_ms"), 0, "{}", on[0]);
+    assert!(on[1].contains(" outcome=\"superseded\" prelock_wait_ms=0 lock_ms=0 "), "{}", on[1]);
+    let prelock = snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.vote_stage_seconds"
+            && key.key().labels().any(|l| l.key() == "stage" && l.value() == "prelock_wait"))
+        .then_some(value)
+    });
+    let Some(DebugValue::Histogram(samples)) = prelock else {
+        panic!("the prelock_wait stage series is not registered: {prelock:?}");
+    };
+    assert_eq!(samples.len(), 1, "one pre-lock wait is recorded, the superseded refusal has none");
+    assert!(samples[0].0 >= VOTE_EXECUTION_WAIT.as_secs_f64(), "{samples:?}");
+
+    Ok(())
+}
+
+/// A request that a newer one from the same author supersedes while it queues on the author lock
+/// is refused once it takes the lock, before any check under it.
+///
+/// The author's round-1 header leads the local clock inside the drift tolerance, so its request
+/// holds the lock while the voter waits the lead out. Round 2 arrives, passes the mark and the wait
+/// before the lock, and queues; round 3 arrives and queues behind it. Round 2 is then refused as
+/// superseded by round 3 instead of being evaluated, and round 3 is evaluated. Without the check
+/// on taking the lock, round 2 would be evaluated: it passed both checks before round 3 arrived.
+#[tokio::test]
+async fn vote_queue_fix_refuses_request_superseded_on_the_lock() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let (tolerance, _) = drift_limits(&committee);
+    let holder = committee
+        .header_builder_last_authority()
+        .latest_execution_block(executed)
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(tolerance / 2)))
+        .build();
+
+    // `join_all` first polls the requests in order: round 1 takes the lock and sleeps on its
+    // lead, then rounds 2 and 3 queue on the lock
+    let mut results = futures::future::join_all([
+        handler.vote(peer, holder, Vec::new()),
+        handler.vote(peer, header_at(&committee, author, 2, executed), Vec::new()),
+        handler.vote(peer, header_at(&committee, author, 3, executed), Vec::new()),
+    ])
+    .await
+    .into_iter();
+    assert_matches!(
+        results.next(),
+        Some(Ok(PrimaryResponse::Vote(_))),
+        "round 1 holds the lock and votes"
+    );
+    assert_matches!(
+        results.next(),
+        Some(Err(PrimaryNetworkError::SupersededRequest {
+            epoch: 0,
+            round: 2,
+            newest_epoch: 0,
+            newest_round: 3
+        })),
+        "round 2 is superseded while it queues on the lock"
+    );
+    let newest = results.next();
+    assert!(
+        !matches!(newest, Some(Err(PrimaryNetworkError::SupersededRequest { .. }))),
+        "round 3 is evaluated: {newest:?}"
+    );
+
+    Ok(())
+}

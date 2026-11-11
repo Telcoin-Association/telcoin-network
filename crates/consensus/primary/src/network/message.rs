@@ -291,6 +291,11 @@ impl PrimaryResponse {
             PrimaryNetworkError::InvalidHeader(
                 HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
             ) => Self::RecoverableError(PrimaryRPCError(error.to_string())),
+            // the voter has a newer request from the same author: the requester has normally
+            // cancelled this one, and one that has not retries instead of giving up on this node
+            PrimaryNetworkError::SupersededRequest { .. } => {
+                Self::RecoverableError(PrimaryRPCError(error.to_string()))
+            }
             PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Decode(_)
             | PrimaryNetworkError::Certificate(_)

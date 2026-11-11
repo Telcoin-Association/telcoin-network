@@ -6,7 +6,7 @@ use crate::{
     metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBusApp, ExecutionCheckError, NodeMode,
+    ConsensusBusApp, ExecutionCheck, ExecutionCheckError, NodeMode,
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
@@ -134,6 +134,16 @@ pub(crate) struct RequestHandler<DB> {
     /// in the same branch, so this keeps the warning to once per author per round. Only headers
     /// whose author passed committee validation get that far, so every key is a committee member.
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
+    /// The newest `(epoch, round)` of a vote request received from each author. Read and written
+    /// only with `vote_queue_fix` on.
+    ///
+    /// A request of the same epoch and a lower round is refused as superseded before the
+    /// per-author lock, or once it takes it. An entry moves only for a request whose peer is its
+    /// author, so no peer can raise another author's mark, and only for a header of this epoch
+    /// at most `gc_depth` rounds past the committed round, so a far-future header cannot hold
+    /// back the author's real ones. Only committee members get that far, so the map holds one
+    /// entry per member at most. The lock is never held across an await.
+    newest_vote_requests: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
     /// Vote path metric handles, resolved once for this handler's epoch.
@@ -172,6 +182,7 @@ where
             consensus_certs: Default::default(),
             epoch_votes_seen: Default::default(),
             deferred_vote_warned: Default::default(),
+            newest_vote_requests: Default::default(),
             consensus_chain,
             vote_metrics: Arc::new(VoteStageHandles::new()),
             rejoin_grace_log: Default::default(),
@@ -785,6 +796,7 @@ where
             round,
             epoch,
             outcome = outcome.as_str(),
+            prelock_wait_ms = timing.stage_ms(VoteStage::PreLockWait),
             lock_ms = timing.lock.map_or(0, millis),
             validate_ms = timing.stage_ms(VoteStage::Validate),
             exec_wait_ms = timing.stage_ms(VoteStage::ExecWait),
@@ -859,6 +871,31 @@ where
             self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
             return Err(HeaderError::NotActiveCvv.into());
         }
+        if self.consensus_config.parameters().vote_queue_fix {
+            // a request queued behind the author lock used to wait out the execution wait under
+            // it, one request after another. wait here instead, side by side with the author's
+            // other requests, and refuse the ones a newer request supersedes. a header outside
+            // the window is refused by `vote_inner` before its execution check, so it neither
+            // moves the mark nor waits
+            let in_window = self.in_vote_window(&header);
+            self.refuse_superseded_request(&header, in_window)?;
+            if in_window {
+                timing.enter(VoteStage::PreLockWait);
+                let waited = timeout(
+                    VOTE_EXECUTION_WAIT,
+                    self.consensus_bus.wait_for_execution(header.latest_execution_block()),
+                )
+                .await;
+                timing.close_at(Instant::now());
+                // every other outcome is decided again by `vote_inner`, which checks execution
+                // under the lock without a wait and so without a watch to find closed
+                if matches!(waited, Ok(Err(ExecutionCheckError::Closed))) {
+                    return Err(HeaderError::ClosedWatchChannel.into());
+                }
+                // a newer request from the author may have arrived during the wait
+                self.refuse_superseded_request(&header, false)?;
+            }
+        }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
         // voted on in parallel but only one vote for an authority can proceed at a time.
@@ -867,6 +904,11 @@ where
             let lock_wait = Instant::now();
             let mut auth_last_vote = auth_lock.lock().await;
             timing.lock_acquired(lock_wait);
+            if self.consensus_config.parameters().vote_queue_fix {
+                // a newer request from the author may have arrived while this one queued on the
+                // lock: refuse it before any check under the lock, leaving the entry untouched
+                self.refuse_superseded_request(&header, false)?;
+            }
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
             if let Some((last_epoch, last_round, last_digest, last_response)) =
@@ -998,6 +1040,53 @@ where
             warned.insert(header.author().clone(), round);
         }
         first
+    }
+
+    /// Whether `header`'s epoch and round are ones this node votes on now: this committee's epoch
+    /// and a round from 1 up to the committed round plus `gc_depth`, the bound `vote_inner` refuses
+    /// as too new above.
+    fn in_vote_window(&self, header: &Header) -> bool {
+        let max_round = self
+            .consensus_bus
+            .committed_round()
+            .saturating_add(self.consensus_config.parameters().gc_depth);
+        header.epoch() == self.consensus_config.committee().epoch()
+            && header.round() != 0
+            && header.round() <= max_round
+    }
+
+    /// Refuse a vote request for `header` when its author has sent a newer one, and with `record`
+    /// make this request the author's newest.
+    ///
+    /// Only a request of the newest one's epoch and a strictly lower round is refused, so a retry
+    /// of the same header and the resend that carries missing parents pass, and a header of
+    /// another epoch keeps the answer `vote_inner` gives it. The caller has checked that the peer
+    /// is the header's author, and records only a header inside [`Self::in_vote_window`]: one past
+    /// it is never voted on, and a mark it set would refuse the author's real headers until its
+    /// rounds caught up. It is asked on arrival, after the wait before the author lock and once
+    /// the lock is taken. The refusal is `SupersededRequest`: recoverable, without a penalty, and
+    /// never written to the author's vote-cache entry.
+    fn refuse_superseded_request(&self, header: &Header, record: bool) -> PrimaryNetworkResult<()> {
+        let mut newest = self.newest_vote_requests.lock();
+        match newest.get(header.author()).copied() {
+            Some((newest_epoch, newest_round))
+                if header.epoch() == newest_epoch && header.round() < newest_round =>
+            {
+                Err(PrimaryNetworkError::SupersededRequest {
+                    epoch: header.epoch(),
+                    round: header.round(),
+                    newest_epoch,
+                    newest_round,
+                })
+            }
+            _ => {
+                // every recorded header is of this committee's epoch, so this only raises the mark
+                if record {
+                    newest.insert(header.author().clone(), (header.epoch(), header.round()));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Decide a vote request's drift tier from how far `header`'s `created_at` leads the local
@@ -1137,8 +1226,9 @@ where
         // the header and the local clock. a tier-2 answer is uncached and carries no penalty, so
         // an author can make this node repeat it at will, with the same header or with a new one
         // for the same round; decided here, each repeat costs no signature verify, no execution
-        // wait and no parent reads. a lead within the tolerance is waited out after the parent
-        // checks instead, because the time they take uses up part of it
+        // wait (with `vote_queue_fix` on, after the bounded wait before the author lock) and no
+        // parent reads. a lead within the tolerance is waited out after the parent checks
+        // instead, because the time they take uses up part of it
         if let HeaderLead::Deferred(reason) = self.check_header_lead(&header, subsecond_active)? {
             return Ok(PrimaryResponse::RecoverableError(reason));
         }
@@ -1181,14 +1271,30 @@ where
         // request, so the requester asks again soon and votes once execution has caught up
         timing.enter(VoteStage::ExecWait);
         let header_block = header.latest_execution_block();
-        match tokio::time::timeout(
-            VOTE_EXECUTION_WAIT,
-            self.consensus_bus.wait_for_execution(header_block),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(ExecutionCheckError::Fork)) => {
+        // `None` is a voter behind on execution
+        let execution = if self.consensus_config.parameters().vote_queue_fix {
+            // `vote_request` already waited before the author lock: check without waiting again,
+            // so requests queued on the lock are not held a second time each. a block not readable
+            // from the canonical database at or below the tip is behind, never a fork
+            match self.consensus_bus.check_execution_block(header_block) {
+                ExecutionCheck::Match => Some(Ok(())),
+                ExecutionCheck::Fork => Some(Err(ExecutionCheckError::Fork)),
+                ExecutionCheck::BelowFloor { floor } => {
+                    Some(Err(ExecutionCheckError::BelowFloor { floor }))
+                }
+                ExecutionCheck::NotYet | ExecutionCheck::Unconfirmed => None,
+            }
+        } else {
+            tokio::time::timeout(
+                VOTE_EXECUTION_WAIT,
+                self.consensus_bus.wait_for_execution(header_block),
+            )
+            .await
+            .ok()
+        };
+        match execution {
+            Some(Ok(())) => {}
+            Some(Err(ExecutionCheckError::Fork)) => {
                 error!(
                     target: "primary",
                     peer_hash = ?header_block,
@@ -1197,7 +1303,7 @@ where
                 );
                 return Err(HeaderError::UnknownExecutionResult(header_block).into());
             }
-            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
+            Some(Err(ExecutionCheckError::BelowFloor { floor })) => {
                 // a snapshot-restored voter holds no block below its floor, so it can neither
                 // confirm nor refute the header's and never will: a final refusal without a
                 // penalty, not a fork
@@ -1213,10 +1319,10 @@ where
                 }
                 .into());
             }
-            Ok(Err(ExecutionCheckError::Closed)) => {
+            Some(Err(ExecutionCheckError::Closed)) => {
                 return Err(HeaderError::ClosedWatchChannel.into());
             }
-            Err(_) => {
+            None => {
                 self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
                 return Err(HeaderError::ExecutionBehind {
                     header_block: header_block.number,
@@ -2030,6 +2136,9 @@ enum VoteOutcome {
     /// validator, or its execution did not reach the header's block within the voter's execution
     /// wait.
     Behind,
+    /// A recoverable refusal because a newer request from the same author had arrived
+    /// (`vote_queue_fix` on).
+    Superseded,
     /// The request or its header failed a check, or a cached refusal was returned.
     Rejected,
     /// The vote timeout fired before a decision.
@@ -2055,6 +2164,7 @@ impl VoteOutcome {
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
             )) => Self::Behind,
+            Err(PrimaryNetworkError::SupersededRequest { .. }) => Self::Superseded,
             Err(PrimaryNetworkError::Timeout(_)) => Self::Timeout,
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::Storage(_)
@@ -2085,6 +2195,7 @@ impl VoteOutcome {
             Self::Deferred => "deferred",
             Self::TooNew => "too_new",
             Self::Behind => "behind",
+            Self::Superseded => "superseded",
             Self::Rejected => "rejected",
             Self::Timeout => "timeout",
             Self::Error => "error",
@@ -2206,6 +2317,13 @@ mod tests {
         assert_eq!(outcome(Err(HeaderError::NotActiveCvv.into()), &timing), "behind");
         let behind = HeaderError::ExecutionBehind { header_block: 12, local_block: 9 };
         assert_eq!(outcome(Err(behind.into()), &timing), "behind");
+        let superseded = PrimaryNetworkError::SupersededRequest {
+            epoch: 0,
+            round: 4,
+            newest_epoch: 0,
+            newest_round: 6,
+        };
+        assert_eq!(outcome(Err(superseded), &timing), "superseded");
         let storage = HeaderError::Storage(eyre::eyre!("disk"));
         assert_eq!(outcome(Err(storage.into()), &timing), "error");
         assert_eq!(

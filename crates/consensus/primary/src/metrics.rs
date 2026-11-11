@@ -173,15 +173,22 @@ impl PrimaryMetrics {
     }
 }
 
-/// A stage of the voter's vote path, in the order `RequestHandler::vote_inner` runs them.
+/// A stage of the voter's vote path, in the order the vote path runs them: the pre-lock wait
+/// before the per-author lock, then the stages of `RequestHandler::vote_inner`.
 ///
 /// [`Self::as_str`] is the `stage` label of `tn_primary_vote_stage_seconds` and
 /// `tn_primary_vote_timeouts_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoteStage {
+    /// The bounded wait for local execution to reach the header's latest execution block, taken
+    /// before the per-author lock when `vote_queue_fix` is on.
+    ///
+    /// It runs before the vote timeout starts, so no vote timeout fires in it.
+    PreLockWait,
     /// Header checks, the drift tier decision and the seed signature verify.
     Validate,
-    /// The wait for local execution to reach the header's latest execution block.
+    /// The wait for local execution to reach the header's latest execution block, or with
+    /// `vote_queue_fix` on the check of it without a wait.
     ExecWait,
     /// The missing-parent check, parent acceptance, the wait for the parents and their checks.
     Parents,
@@ -197,10 +204,11 @@ pub(crate) enum VoteStage {
 
 impl VoteStage {
     /// The number of stages.
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
 
     /// Every stage, in vote path order. A stage's position here is its [`Self::index`].
     pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::PreLockWait,
         Self::Validate,
         Self::ExecWait,
         Self::Parents,
@@ -213,6 +221,7 @@ impl VoteStage {
     /// The static metric label for this stage.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::PreLockWait => "prelock_wait",
             Self::Validate => "validate",
             Self::ExecWait => "exec_wait",
             Self::Parents => "parents",
@@ -228,13 +237,14 @@ impl VoteStage {
     /// The match is exhaustive, so a new stage does not build until it gets a position here.
     pub(crate) const fn index(self) -> usize {
         match self {
-            Self::Validate => 0,
-            Self::ExecWait => 1,
-            Self::Parents => 2,
-            Self::LeadSleep => 3,
-            Self::SyncBatches => 4,
-            Self::VoteStore => 5,
-            Self::Persist => 6,
+            Self::PreLockWait => 0,
+            Self::Validate => 1,
+            Self::ExecWait => 2,
+            Self::Parents => 3,
+            Self::LeadSleep => 4,
+            Self::SyncBatches => 5,
+            Self::VoteStore => 6,
+            Self::Persist => 7,
         }
     }
 }
@@ -833,6 +843,7 @@ mod tests {
         assert_eq!(find("tn_primary.votes_recast_total", None), &DebugValue::Counter(1));
         assert_eq!(find("tn_primary.vote_requests_too_new_total", None), &DebugValue::Counter(1));
         let labels = [
+            "prelock_wait",
             "validate",
             "exec_wait",
             "parents",
