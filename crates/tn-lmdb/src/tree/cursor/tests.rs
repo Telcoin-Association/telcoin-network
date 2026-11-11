@@ -2652,6 +2652,20 @@ fn a_partly_misrouted_leaf() -> (MemStore, TreeRoot, u32, u64, u64) {
     (store, root, leaf, first, last)
 }
 
+/// The mirror of [`a_partly_misrouted_leaf`]: a middle leaf whose separator before it in its
+/// parent was moved inside it, to `key_of(last - 5)`, so its entries `last - 4`, `last - 2` and
+/// `last` lie inside the range its parents give it, the rest before it.
+fn a_partly_misrouted_leaf_from_below() -> (MemStore, TreeRoot, u32, u64, u64) {
+    let (mut store, root) = even_tree(1_000);
+    let (leaf, first, last) = a_middle_leaf(&store, &root);
+    assert!(last >= first + 8, "a leaf of five entries or more");
+    let path = path_to(&store, &root, first);
+    let (parent, ci) = path[path.len() - 2];
+    assert!(ci >= 1, "a middle leaf has a separator before it");
+    set_separator(&mut store, parent, usize::from(ci), last - 5);
+    (store, root, leaf, first, last)
+}
+
 /// A seek checks only the keys its search compared, so it lands in a leaf that only partly
 /// overlaps the range its parents' separators give it when those keys lie inside it: a hit, a
 /// miss and an exact hit there land, an exact miss there misses, and the landing entry is the
@@ -2795,6 +2809,38 @@ fn first_last_and_crossings_check_a_leaf_partly_outside_its_range_in_full() {
         let crossed = if forward { c.next(s, &root) } else { c.prev(s, &root) };
         assert_eq!(corrupt_message(crossed), misrouted_message(leaf), "forward {forward}");
     }
+}
+
+/// A seek that lands on an edge entry of a leaf only partly inside its range, and then leaves
+/// the leaf through that edge, checks the leaf first: `next` from its last entry and `prev` from
+/// its first are `Corrupt` with the descent's message, the cursor unset, instead of a crossing
+/// that silently skips the entries outside the range. So is a seek whose key sorts after the
+/// leaf's last key, which would settle in the next leaf: the leaf it passes through is checked
+/// before the climb.
+#[test]
+fn leaving_a_seeks_leaf_through_its_edge_checks_it_in_full() {
+    // Forward: the range's lower bound inside the leaf, the seek landing on its last entry.
+    let (store, root, leaf, _, last) = a_partly_misrouted_leaf_from_below();
+    let s = &store.reader();
+    let mut c = TreeCursor::default();
+    let hit = owned(c.seek(s, &root, None, &key_of(last)).expect("a hit")).map(|e| e.0);
+    assert_eq!(hit, Some(key_of(last)));
+    assert!(!c.leaf_checked(), "a seek's leaf");
+    assert_eq!(corrupt_message(c.next(s, &root)), misrouted_message(leaf), "next off the end");
+    assert_eq!(c.leaf_pgno(), None, "unset");
+    let mut c = TreeCursor::default();
+    let past = c.seek(s, &root, None, &key_of(last + 1));
+    assert_eq!(corrupt_message(past), misrouted_message(leaf), "a seek past the last key");
+    assert_eq!(c.leaf_pgno(), None, "unset");
+
+    // Backward: the range's upper bound inside the leaf, the seek landing on its first entry.
+    let (store, root, leaf, first, _) = a_partly_misrouted_leaf();
+    let s = &store.reader();
+    let mut c = TreeCursor::default();
+    let hit = owned(c.seek(s, &root, None, &key_of(first)).expect("a hit")).map(|e| e.0);
+    assert_eq!(hit, Some(key_of(first)));
+    assert_eq!(corrupt_message(c.prev(s, &root)), misrouted_message(leaf), "prev off the start");
+    assert_eq!(c.leaf_pgno(), None, "unset");
 }
 
 /// A seek's descent leaves its leaf unchecked ([`TreeCursor::leaf_checked`]) until the first read

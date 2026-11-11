@@ -466,8 +466,9 @@ impl DbTxMut for TnLmdbTxMut {
         self.put_kind::<T>(key, &value, DatabaseWriteOperation::PutUpsert)
     }
 
-    /// The engine's append: a key that does not sort after the table's last is refused with
-    /// MDBX's `MDBX_EKEYMISMATCH`, and nothing changes.
+    /// The engine's append: a key that sorts before the table's last is refused with MDBX's
+    /// `MDBX_EKEYMISMATCH`, and nothing changes; a key equal to the last takes its value again,
+    /// as MDBX's append does (`put_kind`).
     fn append<T: Table>(&self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
         self.put_kind::<T>(key, &value, DatabaseWriteOperation::PutAppend)
     }

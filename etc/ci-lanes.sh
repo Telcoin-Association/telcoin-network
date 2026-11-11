@@ -231,11 +231,12 @@ lane_test_tn_lmdb() {
     # tests runs once against each engine. The feature changes only tn-reth (it adds tn-lmdb-reth
     # as tn-reth's dependency, with no feature change on any other package), so a package with no
     # dependency path to tn-reth, dev-dependencies included (`cargo tree --workspace -i tn-reth
-    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's and
-    # the adapter's suites are such packages and are excluded. Every other package reaches
-    # tn-reth, if only through a dev-dependency, and reruns here (tn-utils, with no path either,
-    # holds a single test).
+    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's,
+    # the adapter's and the engine bench's suites are such packages and are excluded. Every
+    # other package reaches tn-reth, if only through a dev-dependency, and reruns here
+    # (tn-utils, with no path either, holds a single test).
     run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
+        --exclude tn-lmdb-bench \
         --features tn-reth/tn-lmdb "${run_mode[@]}"
     # The adiri-gated tn-reth suites on tn-lmdb: the consensus-registry fork tests and their
     # determinism oracles read reth state through the database, and lane_test_adiri runs them

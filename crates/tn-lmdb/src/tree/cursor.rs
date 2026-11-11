@@ -443,7 +443,11 @@ impl TreeCursor {
         } else {
             slot.checked_sub(1)
         };
-        let Some(to) = to else { return Ok(None) };
+        let Some(to) = to else {
+            // Leaving the leaf through its edge reads past the landing entry too: the crossing
+            // that follows must not skip the entries of a leaf a seek was misrouted into.
+            return self.guarded(|c| c.check_leaf(store, leaf)).map(|()| None);
+        };
         self.guarded(|c| {
             c.check_leaf(store, leaf)?;
             c.set_top_slot(to);
@@ -1221,8 +1225,9 @@ impl TreeCursor {
     }
 
     /// Settle on the leaf just entered, `leaf` the view its descent parsed: at its slot if that
-    /// names an entry, else as [`Self::land_beyond`]. The entry settled on is `read(leaf, slot)`,
-    /// returned with the leaf's page.
+    /// names an entry, else as [`Self::land_beyond`], after the leaf's full check if a seek's
+    /// descent entered it (the climb reads past its landing point). The entry settled on is
+    /// `read(leaf, slot)`, returned with the leaf's page.
     fn land<'s, S: PageRead + ?Sized, T>(
         &mut self,
         store: &'s S,
@@ -1236,6 +1241,7 @@ impl TreeCursor {
             self.state = State::At;
             return Ok(Some((read(&leaf, slot)?, leaf.page())));
         }
+        self.guarded(|c| c.check_leaf(store, leaf.page()))?;
         self.land_beyond(store, root, forward, read)
     }
 
