@@ -32,7 +32,8 @@ use eyre::WrapErr as _;
 use jsonrpsee::rpc_params;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::Child,
     sync::{
@@ -40,7 +41,7 @@ use std::{
         Arc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_test_utils::wait_until;
 use tn_types::{get_available_tcp_port, GenesisAccount, U256};
@@ -772,5 +773,273 @@ async fn epoch_close_under_load(fleet: &mut PipelineFleet) -> eyre::Result<Strin
          transfers, {head} blocks identical; records equal: {}; {}",
         records.join(", "),
         evidence.join("; ")
+    ))
+}
+
+/// The pipelined node [`test_sigkill_mid_pipeline_replays`] kills.
+const VICTIM: usize = 1;
+
+/// What a SIGKILL of [`test_sigkill_mid_pipeline_replays`] waits for in the victim's log before
+/// its offset runs.
+#[derive(Clone, Copy)]
+enum KillTrigger {
+    /// The engine queued output c while output c-1 had not executed: with the persist delay, c-1
+    /// is committing (or about to) and c builds behind it, then parks until c-1's commit ends.
+    QueuedBehindInFlight,
+    /// The engine logged `output executed` for an output that had waited behind the previous
+    /// persist: the hand-over, after which the next output's commit starts if one is parked.
+    ExecutedAfterWait,
+}
+
+impl KillTrigger {
+    /// The trigger's name for the hand-back.
+    fn name(self) -> &'static str {
+        match self {
+            Self::QueuedBehindInFlight => "queued-behind-in-flight",
+            Self::ExecutedAfterWait => "executed-after-wait",
+        }
+    }
+}
+
+/// The five kills of [`test_sigkill_mid_pipeline_replays`]: what each waits for in the victim's
+/// log and how many milliseconds later it lands.
+///
+/// Queued +0 lands while output c builds behind c-1's persist; queued +150 and +300 land inside
+/// c-1's persist delay with c built and parked, the case the test must hit; executed +60 and +380
+/// land inside or after the next output's persist, usually with nothing built behind it.
+const KILL_POINTS: [(KillTrigger, u64); 5] = [
+    (KillTrigger::QueuedBehindInFlight, 0),
+    (KillTrigger::QueuedBehindInFlight, 150),
+    (KillTrigger::ExecutedAfterWait, 60),
+    (KillTrigger::QueuedBehindInFlight, 300),
+    (KillTrigger::ExecutedAfterWait, 380),
+];
+
+/// Wait until the log behind `tail` shows `trigger`, and return the consensus number the
+/// triggering line names.
+async fn wait_for_trigger(tail: &mut LogTail, trigger: KillTrigger) -> eyre::Result<u64> {
+    let (mut queued, mut executed) = (BTreeSet::new(), BTreeSet::new());
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        for line in tail.new_lines()? {
+            let number = log_field(&line, "consensus_number");
+            if line.contains("output queued") {
+                let Some(number) = number else { continue };
+                queued.insert(number);
+                let previous = number.saturating_sub(1);
+                if matches!(trigger, KillTrigger::QueuedBehindInFlight)
+                    && queued.contains(&previous)
+                    && !executed.contains(&previous)
+                {
+                    return Ok(number);
+                }
+            } else if line.contains(OUTPUT_EXECUTED_LOG) {
+                executed.extend(number);
+                if matches!(trigger, KillTrigger::ExecutedAfterWait)
+                    && log_field(&line, "persist_wait_ms").is_some_and(|wait| wait > 0)
+                {
+                    return Ok(number.unwrap_or_default());
+                }
+            }
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "the victim's log showed no {} trigger within 180s",
+            trigger.name()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The `parentBeaconBlockRoot` of block `number` on `url`: the digest of the consensus header
+/// whose output built the block.
+fn output_of_block(url: &str, number: u64) -> eyre::Result<String> {
+    let block: Option<HashMap<String, Value>> = call_rpc(
+        url,
+        "eth_getBlockByNumber",
+        rpc_params!(format!("0x{number:x}"), false),
+        3,
+        number,
+    )?;
+    block
+        .map(|block| block_field(&block, "parentBeaconBlockRoot"))
+        .ok_or_else(|| eyre::eyre!("{url} has no block {number}"))
+}
+
+/// One SIGKILL of the victim, with what its RPC showed right before it.
+struct Kill {
+    /// What the kill waited for in the victim's log.
+    trigger: KillTrigger,
+    /// Milliseconds after the triggering line.
+    offset_ms: u64,
+    /// The consensus number the triggering line names.
+    after_output: u64,
+    /// The victim's finalized block (durable and announced).
+    finalized: u64,
+    /// The victim's latest block (the in-memory tip: built, perhaps not durable).
+    latest: u64,
+    /// Consensus outputs whose blocks lay between the two, read back from node 0 at the end.
+    outputs_in_flight: usize,
+}
+
+impl Kill {
+    /// The kill as text for the hand-back.
+    fn summary(&self) -> String {
+        format!(
+            "{} +{}ms (output {}): finalized {} latest {} outputs_in_flight {}",
+            self.trigger.name(),
+            self.offset_ms,
+            self.after_output,
+            self.finalized,
+            self.latest,
+            self.outputs_in_flight
+        )
+    }
+}
+
+/// New lines appended to a node log since the last read.
+struct LogTail {
+    /// The log file.
+    path: PathBuf,
+    /// Bytes already read.
+    offset: u64,
+    /// A trailing line without its newline yet.
+    partial: String,
+}
+
+impl LogTail {
+    /// Tail `path` from its current end.
+    fn at_end(path: PathBuf) -> eyre::Result<Self> {
+        let offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or_default();
+        Ok(Self { path, offset, partial: String::new() })
+    }
+
+    /// The complete lines appended since the last call, without ANSI escapes.
+    fn new_lines(&mut self) -> eyre::Result<Vec<String>> {
+        let mut file = std::fs::File::open(&self.path)
+            .wrap_err_with(|| format!("opening {}", self.path.display()))?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        self.offset += bytes.len() as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&bytes));
+        let complete = match self.partial.rfind('\n') {
+            Some(end) => {
+                let rest = self.partial.split_off(end + 1);
+                std::mem::replace(&mut self.partial, rest)
+            }
+            None => return Ok(Vec::new()),
+        };
+        Ok(super::common::strip_ansi(&complete).lines().map(str::to_owned).collect())
+    }
+}
+
+/// One pipelined node under load, with the persist delay, SIGKILLed five times at points read
+/// from its own log (see [`KILL_POINTS`]); the other three run sequentially. After each kill
+/// the node restarts and catches up; at the end all four hold the same chain, no node logs a
+/// forbidden line (a failed replay among them), and at least one kill caught two outputs executed
+/// past the finalized tip (one committing, the next built), read from the blocks between the
+/// victim's finalized and latest block at the kill.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "four-node pipelined persist fleet; run through the e2e lane"]
+async fn test_sigkill_mid_pipeline_replays() -> eyre::Result<()> {
+    let _permit = acquire_test_permit();
+    let test = "persist_pipeline_sigkill";
+    let tmp = tempfile::TempDir::with_prefix(test)?;
+    configure(tmp.path(), 30)?;
+    let victim = VALIDATORS[VICTIM];
+    let others = VALIDATORS.into_iter().filter(|name| *name != victim).collect::<Vec<_>>();
+    let overrides = FleetOverrides::default()
+        .parameter([victim], SWITCH, "true")
+        .parameter(others, SWITCH, "false")
+        .env([victim], PERSIST_DELAY_ENV, PERSIST_DELAY_MS.to_string())
+        .env(VALIDATORS, "RUST_LOG", NODE_LOG_FILTER);
+    let mut fleet = PipelineFleet::start(test, tmp.path(), overrides)?;
+    let result = sigkill_mid_pipeline(&mut fleet).await;
+    fleet.guard.kill_all();
+    let summary = result.wrap_err(format!("{test} failed, check logs in test_logs/{test}/"))?;
+    eprintln!("{test}: {summary}");
+    Ok(())
+}
+
+/// The body of [`test_sigkill_mid_pipeline_replays`]; returns the evidence.
+async fn sigkill_mid_pipeline(fleet: &mut PipelineFleet) -> eyre::Result<String> {
+    let given = [false, true, false, false];
+    network_advancing(&fleet.urls())?;
+    for (instance, on) in given.into_iter().enumerate() {
+        fleet.wait_for_switch(instance, on).await?;
+    }
+    let load = Load::start(fleet.url(0));
+    load.wait_flowing().await?;
+    let victim_url = fleet.url(VICTIM);
+    let mut kills = Vec::new();
+    for (trigger, offset_ms) in KILL_POINTS {
+        let mut tail =
+            LogTail::at_end(node_log_path(fleet.test, VICTIM, fleet.runs[VICTIM], false))?;
+        let after_output = wait_for_trigger(&mut tail, trigger).await?;
+        tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+        let finalized = block_number_at(&victim_url, "finalized")?;
+        let latest = block_number_at(&victim_url, "latest")?;
+        fleet.stop(VICTIM, true)?;
+        kills.push(Kill {
+            trigger,
+            offset_ms,
+            after_output,
+            finalized,
+            latest,
+            outputs_in_flight: 0,
+        });
+        fleet.wait_for_progress(get_block_number(&fleet.url(0))?, 3).await?;
+        fleet.restart(VICTIM)?;
+        fleet.wait_for_switch(VICTIM, true).await?;
+        fleet.wait_caught_up(VICTIM).await?;
+    }
+    let sent = load.finish()?;
+    let head = fleet.wait_for_common_head().await?;
+    assert_same_chain(&fleet.urls(), head)?;
+
+    // what each kill caught: the consensus outputs between the victim's finalized and latest
+    // block, read from node 0 now that the lost blocks were rebuilt identically
+    for kill in &mut kills {
+        let mut roots = BTreeSet::new();
+        for number in kill.finalized + 1..=kill.latest {
+            roots.insert(output_of_block(&fleet.url(0), number)?);
+        }
+        kill.outputs_in_flight = roots.len();
+    }
+    let caught = kills.iter().map(Kill::summary).collect::<Vec<_>>().join("; ");
+    eyre::ensure!(
+        kills.iter().all(|kill| kill.outputs_in_flight <= 2),
+        "a kill found more than two outputs executed past the finalized block: {caught}"
+    );
+    eyre::ensure!(
+        kills.iter().any(|kill| kill.outputs_in_flight == 2),
+        "no kill landed with one output committing and the next built: {caught}"
+    );
+
+    assert_switch_lines(fleet, given)?;
+    assert_no_forbidden_lines(fleet)?;
+    // the restarts themselves: no ERROR line about consistency, and every ERROR line counted
+    let mut restart_errors = 0;
+    for run in 1..=fleet.runs[VICTIM] {
+        for line in node_log_lines(fleet.test, VICTIM, run)? {
+            if line.contains(" ERROR ") {
+                restart_errors += 1;
+                eyre::ensure!(
+                    !line.to_lowercase().contains("consisten"),
+                    "restart run {run} of the victim reported a consistency error: {line}"
+                );
+            }
+        }
+    }
+    let lines = assert_engine_lines(fleet, VICTIM, true, true)?;
+    for instance in [0, 2, 3] {
+        assert_engine_lines(fleet, instance, false, false)?;
+    }
+    Ok(format!(
+        "{} kills, {sent} transfers, {head} blocks identical, {restart_errors} ERROR lines in \
+         the victim's restart runs; kills: {caught}; victim {}",
+        kills.len(),
+        lines.summary()
     ))
 }
