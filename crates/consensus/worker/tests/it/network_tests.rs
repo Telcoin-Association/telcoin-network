@@ -916,7 +916,7 @@ async fn test_report_batch_refuses_reporter_over_quota() {
         matches!(
             &err,
             WorkerNetworkError::ReporterOverQuota { peer, digest }
-                if *peer == reporter && *digest == extra_digest
+                if **peer == reporter && *digest == extra_digest
         ),
         "expected the quota error, got {err:?}"
     );

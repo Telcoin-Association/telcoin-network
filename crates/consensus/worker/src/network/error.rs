@@ -85,7 +85,10 @@ pub enum WorkerNetworkError {
     #[error("reporter {peer} is at its bound of uncommitted reported batches, refusing {digest}")]
     ReporterOverQuota {
         /// The committee key that reported the batch.
-        peer: BlsPublicKey,
+        ///
+        /// Boxed: the key is 288 bytes and would dominate the error enum (clippy
+        /// `result_large_err` and `large_enum_variant`).
+        peer: Box<BlsPublicKey>,
         /// The digest of the refused batch.
         digest: B256,
     },

@@ -511,7 +511,7 @@ where
                     "refusing a reported batch: the reporter is at its bound of uncommitted reported batches"
                 );
                 self.metrics.record_batch_report_over_quota();
-                Err(WorkerNetworkError::ReporterOverQuota { peer: *peer, digest })
+                Err(WorkerNetworkError::ReporterOverQuota { peer: Box::new(*peer), digest })
             }
             () => {
                 reported.insert(digest);
