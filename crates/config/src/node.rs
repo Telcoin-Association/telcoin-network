@@ -312,6 +312,31 @@ pub struct Parameters {
     /// `127.0.0.1` -- since it restores dialing of arbitrary internal addresses.
     #[serde(default = "Parameters::default_allow_private_forward_targets")]
     pub allow_private_forward_targets: bool,
+
+    /// Propose headers that name the execution block a quorum of parents has reached, not this
+    /// node's own newest block.
+    ///
+    /// When `true`, the proposer ranks its own tip and each same-epoch parent's latest execution
+    /// block by voting weight and names the highest block that holders of 2f+1 weight have
+    /// reached, capped at its own tip and never older than a fixed number of entries back in its
+    /// recent-blocks ring. Voters then rarely wait for, or refuse, a block they have not executed.
+    /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
+    /// keeps the previous behaviour: every header names this node's own newest executed block.
+    /// Issue #1804.
+    #[serde(default)]
+    pub quorum_exec_block: bool,
+
+    /// When the proposer applies the [`Self::quorum_exec_block`] rule. Only matters while that
+    /// switch is `true`.
+    ///
+    /// The default `0` applies the rule to every header, as first designed. A value `K` above
+    /// zero names this node's own execution tip by default and applies the rule only for `K`
+    /// rounds after one of this node's headers was cancelled uncertified, doubling `K` while that
+    /// keeps happening. With the rule on every header, the blocks parents name are earlier picks
+    /// of the same rule rather than tips, so every proposer settles at the ring floor; `K` keeps
+    /// tips in the parents. Issue #1804.
+    #[serde(default)]
+    pub quorum_exec_block_starved_rounds: u32,
 }
 
 impl Parameters {
@@ -413,6 +438,8 @@ impl Default for Parameters {
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
+            quorum_exec_block: false,
+            quorum_exec_block_starved_rounds: 0,
         }
     }
 }
@@ -564,7 +591,13 @@ impl Parameters {
     ///
     /// Every switch field must be listed here. A test fails while one is missing.
     pub fn switches(&self) -> Vec<(&'static str, SwitchValue)> {
-        vec![]
+        vec![
+            ("quorum_exec_block", SwitchValue::Bool(self.quorum_exec_block)),
+            (
+                "quorum_exec_block_starved_rounds",
+                SwitchValue::Count(u64::from(self.quorum_exec_block_starved_rounds)),
+            ),
+        ]
     }
 }
 
@@ -1184,5 +1217,38 @@ mod test {
                 assert!(!text.contains(name), "{chain} preset sets switch {name}");
             }
         }
+    }
+
+    // ---- bench6 quorum-exec-block ----
+
+    /// The value [`Parameters::switches`] lists for `name` in a file holding the `extra` lines.
+    /// The per-switch tests below share it.
+    fn listed(extra: &str, name: &str) -> String {
+        parse_with(extra)
+            .switches()
+            .into_iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_else(|| panic!("switch {name} is not listed"))
+    }
+
+    /// Both quorum-exec-block switches stay at the bench-5 behaviour unless the file sets them,
+    /// parse their arm values, and are listed next to each other.
+    #[test]
+    fn quorum_exec_block_switches_parse() {
+        let params = parse_with("");
+        assert!(!params.quorum_exec_block);
+        assert_eq!(params.quorum_exec_block_starved_rounds, 0);
+        let params = parse_with("quorum_exec_block: true\nquorum_exec_block_starved_rounds: 4");
+        assert!(params.quorum_exec_block);
+        assert_eq!(params.quorum_exec_block_starved_rounds, 4);
+        assert_eq!(listed("quorum_exec_block: true", "quorum_exec_block"), "true");
+        assert_eq!(
+            listed("quorum_exec_block_starved_rounds: 4", "quorum_exec_block_starved_rounds"),
+            "4"
+        );
+        let names: Vec<_> = params.switches().into_iter().map(|(name, _)| name).collect();
+        let at = names.iter().position(|name| *name == "quorum_exec_block").expect("listed");
+        assert_eq!(names.get(at + 1), Some(&"quorum_exec_block_starved_rounds"));
     }
 }
