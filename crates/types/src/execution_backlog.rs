@@ -53,7 +53,10 @@ impl ExecutionBacklog {
 
     /// Record how many outputs the engine holds: the queued ones plus the one executing.
     ///
-    /// This replaces the previous value, since the queue shrinks as well as grows.
+    /// This replaces the previous value, since the queue shrinks as well as grows. The count is
+    /// read only until both a forwarded and an executed number are recorded (see
+    /// [`Self::outputs_behind`]), so a count left stale once the engine drains cannot hold the
+    /// backlog up.
     pub fn record_queued(&self, outputs: usize) {
         let outputs = u64::try_from(outputs).unwrap_or(u64::MAX);
         self.inner.queued.store(outputs, Ordering::Relaxed);
@@ -76,17 +79,16 @@ impl ExecutionBacklog {
 
     /// How many consensus outputs execution is behind.
     ///
-    /// The larger of two estimates. The last forwarded number minus the last executed one also
-    /// counts outputs still in the channel to the engine, but it is used only once both numbers
-    /// are recorded: a node that has forwarded outputs since start but not yet finished one would
-    /// otherwise read its whole history as backlog. The engine's queued count covers that gap.
-    /// Zero while nothing is recorded, and zero when execution has finished more than was
-    /// recorded as forwarded.
+    /// Once both numbers are recorded, the last forwarded number minus the last executed one. It
+    /// counts the outputs still in the channel to the engine, queued in it and executing, and it
+    /// reads zero when execution has finished more than was recorded as forwarded. Before that,
+    /// the engine's queued count: a node that has forwarded outputs since start but not yet
+    /// finished one would otherwise read its whole history as backlog. Zero while nothing is
+    /// recorded.
     pub fn outputs_behind(&self) -> u64 {
-        let queued = self.queued();
         match (self.last_forwarded(), self.last_executed()) {
-            (Some(forwarded), Some(executed)) => forwarded.saturating_sub(executed).max(queued),
-            _ => queued,
+            (Some(forwarded), Some(executed)) => forwarded.saturating_sub(executed),
+            _ => self.queued(),
         }
     }
 }
@@ -96,7 +98,7 @@ impl ExecutionBacklog {
 /// The gate closes once execution is `limit` or more outputs behind and reopens only once the
 /// backlog is below `limit - 1` (below one when `limit` is one), so a backlog hovering at the limit
 /// does not flip the gate on every output. A `limit` of zero turns the gate off: it admits
-/// everything. [`admission_open`] is the rule as a pure function.
+/// everything. [`AdmissionGate::open_after`] is the rule as a pure function.
 ///
 /// Clones share the open or closed state and the backlog.
 #[derive(Clone, Debug)]
@@ -134,35 +136,35 @@ impl AdmissionGate {
 
     /// Whether a new submission is admitted now.
     ///
-    /// Reads the backlog, applies [`admission_open`] to the gate's state from its last check and
-    /// keeps the result. Two callers that check at once can each act on the state before the
+    /// Reads the backlog, applies [`Self::open_after`] to the gate's state from its last check
+    /// and keeps the result. Two callers that check at once can each act on the state before the
     /// other's update. That costs at most one extra admission or refusal at a crossing.
     pub fn admits(&self) -> bool {
         if !self.is_enabled() {
             return true;
         }
         let was_open = self.open.load(Ordering::Relaxed);
-        let open = admission_open(was_open, self.backlog.outputs_behind(), self.limit);
+        let open = Self::open_after(was_open, self.backlog.outputs_behind(), self.limit);
         if open != was_open {
             self.open.store(open, Ordering::Relaxed);
         }
         open
     }
-}
 
-/// The hysteresis rule of [`AdmissionGate`]: whether the gate is open after it reads
-/// `outputs_behind`, given whether it was open before.
-///
-/// A `limit` of zero means no bound, so the gate is always open. An open gate closes at
-/// `outputs_behind >= limit`. A closed gate reopens at `outputs_behind < limit - 1`; with a
-/// `limit` of one that bound would be zero, which no backlog is below, so the gate reopens at a
-/// backlog of zero instead.
-pub fn admission_open(was_open: bool, outputs_behind: u64, limit: u64) -> bool {
-    if limit == 0 {
-        return true;
+    /// The hysteresis rule: whether the gate is open after it reads `outputs_behind`, given
+    /// whether it was open before.
+    ///
+    /// A `limit` of zero means no bound, so the gate is always open. An open gate closes at
+    /// `outputs_behind >= limit`. A closed gate reopens at `outputs_behind < limit - 1`; with a
+    /// `limit` of one that bound would be zero, which no backlog is below, so the gate reopens at
+    /// a backlog of zero instead.
+    pub fn open_after(was_open: bool, outputs_behind: u64, limit: u64) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        let below = if was_open { limit } else { limit.saturating_sub(1).max(1) };
+        outputs_behind < below
     }
-    let below = if was_open { limit } else { limit.saturating_sub(1).max(1) };
-    outputs_behind < below
 }
 
 /// The counters behind an [`ExecutionBacklog`].
@@ -191,7 +193,7 @@ fn decode(raw: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admission_open, AdmissionGate, ExecutionBacklog};
+    use super::{AdmissionGate, ExecutionBacklog};
 
     #[test]
     fn nothing_recorded_reads_zero() {
@@ -232,21 +234,24 @@ mod tests {
         assert_eq!(backlog.outputs_behind(), 0);
         backlog.record_queued(2);
         assert_eq!(backlog.outputs_behind(), 2);
-        backlog.record_executed(4_999);
+        backlog.record_executed(4_998);
         assert_eq!(backlog.outputs_behind(), 2);
         backlog.record_queued(0);
-        assert_eq!(backlog.outputs_behind(), 1);
+        assert_eq!(backlog.outputs_behind(), 2);
     }
 
+    /// Once both numbers are known the queued count is ignored, so a count the engine left stale
+    /// when it drained cannot keep the backlog up.
     #[test]
-    fn behind_is_the_larger_estimate() {
+    fn a_stale_queued_count_is_ignored_once_both_numbers_are_known() {
         let backlog = ExecutionBacklog::new();
         backlog.record_forwarded(10);
-        backlog.record_executed(8);
-        backlog.record_queued(5);
-        assert_eq!(backlog.outputs_behind(), 5);
         backlog.record_queued(1);
-        assert_eq!(backlog.outputs_behind(), 2);
+        assert_eq!(backlog.outputs_behind(), 1);
+        backlog.record_executed(10);
+        assert_eq!(backlog.outputs_behind(), 0);
+        backlog.record_queued(5);
+        assert_eq!(backlog.outputs_behind(), 0);
     }
 
     /// Execution ahead of the forwarded number (a replay the node did not record) saturates at
@@ -281,9 +286,11 @@ mod tests {
         assert_eq!(backlog.last_forwarded(), Some(u64::MAX - 1));
         assert_eq!(backlog.outputs_behind(), u64::MAX - 1);
         backlog.record_queued(usize::MAX);
-        let queued = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
-        assert_eq!(backlog.queued(), queued);
-        assert_eq!(backlog.outputs_behind(), queued.max(u64::MAX - 1));
+        assert_eq!(backlog.queued(), u64::try_from(usize::MAX).unwrap_or(u64::MAX));
+        assert_eq!(backlog.outputs_behind(), u64::MAX - 1);
+        let fresh = ExecutionBacklog::new();
+        fresh.record_queued(usize::MAX);
+        assert_eq!(fresh.outputs_behind(), u64::try_from(usize::MAX).unwrap_or(u64::MAX));
         backlog.record_executed(u64::MAX);
         assert_eq!(backlog.last_executed(), Some(u64::MAX - 1));
     }
@@ -361,7 +368,7 @@ mod tests {
         ];
         for (was_open, behind, limit, open) in rows {
             assert_eq!(
-                admission_open(was_open, behind, limit),
+                AdmissionGate::open_after(was_open, behind, limit),
                 open,
                 "was_open={was_open} behind={behind} limit={limit}"
             );

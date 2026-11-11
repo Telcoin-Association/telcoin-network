@@ -420,9 +420,10 @@ pub struct Parameters {
     /// Refuse RPC transaction submissions while execution is this many consensus outputs behind.
     ///
     /// When above zero, the RPC submission guard answers "txpool is full" once execution trails
-    /// the outputs forwarded to it by this many, and admits again once the backlog is below one
-    /// less than this (see [`tn_types::AdmissionGate`]). Observer forwards and re-pooled
-    /// transactions are not gated. The default `0` keeps the previous behaviour: no bound.
+    /// the outputs forwarded to it by this many ([`tn_types::ExecutionBacklog::outputs_behind`]),
+    /// and admits again once the backlog is below one less than this, or at zero when this is 1
+    /// ([`tn_types::AdmissionGate`]). Observer forwards and re-pooled transactions are not gated.
+    /// The default `0` keeps the previous behaviour: no bound.
     #[serde(default)]
     pub rpc_admission_backlog_outputs: usize,
 
