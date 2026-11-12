@@ -998,8 +998,9 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Resu
 /// [`dup_delete`] of subkey `s` from outer key `k`'s packed set, validated in the table's
 /// [`Working::packed_in`] ([`dup_entry`]). A miss changes nothing. A set of more rows is rebuilt
 /// without the row into [`Working::packed_out`], which rewrites the cell (no slot: the outer path
-/// cache names no row); the delete of a set's last row removes the cell instead (a set never
-/// empties), with the outer delete's slot, as an emptied nested tree's. The new `packed_rows`
+/// cache names no row), a replace of the outer tree, which never merges; the delete of a set's
+/// last row removes the cell instead (a set never empties), with the outer delete's slot, as an
+/// emptied nested tree's, and that delete can merge. The new `packed_rows`
 /// is counted first, so a record that cannot count the row changes nothing. The cell's write
 /// routes by `hint`, a dup cursor's outer path at `k` ([`DupHint::outer`]).
 #[inline(never)]
@@ -3072,12 +3073,18 @@ impl RwTxn {
     /// changes something since the open, and safe from a crash of the process alone at once, by
     /// its weak meta, but for a crash inside the 128-byte copy of a later meta, which rolls back
     /// to the last sync: `SyncMode::NoSync`) and return its txn id. A transaction that changed
-    /// nothing returns the id of the state it began from, with no I/O. An error latches the
+    /// nothing returns the id of the state it began from, with no I/O but, in
+    /// `SyncMode::Durable`, the sync that makes that state durable when it is not yet: a weak
+    /// head the open trusted ([`Env::sync`]), so a `Durable` commit's return means the state it
+    /// names is durable whether the commit changed anything or not. An error latches the
     /// environment, and whether the commit survives is unknown until the file is reopened.
     pub fn commit(mut self) -> Result<u64> {
         let inner = &*self.inner;
         inner.latch.check()?;
         if !self.work.changed {
+            if inner.sync_mode == SyncMode::Durable {
+                self.work.writer_mut().sync(&inner.latch)?;
+            }
             return Ok(self.work.base.txn);
         }
         let guard = UnwindLatch(&inner.latch, "a commit panicked part way");

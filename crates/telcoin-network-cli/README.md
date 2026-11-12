@@ -429,7 +429,17 @@ migrated is refused until the node has started once, and an `mdbx.dat` the node 
 it. A build with the legacy `mdbx` feature reads while the node runs, and refuses a tn-lmdb
 database (`db/tn-lmdb.dat`, or the marker `db/mdbx-migrated`) as the node does.
 `telcoin-network db load-state` never runs the migration either: it restores into a fresh
-datadir, and the default build refuses a `db/` holding `mdbx.dat` before anything opens it.
+datadir, and the default build refuses a `db/` holding `mdbx.dat`, or an unfinished migration
+(`db/tn-lmdb-migrating/` beside `tn-lmdb.dat`, which the node's next start finishes), before
+anything opens it.
+
+`telcoin-network db migrate-execution` runs the MDBX to tn-lmdb migration of the execution
+database with the node stopped, instead of at the node's next start: it refuses while a node
+holds the datadir, holds the datadir while it runs, takes the node's `--db.*` flags (pass what
+the node runs with, so the migrated file gets the same page size, reservation and growth step),
+finishes a migration a stopped start left after its commit point, refuses what the node's start
+refuses, and prints the rows migrated per table. With no MDBX database it has nothing to do. A
+build with the legacy `mdbx` feature refuses it.
 
 `telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
 and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start

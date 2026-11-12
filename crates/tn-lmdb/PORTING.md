@@ -226,8 +226,8 @@ dies. With the blocks reserved at growth, a full disk is an `io::Error` at the g
 `fallocate` mode 0. macOS: `F_PREALLOCATE` (`F_ALLOCATECONTIG | F_ALLOCATEALL`, then
 `F_ALLOCATEALL` alone, from the physical end of file), a check that `fst_bytesalloc` covers the
 range (else `ENOSPC`), then `set_len`. Where the file system cannot preallocate (`EOPNOTSUPP` or
-`ENOSYS` on Linux, `ENOTSUP` on macOS), it falls back to a sparse `set_len`, so the file still
-works without the guarantee. The close trims the preallocated tail back
+`ENOSYS` on Linux, `ENOTSUP` on macOS), it falls back to a sparse `set_len`, with a warning once
+per process (`sparse_fallback`), so the file still works without the guarantee. The close trims the preallocated tail back
 (`Writer::trim_tail`, `PageFile::trim_to`: `set_len` to the pages in use rounded up to the OS
 page) while the mapping stays. The first growth of a reopened writer cuts a tail it did not
 preallocate the same way (`PageFile::distrust_tail`). Both are `ftruncate` of a mapped file,
@@ -341,7 +341,7 @@ The engine reads a few errno values. Each is a place to check on a new OS:
 | where | errno | meaning |
 |---|---|---|
 | `file::mapped` | `ENOMEM` | a refused mapping (the writer's reservation, a read-only open's file, `Env::check`'s anonymous table of the state's pages: `check::Claims::every`) is `Error::OutOfMemory`, anything else `Error::Io` |
-| `sys::allocate_range` | Linux `EOPNOTSUPP`, `ENOSYS`; macOS `ENOTSUP` | no preallocation here: fall back to a sparse `set_len`. Every other error (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`) fails the growth |
+| `sys::allocate_range` | Linux `EOPNOTSUPP`, `ENOSYS`; macOS `ENOTSUP` | no preallocation here: fall back to a sparse `set_len`, with a warning once per process. Every other error (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`) fails the growth |
 | `sys::fsync_directory` | `EACCES` (open), `EINVAL`, `ENOTSUP`, `EOPNOTSUPP` (fsync) | skipped with a warning |
 | `sys::retry_interrupted` | `EINTR` (`ErrorKind::Interrupted`) | the call is issued again |
 | `sys::flock` | `EWOULDBLOCK` (`ErrorKind::WouldBlock`) | the lock is held: `Locked` |
@@ -391,8 +391,8 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `sys.rs` | `drop_cached_pages` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_DONTNEED)` over the file / a no-op |
 | `sys.rs` | `will_need` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_WILLNEED)` over a range (`rustix`) / a no-op |
 | `boot_record.rs` | `KEPT` | `cfg!(any(target_os = "linux", test))` | the boot record kept beside the file / none, every open drops (a no-op off Linux) |
-| `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback |
-| `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback |
+| `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback (warned once) |
+| `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback (warned once) |
 | `env.rs` | `DataSync::Ranges` | `macos` | the variant exists on macOS only |
 | `env.rs` | `DataSync::File` | `cfg_attr(all(macos, not(test)))` | `allow(dead_code)`: only a test knob picks it on macOS |
 | `env.rs` | `EnvOptions::default` | `!cfg!(linux)` | `readahead` default: off (advise `MADV_RANDOM`) on Linux only |

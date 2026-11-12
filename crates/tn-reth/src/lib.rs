@@ -98,7 +98,7 @@ pub use reth_db::{static_file::iter_static_files, Database as RethDatabaseT};
 pub use reth_errors::{ProviderError, RethError};
 pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
-    args::{ColorMode, LogArgs},
+    args::{ColorMode, DatabaseArgs, LogArgs},
     dirs::MaybePlatformPath,
 };
 /// Test-only re-export so engine tests can construct static-file provider errors.
@@ -153,8 +153,8 @@ pub use cli::{
 };
 pub use env::{
     database::{
-        db_check, db_table_stats, default_page_size, refuse_pending_migration, DbCheckReport,
-        DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
+        db_check, db_table_stats, default_page_size, migrate_reth_db, refuse_pending_migration,
+        DbCheckReport, DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
         DB_TABLE_STATS_NEEDS_STOPPED_NODE,
     },
     *,

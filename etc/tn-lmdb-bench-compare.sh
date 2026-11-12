@@ -77,8 +77,9 @@
 # the JSON), the rounds and thresholds, then one line per row: name, group, sync, base and head
 # median, ratio, min ratio, each side's spread ((max - min) / median of its pooled samples) and
 # the verdict: ok, improved, REGRESSION, not gated (a durable time row, or a row whose JSON says
-# `gate: false`: the bench marks the commit rows so in a run of fewer than 1M entries, the quick
-# tier's, where one commit is too short to hold still), or new and removed (a row on one side
+# `gate: false`: the bench marks the commit rows and the 4-thread `ro.txn.mt` so in a run of fewer
+# than 1M entries, the quick tier's, where one commit is too short to hold still and the thread
+# row wants idle cores a shared runner lacks), or new and removed (a row on one side
 # only, never gated). Lower is better for every row. When rustc or cargo processes were running
 # as the runs started, the report says so.
 #
@@ -100,15 +101,22 @@
 #                                 line saying why when there is nothing to compare)
 #   tmp/                          the runs' TMPDIR, removed at exit
 # Exit codes: 0 no gated regression (or nothing to compare), 1 a gated regression, 2 a usage,
-# environment, build or run error, or any failure the script does not expect (never 1).
+# environment, build or run error, or any failure the script does not expect (never 1). That holds
+# with stderr closed or unwritable too: the messages below are `|| true`, so a failed echo cannot
+# end the script with echo's own status, 1, under errexit.
 set -Eeuo pipefail
 # A command that fails outside an `if`, `||` or `&&` (a full disk, a permission error) would end
 # the script with its own status, which may be 1, a gated regression's code: exit 2 instead.
-trap 'rc=$?; echo "tn-lmdb-bench-compare: line $LINENO: unexpected failure (status $rc): $BASH_COMMAND" >&2; exit 2' ERR
+trap 'rc=$?; echo "tn-lmdb-bench-compare: line $LINENO: unexpected failure (status $rc): $BASH_COMMAND" >&2 || true; exit 2' ERR
 
 die() {
-    echo "tn-lmdb-bench-compare: $*" >&2
+    echo "tn-lmdb-bench-compare: $*" >&2 || true
     exit 2
+}
+# The helper's exit status as this script's: its 0 and 1 pass through; anything else (its 2, or
+# a signal, a missing python3 module) is this script's 2.
+helper_status() {
+    case "$1" in 0 | 1) echo "$1" ;; *) echo 2 ;; esac
 }
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 helper="$script_dir/tn-lmdb-bench-compare.py"
@@ -177,6 +185,7 @@ if [ -n "$report_only" ]; then
     [ "$gate_durable" = 0 ] || report_args+=(--gate-durable)
     status=0
     python3 -I "$helper" report "$report_only" ${report_args[@]+"${report_args[@]}"} || status=$?
+    status="$(helper_status "$status")"
     [ "$status" = 2 ] || echo "report: $(cd "$report_only" && pwd -P)/report.md"
     exit "$status"
 fi
@@ -447,5 +456,6 @@ done
 
 status=0
 python3 -I "$helper" report "$bench_dir" || status=$?
+status="$(helper_status "$status")"
 [ "$status" = 2 ] || echo "report: $bench_dir/report.md"
 exit "$status"

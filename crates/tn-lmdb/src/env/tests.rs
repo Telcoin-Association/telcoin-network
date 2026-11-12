@@ -1304,30 +1304,44 @@ fn a_sync_after_a_weak_commit_runs_the_durable_steps() {
 }
 
 /// A `Durable` open in the same boot trusts a `NoSync` writer's weak head, which stays weak until
-/// a sync: an `Env::sync` makes it steady (a durable commit's work, in `Durable` mode too), and so
-/// does the close when no commit replaced it; either way it then survives a reboot.
+/// a sync: an `Env::sync` makes it steady (a durable commit's work, in `Durable` mode too), so
+/// does a `Durable` commit that changed nothing (its return promises the state it names is
+/// durable), and so does the close when no commit replaced it; either way it then survives a
+/// reboot.
 #[test]
 fn a_durable_open_makes_a_trusted_weak_head_steady_at_sync_and_close() {
-    for by_close in [false, true] {
+    for by in ["sync", "no-change commit", "close"] {
         let (_dir, path) = temp();
         let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
         let first = durable_first_commit(&env);
         let txn = put_all(&env, "a", &[(b"k", b"1")]);
         env.crash();
         let env = open(&path);
-        assert_eq!(env.stat().txn_id, txn, "by_close {by_close}: the trusted weak head");
+        assert_eq!(env.stat().txn_id, txn, "by {by}: the trusted weak head");
         assert_eq!(env.with_writer(|w| w.slots), [Slot::weak(txn), Slot::steady(first)]);
-        if by_close {
+        if by == "close" {
             drop(env);
         } else {
-            env.sync().expect("sync");
-            assert_eq!(env.io_stats().commits, 1, "by_close {by_close}: the sync's durable steps");
+            if by == "sync" {
+                env.sync().expect("sync");
+            } else {
+                let rw = env.begin_rw().expect("rw");
+                assert_eq!(rw.commit().expect("commit"), txn, "by {by}: the base txn");
+            }
+            assert_eq!(env.io_stats().commits, 1, "by {by}: the sync's durable steps");
             assert_eq!(env.with_writer(|w| w.slots), [Slot::steady(txn), Slot::steady(first)]);
+            let rw = env.begin_rw().expect("rw");
+            assert_eq!(rw.commit().expect("commit"), txn, "by {by}: a steady state");
+            assert_eq!(
+                env.io_stats().commits,
+                1,
+                "by {by}: a second no-change commit syncs nothing"
+            );
             env.crash();
         }
         disk_model::reboot();
         let env = open(&path);
-        assert_eq!(env.stat().txn_id, txn, "by_close {by_close}: steady across a reboot");
+        assert_eq!(env.stat().txn_id, txn, "by {by}: steady across a reboot");
     }
 }
 

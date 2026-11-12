@@ -39,16 +39,17 @@ use crate::{
 /// The first 8 bytes of every meta record.
 pub(crate) const MAGIC: [u8; 8] = *b"tn-lmdb\0";
 
-/// The on-disk format version this build reads and writes: 7, whose tree pages carry the tag of
-/// their tree in the header (`page::tag`, compared on every fetch: `tree::TreeRoot::tag`), whose
-/// meta records carry a flags word and a boot id ([`Tag`]), whose leaves hold inline values up to
-/// their entry limit of `U / 2` (`page::Geometry::max_value`) and whose tree pages' CRCs skip
-/// their free gaps (`page::crc`). Version 6's page headers kept those four bytes reserved (zero);
-/// version 5's records kept the flags and boot id bytes reserved and had no weak record; version
-/// 4's leaves held inline values only to `U / 4`, every larger value in an overflow run, and
-/// version 3's pages carry whole-page CRCs; each is refused as [`Error::UnsupportedVersion`], as
-/// are 2 and 1: the format is pre-release, with no migration.
-pub(crate) const FORMAT_VERSION: u32 = 7;
+/// The on-disk format version this build reads and writes: 8, whose tree pages and overflow runs
+/// carry the tag of their tree in the header (`page::tag`, `overflow::Ovf::tag`, compared on
+/// every fetch: `tree::TreeRoot::tag`), whose meta records carry a flags word and a boot id
+/// ([`Tag`]), whose leaves hold inline values up to their entry limit of `U / 2`
+/// (`page::Geometry::max_value`) and whose tree pages' CRCs skip their free gaps (`page::crc`).
+/// Version 7's runs carried their page count at bytes 20..24 instead of the tag; version 6's page
+/// headers kept bytes 18..22 reserved (zero); version 5's records kept the flags and boot id bytes
+/// reserved and had no weak record; version 4's leaves held inline values only to `U / 4`, every
+/// larger value in an overflow run, and version 3's pages carry whole-page CRCs; each is refused as
+/// [`Error::UnsupportedVersion`], as are 2 and 1: the format is pre-release, with no migration.
+pub(crate) const FORMAT_VERSION: u32 = 8;
 
 /// The size of a meta record (at offset 0 of its page).
 pub(crate) const META_LEN: usize = 128;
@@ -71,7 +72,7 @@ const WEAK: u32 = 1;
 /// Where the boot id of the record's writer lies ([`Tag::boot_id`]).
 const BOOT_ID: std::ops::Range<usize> = FLAGS.end..FLAGS.end + 16;
 
-/// The bytes the format reserves (zero in version 7).
+/// The bytes the format reserves (zero in version 8).
 const RESERVED: std::ops::Range<usize> = BOOT_ID.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
@@ -767,7 +768,7 @@ mod tests {
     /// stamped or not: the format is pre-release, with no migration.
     #[test]
     fn a_version_2_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(2);
     }
 
@@ -776,7 +777,7 @@ mod tests {
     /// migration.
     #[test]
     fn a_version_3_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(3);
     }
 
@@ -785,7 +786,7 @@ mod tests {
     /// stamped or not, never read as damage: the format is pre-release, with no migration.
     #[test]
     fn a_version_4_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(4);
     }
 
@@ -794,7 +795,7 @@ mod tests {
     /// migration.
     #[test]
     fn a_version_5_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(5);
     }
 
@@ -803,8 +804,17 @@ mod tests {
     /// pre-release, with no migration.
     #[test]
     fn a_version_6_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(6);
+    }
+
+    /// A version-7 record (overflow runs without a tree tag: bytes 20..24 of a run's header its
+    /// page count) is refused before its CRC, stamped or not, never read as damage: the format is
+    /// pre-release, with no migration.
+    #[test]
+    fn a_version_7_record_is_refused() {
+        assert_eq!(FORMAT_VERSION, 8);
+        assert_version_refused(7);
     }
 
     /// A weak record and a steady one carrying a boot id round-trip with their tags, the flag at

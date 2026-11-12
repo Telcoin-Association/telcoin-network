@@ -225,21 +225,32 @@ fn open_in(path: &Path, mode: Mode) -> Env {
     Env::open(path, EnvOptions { sync_period, gap_fill, ..options(mode.sync()) }).expect("open")
 }
 
-/// The crash points of a commit, in protocol order.
-const POINTS: [CrashAt; 7] = [
+/// The crash points of a commit, in protocol order. `AfterWeakMetaCopy` is a point of a
+/// `SyncMode::NoSync` commit that defers its sync alone ([`in_deferred_commit`]): the matrix
+/// skips it in the other modes, whose crash commit never copies a weak meta.
+const POINTS: [CrashAt; 8] = [
     CrashAt::BeforeSave,
     CrashAt::AfterSave,
     CrashAt::AfterStamp,
+    CrashAt::AfterWeakMetaCopy,
     CrashAt::AfterDataSync,
     CrashAt::AfterSizeSync,
     CrashAt::AfterMetaCopy,
     CrashAt::AfterMetaMsync,
 ];
 
+/// True if `at` is a point of a `SyncMode::NoSync` commit that defers its sync, the last of them
+/// after its weak meta copy; the other points are the following sync's.
+fn in_deferred_commit(at: CrashAt) -> bool {
+    matches!(
+        at,
+        CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp | CrashAt::AfterWeakMetaCopy
+    )
+}
+
 /// True if `at` stops a commit in `mode` (else it stops the following sync).
 fn stops_the_commit(mode: Mode, at: CrashAt) -> bool {
-    mode != Mode::NoSync
-        || matches!(at, CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp)
+    mode != Mode::NoSync || in_deferred_commit(at)
 }
 
 /// Copy the base to a tracked case file, open it as `mode` commits, make the commits (in
@@ -393,8 +404,10 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
     let trusted = record.filter(|&(_, weak)| process || !weak);
     let reaches_m = trusted.is_some_and(|(txn, _)| txn == m_txn);
     // `M`'s steady record survives exactly when step 6 completed, may during it, and must not
-    // before it; in `NoSync` its weak record is in the slot from the crash commit on.
-    let weak_m = mode == Mode::NoSync && !stops_the_commit(mode, at);
+    // before it; in `NoSync` its weak record is in the slot from the crash commit's weak meta copy
+    // on, through the sync after it.
+    let weak_m =
+        mode == Mode::NoSync && (at == CrashAt::AfterWeakMetaCopy || !stops_the_commit(mode, at));
     match (at, loss) {
         (CrashAt::AfterMetaMsync, _) => assert!(reaches_m, "{case}: the msynced meta survives"),
         (CrashAt::AfterMetaCopy, Loss::Process) => {
@@ -507,6 +520,9 @@ pub(super) fn matrix_of(base: &Base, seeds: u64, modes: &[Mode]) {
         for by_msync in [false, true] {
             dry_run(base, mode, by_msync);
             for (n, at) in POINTS.into_iter().enumerate() {
+                if at == CrashAt::AfterWeakMetaCopy && mode != Mode::NoSync {
+                    continue;
+                }
                 for loss in [Loss::Process, Loss::Strict] {
                     crash_case(base, mode, by_msync, at, loss);
                 }
@@ -904,9 +920,11 @@ fn reopen_head_or_last_sync(
 /// checks the pages it names that were written since the last sync, and falls back to the last
 /// sync when any fails: here the kernel wrote back the weak meta's page before the others, then
 /// the volume went. Over random writebacks (some pages torn by sector) each copy opens to exactly
-/// the head's state or the last sync, never `Corrupt`, and checks; after a strict loss it opens
-/// at the last sync, which checks and takes a commit. With `trust_unsynced` off every one opens at
-/// the last sync, unchecked.
+/// the head's state or the last sync, never `Corrupt`, and checks, and never falls back when
+/// every page the head names since the last sync survived ([`head_survived`]: the oracle's
+/// direction the check is held to); a strict loss with exactly those pages written back opens at
+/// the head. After a strict loss it opens at the last sync, which checks and takes a commit.
+/// With `trust_unsynced` off every one opens at the last sync, unchecked.
 #[test]
 fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync() {
     volume_lost_opens_at_the_last_sync(&base(4096), 32);
@@ -925,13 +943,29 @@ fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync_heavy() {
 /// writebacks.
 fn volume_lost_opens_at_the_last_sync(base: &Base, seeds: u64) {
     let (path, synced, head) = lost_head(base, "lost");
+    let new = fs::read(&path).expect("the head's bytes");
+    // The pages the head needs, from the head file itself (a process crash: every page is there).
+    let needed = {
+        let env = Env::open_read_only(&path, options(SyncMode::NoSync)).expect("the head");
+        assert_eq!(env.stat().txn_id, head.0, "the head file opens at the head");
+        assert!(env::take_weak_head_check().is_some_and(|c| c.is_ok()), "the head's check passes");
+        pages_since(&env, synced.0)
+    };
     let mut fell_back = 0;
     for seed in 0..seeds {
         let copy = base.dir.path().join(format!("lost{seed}"));
         disk_model::copy_tracked(&path, &copy);
         disk_model::volume_loss_random(&copy, seed);
         let case = format!("{seed}");
-        fell_back += u32::from(reopen_head_or_last_sync(&copy, &synced, &head, &case));
+        let kept =
+            head_survived(&new, &fs::read(&copy).expect("read"), base.page_size, head.0, &needed);
+        let fell = reopen_head_or_last_sync(&copy, &synced, &head, &case);
+        assert!(
+            !(kept && fell),
+            "seed {seed}: every page the head names since the last sync survived, yet open fell \
+             back"
+        );
+        fell_back += u32::from(fell);
         let env = open_trusting(&copy, false).expect("the last sync");
         assert_eq!(
             env::take_weak_head_check(),
@@ -944,6 +978,22 @@ fn volume_lost_opens_at_the_last_sync(base: &Base, seeds: u64) {
         fs::remove_file(&copy).expect("remove");
     }
     assert!(fell_back > 0, "some writeback leaves the head naming lost pages");
+    // A strict loss after a writeback of exactly the pages the head needs: open keeps the head.
+    let copy = base.dir.path().join("lost-needed");
+    disk_model::copy_tracked(&path, &copy);
+    disk_model::volume_loss(&copy);
+    let file = fs::OpenOptions::new().write(true).open(&copy).expect("open");
+    let size = u64::from(base.page_size);
+    for &p in &needed {
+        let at = (u64::from(p) * size) as usize;
+        file.write_all_at(&new[at..at + size as usize], at as u64).expect("write the page back");
+    }
+    drop(file);
+    assert!(
+        !reopen_head_or_last_sync(&copy, &synced, &head, "needed pages"),
+        "the head's pages survived"
+    );
+    disk_model::untrack(&copy);
     disk_model::volume_loss(&path);
     let strict = reopen_head_or_last_sync(&path, &synced, &head, "strict");
     assert!(strict, "a strict loss falls back");

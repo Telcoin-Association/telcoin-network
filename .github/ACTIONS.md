@@ -489,7 +489,7 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
 
 ## tn-lmdb regression bench
 
-`.github/workflows/tn-lmdb-bench.yaml` runs `etc/tn-lmdb-bench-compare.sh --tier quick <base sha> <head sha>`: the tn-lmdb engine bench (`crates/tn-lmdb-bench`) built against both commits, run as interleaved rounds and compared row by row.
+`.github/workflows/tn-lmdb-bench.yaml` runs `etc/tn-lmdb-bench-compare.sh --tier quick --sync nosync,durable <base sha> <head sha>` on a pull request (a dispatch takes the tier's own sync modes): the tn-lmdb engine bench (`crates/tn-lmdb-bench`) built against both commits, run as interleaved rounds and compared row by row.
 The script's header comment is the reference for what it builds, runs and reports.
 
 It runs only when asked:
@@ -507,12 +507,24 @@ A pull request whose base has no tn-lmdb (no `crates/tn-lmdb/Cargo.toml`) gets e
 The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
 Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
 
-Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable time rows, and the quick tier's two single-commit rows, reported, not gated) catches large regressions only.
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows) catches large regressions only.
+The quick tier runs nosync only, so a pull request's run adds `--sync nosync,durable` (about 6 s more per run) for the durable rows: `reth.block.pages_synced`, the pages synced per block commit, is exact and gated; the durable time rows are reported, not gated.
+The quick tier's three small-run rows, the two single-commit rows (`put.seq.commit`, `put.rand.commit`) and the 4-thread `ro.txn.mt`, are reported, not gated, in any run of fewer than 1M entries: one commit of 100k entries is too short to hold still, and the thread row wants four idle cores a shared runner does not have.
 For anything finer, run the script locally, with more rounds, on an idle machine.
 
 The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.
 It has no dependency cache: the bench builds as two small standalone packages in their own target directories under `runner.temp`, so it neither reads nor writes the entries in "Caches" (and is not one of the cache steps counted there).
 It triggers on `pull_request`, never `pull_request_target`: it compiles and runs the pull request's code, with a read-only token and no secrets, like every other pull request job.
+
+## aarch64 CRC kernel
+
+`.github/workflows/arm64-crc.yaml` (*arm64 CRC kernel*) runs `cargo nextest run --locked -p tn-lmdb -E 'test(/^crc::tests::/)'` on `ubuntu-24.04-arm`.
+`crates/tn-lmdb/src/crc.rs` (a copy of `crates/storage/src/archive/crc.rs`) has a PMULL carry-less-multiply CRC-32 kernel that is compiled on little-endian aarch64 only, and its tests compare that kernel with `crc32fast`.
+Every test lane in `pr.yaml` runs on `ubuntu-latest`, which is x86_64, so without this workflow the kernel never ran in CI; the maintainers' attested runs on Apple silicon were its only coverage.
+
+It runs on a `pull_request` or a push to `main` that touches `crates/tn-lmdb/**`, `crates/storage/src/archive/crc.rs`, `rust-toolchain.toml`, `Cargo.lock` or the workflow itself, and on every `merge_group` (that event takes no path filter).
+It is not a required check and is not in `CI Success`'s `needs` list, so a red run blocks nothing but shows on the pull request; keep it that way (item 1 of "Repository settings this requires").
+The checkout takes no submodule (tn-lmdb needs none), the toolchain and `cargo-nextest` install steps are the same as the test lanes', and there is no dependency cache: the package builds from cold in about a minute, and a second architecture's entries would eat the quota the queue's entries need.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.

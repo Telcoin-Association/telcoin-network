@@ -323,6 +323,7 @@ impl RethConfig {
         // `init_reth_defaults` before parsing, so `txpool` already carries either that default
         // or the operator's explicit value. Nothing to override here.
         let RethCommand { mut rpc, txpool, db, db_gap_fill } = reth_config;
+        crate::env::database::warn_max_size_is_a_reservation(&db);
 
         Self::validate_rpc_modules(rpc.http, &mut rpc.http_api);
         Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);

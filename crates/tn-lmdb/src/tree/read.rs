@@ -19,7 +19,9 @@ use crate::{
 ///
 /// The CRC itself is not recomputed here (that costs a pass over the page on every read):
 /// copy-on-write verifies a page before its first copy (unless this writer stamped the page
-/// itself: `Allocator::stamped`), and the root of each tree is verified when the file is opened.
+/// itself: `Allocator::stamped`), the catalog's and the free tree's roots are verified when the
+/// file is opened (and a trusted weak head's pages since the last sync: `check::check_since`),
+/// and `Env::check` verifies every page.
 /// So damage inside a page's bounds (a key, a value, an in-bounds length or entry count) is
 /// returned as data until a copy, a free walk or `Env::check` meets it, as on an engine with no
 /// page CRC.
@@ -37,12 +39,12 @@ pub(crate) fn checked_page<'a>(
 
 /// [`checked_page`] for a page reached through a pointer that names it as `(pgno, want_txn)` (a
 /// branch cell's `child` and `child_txn`, or a root's): after those checks, the low 32 bits of
-/// the header's txn must equal `want_txn`, so a pointer to a stale copy or redirected to another
-/// page is [`Error::Corrupt`]. A pointer redirected to a page of the same commit passes that
-/// check, and the tag check refuses it unless the page is of the same tree: that redirection,
-/// damage at rest to the 4-byte pointer, is found by the key-range checks of the descents and
-/// cursors, and by `Env::check`, which refuses a page reached twice. The header's page number,
-/// tag and txn are read once for every check.
+/// the header's txn must equal `want_txn`, so a pointer to a stale copy, or redirected to a page
+/// of another commit, is [`Error::Corrupt`]. A pointer redirected to a page of the same commit
+/// passes that check, and the tag check refuses it unless the page is of the same tree: that
+/// redirection, damage at rest to the 4-byte pointer, is found by the key-range checks of the
+/// descents and cursors, and by `Env::check`, which refuses a page reached twice. The header's page
+/// number, tag and txn are read once for every check.
 #[inline]
 pub(crate) fn checked_child<'a>(
     pgno: u32,
@@ -167,8 +169,9 @@ pub(crate) struct Leaf<'s> {
 }
 
 /// Descend from `root` to the leaf whose range holds `key` (`None` for the empty tree). Every
-/// page on the way must be the one its parent names (header page number and txn equal to the
-/// branch cell's `child` and `child_txn`, or the root's), a branch at every level above the
+/// page on the way must be the one its parent names (header page number equal to the branch
+/// cell's `child`, or the root's, the txn's low 32 bits to its `child_txn`, and its tag the
+/// tree's), a branch at every level above the
 /// leaves and a leaf at the leaf level, and only the root leaf may be empty; else
 /// [`Error::Corrupt`].
 ///
@@ -548,7 +551,7 @@ mod tests {
 
     /// A branch cell redirected to an older, still CRC-valid copy of its child (same page range,
     /// stale contents) passes every range check; only the cell's `child_txn` exposes it. A cell
-    /// redirected to another page is caught too. Reads and writes both refuse.
+    /// redirected to another page of an older commit is caught too. Reads and writes both refuse.
     #[test]
     fn stale_copies_and_redirected_children_are_corrupt() {
         let (mut store, mut root) = committed_tree(60);

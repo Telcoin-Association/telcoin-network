@@ -1,7 +1,7 @@
 //! [`TnLmdbEnv`]: the environment, its table map, and reth's `Database` and `DatabaseMetrics`.
 
 use crate::{
-    dup::{dup_layout, DupLayout},
+    dup::{dup_layout, DupLayout, DUP_LAYOUTS},
     error,
     timeout::{ReaderState, ReaderTimeouts, DEFAULT_READ_TRANSACTION_TIMEOUT},
     tx::{TnLmdbTx, TnLmdbTxMut},
@@ -325,6 +325,22 @@ impl TnLmdbArgs {
     }
 }
 
+/// The plain engine table recording the layout each dup-sort table of the file was created with
+/// ([`DUP_LAYOUTS`]): a row per table, its name to its [`layout_record`].
+/// [`TnLmdbEnv::create_tables_for`] writes a table's row as it creates the table, and
+/// [`TnLmdbEnv::open`] compares each row with this build's layout: the engine's catalog records a
+/// dup table's key width and `packed_max`, not its subkey width, and nothing of a composite table's
+/// split, so a change of those in [`DUP_LAYOUTS`] would otherwise open an old file silently. A file
+/// without the table or a row (written before the record) opens, lenient on purpose: no tn-lmdb
+/// file is in production yet; a layout change once one is can make the record required.
+pub(crate) const LAYOUT_TABLE: &str = "TnLmdbRethLayout";
+
+/// A layout's row in [`LAYOUT_TABLE`]: its key width, its subkey width, and its form (1 an
+/// engine dup table, 0 composite keys in a plain table).
+fn layout_record(layout: DupLayout) -> [u8; 3] {
+    [layout.key as u8, layout.subkey as u8, u8::from(layout.nested)]
+}
+
 /// One table of the map: its engine handle and how its rows are laid out.
 #[derive(Clone, Debug)]
 pub(crate) struct TableEntry {
@@ -536,6 +552,18 @@ impl TnLmdbEnv {
                 tables.entries.insert(name, entry);
             }
         }
+        // The layouts the file was written with ([`LAYOUT_TABLE`]), each against this build's.
+        if let Some(records) = txn.open_table(LAYOUT_TABLE).map_err(open_error)? {
+            for (name, _) in DUP_LAYOUTS {
+                let Some(layout) = tables.layout(name) else { continue };
+                let expected = layout_record(layout);
+                if let Some(found) = txn.get(&records, name.as_bytes()).map_err(open_error)? {
+                    if found != expected {
+                        return Err(error::layout_mismatch(name, found, expected));
+                    }
+                }
+            }
+        }
         let watch =
             ReaderWatch::new(env.clone(), LONG_READER_WARN_AFTER, LONG_READER_WARN_INTERVAL);
         let timeouts = args.read_transaction_timeout.map(ReaderTimeouts::start).transpose()?;
@@ -566,16 +594,21 @@ impl TnLmdbEnv {
     /// as [`DatabaseError::CreateTable`].
     pub fn create_tables_for<TS: TableSet>(&mut self) -> Result<(), DatabaseError> {
         let mut txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
+        let create_error = |e: tn_lmdb::Error| DatabaseError::CreateTable(error::info(&e));
+        let records = txn.create_table(LAYOUT_TABLE).map_err(create_error)?;
         let mut created = Vec::new();
         for info in TS::tables() {
             let name = info.name();
-            let create_error = |e: tn_lmdb::Error| DatabaseError::CreateTable(error::info(&e));
-            let options = self.tables.options(self.tables.layout(name)).map_err(create_error)?;
+            let layout = self.tables.layout(name);
+            let options = self.tables.options(layout).map_err(create_error)?;
             let table = match options {
                 Some(options) => txn.create_dup_table(name, options),
                 None => txn.create_table(name),
             }
             .map_err(create_error)?;
+            if let Some(layout) = layout {
+                txn.put(&records, name.as_bytes(), &layout_record(layout)).map_err(create_error)?;
+            }
             created.push((name, self.tables.entry(&txn, table)?));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;

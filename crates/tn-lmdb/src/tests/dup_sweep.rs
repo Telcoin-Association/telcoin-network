@@ -7,7 +7,7 @@
 use std::{collections::BTreeMap, fs, sync::Arc};
 
 use super::{
-    damage::{restamped, tree, Stage, P},
+    damage::{restamped, same_rows, tree, Reads, Stage, P},
     dup::{dup_key, restamp_cell, restamp_record, COLD, HOT, OPTIONS},
     *,
 };
@@ -160,7 +160,10 @@ fn empty_subkey(path: &Path, pgno: u32) {
 /// seeks the key after `hide` past it) and `p`, then (unless `read_only`) rewrite every fifth row
 /// of each through a detached cursor (as [`rewrite_through_cursors`]) and put to it, fill a new
 /// table, commit, and check. The first error must be `Corrupt` from `stage`
-/// and the environment latched (read-only: by the operation that returned it); writes fail.
+/// and the environment latched (read-only: by the operation that returned it); writes fail. The
+/// gets and scans that succeed are the model's unless `reads` says the damage may show in them
+/// ([`Reads`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn sweep_dup(
     env: &Env,
     plain: &Rows,
@@ -169,12 +172,13 @@ pub(super) fn sweep_dup(
     what: &str,
     stage: Stage,
     read_only: bool,
+    reads: Reads,
 ) {
-    sweep_dup_writing(env, plain, dup, dup, hide, what, stage, read_only);
+    sweep_dup_reading(env, plain, dup, dup, hide, what, stage, read_only, reads);
 }
 
-/// [`sweep_dup`] whose write stage puts to every fifth row of `written` in `d`, not of `dup`: a
-/// hidden key's rows, left out of the gets and the scan, can still be the write stage's.
+/// [`sweep_dup_reading`] for a case table that does not say what its reads return
+/// ([`Reads::Changed`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sweep_dup_writing(
     env: &Env,
@@ -186,13 +190,36 @@ pub(super) fn sweep_dup_writing(
     stage: Stage,
     read_only: bool,
 ) {
+    sweep_dup_reading(env, plain, dup, written, hide, what, stage, read_only, Reads::Changed);
+}
+
+/// [`sweep_dup`] whose write stage puts to every fifth row of `written` in `d`, not of `dup`: a
+/// hidden key's rows, left out of the gets and the scan, can still be the write stage's.
+#[allow(clippy::too_many_arguments)]
+fn sweep_dup_reading(
+    env: &Env,
+    plain: &Rows,
+    dup: &Rows,
+    written: &Rows,
+    hide: Option<u32>,
+    what: &str,
+    stage: Stage,
+    read_only: bool,
+    reads: Reads,
+) {
     let mut first = None;
     let ro = Arc::new(env.begin_ro().expect("ro"));
     for (name, rows) in [("d", dup), ("p", plain)] {
         let get = (|| {
-            let Some(table) = ro.open_table(name)? else { return Ok(()) };
-            for k in rows.keys() {
-                ro.get(&table, k)?;
+            let Some(table) = ro.open_table(name)? else {
+                assert!(reads == Reads::Changed, "{what}: table {name} does not open");
+                return Ok(());
+            };
+            for (k, v) in rows {
+                let got = ro.get(&table, k)?;
+                if reads == Reads::Exact {
+                    assert!(got == Some(&v[..]), "{what}: table {name} key {k:?}: the get differs");
+                }
             }
             Ok(())
         })();
@@ -203,24 +230,35 @@ pub(super) fn sweep_dup_writing(
     let scan = (|| {
         if let Some(table) = ro.open_table("d")? {
             let mut cursor = ro.dup_cursor_owned(&table)?;
-            let mut row = cursor.first()?.map(|(k, _)| k.to_vec());
-            while let Some(key) = row {
+            let owned = |row: Option<(&[u8], &[u8])>| row.map(|(k, v)| (k.to_vec(), v.to_vec()));
+            let mut scanned = Vec::new();
+            let mut row = owned(cursor.first()?);
+            while let Some((key, v)) = row {
                 row = match cursor.next_in_prefix(K)? {
-                    Some((k, _)) => Some(k.to_vec()),
+                    Some((k, v)) => Some((k.to_vec(), v.to_vec())),
                     None => {
                         let after = u32::from_be_bytes(key[..K].try_into().expect("K")) + 1;
-                        match hide == Some(after) {
+                        owned(match hide == Some(after) {
                             true => cursor.seek_key(&(after + 1).to_be_bytes())?,
                             false => cursor.next()?,
-                        }
-                        .map(|(k, _)| k.to_vec())
+                        })
                     }
                 };
+                scanned.push((key, v));
+            }
+            if reads == Reads::Exact {
+                assert!(same_rows(&scanned, dup), "{what}: table d: the scan differs");
             }
         }
         let Some(table) = ro.open_table("p")? else { return Ok(()) };
         let mut cursor = ro.cursor(&table)?;
-        while cursor.next()?.is_some() {}
+        let mut scanned = Vec::new();
+        while let Some((k, v)) = cursor.next()? {
+            scanned.push((k.to_vec(), v.to_vec()));
+        }
+        if reads == Reads::Exact {
+            assert!(same_rows(&scanned, plain), "{what}: table p: the scan differs");
+        }
         Ok(())
     })();
     if let Err(e) = scan {
@@ -295,6 +333,17 @@ fn rewrite_through_cursors(
 /// first meet it, the outer key whose rows the sweeps leave alone (so a later use meets it), and
 /// the damage.
 pub(super) type Case<'a> = (&'a str, Stage, Stage, Option<u32>, Box<dyn Fn(&Path) + 'a>);
+
+/// What the reads of case `what` of [`cases`] return ([`Reads`]): the damage of "nested
+/// separator" misroutes gets (a byte of a separator in the nested branch root), that of "nested
+/// leaf bytes" and "plain leaf bytes" is in a row's value, which gets return as stored; every
+/// other case's reads are the model's, or fail. A case not named here is held to the model.
+fn reads_of(what: &str) -> Reads {
+    match what {
+        "nested separator" | "nested leaf bytes" | "plain leaf bytes" => Reads::Changed,
+        _ => Reads::Exact,
+    }
+}
 
 /// The cases over `fx`.
 fn cases(fx: &DupFixture) -> Vec<Case<'_>> {
@@ -445,7 +494,7 @@ fn run(read_only: bool) {
             false => open(&path, SyncMode::Durable),
         };
         let stage = if read_only { *ro_stage } else { *write_stage };
-        sweep_dup(&env, &fx.plain, &dup, *hide, what, stage, read_only);
+        sweep_dup(&env, &fx.plain, &dup, *hide, what, stage, read_only, reads_of(what));
         drop(env);
         fs::remove_file(&path).expect("remove");
     }

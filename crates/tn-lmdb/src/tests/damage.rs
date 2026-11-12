@@ -48,7 +48,7 @@ pub(super) fn tree(env: &Env, name: &str) -> TreeRoot {
 }
 
 /// The children `(pgno, txn)` of branch page `pgno` in the newest state of `env`.
-fn children(env: &Env, pgno: u32) -> Vec<(u32, u32)> {
+pub(super) fn children(env: &Env, pgno: u32) -> Vec<(u32, u32)> {
     let snapshot = env.inner().current();
     let page = snapshot.page_any(pgno).expect("branch");
     (0..page::nkeys(page)).map(|i| page::branch_child(page, i).expect("child")).collect()
@@ -198,18 +198,49 @@ pub(super) enum Stage {
     Check,
 }
 
+/// What a damage case's reads return where they succeed. Reads do not recompute CRCs, so a case
+/// whose damage lands inside bytes a read returns as stored (a leaf's cells, a 1-page run's
+/// value) or routes by (a branch's separators) legitimately reads it back changed, or misses a
+/// row; any other case's reads must be the model's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reads {
+    /// Every table opens, every `Ok` get is the model's value and a scan that ends `Ok` is the
+    /// model's rows, in order.
+    Exact,
+    /// A get, a scan or a table open may answer from the damaged bytes.
+    Changed,
+}
+
+/// True if a scan's rows are the model's `rows`, in order.
+pub(super) fn same_rows(scanned: &[(Vec<u8>, Vec<u8>)], rows: &Rows) -> bool {
+    scanned.len() == rows.len() && scanned.iter().zip(rows).all(|(s, r)| s.0 == *r.0 && s.1 == *r.1)
+}
+
+/// [`sweep_reading`] for a case table that does not say what its reads return
+/// ([`Reads::Changed`]).
+pub(super) fn sweep(env: &Env, state: &State, what: &str, stage: Stage) {
+    sweep_reading(env, state, what, stage, Reads::Changed);
+}
+
 /// Use a damaged environment as an application would — get every key, scan every table, then
 /// write to each table and fill a new one (copies of published pages, free-list loads) — and then
 /// check it: the first error must be `Corrupt` and come from `stage`, the environment must latch,
-/// and later writes fail.
-pub(super) fn sweep(env: &Env, state: &State, what: &str, stage: Stage) {
+/// and later writes fail. The gets and scans that succeed are the model's unless `reads` says
+/// the damage may show in them ([`Reads`]).
+pub(super) fn sweep_reading(env: &Env, state: &State, what: &str, stage: Stage, reads: Reads) {
     let mut first = None;
     let ro = env.begin_ro().expect("ro");
     for (name, rows) in state {
         let get = (|| {
-            let Some(table) = ro.open_table(name)? else { return Ok(()) };
-            for k in rows.keys() {
-                ro.get(&table, k)?;
+            let Some(table) = ro.open_table(name)? else {
+                assert!(reads == Reads::Changed, "{what}: table {name} does not open");
+                return Ok(());
+            };
+            for (k, v) in rows {
+                let got = ro.get(&table, k)?;
+                if reads == Reads::Exact {
+                    assert!(got == Some(&v[..]), "{what}: table {name} key {k:?}: the get differs");
+                }
             }
             Ok(())
         })();
@@ -217,11 +248,17 @@ pub(super) fn sweep(env: &Env, state: &State, what: &str, stage: Stage) {
             first.get_or_insert((Stage::Get, e));
         }
     }
-    for name in state.keys() {
+    for (name, rows) in state {
         let scan = (|| {
             let Some(table) = ro.open_table(name)? else { return Ok(()) };
             let mut cursor = ro.cursor(&table)?;
-            while cursor.next()?.is_some() {}
+            let mut scanned = Vec::new();
+            while let Some((k, v)) = cursor.next()? {
+                scanned.push((k.to_vec(), v.to_vec()));
+            }
+            if reads == Reads::Exact {
+                assert!(same_rows(&scanned, rows), "{what}: table {name}: the scan differs");
+            }
             Ok(())
         })();
         if let Err(e) = scan {
@@ -274,26 +311,40 @@ fn damage_at_rest_fails_closed_or_latches() {
     assert!(page::txn(&stale) < page::txn(&current), "{at:?}");
     assert_eq!(page::leaf_inline_entry(&stale, 1).ok(), page::leaf_inline_entry(&current, 1).ok());
 
-    type Damage<'a> = (&'a str, Stage, Box<dyn Fn(&Path) + 'a>);
+    type Damage<'a> = (&'a str, Stage, Reads, Box<dyn Fn(&Path) + 'a>);
     let (redirect, target) = at.same_txn;
+    use Reads::{Changed, Exact};
     let opens: Vec<Damage<'_>> = vec![
         // A byte of a cell of a leaf (reads do not recompute CRCs: the copy-on-write that would
-        // spread it refuses it), of the root, and of a level-two branch's slot array.
-        ("leaf", Stage::Write, Box::new(|p| flip(p, u64::from(at.t_leaf) * P + P - 16))),
-        ("root", Stage::Scan, Box::new(|p| flip(p, u64::from(at.t_root) * P + P - 16))),
-        ("branch", Stage::Get, Box::new(|p| flip(p, u64::from(at.t_branch) * P + 26))),
-        ("free leaf", Stage::Write, Box::new(|p| flip(p, u64::from(at.free_leaf) * P + P - 16))),
+        // spread it refuses it; a get of its row returns it as stored), of the root (a separator:
+        // a get routed by it misses), and of a level-two branch's slot array.
+        ("leaf", Stage::Write, Changed, Box::new(|p| flip(p, u64::from(at.t_leaf) * P + P - 16))),
+        ("root", Stage::Scan, Changed, Box::new(|p| flip(p, u64::from(at.t_root) * P + P - 16))),
+        ("branch", Stage::Get, Exact, Box::new(|p| flip(p, u64::from(at.t_branch) * P + 26))),
+        (
+            "free leaf",
+            Stage::Write,
+            Exact,
+            Box::new(|p| flip(p, u64::from(at.free_leaf) * P + P - 16)),
+        ),
         (
             "catalog leaf",
             Stage::Write,
+            Exact,
             Box::new(|p| flip(p, u64::from(at.catalog_leaf) * P + P - 16)),
         ),
-        ("zeroed leaf", Stage::Get, Box::new(|p| write_page(p, at.t_leaf, &vec![0; P as usize]))),
+        (
+            "zeroed leaf",
+            Stage::Get,
+            Exact,
+            Box::new(|p| write_page(p, at.t_leaf, &vec![0; P as usize])),
+        ),
         // A torn write that left a leaf's header intact and its last sector zero (trailer
         // included): only the zero-CRC check of a page fetch tells, since a zeroed cell parses.
         (
             "zeroed tail sector",
             Stage::Get,
+            Exact,
             Box::new(|p| {
                 let mut page = read_page(p, at.t_leaf);
                 page[P as usize - 512..].fill(0);
@@ -306,17 +357,20 @@ fn damage_at_rest_fails_closed_or_latches() {
         (
             "redirected",
             Stage::Get,
+            Exact,
             Box::new(|p| restamped(p, at.t_branch, |b| set_child(b, redirect, target))),
         ),
         (
             "stale copy",
             Stage::Get,
+            Exact,
             Box::new(|p| restamped(p, at.t_branch, |b| set_child(b, 0, fx.stale))),
         ),
         // A free record listing a page past the end of the file (its CRC re-stamped).
         (
             "free record",
             Stage::Write,
+            Exact,
             Box::new(|p| {
                 restamped(p, at.free_leaf, |b| {
                     let offset = (at.free_value - u64::from(at.free_leaf) * P) as usize + 4;
@@ -325,14 +379,14 @@ fn damage_at_rest_fails_closed_or_latches() {
             }),
         ),
     ];
-    for (what, stage, damage) in &opens {
+    for (what, stage, reads, damage) in &opens {
         let path = fx.dir.path().join("case");
         fs::copy(&fx.path, &path).expect("copy");
         damage(&path);
         let before = fs::read(&path).expect("read");
         let env = open(&path, SyncMode::Durable);
         assert!(fs::read(&path).expect("read") == before, "{what}: the open changed the file");
-        sweep(&env, &fx.state, what, *stage);
+        sweep_reading(&env, &fx.state, what, *stage, *reads);
         drop(env);
         let after = fs::read(&path).expect("read");
         assert!(after[..2 * P as usize] == before[..2 * P as usize], "{what}: a meta changed");
@@ -723,9 +777,10 @@ fn a_table_root_short_of_its_leaves_is_refused_by_the_tree_walk() {
     }
 }
 
-/// Table `u`'s last leaf in the fixture (`u` has two levels and no runs, so a free of it reads its
-/// root and only its first leaf), and a copy of the fixture's file, named `what`, whose first free
-/// record (which passes the reuse gate) also lists that leaf, the record's leaf CRC stamped again.
+/// Table `u`'s last leaf in the fixture (`u` has two levels and no runs, so a free of it reads
+/// every leaf's header but verifies none), and a copy of the fixture's file, named `what`, whose
+/// first free record (which passes the reuse gate) also lists that leaf, the record's leaf CRC
+/// stamped again.
 fn u_leaf_listed_free(fx: &Fixture, what: &str) -> (PathBuf, u32) {
     let free_leaf = places(&fx.path).free_leaf;
     let leaf = {
@@ -942,13 +997,13 @@ fn a_loose_page_at_the_page_count_is_refused_by_the_tree_walk() {
     }
 }
 
-/// The same damage across transactions: `w` takes `L` and commits, so `L` is published when a
-/// later transaction drops `u`. That drop cannot tell (it reads only `u`'s first leaf) and frees
-/// `L` again. Once a later write hands `L` to table `x`, `w`'s gets of the keys in `L` fail the
-/// tree-tag check (the page belongs to `x`'s tree now) and latch: `Corrupt`, never `x`'s
-/// entries.
+/// The same damage across transactions: `w` takes `L` and commits, so `L` is published, and
+/// `w`'s, when a later transaction drops `u`. The drop reads every leaf of `u` with a descent's
+/// checks, so it meets `L` carrying `w`'s tag under `u`'s branch: `Corrupt`, naming both tags,
+/// which latches, and frees nothing; `w`'s keys all read back. (Before every leaf was read, the
+/// drop freed `L` again and a later table's reuse of it made `w`'s keys in `L` `Corrupt`.)
 #[test]
-fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
+fn a_live_leaf_published_to_another_table_refuses_a_later_drop() {
     let fx = fixture();
     let (path, leaf) = u_leaf_listed_free(&fx, "across");
     let env = open(&path, SyncMode::Durable);
@@ -957,38 +1012,23 @@ fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
     let w = txn.create_table("w").expect("w");
     let n = put_until_private(&mut txn, &w, leaf, 900);
     txn.commit().expect("commit");
+    let tags = (tree(&env, "w").tag, tree(&env, "u").tag);
+    let want =
+        format!("page {leaf} belongs to the tree tagged {:#x}, not to {:#x}", tags.0, tags.1);
     let mut txn = env.begin_rw().expect("begin");
     let u = txn.open_table("u").expect("open").expect("u");
-    txn.drop_table(u).expect("the drop cannot tell");
-    let dropped = txn.commit().expect("commit");
-    let freed = env.with_writer(|w| w.alloc.free_log.contains(&(dropped, leaf)));
-    assert!(freed, "the drop freed L");
-    // One more commit, so the gate passes the drop's txn and `L` is reusable.
-    let mut txn = env.begin_rw().expect("begin");
-    let y = txn.create_table("y").expect("y");
-    txn.put(&y, b"k", b"v").expect("put");
-    txn.commit().expect("commit");
-    let mut txn = env.begin_rw().expect("begin");
-    let x = txn.create_table("x").expect("x");
-    put_until_private(&mut txn, &x, leaf, 3000);
-    txn.commit().expect("the commit cannot tell");
+    let got = txn.drop_table(u);
+    assert!(matches!(&got, Err(Error::Corrupt(m)) if m == &want), "drop: {got:?}");
+    drop(txn);
+    assert!(env.failure().is_some(), "the drop latched");
+    let freed = env.with_writer(|w| w.alloc.free_log.iter().any(|&(_, p)| p == leaf));
+    assert!(!freed, "L stays w's");
     let ro = env.begin_ro().expect("ro");
     let w = ro.open_table("w").expect("open").expect("w");
-    let mut refused = 0;
     for i in 0..n {
-        match ro.get(&w, &i.to_be_bytes()) {
-            Ok(got) => assert!(got == Some(&value(9, i, 900)[..]), "key {i}: the value as written"),
-            Err(Error::Corrupt(e)) => {
-                assert!(e.contains(&format!("page {leaf} ")), "{e}");
-                assert!(e.contains("belongs to the tree tagged"), "{e}");
-                refused += 1;
-            }
-            Err(e) => panic!("key {i}: {e}"),
-        }
+        let got = ro.get(&w, &i.to_be_bytes()).expect("w reads whole");
+        assert!(got == Some(&value(9, i, 900)[..]), "key {i}: the value as written");
     }
-    assert!(refused > 0, "the keys in L are refused");
-    drop(ro);
-    assert!(env.failure().is_some(), "the get latched");
 }
 
 /// The key of the one row [`two_tables`] gives each table: `key` in a plain table, outer key 1

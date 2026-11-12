@@ -275,15 +275,59 @@ fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
     }
     assert_eq!(std::fs::read(path.join("mdbx.dat")).expect("read"), b"an MDBX database");
     assert_eq!(std::fs::read_dir(&path).expect("list").count(), 2, "nothing else is made");
+
+    // A migration stopped after its commit point that already removed MDBX's files: the temp
+    // directory, emptied by the rename, beside `tn-lmdb.dat` and no marker. The open would finish
+    // it, so the tn-lmdb build refuses it too; a temp directory still holding a copy (a stale one
+    // the open removes beside a tn-lmdb database) is no migration.
+    std::fs::remove_file(path.join("mdbx.dat")).expect("remove");
+    let temp = path.join(MIGRATING_DIR);
+    std::fs::create_dir(&temp).expect("temp dir");
+    let checked = refuse_pending_migration(&path);
+    #[cfg(feature = "mdbx")]
+    checked.expect("the MDBX build never finishes a migration");
+    #[cfg(not(feature = "mdbx"))]
+    {
+        let msg = format!("{:#}", checked.expect_err("the open would finish it"));
+        assert!(msg.contains("unfinished MDBX to tn-lmdb migration"), "says why: {msg}");
+        assert!(msg.contains(&temp.display().to_string()), "names the temp directory: {msg}");
+        assert!(msg.contains("next start finishes"), "{msg}");
+    }
+    assert!(temp.try_exists().expect("stat"), "the temp directory is kept");
+    std::fs::write(temp.join("tn-lmdb.dat"), b"a stopped copy").expect("plant");
+    refuse_pending_migration(&path).expect("a stale copy beside a tn-lmdb database");
 }
 
-/// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
+/// `--db.max-size` on the command line draws a warning when the node's config is built from the
+/// parsed command (`RethConfig::new`) on the tn-lmdb build, where the flag is the mapping's
+/// reservation and not the cap reth's help describes; unset, it draws none, and the MDBX build,
+/// which runs reth's cap, warns of nothing.
+#[test]
+fn max_size_on_the_command_line_warns_that_it_is_a_reservation() {
+    use clap::Parser as _;
+    crate::init_reth_defaults();
+    let tmp = TempDir::new().expect("tempdir");
+    let chain: Arc<crate::RethChainSpec> = Arc::new(test_genesis().into());
+    let warned = |args: &[&str]| {
+        let command = crate::RethCommand::try_parse_from(args).expect("parsed");
+        let warnings = WarnCapture::default();
+        tracing::subscriber::with_default(warnings.clone(), || {
+            RethConfig::new(command, None, tmp.path(), true, chain.clone())
+        });
+        warnings.find("reservation, not a cap")
+    };
+    assert_eq!(warned(&["tn-reth"]), None, "no flag, no warning");
+    let warned = warned(&["tn-reth", "--db.max-size", "4GB"]);
+    assert_eq!(warned.is_some(), !cfg!(feature = "mdbx"), "{warned:?}");
+    if let Some(warned) = warned {
+        assert!(warned.contains("max_size=4294967296"), "names the size: {warned}");
+    }
+}
+
 /// A subscriber keeping the text of every WARN event's fields, for a test asserting a warning.
-#[cfg(feature = "mdbx")]
 #[derive(Clone, Default)]
 struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
 
-#[cfg(feature = "mdbx")]
 impl WarnCapture {
     /// The first warning whose text holds `text`.
     fn find(&self, text: &str) -> Option<String> {
@@ -291,7 +335,6 @@ impl WarnCapture {
     }
 }
 
-#[cfg(feature = "mdbx")]
 impl tracing::Subscriber for WarnCapture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
@@ -314,6 +357,7 @@ impl tracing::Subscriber for WarnCapture {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
 #[cfg(feature = "mdbx")]
 mod mdbx {
     use super::*;

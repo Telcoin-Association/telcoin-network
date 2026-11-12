@@ -176,7 +176,10 @@ impl MapView {
         // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), and
         // `[offset, end)` lies within it and within the published bytes, which the owner does not
         // modify while a reader can reach them, but for the meta pages, which only the writer
-        // that rewrites them slices (see the method docs).
+        // that rewrites them slices (see the method docs). "Reach" rests on undamaged published
+        // pointers: reads do not recompute CRCs, so a pointer damaged at rest can name a page
+        // the writer is reusing, and this slice then overlaps the writer's stores until the
+        // checks after it refuse the page (README, do-not-flag item 2).
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
     }
 }
@@ -399,6 +402,8 @@ impl PageFile {
         self.len = target;
         self.backed = target;
         self.size_unsynced.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        crate::disk_model::resized(self.ino, target);
         Ok(())
     }
 
@@ -492,7 +497,9 @@ impl PageFile {
     ///
     /// The tree layer upholds the rule that makes this sound: the writer mutates only its private
     /// pages (pages it allocated in this transaction, which no reader's snapshot reaches), so no
-    /// reader ever reads bytes being written.
+    /// reader ever reads bytes being written. A reader reaches a page through published
+    /// pointers, whose CRCs reads do not recompute: one damaged at rest can name a private page,
+    /// which the reader slices and refuses (README, do-not-flag item 2).
     #[inline]
     pub(crate) fn page_mut(&mut self, pgno: u32, page_size: usize) -> Result<&mut [u8]> {
         self.pages_mut(pgno, page_size, page_size)
