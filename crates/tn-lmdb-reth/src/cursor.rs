@@ -668,8 +668,8 @@ struct Rows {
 /// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in on a
 /// plain engine cursor ([`flat_seek_dup`]). Every layout's `key + subkey` fits (`StoragesTrie`'s
 /// 97 bytes is the widest), so building the seek key from reth's encoded keys allocates nothing;
-/// only a longer raw input takes a `Vec`. The encodes themselves may allocate: `StoragesTrie`'s
-/// subkey, `StoredNibblesSubKey`, encodes to a `Vec`.
+/// only a longer raw input takes a `Vec`. `StoragesTrie`'s subkey, `StoredNibblesSubKey`, encodes
+/// to a `[u8; 65]`, so its encode does not allocate either.
 const SEEK_KEY_STACK: usize = 128;
 
 // Every layout's `key ‖ subkey` fits the stack buffer, and its key width the engine's `u16`

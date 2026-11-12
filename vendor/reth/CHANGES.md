@@ -606,6 +606,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   tn-reth's `trie_overlay` tests and the format-freeze fixtures (their block hashes are unchanged,
   so the case does not occur on that chain). *Upstream*: n/a (upstream commit).
 
+- **TN-0141** — Backport 8d97ab63c, 1b09bf5a2 and 3fba6ad70: `StoredNibblesSubKey` encodes to a
+  `[u8; 65]` instead of a `Vec`, and the storage-root span is trace-level and records its root
+  without formatting it first. *Kind*: backport.
+  *Files*: `crates/storage/db-api/src/models/mod.rs` (`Encode for StoredNibblesSubKey`),
+  `crates/trie/common/src/nibbles.rs` (`StoredNibblesSubKey::to_compact_array`; upstream's five
+  tests), `crates/trie/trie/src/trie.rs` (`StorageRoot::calculate`'s `instrument`: level `trace`,
+  name `storage_trie`, field `addr`; the two `storage_root` records in `calculate_with_cursors` pass
+  `tracing::field::debug`). Two conflicts in `trie.rs`: the attribute line, which the pin spells
+  differently (TN-0105), takes upstream's line (with it upstream's plain space for a non-breaking
+  one in the doc line above); the empty-storage short circuit, whose condition upstream changed in
+  a commit TN does not carry, keeps the pin's condition and takes only the record.
+  *Why*: every storage-trie seek and write encodes a subkey, one heap allocation each with the
+  `Vec`. TN's state root computes a storage root per changed account (TN-0105, TN-0139); the span
+  on `calculate` was at INFO, so it was built, with the address formatted, whenever INFO was on for
+  `trie::storage_root`, and each root was formatted into a `String` even with the span disabled.
+  Execution and storage path: the encoded bytes are the same (64 bytes of nibbles, zero padded,
+  then the count; upstream's test compares `to_compact_array` with `to_compact` at every length),
+  so the `StoragesTrie` keys are unchanged. The span change reaches logs only; a filter on the old
+  span name (`Storage trie`) or field (`hashed_address`) needs the new ones.
+  *Tests*: upstream's `test_stored_nibbles_subkey_compact_array_*`; reth-trie-common, reth-db-api,
+  reth-trie and reth-trie-db suites; the format-freeze writer test (the `StoragesTrie` rows of its
+  fixtures are unchanged). *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
