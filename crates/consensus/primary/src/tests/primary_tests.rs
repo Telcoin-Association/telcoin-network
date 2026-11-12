@@ -27,7 +27,7 @@ use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, now_ms, BlockNumHash, BlsPublicKey, Certificate, Committee,
     ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, Header, HeaderDigest,
-    SealedHeader, TaskManager, TnReceiver, B256,
+    SealedHeader, SignatureVerificationState, TaskManager, TnReceiver, B256,
 };
 use tokio::time::timeout;
 
@@ -949,6 +949,58 @@ async fn test_request_vote_pending_attached_parent_times_out_recoverably() {
     assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
     let response = voter.handler.vote(author_peer, header, voter.round_2_missing.clone()).await;
     assert!(matches!(response, Ok(PrimaryResponse::Vote(_))), "{response:?}");
+}
+
+/// A parent already held as pending is not verified again when a second citing author attaches
+/// it: the copy is skipped, and the vote waits for the pending parent and is cast once it is
+/// stored (#1822 follow-up).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_skips_attached_parent_already_pending() {
+    let voter = PendingParentVoter::new().await;
+    let (first_peer, first_header) = voter.header(2);
+    let (second_peer, second_header) = voter.header(3);
+    let expected_missing = voter.missing_digests();
+
+    // TEST PHASE 1: both authors cite the missing parents and are told about them.
+    for (peer, header) in [(first_peer, &first_header), (second_peer, &second_header)] {
+        let response = voter.handler.vote(peer, header.clone(), Vec::new()).await.unwrap();
+        let PrimaryResponse::MissingParents(missing) = response else {
+            panic!("Expected MissingParents, got: {response:?}");
+        };
+        assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+    }
+
+    // TEST PHASE 2: the first author attaches them. They are parked as pending, and its vote
+    // times out waiting for them.
+    let response =
+        voter.handler.vote(first_peer, first_header, voter.round_2_missing.clone()).await;
+    assert!(matches!(response, Err(PrimaryNetworkError::Timeout(_))), "{response:?}");
+    assert!(voter.missing_parents_pending(&second_header).await);
+
+    // TEST PHASE 3: the second author attaches copies whose aggregate signature does not verify.
+    // A certificate's digest is its header's, so each copy has the digest of a pending parent and
+    // is skipped unverified; verifying it would end the vote in an invalid signature error. The
+    // vote waits for the pending parents and is cast once the round 1 certificates arrive.
+    let wrong_signature = voter.round_1_certs[0].aggregated_signature().unwrap();
+    let copies = voter
+        .round_2_missing
+        .iter()
+        .cloned()
+        .map(|mut cert| {
+            cert.set_signature_verification_state(SignatureVerificationState::Unverified(
+                wrong_signature,
+            ));
+            cert
+        })
+        .collect::<Vec<_>>();
+    let vote = voter.handler.vote(second_peer, second_header, copies);
+    let supply = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        voter.supply_round_1().await;
+    };
+    let (response, ()) = tokio::join!(vote, supply);
+    assert!(matches!(response, Ok(PrimaryResponse::Vote(_))), "{response:?}");
+    assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
 }
 
 #[tokio::test]
