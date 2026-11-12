@@ -11,7 +11,7 @@ use alloy::{
 use clap::Parser as _;
 use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
-use eyre::Report;
+use eyre::{Report, WrapErr as _};
 use jsonrpsee::{
     core::{client::ClientT as _, DeserializeOwned},
     http_client::HttpClientBuilder,
@@ -436,18 +436,40 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     // exist or an epoch closes, so we cannot rely on block_number advancing
     // during idle periods. Actual block production is verified later by
     // send_and_confirm().
+    // Each poll logs nothing. The latest miss is kept and attached to a timeout, so the error
+    // still names the node that did not answer and the reason.
+    let last_miss: RefCell<Option<String>> = RefCell::new(None);
     wait_until_blocking(Duration::from_secs(45), "all nodes advancing", || {
-        Ok(client_urls.iter().all(|url| serves_latest_block(url)))
+        let miss = client_urls.iter().find_map(|url| latest_block_miss(url));
+        let all_served = miss.is_none();
+        miss.into_iter().for_each(|text| *last_miss.borrow_mut() = Some(text));
+        Ok(all_served)
+    })
+    .wrap_err_with(|| {
+        format!(
+            "last node not serving RPC: {}",
+            last_miss.borrow().as_deref().unwrap_or("none recorded")
+        )
     })
 }
 
-/// Whether `node` answers one `eth_getBlockByNumber("latest")` request with a block right now.
+/// Why `node` does not serve the latest block right now: its URL with the probe error or the null
+/// block. `None` when it serves one.
+fn latest_block_miss(node: &str) -> Option<String> {
+    probe_latest_block(node).map_or_else(
+        |e| Some(format!("{node}: {e:#}")),
+        |served| (!served).then(|| format!("{node}: latest block is null")),
+    )
+}
+
+/// Whether `node` answers one `eth_getBlockByNumber("latest")` request with a block right now:
+/// `Ok(false)` for a null block, `Err` for a transport or RPC error.
 ///
 /// The readiness probe of [`network_advancing`]: the same request [`get_block_number`] makes, in
 /// ONE attempt that logs nothing. `call_rpc` retries 10 times with a 250ms backoff and logs an
 /// error after the last one, so a probe built on it rounds every node's start-up up to the next
 /// 250ms step and fills the test log on every miss. Here the caller's own poll sets the cadence.
-fn serves_latest_block(node: &str) -> bool {
+fn probe_latest_block(node: &str) -> eyre::Result<bool> {
     let probe = || async move {
         let client =
             HttpClientBuilder::default().request_timeout(Duration::from_secs(10)).build(node)?;
@@ -455,19 +477,17 @@ fn serves_latest_block(node: &str) -> bool {
             client.request("eth_getBlockByNumber", rpc_params!("latest", true)).await?;
         Ok::<_, eyre::Report>(block.is_some())
     };
-    tokio::runtime::Handle::try_current()
-        .map_or_else(
-            |_| {
-                Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .map_err(eyre::Report::from)
-                    .and_then(|runtime| runtime.block_on(probe()))
-            },
-            |handle| tokio::task::block_in_place(|| handle.block_on(probe())),
-        )
-        .unwrap_or(false)
+    tokio::runtime::Handle::try_current().map_or_else(
+        |_| {
+            Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(eyre::Report::from)
+                .and_then(|runtime| runtime.block_on(probe()))
+        },
+        |handle| tokio::task::block_in_place(|| handle.block_on(probe())),
+    )
 }
 
 /// Start a process running a validator node.
