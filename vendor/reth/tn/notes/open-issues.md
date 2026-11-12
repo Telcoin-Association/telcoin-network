@@ -87,6 +87,14 @@ unpaid tip. Skipped copies add nothing to `gas_used`, so the base fee does not r
 Known and left alone, because TN never takes these paths or stops the node first. Each needs its
 own change if that stops being true.
 
+- **TN-0083's resume of a torn first launch covers v1 only.** Under v2 the torn launch's static
+  files also hold block 0's changesets, so the resumed genesis write appends them again and fails
+  with `UnexpectedStaticFileBlockNumber(StorageChangeSets, 0, 1)` on every start, as v1's
+  `UninitializedDatabase` did before TN-0083: it fails closed, and deleting the fresh datadir
+  recovers. Upstream 168b0a477 deletes the two changeset segments before the replay and refuses
+  static files past genesis; it needs `delete_segment` to drop the cached writer first
+  (6cb04766e).
+
 - **`take_block_and_execution_above` returns the wrong post-state under v2.** It calls
   `unwind_trie_state_from` first, which reverts `HashedAccounts` and `HashedStorages`, and then
   `take_state_above`, which under v2 reads the blocks' present values from those same tables
@@ -98,8 +106,10 @@ own change if that stops being true.
 - **A file rotation publishes rows before the database commit.** When a save fills a static
   file, `increment_block` commits it (`StaticFileProviderRW::commit`) and the reader index names
   its rows at once, while `save_blocks` is still running. If the database arm then fails, the
-  headers tip (TN's `last_block_number`) reads ahead of the database until the node halts; the
-  restart prunes the rows back (`check_consistency`), and re-execution writes the same ones.
+  headers static file's tip (the provider's `last_block_number`) reads ahead of the database
+  until the node halts; TN's committed tip (`RethEnv::last_block_number`) reads the `Finish`
+  checkpoint and stays. The restart prunes the rows back (`check_consistency`), and re-execution
+  writes the same ones.
   `test_save_blocks_without_db_commit_heals_across_files_v2` (TN-0115) pins this state.
 - **A cache miss after a failed save can cache uncommitted rows.** Since TN-0118 every segment
   writes its `.conf` in its own thread, so after a database-arm failure in `save_blocks` the
