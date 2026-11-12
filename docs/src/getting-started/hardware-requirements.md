@@ -17,6 +17,7 @@ Please email support@telcoin.org with your proposed hardware specifications.
 ## Summary
 
 Each figure on this page comes from a code constant, from the resource model in [How these numbers were derived](#how-these-numbers-were-derived), or from the benchmark described in that section.
+The validator disk IOPS figures instead come from the execution benchmark in [Execution database: disk and memory](execution-database-hardware.md), which ran on this release's execution database.
 The benchmark ran on 2026-09-23 on two GCP fleets, and its results are in the [benchmark report](https://claude.ai/artifact/6qpBKmd3eKNaRBuxUtPPCR), also committed as `bench/reports/2026-09-bench-10v.html` in the tn-transaction-generator repository.
 On this page, e2 means the e2-custom-4-8192 fleet (4 vCPU, which is 2 physical cores, and 8 GB; run r20260923-0708) and c3 means the c3-highcpu-8 fleet (8 vCPU, which is 4 physical cores, and 16 GB; run r20260923-0515).
 Each cell below says whether its figure is measured, modelled or provisional, and its note gives the run and the `sizing.json` field or the formula behind it.
@@ -25,8 +26,8 @@ Benchmark sources and code references are listed at the end of the page.
 
 | Role | Tier | CPU (physical cores, PassMark single-thread) | RAM | Storage (capacity, sustained IOPS, MB/s, DWPD) | Network |
 | --- | --- | --- | --- | --- | --- |
-| Validator | Minimum | 8 physical cores (twice the measured 4) [^b-val-cpu-min] [^doubling] | 32 GB ECC (twice the measured 16 GB) [^b-val-ram-min] [^doubling] | 2 TB TLC NVMe, 10,000 write IOPS, 300 MB/s, 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
-| Validator | Recommended | 16 physical cores, PassMark 3,500 or higher (twice the minimum; PassMark modelled) [^b-val-cpu-rec] [^doubling] | 64 GB ECC (twice the minimum) [^b-val-ram-rec] [^doubling] | 4 TB TLC NVMe, 20,000 IOPS, 500 MB/s, 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] | 1 Gbps (measured demand, modelled margin) [^b-net] |
+| Validator | Minimum | 8 physical cores (twice the measured 4) [^b-val-cpu-min] [^doubling] | 32 GB ECC (twice the measured 16 GB) [^b-val-ram-min] [^doubling] | 2 TB TLC NVMe, 20,000 sustained write IOPS (measured on this release's execution database), 300 MB/s, 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] [^exec-disk] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
+| Validator | Recommended | 16 physical cores, PassMark 3,500 or higher (twice the minimum; PassMark modelled) [^b-val-cpu-rec] [^doubling] | 64 GB ECC (twice the minimum) [^b-val-ram-rec] [^doubling] | 4 TB TLC NVMe: local NVMe, or 40,000 sustained IOPS on cloud block storage (provisional, not yet measured), 500 MB/s, 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] [^exec-disk] | 1 Gbps (measured demand, modelled margin) [^b-net] |
 | Validator | Headroom | As recommended (modelled) [^b-head] | 64 GB ECC (as recommended) [^b-head] [^doubling] | 12 TB, otherwise as recommended (modelled) [^b-head-disk] | 1 Gbps (modelled) [^b-head] |
 | Observer (follower) | Minimum | 2 physical cores (measured) [^b-obs-min] | 8 GB (measured) [^b-obs-min] | As validator minimum (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
 | Observer (follower) | Recommended | 4 physical cores (measured) [^b-obs-rec] | 16 GB (measured) [^b-obs-rec] | As validator recommended (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
@@ -52,7 +53,8 @@ The minimum tier is twice the measured single-worker minimum, and the recommende
 Storage and network keep their derived figures, and the observer tiers are not doubled.
 [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled) says what each worker adds, and [Expected service life](#expected-service-life) says how long each tier lasts.
 
-Neither fleet's 100 GB network-attached volume ran free of IO stalls (see [Storage](#storage)), so every tier's disk figures come from measured demand plus margin, not from a tested volume.
+Neither fleet's 100 GB network-attached volume ran free of IO stalls (see [Storage](#storage)), so the disk capacity, throughput and endurance figures come from measured demand plus margin, not from a tested volume.
+The validator IOPS figures come from cloud volumes tested with this release's execution database [^exec-disk].
 
 Cloud vCPUs are usually hyperthreads, so 8 vCPUs are 4 physical cores, and the minimum tier's 8 physical cores are a 16-vCPU instance.
 Compare physical cores when reading this table.
@@ -146,6 +148,12 @@ The benchmark moved these provisional figures, before the multi-worker doubling:
 - The follower observer minimum fell from 4 to 2 physical cores and settled at 8 GB, with 16 GB recommended.
 
 Validator RAM (16 and 32 GB for one worker), storage capacity (2 and 4 TB) and network (200 Mbps and 1 Gbps) held.
+
+This release's execution database (tn-lmdb) then moved the validator disk IOPS, measured with the execution benchmark rather than the network benchmark [^exec-disk]:
+
+- The minimum disk rose from 10,000 to 20,000 sustained write IOPS. Its commits are bound by write IOPS on cloud block storage: at 4,500 IOPS one peak output's commit took 12.3 s.
+- The recommended disk changed from 20,000 IOPS to local NVMe, or 40,000 IOPS on cloud block storage, a provisional figure until it is measured.
+- Throughput (300 and 500 MB/s), capacity and endurance held.
 
 Earlier versions of this page asked validators for 16 cores / 32 threads, 128 GB of RAM and 4 to 7.5 TB of NVMe, and observers for 8 cores / 16 threads and 16 to 32 GB.
 Those figures were not derived from measurement.
@@ -311,7 +319,9 @@ c3 wrote more bytes in fewer, larger IOs, and its extra memory kept reads in pag
 Disk was the tightest resource in both fleets.
 On e2, write IOPS ran at 57% to 62% of the volume's 9,000 IOPS limit, and IO pressure was the highest pressure signal on every node.
 On c3, every validator's p95 write rate sat between 181 and 190 MB/s, about 75% of the 240 MiB/s per-VM cap, and IO pressure was around 50% at p95, so the volume was the tightest resource on c3 as well.
-Size sustained IOPS from these p95 figures and write throughput from the c3 plateau, with the same 2x margin as the recommended tier: 2 × (2,990 + 5,120) is 16,220 IOPS, so the recommended tier asks for 20,000, and twice the c3 plateau is 380 MB/s, so it asks for 500.
+Size write throughput from the c3 plateau, with the same 2x margin as the recommended tier: twice the c3 plateau is 380 MB/s, so the recommended tier asks for 500.
+On the previous execution database (MDBX), the same margin on these p95 IOPS figures gave 2 × (2,990 + 5,120) = 16,220 IOPS, and the tiers asked for 10,000 and 20,000.
+This release's execution database needs more: each consensus output ends in one durable commit whose time on cloud block storage is set by the disk's IOPS limit, so the minimum asks for 20,000 sustained write IOPS and the recommended tier for local NVMe or 40,000 IOPS [^exec-disk].
 Quote sustained figures, not burst.
 Endurance is covered under [Storage: TLC over QLC](#storage-tlc-over-qlc).
 This release's execution database commits are bound by write IOPS on cloud disks: [Execution database: disk and memory](execution-database-hardware.md) gives their measured commit times and the `--db.gap-fill` setting.
@@ -637,7 +647,9 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 | Single-worker minimum and recommended CPU and RAM | Benchmark and the tier rules | Measured |
 | Validator CPU and RAM tiers in the summary | Twice the single-worker figures | Modelled margin for the multi-worker rollout, not measured |
 | PassMark floor | Judgement; CPU scores were not recorded | Modelled |
-| Disk and network figures in every tier | Measured demand plus the tier margins | Modelled from measured demand |
+| Disk and network figures in every tier, except validator IOPS | Measured demand plus the tier margins | Modelled from measured demand |
+| Validator minimum disk IOPS | Execution benchmark on cloud volumes of 4,500 and 20,000 IOPS | Measured |
+| Validator recommended disk IOPS (cloud block storage) | Twice the minimum | Provisional, not yet measured |
 | Replay memory peak | Benchmark, one e2 validator, one restart | Measured, single sample |
 | β_reth, β_pack | Benchmark mixed phase | Measured lower bounds for the benchmark mix |
 | PC_hot, M_base | On-node sampler | Measured proxies |
@@ -654,15 +666,15 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 ## Sources and code references
 
 Notes whose names start with `b-` cite the benchmark: the run, and the field in that run's `sizing.json` unless another file is named.
-`doubling` states the multi-worker rule, and the rest cite code.
+`exec-disk` cites the execution benchmark, `doubling` states the multi-worker rule, and the rest cite code.
 
 [^b-val-cpu-min]: Measured, r20260923-0708 (e2) and r20260923-0515 (c3). `gcp_by_role.validator.cpu_utilization`: e2 validators ran 44% mean (`mean_avg_nodes`), 55% p95 (`p95_max_node`) and 66% max of 4 vCPU; c3 validators ran 13%, 25% and 36% of 8 vCPU. `prometheus.tn_engine_queued_outputs`: every e2 validator reached 7 or 8 queued outputs, against a limit of 8, while no c3 validator passed 3. `prometheus.tn_batch_builder_pending_pool_transactions`: seven e2 pools peaked at 9,480 to 9,850 transactions, near the default limit of 10,000. The 2-core e2 hosts were execution-bound, so they fail the minimum rule; the 4-core c3 hosts pass it on CPU. The single-worker minimum is therefore 4 physical cores, and the summary doubles it to 8.
 [^b-val-ram-min]: Measured, r20260923-0708 and r20260923-0515. e2 (8 GB): `gcp_by_role.validator.memory_percent_used.p95_max_node` 81%, `telcoin_rss_bytes.p95_max_node` 7.15 GB, `sampler_by_node.*.psi_mem_some_avg10.run_max` 0.9 to 4%, replay peak 7.0 GB. c3 (16 GB): 52%, 10.8 GB, PSI memory 0. 8 GB left no room for the replay peak, so the single-worker minimum is 16 GB, and the summary doubles it to 32 GB.
-[^b-val-disk-min]: Modelled from measured demand. The minimum takes twice the e2 p95 write IOPS (5,120, `gcp_by_role.validator.disk_write_ops_per_sec.p95_max_node`) and sets throughput above the c3 plateau of 190 MB/s (`disk_write_bytes_per_sec.p95_max_node`), because both fleets' 100 GB volumes showed IO stalls. 2 TB holds about 8 months of growth at the 6-hour ceiling (about 8 GB a day with idle growth). 2.4 DWPD is twice the modelled 0.4 to 1.2 DWPD at the ceiling (see [Endurance](#endurance-from-the-measured-write-rate)).
+[^b-val-disk-min]: Modelled from measured demand, except IOPS. The IOPS figure is measured on this release's execution database (see the `exec-disk` note); on the previous one (MDBX) the network benchmark's demand set it at 10,000, twice the e2 p95 write IOPS (5,120, `gcp_by_role.validator.disk_write_ops_per_sec.p95_max_node`). Throughput is set above the c3 plateau of 190 MB/s (`disk_write_bytes_per_sec.p95_max_node`), because both fleets' 100 GB volumes showed IO stalls. 2 TB holds about 8 months of growth at the 6-hour ceiling (about 8 GB a day with idle growth). 2.4 DWPD is twice the modelled 0.4 to 1.2 DWPD at the ceiling (see [Endurance](#endurance-from-the-measured-write-rate)).
 [^b-net]: Measured demand, r20260923-0708 and r20260923-0515, `gcp_by_role.validator.network_sent_bytes_per_sec.p95_max_node` and `network_received_bytes_per_sec.p95_max_node`: out 56 Mbps (e2) and 86 Mbps (c3), in 24 and 21 Mbps. 200 Mbps symmetric clears the measured p95 with room for catch-up. 1 Gbps keeps p95 under a tenth of capacity and leaves room for catch-up and serving epoch packs, which the benchmark did not measure. Egress includes RPC traffic to the load generator.
 [^b-val-cpu-rec]: Cores measured, r20260923-0515: 25% p95 and 36% max of 8 vCPU (`gcp_by_role.validator.cpu_utilization`) on 4 physical cores, under the half-capacity line, with the engine queue at 3 or below, so the single-worker recommended figure is 4 physical cores; the summary's 16 is twice the doubled minimum. The PassMark figure is modelled: the benchmark did not record CPU models or scores, and 3,500 is a floor chosen for single-thread speed, not a measurement.
 [^b-val-ram-rec]: Measured, r20260923-0515: 16 GB ran at 52% p95 (`gcp_by_role.validator.memory_percent_used.p95_max_node`), just over half of capacity, so the single-worker recommended figure is 32 GB; the summary's 64 GB is twice the doubled minimum.
-[^b-val-disk-rec]: Modelled from measured demand. 20,000 sustained IOPS is above twice the e2 p95 read plus write IOPS (2 × (2,990 + 5,120) = 16,220; `disk_read_ops_per_sec.p95_max_node`, `disk_write_ops_per_sec.p95_max_node`). 500 MB/s is above twice the c3 write plateau (380 MB/s). 4 TB covers one year at the 6-hour ceiling (2.9 TB) with room to spare. 1.2 DWPD is twice the modelled 0.2 to 0.6 DWPD at the ceiling.
+[^b-val-disk-rec]: Modelled from measured demand, except IOPS. Local NVMe was the fastest disk the execution benchmark measured, and 40,000 IOPS on cloud block storage is twice the measured minimum, a provisional figure until it is measured (see the `exec-disk` note). On the previous execution database (MDBX) the network benchmark set it at 20,000, above twice the e2 p95 read plus write IOPS (2 × (2,990 + 5,120) = 16,220; `disk_read_ops_per_sec.p95_max_node`, `disk_write_ops_per_sec.p95_max_node`). 500 MB/s is above twice the c3 write plateau (380 MB/s). 4 TB covers one year at the 6-hour ceiling (2.9 TB) with room to spare. 1.2 DWPD is twice the modelled 0.2 to 0.6 DWPD at the ceiling.
 [^b-head]: Modelled. Headroom is sized for the planning load, the 6-hour batch-cache ceiling of about 260 TPS, under a thirteenth of the e2 fleet's 3,569 TPS. The recommended CPU, memory and network cover that load, and replay at it holds at most about 1 GiB of batch data. Headroom therefore adds storage (and, for public RPC observers, memory), not throughput.
 [^b-head-disk]: Modelled: G_day = 86400 · λ · 345 B + G_idle at the ceiling is about 8 GB a day, 8.8 TB over three years (a lower bound). 12 TB holds that with about a third to spare.
 [^b-obs-min]: Measured, r20260923-0708, `gcp_by_role.observer`: the e2 observer (2 physical cores, 8 GB) used 22% mean and 27% p95 CPU, 38% of memory at p95 (3.7 GB resident), and peaked at 1% memory pressure. It fell behind at times (engine queue at 8) but caught up after its restart.
@@ -676,6 +688,7 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^b-beta-reth]: Measured, `storage_growth.beta_reth_bytes_per_tx.median`: 251 (r20260923-0708) and 257 (r20260923-0515) bytes per landed transaction over the mixed window. `db/mdbx.dat` stayed at 4,295,995,405 bytes on every node in every run (sampler `db_bytes`), so this counts `static_files` growth only.
 [^b-beta-pack]: Measured, `storage_growth.beta_pack_bytes_per_tx.median`: 92 (r20260923-0708) and 94 (r20260923-0515). Packs for the open epoch are folded in at epoch close, so the figure is a lower bound when the window ends mid-epoch.
 [^b-txbytes]: Measured from Prometheus over each fleet's mixed window: batch bytes divided by batch transactions (`tn_worker_batch_size_bytes`, `tn_worker_batch_transactions`) is 188 B on c3 (r20260923-0515) and about 190 B on e2 (r20260923-0708), about 340 transactions and 63 to 65 KiB per batch. The e2 figure excludes bench-validator-03's re-sealed batches and is approximated from the histogram means. The superseded e2 run r20260923-0215 measured 192 B.
+[^exec-disk]: Measured with the execution benchmark (durable commits, storage layout v2, gap fill off, one state-root thread), described in [Execution database: disk and memory](execution-database-hardware.md#disk). Peak profile, mean commit per consensus output: 12.3 s on GCP Hyperdisk Balanced at 4,500 IOPS (c3-highmem-8) and 1.4 s at 20,000 IOPS and 800 MiB/s (c3-highcpu-8), where a whole peak output took 3,509 ms and a busy one 1,095 ms. During those commits the node wrote about 18,000 IOPS of about 5 KiB each, so the 20,000-IOPS disk was the limit. Local NVMe (c3-standard-8-lssd) took 2,682 ms per peak output and 685 ms per busy one.
 [^b-disk]: Measured, `gcp_by_role.validator.disk_*_per_sec.p95_max_node`: e2 2,990 read and 5,120 write IOPS (5,570 max) at 137 MB/s (145 max); c3 5 read and 2,440 write IOPS at 190 MB/s. IO pressure from `sampler_by_node.*.psi_io_some_avg10.run_max`. Volume limits from each run's `limits` section and the report.
 [^b-writes]: Measured, `sampler_by_node.*.growth_mixed.io_write_bytes` over the mixed window, divided by `storage_growth.chain_tx_in_window` and by the data directory's growth, excluding the restarted validator. The process write rate is `storage_growth.telcoin_process_write_bytes_per_sec`: 56 MB/s median on e2 and 163 MB/s on c3. The scaling to 260 TPS is modelled.
 [^doubling]: Modelled margin, not measured. The benchmark ran one worker per validator. The summary's validator minimum is twice the single-worker minimum and its recommended tier is twice that minimum, to cover the worker count governance is expected to raise over the next 12 months (see [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled)). Storage, network and observer figures are not doubled.

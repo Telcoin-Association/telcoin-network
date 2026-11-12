@@ -35,8 +35,9 @@ During commits on the 20,000-IOPS disk the node wrote about 90 MiB/s in writes o
 
 What this means for a validator:
 
-- **Local NVMe is best.** It was the fastest disk measured.
-- **On cloud block storage, provision at least 20,000 IOPS and 800 MiB/s.** At those limits, Hyperdisk Balanced spent 1.4 s of a 3.5 s peak output in the commit.
+- **Local NVMe is best.** It was the fastest disk measured, and it is the recommended disk in [Hardware Requirements](hardware-requirements.md#summary).
+- **On cloud block storage, the minimum is 20,000 sustained write IOPS.** At that limit Hyperdisk Balanced spent 1.4 s of a 3.5 s peak output in the commit, and the disk, not the node, set the pace.
+- **The recommended figure for cloud block storage is 40,000 IOPS.** It is provisional: twice the minimum, not yet measured.
 - **4,500 IOPS is too slow for a busy validator.** The commit of one peak output took 12 s or more.
 - Nothing between 4,500 and 20,000 IOPS has been measured on this database.
 - Quote provisioned, sustained figures, not burst figures.
