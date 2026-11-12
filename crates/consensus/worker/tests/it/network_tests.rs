@@ -23,11 +23,11 @@ use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
     Address, AuthorityIdentifier, Batch, BatchValidation, BatchValidationError, BcsError,
-    BlsPublicKey, Database, SealedBatch, TaskManager, B256,
+    BlsPublicKey, Database, SealedBatch, TaskManager, B256, MAX_GC_DEPTH,
 };
 use tn_worker::{
-    RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
-    WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS, MAX_PENDING_REQUESTS_PER_PEER,
+    ReportedBatchLedger, RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle,
+    WorkerRequest, WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS, MAX_PENDING_REQUESTS_PER_PEER,
     MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -81,7 +81,13 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
         .expect("worker 0 local network")
         .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
         .expect("register mock primary handler");
-    let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
+    let handler = RequestHandler::new(
+        worker_id,
+        batch_validator,
+        config,
+        network_handle,
+        ReportedBatchLedger::new(),
+    );
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
 
@@ -115,7 +121,13 @@ fn create_test_types_with_validator_and_primary(
         .expect("worker 0 local network")
         .set_worker_to_primary_local_handler(primary)
         .expect("register mock primary handler");
-    let handler = RequestHandler::new(worker_id, validator, config, network_handle);
+    let handler = RequestHandler::new(
+        worker_id,
+        validator,
+        config,
+        network_handle,
+        ReportedBatchLedger::new(),
+    );
     (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
 }
 
@@ -425,12 +437,12 @@ async fn test_batch_gossip_topics() {
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
+    assert!(handler.pub_process_gossip_for_test(&good_msg, None).await.is_ok());
 
     // A batch gossiped on any other topic must be rejected as an invalid topic.
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
+    assert!(handler.pub_process_gossip_for_test(&bad_msg, None).await.is_err());
 }
 
 /// Three workers on the same validator accept only their own batch gossip namespace.
@@ -480,6 +492,7 @@ async fn test_multi_worker_batch_gossip_isolation() -> eyre::Result<()> {
                     Arc::new(NoopBatchValidator),
                     config.clone(),
                     handle,
+                    ReportedBatchLedger::new(),
                 );
                 futures::stream::iter(0..3)
                     .then(|topic_worker| {
@@ -500,7 +513,7 @@ async fn test_multi_worker_batch_gossip_isolation() -> eyre::Result<()> {
                                     ),
                                 ),
                             };
-                            let result = handler.pub_process_gossip_for_test(&message).await;
+                            let result = handler.pub_process_gossip_for_test(&message, None).await;
                             if worker_id == topic_worker {
                                 assert!(result.is_ok(), "worker {worker_id}: {result:?}");
                             } else {
@@ -534,7 +547,7 @@ async fn test_batch_gossip_topic_is_chain_namespaced() {
         sequence_number: None,
         topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(2017, 0)),
     };
-    assert!(handler.pub_process_gossip_for_test(&good).await.is_ok());
+    assert!(handler.pub_process_gossip_for_test(&good, None).await.is_ok());
 
     // the chain-0 namespace is a different topic and is rejected
     let bad = GossipMessage {
@@ -544,7 +557,7 @@ async fn test_batch_gossip_topic_is_chain_namespaced() {
         topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0)),
     };
     assert_matches!(
-        handler.pub_process_gossip_for_test(&bad).await,
+        handler.pub_process_gossip_for_test(&bad, None).await,
         Err(WorkerNetworkError::InvalidTopic)
     );
 }
@@ -555,8 +568,9 @@ async fn test_batch_gossip_topic_is_chain_namespaced() {
 /// author's gossip-driven fetch amplification.
 #[tokio::test]
 async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
-    let TestTypes { mut network_commands_rx, handler, task_manager, committee: _ } =
+    let TestTypes { mut network_commands_rx, handler, task_manager, committee } =
         create_test_types();
+    let author = committee.last_authority().primary_public_key();
     let batch_digest = B256::random();
     let data = tn_types::encode(&WorkerGossip::Batch(0, batch_digest));
     let make_msg = || GossipMessage {
@@ -572,7 +586,7 @@ async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
     let handler_a = handler.clone();
     let msg_a = make_msg();
     task_manager.spawn_task("prefetch-a", async move {
-        let _ = handler_a.pub_process_gossip_for_test(&msg_a).await;
+        let _ = handler_a.pub_process_gossip_for_test(&msg_a, Some(&author)).await;
         Ok(())
     });
 
@@ -583,7 +597,10 @@ async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
     // Task B: a duplicate gossip for the same digest. It must be deduplicated and
     // return without emitting any network command of its own.
     let msg_b = make_msg();
-    handler.pub_process_gossip_for_test(&msg_b).await.expect("duplicate gossip returns Ok");
+    handler
+        .pub_process_gossip_for_test(&msg_b, Some(&author))
+        .await
+        .expect("duplicate gossip returns Ok");
 
     // The duplicate emitted nothing: no second fetch fan-out for an in-flight digest.
     assert_matches!(
@@ -602,15 +619,17 @@ async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
 /// Byzantine committee member get a semantically-invalid batch voted on and certified.
 #[tokio::test]
 async fn test_gossip_prefetch_rejects_invalid_batch() {
-    let (TestTypes { handler, .. }, store) =
+    let (TestTypes { committee, handler, .. }, store) =
         create_test_types_with_validator(Arc::new(RejectingBatchValidator));
+    let author = committee.last_authority().primary_public_key();
     // current-epoch batch (fixture epoch is 0), so only validation can reject it
     let batch = Batch::default();
     let digest = batch.digest();
 
     // dropping an invalid body is not an error (it is a peer content fault, not a local one)
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch, &author).await;
     assert_matches!(res, Ok(()));
+    assert_eq!(handler.pub_reported_batches().counted(&author), 0, "a dropped body is not counted");
 
     // the security property: an unvalidated body never reaches the cache the vote path trusts
     assert!(
@@ -625,13 +644,16 @@ async fn test_gossip_prefetch_rejects_invalid_batch() {
 /// rejected batch above was dropped.
 #[tokio::test]
 async fn test_gossip_prefetch_caches_valid_batch() {
-    let (TestTypes { handler, .. }, store) =
+    let (TestTypes { committee, handler, .. }, store) =
         create_test_types_with_validator(Arc::new(NoopBatchValidator));
+    let author = committee.last_authority().primary_public_key();
     let batch = Batch::default();
     let digest = batch.digest();
 
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch, &author).await;
     assert_matches!(res, Ok(()));
+    // the stored batch counts against the bound of the gossip author (issue #1794)
+    assert_eq!(handler.pub_reported_batches().counted(&author), 1);
 
     assert!(
         store.get::<NodeBatchesCache>(&digest).expect("read store").is_some(),
@@ -770,7 +792,7 @@ async fn test_panicking_validator_is_internal_and_records_nothing() {
     assert!(Option::<Penalty>::from(err).is_none());
 
     // the prefetch path drops the body without an error
-    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch).await;
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch, &peer).await;
     assert_matches!(res, Ok(()));
 
     // nothing is recorded: the digest is not rejected and the batch is not cached
@@ -1159,10 +1181,10 @@ async fn test_report_batch_refuses_reporter_over_quota() {
     assert!(penalty.is_none(), "the quota refusal must not penalize the reporter");
 }
 
-/// A commit evicts committed batches from the cache, and that frees the reporter's quota: after
-/// one stored digest leaves the cache, the next distinct batch is accepted and stored
-/// (issue #1794). If the bound counted digests that are no longer in the cache, the next batch
-/// would be refused, so this test fails.
+/// A commit frees the reporter's quota: `process_output` evicts the committed batches from the
+/// cache and removes their digests from the node-wide ledger, so after one stored batch is
+/// committed the next distinct batch is accepted and stored (issue #1794). If the bound kept
+/// counting committed digests, the next batch would be refused, so this test fails.
 #[tokio::test]
 async fn test_report_batch_quota_frees_when_commit_evicts_a_batch() {
     let (TestTypes { committee, handler, .. }, store, _counters) =
@@ -1172,8 +1194,9 @@ async fn test_report_batch_quota_frees_when_commit_evicts_a_batch() {
     let stored = report_distinct_batches(&handler, &reporter, 0..cap).await;
     assert_all_accepted(&stored);
     let (evicted, _) = stored.first().expect("the bound is at least one batch");
-    // what `evict_committed_batches` does for a committed batch
+    // what `process_output` does for a committed batch: evict the row, then forget the digest
     store.remove::<NodeBatchesCache>(evicted).expect("remove the committed batch");
+    handler.pub_reported_batches().forget(std::iter::once(evicted), 1);
 
     let next = distinct_batch(cap);
     let next_digest = next.digest();
@@ -1238,10 +1261,11 @@ async fn test_report_batch_repeat_of_cached_digest_ignores_quota() {
     );
 }
 
-/// An invalid batch consumes no quota: a reporter whose every batch is rejected never reaches the
-/// bound, so the report after the bound count is still refused for its body and not for the quota
-/// (issue #1794). Without the release on a validation failure the last report fails with the
-/// quota error, so this test fails.
+/// An invalid batch consumes no quota: nothing is counted before a successful store write, so a
+/// reporter whose every batch is rejected never reaches the bound, and the report after the bound
+/// count is still refused for its body and not for the quota (issue #1794). If the handler
+/// counted a batch before its validation, the last report would fail with the quota error, so
+/// this test fails.
 #[tokio::test]
 async fn test_report_batch_invalid_batch_consumes_no_quota() {
     let (TestTypes { committee, handler, .. }, _store, counters) =
@@ -1264,4 +1288,266 @@ async fn test_report_batch_invalid_batch_consumes_no_quota() {
         "every distinct invalid batch is validated"
     );
     assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
+    assert_eq!(handler.pub_reported_batches().counted(&reporter), 0);
+}
+
+/// Spawn a report of `sealed_batch` from `reporter` on a clone of `handler`.
+fn spawn_report(
+    handler: &RequestHandler<MemDatabase>,
+    reporter: BlsPublicKey,
+    sealed_batch: SealedBatch,
+) -> tokio::task::JoinHandle<Result<(), WorkerNetworkError>> {
+    let handler = handler.clone();
+    tokio::spawn(async move { handler.pub_process_report_batch(&reporter, sealed_batch).await })
+}
+
+/// A failed report of a digest does not uncount the batch that an overlapping report of the same
+/// digest stores (issue #1794). Report B claims digest D with another body and enters the gated
+/// validation first. Report A brings the body of D and waits behind B. B gets no release, so its
+/// validation fails while A waits. Then A is released and stores D. D must be stored and counted
+/// for the reporter. If the failure of B gave back a slot that A then used without a count, D
+/// would be stored but not counted, so this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_report_batch_failed_overlap_keeps_stored_batch_counted() {
+    let (validator, mut started_rx, release_tx) = gated_validator();
+    let (TestTypes { committee, handler, .. }, store) =
+        create_test_types_with_validator(Arc::new(validator));
+    let reporter = committee.last_authority().primary_public_key();
+    let batch = distinct_batch(0);
+    let digest = batch.digest();
+
+    // B holds the gate and gets no release, so its validation times out and fails
+    let report_b = spawn_report(&handler, reporter, distinct_batch(1).seal(digest));
+    started_rx.recv().await.expect("report B is in validation");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A passes the quota check and waits behind B
+    let report_a = spawn_report(&handler, reporter, batch.seal(digest));
+    started_rx.recv().await.expect("report A is in validation");
+
+    assert_matches!(
+        report_b.await.expect("report B task"),
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+    );
+    release_tx.send(()).expect("release report A");
+    assert_matches!(report_a.await.expect("report A task"), Ok(()));
+
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_some());
+    assert_eq!(handler.pub_reported_batches().counted(&reporter), 1, "the stored batch counts");
+}
+
+/// A batch that fails validation while it is in flight does not lift the bound (issue #1794).
+/// The reporter stores one batch less than the bound. Then a valid batch B and a batch C whose
+/// validation fails are in flight together, so both pass the check. B is stored and counted, C
+/// is not. The reporter is then at the bound, and its next distinct batch is refused. If the
+/// failure of C freed a slot that B holds, the next batch would be accepted, so this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_report_batch_invalid_batch_in_flight_keeps_the_bound() {
+    let (validator, mut started_rx, release_tx) = gated_validator();
+    let (TestTypes { committee, handler, .. }, _store) =
+        create_test_types_with_validator(Arc::new(validator));
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+
+    // store one batch less than the bound, with one release for each validation
+    (1..cap).for_each(|_| release_tx.send(()).expect("release a validation"));
+    let stored = report_distinct_batches(&handler, &reporter, 0..cap - 1).await;
+    assert_all_accepted(&stored);
+    let started = std::iter::from_fn(|| started_rx.try_recv().ok()).count();
+    assert_eq!(started, stored.len());
+
+    // B holds the gate, C waits behind it, and only B gets a release
+    let batch_b = distinct_batch(cap - 1);
+    let digest_b = batch_b.digest();
+    let report_b = spawn_report(&handler, reporter, batch_b.seal(digest_b));
+    started_rx.recv().await.expect("report B is in validation");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let batch_c = distinct_batch(cap);
+    let digest_c = batch_c.digest();
+    let report_c = spawn_report(&handler, reporter, batch_c.seal(digest_c));
+    started_rx.recv().await.expect("report C passed the check and is in validation");
+    release_tx.send(()).expect("release report B");
+
+    assert_matches!(report_b.await.expect("report B task"), Ok(()));
+    assert_matches!(
+        report_c.await.expect("report C task"),
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+    );
+    assert_eq!(
+        handler.pub_reported_batches().counted(&reporter),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER
+    );
+
+    let over = distinct_batch(cap + 1);
+    let over_digest = over.digest();
+    let refused = handler.pub_process_report_batch(&reporter, over.seal(over_digest)).await;
+    assert_matches!(refused, Err(WorkerNetworkError::ReporterOverQuota { .. }));
+}
+
+/// A committed batch that a late gossip caches again does not count against its first reporter
+/// (issue #1794). Reporter A stores D, the commit of D evicts the row and removes D from the
+/// ledger, and a gossip prefetch from another key caches D again. D now counts against the
+/// gossip author, and A can store a full bound of new batches. If D still counted for A because
+/// it is in the cache again, the last new batch of A would be refused, so this test fails.
+#[tokio::test]
+async fn test_report_batch_recached_committed_batch_does_not_pin_the_reporter() {
+    let (TestTypes { committee, handler, .. }, store, _counters) =
+        create_counting_test_types(Verdict::Accept);
+    let reporter = committee.last_authority().primary_public_key();
+    let gossip_author = committee.first_authority().primary_public_key();
+    let cap = reporter_quota();
+    let batch = distinct_batch(0);
+    let digest = batch.digest();
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(first, Ok(()));
+
+    // the commit of D: `process_output` evicts the row and forgets the digest
+    store.remove::<NodeBatchesCache>(&digest).expect("remove the committed batch");
+    handler.pub_reported_batches().forget(std::iter::once(&digest), 1);
+    assert_eq!(handler.pub_reported_batches().counted(&reporter), 0);
+
+    // a late gossip of D from another key caches it again
+    let recached =
+        handler.pub_validate_and_cache_prefetched_batch(&digest, &batch, &gossip_author).await;
+    assert_matches!(recached, Ok(()));
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_some());
+    assert_eq!(handler.pub_reported_batches().counted(&gossip_author), 1);
+
+    let stored = report_distinct_batches(&handler, &reporter, 1..cap + 1).await;
+    assert_all_accepted(&stored);
+    assert_eq!(
+        handler.pub_reported_batches().counted(&reporter),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER
+    );
+}
+
+/// Stored batches that are never committed age out when their key is at the bound (issue #1794).
+/// The reporter fills the bound with batches that no commit frees, as after failed seals or an
+/// outage. While the committed round is not more than [`MAX_GC_DEPTH`] rounds past the round at
+/// which the batches were counted, the next batch is refused. One committed round later the
+/// batches age out: the next batch is accepted and the aged batches are deleted from
+/// `NodeBatchesCache`. Without the age-out the reporter stays locked out, so this test fails.
+#[tokio::test]
+async fn test_report_batch_quota_ages_out_uncommitted_batches() {
+    let (TestTypes { committee, handler, .. }, store, _counters) =
+        create_counting_test_types(Verdict::Accept);
+    let reporter = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &reporter, 0..cap).await;
+    assert_all_accepted(&stored);
+
+    // commits of other batches move the committed round to the edge of the window
+    handler.pub_reported_batches().forget(std::iter::empty::<&B256>(), MAX_GC_DEPTH);
+    let early = distinct_batch(cap);
+    let early_digest = early.digest();
+    let refused = handler.pub_process_report_batch(&reporter, early.seal(early_digest)).await;
+    assert_matches!(refused, Err(WorkerNetworkError::ReporterOverQuota { .. }));
+
+    // one more committed round, and the batches of the reporter age out
+    handler.pub_reported_batches().forget(std::iter::empty::<&B256>(), MAX_GC_DEPTH + 1);
+    let next = distinct_batch(cap + 1);
+    let next_digest = next.digest();
+    let accepted = handler.pub_process_report_batch(&reporter, next.seal(next_digest)).await;
+    assert_matches!(accepted, Ok(()));
+    assert!(store.get::<NodeBatchesCache>(&next_digest).expect("read store").is_some());
+    assert_eq!(handler.pub_reported_batches().counted(&reporter), 1);
+    stored.iter().for_each(|(digest, _)| {
+        assert!(
+            store.get::<NodeBatchesCache>(digest).expect("read store").is_none(),
+            "aged batch {digest} must be deleted from the cache"
+        );
+    });
+}
+
+/// The bound is one per committee key for the whole node: two workers that share the ledger of
+/// the node count the batches of one key against one bound (issue #1794). Half the bound is
+/// stored through worker 0 and half through worker 1, and the next batch is refused on worker 1.
+/// With one ledger per worker, each worker would accept up to the bound, so this test fails.
+#[tokio::test]
+async fn test_report_batch_quota_is_node_wide_across_workers() {
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .number_of_workers(std::num::NonZeroUsize::new(2).expect("two workers"))
+        .build();
+    let config = committee.first_authority().consensus_config();
+    let reporter = committee.last_authority().primary_public_key();
+    let task_manager = TaskManager::default();
+    let ledger = ReportedBatchLedger::new();
+    // one handler for each worker, on the store and the ledger of the node
+    let worker_handler = |worker_id| {
+        config
+            .local_network(worker_id)
+            .expect("local network of the worker")
+            .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+            .expect("register mock primary handler");
+        let (tx, network_commands_rx) = mpsc::channel(10);
+        let network_handle = WorkerNetworkHandle::new(
+            NetworkHandle::new(tx),
+            task_manager.get_spawner(),
+            worker_id,
+            0,
+            0,
+        );
+        let handler = RequestHandler::new(
+            worker_id,
+            Arc::new(NoopBatchValidator),
+            config.clone(),
+            network_handle,
+            ledger.clone(),
+        );
+        (handler, network_commands_rx)
+    };
+    let (worker_0, _commands_0) = worker_handler(0);
+    let (worker_1, _commands_1) = worker_handler(1);
+    let cap = reporter_quota();
+    let half = cap / 2;
+
+    let through_0 = report_distinct_batches(&worker_0, &reporter, 0..half).await;
+    let through_1 = report_distinct_batches(&worker_1, &reporter, half..cap).await;
+    assert_all_accepted(&through_0);
+    assert_all_accepted(&through_1);
+    assert_eq!(ledger.counted(&reporter), MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER);
+
+    let extra = distinct_batch(cap);
+    let extra_digest = extra.digest();
+    let refused = worker_1.pub_process_report_batch(&reporter, extra.seal(extra_digest)).await;
+    assert_matches!(refused, Err(WorkerNetworkError::ReporterOverQuota { .. }));
+}
+
+/// The gossip prefetch is charged to the gossip author (issue #1794): a key at its bound of
+/// uncommitted stored batches gets no prefetch, so its gossip of a new digest returns at once and
+/// sends no fetch request. Without the check the prefetch sends a fetch request and waits for a
+/// reply that never comes, so this test fails.
+#[tokio::test]
+async fn test_gossip_prefetch_skipped_for_author_at_quota() {
+    let TestTypes { mut network_commands_rx, handler, task_manager: _task_manager, committee } =
+        create_test_types();
+    let author = committee.last_authority().primary_public_key();
+    let cap = reporter_quota();
+    let stored = report_distinct_batches(&handler, &author, 0..cap).await;
+    assert_all_accepted(&stored);
+    let _ = std::iter::from_fn(|| network_commands_rx.try_recv().ok()).count();
+
+    let digest = distinct_batch(cap).digest();
+    let message = GossipMessage {
+        source: None,
+        data: tn_types::encode(&WorkerGossip::Batch(0, digest)),
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0)),
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.pub_process_gossip_for_test(&message, Some(&author)),
+    )
+    .await
+    .expect("a key at its bound gets no prefetch, so the gossip returns at once");
+    assert_matches!(outcome, Ok(()));
+    assert_matches!(
+        network_commands_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "a key at its bound must not trigger a batch fetch"
+    );
+    assert_eq!(
+        handler.pub_reported_batches().counted(&author),
+        MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER
+    );
 }

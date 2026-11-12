@@ -156,8 +156,8 @@ impl WorkerNetworkError {
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
-            // transient: the reporter is at its uncommitted-batch bound, which clears as commits
-            // evict its batches, and an honest reporter can reach it during a commit stall
+            // the key is at its bound of uncommitted stored batches, which frees when a commit
+            // frees its batches or when they age out; an honest key can reach it in a commit stall
             WorkerNetworkError::ReporterOverQuota { .. } => None,
         }
     }
