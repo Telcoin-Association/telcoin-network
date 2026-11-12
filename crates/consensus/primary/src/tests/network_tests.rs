@@ -1688,6 +1688,93 @@ async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Test setup for a vote this node cast before a restart: a header from the last authority and a
+/// durable vote info for it, with the in-memory `auth_last_vote` guard empty (fresh handler).
+fn seed_stored_vote(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+) -> eyre::Result<Header> {
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let stored = VoteInfo {
+        epoch: header.epoch(),
+        round: header.round(),
+        vote_digest: header.digest().into(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&committee.last_authority().id(), &stored)?;
+    Ok(header)
+}
+
+/// A repeated vote request for a header this node voted for before a restart is recast under the
+/// author lock, and the recast vote stays in the author's guard. Later repeats are served from the
+/// guard, so a burst of copies of one header signs at most once (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_fills_author_guard() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let request_vote = || handler.vote(peer, header.clone(), vec![]);
+
+    assert!(
+        !handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a fresh handler holds the stored vote only on disk"
+    );
+    let first = request_vote().await;
+    assert_matches!(first, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "the recast vote must stay in the author's guard"
+    );
+
+    let second = request_vote().await;
+    assert_matches!(second, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    let third = request_vote().await;
+    assert_matches!(third, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+
+    Ok(())
+}
+
+/// The recast of a stored vote waits for the author lock, like every other vote request from that
+/// author, so parallel copies of one header queue on the lock instead of each signing at once
+/// (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_waits_for_author_lock() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let held = handler.lock_author_vote(&author_id).await;
+    assert!(held.is_some(), "every committee member has a vote lock");
+    let mut recast = std::pin::pin!(handler.vote(peer, header.clone(), vec![]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut recast).await.is_err(),
+        "the recast must not answer while another request from the author holds its lock"
+    );
+
+    drop(held);
+    let res = recast.await;
+    assert_matches!(res, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    Ok(())
+}
+
 /// A header whose epoch-close seed signature does not verify against the author's protocol key
 /// over the canonical seed message for its `(epoch, round)` must be refused with
 /// `HeaderError::InvalidSeedSignature` (no vote), while a header carrying a valid seed
