@@ -894,9 +894,18 @@ refuses to start while a `.partial` directory is there, and running the command 
   telcoin-network node --datadir <datadir> ...                     # rebuilds from genesis
   ```
 
-  The node re-executes every consensus output from its own consensus database and from peers, and
-  each epoch is checked against its certified record. It is out of the committee's work for the
-  whole rebuild. On a five-validator committee with a quorum of four, one validator out leaves no
+  The node re-executes every consensus output from its own consensus database and from peers. Each
+  epoch it re-executes is checked against the epoch record it already holds (certified, or its own
+  from before the reset): when it closes the epoch, and again when it enters the next one, the
+  record's `final_state` must be the epoch's closing block in the rebuilt chain, number and hash.
+  Block hashes chain, so this covers every block up to that closing block: the check finds the
+  first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
+  final_state does not match this node's closing block` with the epoch and both blocks, counts
+  `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
+  epoch. Two records are not compared: the epoch-0 placeholder, which the epoch-0 close replaces,
+  and on a datadir restored from a state pack, the record of the restored block, which this node
+  imported (`db load-state` checked it) and did not execute. It is out of the committee's work for
+  the whole rebuild. On a five-validator committee with a quorum of four, one validator out leaves no
   margin, so validators take the swap below.
 - **Side-observer swap** (validators): build the new execution database on another node, then swap
   it in, so the validator is down only for the swap.

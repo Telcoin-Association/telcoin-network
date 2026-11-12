@@ -232,9 +232,10 @@ where
         // record
         // - re-derive record N-1 locally from the executed closing block before opening the pack.
         // Re-derives nothing unless the previous epoch's record is actually missing. With the
-        // record present it clears the epoch tables only when they still hold rows of an older
-        // epoch (killed between the record write and the tables clear).
-        self.recover_previous_epoch_record(committee.epoch(), engine).await?;
+        // record present it checks the record against the closing block (`epoch_start_header`)
+        // and clears the epoch tables only when they still hold rows of an older epoch (killed
+        // between the record write and the tables clear).
+        self.recover_previous_epoch_record(committee.epoch(), &epoch_start_header, engine).await?;
 
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
         if epoch_mode.replay_consensus() {
@@ -1350,7 +1351,7 @@ fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::manager::{
         read_base_fees_for_entered_epoch, sync_num_workers_from_chain, EpochBaseFees,
@@ -1420,6 +1421,21 @@ mod tests {
         TaskManager,
         Committee,
     )> {
+        manager_with_engine_and_floor(temp, None).await
+    }
+
+    /// [`manager_with_engine`] on a datadir that holds `floor` as its restored-state floor marker,
+    /// as a snapshot restore leaves it, when `floor` is given.
+    pub(in crate::manager::node) async fn manager_with_engine_and_floor(
+        temp: &TempDir,
+        floor: Option<u64>,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        ExecutionNode,
+        RethEnv,
+        TaskManager,
+        Committee,
+    )> {
         use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
         use tn_config::{Config, KeyConfig};
         use tn_storage::mem_db::MemDatabase;
@@ -1430,9 +1446,13 @@ mod tests {
         let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
         let config = Config::default_for_test();
         let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        if let Some(floor) = floor {
+            std::fs::write(RethEnv::restored_state_floor_marker(&datadir), format!("{floor}\n"))?;
+        }
         let tasks = TaskManager::default();
         let reth_env =
             RethEnv::new(&node_config, &tasks, reth_db.clone(), None, GasAccumulator::new(1))?;
+        eyre::ensure!(reth_env.restored_state_floor() == floor, "the env reads the floor marker");
         let builder = TnBuilder::new(node_config, config, reth_db);
         let engine = ExecutionNode::new(&builder, reth_env.clone())?;
         let keys =
