@@ -16,6 +16,7 @@ mod header_validator;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
+pub(crate) use cert_validator::verify_stored_certificate;
 
 #[cfg(test)]
 #[path = "../tests/certificate_processing_tests.rs"]
