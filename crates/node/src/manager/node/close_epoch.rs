@@ -446,13 +446,16 @@ where
         // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
         // not the reth canonical tip: the engine publishes each executed output's last block
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
-        // mid-execution but never lead it. At every call site (the live boundary arm and the
-        // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
-        // `wait_for_consensus_execution` as well as try_restore_state() on startup) the wait
-        // resolved on the exact write that carries the
-        // closing block, so this read IS that block; the pin makes the record's committee reads
-        // and its `final_state` derive from the same header by construction instead of by
-        // timing.
+        // mid-execution but never lead it. At every call site this read IS the closing block:
+        // - the live boundary arm and the two recovery arms of `run_epoch` (replay-and-close and
+        //   the leftover drain) each run after `close_epoch`'s `wait_for_consensus_execution`,
+        //   which resolved on the exact write that carries the closing block;
+        // - the re-derive path of `recover_previous_epoch_record` runs before any output of the
+        //   next epoch executes, on the value `try_restore_state` primed from the executed blocks
+        //   at startup, and checks it is the executed closing block
+        //   (`last_executed_output_blocks(1)`) before it calls here.
+        // The pin makes the record's committee reads and its `final_state` derive from the same
+        // header by construction instead of by timing.
         //
         // `parent_state` is sampled ONCE (at the top, so the replay guard above compares the same
         // pin) and threaded into the retry below as its pin, and both
@@ -2040,6 +2043,36 @@ mod tests {
 
         let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
         assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: false, recorded, local });
+        Ok(())
+    }
+
+    /// A certified epoch-0 record is compared like any later epoch's: epoch 0 builds over only an
+    /// uncertified record 0, so a certified one whose `final_state` is not the closing block stops
+    /// the close, unpublished, and one that matches is reused.
+    #[tokio::test]
+    async fn replay_guard_stops_on_a_certified_epoch0_record_that_does_not_match(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_epoch0")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(10, 0x10);
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: recorded,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save(record0.clone(), certificate_for(&record0)).await?;
+        let local = block(10, 0x11);
+        execute_to(&manager, local);
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(0, &engine).await);
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 0, certified: true, recorded, local });
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
+
+        execute_to(&manager, recorded);
+        manager.write_epoch_record(0, &engine).await?;
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record0));
         Ok(())
     }
 
