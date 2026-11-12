@@ -254,6 +254,8 @@ The c3 validators held 2.1 to 3.1 GB of file-backed pages and read almost nothin
 The e2 validators held 1.7 to 1.8 GB, and five of the ten read 1,800 to 3,000 IOPS at p95, most likely page-cache misses.
 So PC_hot is about 3 GB at the benchmark's chain size, and it grows with state.
 
+Every node also keeps a fixed execution cache of about 160 MiB ([Execution database: disk and memory](execution-database-hardware.md#memory)).
+
 Disable swap.
 A swapping validator keeps running but executes slowly, and because votes wait on execution it drags on the committee instead of failing visibly.
 Use ECC memory.
@@ -312,6 +314,7 @@ On c3, every validator's p95 write rate sat between 181 and 190 MB/s, about 75% 
 Size sustained IOPS from these p95 figures and write throughput from the c3 plateau, with the same 2x margin as the recommended tier: 2 × (2,990 + 5,120) is 16,220 IOPS, so the recommended tier asks for 20,000, and twice the c3 plateau is 380 MB/s, so it asks for 500.
 Quote sustained figures, not burst.
 Endurance is covered under [Storage: TLC over QLC](#storage-tlc-over-qlc).
+This release's execution database commits are bound by write IOPS on cloud disks: [Execution database: disk and memory](execution-database-hardware.md) gives their measured commit times and the `--db.gap-fill` setting.
 
 #### Per-epoch batch-cache ceiling
 
