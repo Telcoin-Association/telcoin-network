@@ -56,9 +56,19 @@ pub(crate) fn compressed<'b, V: Compress>(value: &'b V, buf: &'b mut Vec<u8>) ->
     buf
 }
 
-/// The value of table `T` stored as `bytes`, if any.
+/// `f`, a decode of a stored key or value, with a panic in it caught and made
+/// [`DatabaseError::Decode`]: reth's `Decompress` and `Decode` (its `Compact` forms) expect their
+/// input well formed and panic on a damaged one (a truncated `Bytecode`, say), where this crate
+/// reports it as the read's error (the crate docs' differences from MDBX). Costs nothing on the
+/// path that does not panic.
+pub(crate) fn guarded<V>(f: impl FnOnce() -> Result<V, DatabaseError>) -> Result<V, DatabaseError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(Err(DatabaseError::Decode))
+}
+
+/// The value of table `T` stored as `bytes`, if any; a damaged one is [`DatabaseError::Decode`]
+/// ([`guarded`]).
 fn decompress<T: Table>(bytes: Option<&[u8]>) -> Result<Option<T::Value>, DatabaseError> {
-    bytes.map(T::Value::decompress).transpose()
+    guarded(|| bytes.map(T::Value::decompress).transpose())
 }
 
 /// The value of `key` in table `T` (on a dup-sort table, the key's first, as MDBX's `get`

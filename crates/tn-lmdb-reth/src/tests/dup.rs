@@ -1274,6 +1274,17 @@ fn rows_and_tables_without_a_layout_are_refused() {
     // A value of exactly the subkey's width is a row with an empty rest.
     c.upsert(key(20), &raw(32)).unwrap();
     assert_eq!(c.current().unwrap(), Some((key(20), raw(32))));
+    // An insert of a key that has a row is refused as present whatever its value's size, as
+    // MDBX refuses it (it finds the key before it checks the value), the cursor on the key's
+    // first row.
+    let present = DatabaseWriteError {
+        info: Error::KeyExist.into(),
+        operation: Op::CursorInsert,
+        table_name: PlainStorageState::NAME,
+        key: vec![1; 20],
+    };
+    assert_eq!(dbg(c.insert(key(20), &raw(31)).unwrap_err()), dbg(present.into()));
+    assert_eq!(c.current().unwrap(), Some((key(20), raw(32))));
     // A delete with a value no row can hold deletes nothing.
     assert!(!tx.delete::<Raw>(key(20), Some(raw(31))).unwrap());
     assert_eq!(tx.entries::<Raw>().unwrap(), 1);
@@ -2073,12 +2084,16 @@ fn a_held_delete_that_fails_unlatched_still_fails_the_commit() {
 /// key, or left one (the test-only `TnLmdbTxMut::break_next_wipe`: the tree and the cursor
 /// disagree, as damage the engine did not detect or a bug would make them), is refused with the
 /// engine's `Failed` (`MDBX_PANIC`), and the commit refuses the transaction with it: the
-/// environment stays open, and every row is still there.
+/// environment stays open, and every row is still there. A row left is seen whether the cursor's
+/// follower shares the key (`RowLeft`) or only the tree still holds the key's rows, the cursor
+/// out of the deleted state (`NotRun`: the wipe did not run, every row of the key still there).
 #[test]
 fn a_wipe_that_breaks_its_invariant_is_refused_and_fails_the_commit() {
-    for (fault, what) in
-        [(WipeFault::NoRowRemoved, "removed no row"), (WipeFault::RowLeft, "left a row of it")]
-    {
+    for (fault, what) in [
+        (WipeFault::NoRowRemoved, "removed no row"),
+        (WipeFault::RowLeft, "left a row of it"),
+        (WipeFault::NotRun, "left a row of it"),
+    ] {
         for form in [Form::Packed, Form::PackedSmall] {
             let (_dir, db) = create_test_db_with(TnLmdbEnvKind::RW, form);
             db.update(|tx| {
