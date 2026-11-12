@@ -20,6 +20,6 @@ For the registry ABI that is live today, read the `tn-contracts` sources or the 
 
 ## mainnet
 
-`mainnet/` (chain ID 487) holds placeholders, not the real mainnet configuration.
+`mainnet/` (chain ID 731) holds placeholders, not the real mainnet configuration.
 Its validators are throwaway keys from the ignored test `regenerate_mainnet_chain_configs` in `crates/telcoin-network-cli/src/genesis/mod.rs`, which is rerun after a `tn-contracts` artifact bump.
 The real files will come from the mainnet genesis ceremony.

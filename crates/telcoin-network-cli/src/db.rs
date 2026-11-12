@@ -9,7 +9,7 @@
 //! node stopped (`tn_reth::migrate_reth_db`).
 
 use crate::{
-    node::{validate_faucet_build, NamedChain},
+    node::{validate_faucet_build, NamedChain, OptInValueParser},
     version::SHORT_VERSION,
 };
 use clap::{Args, Parser, Subcommand};
@@ -817,11 +817,30 @@ pub struct DbLoadStateArgs {
     /// datadir config. Genesis is the trust root and must match the chain the pack came from.
     #[arg(long)]
     pub chain: Option<NamedChain>,
+
+    /// Let a faucet build load state for the loaded chain. Test networks only.
+    ///
+    /// The same opt-in as `node --allow-faucet-on-chain`: a faucet build refuses every chain but
+    /// adiri without it, and refuses mainnet (chain id 731) and the embedded mainnet genesis
+    /// with or without it.
+    #[arg(
+        long,
+        env = "TN_ALLOW_FAUCET_ON_CHAIN",
+        value_parser = OptInValueParser::default(),
+        hide_short_help = true
+    )]
+    pub allow_faucet_on_chain: bool,
 }
 
 impl DbLoadStateArgs {
     /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        self.execute_with(datadir, tn_reth::FAUCET_ENABLED)
+    }
+
+    /// [`Self::execute`] with the faucet guard's input explicit, so a test can exercise the
+    /// guard's refusal in a build that does not carry the faucet.
+    fn execute_with(&self, datadir: PathBuf, faucet_enabled: bool) -> eyre::Result<()> {
         // This writes chain data into the datadir: refuse to run while a live node holds the
         // datadir PID lock, and take it for our own run so a node cannot start mid-import;
         // released when this returns. Every config load below needs the datadir to exist, and so
@@ -852,17 +871,12 @@ impl DbLoadStateArgs {
         // command). Genesis is the trust root, so it must match the chain the pack came from.
         let tn_config = self.chain.map_or_else(
             || Config::load(&datadir, SHORT_VERSION),
-            |chain| match chain {
-                NamedChain::Adiri | NamedChain::TestNet => {
-                    Config::load_adiri(&datadir, SHORT_VERSION)
-                }
-                NamedChain::MainNet => Config::load_mainnet(&datadir, SHORT_VERSION),
-            },
+            |chain| chain.load_config(&datadir, SHORT_VERSION),
         )?;
 
         // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
         // the node command, refused before any datadir mutation.
-        validate_faucet_build(tn_reth::FAUCET_ENABLED, tn_config.genesis())?;
+        validate_faucet_build(faucet_enabled, tn_config.genesis(), self.allow_faucet_on_chain)?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
         // leaves the target untouched.
@@ -873,9 +887,13 @@ impl DbLoadStateArgs {
             reject_non_resumable_bundle(&bundle_consensus, &bundle_records, &bundle_certs)?;
 
         // The genesis committee is the trust root for record verification; load it exactly as the
-        // node does (its yaml was materialized by the `Config::load_*` step above). This is loaded
-        // here, not inside the import closure, because the pre-import chain walk below needs it —
-        // and a datadir missing its committee should fail before the import, not after it.
+        // node does. With `--chain` the bundled committee yaml is written first, only now that the
+        // checks above have passed. This is loaded here, not inside the import closure, because the
+        // pre-import chain walk below needs it — and a datadir missing its committee should fail
+        // before the import, not after it.
+        if let Some(chain) = self.chain {
+            chain.write_committee(&datadir)?;
+        }
         let genesis_committee =
             Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
                 .map_err(|e| {
@@ -892,8 +910,8 @@ impl DbLoadStateArgs {
         // `restore_pack` below. A bundle with a forged certificate, a broken parent link, or a
         // committee that does not anchor to the local genesis is refused in well under a second
         // with no chain data written, instead of after an import that can run for hours has already
-        // committed. (The `Config::load_*` step above may have materialized the genesis committee
-        // yaml into the datadir; that is config, not chain data, and it is what this check reads.)
+        // committed. (The `--chain` committee write above puts the genesis committee yaml into the
+        // datadir; that is config, not chain data, and it is what this check reads.)
         let certs = read_bundle_certs(&bundle_certs)?;
         let last_epoch_record =
             verify_record_chain_in_memory(&genesis_committee.bls_keys(), &records, &certs)?;
@@ -1828,9 +1846,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let datadir = dir.path().to_path_buf();
         let _held = PidLock::acquire(&datadir).expect("acquire datadir lock");
-        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
-            .execute(datadir)
-            .expect_err("load-state must refuse while a node holds the lock");
+        let err = super::DbLoadStateArgs {
+            pack: dir.path().join("bundle"),
+            chain: None,
+            allow_faucet_on_chain: false,
+        }
+        .execute(datadir)
+        .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
     }
 
@@ -1843,9 +1865,13 @@ mod tests {
         let partial = datadir.join("execution-reset-20261109T000000Z.partial");
         fs::create_dir_all(partial.join("db")).unwrap();
 
-        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
-            .execute(datadir.clone())
-            .expect_err("an unfinished reset");
+        let err = super::DbLoadStateArgs {
+            pack: dir.path().join("bundle"),
+            chain: None,
+            allow_faucet_on_chain: false,
+        }
+        .execute(datadir.clone())
+        .expect_err("an unfinished reset");
         assert!(err.to_string().contains("did not finish"), "the reset's refusal: {err:#}");
         let mut entries: Vec<_> =
             fs::read_dir(&datadir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -1868,8 +1894,12 @@ mod tests {
         fs::write(db.join("mdbx.dat"), b"an MDBX database").unwrap();
 
         let load = || {
-            super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
-                .execute(datadir.clone())
+            super::DbLoadStateArgs {
+                pack: dir.path().join("bundle"),
+                chain: None,
+                allow_faucet_on_chain: false,
+            }
+            .execute(datadir.clone())
         };
         let err = load().expect_err("no bundle, and on tn-lmdb an MDBX database");
         let msg = format!("{err:#}");
@@ -2840,6 +2870,35 @@ mod tests {
         assert!(persisting.is_err(), "the persisting path must refuse the same bundle");
     }
 
+    /// `db load-state --chain mainnet` writes the bundled committee only after the faucet guard
+    /// and the bundle-shape check pass: a faucet build refused on mainnet, or a bundle refused as
+    /// non-resumable, leaves no `genesis/` directory behind. Both refusals run here whatever the
+    /// build's features, through the guard's explicit `faucet_enabled` input.
+    #[test]
+    fn load_state_refusal_writes_no_committee() {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, TelcoinDirs as _};
+
+        let datadir = tempfile::tempdir().expect("datadir");
+        let datadir_path = datadir.path().to_path_buf();
+        Config::write_to_path(datadir_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        let bundle = tempfile::tempdir().expect("empty bundle");
+        let args = super::DbLoadStateArgs {
+            pack: bundle.path().to_path_buf(),
+            chain: Some(super::NamedChain::Mainnet),
+            allow_faucet_on_chain: false,
+        };
+        // a faucet build stops at the mainnet refusal, any other build at the bundle check
+        for (faucet_enabled, expected) in [(true, "refuses mainnet"), (false, "state-only pack")] {
+            let err = args
+                .execute_with(datadir_path.clone(), faucet_enabled)
+                .expect_err("an empty bundle on mainnet must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(expected), "faucet_enabled={faucet_enabled}: {msg}");
+            assert!(!datadir_path.genesis_path().exists(), "a refused load-state wrote genesis/");
+        }
+    }
+
     /// The ordering, end to end: `db load-state` refuses a bundle whose record chain does not
     /// verify against the local genesis committee *before* it creates any chain data.
     ///
@@ -2859,8 +2918,8 @@ mod tests {
 
         let datadir = tempfile::tempdir().expect("datadir");
         let datadir_path = datadir.path().to_path_buf();
-        // `Config::load_adiri` reads node-info.yaml and materializes genesis/committee.yaml; the
-        // adiri genesis itself is compiled in, so this needs no network, no keys, no passphrase.
+        // `--chain adiri` reads node-info.yaml and writes genesis/committee.yaml; the adiri
+        // genesis itself is compiled in, so this needs no network, no keys, no passphrase.
         Config::write_to_path(datadir_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
             .expect("seed node info");
 
@@ -2893,6 +2952,7 @@ mod tests {
         let args = super::DbLoadStateArgs {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Adiri),
+            allow_faucet_on_chain: false,
         };
         let err = args
             .execute(datadir_path.clone())

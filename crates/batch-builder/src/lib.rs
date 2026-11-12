@@ -19,16 +19,20 @@
 
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
-use futures_util::{future::OptionFuture, StreamExt};
-use std::time::{Duration, Instant};
+use futures_util::{future::OptionFuture, FutureExt as _, Stream, StreamExt};
+use std::{
+    fmt,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedHeader,
-    TaskSpawner, TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBatch,
+    SealedHeader, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{
     sync::oneshot,
-    time::{Instant as TokioInstant, Interval},
+    time::{Instant as TokioInstant, Interval, Sleep},
 };
 use tracing::{debug, error, field, info, info_span, warn, Instrument};
 
@@ -38,8 +42,11 @@ mod metrics;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-use crate::metrics::BatchBuilderMetrics;
 pub use crate::metrics::{record_base_fee, record_pending_pool_transactions};
+use crate::{
+    batch::BuildStats,
+    metrics::{BatchBuilderMetrics, BuildReasonCounters},
+};
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]
@@ -81,6 +88,26 @@ enum BuildOutcome {
 /// against a demotion window that has already expired.
 const REFUSAL_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// How long an idle builder waits after a transaction arrives before it builds.
+///
+/// Without an arrival wake, a transaction reaching an idle builder waits for the next
+/// `max_batch_delay` tick (250 ms on the devnet, half that on average) or canonical update.
+/// Building on the first arrival alone would seal one transaction per batch during a burst, so
+/// the first arrival arms this delay and the build takes whatever landed meanwhile. Later
+/// arrivals do not extend it, so a steady stream cannot postpone the build. It is armed only
+/// while no build is in flight and no refusal backoff holds the gate. After a failed or empty
+/// build, arrivals arm nothing until the next tick or a mined batch, so a retry keeps the tick
+/// cadence and peers that just rejected a batch are not asked again one fill delay later. The
+/// hold lasts only while something is pending: once a pass of the loop finds nothing pending
+/// there is nothing to retry, and the next arrival arms the delay again.
+///
+/// An admission into any subpool arms it, so a queued (nonce-gap) or parked arrival does too;
+/// when that delay expires with nothing pending, the loop pushes the tick out by one period.
+/// This cannot strand a transaction: an idle builder pushes the tick out only while nothing is
+/// pending, so a transaction that becomes pending is built on the next wake at an open gate,
+/// one tick later at the latest.
+const BATCH_WAKE_FILL_DELAY: Duration = Duration::from_millis(40);
+
 /// Live refusal-backoff state, present exactly while the last seal attempt was refused.
 #[derive(Debug)]
 struct RefusalBackoff {
@@ -92,6 +119,80 @@ struct RefusalBackoff {
     delay: Duration,
     /// Consecutive refused seals, reported by the recovery log line.
     refusals: u32,
+}
+
+/// What woke the run loop for the iteration that started a build, reported as `wake=` on the
+/// `batch built` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WakeSource {
+    /// The `max_batch_delay` tick. The loop's first pass reports this too: an interval's first
+    /// tick completes immediately, so entering the loop is that first tick.
+    Tick,
+    /// A canonical state notification from the engine.
+    Canonical,
+    /// The previous batch's quorum ack: a mined completion continues straight into the next
+    /// build. Any other completion skips one pass, so the next wake-up names the build.
+    Ack,
+    /// The fill delay armed by a transaction arriving at an idle builder
+    /// ([`BATCH_WAKE_FILL_DELAY`]).
+    ///
+    /// A tick or canonical update that lands inside the fill-delay window builds at once under
+    /// its own label and spends the armed delay, so the `wake=arrival` share of built batches is
+    /// a lower bound on the builds an arrival prompted, not the exact share.
+    Arrival,
+}
+
+impl WakeSource {
+    /// The static label carried by the `batch built` line.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::Canonical => "canonical",
+            Self::Ack => "ack",
+            Self::Arrival => "arrival",
+        }
+    }
+}
+
+/// The run loop's view of the pool when it started a build, carried to the `batch built` line.
+#[derive(Clone, Copy, Debug)]
+struct BuildTrigger {
+    /// What woke the loop for the iteration that started the build.
+    wake: WakeSource,
+    /// Pending sub-pool size when the build started.
+    pending_before: usize,
+    /// Queued (nonce-gap) sub-pool size when the build started.
+    queued_before: usize,
+}
+
+/// Admission notifications from the worker's pool, one per transaction added to any sub-pool
+/// ([`WorkerTxPool::admitted_transactions`]).
+struct Arrivals(Pin<Box<dyn Stream<Item = ()> + Send>>);
+
+impl Arrivals {
+    /// Discard every notification already buffered, without waiting. Bounded by the pool's
+    /// listener channel capacity; tokio's coop budget can also end it early, and whatever is
+    /// left drains on the next wake-up.
+    ///
+    /// `now_or_never` polls with a noop waker, and the last poll of an empty channel leaves it
+    /// registered. That is safe only because every caller re-polls the stream in the run loop's
+    /// next `select!` before the task parks on it. The ack arm awaits the pool update between
+    /// its drain and that re-poll; a notification sent meanwhile wakes nobody, but it stays in
+    /// the channel and the real poll finds it.
+    ///
+    /// The pool keeps this listener when its channel (1024 slots by default, set by
+    /// `--txpool.max-new-txns`) is full and drops the notification instead (reth's
+    /// `TransactionListener::send_all`), so a full channel never ends the stream, and a dropped
+    /// notification costs at most one tick.
+    fn drain(&mut self) {
+        while let Some(Some(())) = self.0.next().now_or_never() {}
+    }
+}
+
+impl fmt::Debug for Arrivals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Arrivals")
+    }
 }
 
 /// Receiver for the async task that awaits a blocking batch build and the worker's seal result.
@@ -141,9 +242,15 @@ pub struct BatchBuilder {
     epoch: Epoch,
     /// Prometheus metrics for this worker's batch builder.
     metrics: BatchBuilderMetrics,
+    /// Pre-resolved `builds_total` series of this worker, one per build reason.
+    build_counters: BuildReasonCounters,
     /// Backoff applied while every seal attempt is refused by forward admission
     /// (issue #1145). `None` whenever the last completed build was not a refusal.
     refusal_backoff: Option<RefusalBackoff>,
+    /// Transaction admissions into the worker's pool; an arrival wakes an idle builder.
+    arrivals: Arrivals,
+    /// The fill delay armed by the first arrival at an idle builder, `None` while disarmed.
+    fill_delay: Option<Pin<Box<Sleep>>>,
 }
 
 impl BatchBuilder {
@@ -164,6 +271,7 @@ impl BatchBuilder {
         let state_changed = reth_env.canonical_block_stream();
         let last_canonical_update = Self::latest_canon_header(reth_env)?;
         let metrics = BatchBuilderMetrics::new_for_worker(worker_id);
+        let arrivals = Arrivals(Box::pin(pool.admitted_transactions()));
         // constant per epoch
         metrics.base_fee.set(base_fee as f64);
         Ok(Self {
@@ -179,7 +287,10 @@ impl BatchBuilder {
             base_fee,
             epoch,
             metrics,
+            build_counters: BuildReasonCounters::new_for_worker(worker_id),
             refusal_backoff: None,
+            arrivals,
+            fill_delay: None,
         })
     }
 
@@ -194,8 +305,9 @@ impl BatchBuilder {
     /// - convert result to fatal/non-fatal
     /// - return result
     ///
-    /// Workers only propose one batch at a time.
-    fn spawn_execution_task(&self) -> BuildResult {
+    /// Workers only propose one batch at a time. `trigger` is the run loop's view when it started
+    /// this build; it only feeds the `batch built` line.
+    fn spawn_execution_task(&self, trigger: BuildTrigger) -> BuildResult {
         let pool = self.pool.clone();
         let to_worker = self.to_worker.clone();
 
@@ -205,6 +317,7 @@ impl BatchBuilder {
         let worker_id = self.worker_id;
         let base_fee = self.base_fee;
         let metrics = self.metrics.clone();
+        let build_counters = self.build_counters.clone();
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -215,7 +328,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable } =
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable, stats } =
                 match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
                     Ok(output) => output,
                     Err(e) => {
@@ -252,6 +365,7 @@ impl BatchBuilder {
             } else {
                 let batch = batch.seal_slow();
                 span.record("batch", batch.digest().to_string());
+                report_batch_built(&metrics, &build_counters, worker_id, &batch, &stats, trigger);
 
                 // forward to worker and wait for ack that quorum was reached
                 if let Err(e) = to_worker.send((batch, ack)).await {
@@ -352,6 +466,9 @@ impl BatchBuilder {
 /// - poll any pending block building tasks
 /// - otherwise, build next block if pending transactions are available
 ///
+/// An idle builder wakes on the `max_batch_delay` tick, a canonical update, or a transaction
+/// arrival; an arrival builds once the `BATCH_WAKE_FILL_DELAY` fill delay has passed.
+///
 /// If a task completes, the loop continues to poll for any new output from consensus then begins
 /// executing the next task.
 ///
@@ -429,15 +546,29 @@ impl BatchBuilder {
     pub async fn run(mut self) -> BatchBuilderResult<()> {
         // reproduces the original future's post-quorum-failure `break`: skip starting a build for
         // exactly one iteration so the loop backs off (parks) before retrying, instead of
-        // immediately rebuilding the same (still-unmined) transactions.
+        // immediately rebuilding the same (still-unmined) transactions. An arrival notification
+        // sets it too: that wake-up only arms the fill delay and never builds by itself.
         let mut defer_build = false;
+        // what woke the loop last; the build this iteration starts reports it
+        let mut wake = WakeSource::Tick;
+        // set by a failed or empty completion and cleared by the next tick, a mined batch, or any
+        // pass that finds nothing pending: while set, arrivals do not arm the fill delay, so the
+        // retry keeps the tick cadence
+        let mut failed_hold = false;
 
         // loop when a successful block is built
         loop {
             // refresh the pending-pool gauge on every wake, gated or not: operators watch it
             // exactly while a backoff or an in-flight build is holding the gate closed
-            let pending = self.pool.pool_size().pending;
+            let pool_size = self.pool.pool_size();
+            let pending = pool_size.pending;
             self.metrics.pending_pool_transactions.set(pending as f64);
+            // nothing is left to retry, so the next arrival arms the fill delay again instead of
+            // waiting out a stale hold for the tick. Checked on every pass, gated or not: the
+            // deferred pass after an empty build and the pass after an arrival skip the gate
+            if pending == 0 {
+                failed_hold = false;
+            }
             // only propose one block at a time; a live refusal backoff also holds the gate
             // closed, so a canonical-state wake-up cannot bypass it (issue #1145)
             let backing_off = self.refusal_backoff_holds();
@@ -451,7 +582,14 @@ impl BatchBuilder {
                     // nothing pending
                 } else {
                     // start building the next batch
-                    self.pending_task = Some(self.spawn_execution_task());
+                    let trigger = BuildTrigger {
+                        wake,
+                        pending_before: pending,
+                        queued_before: pool_size.queued,
+                    };
+                    // the build takes whatever has arrived, so an armed fill delay is spent
+                    self.fill_delay = None;
+                    self.pending_task = Some(self.spawn_execution_task(trigger));
 
                     // don't break so pending_task receiver gets polled
                 }
@@ -466,6 +604,7 @@ impl BatchBuilder {
 
                 // This is used as a "wake up" when canonical state updates.
                 Some(latest) = self.state_changed.next() => {
+                    wake = WakeSource::Canonical;
                     // NOTE: separate background task applies these changes to the pool
                     // regardless of pending_task
                     self.last_canonical_update = latest.tip().clone_sealed_header()
@@ -478,6 +617,10 @@ impl BatchBuilder {
                     // the build resolved; the original `take`s the receiver and only restores it
                     // while it is still pending, so clear the slot here
                     self.pending_task = None;
+                    wake = WakeSource::Ack;
+                    // arrivals during the build never arm the fill delay: the build gate below,
+                    // or the deferred retry, already covers every transaction now in the pool
+                    self.arrivals.drain();
 
                     debug!(target: "block-builder", ?res, "pending task complete");
                     // ensure no fatal errors
@@ -488,7 +631,10 @@ impl BatchBuilder {
                     // pre-existing empty-mined path below: no pool update, one deferred build,
                     // park until a wake-up.
                     let MinedBatchResult { mined_transactions, changed_accounts } = match outcome {
-                        BuildOutcome::Mined(mined) => mined,
+                        BuildOutcome::Mined(mined) => {
+                            failed_hold = false;
+                            mined
+                        }
                         BuildOutcome::Refused => {
                             self.note_refusal();
                             MinedBatchResult {
@@ -496,10 +642,10 @@ impl BatchBuilder {
                                 changed_accounts: vec![],
                             }
                         }
-                        BuildOutcome::Empty | BuildOutcome::Failed => MinedBatchResult {
-                            mined_transactions: vec![],
-                            changed_accounts: vec![],
-                        },
+                        BuildOutcome::Empty | BuildOutcome::Failed => {
+                            failed_hold = true;
+                            MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] }
+                        }
                     };
 
                     // NOTE: a mined batch that pruned nothing applies no pool update; it also
@@ -545,10 +691,73 @@ impl BatchBuilder {
 
                 // periodic wake to check the pending pool; gated to no-build-in-flight to match the
                 // original, which only polled the interval while `pending_task` was `None`.
-                _ = self.max_delay_interval.tick(), if self.pending_task.is_none() => {}
+                _ = self.max_delay_interval.tick(), if self.pending_task.is_none() => {
+                    wake = WakeSource::Tick;
+                    failed_hold = false;
+                }
+
+                // the fill delay armed by an arrival has passed: build whatever is pending by now,
+                // which may be nothing if only queued or parked transactions arrived
+                Some(()) = OptionFuture::from(self.fill_delay.as_mut()), if self.fill_delay.is_some() => {
+                    self.fill_delay = None;
+                    wake = WakeSource::Arrival;
+                }
+
+                // a transaction entered any subpool (pending, queued or parked); polled while a
+                // build is in flight too and drained so a burst is one wake. The pool's listener
+                // channel is bounded and drops when full: a drop costs at most one tick
+                Some(()) = self.arrivals.0.next() => {
+                    self.arrivals.drain();
+                    // every admission defers, pending or not: the build waits for the fill delay
+                    // so the rest of a burst lands in it
+                    defer_build = true;
+                    // arm only at an idle, open gate: one batch in flight per worker, a live
+                    // refusal backoff keeps its own cadence (issue #1145) and a failed or empty
+                    // build retries on the tick
+                    if self.pending_task.is_none()
+                        && self.fill_delay.is_none()
+                        && !failed_hold
+                        && !self.refusal_backoff_holds()
+                    {
+                        let fill = tokio::time::sleep(BATCH_WAKE_FILL_DELAY);
+                        self.fill_delay = Some(Box::pin(fill));
+                    }
+                }
             }
         }
     }
+}
+
+/// Emit the `batch built` line and record the build metrics for a sealed, non-empty batch.
+///
+/// One line per batch, never per transaction. Durations are whole milliseconds.
+fn report_batch_built(
+    metrics: &BatchBuilderMetrics,
+    build_counters: &BuildReasonCounters,
+    worker_id: WorkerId,
+    batch: &SealedBatch,
+    stats: &BuildStats,
+    trigger: BuildTrigger,
+) {
+    let millis = |elapsed: Duration| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    metrics.pool_age_seconds.record(stats.pool_age_max);
+    build_counters.record(stats.reason);
+    info!(
+        target: "consensus::metrics",
+        digest = %batch.digest(),
+        worker_id,
+        num_txs = batch.batch().transactions().len(),
+        bytes = stats.bytes,
+        gas = stats.gas,
+        reason = stats.reason.label(),
+        pool_age_p50_ms = millis(stats.pool_age_p50),
+        pool_age_max_ms = millis(stats.pool_age_max),
+        build_ms = millis(stats.build),
+        pending_before = trigger.pending_before,
+        queued_before = trigger.queued_before,
+        wake = trigger.wake.label(),
+        "batch built"
+    );
 }
 
 #[cfg(test)]
@@ -574,6 +783,10 @@ mod tests {
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
+
+    /// The trigger handed to builds a test spawns directly, outside the run loop.
+    const TEST_TRIGGER: BuildTrigger =
+        BuildTrigger { wake: WakeSource::Tick, pending_before: 0, queued_before: 0 };
 
     /// Drain the pending pool after the build gate but before the spawned task is polled.
     /// The empty result must never reach the worker, and the run loop must defer a newly
@@ -627,7 +840,7 @@ mod tests {
                 .await
                 .map_err(std::io::Error::other)?;
             assert!(txpool.pending_transactions().is_empty());
-            let done = batch_builder.spawn_execution_task();
+            let done = batch_builder.spawn_execution_task(TEST_TRIGGER);
 
             let outcome = tokio::select! {
                 outcome = done => outcome
@@ -1213,11 +1426,12 @@ mod tests {
         // await the build task itself: no sleeps, no polling of the run loop. The timeout is a
         // failure detector, not a wait: a build that seals reaches the ack wait and never
         // resolves, so it must surface as a failed assertion rather than a hung test.
-        let outcome = timeout(Duration::from_secs(5), batch_builder.spawn_execution_task())
-            .await
-            .expect("the build task finishes without waiting on a seal ack")
-            .expect("build task reports its outcome")
-            .expect("an all-deferred build is not a fatal error");
+        let outcome =
+            timeout(Duration::from_secs(5), batch_builder.spawn_execution_task(TEST_TRIGGER))
+                .await
+                .expect("the build task finishes without waiting on a seal ack")
+                .expect("build task reports its outcome")
+                .expect("an all-deferred build is not a fatal error");
 
         assert_matches!(outcome, BuildOutcome::Empty);
         assert!(
@@ -1632,5 +1846,565 @@ mod tests {
             "the post-batch pool update must install the epoch fee, not the stale canonical \
              tip header's",
         );
+    }
+
+    /// The `batch built` line and its metrics, captured without a formatting layer.
+    mod batch_built_line {
+        use super::*;
+        use crate::{batch::BuildReason, test_utils::TestPool};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{fmt, sync::Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        /// One captured event: its target and its fields, the message under `message`.
+        #[derive(Debug, Default)]
+        pub(super) struct Captured {
+            /// The event's target.
+            target: String,
+            /// Field names and values, strings without quotes.
+            fields: Vec<(String, String)>,
+        }
+
+        impl Captured {
+            /// The value of field `name`, if the event carries it.
+            pub(super) fn field(&self, name: &str) -> Option<&str> {
+                self.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+            }
+        }
+
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields.push((field.name().to_string(), value.to_string()));
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                self.fields.push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+
+        /// A subscriber that keeps every event and ignores spans.
+        #[derive(Clone, Default)]
+        pub(super) struct Capture(pub(super) Arc<Mutex<Vec<Captured>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut captured = Captured {
+                    target: event.metadata().target().to_string(),
+                    ..Default::default()
+                };
+                event.record(&mut captured);
+                self.0.lock().unwrap().push(captured);
+            }
+        }
+
+        /// Sign a zero-value transfer with an explicit gas limit.
+        fn transfer(factory: &mut TransactionFactory, gas_limit: u64) -> Vec<u8> {
+            factory
+                .create_explicit_eip1559(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(gas_limit),
+                    Some(Address::ZERO),
+                    Some(U256::ZERO),
+                    None,
+                    None,
+                )
+                .encoded_2718()
+        }
+
+        /// A drained build and a gas-full build each emit one `batch built` line with every
+        /// contract field, and feed `pool_age_seconds` and `builds_total{reason}`.
+        #[test]
+        fn batch_built_line_carries_reason_pool_age_and_wake() {
+            let mut sender = TransactionFactory::new();
+            let mut other = TransactionFactory::new_random();
+            let full_gas = tn_types::max_batch_gas(0);
+            let drained = vec![transfer(&mut sender, 21_000), transfer(&mut sender, 21_000)];
+            let gas_full = vec![transfer(&mut sender, full_gas), transfer(&mut other, 21_000)];
+            let cases = [
+                (drained, WakeSource::Canonical, "drained", "2", 42_000.to_string()),
+                (gas_full, WakeSource::Ack, "gas_full", "1", full_gas.to_string()),
+            ];
+
+            let capture = Capture::default();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let mut digests = Vec::new();
+            ::metrics::with_local_recorder(&recorder, || {
+                tracing::subscriber::with_default(capture.clone(), || {
+                    let metrics = BatchBuilderMetrics::new_for_worker(3);
+                    let build_counters = BuildReasonCounters::new_for_worker(3);
+                    for (txs, wake, ..) in &cases {
+                        let mut pool = TestPool::new(txs);
+                        let args = BatchBuilderArgs {
+                            pool: &mut pool,
+                            beneficiary: Address::ZERO,
+                            epoch: 0,
+                        };
+                        let output = build_batch(args, 3, MIN_PROTOCOL_BASE_FEE);
+                        let batch = output.batch.seal_slow();
+                        digests.push(batch.digest().to_string());
+                        let trigger =
+                            BuildTrigger { wake: *wake, pending_before: 2, queued_before: 5 };
+                        report_batch_built(
+                            &metrics,
+                            &build_counters,
+                            3,
+                            &batch,
+                            &output.stats,
+                            trigger,
+                        );
+                    }
+                });
+            });
+
+            let events = capture.0.lock().unwrap();
+            let lines: Vec<_> = events
+                .iter()
+                .filter(|event| event.field("message") == Some("batch built"))
+                .collect();
+            assert_eq!(lines.len(), cases.len(), "one line per sealed batch: {events:?}");
+            for ((line, digest), (_, wake, reason, num_txs, gas)) in
+                lines.iter().zip(&digests).zip(&cases)
+            {
+                assert_eq!(line.target, "consensus::metrics");
+                assert_eq!(line.field("digest"), Some(digest.as_str()));
+                assert_eq!(line.field("worker_id"), Some("3"));
+                assert_eq!(line.field("num_txs"), Some(*num_txs));
+                assert_eq!(line.field("gas"), Some(gas.as_str()));
+                assert_eq!(line.field("reason"), Some(*reason));
+                assert_eq!(line.field("wake"), Some(wake.label()));
+                assert_eq!(line.field("pending_before"), Some("2"));
+                assert_eq!(line.field("queued_before"), Some("5"));
+                for field in ["bytes", "pool_age_p50_ms", "pool_age_max_ms", "build_ms"] {
+                    let value = line.field(field).unwrap_or_else(|| panic!("{field} missing"));
+                    assert!(value.parse::<u64>().is_ok(), "{field}={value} is not a number");
+                }
+            }
+
+            let snapshot = snapshotter.snapshot().into_vec();
+            let builds = |reason: BuildReason| {
+                snapshot.iter().find_map(|(key, _, _, value)| {
+                    (key.key().name() == "tn_batch_builder.builds_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == reason.label()))
+                    .then_some(value)
+                })
+            };
+            assert!(matches!(builds(BuildReason::Drained), Some(DebugValue::Counter(1))));
+            assert!(matches!(builds(BuildReason::GasFull), Some(DebugValue::Counter(1))));
+            assert!(matches!(builds(BuildReason::BytesFull), Some(DebugValue::Counter(0))));
+            let pool_age = snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == "tn_batch_builder.pool_age_seconds")
+                .map(|(.., value)| value);
+            assert!(
+                matches!(pool_age, Some(DebugValue::Histogram(samples)) if samples.len() == 2),
+                "one pool-age sample per built batch: {pool_age:?}"
+            );
+        }
+    }
+
+    /// The arrival wake: an idle builder seals within the fill delay of a transaction arriving,
+    /// and an arrival never starts a second build while one is in flight.
+    mod arrival_wake {
+        use super::{batch_built_line::Capture, *};
+        use std::collections::VecDeque;
+        use tn_types::{
+            repack_monitor::RepackMonitor, CertifiedBatch, EpochSeedChainValue, ReputationScores,
+        };
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        /// A batch delay far beyond every assertion window: only an arrival explains a build.
+        const LONG_TICK: Duration = Duration::from_secs(60);
+
+        /// A batch delay short enough to wait for, long against the fill delay.
+        const SHORT_TICK: Duration = Duration::from_secs(1);
+
+        /// A running builder, parked on an empty pool, and its test tools.
+        struct IdleBuilder {
+            /// Signs the test transactions.
+            tx_factory: TransactionFactory,
+            /// The builder's pool.
+            txpool: WorkerTxPool,
+            /// The test chain.
+            chain: Arc<RethChainSpec>,
+            /// Batches the builder hands to the worker, with their ack senders.
+            from_batch_builder: tokio::sync::mpsc::Receiver<(
+                SealedBatch,
+                oneshot::Sender<Result<(), BlockSealError>>,
+            )>,
+            /// The run loop.
+            builder: tokio::task::JoinHandle<BatchBuilderResult<()>>,
+            /// Kept alive for the pool's provider.
+            _reth_env: RethEnv,
+            /// Kept alive so the builder's spawned build tasks are not cancelled.
+            _task_manager: TaskManager,
+        }
+
+        /// Start a builder with batch delay `tick` and let it park with an empty pool.
+        async fn idle_builder(path: &Path, tick: Duration) -> IdleBuilder {
+            let TestTools { tx_factory, execution_components, task_manager } = get_test_tools(path);
+            let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
+            let (to_worker, from_batch_builder) = tokio::sync::mpsc::channel(2);
+            let batch_builder = BatchBuilder::new(
+                &reth_env,
+                txpool.clone(),
+                to_worker,
+                Address::ZERO,
+                tick,
+                task_manager.get_spawner(),
+                0,
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+            )
+            .expect("batch builder");
+            let builder = tokio::spawn(batch_builder.run());
+            // the first pass sees an empty pool and pushes the tick out by a whole period
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(txpool.pool_size().pending, 0);
+            IdleBuilder {
+                tx_factory,
+                txpool,
+                chain,
+                from_batch_builder,
+                builder,
+                _reth_env: reth_env,
+                _task_manager: task_manager,
+            }
+        }
+
+        /// Submit one 10-wei transfer from `tx_factory` and return its hash.
+        async fn submit(
+            tx_factory: &mut TransactionFactory,
+            chain: &Arc<RethChainSpec>,
+            txpool: &WorkerTxPool,
+        ) -> TxHash {
+            tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    u128::from(MIN_PROTOCOL_BASE_FEE),
+                    Address::ZERO,
+                    U256::from(10),
+                    txpool.clone(),
+                )
+                .await
+        }
+
+        /// The hashes of a sealed batch's transactions.
+        fn hashes(batch: &SealedBatch) -> Vec<TxHash> {
+            batch
+                .batch()
+                .transactions()
+                .iter()
+                .map(|tx| *recover_raw_transaction(tx).expect("batch tx decodes").hash())
+                .collect()
+        }
+
+        /// The `wake` field of every `batch built` line captured so far.
+        fn wakes(capture: &Capture) -> Vec<String> {
+            capture
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.field("message") == Some("batch built"))
+                .filter_map(|event| event.field("wake").map(str::to_string))
+                .collect()
+        }
+
+        /// One transaction reaching an idle builder is sealed once the fill delay passes, long
+        /// before the batch-delay tick, and its line reports the arrival wake.
+        #[tokio::test]
+        async fn idle_builder_seals_an_arrival_within_the_fill_delay() {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new().unwrap();
+            // the underscore bindings keep the reth env and task manager alive to the end
+            let IdleBuilder {
+                mut tx_factory,
+                txpool,
+                chain,
+                mut from_batch_builder,
+                builder,
+                _reth_env,
+                _task_manager,
+            } = idle_builder(tmp_dir.path(), LONG_TICK).await;
+
+            let submitted = Instant::now();
+            let hash = submit(&mut tx_factory, &chain, &txpool).await;
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("the arrival is sealed long before the batch-delay tick")
+                .expect("worker channel open");
+            let waited = submitted.elapsed();
+
+            assert!(waited >= BATCH_WAKE_FILL_DELAY, "built before the fill delay: {waited:?}");
+            assert_eq!(hashes(&batch), vec![hash]);
+            assert_eq!(wakes(&capture), ["arrival"]);
+
+            ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
+            assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
+
+        /// A transaction arriving while a batch awaits its quorum ack starts no second build; it
+        /// goes into the batch built after the ack, whose line reports the ack wake.
+        #[tokio::test]
+        async fn arrival_during_an_in_flight_build_starts_no_second_build() {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new().unwrap();
+            // the underscore bindings keep the reth env and task manager alive to the end
+            let IdleBuilder {
+                mut tx_factory,
+                txpool,
+                chain,
+                mut from_batch_builder,
+                builder,
+                _reth_env,
+                _task_manager,
+            } = idle_builder(tmp_dir.path(), LONG_TICK).await;
+
+            let first = submit(&mut tx_factory, &chain, &txpool).await;
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("first batch sealed")
+                .expect("worker channel open");
+            assert_eq!(hashes(&batch), vec![first]);
+
+            // several fill delays pass with the first batch unacknowledged
+            let second = submit(&mut tx_factory, &chain, &txpool).await;
+            tokio::time::sleep(BATCH_WAKE_FILL_DELAY * 5).await;
+            assert_matches!(from_batch_builder.try_recv(), Err(TryRecvError::Empty));
+            assert_eq!(txpool.pool_size().pending, 2, "nothing mined before the ack");
+
+            ack.send(Ok(())).unwrap();
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("second batch sealed after the ack")
+                .expect("worker channel open");
+            assert_eq!(hashes(&batch), vec![second]);
+            assert_eq!(wakes(&capture), ["arrival", "ack"]);
+
+            ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
+            assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
+
+        /// After a failed seal an arrival does not rebuild one fill delay later: the retry waits
+        /// for the batch-delay tick, as it did before the arrival wake.
+        #[tokio::test]
+        async fn arrival_after_a_failed_seal_waits_for_the_tick() {
+            assert_retry_waits_for_the_tick(BlockSealError::QuorumRejected).await;
+        }
+
+        /// A failed seal holds the fill delay only while its transactions can still be retried.
+        /// Once they leave the pool and a canonical update wakes the idle builder, the next
+        /// arrival arms the fill delay again instead of waiting for the batch-delay tick.
+        #[tokio::test]
+        async fn arrival_after_a_failed_seal_and_an_emptied_pool_arms_the_fill_delay() {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new().unwrap();
+            // the underscore binding keeps the task manager alive to the end
+            let IdleBuilder {
+                mut tx_factory,
+                mut txpool,
+                chain,
+                mut from_batch_builder,
+                builder,
+                _reth_env: reth_env,
+                _task_manager,
+            } = idle_builder(tmp_dir.path(), LONG_TICK).await;
+
+            let first = submit(&mut tx_factory, &chain, &txpool).await;
+            let (failed, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("first batch sealed")
+                .expect("worker channel open");
+            assert_eq!(hashes(&failed), vec![first]);
+            ack.send(Err(BlockSealError::QuorumRejected)).unwrap();
+            // the run loop takes the failure before the pool changes under it
+            tokio::time::sleep(BATCH_WAKE_FILL_DELAY).await;
+
+            // the failed batch's transaction leaves the pool, then a block that mines it wakes
+            // the idle builder with nothing pending
+            txpool.remove_unsupported_txs(vec![first]);
+            assert_eq!(txpool.pool_size().pending, 0);
+            let output = ConsensusOutput::new(
+                CommittedSubDag::new(
+                    vec![Certificate::default()],
+                    Certificate::default(),
+                    0,
+                    ReputationScores::default(),
+                    None,
+                    EpochSeedChainValue::genesis_placeholder(),
+                ),
+                ConsensusHeaderDigest::default(),
+                0,
+                false,
+                VecDeque::from([failed.digest()]),
+                vec![CertifiedBatch {
+                    address: Address::ZERO,
+                    batches: vec![failed.batch().clone()],
+                }],
+            );
+            let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
+            let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+            let block_1 = tokio::task::spawn_blocking(move || {
+                execute_consensus_output(
+                    args,
+                    GasAccumulator::default(),
+                    RepackMonitor::default(),
+                    engine_update_tx,
+                )
+                .expect("output executed")
+            })
+            .await
+            .unwrap();
+            assert_eq!(block_1.number, 1);
+            // the pool has applied the block, so the sender's next nonce is pending
+            tn_test_utils::wait_until(Duration::from_secs(5), "pool applies block 1", || async {
+                Ok(txpool.block_info().last_seen_block_number == 1)
+            })
+            .await
+            .unwrap();
+
+            let submitted = Instant::now();
+            let second = submit(&mut tx_factory, &chain, &txpool).await;
+            assert_eq!(txpool.pool_size().pending, 1, "the second transaction is pending");
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("the arrival is sealed long before the batch-delay tick")
+                .expect("worker channel open");
+            let waited = submitted.elapsed();
+
+            assert!(waited >= BATCH_WAKE_FILL_DELAY, "built before the fill delay: {waited:?}");
+            assert_eq!(hashes(&batch), vec![second]);
+            assert_eq!(wakes(&capture), ["arrival", "arrival"]);
+
+            ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
+            assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
+
+        /// An empty build that leaves nothing pending, as when selection removed every
+        /// candidate itself, sets the hold with nothing to retry. The deferred pass right after
+        /// it clears the hold, so the next arrival is sealed after the fill delay instead of
+        /// waiting for the batch-delay tick.
+        #[tokio::test]
+        async fn arrival_after_an_empty_build_with_nothing_pending_arms_the_fill_delay() {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new().unwrap();
+            let TestTools { mut tx_factory, execution_components, task_manager } =
+                get_test_tools(tmp_dir.path());
+            let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
+            let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+            let mut batch_builder = BatchBuilder::new(
+                &reth_env,
+                txpool.clone(),
+                to_worker,
+                Address::ZERO,
+                LONG_TICK,
+                task_manager.get_spawner(),
+                0,
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+            )
+            .expect("batch builder");
+            // the run loop's first completion is an empty build, with the pool empty after it
+            let (result, done) = oneshot::channel();
+            result.send(Ok(BuildOutcome::Empty)).unwrap();
+            batch_builder.pending_task = Some(done);
+            let builder = tokio::spawn(batch_builder.run());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(txpool.pool_size().pending, 0);
+
+            let submitted = Instant::now();
+            let hash = submit(&mut tx_factory, &chain, &txpool).await;
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("the arrival is sealed long before the batch-delay tick")
+                .expect("worker channel open");
+            let waited = submitted.elapsed();
+
+            assert!(waited >= BATCH_WAKE_FILL_DELAY, "built before the fill delay: {waited:?}");
+            assert_eq!(hashes(&batch), vec![hash]);
+            assert_eq!(wakes(&capture), ["arrival"]);
+
+            ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
+            assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
+
+        /// An arrival during a live refusal backoff does not build before the backoff ends
+        /// (issue #1145); the first tick after it does.
+        #[tokio::test]
+        async fn arrival_during_a_refusal_backoff_does_not_build() {
+            assert_retry_waits_for_the_tick(BlockSealError::NotValidator).await;
+        }
+
+        /// Seal one arrival, fail its seal with `error`, submit a second transaction, and check
+        /// that nothing is built until the batch-delay tick, which then carries both.
+        ///
+        /// The first refusal backs off for one batch delay, so both outcomes rebuild on the tick
+        /// that follows the failure by [`SHORT_TICK`].
+        async fn assert_retry_waits_for_the_tick(error: BlockSealError) {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            let tmp_dir = TempDir::new().unwrap();
+            // the underscore bindings keep the reth env and task manager alive to the end
+            let IdleBuilder {
+                mut tx_factory,
+                txpool,
+                chain,
+                mut from_batch_builder,
+                builder,
+                _reth_env,
+                _task_manager,
+            } = idle_builder(tmp_dir.path(), SHORT_TICK).await;
+
+            let first = submit(&mut tx_factory, &chain, &txpool).await;
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("first batch sealed")
+                .expect("worker channel open");
+            assert_eq!(hashes(&batch), vec![first]);
+            let failed = Instant::now();
+            ack.send(Err(error)).unwrap();
+
+            // several fill delays pass after a new arrival without a build
+            let second = submit(&mut tx_factory, &chain, &txpool).await;
+            tokio::time::sleep(BATCH_WAKE_FILL_DELAY * 5).await;
+            assert_matches!(from_batch_builder.try_recv(), Err(TryRecvError::Empty));
+
+            let (batch, ack) = timeout(Duration::from_secs(5), from_batch_builder.recv())
+                .await
+                .expect("the tick rebuilds")
+                .expect("worker channel open");
+            let waited = failed.elapsed();
+            assert!(waited >= SHORT_TICK, "rebuilt {waited:?} after the failure, before the tick");
+            assert_eq!(hashes(&batch), vec![first, second]);
+            assert_eq!(wakes(&capture), ["arrival", "tick"]);
+
+            ack.send(Err(BlockSealError::FatalDBFailure)).unwrap();
+            assert_matches!(builder.await.unwrap(), Err(BatchBuilderError::FatalDBFailure));
+        }
     }
 }

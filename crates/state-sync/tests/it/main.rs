@@ -48,13 +48,14 @@ async fn test_sync_save_consensus() {
         ConsensusOutput::new(sub_dag, B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
     // Save consensus using state_sync
-    state_sync::save_consensus(
+    let written = state_sync::save_consensus(
         output,
         &mut consensus_chain,
         &tn_primary::PrimaryMetrics::default(),
     )
     .await
     .unwrap();
+    assert!(written.bytes > 0, "the output is written to the current pack");
 
     // Verify the consensus was saved
     let saved = consensus_chain.consensus_header_by_number(1).await.unwrap();

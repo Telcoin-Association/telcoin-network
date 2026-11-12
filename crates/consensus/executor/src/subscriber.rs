@@ -2,21 +2,28 @@
 
 use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
+use metrics::Counter;
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::PrimaryToWorkerClient;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
+use tn_primary::{
+    network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, ExecutionCheckError, NodeMode,
+};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusOutput, ConsensusResult, Database, Epoch, EpochRecord, Hash as _, Noticer, Round,
     TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
+    MAX_REJOIN_ATTEMPTS_PER_EPOCH,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -36,6 +43,57 @@ const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// older than this is a stale record (for example one loaded at restart) and must not promote a
 /// node that has not caught up.
 const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// How often a catching-up CVV checks for a stalled consensus head
+/// ([`tn_types::REJOIN_STALLED_HEAD_AFTER`]) while it waits for the next output.
+///
+/// The usual rejoin check runs only when an output arrives, and a committee halted below quorum
+/// sends none. A quarter of the stall threshold keeps the rejoin within one interval of the
+/// threshold at a negligible cost: two watch reads and two consensus-chain hints per tick, a send
+/// on the gap-request watch while the gossiped frontier is ahead of the replayed outputs and the
+/// head, or the replayed output, has stood still for an interval, and a request to the
+/// epoch-record actor only for a check that passes the hints. A stalled head re-sends the gap
+/// request every interval; a replay stuck below a moving head re-sends its first request with a
+/// doubling wait capped at [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`].
+const REJOIN_STALLED_HEAD_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The longest wait between two gap requests of a replay stuck below a moving head
+/// ([`Subscriber::rerequest_behind_frontier`]).
+///
+/// The first request goes out one [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] after the replay stopped
+/// moving, and the wait doubles with every repeat of the same request (10 s, 20 s, 40 s) up to
+/// this cap, so a replay that cannot move (an output no peer serves, or a stream that refuses
+/// what it is given) costs one bounded walk a minute rather than a new, wider walk per check.
+const REJOIN_STUCK_REPLAY_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The most the stalled-head rule backs off: a catching-up CVV must watch the head stall for at
+/// most this many times [`tn_types::REJOIN_STALLED_HEAD_AFTER`] (see
+/// [`stalled_head_stall_needed`]).
+const REJOIN_STALLED_HEAD_MAX_BACKOFF: u32 = 8;
+
+/// Minimum interval between two `rejoin not ready` lines for the same [`RejoinBlocker`].
+///
+/// A catching-up CVV checks readiness after every output it handles, hundreds a second while it
+/// replays, so the line is logged when the blocker changes and otherwise at most this often.
+const REJOIN_NOT_READY_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Minimum interval between two `stalled head not ready` lines of one catch-up loop.
+///
+/// The stalled-head check runs every [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] for as long as the
+/// node stays inactive, so one line per 30 s shows which part blocks it without a line per check.
+const REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum interval between two `re-requesting consensus outputs behind the gossiped frontier`
+/// lines of one catch-up loop. The re-request itself repeats every
+/// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] while the head stays stalled, and backs off up to
+/// [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`] while only the replay is stuck.
+const REJOIN_FRONTIER_REREQUEST_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Shortest wait for local execution that a committed sub-dag logs before its output is assembled.
+///
+/// Under load an output waits a few hundred milliseconds for the engine, so only a longer wait
+/// (an execution backlog) is worth a line.
+const EXECUTION_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// Only an output from this subscriber's still-open epoch can establish rejoin readiness.
 /// Future outputs are ignored by `handle_sync_output`, and finalized epochs must be replayed
@@ -57,7 +115,11 @@ fn rejoin_epoch_is_open(
 ///
 /// `handled_epoch` and `handled_round` belong to the consensus output the node just handled.
 /// `newest_epoch`, `newest_round` and `newest_age` belong to the newest consensus header the node
-/// knows about. The rule has three parts:
+/// knows about. `attempts` counts this node's failed promotions in its epoch (a demotion followed
+/// inside the rejoin grace, see `RejoinState`). The rule has four parts:
+/// - fewer than [`MAX_REJOIN_ATTEMPTS_PER_EPOCH`] of the node's promotions in its epoch failed;
+///   past that it follows consensus as inactive until the epoch boundary resets the count, unless
+///   the consensus head stalls ([`stalled_head_ready`]);
 /// - the newest known header is younger than [`REJOIN_HEAD_MAX_AGE`]. Freshness is checked on the
 ///   newest known header, not on the handled output, so a stale record still blocks promotion;
 /// - both are in the same epoch, because rounds only compare inside one epoch;
@@ -68,6 +130,9 @@ fn rejoin_epoch_is_open(
 /// The old rule required the handled output to be the newest known header. Under sustained load
 /// a node that must fetch, verify and execute every output is always a few outputs behind, so
 /// that rule never held until the load dropped.
+///
+/// The freshness part needs new outputs, which a committee halted below quorum does not produce;
+/// [`stalled_head_ready`] covers that case.
 fn rejoin_ready(
     handled_epoch: Epoch,
     handled_round: Round,
@@ -75,10 +140,86 @@ fn rejoin_ready(
     newest_round: Round,
     newest_age: Duration,
     rejoin_window: Round,
+    attempts: u32,
 ) -> bool {
-    newest_age < REJOIN_HEAD_MAX_AGE
+    attempts < MAX_REJOIN_ATTEMPTS_PER_EPOCH
+        && newest_age < REJOIN_HEAD_MAX_AGE
         && handled_epoch == newest_epoch
         && newest_round.saturating_sub(handled_round) <= rejoin_window
+}
+
+/// `Ok` when a catching-up CVV should rejoin consensus on a stalled consensus head, otherwise the
+/// first part of the rule that fails.
+///
+/// `replayed_epoch` and `replayed_number` locate the newest output in this node's consensus
+/// chain; `newest` is the newest consensus header the node knows about, and `unchanged_for` how
+/// long this node has watched it stay the newest since it started catching up. `gossiped_number`
+/// is the newest consensus number peers advertise. The rule has three parts, checked in order:
+/// - the node watched the head stall: the newest known header is at least
+///   [`tn_types::REJOIN_STALLED_HEAD_AFTER`] old ([`StalledHeadBlocker::HeadAge`]) and stayed the
+///   newest for at least `stall_needed` ([`stalled_head_stall_needed`],
+///   [`StalledHeadBlocker::Stall`]). The age alone is not enough: the header watch moves only with
+///   this node's own saves while it is active, so after a demotion it reads old however fast the
+///   committee commits;
+/// - no peer advertises a newer consensus number, so this is a halt, not a catch-up
+///   ([`StalledHeadBlocker::Frontier`]);
+/// - the node has replayed the newest header: its newest output is in the header's epoch and at or
+///   past its number, so nothing is left to catch up and the round gap of [`rejoin_ready`] is zero
+///   ([`StalledHeadBlocker::Replay`]).
+///
+/// The rejoin cap does not apply (see [`tn_types::REJOIN_STALLED_HEAD_AFTER`]). The caller still
+/// requires a known header ([`StalledHeadBlocker::NoHead`]) and the header to close no epoch but
+/// the previous one (`stalled_head_epoch_is_open`, [`StalledHeadBlocker::Epoch`]).
+fn stalled_head_ready(
+    replayed_epoch: Epoch,
+    replayed_number: u64,
+    newest: &NewestHeader,
+    unchanged_for: Duration,
+    stall_needed: Duration,
+    gossiped_number: u64,
+) -> Result<(), StalledHeadBlocker> {
+    if newest.age < tn_types::REJOIN_STALLED_HEAD_AFTER {
+        Err(StalledHeadBlocker::HeadAge)
+    } else if unchanged_for < stall_needed {
+        Err(StalledHeadBlocker::Stall)
+    } else if gossiped_number > replayed_number {
+        Err(StalledHeadBlocker::Frontier)
+    } else if replayed_epoch != newest.epoch || replayed_number < newest.number {
+        Err(StalledHeadBlocker::Replay)
+    } else {
+        Ok(())
+    }
+}
+
+/// How long a catching-up CVV must watch the head stall before it rejoins on it:
+/// [`tn_types::REJOIN_STALLED_HEAD_AFTER`], doubled for each failed promotion on a stalled head in
+/// its epoch, up to [`REJOIN_STALLED_HEAD_MAX_BACKOFF`] times. The cap does not apply to the
+/// stalled-head rule, so this slows down a node whose stalled-head rejoins keep failing. Failures
+/// of the usual rule do not delay it: they have their own cap, and a halt should not wait for them.
+fn stalled_head_stall_needed(stalled_failures: u32) -> Duration {
+    let backoff = 1_u32.checked_shl(stalled_failures).unwrap_or(u32::MAX);
+    tn_types::REJOIN_STALLED_HEAD_AFTER.saturating_mul(backoff.min(REJOIN_STALLED_HEAD_MAX_BACKOFF))
+}
+
+/// True when a stalled consensus head may promote this node in `current_epoch`.
+///
+/// Either the head is in the node's open epoch (`rejoin_epoch_is_open`), or it is the final header
+/// of the epoch before, which the latest epoch record closes. The second case is a committee that
+/// halted at the start of `current_epoch`: no output of it exists, and a node that has replayed
+/// through the boundary is where an active member starts the epoch, with an empty DAG. A head that
+/// closes any older epoch, or `current_epoch` itself, never promotes.
+fn stalled_head_epoch_is_open(
+    current_epoch: Epoch,
+    newest: &NewestHeader,
+    latest_record: Option<&EpochRecord>,
+) -> bool {
+    rejoin_epoch_is_open(current_epoch, newest.epoch, latest_record)
+        || (newest.epoch.checked_add(1) == Some(current_epoch)
+            && latest_record.is_some_and(|record| {
+                record.epoch == newest.epoch
+                    && record.final_consensus.number == newest.number
+                    && newest.number > 0
+            }))
 }
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
@@ -111,6 +252,41 @@ struct Inner {
     epoch_boundary: TimestampSec,
     /// Prometheus metrics for consensus output assembly.
     metrics: ExecutorMetrics,
+    /// Outputs whose leader's execution block was below the restored-state floor, since the last
+    /// output whose block was checked.
+    below_floor: UncheckedBelowFloor,
+}
+
+/// A run of outputs whose leader's execution block is below this node's restored-state floor, so
+/// [`Subscriber::wait_for_leader_execution`] could not check it.
+///
+/// After a restart with a backlog every output can be one, so a run logs two warnings at most: one
+/// at its first output, and one with its length at the first output whose block is checked again.
+/// The outputs in between log at debug. The first warning keeps a run visible when the subscriber
+/// ends before any output is checked again (an epoch boundary, a fork, a shutdown or a demotion).
+/// A run follows the order in which the checks finish, not consensus order, so near the floor one
+/// run can split into several. Updated only from the subscriber's own task.
+#[derive(Debug, Default)]
+struct UncheckedBelowFloor {
+    /// The outputs in the current run.
+    outputs: AtomicU64,
+    /// The floor the latest of them was below.
+    floor: AtomicU64,
+}
+
+impl UncheckedBelowFloor {
+    /// Count an output whose leader's block is below `floor`; returns the run's length so far.
+    fn record(&self, floor: u64) -> u64 {
+        self.floor.store(floor, Ordering::Relaxed);
+        self.outputs.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// End the run at an output whose block was checked: its length and floor, `None` when no
+    /// output went unchecked since the last call.
+    fn take(&self) -> Option<(u64, u64)> {
+        let outputs = self.outputs.swap(0, Ordering::Relaxed);
+        (outputs > 0).then(|| (outputs, self.floor.load(Ordering::Relaxed)))
+    }
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -137,6 +313,7 @@ pub fn spawn_subscriber<DB: Database>(
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
             metrics: ExecutorMetrics::default(),
+            below_floor: UncheckedBelowFloor::default(),
         }),
     };
     match mode {
@@ -263,17 +440,73 @@ impl<DB: Database> Subscriber<DB> {
     /// Keep replaying finalized epochs even when their final headers still count as fresh.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing outputs so we don't miss them.
-        let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
+        let rx_sync_output = self.consensus_bus.subscribe_sync_output();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
+        self.rejoin_loop(rx_sync_output).await
+    }
+
+    /// Replay the outputs state sync delivers and promote this node once it may rejoin consensus:
+    /// after a handled output, when it is within the rejoin window of a fresh head
+    /// ([`rejoin_ready`]), and on a timer, when the head has stalled at a header this node has
+    /// already replayed ([`stalled_head_ready`]).
+    async fn rejoin_loop(
+        &self,
+        mut rx_sync_output: impl TnReceiver<ConsensusOutput>,
+    ) -> SubscriberResult<()> {
+        // each demotion site settles the latest promotion at its own time, except the node's
+        // record veto when the epoch's tasks start, which this loop follows in the same epoch
+        // run. this settles it at the loop's entry for any demotion that did not; after a restart
+        // that entry can come past the grace, and then the promotion does not count
+        let committee_epoch = self.inner.committee.epoch();
+        let entry = tokio::time::Instant::now();
+        self.consensus_bus
+            .rejoin_state()
+            .send_if_modified(|state| state.record_demotion(committee_epoch, entry, false));
+        let stall_needed = stalled_head_stall_needed(
+            self.consensus_bus.rejoin_state().borrow().stalled_failures(committee_epoch),
+        );
         // Derived from the same helper as the demotion window in `behind_consensus`, so a node
         // that rejoins is not demoted again at once.
         let rejoin_window = tn_types::rejoin_round_window(self.config.parameters().gc_depth);
-        while let Some(output) = rx_sync_output.recv().await {
+        // readiness is checked after every handled output, so the counter handles are resolved
+        // once here rather than per check
+        let blocked_counters = rejoin_blocked_counters();
+        let mut not_ready_log = RejoinLogThrottle::default();
+        // a stall counts only from here: the newest known header is whatever this node saved or
+        // heard before it was demoted, which says nothing about whether the committee still
+        // commits. the first check is one interval in
+        let mut stalled = StalledHeadCheck::new(
+            self.newest_number(),
+            self.inner.consensus_chain.latest_consensus_number(),
+            entry,
+            stall_needed,
+        );
+        let mut stalled_head_check = tokio::time::interval_at(
+            entry + REJOIN_STALLED_HEAD_CHECK_INTERVAL,
+            REJOIN_STALLED_HEAD_CHECK_INTERVAL,
+        );
+        stalled_head_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let output = tokio::select! {
+                // outputs first: while replay keeps them coming there is something left to
+                // catch up, which the stalled-head rule refuses anyway
+                biased;
+                output = rx_sync_output.recv() => match output {
+                    Some(output) => output,
+                    None => break,
+                },
+                _ = stalled_head_check.tick() => {
+                    if self.rejoin_on_stalled_head(&mut stalled).await {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
             let consensus_header_number = output.number();
             let handled_epoch = output.sub_dag().leader_epoch();
             let handled_round = output.leader_round();
@@ -287,42 +520,282 @@ impl<DB: Database> Subscriber<DB> {
                 handled_epoch,
                 latest_record.as_ref(),
             );
-            if let Some(last_consensus_header) =
-                self.consensus_bus.last_consensus_header().borrow().as_ref()
-            {
+            let newest = self.newest_header();
+            // this node's failed promotions in its epoch, capped per epoch
+            let attempts =
+                self.consensus_bus.rejoin_state().borrow().attempts(self.inner.committee.epoch());
+            if let Some(newest) = &newest {
                 // Rejoin when the handled output is within the rejoin window of the newest known
                 // header and that header is fresh. The freshness check stops a stale record from
                 // promoting a node that has not caught up.
-                // freshness is measured in milliseconds so a sub-second commit time is not rounded
-                // away. a pre-fork commit time is whole seconds, and there this equals comparing
-                // whole seconds against the clock rounded down to the second
-                let newest_round = last_consensus_header.sub_dag.leader_round();
                 if epoch_is_open
                     && rejoin_ready(
                         handled_epoch,
                         handled_round,
-                        last_consensus_header.sub_dag.leader_epoch(),
-                        newest_round,
-                        last_consensus_header.sub_dag.commit_timestamp_ms().elapsed(),
+                        newest.epoch,
+                        newest.round,
+                        newest.age,
                         rejoin_window,
+                        attempts,
                     )
                 {
+                    let (exec_round, exec_number) = self.exec_progress();
                     // We are caught up enough so try to jump back into consensus
                     info!(
                         target: "subscriber",
                         consensus_header_number,
-                        newest_number = last_consensus_header.number,
-                        round_gap = newest_round.saturating_sub(handled_round),
+                        newest_number = newest.number,
+                        round_gap = newest.round.saturating_sub(handled_round),
                         rejoin_window,
+                        handled_round,
+                        newest_round = newest.round,
+                        exec_round,
+                        exec_number,
                         "attempting to rejoin consensus"
                     );
-                    self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
-                    self.config.shutdown().notify();
+                    self.promote(false);
                     return Ok(());
                 }
             }
+            let reason =
+                RejoinBlocker::classify(epoch_is_open, attempts, newest.as_ref(), handled_epoch);
+            blocked_counters[reason.index()].increment(1);
+            if not_ready_log.should_log(reason, Instant::now()) {
+                // a node with no known header logs zeros for the newest header's fields
+                let (newest_epoch, newest_round, newest_age_ms) =
+                    newest.as_ref().map_or((0, 0, 0), |newest| {
+                        (
+                            newest.epoch,
+                            newest.round,
+                            u64::try_from(newest.age.as_millis()).unwrap_or(u64::MAX),
+                        )
+                    });
+                info!(
+                    target: "subscriber",
+                    consensus_header_number,
+                    handled_epoch,
+                    handled_round,
+                    newest_epoch,
+                    newest_round,
+                    newest_age_ms,
+                    rejoin_window,
+                    exec_round = self.consensus_bus.last_consensus_round(),
+                    reason = reason.as_str(),
+                    "rejoin not ready"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// The newest consensus header this node knows about, copied out of the bus's watch.
+    fn newest_header(&self) -> Option<NewestHeader> {
+        // freshness is measured in milliseconds so a sub-second commit time is not rounded away.
+        // a pre-fork commit time is whole seconds, and there this equals comparing whole seconds
+        // against the clock rounded down to the second
+        self.consensus_bus.last_consensus_header().borrow().as_ref().map(|header| NewestHeader {
+            number: header.number,
+            epoch: header.sub_dag.leader_epoch(),
+            round: header.sub_dag.leader_round(),
+            age: header.sub_dag.commit_timestamp_ms().elapsed(),
+        })
+    }
+
+    /// The number of the newest consensus header this node knows about.
+    fn newest_number(&self) -> Option<u64> {
+        self.consensus_bus.last_consensus_header().borrow().as_ref().map(|header| header.number)
+    }
+
+    /// Promote this catching-up CVV when it has watched the consensus head stall, for
+    /// `check.stall_needed`, at a header it has already replayed ([`stalled_head_ready`],
+    /// [`stalled_head_epoch_is_open`]). `check` holds what this catch-up loop tracks between
+    /// checks. Returns true when it promoted.
+    ///
+    /// A refused check logs `stalled head not ready` with the part that blocked it, `no_head` when
+    /// it knows no consensus header yet, at most once per
+    /// [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`] ([`StalledHeadCheck::log_not_ready`]). A
+    /// check that finds the gossiped frontier ahead of the replayed outputs while the newest known
+    /// header, or the replayed output, has not moved for a check interval asks state sync to fetch
+    /// the gap again ([`Self::rerequest_behind_frontier`]).
+    ///
+    /// A committee halted below quorum commits nothing, so without this check the freshness rule of
+    /// [`rejoin_ready`] would keep this node inactive, and the committee halted, for good.
+    async fn rejoin_on_stalled_head(&self, check: &mut StalledHeadCheck) -> bool {
+        let now = tokio::time::Instant::now();
+        let newest = self.newest_header();
+        let unchanged_for = check.observed_head.observe(newest.map(|newest| newest.number), now);
+        let gossiped = self.consensus_bus.published_consensus_num_hash();
+        let (_, gossiped_number, _) = gossiped;
+        let chain = &self.inner.consensus_chain;
+        let replayed_number = chain.latest_consensus_number();
+        let Some(newest) = newest else {
+            check.log_not_ready(
+                now,
+                StalledHeadBlocker::NoHead,
+                unchanged_for,
+                None,
+                replayed_number,
+                gossiped_number,
+            );
+            return false;
+        };
+        let replay_unchanged_for = check.observe_replay(replayed_number, now);
+        let head_stalled = unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL;
+        if gossiped_number > replayed_number
+            && (head_stalled || replay_unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL)
+        {
+            self.rerequest_behind_frontier(check, gossiped, replayed_number, head_stalled, now);
+        }
+        let mut ready = stalled_head_ready(
+            chain.latest_consensus_epoch(),
+            replayed_number,
+            &newest,
+            unchanged_for,
+            check.stall_needed,
+            gossiped_number,
+        );
+        if ready.is_ok() {
+            // a stalled head that closed an older epoch is replayed through its boundary instead.
+            // checked last: it is the only part that asks the epoch-record actor
+            let latest_record = chain.epochs().latest_record().await;
+            if !stalled_head_epoch_is_open(
+                self.inner.committee.epoch(),
+                &newest,
+                latest_record.as_ref(),
+            ) {
+                ready = Err(StalledHeadBlocker::Epoch);
+            }
+        }
+        if let Err(blocked_by) = ready {
+            check.log_not_ready(
+                now,
+                blocked_by,
+                unchanged_for,
+                Some(newest.number),
+                replayed_number,
+                gossiped_number,
+            );
+            return false;
+        }
+        let stall_needed_ms = u64::try_from(check.stall_needed.as_millis()).unwrap_or(u64::MAX);
+        info!(
+            target: "subscriber",
+            head_age_ms = u64::try_from(newest.age.as_millis()).unwrap_or(u64::MAX),
+            newest_round = newest.round,
+            replayed_number,
+            gossiped_number,
+            stall_needed_ms,
+            "rejoining on a stalled consensus head"
+        );
+        metrics::counter!("tn_executor.stalled_head_rejoins_total").increment(1);
+        self.promote(true);
+        true
+    }
+
+    /// Ask state sync to fetch the outputs from `replayed_number + 1` up to the `gossiped`
+    /// frontier again, through the gap fill of the consensus fetch task, at most once per
+    /// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] while the head is stalled (`head_stalled`), and with
+    /// a backoff while only the replay is stuck.
+    ///
+    /// A gossiped number is fetched once, when it arrives, and that fetch can end without the
+    /// outputs: the fetch task holds back a number while too many walks run, and a walk abandons a
+    /// range in an epoch no local pack decodes. A committee halted below quorum gossips nothing
+    /// later, so the gap would stay open and the frontier part of [`stalled_head_ready`] would
+    /// refuse forever. A live committee keeps gossiping, but each later walk stops at the previous
+    /// gossiped number, so nothing refetches outputs lost below that floor: state sync drops an
+    /// output from its cache when it hands it to a catch-up loop, and the next loop discards what
+    /// the previous one left queued (a promotion that ended in a demotion), so a replay stuck
+    /// below a moving head asks too. The fetch task defers a request that running walks already
+    /// cover (`reserve_if_uncovered`), so this recovers a fetch that was skipped or has ended,
+    /// not one a covering walk is still retrying, and repeating it costs nothing while such
+    /// walks run.
+    ///
+    /// A replay stuck below a moving head would widen that request with every check: its floor
+    /// stays while the frontier rises, so once the previous walk has ended the wider range is
+    /// uncovered and every check would start another walk down to the floor. While the floor
+    /// stays the same, the stuck replay therefore re-sends its first request unchanged (a walk
+    /// still running covers it, and gossip walks fetch the outputs above it anyway), and waits
+    /// twice as long before each repeat, up to [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`]; a replay that
+    /// moves resets both ([`StalledHeadCheck::observe_replay`]).
+    ///
+    /// A frontier gossiped in a later epoch than this node's committee is not re-requested: the
+    /// walk would abort at once in an epoch this node cannot decode yet, and the send would replace
+    /// the stream's own gap request near the boundary.
+    fn rerequest_behind_frontier(
+        &self,
+        check: &mut StalledHeadCheck,
+        gossiped: (Epoch, u64, ConsensusHeaderDigest),
+        replayed_number: u64,
+        head_stalled: bool,
+        now: tokio::time::Instant,
+    ) {
+        let (epoch, to, hash) = gossiped;
+        if epoch > self.inner.committee.epoch() {
+            return;
+        }
+        let fresh = (epoch, to, hash, replayed_number.saturating_add(1));
+        let stuck_replay = if head_stalled {
+            None
+        } else {
+            match check.stuck_replay {
+                Some(stuck) if now.saturating_duration_since(stuck.sent) < stuck.wait => return,
+                Some(stuck) => Some(StuckReplayRequest {
+                    sent: now,
+                    wait: stuck.wait.saturating_mul(2).min(REJOIN_STUCK_REPLAY_MAX_BACKOFF),
+                    ..stuck
+                }),
+                None => Some(StuckReplayRequest {
+                    request: fresh,
+                    sent: now,
+                    wait: REJOIN_STALLED_HEAD_CHECK_INTERVAL.saturating_mul(2),
+                }),
+            }
+        };
+        if !rate_limit_due(&mut check.rerequested, now, REJOIN_STALLED_HEAD_CHECK_INTERVAL) {
+            return;
+        }
+        let (request, backoff) = match stuck_replay {
+            Some(stuck) => {
+                check.stuck_replay = Some(stuck);
+                (stuck.request, stuck.wait)
+            }
+            None => (fresh, REJOIN_STALLED_HEAD_CHECK_INTERVAL),
+        };
+        self.consensus_bus.consensus_gap_request().send_replace(Some(request));
+        if rate_limit_due(&mut check.rerequest_logged, now, REJOIN_FRONTIER_REREQUEST_LOG_INTERVAL)
+        {
+            let (_, to, _, from) = request;
+            info!(
+                target: "subscriber",
+                from,
+                to,
+                backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                "re-requesting consensus outputs behind the gossiped frontier"
+            );
+        }
+    }
+
+    /// Promote this catching-up CVV back to an active CVV and end the epoch so it restarts as one.
+    ///
+    /// The promotion is recorded in the rejoin state (pending, stamped now) before the node mode
+    /// flips, so no demotion check can see the node active without its rejoin grace. It counts
+    /// as failed only if a demotion follows inside the grace: toward the rejoin cap, or, for a
+    /// promotion on a stalled consensus head (`stalled`), toward the stalled-head rule's backoff.
+    fn promote(&self, stalled: bool) {
+        let epoch = self.inner.committee.epoch();
+        self.consensus_bus.rejoin_state().send_modify(|state| {
+            state.record_promotion(epoch, tokio::time::Instant::now(), stalled)
+        });
+        let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+        self.consensus_bus.metrics().record_rejoin_transition(previous);
+        self.config.shutdown().notify();
+    }
+
+    /// The leader round and consensus number of the last output the engine processed, executed or
+    /// skipped as empty.
+    fn exec_progress(&self) -> (Round, u64) {
+        let recent = self.consensus_bus.recent_blocks().borrow();
+        (recent.last_consensus_round(), recent.latest_consensus_block_num_hash().number)
     }
 
     /// Follow along with consensus output but do not try to join consensus.
@@ -389,13 +862,26 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Save consensus output and publish or signature.
+    ///
+    /// Once the output is durable it logs `output saved` with the time the pack's sync and the
+    /// slot files' sync took, and records the pack's in `consensus_pack_persist_seconds`.
     async fn handle_consensus_output(
         &self,
         consensus_chain: &mut ConsensusChain,
         output: ConsensusOutput,
     ) -> SubscriberResult<()> {
         debug!(target: "subscriber", output=?output.digest(), "saving next output");
-        save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        let saved =
+            save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        self.inner.metrics.consensus_pack_persist_seconds.record(saved.pack_persist.as_secs_f64());
+        info!(
+            target: "consensus::metrics",
+            number = output.number(),
+            leader_round = output.sub_dag().leader_round(),
+            pack_persist_ms = u64::try_from(saved.pack_persist.as_millis()).unwrap_or(u64::MAX),
+            slots_persist_ms = u64::try_from(saved.slots_persist.as_millis()).unwrap_or(u64::MAX),
+            "output saved"
+        );
         debug!(target: "subscriber", "broadcasting output...");
         // Publish the consensus result now that we are totally finished.
         let number = output.number();
@@ -453,6 +939,8 @@ impl<DB: Database> Subscriber<DB> {
         let mut waiting = FuturesOrdered::new();
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
+        // running maximum of the received leaders' execution blocks (see `next_wait_floor`)
+        let mut wait_floor = 0;
 
         let mut epoch_done = false;
         // rx_sequence is now passed as parameter to avoid race condition
@@ -476,7 +964,8 @@ impl<DB: Database> Subscriber<DB> {
                     let number = last_number + 1;
                     last_number += 1;
                     last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
-                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
+                    wait_floor = next_wait_floor(wait_floor, &sub_dag);
+                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number, wait_floor));
                 },
 
                 // Receive consensus messages after all transaction data is downloaded
@@ -488,6 +977,38 @@ impl<DB: Database> Subscriber<DB> {
                 Some(output) = waiting.next() => {
                     match output {
                         Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
+                        Err(SubscriberError::ExecutionFork {
+                            number,
+                            base_block,
+                            base_hash,
+                            leader,
+                            leader_round,
+                        }) => {
+                            error!(
+                                target: "subscriber",
+                                number,
+                                base_block,
+                                %base_hash,
+                                %leader,
+                                leader_round,
+                                "leader's execution block is not on the local chain; execution has forked, going inactive"
+                            );
+                            let previous =
+                                self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+                            self.consensus_bus.metrics().record_execution_fork_transition(previous);
+                            // settle the latest rejoin at this demotion's own time: the catch-up
+                            // loop that would otherwise settle it starts after the restart,
+                            // possibly past the grace
+                            let epoch = self.inner.committee.epoch();
+                            let now = tokio::time::Instant::now();
+                            self.consensus_bus
+                                .rejoin_state()
+                                .send_if_modified(|state| state.record_demotion(epoch, now, false));
+                            self.config.shutdown().notify();
+                            // not an error (that would fail this critical task) and not through
+                            // the shutdown drain (that would save outputs past the fork)
+                            return Ok(());
+                        }
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");
                             // Failure to fetch batches is a fatal condition, return an error which will trigger node shutdown.
@@ -536,13 +1057,23 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
+    ///
+    /// Before anything else, empty sub-dags included, it waits for local execution to reach
+    /// `wait_floor` and checks the leader's execution block (see
+    /// [`Self::wait_for_leader_execution`]), so an output is only assembled, and later saved, once
+    /// its leader passed the fork check.
     #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
         sub_dag: CommittedSubDag,
         parent_hash: ConsensusHeaderDigest,
         number: u64,
+        wait_floor: u64,
     ) -> SubscriberResult<ConsensusOutput> {
+        self.wait_for_leader_execution(&sub_dag, number, wait_floor).await?;
+        // the batch fetch is timed from here, after the execution wait, to the assembled output
+        let fetch_started = Instant::now();
+
         let num_blocks = sub_dag.num_primary_batches();
         let num_certs = sub_dag.len();
 
@@ -645,6 +1176,8 @@ impl<DB: Database> Subscriber<DB> {
             num_certs = num_certs,
             num_batches = batch_digests.len(),
             total_txs = total_txs,
+            fetch_ms = u64::try_from(fetch_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            leader_epoch = sub_dag.leader_epoch(),
             "consensus output ready"
         );
         self.inner.metrics.outputs_ready_total.increment(1);
@@ -660,6 +1193,106 @@ impl<DB: Database> Subscriber<DB> {
             batch_digests,
             batches,
         ))
+    }
+
+    /// Wait until local execution reaches block `wait_floor`, then check that the leader's
+    /// execution block is the block this node executed at that height.
+    ///
+    /// `wait_floor` is at least the leader's own block number: it is the running maximum over
+    /// every leader received so far (see [`next_wait_floor`]), so the outputs pass this wait in
+    /// consensus order and an output led by a node whose execution trails this one's does not
+    /// pass early and sit fully assembled behind a slower predecessor. Every leader's block comes
+    /// from an earlier output, so executing the outputs ahead of this one always reaches the
+    /// floor. The check itself is [`ConsensusBusApp::wait_for_execution`], the one each vote
+    /// makes.
+    ///
+    /// Returns [`SubscriberError::ExecutionFork`] only when this node holds a different block at
+    /// the leader's number. A block below this node's restored-state floor cannot be checked here
+    /// and the output goes on, because the voters that certified the leader checked it against
+    /// their own chains. After a restart with a backlog that can be every output for a while, so
+    /// a run of them warns at its first output and again, with its length, at the first output
+    /// whose block is checked again; the outputs in between log at debug (see
+    /// [`UncheckedBelowFloor`]).
+    async fn wait_for_leader_execution(
+        &self,
+        sub_dag: &CommittedSubDag,
+        number: u64,
+        wait_floor: u64,
+    ) -> SubscriberResult<()> {
+        let started = Instant::now();
+        let base = sub_dag.leader().latest_execution_block();
+        let mut rx_recent_blocks = self.consensus_bus.recent_blocks().subscribe();
+        rx_recent_blocks
+            .wait_for(|blocks| blocks.latest_execution_block_num_hash().number >= wait_floor)
+            .await
+            .map(|_| ())
+            .map_err(|_| SubscriberError::ClosedChannel("recent_blocks".to_string()))?;
+        let checked = self.consensus_bus.wait_for_execution(base).await;
+        let waited = started.elapsed();
+        self.inner.metrics.execution_wait_seconds.record(waited.as_secs_f64());
+        if waited > EXECUTION_WAIT_LOG_THRESHOLD {
+            info!(
+                target: "subscriber",
+                number,
+                leader_round = sub_dag.leader_round(),
+                base_block = base.number,
+                executed_block = self.consensus_bus.latest_execution_block_num_hash().number,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "waited for execution before assembling the output"
+            );
+        }
+        match checked {
+            Ok(()) => {
+                if let Some((unchecked_outputs, floor)) = self.inner.below_floor.take() {
+                    warn!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        unchecked_outputs,
+                        "outputs whose leader's execution block was below the restored-state floor were not checked; checked again from this output"
+                    );
+                }
+                Ok(())
+            }
+            Err(ExecutionCheckError::BelowFloor { floor }) => {
+                let unchecked_outputs = self.inner.below_floor.record(floor);
+                if unchecked_outputs == 1 {
+                    // warn at a run's first output: the subscriber can end before any output is
+                    // checked again
+                    warn!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        "leader's execution block is below the restored-state floor; not checked, and outputs below it log at debug until one is checked again"
+                    );
+                } else {
+                    debug!(
+                        target: "subscriber",
+                        number,
+                        leader_round = sub_dag.leader_round(),
+                        base_block = base.number,
+                        floor,
+                        unchecked_outputs,
+                        "leader's execution block is below the restored-state floor; not checked"
+                    );
+                }
+                Ok(())
+            }
+            Err(ExecutionCheckError::Fork) => Err(SubscriberError::ExecutionFork {
+                number,
+                base_block: base.number,
+                base_hash: base.hash,
+                leader: sub_dag.leader().author().clone(),
+                leader_round: sub_dag.leader_round(),
+            }),
+            Err(ExecutionCheckError::Closed) => {
+                Err(SubscriberError::ClosedChannel("recent_blocks".to_string()))
+            }
+        }
     }
 
     /// Warn every [`FETCH_BATCHES_STALL_WARN_INTERVAL`] while a worker's fetch leg is
@@ -736,6 +1369,20 @@ impl<DB: Database> Subscriber<DB> {
                     .collect()
             })
     }
+}
+
+/// The execution block number the next received sub-dag's output waits for: the running maximum
+/// of the leaders' execution blocks, `wait_floor` so far raised to `sub_dag`'s leader's block.
+///
+/// Keeping the floor monotone makes the outputs pass their execution wait in consensus order: an
+/// output led from an older block does not pass early and sit fully assembled behind a slower
+/// predecessor. It does not bound how many outputs are assembled at once. Every output whose floor
+/// local execution has passed is assembled concurrently, so under a uniform backlog the outputs
+/// held in memory approach the outputs between the executed and the committed leader: up to about
+/// 500 at the 1,000-round run-ahead bound ([`tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS`]), about
+/// 0.5-0.6 GB at the 1.0-1.25 MB average output and 2.75 GB at the 5.5 MB maximum.
+fn next_wait_floor(wait_floor: u64, sub_dag: &CommittedSubDag) -> u64 {
+    wait_floor.max(sub_dag.leader().latest_execution_block().number)
 }
 
 /// Drain the batch-fetch futures still pending when graceful shutdown fires.
@@ -832,11 +1479,347 @@ fn classify_sync_output(latest: u64, number: u64) -> SyncContinuity {
     }
 }
 
+/// The newest consensus header a catching-up CVV knows about, copied out of the watch for one
+/// readiness check.
+#[derive(Clone, Copy, Debug)]
+struct NewestHeader {
+    /// The header's consensus number.
+    number: u64,
+    /// The epoch of the header's leader.
+    epoch: Epoch,
+    /// The round of the header's leader.
+    round: Round,
+    /// Time since the header's sub-dag was committed.
+    age: Duration,
+}
+
+/// True when an action last taken at `last` may be taken again at `now`: never taken, or at least
+/// `interval` ago. A `true` answer records `now` in `last`.
+fn rate_limit_due(
+    last: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= interval);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// A consensus number a catching-up CVV has watched, the newest known header's or the newest
+/// replayed output's, and since when it has stayed the same. Owned by one catch-up loop.
+#[derive(Clone, Copy, Debug)]
+struct ObservedHead {
+    /// The number when last observed. Only a watched head is ever `None` (no header known yet);
+    /// a watched replay always has a number.
+    number: Option<u64>,
+    /// When `number` was first observed, or the catch-up loop started if it has not changed.
+    since: tokio::time::Instant,
+}
+
+impl ObservedHead {
+    /// Observe `number` at `now` and return how long it has stayed the same. A changed number
+    /// restarts the watch at `now`.
+    fn observe(&mut self, number: Option<u64>, now: tokio::time::Instant) -> Duration {
+        if number != self.number {
+            *self = Self { number, since: now };
+        }
+        now.saturating_duration_since(self.since)
+    }
+}
+
+/// What one catch-up loop tracks between its stalled-head checks
+/// ([`Subscriber::rejoin_on_stalled_head`]).
+#[derive(Clone, Copy, Debug)]
+struct StalledHeadCheck {
+    /// The newest known header and how long it has stayed the newest.
+    observed_head: ObservedHead,
+    /// The newest replayed output and how long it has stayed the newest.
+    observed_replay: ObservedHead,
+    /// How long the head must stall before this loop rejoins on it
+    /// ([`stalled_head_stall_needed`]).
+    stall_needed: Duration,
+    /// When this loop last logged a refused check.
+    not_ready_logged: Option<tokio::time::Instant>,
+    /// When this loop last re-requested the outputs behind the gossiped frontier.
+    rerequested: Option<tokio::time::Instant>,
+    /// When this loop last logged a re-request.
+    rerequest_logged: Option<tokio::time::Instant>,
+    /// The gap request a replay stuck below a moving head last sent, and its backoff; `None`
+    /// until the stuck replay first asks, and again once the replay moves.
+    stuck_replay: Option<StuckReplayRequest>,
+}
+
+impl StalledHeadCheck {
+    /// The state of a catch-up loop that started at `entry` knowing the header `newest_number`,
+    /// with the outputs through `replayed_number` replayed.
+    fn new(
+        newest_number: Option<u64>,
+        replayed_number: u64,
+        entry: tokio::time::Instant,
+        stall_needed: Duration,
+    ) -> Self {
+        Self {
+            observed_head: ObservedHead { number: newest_number, since: entry },
+            observed_replay: ObservedHead { number: Some(replayed_number), since: entry },
+            stall_needed,
+            not_ready_logged: None,
+            rerequested: None,
+            rerequest_logged: None,
+            stuck_replay: None,
+        }
+    }
+
+    /// Observe the newest replayed output at `now` and return how long it has stayed the newest.
+    /// A replay that moved past the floor of the last stuck-replay request ends that request and
+    /// its backoff, so a replay that sticks again asks afresh one check interval later.
+    fn observe_replay(&mut self, replayed_number: u64, now: tokio::time::Instant) -> Duration {
+        let unchanged_for = self.observed_replay.observe(Some(replayed_number), now);
+        if self.stuck_replay.is_some_and(|stuck| stuck.floor() != replayed_number.saturating_add(1))
+        {
+            self.stuck_replay = None;
+        }
+        unchanged_for
+    }
+
+    /// Log a check refused at `now` by `blocked_by` as `stalled head not ready`, at most once per
+    /// [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`]. `newest_number` is `None` while no
+    /// consensus header is known, and the line then leaves it out.
+    fn log_not_ready(
+        &mut self,
+        now: tokio::time::Instant,
+        blocked_by: StalledHeadBlocker,
+        unchanged_for: Duration,
+        newest_number: Option<u64>,
+        replayed_number: u64,
+        gossiped_number: u64,
+    ) {
+        if !rate_limit_due(
+            &mut self.not_ready_logged,
+            now,
+            REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL,
+        ) {
+            return;
+        }
+        info!(
+            target: "subscriber",
+            unchanged_for_ms = u64::try_from(unchanged_for.as_millis()).unwrap_or(u64::MAX),
+            stall_needed_ms = u64::try_from(self.stall_needed.as_millis()).unwrap_or(u64::MAX),
+            newest_number,
+            replayed_number,
+            gossiped_number,
+            blocked_by = blocked_by.as_str(),
+            "stalled head not ready"
+        );
+    }
+}
+
+/// A gap request sent for a replay stuck below a moving head
+/// ([`Subscriber::rerequest_behind_frontier`]), repeated unchanged while the replay stays stuck.
+#[derive(Clone, Copy, Debug)]
+struct StuckReplayRequest {
+    /// The request as sent on the gap-request watch: `(epoch, to, hash, from)`.
+    request: (Epoch, u64, ConsensusHeaderDigest, u64),
+    /// When it was last sent.
+    sent: tokio::time::Instant,
+    /// How long after `sent` it may be sent again: doubles with every repeat, up to
+    /// [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`].
+    wait: Duration,
+}
+
+impl StuckReplayRequest {
+    /// The lowest consensus number the request asks for: the stuck replay's next output.
+    const fn floor(&self) -> u64 {
+        self.request.3
+    }
+}
+
+/// The first part of the stalled-head rule a catching-up CVV failed
+/// ([`Subscriber::rejoin_on_stalled_head`], [`stalled_head_ready`],
+/// [`stalled_head_epoch_is_open`]): the `blocked_by` field of the `stalled head not ready` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StalledHeadBlocker {
+    /// The node knows no consensus header yet, so there is no head to watch stall.
+    NoHead,
+    /// The newest known header is younger than [`tn_types::REJOIN_STALLED_HEAD_AFTER`]: the
+    /// committee may still commit, and the usual rule ([`rejoin_ready`]) handles a fresh head.
+    HeadAge,
+    /// The node has not yet watched the newest known header stay the newest for the stall it
+    /// needs ([`stalled_head_stall_needed`]).
+    Stall,
+    /// A peer advertises a consensus number past the newest output this node has replayed.
+    Frontier,
+    /// The newest output this node has replayed is not the newest known header or past it.
+    Replay,
+    /// The newest known header is neither in this node's open epoch nor the final header of the
+    /// epoch before ([`stalled_head_epoch_is_open`]).
+    Epoch,
+}
+
+impl StalledHeadBlocker {
+    /// The `blocked_by` value of the `stalled head not ready` line.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoHead => "no_head",
+            Self::HeadAge => "head_age",
+            Self::Stall => "stall",
+            Self::Frontier => "frontier",
+            Self::Replay => "replay",
+            Self::Epoch => "epoch",
+        }
+    }
+}
+
+/// Why a catching-up CVV did not rejoin consensus after handling an output: the `reason` of the
+/// `rejoin not ready` line and the `reason` label of `tn_executor_rejoin_blocked_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejoinBlocker {
+    /// The handled output is not from this subscriber's still-open epoch (see
+    /// `rejoin_epoch_is_open`), so the node keeps replaying.
+    EpochClosed,
+    /// [`MAX_REJOIN_ATTEMPTS_PER_EPOCH`] of this node's promotions in its epoch already failed, so
+    /// it follows consensus as inactive until the epoch boundary or a stalled consensus head
+    /// ([`stalled_head_ready`]).
+    AttemptsExhausted,
+    /// No consensus header has been seen yet to measure the network head by.
+    NoKnownHeader,
+    /// The newest known header is at least [`REJOIN_HEAD_MAX_AGE`] old.
+    StaleHead,
+    /// The newest known header is from another epoch than the handled output.
+    EpochMismatch,
+    /// The handled output trails the newest known header by more than the rejoin window.
+    RoundGap,
+}
+
+impl RejoinBlocker {
+    /// The number of blockers.
+    const COUNT: usize = 6;
+
+    /// Every blocker, in the order [`Self::classify`] tests them. A blocker's position here is its
+    /// [`Self::index`].
+    const ALL: [Self; Self::COUNT] = [
+        Self::EpochClosed,
+        Self::AttemptsExhausted,
+        Self::NoKnownHeader,
+        Self::StaleHead,
+        Self::EpochMismatch,
+        Self::RoundGap,
+    ];
+
+    /// The static label for this blocker.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EpochClosed => "epoch_closed",
+            Self::AttemptsExhausted => "attempts_exhausted",
+            Self::NoKnownHeader => "no_known_header",
+            Self::StaleHead => "stale_head",
+            Self::EpochMismatch => "epoch_mismatch",
+            Self::RoundGap => "round_gap",
+        }
+    }
+
+    /// The position of this blocker in [`Self::ALL`], for per-blocker arrays.
+    ///
+    /// The match is exhaustive, so a new blocker does not compile until it gets a slot here; give
+    /// it the next slot, append it to [`Self::ALL`] and raise [`Self::COUNT`].
+    const fn index(self) -> usize {
+        match self {
+            Self::EpochClosed => 0,
+            Self::AttemptsExhausted => 1,
+            Self::NoKnownHeader => 2,
+            Self::StaleHead => 3,
+            Self::EpochMismatch => 4,
+            Self::RoundGap => 5,
+        }
+    }
+
+    /// Classify a readiness check that failed: the first condition the check would refuse, in the
+    /// order of [`Self::ALL`].
+    ///
+    /// Call only on the not-ready branch. The first five blockers mirror `rejoin_epoch_is_open`
+    /// and the attempts, freshness and epoch parts of `rejoin_ready`, so a failed check that
+    /// passes them failed on the round gap. A node out of attempts reports that ahead of the
+    /// network head, which no longer decides anything for it in this epoch.
+    fn classify(
+        epoch_is_open: bool,
+        attempts: u32,
+        newest: Option<&NewestHeader>,
+        handled_epoch: Epoch,
+    ) -> Self {
+        if !epoch_is_open {
+            return Self::EpochClosed;
+        }
+        if attempts >= MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+            return Self::AttemptsExhausted;
+        }
+        let Some(newest) = newest else {
+            return Self::NoKnownHeader;
+        };
+        if newest.age >= REJOIN_HEAD_MAX_AGE {
+            Self::StaleHead
+        } else if newest.epoch != handled_epoch {
+            Self::EpochMismatch
+        } else {
+            Self::RoundGap
+        }
+    }
+}
+
+// compile-time check that `ALL` lists the blockers in slot order, so every `index` in it is a valid
+// position in the per-blocker arrays. `index` is an exhaustive match, so a new blocker fails the
+// build until it gets a slot, and a slot that moves another blocker fails here until `ALL`
+// follows. stable rust cannot count variants, so a blocker given the next free slot still needs
+// `COUNT` and `ALL` raised by hand.
+const _: () = {
+    let mut position = 0;
+    while position < RejoinBlocker::COUNT {
+        assert!(
+            RejoinBlocker::ALL[position].index() == position,
+            "RejoinBlocker::ALL out of order"
+        );
+        position += 1;
+    }
+};
+
+/// Resolve the `tn_executor_rejoin_blocked_total{reason}` handles, indexed by
+/// [`RejoinBlocker::index`].
+fn rejoin_blocked_counters() -> [Counter; RejoinBlocker::COUNT] {
+    RejoinBlocker::ALL.map(
+        |reason| metrics::counter!("tn_executor.rejoin_blocked_total", "reason" => reason.as_str()),
+    )
+}
+
+/// Rate limit for the `rejoin not ready` line: log when the blocker changes, and otherwise at most
+/// once per [`REJOIN_NOT_READY_LOG_INTERVAL`].
+///
+/// Owned by one catch-up loop, so the stamp needs no synchronization.
+#[derive(Debug, Default)]
+struct RejoinLogThrottle {
+    /// The blocker last logged and when.
+    last: Option<(RejoinBlocker, Instant)>,
+}
+
+impl RejoinLogThrottle {
+    /// True when a check blocked by `reason` at `now` should be logged. A `true` answer records
+    /// `reason` and `now` as the last line logged.
+    fn should_log(&mut self, reason: RejoinBlocker, now: Instant) -> bool {
+        let due = self.last.is_none_or(|(last_reason, logged_at)| {
+            last_reason != reason
+                || now.saturating_duration_since(logged_at) >= REJOIN_NOT_READY_LOG_INTERVAL
+        });
+        if due {
+            self.last = Some((reason, now));
+        }
+        due
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         classify_sync_output, drain_pending_on_shutdown, save_consensus, Inner, Subscriber,
-        SyncContinuity,
+        SyncContinuity, UncheckedBelowFloor,
     };
     use crate::{metrics::ExecutorMetrics, SubscriberError};
     use futures::{future, stream::FuturesOrdered};
@@ -915,6 +1898,7 @@ mod tests {
                 consensus_chain,
                 epoch_boundary: u64::MAX,
                 metrics: ExecutorMetrics::default(),
+                below_floor: UncheckedBelowFloor::default(),
             }),
         }
     }
@@ -1335,6 +2319,1606 @@ mod tests {
         let forwarded = rx_consensus_output.try_recv().expect("the next output is forwarded");
         assert_eq!(forwarded.number(), 4);
     }
+
+    mod f1_commit_lag {
+        use super::{f3_rejoin::SubscriberLines, *};
+        use crate::subscriber::next_wait_floor;
+        use tn_types::{
+            Batch, BlockNumHash, ConsensusNumHash, EpochSeedChainValue, ExecHeader, Notifier,
+            SealedHeader,
+        };
+
+        /// The hash this node's execution gives block `number` in these tests.
+        fn local_hash(number: u64) -> B256 {
+            B256::repeat_byte(u8::try_from(number).unwrap())
+        }
+
+        /// A block hash this node never executed: the forked leader's.
+        fn forked_hash() -> B256 {
+            B256::repeat_byte(0xff)
+        }
+
+        /// Record block `number` as executed, as the engine does after each output.
+        fn execute(bus: &ConsensusBusApp, number: u64) {
+            let header = ExecHeader { number, ..Default::default() };
+            bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(
+                    0,
+                    ConsensusNumHash::new(number, ConsensusHeaderDigest::default()),
+                    Some(SealedHeader::new(header, local_hash(number))),
+                )
+            });
+        }
+
+        /// A one-certificate sub-dag whose leader references execution block `base`, with one
+        /// batch in its payload when `with_payload`.
+        fn led_at(
+            fixture: &CommitteeFixture<MemDatabase>,
+            base: BlockNumHash,
+            with_payload: bool,
+        ) -> CommittedSubDag {
+            let mut builder = fixture.header_builder_last_authority().latest_execution_block(base);
+            if with_payload {
+                builder = builder.with_payload_batch(&Batch::default(), 0);
+            }
+            let leader = fixture.certificate(&builder.build());
+            CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                0,
+                ReputationScores::new(&fixture.committee()),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            )
+        }
+
+        /// A fixture, its consensus chain and a recent blocks ring holding block 1.
+        async fn setup() -> (CommitteeFixture<MemDatabase>, TempDir, ConsensusChain, ConsensusBusApp)
+        {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            execute(&bus, 1);
+            (fixture, temp_dir, chain, bus)
+        }
+
+        /// A leader whose execution block this node executed differently fails the fork check
+        /// before any batch is fetched: the payload's batch exists nowhere, so a fetch would never
+        /// return.
+        #[tokio::test]
+        async fn fetch_batches_reports_execution_fork() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let sub_dag = led_at(&fixture, BlockNumHash::new(1, forked_hash()), true);
+            assert_ne!(sub_dag.num_primary_batches(), 0);
+            let (expected_leader, expected_round) =
+                (sub_dag.leader().author().clone(), sub_dag.leader_round());
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                subscriber.fetch_batches(sub_dag, B256::ZERO.into(), 1, 1),
+            )
+            .await
+            .expect("the fork check runs before the batch fetch");
+
+            // the error names the leader that referenced the block (SEC-11)
+            assert!(matches!(
+                result,
+                Err(SubscriberError::ExecutionFork {
+                    number: 1,
+                    base_block: 1,
+                    base_hash,
+                    leader,
+                    leader_round,
+                }) if base_hash == forked_hash()
+                    && leader == expected_leader
+                    && leader_round == expected_round
+            ));
+        }
+
+        /// A leader block below a snapshot-restored node's floor cannot be checked there, so it
+        /// is not a fork: the output is assembled, while the same mismatch at the floor still
+        /// fails the check (SEC-6).
+        #[tokio::test]
+        async fn fetch_batches_assembles_below_the_restore_floor() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            (2..=5).for_each(|number| execute(&bus, number));
+            bus.set_canonical_reader(Arc::new(RestoredAt3));
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let below = led_at(&fixture, BlockNumHash::new(2, forked_hash()), false);
+            let output = subscriber.fetch_batches(below, B256::ZERO.into(), 1, 2).await.unwrap();
+            assert_eq!(output.number(), 1);
+
+            let at_floor = led_at(&fixture, BlockNumHash::new(3, forked_hash()), false);
+            let result = subscriber.fetch_batches(at_floor, B256::ZERO.into(), 2, 3).await;
+            assert!(matches!(result, Err(SubscriberError::ExecutionFork { base_block: 3, .. })));
+        }
+
+        /// A restored execution database whose floor is block 3, attesting this node's blocks
+        /// from there on.
+        struct RestoredAt3;
+
+        impl tn_types::CanonicalExecutionReader for RestoredAt3 {
+            fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
+                (number >= 3).then(|| local_hash(number))
+            }
+            fn restored_state_floor(&self) -> Option<u64> {
+                Some(3)
+            }
+        }
+
+        /// Outputs whose leader's block is below the restore floor form a run: its first output
+        /// warns, the next one logs at debug, and the first output checked again warns with the
+        /// run's length. The next checked output logs neither warning.
+        #[tokio::test]
+        async fn below_floor_run_warns_when_it_starts_and_when_checking_resumes() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            (2..=5).for_each(|number| execute(&bus, number));
+            bus.set_canonical_reader(Arc::new(RestoredAt3));
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+
+            for (number, base) in [(1, 1), (2, 2)] {
+                // a hash the ring does not hold, so the check reaches the restored floor
+                let below = led_at(&fixture, BlockNumHash::new(base, forked_hash()), false);
+                subscriber.fetch_batches(below, B256::ZERO.into(), number, base).await.unwrap();
+            }
+            for (number, base) in [(3, 3), (4, 4)] {
+                let checked = led_at(&fixture, BlockNumHash::new(base, local_hash(base)), false);
+                subscriber.fetch_batches(checked, B256::ZERO.into(), number, base).await.unwrap();
+            }
+
+            let logged = |message: &str, expected: &[(&str, &str)]| {
+                let found = lines.with_message(message);
+                assert_eq!(found.len(), 1, "one `{message}` line: {found:?}");
+                for (key, value) in expected {
+                    assert_eq!(found[0].get(*key).map(String::as_str), Some(*value), "{found:?}");
+                }
+            };
+            // warn: the run starts at output 1
+            logged(
+                "leader's execution block is below the restored-state floor; not checked, and outputs below it log at debug until one is checked again",
+                &[("number", "1"), ("base_block", "1"), ("floor", "3")],
+            );
+            // debug: output 2 only counts
+            logged(
+                "leader's execution block is below the restored-state floor; not checked",
+                &[("number", "2"), ("floor", "3"), ("unchecked_outputs", "2")],
+            );
+            // warn: output 3 is checked again and reports the run; output 4 finds no run
+            logged(
+                "outputs whose leader's execution block was below the restored-state floor were not checked; checked again from this output",
+                &[("number", "3"), ("base_block", "3"), ("floor", "3"), ("unchecked_outputs", "2")],
+            );
+        }
+
+        /// A run's length and floor are taken once, and a new run counts from one.
+        #[test]
+        fn unchecked_below_floor_takes_each_run_once() {
+            let run = UncheckedBelowFloor::default();
+            assert_eq!(run.take(), None);
+            assert_eq!(run.record(3), 1);
+            assert_eq!(run.record(3), 2);
+            assert_eq!(run.take(), Some((2, 3)));
+            assert_eq!(run.take(), None);
+            assert_eq!(run.record(4), 1);
+            assert_eq!(run.take(), Some((1, 4)));
+        }
+
+        /// A sub-dag with no batches gets the same fork check: its output is not returned before
+        /// the check, and the check passes for a leader on the local chain.
+        #[tokio::test]
+        async fn fetch_batches_checks_empty_subdag() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let forked = led_at(&fixture, BlockNumHash::new(1, forked_hash()), false);
+            assert_eq!(forked.num_primary_batches(), 0);
+            let result = subscriber.fetch_batches(forked, B256::ZERO.into(), 1, 1).await;
+            assert!(matches!(result, Err(SubscriberError::ExecutionFork { number: 1, .. })));
+
+            let local = led_at(&fixture, BlockNumHash::new(1, local_hash(1)), false);
+            let output = subscriber.fetch_batches(local, B256::ZERO.into(), 1, 1).await.unwrap();
+            assert_eq!(output.number(), 1);
+        }
+
+        /// A later output led from an older execution block still waits for the floor an earlier
+        /// output set: leaders at blocks 5 then 1, with block 1 executed, and the second output
+        /// does not finish before execution reaches block 5.
+        #[tokio::test]
+        async fn wait_floor_is_monotone() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+            let first = led_at(&fixture, BlockNumHash::new(5, local_hash(5)), false);
+            let second = led_at(&fixture, BlockNumHash::new(1, local_hash(1)), false);
+            let first_floor = next_wait_floor(0, &first);
+            let second_floor = next_wait_floor(first_floor, &second);
+            assert_eq!((first_floor, second_floor), (5, 5));
+
+            let first_output =
+                Box::pin(subscriber.fetch_batches(first, B256::ZERO.into(), 1, first_floor));
+            let mut second_output =
+                Box::pin(subscriber.fetch_batches(second, B256::ZERO.into(), 2, second_floor));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut second_output).await.is_err(),
+                "the second output waits for the first leader's block"
+            );
+
+            (2..=5).for_each(|number| execute(&bus, number));
+            let second_output = tokio::time::timeout(Duration::from_secs(10), second_output)
+                .await
+                .expect("execution reached the floor")
+                .unwrap();
+            let first_output = tokio::time::timeout(Duration::from_secs(10), first_output)
+                .await
+                .expect("execution reached the first leader's block")
+                .unwrap();
+            assert_eq!((first_output.number(), second_output.number()), (1, 2));
+        }
+
+        /// On a failed fork check `run` goes inactive, shuts the epoch down and returns `Ok`
+        /// without saving the output: an `Err` would fail the critical task, and the shutdown
+        /// drain would save outputs past the fork. A promotion before it is settled by the
+        /// demotion as a failed one.
+        #[tokio::test]
+        async fn run_returns_ok_after_execution_fork() {
+            let (fixture, _temp_dir, chain, bus) = setup().await;
+            let subscriber = sync_subscriber(&fixture, chain.clone(), &bus);
+            let epoch = subscriber.inner.committee.epoch();
+            bus.rejoin_state().send_modify(|state| {
+                state.record_promotion(epoch, tokio::time::Instant::now(), false)
+            });
+            let epoch_shutdown =
+                fixture.authorities().next().unwrap().consensus_config().shutdown().subscribe();
+            let (tx_sequence, rx_sequence) = mpsc::channel(4);
+            tx_sequence
+                .send(led_at(&fixture, BlockNumHash::new(1, forked_hash()), false))
+                .await
+                .unwrap();
+            let run_shutdown = Notifier::new();
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                subscriber.run(run_shutdown.subscribe(), rx_sequence, chain.clone()),
+            )
+            .await
+            .expect("run returns after the fork");
+
+            assert!(result.is_ok(), "{result:?}");
+            assert!(bus.is_cvv_inactive(), "the node goes inactive");
+            assert!(epoch_shutdown.noticed(), "the epoch shuts down");
+            assert_eq!(chain.latest_consensus_number(), 0, "the forked output is not saved");
+            // settled at the demotion, inside the grace, so it counts toward the rejoin cap
+            // however late the catch-up loop starts
+            let rejoin = *bus.rejoin_state().borrow();
+            assert!(!rejoin.is_pending(epoch), "settled by the demotion, not by the catch-up loop");
+            assert_eq!(rejoin.attempts(epoch), 1, "a failed promotion");
+        }
+    }
+
+    mod land_path_obs {
+        use super::*;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{cell::RefCell, collections::BTreeMap, future::Future, sync::Once};
+        use tn_network_types::MockPrimaryToWorkerClient;
+        use tn_types::{
+            Batch, BlockNumHash, ConsensusNumHash, EpochSeedChainValue, ExecHeader, SealedHeader,
+        };
+        use tracing::{
+            field::{Field, Visit},
+            span, Event, Metadata,
+        };
+
+        /// One `consensus::metrics` event: its message and its other fields as logged.
+        type Captured = (String, BTreeMap<String, String>);
+
+        thread_local! {
+            /// The `consensus::metrics` events logged on this thread while it captures.
+            static CAPTURED: RefCell<Option<Vec<Captured>>> = const { RefCell::new(None) };
+        }
+
+        /// Collects an event's fields by name, each value as its `Debug` text.
+        struct Fields(BTreeMap<String, String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        /// Records the `consensus::metrics` events of the threads capturing at the time.
+        struct Capture;
+
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.target() == "consensus::metrics"
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                let message = fields.0.remove("message").unwrap_or_default();
+                CAPTURED.with(|captured| {
+                    if let Some(events) = captured.borrow_mut().as_mut() {
+                        events.push((message, fields.0));
+                    }
+                });
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        /// Drive `work` on this thread, returning its result and the `consensus::metrics` events
+        /// it logged here. The tests run on a current-thread runtime, so `work` logs on this
+        /// thread.
+        ///
+        /// Events reach [`Capture`] through this thread's scoped default, held for the capture.
+        /// A [`Capture`] is also tried once as the global default, and a global that another test
+        /// installed first keeps its place. The global is there for tracing-core's interest cache:
+        /// while a single dispatcher is registered, a callsite reached for the first time takes
+        /// its interest from the default of the thread that reaches it, so another test's thread
+        /// could disable an event this capture waits for. A second registered dispatcher, ours or
+        /// another test's, makes every callsite consult this scoped default as well.
+        async fn capture<T>(work: impl Future<Output = T>) -> (T, Vec<Captured>) {
+            static INSTALLED: Once = Once::new();
+            INSTALLED.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(Capture);
+            });
+            let _scoped = tracing::subscriber::set_default(Capture);
+            CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+            let result = work.await;
+            let events = CAPTURED.with(|captured| captured.borrow_mut().take()).unwrap_or_default();
+            (result, events)
+        }
+
+        /// The fields of the only captured event with `message`.
+        fn only<'a>(events: &'a [Captured], message: &str) -> &'a BTreeMap<String, String> {
+            let matching: Vec<_> = events.iter().filter(|(m, _)| m == message).collect();
+            assert_eq!(matching.len(), 1, "one `{message}` line per output: {events:?}");
+            &matching[0].1
+        }
+
+        /// `fields[key]` as a whole number, failing the test when it is missing or not one.
+        fn whole(fields: &BTreeMap<String, String>, key: &str) -> u64 {
+            fields
+                .get(key)
+                .unwrap_or_else(|| panic!("`{key}` logged: {fields:?}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("`{key}` is a whole number: {e}"))
+        }
+
+        /// A subscriber for the fixture's first authority whose metrics are `metrics`.
+        fn subscriber_with(
+            fixture: &CommitteeFixture<MemDatabase>,
+            consensus_chain: ConsensusChain,
+            consensus_bus: &ConsensusBusApp,
+            metrics: ExecutorMetrics,
+        ) -> Subscriber<MemDatabase> {
+            let config = fixture.authorities().next().unwrap().consensus_config();
+            let (network_tx, _network_rx) = mpsc::channel(1);
+            Subscriber {
+                consensus_bus: consensus_bus.clone(),
+                config: config.clone(),
+                network_handle: PrimaryNetworkHandle::new_for_test(network_tx),
+                inner: Arc::new(Inner {
+                    authority_id: config.authority_id(),
+                    committee: config.committee().clone(),
+                    consensus_chain,
+                    epoch_boundary: u64::MAX,
+                    metrics,
+                    below_floor: UncheckedBelowFloor::default(),
+                }),
+            }
+        }
+
+        /// Saving an output logs one `output saved` line keyed by its consensus number and leader
+        /// round, with the pack's and the slot files' persist times, and records the pack's in
+        /// `consensus_pack_persist_seconds`.
+        #[tokio::test]
+        async fn output_saved_reports_persist_times() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let mut chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            // handles bound to the local recorder keep recording into it after the closure
+            let metrics = metrics::with_local_recorder(&recorder, || {
+                ExecutorMetrics::new_with_labels(Vec::<metrics::Label>::new())
+            });
+            let subscriber = subscriber_with(&fixture, chain.clone(), &bus, metrics);
+            let mut rx_consensus_output = bus.subscribe_consensus_output();
+            let output = chained_outputs(&fixture, 1).remove(0);
+            let leader_round = output.sub_dag().leader_round();
+
+            let (result, events) =
+                capture(subscriber.handle_consensus_output(&mut chain, output)).await;
+            result.expect("the output saves and is forwarded");
+            assert_eq!(rx_consensus_output.try_recv().expect("forwarded").number(), 1);
+
+            let saved = only(&events, "output saved");
+            assert_eq!(
+                saved.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["leader_round", "number", "pack_persist_ms", "slots_persist_ms"]
+            );
+            assert_eq!(whole(saved, "number"), 1, "the consensus number");
+            assert_eq!(whole(saved, "leader_round"), u64::from(leader_round));
+            whole(saved, "pack_persist_ms");
+            whole(saved, "slots_persist_ms");
+
+            let snapshot = snapshotter.snapshot().into_vec();
+            let (_, _, _, value) = snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == "tn_executor.consensus_pack_persist_seconds")
+                .expect("the pack persist histogram is registered");
+            assert!(
+                matches!(value, DebugValue::Histogram(samples) if samples.len() == 1),
+                "one pack persist sample per saved output: {value:?}"
+            );
+        }
+
+        /// An assembled output's `consensus output ready` line carries the batch fetch time and
+        /// the leader's epoch beside its consensus number and leader round.
+        #[tokio::test]
+        async fn output_ready_reports_fetch_ms_and_leader_epoch() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            // block 1 executed, so the leader below passes the execution wait and fork check
+            let local = B256::repeat_byte(1);
+            bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(
+                    0,
+                    ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                    Some(SealedHeader::new(ExecHeader { number: 1, ..Default::default() }, local)),
+                )
+            });
+            // worker 0 serves the one batch in the leader's payload
+            let batch = Batch::default();
+            fixture
+                .authorities()
+                .next()
+                .unwrap()
+                .consensus_config()
+                .local_network(0)
+                .expect("worker 0 local network")
+                .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                    batches: std::collections::HashMap::from([(batch.digest(), batch.clone())]),
+                }))
+                .expect("register the worker mock");
+            let header = fixture
+                .header_builder_last_authority()
+                .latest_execution_block(BlockNumHash::new(1, local))
+                .with_payload_batch(&batch, 0)
+                .build();
+            let leader = fixture.certificate(&header);
+            let sub_dag = CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                0,
+                ReputationScores::new(&fixture.committee()),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            );
+            let leader_round = sub_dag.leader_round();
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let (output, events) =
+                capture(subscriber.fetch_batches(sub_dag, B256::ZERO.into(), 1, 1)).await;
+            let output = output.expect("the batch is fetched and the output assembled");
+            assert_eq!(output.number(), 1);
+
+            let ready = only(&events, "consensus output ready");
+            assert_eq!(whole(ready, "number"), 1, "the consensus number");
+            assert_eq!(whole(ready, "leader_round"), u64::from(leader_round));
+            assert_eq!(whole(ready, "leader_epoch"), u64::from(fixture.committee().epoch()));
+            assert_eq!(whole(ready, "num_batches"), 1);
+            whole(ready, "fetch_ms");
+        }
+    }
+
+    // bench5 f3-rejoin
+    mod f3_rejoin {
+        use super::{
+            super::{
+                rejoin_ready, stalled_head_epoch_is_open, stalled_head_ready,
+                stalled_head_stall_needed, NewestHeader, ObservedHead, RejoinBlocker,
+                StalledHeadBlocker, StalledHeadCheck, REJOIN_HEAD_MAX_AGE,
+                REJOIN_STALLED_HEAD_CHECK_INTERVAL, REJOIN_STALLED_HEAD_MAX_BACKOFF,
+                REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL, REJOIN_STUCK_REPLAY_MAX_BACKOFF,
+            },
+            *,
+        };
+        use crate::errors::SubscriberResult;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+        use std::collections::BTreeMap;
+        use tn_primary::NodeMode;
+        use tn_types::{
+            now_ms, rejoin_round_window, ConsensusNumHash, Epoch, EpochRecord, EpochSeedChainValue,
+            Round, TimestampMs, MAX_GC_DEPTH, MAX_REJOIN_ATTEMPTS_PER_EPOCH, REJOIN_DEMOTION_GRACE,
+            REJOIN_STALLED_HEAD_AFTER,
+        };
+        use tokio::task::JoinHandle;
+
+        /// A promotion goes through `promote`: it records a pending promotion and its time in the
+        /// rejoin state, without counting an attempt, flips the node to an active CVV and ends the
+        /// epoch.
+        #[tokio::test]
+        async fn promote_stamps_the_rejoin_state() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let consensus_chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let subscriber = sync_subscriber(&fixture, consensus_chain, &bus);
+            let epoch = fixture.committee().epoch();
+            let epoch_shutdown = subscriber.config.shutdown().subscribe();
+
+            subscriber.promote(false);
+
+            let state = *bus.rejoin_state().borrow();
+            assert_eq!(state.attempts(epoch), 0, "a promotion is not a failed attempt");
+            assert!(state.is_pending(epoch), "it waits for a demotion to settle it");
+            assert!(state.promoted_at(epoch).is_some(), "the promotion is stamped");
+            assert!(bus.is_active_cvv(), "the node is active");
+            assert!(epoch_shutdown.noticed(), "the epoch restarts");
+        }
+
+        /// The catching-up node's epoch in these cases.
+        const EPOCH: Epoch = 3;
+        /// Round of the newest known header, which the handled output matches.
+        const NEWEST: Round = 400;
+
+        /// A catching-up CVV whose promotions fail twice in an epoch, each followed by a demotion
+        /// inside the rejoin grace, is refused a third time with `attempts_exhausted`, reported
+        /// ahead of the head conditions but after a closed epoch. A promotion that holds past the
+        /// grace does not count. The next epoch's key reads zero, and the sticky inactive entry
+        /// into it resets the count while a mode change inside the epoch keeps it.
+        #[test]
+        fn third_rejoin_in_an_epoch_is_refused() {
+            let window = rejoin_round_window(MAX_GC_DEPTH);
+            let fresh = Duration::from_millis(500);
+            let newest = NewestHeader { number: 9, epoch: EPOCH, round: NEWEST, age: fresh };
+            let bus = ConsensusBusApp::new();
+            let attempts = |epoch: Epoch| bus.rejoin_state().borrow().attempts(epoch);
+            let ready = |epoch: Epoch| {
+                rejoin_ready(epoch, NEWEST, epoch, NEWEST, fresh, window, attempts(epoch))
+            };
+
+            let start = tokio::time::Instant::now();
+            assert!(ready(EPOCH), "the first promotion is allowed");
+            bus.rejoin_state().send_modify(|state| {
+                state.record_promotion(EPOCH, start, false);
+                state.record_demotion(EPOCH, start + REJOIN_DEMOTION_GRACE, false);
+            });
+            assert_eq!(attempts(EPOCH), 0, "a promotion that outlasts the grace does not count");
+
+            for failure in 1..=MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+                assert!(ready(EPOCH), "the promotion before failure {failure} is allowed");
+                bus.rejoin_state().send_modify(|state| {
+                    state.record_promotion(EPOCH, start, false);
+                    state.record_demotion(EPOCH, start + Duration::from_secs(1), false);
+                });
+            }
+            assert_eq!(attempts(EPOCH), 2);
+            assert!(!ready(EPOCH), "a third promotion in the epoch is refused");
+            assert_eq!(
+                RejoinBlocker::classify(true, attempts(EPOCH), Some(&newest), EPOCH),
+                RejoinBlocker::AttemptsExhausted
+            );
+            assert_eq!(
+                RejoinBlocker::classify(true, attempts(EPOCH), None, EPOCH),
+                RejoinBlocker::AttemptsExhausted,
+                "reported ahead of the head conditions"
+            );
+            assert_eq!(
+                RejoinBlocker::classify(false, attempts(EPOCH), Some(&newest), EPOCH),
+                RejoinBlocker::EpochClosed,
+                "a closed epoch is still reported first"
+            );
+            assert_eq!(RejoinBlocker::AttemptsExhausted.as_str(), "attempts_exhausted");
+
+            assert_eq!(attempts(EPOCH + 1), 0, "the next epoch's key starts at zero");
+            assert!(ready(EPOCH + 1), "the next epoch may rejoin again");
+            assert!(
+                !bus.rejoin_state().send_if_modified(|state| state.enter_epoch(EPOCH)),
+                "an inactive restart inside the epoch keeps the count"
+            );
+            assert_eq!(attempts(EPOCH), 2);
+            assert!(bus.rejoin_state().send_if_modified(|state| state.enter_epoch(EPOCH + 1)));
+            assert_eq!((attempts(EPOCH), attempts(EPOCH + 1)), (0, 0), "the boundary resets it");
+        }
+
+        /// The stalled-head rule promotes only on a head at least `REJOIN_STALLED_HEAD_AFTER` old
+        /// that the node watched stay the newest for the stall it needs, that no peer advertises
+        /// past, and that the node has replayed; a refusal names the first part that fails. A
+        /// fresher head is left to `rejoin_ready`, which a head younger than `REJOIN_HEAD_MAX_AGE`
+        /// passes.
+        #[test]
+        fn stalled_head_ready_needs_a_watched_stall_at_a_replayed_head() {
+            let window = rejoin_round_window(MAX_GC_DEPTH);
+            let head = |age: Duration| NewestHeader { number: 9, epoch: EPOCH, round: NEWEST, age };
+            let stalled = REJOIN_STALLED_HEAD_AFTER;
+            let decades = Duration::from_secs(1_000_000_000);
+            assert!(REJOIN_HEAD_MAX_AGE < stalled, "the usual rule refuses a head first");
+            let ready = |replayed_epoch, replayed_number, age, watched, gossiped| {
+                stalled_head_ready(
+                    replayed_epoch,
+                    replayed_number,
+                    &head(age),
+                    watched,
+                    stalled,
+                    gossiped,
+                )
+            };
+
+            assert_eq!(
+                ready(EPOCH, 9, stalled, stalled, 9),
+                Ok(()),
+                "watched stalled at the limit"
+            );
+            assert_eq!(ready(EPOCH, 10, decades, stalled, 10), Ok(()), "replayed past the header");
+            let short = stalled - Duration::from_millis(1);
+            assert_eq!(
+                ready(EPOCH, 9, decades, short, 9),
+                Err(StalledHeadBlocker::Stall),
+                "an old head watched too briefly"
+            );
+            assert_eq!(
+                ready(EPOCH, 9, short, stalled, 9),
+                Err(StalledHeadBlocker::HeadAge),
+                "a head younger than the limit"
+            );
+            assert_eq!(
+                ready(EPOCH, 9, decades, stalled, 10),
+                Err(StalledHeadBlocker::Frontier),
+                "a peer advertises a newer number"
+            );
+            assert_eq!(
+                ready(EPOCH, 8, decades, stalled, 8),
+                Err(StalledHeadBlocker::Replay),
+                "an output left to replay"
+            );
+            assert_eq!(
+                ready(EPOCH - 1, 9, decades, stalled, 9),
+                Err(StalledHeadBlocker::Replay),
+                "replayed in another epoch"
+            );
+            assert_eq!(
+                stalled_head_ready(EPOCH, 9, &head(decades), stalled, stalled * 2, 9),
+                Err(StalledHeadBlocker::Stall),
+                "a backed-off rule needs the longer stall"
+            );
+            // the first failing part is the one named
+            assert_eq!(
+                ready(EPOCH, 8, short, Duration::ZERO, 10),
+                Err(StalledHeadBlocker::HeadAge)
+            );
+            assert_eq!(
+                ready(EPOCH, 8, decades, Duration::ZERO, 10),
+                Err(StalledHeadBlocker::Stall)
+            );
+            assert_eq!(ready(EPOCH, 8, decades, stalled, 10), Err(StalledHeadBlocker::Frontier));
+            let names = [
+                StalledHeadBlocker::NoHead,
+                StalledHeadBlocker::HeadAge,
+                StalledHeadBlocker::Stall,
+                StalledHeadBlocker::Frontier,
+                StalledHeadBlocker::Replay,
+                StalledHeadBlocker::Epoch,
+            ]
+            .map(StalledHeadBlocker::as_str);
+            assert_eq!(names, ["no_head", "head_age", "stall", "frontier", "replay", "epoch"]);
+
+            let fresh = Duration::from_millis(500);
+            assert_eq!(ready(EPOCH, 9, fresh, stalled, 9), Err(StalledHeadBlocker::HeadAge));
+            assert!(
+                rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, fresh, window, 0),
+                "a fresh head takes the usual path"
+            );
+        }
+
+        /// The stall to watch doubles with each failed stalled-head promotion, up to the cap.
+        #[test]
+        fn stalled_head_stall_needed_backs_off_to_the_cap() {
+            let base = REJOIN_STALLED_HEAD_AFTER;
+            let needed: Vec<_> = (0..6).map(stalled_head_stall_needed).collect();
+            let capped = base * REJOIN_STALLED_HEAD_MAX_BACKOFF;
+            assert_eq!(needed, [base, base * 2, base * 4, capped, capped, capped]);
+            assert_eq!(stalled_head_stall_needed(u32::MAX), capped, "a huge count saturates");
+        }
+
+        /// A changed newest header number restarts the watched stall; an unchanged one extends it.
+        #[test]
+        fn observed_head_restarts_on_a_new_number() {
+            let start = tokio::time::Instant::now();
+            let at = |secs: u64| start + Duration::from_secs(secs);
+            let mut observed = ObservedHead { number: Some(3), since: start };
+            assert_eq!(observed.observe(Some(3), at(5)), Duration::from_secs(5));
+            assert_eq!(observed.observe(Some(4), at(7)), Duration::ZERO, "a new header");
+            assert_eq!(observed.observe(Some(4), at(10)), Duration::from_secs(3));
+            assert_eq!(observed.observe(None, at(11)), Duration::ZERO);
+        }
+
+        /// A stalled head may promote in the node's open epoch, or as the final header of the
+        /// epoch before, which the latest record closes. A head that closes the node's own epoch,
+        /// any older one, or is not the recorded final header never promotes.
+        #[test]
+        fn stalled_head_epoch_is_open_at_the_open_epoch_or_its_start() {
+            let head = |epoch: Epoch, number: u64| NewestHeader {
+                number,
+                epoch,
+                round: NEWEST,
+                age: REJOIN_STALLED_HEAD_AFTER,
+            };
+            let closing = |epoch: Epoch, number: u64| EpochRecord {
+                epoch,
+                final_consensus: ConsensusNumHash::new(number, Default::default()),
+                ..Default::default()
+            };
+            let previous = closing(EPOCH - 1, 90);
+
+            assert!(stalled_head_epoch_is_open(EPOCH, &head(EPOCH, 120), Some(&previous)));
+            assert!(
+                stalled_head_epoch_is_open(EPOCH, &head(EPOCH - 1, 90), Some(&previous)),
+                "a committee halted at the start of the epoch"
+            );
+            assert!(
+                !stalled_head_epoch_is_open(EPOCH, &head(EPOCH - 1, 89), Some(&previous)),
+                "not the final header of the epoch before"
+            );
+            assert!(
+                !stalled_head_epoch_is_open(EPOCH, &head(EPOCH - 2, 90), Some(&previous)),
+                "an older epoch"
+            );
+            assert!(!stalled_head_epoch_is_open(EPOCH, &head(EPOCH - 1, 90), None));
+            let own = closing(EPOCH, 120);
+            assert!(
+                !stalled_head_epoch_is_open(EPOCH, &head(EPOCH, 120), Some(&own)),
+                "the node's own epoch is closed"
+            );
+            assert!(
+                !stalled_head_epoch_is_open(1, &head(0, 0), Some(&closing(0, 0))),
+                "the synthetic epoch-zero record closes nothing"
+            );
+        }
+
+        /// A consensus header numbered `number` in the fixture's epoch whose leader was created
+        /// `created_at`.
+        fn header_created_at(
+            fixture: &CommitteeFixture<MemDatabase>,
+            number: u64,
+            created_at: TimestampMs,
+        ) -> ConsensusHeader {
+            let committee = fixture.committee();
+            let header = fixture
+                .authorities()
+                .next()
+                .unwrap()
+                .header_builder(&committee)
+                .created_at_ms(created_at)
+                .build();
+            let leader = fixture.certificate(&header);
+            let sub_dag = CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                number,
+                ReputationScores::new(&committee),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            );
+            ConsensusHeader { parent_hash: B256::ZERO.into(), sub_dag, number, extra: B256::ZERO }
+        }
+
+        /// An inactive subscriber whose consensus chain holds outputs 1 to 3, with the bus and the
+        /// chain's directory.
+        async fn caught_up_to_three(
+            fixture: &CommitteeFixture<MemDatabase>,
+        ) -> (Subscriber<MemDatabase>, ConsensusBusApp, TempDir) {
+            caught_up_to(fixture, 3).await
+        }
+
+        /// An inactive subscriber whose consensus chain holds outputs 1 to `number`, with the bus
+        /// and the chain's directory.
+        async fn caught_up_to(
+            fixture: &CommitteeFixture<MemDatabase>,
+            number: u64,
+        ) -> (Subscriber<MemDatabase>, ConsensusBusApp, TempDir) {
+            let temp_dir = TempDir::new().unwrap();
+            let mut chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            for output in chained_outputs(fixture, number) {
+                save_consensus(output, &mut chain, bus.metrics()).await.unwrap();
+            }
+            assert_eq!(chain.latest_consensus_number(), number);
+            bus.node_mode().send_replace(NodeMode::CvvInactive);
+            (sync_subscriber(fixture, chain, &bus), bus, temp_dir)
+        }
+
+        /// The value of `tn_executor.stalled_head_rejoins_total` since the previous snapshot.
+        fn stalled_head_rejoins(snapshotter: &Snapshotter) -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| match value {
+                    DebugValue::Counter(count)
+                        if key.key().name() == "tn_executor.stalled_head_rejoins_total" =>
+                    {
+                        Some(count)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
+
+        /// Run the catch-up loop, with `output` queued for it, and report whether it promoted the
+        /// node.
+        ///
+        /// A run that promotes waits on the epoch-record actor's thread, which a paused clock
+        /// would skip past to the deadline, so the clock runs for this call: ten seconds bound a
+        /// run whose first timer check completes at once. The clock is paused again on return.
+        async fn run_rejoin_loop(
+            subscriber: &Subscriber<MemDatabase>,
+            output: Option<ConsensusOutput>,
+        ) -> bool {
+            // the channel drops what is sent while nothing is subscribed
+            let rx = subscriber.consensus_bus.subscribe_sync_output();
+            if let Some(output) = output {
+                subscriber.consensus_bus.sync_output().send(output).await.unwrap();
+            }
+            tokio::time::resume();
+            let run = tokio::time::timeout(Duration::from_secs(10), subscriber.rejoin_loop(rx));
+            let promoted = run.await.map(|result| result.expect("the loop ends without an error"));
+            tokio::time::pause();
+            promoted.is_ok()
+        }
+
+        /// Run the catch-up loop for a minute of the paused clock, a dozen timer checks, and
+        /// report whether it promoted the node.
+        async fn rejoins_within_a_paused_minute(subscriber: &Subscriber<MemDatabase>) -> bool {
+            let task = spawn_rejoin_loop(subscriber).await;
+            loop_ends_after(task, Duration::from_secs(60), Duration::from_millis(500)).await
+        }
+
+        /// Start the catch-up loop as a task of the paused runtime and let it reach its first wait.
+        async fn spawn_rejoin_loop(
+            subscriber: &Subscriber<MemDatabase>,
+        ) -> JoinHandle<SubscriberResult<()>> {
+            let subscriber = subscriber.clone();
+            let task = tokio::spawn(async move {
+                let rx = subscriber.consensus_bus.subscribe_sync_output();
+                subscriber.rejoin_loop(rx).await
+            });
+            // a paused clock runs every ready task before it advances
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            task
+        }
+
+        /// Let `wait` of the paused clock pass, then let the clock run until the loop task ends,
+        /// for at most `bound`, and report whether it ended, which it does only by promoting. A
+        /// check that passes waits on the epoch-record actor's thread, which a paused clock would
+        /// skip past, so the clock runs for that last part.
+        async fn loop_ends_after(
+            mut task: JoinHandle<SubscriberResult<()>>,
+            wait: Duration,
+            bound: Duration,
+        ) -> bool {
+            tokio::time::sleep(wait).await;
+            tokio::time::resume();
+            let ended = tokio::time::timeout(bound, &mut task).await;
+            tokio::time::pause();
+            match ended {
+                Ok(joined) => {
+                    joined.expect("the loop task completes").expect("the loop ends without error");
+                    true
+                }
+                Err(_) => {
+                    // wait for the abort, so the loop's channel subscription is released
+                    task.abort();
+                    assert!(task.await.is_err_and(|error| error.is_cancelled()));
+                    false
+                }
+            }
+        }
+
+        /// Let 200 milliseconds of real time pass with the clock running, so a check already
+        /// waiting on the epoch-record actor's thread completes before the next assertion.
+        async fn settle_in_real_time() {
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::pause();
+        }
+
+        /// A demotion right after the loop starts finds a head that already reads decades old,
+        /// yet the timer promotes only once the node has watched it stay the newest for
+        /// `REJOIN_STALLED_HEAD_AFTER`, with its failed attempts at the cap: one `rejoining on a
+        /// stalled consensus head`, counted once, and no attempt counted. A failed stalled-head
+        /// promotion doubles the stall to watch and still leaves the cap's count alone; one that
+        /// outlasts the grace changes nothing.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_head_rejoins_after_a_watched_stall_without_counting_an_attempt() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            let epoch = fixture.committee().epoch();
+            let decades_ago = TimestampMs::from_millis(1);
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                3,
+                decades_ago,
+            )));
+            let start = tokio::time::Instant::now();
+            bus.rejoin_state().send_modify(|state| {
+                for _ in 0..MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+                    state.record_promotion(epoch, start, false);
+                    state.record_demotion(epoch, start, false);
+                }
+            });
+            let attempts = || bus.rejoin_state().borrow().attempts(epoch);
+            let stalled_failures = || bus.rejoin_state().borrow().stalled_failures(epoch);
+            assert_eq!(attempts(), MAX_REJOIN_ATTEMPTS_PER_EPOCH);
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _local_recorder = metrics::set_default_local_recorder(&recorder);
+            let short_of = |stall: Duration| stall - Duration::from_secs(1);
+
+            let task = spawn_rejoin_loop(&subscriber).await;
+            tokio::time::sleep(short_of(REJOIN_STALLED_HEAD_AFTER)).await;
+            settle_in_real_time().await;
+            assert!(bus.is_cvv_inactive(), "no rejoin before the stall was watched long enough");
+            assert!(
+                loop_ends_after(task, REJOIN_STALLED_HEAD_CHECK_INTERVAL, Duration::from_secs(10))
+                    .await
+            );
+            assert!(bus.is_active_cvv(), "the stalled head promotes");
+            assert_eq!(stalled_head_rejoins(&snapshotter), 1);
+            assert_eq!(attempts(), MAX_REJOIN_ATTEMPTS_PER_EPOCH, "the promotion is not counted");
+            assert!(bus.rejoin_state().borrow().is_pending(epoch));
+
+            // demoted a second later by a site that does not settle the rejoin: the restarted
+            // loop settles it as a failed stalled-head promotion, outside the cap's count, and
+            // the next stalled-head rejoin needs twice the stall
+            tokio::time::advance(Duration::from_secs(1)).await;
+            bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let task = spawn_rejoin_loop(&subscriber).await;
+            assert_eq!((attempts(), stalled_failures()), (MAX_REJOIN_ATTEMPTS_PER_EPOCH, 1));
+            tokio::time::sleep(short_of(REJOIN_STALLED_HEAD_AFTER * 2)).await;
+            settle_in_real_time().await;
+            assert!(bus.is_cvv_inactive(), "the backed-off rule waits for twice the stall");
+            assert!(
+                loop_ends_after(task, REJOIN_STALLED_HEAD_CHECK_INTERVAL, Duration::from_secs(10))
+                    .await
+            );
+            assert!(bus.is_active_cvv());
+            assert_eq!(stalled_head_rejoins(&snapshotter), 1);
+
+            // demoted once the grace has passed: not a failed promotion
+            tokio::time::advance(REJOIN_DEMOTION_GRACE + Duration::from_secs(1)).await;
+            bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let task = spawn_rejoin_loop(&subscriber).await;
+            assert_eq!((attempts(), stalled_failures()), (MAX_REJOIN_ATTEMPTS_PER_EPOCH, 1));
+            task.abort();
+        }
+
+        /// A stalled head the node has not replayed yet, or one that peers advertise past, does
+        /// not promote it: the timer keeps checking for a minute and the node stays inactive.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_head_with_catch_up_left_does_not_rejoin() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            let decades_ago = TimestampMs::from_millis(1);
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _local_recorder = metrics::set_default_local_recorder(&recorder);
+            assert!(Duration::from_secs(60) > REJOIN_STALLED_HEAD_AFTER * 2);
+
+            // output 4 is known but not replayed
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                4,
+                decades_ago,
+            )));
+            assert!(!rejoins_within_a_paused_minute(&subscriber).await, "output 4 is to replay");
+            assert!(bus.is_cvv_inactive());
+
+            // output 3 is replayed, but peers advertise output 5
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                3,
+                decades_ago,
+            )));
+            bus.last_published_consensus_num_hash().send_replace((
+                fixture.committee().epoch(),
+                5,
+                Default::default(),
+            ));
+            assert!(!rejoins_within_a_paused_minute(&subscriber).await, "peers are ahead");
+            assert!(bus.is_cvv_inactive());
+            assert_eq!(stalled_head_rejoins(&snapshotter), 0);
+        }
+
+        /// A fresh head is not a stalled one: the timer leaves the node inactive, and the next
+        /// handled output promotes it through the usual rule, which the stalled-head counter does
+        /// not count.
+        #[tokio::test(start_paused = true)]
+        async fn fresh_head_rejoins_through_the_usual_rule() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            let epoch = fixture.committee().epoch();
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                3,
+                now_ms(),
+            )));
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _local_recorder = metrics::set_default_local_recorder(&recorder);
+
+            assert!(!rejoins_within_a_paused_minute(&subscriber).await, "a fresh head waits");
+            assert!(bus.is_cvv_inactive());
+
+            // output 4 arrives: handled, within the window of the fresh head
+            let output = chained_outputs(&fixture, 4).pop();
+            assert!(run_rejoin_loop(&subscriber, output).await, "the handled output promotes");
+            assert!(bus.is_active_cvv());
+            assert_eq!(stalled_head_rejoins(&snapshotter), 0, "not a stalled-head rejoin");
+            assert_eq!(bus.rejoin_state().borrow().attempts(epoch), 0);
+        }
+
+        /// One `subscriber` event: its message and its other fields as logged.
+        type Line = (String, BTreeMap<String, String>);
+
+        /// Records the `subscriber` events of the threads it is the default subscriber for. The
+        /// paused-clock tests run the catch-up loop on the test's own thread.
+        #[derive(Clone, Default)]
+        pub(super) struct SubscriberLines(Arc<std::sync::Mutex<Vec<Line>>>);
+
+        impl SubscriberLines {
+            /// The fields of every captured line with `message`, in the order logged.
+            pub(super) fn with_message(&self, message: &str) -> Vec<BTreeMap<String, String>> {
+                let lines = self.0.lock().unwrap();
+                lines
+                    .iter()
+                    .filter(|(m, _)| m == message)
+                    .map(|(_, fields)| fields.clone())
+                    .collect()
+            }
+        }
+
+        /// Collects an event's fields by name: a string as itself, anything else as its `Debug`
+        /// text.
+        struct LineFields<'a>(&'a mut BTreeMap<String, String>);
+
+        impl tracing::field::Visit for LineFields<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        impl tracing::Subscriber for SubscriberLines {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target() == "subscriber"
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = BTreeMap::new();
+                event.record(&mut LineFields(&mut fields));
+                let message = fields.remove("message").unwrap_or_default();
+                self.0.lock().unwrap().push((message, fields));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        /// A node demoted for lagging its own commits holds the frontier it heard while active,
+        /// output 5, above its own last save, output 3. The frontier part refuses the stalled
+        /// head, and `stalled head not ready` names `stall` and then `frontier`, at most once per
+        /// 30 s. Once the frontier is fetched (outputs 4 and 5 saved and the head watch at 5), the
+        /// stall restarts at the check that sees the new head, and the node rejoins a full stall
+        /// after it, not at that check.
+        #[tokio::test(start_paused = true)]
+        async fn fetched_frontier_restarts_the_stall_and_then_promotes() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            let epoch = fixture.committee().epoch();
+            let decades_ago = TimestampMs::from_millis(1);
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                3,
+                decades_ago,
+            )));
+            bus.last_published_consensus_num_hash().send_replace((epoch, 5, Default::default()));
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _local_recorder = metrics::set_default_local_recorder(&recorder);
+            assert_eq!(REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL, Duration::from_secs(30));
+
+            // checks at 5 s, 10 s, ... after the entry: the stall blocks until 20 s, then the
+            // frontier
+            let task = spawn_rejoin_loop(&subscriber).await;
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            settle_in_real_time().await;
+            assert!(bus.is_cvv_inactive(), "the gossiped frontier is not replayed yet");
+
+            // the fetch lands: the head watch moves to 5, then outputs 4 and 5 are saved. the
+            // clock runs while they persist, and a check in between finds head 5 unreplayed
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                5,
+                decades_ago,
+            )));
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            tokio::time::resume();
+            for output in chained_outputs(&fixture, 5).into_iter().skip(3) {
+                save_consensus(output, &mut chain, bus.metrics()).await.unwrap();
+            }
+            tokio::time::pause();
+            assert_eq!(subscriber.inner.consensus_chain.latest_consensus_number(), 5);
+
+            // the check at 45 s sees head 5 and restarts the stall: a stall still counted from
+            // the entry would promote there
+            tokio::time::sleep(Duration::from_secs(22)).await;
+            settle_in_real_time().await;
+            assert!(bus.is_cvv_inactive(), "the new head restarts the stall");
+            assert!(
+                loop_ends_after(task, Duration::from_secs(8), Duration::from_secs(10)).await,
+                "a full stall after the check that saw head 5 promotes"
+            );
+            assert!(bus.is_active_cvv());
+            assert_eq!(stalled_head_rejoins(&snapshotter), 1);
+
+            // one line per 30 s: at 5 s, at 35 s, and at 65 s only when the timer's millisecond
+            // rounding after the real-time saves leaves that check a millisecond short of the
+            // stall (the check at 70 s then promotes)
+            let refused = lines.with_message("stalled head not ready");
+            assert!((2..=3).contains(&refused.len()), "{refused:?}");
+            if let Some(third) = refused.get(2) {
+                for (key, value) in
+                    [("blocked_by", "stall"), ("newest_number", "5"), ("replayed_number", "5")]
+                {
+                    assert_eq!(third.get(key).map(String::as_str), Some(value), "{third:?}");
+                }
+            }
+            let expected = |unchanged_for_ms: &str, blocked_by: &str| {
+                BTreeMap::from([
+                    ("unchanged_for_ms".to_string(), unchanged_for_ms.to_string()),
+                    ("stall_needed_ms".to_string(), "20000".to_string()),
+                    ("newest_number".to_string(), "3".to_string()),
+                    ("replayed_number".to_string(), "3".to_string()),
+                    ("gossiped_number".to_string(), "5".to_string()),
+                    ("blocked_by".to_string(), blocked_by.to_string()),
+                ])
+            };
+            assert_eq!(refused[0], expected("5000", "stall"));
+            assert_eq!(refused[1], expected("35000", "frontier"));
+            let promoted = lines.with_message("rejoining on a stalled consensus head");
+            assert_eq!(promoted.len(), 1, "{promoted:?}");
+            let promoted = &promoted[0];
+            for (key, value) in
+                [("replayed_number", "5"), ("gossiped_number", "5"), ("stall_needed_ms", "20000")]
+            {
+                assert_eq!(promoted.get(key).map(String::as_str), Some(value), "{promoted:?}");
+            }
+            assert!(promoted.contains_key("head_age_ms") && promoted.contains_key("newest_round"));
+        }
+
+        /// A committee halted at the start of the node's epoch: the newest header is the final
+        /// header of the epoch before, which the node has replayed, so its latest output is in
+        /// that epoch. The loop refuses that head while no record closes the epoch before at it,
+        /// and promotes a stall after its entry once the record does.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_final_header_of_the_previous_epoch_promotes_at_the_epoch_start() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            let previous = fixture.committee().epoch();
+            let current = CommitteeFixture::builder(MemDatabase::default)
+                .epoch(previous + 1)
+                .build()
+                .committee();
+            let chain = subscriber.inner.consensus_chain.clone();
+            let subscriber = Subscriber {
+                inner: Arc::new(Inner {
+                    authority_id: subscriber.inner.authority_id.clone(),
+                    committee: current,
+                    consensus_chain: chain.clone(),
+                    epoch_boundary: u64::MAX,
+                    metrics: ExecutorMetrics::default(),
+                    below_floor: UncheckedBelowFloor::default(),
+                }),
+                ..subscriber
+            };
+            assert_eq!(chain.latest_consensus_epoch(), previous, "replayed into the epoch before");
+            let decades_ago = TimestampMs::from_millis(1);
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                3,
+                decades_ago,
+            )));
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _local_recorder = metrics::set_default_local_recorder(&recorder);
+
+            assert!(
+                !rejoins_within_a_paused_minute(&subscriber).await,
+                "no record closes the epoch before at this header"
+            );
+            assert!(bus.is_cvv_inactive());
+
+            tokio::time::resume();
+            chain
+                .epochs()
+                .save_record(EpochRecord {
+                    epoch: previous,
+                    final_consensus: ConsensusNumHash::new(3, Default::default()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            tokio::time::pause();
+            let task = spawn_rejoin_loop(&subscriber).await;
+            tokio::time::sleep(REJOIN_STALLED_HEAD_AFTER - Duration::from_secs(1)).await;
+            settle_in_real_time().await;
+            assert!(bus.is_cvv_inactive(), "no rejoin before the stall was watched long enough");
+            assert!(
+                loop_ends_after(task, REJOIN_STALLED_HEAD_CHECK_INTERVAL, Duration::from_secs(10))
+                    .await
+            );
+            assert!(bus.is_active_cvv(), "the closed epoch's final header promotes");
+            assert_eq!(stalled_head_rejoins(&snapshotter), 1);
+        }
+
+        /// A check that finds the gossiped frontier, 38, ahead of the replayed outputs, 31, while
+        /// the newest known header has not moved for a check interval asks state sync to fetch 32
+        /// to 38 again: one gap request per check interval, logged once per 30 s. A head watched
+        /// for less than an interval, or a head and a replay that both moved since the last check,
+        /// ask nothing.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_check_rerequests_the_outputs_behind_the_gossiped_frontier() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let decades_ago = TimestampMs::from_millis(1);
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                31,
+                decades_ago,
+            )));
+            let frontier: ConsensusHeaderDigest = B256::repeat_byte(38).into();
+            bus.last_published_consensus_num_hash().send_replace((epoch, 38, frontier));
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let mut check = StalledHeadCheck::new(
+                Some(31),
+                31,
+                tokio::time::Instant::now(),
+                REJOIN_STALLED_HEAD_AFTER,
+            );
+            let requested = Some((epoch, 38, frontier, 32));
+
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL - Duration::from_millis(1))
+                .await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the head may still move");
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(rx_gap.has_changed().unwrap(), "the head stayed for a check interval");
+            assert_eq!(*rx_gap.borrow_and_update(), requested);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "a second check inside the interval");
+
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(rx_gap.has_changed().unwrap(), "the next interval asks again");
+            assert_eq!(*rx_gap.borrow_and_update(), requested);
+            let logged =
+                lines.with_message("re-requesting consensus outputs behind the gossiped frontier");
+            let from_to = BTreeMap::from([
+                ("from".to_string(), "32".to_string()),
+                ("to".to_string(), "38".to_string()),
+                ("backoff_ms".to_string(), "5000".to_string()),
+            ]);
+            assert_eq!(logged, vec![from_to], "one line per 30 s");
+
+            bus.last_consensus_header().send_replace(Some(header_created_at(
+                &fixture,
+                33,
+                decades_ago,
+            )));
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the head and the replay moved");
+
+            // a frontier in the next epoch is not re-requested; back in this epoch it is
+            bus.last_published_consensus_num_hash().send_replace((epoch + 1, 40, frontier));
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "a frontier in a later epoch");
+            bus.last_published_consensus_num_hash().send_replace((epoch, 38, frontier));
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 38, frontier, 33)));
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A node that knows no consensus header has no head to watch stall: the check refuses,
+        /// and `stalled head not ready` names `no_head`, with no newest number, at most once per
+        /// 30 s. Nothing else changes: a frontier ahead of the replay is not re-requested.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_check_without_a_known_header_logs_no_head() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to_three(&fixture).await;
+            assert!(bus.last_consensus_header().borrow().is_none(), "no header is known");
+            bus.last_published_consensus_num_hash().send_replace((
+                fixture.committee().epoch(),
+                5,
+                Default::default(),
+            ));
+            let rx_gap = bus.consensus_gap_request().subscribe();
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let mut check = StalledHeadCheck::new(
+                None,
+                3,
+                tokio::time::Instant::now(),
+                REJOIN_STALLED_HEAD_AFTER,
+            );
+
+            for _ in 0..2 {
+                tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+                assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            }
+            assert!(!rx_gap.has_changed().unwrap(), "no head, no re-request");
+            assert!(bus.is_cvv_inactive());
+            let refused = lines.with_message("stalled head not ready");
+            let ms = |duration: Duration| duration.as_millis().to_string();
+            let expected = BTreeMap::from([
+                ("unchanged_for_ms".to_string(), ms(REJOIN_STALLED_HEAD_CHECK_INTERVAL)),
+                ("stall_needed_ms".to_string(), ms(REJOIN_STALLED_HEAD_AFTER)),
+                ("replayed_number".to_string(), "3".to_string()),
+                ("gossiped_number".to_string(), "5".to_string()),
+                ("blocked_by".to_string(), "no_head".to_string()),
+            ]);
+            assert_eq!(refused, vec![expected], "one line per 30 s");
+        }
+
+        /// A replay stuck below a frontier that keeps moving asks for the gap once it has stayed
+        /// for a check interval, although the newest known header never stays: the outputs a
+        /// previous catch-up loop took from state sync's cache and never saved (a promotion that
+        /// ended in a demotion, as in `restarts::test_restartstt` before the restored-dag fix) lie
+        /// below the floor of every later gossip walk. A replay that moves again asks nothing.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_replay_rerequests_the_outputs_behind_a_moving_head() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let now_ish = tn_types::now_ms();
+            let head = |number| {
+                bus.last_consensus_header()
+                    .send_replace(Some(header_created_at(&fixture, number, now_ish)));
+            };
+            head(36);
+            let frontier: ConsensusHeaderDigest = B256::repeat_byte(38).into();
+            bus.last_published_consensus_num_hash().send_replace((epoch, 38, frontier));
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+            let mut check = StalledHeadCheck::new(
+                Some(36),
+                31,
+                tokio::time::Instant::now(),
+                REJOIN_STALLED_HEAD_AFTER,
+            );
+
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL - Duration::from_millis(1))
+                .await;
+            head(37);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the replay may still move");
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            head(38);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(rx_gap.has_changed().unwrap(), "the replay stayed for a check interval");
+            assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 38, frontier, 32)));
+
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            head(39);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the replay moved since the last check");
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A catch-up loop whose failed promotions reached the cap still follows consensus: its
+        /// timer asks state sync for the outputs below a moving frontier within one check interval
+        /// when no output arrives, so the node keeps replaying for the rest of the epoch.
+        #[tokio::test(start_paused = true)]
+        async fn exhausted_loop_still_rerequests_a_stuck_replay() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let start = tokio::time::Instant::now();
+            bus.rejoin_state().send_modify(|state| {
+                for _ in 0..MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+                    state.record_promotion(epoch, start, false);
+                    state.record_demotion(epoch, start, false);
+                }
+            });
+            assert_eq!(bus.rejoin_state().borrow().attempts(epoch), MAX_REJOIN_ATTEMPTS_PER_EPOCH);
+            let now_ish = tn_types::now_ms();
+            let head = |number| {
+                bus.last_consensus_header()
+                    .send_replace(Some(header_created_at(&fixture, number, now_ish)));
+            };
+            head(33);
+            let frontier: ConsensusHeaderDigest = B256::repeat_byte(40).into();
+            bus.last_published_consensus_num_hash().send_replace((epoch, 40, frontier));
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+
+            let task = spawn_rejoin_loop(&subscriber).await;
+            // the head moves every second, the replay never does
+            for number in 34..=38 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                head(number);
+            }
+            settle_in_real_time().await;
+            assert!(rx_gap.has_changed().unwrap(), "the stuck replay was re-requested");
+            assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 40, frontier, 32)));
+            assert!(bus.is_cvv_inactive(), "the loop keeps following");
+            assert!(!task.is_finished());
+            task.abort();
+            assert!(task.await.is_err_and(|error| error.is_cancelled()));
+        }
+
+        /// Run `checks` stalled-head checks one check interval apart while the newest known header
+        /// and the gossiped frontier both move by one before every check (the frontier from
+        /// `frontier_base + 1`), and return each gap request sent with the seconds since `start`.
+        async fn checks_under_a_moving_head(
+            subscriber: &Subscriber<MemDatabase>,
+            bus: &ConsensusBusApp,
+            fixture: &CommitteeFixture<MemDatabase>,
+            check: &mut StalledHeadCheck,
+            start: tokio::time::Instant,
+            frontier_base: u64,
+            checks: u64,
+        ) -> Vec<(u64, Option<(Epoch, u64, ConsensusHeaderDigest, u64)>)> {
+            let epoch = fixture.committee().epoch();
+            let now_ish = tn_types::now_ms();
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+            let mut sent = Vec::new();
+            for step in 1..=checks {
+                tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+                let top = frontier_base + step;
+                bus.last_consensus_header().send_replace(Some(header_created_at(
+                    fixture,
+                    top - 2,
+                    now_ish,
+                )));
+                let hash: ConsensusHeaderDigest =
+                    B256::repeat_byte(u8::try_from(top).unwrap()).into();
+                bus.last_published_consensus_num_hash().send_replace((epoch, top, hash));
+                assert!(!subscriber.rejoin_on_stalled_head(check).await);
+                if rx_gap.has_changed().unwrap() {
+                    let at = tokio::time::Instant::now().saturating_duration_since(start);
+                    sent.push((at.as_secs(), *rx_gap.borrow_and_update()));
+                }
+            }
+            sent
+        }
+
+        /// A replay stuck at 31 below a head and a frontier that move before every check asks for
+        /// 32 up to the frontier of the moment once it has stayed for a check interval, then
+        /// re-sends that same request, without widening its top to the newer frontier, after
+        /// waits of 10, 20 and 40 s and then every 60 s: a walk still running covers the repeat,
+        /// so the fetch task defers it, and a replay that cannot move costs one bounded walk a
+        /// minute. The line carries the wait before the next repeat.
+        #[tokio::test(start_paused = true)]
+        async fn stuck_replay_under_a_moving_head_resends_the_same_range_with_backoff() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let start = tokio::time::Instant::now();
+            let mut check = StalledHeadCheck::new(Some(31), 31, start, REJOIN_STALLED_HEAD_AFTER);
+
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 38, 39)
+                    .await;
+            let first = Some((epoch, 39, B256::repeat_byte(39).into(), 32));
+            let at: Vec<_> = sent.iter().map(|(at, _)| *at).collect();
+            assert_eq!(at, vec![5, 15, 35, 75, 135, 195], "waits of 5, 10, 20, 40, 60 and 60 s");
+            assert!(
+                sent.iter().all(|(_, request)| *request == first),
+                "the floor stays and the top is not widened: {sent:?}"
+            );
+            let backoff_ms: Vec<_> = lines
+                .with_message("re-requesting consensus outputs behind the gossiped frontier")
+                .into_iter()
+                .map(|fields| {
+                    assert_eq!(fields.get("from").map(String::as_str), Some("32"));
+                    assert_eq!(fields.get("to").map(String::as_str), Some("39"));
+                    fields.get("backoff_ms").cloned().unwrap_or_default()
+                })
+                .collect();
+            let cap = REJOIN_STUCK_REPLAY_MAX_BACKOFF.as_millis().to_string();
+            assert_eq!(
+                backoff_ms,
+                vec!["10000".to_string(), "40000".to_string(), cap.clone(), cap.clone(), cap],
+                "one line per 30 s at most"
+            );
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A replay that moves ends the stuck-replay backoff: once it sticks again it asks for the
+        /// gap above its new floor, up to the frontier of the moment, one check interval later,
+        /// and repeats that new request after 10 s, as a replay stuck for the first time does.
+        #[tokio::test(start_paused = true)]
+        async fn replay_progress_resets_the_stuck_replay_backoff() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let start = tokio::time::Instant::now();
+            let mut check = StalledHeadCheck::new(Some(31), 31, start, REJOIN_STALLED_HEAD_AFTER);
+
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 38, 4)
+                    .await;
+            let stuck_at_31 = Some((epoch, 39, B256::repeat_byte(39).into(), 32));
+            assert_eq!(sent, vec![(5, stuck_at_31), (15, stuck_at_31)], "backing off at 20 s");
+
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 42, 4)
+                    .await;
+            // 25 s: the replay moved since the check at 20 s; 30 s: stuck for an interval
+            // again, asked afresh; 40 s: the first repeat, 10 s later
+            let stuck_at_32 = Some((epoch, 44, B256::repeat_byte(44).into(), 33));
+            assert_eq!(sent, vec![(30, stuck_at_32), (40, stuck_at_32)]);
+            assert!(bus.is_cvv_inactive());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +3986,7 @@ mod worker_fanout_tests {
                 consensus_chain,
                 epoch_boundary: u64::MAX,
                 metrics: ExecutorMetrics::default(),
+                below_floor: UncheckedBelowFloor::default(),
             }),
         };
 
@@ -1444,6 +4029,7 @@ mod rejoin_tests {
             NEWEST,
             FRESH,
             rejoin_round_window(MAX_GC_DEPTH),
+            0,
         )
     }
 
@@ -1484,11 +4070,11 @@ mod rejoin_tests {
     fn no_rejoin_on_stale_newest_header() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, REJOIN_HEAD_MAX_AGE, window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, REJOIN_HEAD_MAX_AGE, window, 0),
             "a newest header at the age limit must not promote"
         );
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, Duration::from_secs(60), window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, Duration::from_secs(60), window, 0),
             "an old newest header must not promote"
         );
     }
@@ -1498,7 +4084,7 @@ mod rejoin_tests {
     fn no_rejoin_across_epochs() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window, 0),
             "a node in an older epoch must not rejoin"
         );
     }
@@ -1540,7 +4126,7 @@ mod rejoin_tests {
     fn rejoin_when_ahead_of_newest_header() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            rejoin_ready(EPOCH, NEWEST + 2, EPOCH, NEWEST, FRESH, window),
+            rejoin_ready(EPOCH, NEWEST + 2, EPOCH, NEWEST, FRESH, window, 0),
             "a node past the newest known header must rejoin"
         );
     }
@@ -1553,5 +4139,138 @@ mod rejoin_tests {
                 .all(|gc_depth| rejoin_round_window(gc_depth) < gc_activity_window(gc_depth)),
             "the rejoin window must be smaller than the demotion window"
         );
+    }
+
+    /// A newest known header in [`EPOCH`] at round [`NEWEST`] with the given age.
+    fn newest_header(epoch: Epoch, age: Duration) -> NewestHeader {
+        NewestHeader { number: 9, epoch, round: NEWEST, age }
+    }
+
+    /// Each blocker is reported for the first condition that refuses promotion.
+    #[test]
+    fn rejoin_blocker_names_first_failed_condition() {
+        let fresh = newest_header(EPOCH, FRESH);
+        let stale = newest_header(EPOCH, REJOIN_HEAD_MAX_AGE);
+        let other_epoch = newest_header(EPOCH + 1, FRESH);
+        let cases = [
+            (false, Some(&fresh), RejoinBlocker::EpochClosed),
+            (false, None, RejoinBlocker::EpochClosed),
+            (true, None, RejoinBlocker::NoKnownHeader),
+            (true, Some(&stale), RejoinBlocker::StaleHead),
+            (true, Some(&newest_header(EPOCH + 1, REJOIN_HEAD_MAX_AGE)), RejoinBlocker::StaleHead),
+            (true, Some(&other_epoch), RejoinBlocker::EpochMismatch),
+            (true, Some(&fresh), RejoinBlocker::RoundGap),
+        ];
+        for (epoch_is_open, newest, expected) in cases {
+            assert_eq!(
+                RejoinBlocker::classify(epoch_is_open, 0, newest, EPOCH),
+                expected,
+                "open={epoch_is_open} newest={newest:?}"
+            );
+        }
+        let labels = [
+            "epoch_closed",
+            "attempts_exhausted",
+            "no_known_header",
+            "stale_head",
+            "epoch_mismatch",
+            "round_gap",
+        ];
+        assert_eq!(RejoinBlocker::ALL.map(RejoinBlocker::as_str), labels);
+        for (index, blocker) in RejoinBlocker::ALL.into_iter().enumerate() {
+            assert_eq!(blocker.index(), index);
+        }
+    }
+
+    /// Whenever the readiness check refuses an open epoch with a known header, the blocker names a
+    /// condition that holds, and `round_gap` only when the gap really exceeds the window.
+    #[test]
+    fn rejoin_blocker_agrees_with_rejoin_ready() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        let ages = [Duration::ZERO, FRESH, REJOIN_HEAD_MAX_AGE, Duration::from_secs(60)];
+        for age in ages {
+            for newest_epoch in [EPOCH - 1, EPOCH, EPOCH + 1] {
+                for handled_round in [0, NEWEST - window - 1, NEWEST - window, NEWEST, NEWEST + 1] {
+                    let newest = newest_header(newest_epoch, age);
+                    if rejoin_ready(EPOCH, handled_round, newest_epoch, NEWEST, age, window, 0) {
+                        continue;
+                    }
+                    let holds = match RejoinBlocker::classify(true, 0, Some(&newest), EPOCH) {
+                        RejoinBlocker::StaleHead => age >= REJOIN_HEAD_MAX_AGE,
+                        RejoinBlocker::EpochMismatch => newest_epoch != EPOCH,
+                        RejoinBlocker::RoundGap => NEWEST.saturating_sub(handled_round) > window,
+                        RejoinBlocker::EpochClosed
+                        | RejoinBlocker::AttemptsExhausted
+                        | RejoinBlocker::NoKnownHeader => false,
+                    };
+                    assert!(holds, "age={age:?} epoch={newest_epoch} round={handled_round}");
+                }
+            }
+        }
+    }
+
+    /// The blocked counter registers one series per blocker under its `reason` label.
+    #[test]
+    fn rejoin_blocked_counters_register_labelled_series() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let counters = rejoin_blocked_counters();
+            counters[RejoinBlocker::EpochClosed.index()].increment(3);
+            counters[RejoinBlocker::RoundGap.index()].increment(1);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for blocker in RejoinBlocker::ALL {
+            let value = snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == "tn_executor.rejoin_blocked_total"
+                        && key
+                            .labels()
+                            .map(|label| (label.key(), label.value()))
+                            .eq([("reason", blocker.as_str())])
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("reason={} not registered", blocker.as_str()));
+            let expected = match blocker {
+                RejoinBlocker::EpochClosed => 3,
+                RejoinBlocker::RoundGap => 1,
+                _ => 0,
+            };
+            assert_eq!(value, &DebugValue::Counter(expected), "reason={}", blocker.as_str());
+        }
+    }
+
+    /// The not-ready line is logged on the first check, on every change of blocker and otherwise
+    /// once the interval has passed since the last line.
+    #[test]
+    fn rejoin_log_throttle_logs_on_change_or_interval() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let interval = u64::try_from(REJOIN_NOT_READY_LOG_INTERVAL.as_millis()).unwrap();
+        let mut throttle = RejoinLogThrottle::default();
+
+        assert!(throttle.should_log(RejoinBlocker::EpochClosed, at(0)), "first check logs");
+        assert!(!throttle.should_log(RejoinBlocker::EpochClosed, at(10)), "repeat is throttled");
+        assert!(throttle.should_log(RejoinBlocker::RoundGap, at(20)), "a new blocker logs");
+        assert!(throttle.should_log(RejoinBlocker::EpochClosed, at(30)), "a change back logs");
+        assert!(
+            !throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval - 1)),
+            "a repeat inside the interval is throttled"
+        );
+        assert!(
+            throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval)),
+            "a repeat once the interval has passed logs"
+        );
+        assert!(
+            !throttle.should_log(RejoinBlocker::EpochClosed, at(30 + interval + 1)),
+            "the interval restarts at the last line"
+        );
+        // an earlier stamp than the last line saturates to zero instead of panicking
+        assert!(!throttle.should_log(RejoinBlocker::EpochClosed, start));
     }
 }

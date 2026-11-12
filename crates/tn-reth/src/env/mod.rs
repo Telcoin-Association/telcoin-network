@@ -66,6 +66,7 @@ mod persist_bench;
 mod rpc;
 
 pub use exec_cache::ExecutionCacheStats;
+pub use execution::{BlockBuildTimings, OutputBuildScope};
 pub use layout::StorageLayout;
 pub use output_overlay::OutputTrieOverlay;
 

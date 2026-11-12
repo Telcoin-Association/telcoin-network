@@ -13,15 +13,24 @@
 //!   in memory WITHOUT persisting between them - the true production shape of a multi-block
 //!   `ConsensusOutput`, which no other test in the tree exercises.
 
-use crate::pipeline_helpers::{consensus_output_for_test, PipelineTestEnv};
+use crate::pipeline_helpers::{
+    block_differences, child_init_code, consensus_output_for_test, consensus_output_with_batches,
+    deploy_code, PipelineTestEnv, CHILD_RUNTIME, FACTORY_RUNTIME,
+};
 use reth_chain_state::ComputedTrieData;
 use reth_provider::{DBProvider as _, HashedPostStateProvider as _, StateRootProvider as _};
+use reth_revm::db::AccountStatus;
 use reth_trie::{HashedPostState, HashedStorage, StateRoot, TrieInput, TrieInputSorted};
 use reth_trie_db::DatabaseStateRoot as _;
 use secp256k1::rand::{rngs::StdRng, RngCore as _, SeedableRng as _};
-use std::sync::Arc;
-use tn_reth::{payload::TNPayload, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay};
-use tn_types::{Account, Address, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
+use std::{sync::Arc, time::Duration};
+use tn_reth::{
+    error::TnRethError, payload::TNPayload, ExecutedBlock, NewCanonicalChain, OutputBuildScope,
+    OutputTrieOverlay, RethEnv,
+};
+use tn_types::{
+    keccak256, Account, Address, Bytes, TransactionTrait as _, B256, MIN_PROTOCOL_BASE_FEE, U256,
+};
 
 /// Draw a deterministic 32-byte key from the seeded rng.
 fn rand_b256(rng: &mut StdRng) -> B256 {
@@ -233,5 +242,369 @@ fn test_unpersisted_chain_roots_match_memory_overlay_oracle() -> eyre::Result<()
         env.canonical_header.hash(),
         "canonical tip is the last built block",
     );
+    Ok(())
+}
+
+/// The untimed wrapper is transparent and the build is deterministic. Two blocks of one output
+/// are built from the same payloads through `build_block_from_batch_payload` (now a wrapper over
+/// the timed build) and `build_block_from_batch_payload_timed`, each path with its own output
+/// overlay, and must agree on the block hash, state root, gas, receipts and bundle state. Each
+/// block carries a replayed transaction (skipped as invalid) and bytes that do not decode
+/// (dropped at recovery), so both drop paths run, and block 2's root runs over a non-empty
+/// overlay.
+///
+/// Both paths share one implementation, so this cannot catch a difference from the pre-split
+/// build. That equivalence rests on the transaction moving into the builder as the same
+/// `Recovered<T>` value it used to clone, and on
+/// `test_unpersisted_chain_roots_match_memory_overlay_oracle`, whose independent reth oracle
+/// checks the roots built through the timed root provider.
+#[test]
+fn test_timed_build_matches_untimed_build() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let cims = env.reth_env.canonical_in_memory_state();
+    let recipient = Address::random();
+    let beneficiary = Address::random();
+    let mut untimed_overlay = OutputTrieOverlay::new();
+    let mut timed_overlay = OutputTrieOverlay::new();
+
+    for i in 1..=2u64 {
+        let parent = env.canonical_header.clone();
+        let output = consensus_output_for_test(i as u32, 0, i, env.block_timestamp);
+        let mut txs: Vec<Vec<u8>> = (0..3u64)
+            .map(|amount| {
+                env.user_factory.create_eip1559_encoded(
+                    env.chain.clone(),
+                    Some(1_000_000),
+                    MIN_PROTOCOL_BASE_FEE.into(),
+                    Some(recipient),
+                    U256::from(amount + 1),
+                    Bytes::new(),
+                )
+            })
+            .collect();
+        txs.push(txs[0].clone());
+        txs.push(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        // `new_for_test` randomizes the beneficiary, batch digest and mix hash: pin them so both
+        // paths build from the same payload
+        let payload = || {
+            TNPayload::new_for_test_with(
+                parent.clone(),
+                &output,
+                beneficiary,
+                B256::with_last_byte(i as u8),
+                B256::with_last_byte(0x80 | i as u8),
+            )
+        };
+        let untimed =
+            env.reth_env.build_block_from_batch_payload(payload(), &txs, &mut untimed_overlay)?;
+        let (timed, timings) = env.reth_env.build_block_from_batch_payload_timed(
+            payload(),
+            &txs,
+            &mut timed_overlay,
+        )?;
+
+        let header = untimed.recovered_block.clone_sealed_header();
+        let timed_header = timed.recovered_block.clone_sealed_header();
+        assert_eq!(header.hash(), timed_header.hash(), "block hash diverged at block {i}");
+        assert_eq!(header.state_root, timed_header.state_root, "state root diverged at block {i}");
+        assert_eq!(header.gas_used, timed_header.gas_used, "gas used diverged at block {i}");
+        assert_eq!(
+            untimed.execution_output.result.receipts, timed.execution_output.result.receipts,
+            "receipts diverged at block {i}",
+        );
+        assert_eq!(
+            untimed.execution_output.state, timed.execution_output.state,
+            "bundle state diverged at block {i}",
+        );
+        assert_eq!(timed.recovered_block.transaction_count(), 3, "both drop paths ran");
+        // the root lap is read off the root provider wrapper: zero would mean it was never timed
+        assert!(timings.root > Duration::ZERO, "root lap not measured at block {i}");
+        assert!(timings.evm > Duration::ZERO, "evm lap not measured at block {i}");
+
+        // chain the (identical) block in memory only, as the engine does within an output
+        cims.update_chain(NewCanonicalChain::Commit { new: vec![untimed] });
+        cims.set_canonical_head(header.clone());
+        env.canonical_header = header;
+        env.block_timestamp += 1;
+    }
+    Ok(())
+}
+
+/// Signers recovered ahead of the build (`recover_output_signers`, as the engine's background job
+/// runs it) build the blocks the bytes path builds. One three-batch output, split across two
+/// certificates, is built block by block through `build_block_from_batch_payload` from each
+/// batch's bytes (its own output overlay) and through
+/// `build_block_from_recovered_payload` from the batch's entry of the recovered signers (one
+/// build scope for the output, as the engine passes it), and the two must agree on the block
+/// hash, state root, gas, receipts and bundle state.
+///
+/// The recovered signers come one `Vec` per batch in flattened order (certificate, then batch); a
+/// flat list would shift transactions across blocks, so the test pins the per-batch shape and
+/// order across both certificates. Batch 1 replays one of its own transactions and batch 3 (the
+/// second certificate's) repeats one of batch 1's, and both carry bytes that do not decode: every
+/// copy after the first executes nowhere (it is skipped as invalid in either block), the
+/// undecodable bytes are dropped at recovery, and the later blocks' roots run over a non-empty
+/// overlay.
+#[test]
+fn test_recovered_build_matches_bytes_build() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let cims = env.reth_env.canonical_in_memory_state();
+    let recipient = Address::random();
+    let beneficiary = Address::random();
+    let undecodable = vec![0xde, 0xad, 0xbe, 0xef];
+    // one sender, consecutive nonces 0..6
+    let txs: Vec<Vec<u8>> = (0..6u64)
+        .map(|amount| {
+            env.user_factory.create_eip1559_encoded(
+                env.chain.clone(),
+                Some(1_000_000),
+                MIN_PROTOCOL_BASE_FEE.into(),
+                Some(recipient),
+                U256::from(amount + 1),
+                Bytes::new(),
+            )
+        })
+        .collect();
+    // the first certificate carries batches 1 and 2, the second batch 3
+    let certificates = vec![
+        vec![
+            // nonce 0 replayed within the batch
+            vec![
+                txs[0].clone(),
+                txs[1].clone(),
+                txs[2].clone(),
+                txs[0].clone(),
+                undecodable.clone(),
+            ],
+            vec![txs[3].clone()],
+        ],
+        // nonce 1 again, already executed by block 1 of the same output
+        vec![vec![txs[1].clone(), txs[4].clone(), undecodable, txs[5].clone()]],
+    ];
+    let batch_bytes: Vec<Vec<Vec<u8>>> = certificates.iter().flatten().cloned().collect();
+    let output = consensus_output_with_batches(1, env.block_timestamp, certificates);
+
+    let signers = RethEnv::recover_output_signers(&output);
+    assert_eq!(signers.len(), output.flatten_batches().len(), "one entry per flattened batch");
+    // per batch and in batch order: every decodable copy survives recovery, duplicates included
+    // (only execution skips them)
+    let recovered_hashes: Vec<Vec<B256>> =
+        signers.iter().map(|batch| batch.iter().map(|tx| *tx.tx_hash()).collect()).collect();
+    let decoded_hashes: Vec<Vec<B256>> = batch_bytes
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .filter_map(|bytes| tn_reth::recover_raw_transaction(bytes).ok())
+                .map(|tx| *tx.tx_hash())
+                .collect()
+        })
+        .collect();
+    assert_eq!(recovered_hashes, decoded_hashes);
+    assert_eq!(recovered_hashes.iter().map(Vec::len).collect::<Vec<_>>(), [4, 1, 3]);
+
+    let mut bytes_overlay = OutputTrieOverlay::new();
+    let mut recovered_scope = OutputBuildScope::new();
+    for (i, (bytes, recovered)) in batch_bytes.iter().zip(signers).enumerate() {
+        let parent = env.canonical_header.clone();
+        // pin the beneficiary, batch digest and mix hash so both paths build the same payload
+        let payload = || {
+            TNPayload::new_for_test_with(
+                parent.clone(),
+                &output,
+                beneficiary,
+                B256::with_last_byte(i as u8 + 1),
+                B256::with_last_byte(0x80 | (i as u8 + 1)),
+            )
+        };
+        let from_bytes =
+            env.reth_env.build_block_from_batch_payload(payload(), bytes, &mut bytes_overlay)?;
+        let (from_recovered, timings) = env.reth_env.build_block_from_recovered_payload(
+            payload(),
+            recovered,
+            &mut recovered_scope,
+        )?;
+
+        let header = from_bytes.recovered_block.clone_sealed_header();
+        let recovered_header = from_recovered.recovered_block.clone_sealed_header();
+        assert_eq!(header.hash(), recovered_header.hash(), "block hash diverged at block {i}");
+        assert_eq!(header.state_root, recovered_header.state_root, "state root diverged at {i}");
+        assert_eq!(header.receipts_root, recovered_header.receipts_root, "receipts root at {i}");
+        assert_eq!(header.gas_used, recovered_header.gas_used, "gas used diverged at block {i}");
+        assert_eq!(
+            from_bytes.execution_output.result.receipts,
+            from_recovered.execution_output.result.receipts,
+            "receipts diverged at block {i}",
+        );
+        assert_eq!(
+            from_bytes.execution_output.state, from_recovered.execution_output.state,
+            "bundle state diverged at block {i}",
+        );
+        assert_eq!(timings.recover, Duration::ZERO, "the recovered build recovers nothing");
+
+        // each nonce executes exactly once across the output: block 1 runs nonces 0-2 (its
+        // replayed nonce 0 is skipped), block 2 nonce 3, block 3 nonces 4-5 (the second
+        // certificate's repeat of nonce 1 is skipped)
+        let executed_nonces: Vec<u64> =
+            from_recovered.recovered_block.transactions_recovered().map(|tx| tx.nonce()).collect();
+        let expected_nonces: &[u64] = match i {
+            0 => &[0, 1, 2],
+            1 => &[3],
+            _ => &[4, 5],
+        };
+        assert_eq!(executed_nonces, expected_nonces, "executed nonces of block {i}");
+
+        // chain the (identical) block in memory only, as the engine does within an output
+        cims.update_chain(NewCanonicalChain::Commit { new: vec![from_bytes] });
+        cims.set_canonical_head(header.clone());
+        env.canonical_header = header;
+    }
+    Ok(())
+}
+
+/// Runtime of the probe: `sstore(addr, extcodehash(addr))` for the address in the calldata, a
+/// read of an account that neither touches it nor changes it.
+const PROBE_RUNTIME: [u8; 7] = [0x5f, 0x35, 0x3f, 0x5f, 0x35, 0x55, 0x00];
+
+/// The cross-block execution cache builds an unpersisted output's blocks exactly as a build
+/// without it (E5). A three-block output is built in memory, without persisting, twice from the
+/// same payloads on one env: first through the bytes path, which finds the execution cache
+/// anchored at its parent (checked in by the previous block's builds) and reads through it, then
+/// through the recovered path with ONE build scope for the output, which finds the cache moved
+/// past its parent and starts empty. The two must agree on block hash, state root, receipts root,
+/// gas, receipts and bundle state at every block, and no checked hit may have been stale.
+///
+/// The output walks every wiped-account case of the cache with a repeated sender:
+///
+/// - block 1 deploys a CREATE2 factory and a probe by transaction, probes an existing empty
+///   account, creates and self-destructs child A in one transaction and funds child B's future
+///   address (a balance-only account);
+/// - block 2 recreates A at the same address with slot 1 written, creates B over the funded account
+///   and self-destructs it (an existing account destroyed) and recreates it within the block
+///   (`DestroyedChanged`), and clears the empty account with a zero-value transfer (EIP-161);
+/// - block 3 calls A and B (each reads slot 1 and writes slot 2), probes A and touches the cleared
+///   account again: a stale cache would revive it and destroy it a second time in the bundle.
+///
+/// One revm `State` kept across the blocks fails this shape: A's sticky `DestroyedChanged` makes
+/// reth rebuild its storage as wiped and drop block 2's slot 1 from the root.
+#[test]
+fn test_execution_cache_matches_fresh_reads() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new_with_empty_governance_eoa();
+    let user = env.user_factory.address();
+    let empty = env.governance_factory.address();
+    let factory = user.create(0);
+    let probe = user.create(1);
+    let (child_a_init, child_b_init) = (child_init_code(0), child_init_code(1));
+    let child_a = factory.create2_from_code(B256::ZERO, &child_a_init);
+    let child_b = factory.create2_from_code(B256::ZERO, &child_b_init);
+    let child_code_hash = keccak256(CHILD_RUNTIME);
+    let word = |value: u64| Bytes::from(B256::from(U256::from(value)).to_vec());
+    let probe_of = |address: Address| Bytes::from(address.into_word().to_vec());
+    let mut tx = |to: Option<Address>, value: u64, input: Bytes| {
+        env.user_factory.create_eip1559_encoded(
+            env.chain.clone(),
+            Some(1_000_000),
+            MIN_PROTOCOL_BASE_FEE.into(),
+            to,
+            U256::from(value),
+            input,
+        )
+    };
+    let blocks = [
+        vec![
+            tx(None, 0, deploy_code(&FACTORY_RUNTIME)),
+            tx(None, 0, deploy_code(&PROBE_RUNTIME)),
+            tx(Some(probe), 0, probe_of(empty)),
+            tx(Some(factory), 0, child_a_init.clone().into()),
+            tx(Some(child_b), 1, Bytes::new()),
+        ],
+        vec![
+            tx(Some(factory), 7, child_a_init.into()),
+            tx(Some(factory), 0, child_b_init.clone().into()),
+            tx(Some(factory), 9, child_b_init.into()),
+            tx(Some(empty), 0, Bytes::new()),
+        ],
+        vec![
+            tx(Some(child_a), 0, word(5)),
+            tx(Some(child_b), 0, word(5)),
+            tx(Some(probe), 0, probe_of(child_a)),
+            tx(Some(empty), 0, Bytes::new()),
+        ],
+    ];
+
+    let mut overlay = OutputTrieOverlay::new();
+    let mut scope = OutputBuildScope::new();
+    for (i, txs) in blocks.iter().enumerate() {
+        let (fresh, shared) =
+            env.build_unpersisted_fresh_and_shared(txs, &mut overlay, &mut scope)?;
+        assert_eq!(block_differences(&fresh, &shared), Vec::<&str>::new(), "block {}", i + 1);
+        assert_eq!(env.reth_env.execution_cache_rebuilds(), 0, "block {}: a stale hit", i + 1);
+        assert_eq!(fresh.recovered_block.transaction_count(), txs.len(), "block {}", i + 1);
+        for index in 0..txs.len() {
+            assert!(env.tx_succeeded(&fresh, index), "block {} tx {index} failed", i + 1);
+        }
+        let bundle = &fresh.execution_output.state;
+        match i {
+            0 => {
+                // created and destroyed in one transaction: not an account after the block
+                assert!(bundle.state.get(&child_a).is_none_or(|account| account.info.is_none()));
+            }
+            1 => {
+                // destroyed and recreated within the block
+                assert_eq!(bundle.state[&child_b].status, AccountStatus::DestroyedChanged);
+                // cleared under EIP-161: destroyed without info
+                assert!(bundle.state[&empty].info.is_none());
+                assert!(bundle.state[&empty].status.was_destroyed());
+            }
+            _ => {
+                // touched again: no longer an account, and no second destruction in the bundle
+                assert!(
+                    !bundle.state.contains_key(&empty),
+                    "a dead account is not destroyed twice"
+                );
+                // the probe stored A's code hash
+                assert_eq!(
+                    bundle.state[&probe].storage[&U256::from_be_bytes(child_a.into_word().0)]
+                        .present_value,
+                    U256::from_be_bytes(child_code_hash.0),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A build scope builds only on the block it was last advanced to. After one block of an output,
+/// a payload on any other parent (here the output's own parent, as a scope kept past its output
+/// or reused on another branch would see it) fails with `ScopeParentMismatch` before anything is
+/// built, and the scope still builds the output's next block on its tip.
+#[test]
+fn test_scope_rejects_payload_on_another_parent() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let genesis = env.canonical_header.clone();
+    let mut overlay = OutputTrieOverlay::new();
+    let mut scope = OutputBuildScope::new();
+    let (block, _) =
+        env.build_unpersisted_fresh_and_shared(&Vec::new(), &mut overlay, &mut scope)?;
+    let tip = block.recovered_block.hash();
+
+    let output = consensus_output_for_test(9, 0, 9, env.block_timestamp);
+    let stale = TNPayload::new_for_test(genesis.clone(), &output);
+    let err = env
+        .reth_env
+        .build_block_from_recovered_payload(stale, Vec::new(), &mut scope)
+        .expect_err("a payload off the scope's tip must fail closed");
+    assert!(
+        matches!(err, TnRethError::ScopeParentMismatch { expected, got }
+            if expected == tip && got == genesis.hash()),
+        "unexpected error: {err}",
+    );
+
+    // the rejected payload changed nothing: the next block of the output still builds on the tip
+    let (fresh, shared) =
+        env.build_unpersisted_fresh_and_shared(&Vec::new(), &mut overlay, &mut scope)?;
+    assert_eq!(block_differences(&fresh, &shared), Vec::<&str>::new());
+    assert_eq!(fresh.recovered_block.parent_hash, tip);
     Ok(())
 }

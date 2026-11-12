@@ -25,6 +25,7 @@ use tn_types::{
 use tracing::{debug, warn};
 
 use crate::{
+    metrics::WorkerMetrics,
     network::{Req, Res, MAX_BATCH_DIGESTS_PER_REQUEST},
     WorkerGossip, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
@@ -301,6 +302,12 @@ pub struct WorkerNetworkHandle {
     chain_id: u64,
     /// The id of the worker this handle belongs to, used to select its gossip topics.
     worker_id: WorkerId,
+    /// Metrics for the batch request outcomes of this handle and for the serve-phase
+    /// refusals of the inbound sync streams that hold a clone of it.
+    ///
+    /// Built from the worker id, like the other per-worker instances, so the public
+    /// constructors keep their signatures and every instance records into the same series.
+    metrics: WorkerMetrics,
 }
 
 impl WorkerNetworkHandle {
@@ -321,6 +328,7 @@ impl WorkerNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             stalled_peers: Arc::new(Mutex::new(HashSet::new())),
             committee: Arc::new(Mutex::new(HashSet::new())),
+            metrics: WorkerMetrics::new_for_worker(worker_id),
         }
     }
 
@@ -337,6 +345,11 @@ impl WorkerNetworkHandle {
     /// Return a reference to the inner handle.
     pub fn inner_handle(&self) -> &NetworkHandle<Req, Res> {
         &self.handle
+    }
+
+    /// Return the worker metrics this handle records into.
+    pub(crate) fn metrics(&self) -> &WorkerMetrics {
+        &self.metrics
     }
 
     /// Publish a batch digest to the worker network.
@@ -501,6 +514,7 @@ impl WorkerNetworkHandle {
                 self.request_batches_from_peer(peer, digests_for_peer).await.map_or_else(
                     |error| match error {
                         PeerFetchError::Denied(e) => {
+                            self.metrics.record_batch_request_denied(&peer, &committee);
                             warn!(
                                 target: "worker::network",
                                 %peer,
@@ -516,6 +530,7 @@ impl WorkerNetworkHandle {
                             );
                         }
                         PeerFetchError::Failed(e) => {
+                            self.metrics.record_batch_request_failed(&peer, &committee);
                             warn!(
                                 target: "worker::network",
                                 %peer,
@@ -1050,6 +1065,7 @@ impl WorkerNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             stalled_peers: Arc::new(Mutex::new(HashSet::new())),
             committee: Arc::new(Mutex::new(HashSet::new())),
+            metrics: WorkerMetrics::new_for_worker(tn_types::DEFAULT_WORKER_ID),
         }
     }
 
@@ -1082,13 +1098,18 @@ mod tests {
     };
     use crate::test_utils::create_test_batches;
     use futures::{stream, StreamExt as _, TryStreamExt as _};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
         collections::{BTreeSet, HashSet},
         time::Duration,
     };
-    use tn_network_libp2p::{write_frame, SyncFrame, WorkerSyncRequest};
-    use tn_types::{encode, AuthorityIdentifier, BlockHash, BlsKeypair, BlsPublicKey, TaskManager};
+    use tn_network_libp2p::{
+        error::NetworkError, types::NetworkCommand, write_frame, SyncFrame, WorkerSyncRequest,
+    };
+    use tn_types::{
+        encode, AuthorityIdentifier, BlockHash, BlsKeypair, BlsPublicKey, TaskManager, B256,
+    };
 
     /// A distinct BLS public key for each `seed`.
     fn peer_key(seed: u64) -> BlsPublicKey {
@@ -1301,5 +1322,55 @@ mod tests {
         assert!(handle.stalled_peers_for_test().contains(&peer));
         handle.update_epoch(1, HashSet::new());
         assert!(handle.stalled_peers_for_test().is_empty(), "the record is reset per epoch");
+    }
+
+    /// A peer whose stream open fails is counted once as a failed batch request, because it
+    /// is skipped on the later passes, and never as a denied one. The peer is in the
+    /// handle's committee, so it records under its own key rather than `other`.
+    #[tokio::test(start_paused = true)]
+    async fn failed_peer_counts_one_failed_batch_request() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the current-thread test runtime keeps every task on this thread, so the local
+        // recorder also covers the per-peer counters resolved on the first failure
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let peer = BlsPublicKey::default();
+        let (sender, mut commands) = tokio::sync::mpsc::channel(10);
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    NetworkCommand::ConnectedPeers { reply } => {
+                        reply.send(vec![peer]).expect("send peers");
+                    }
+                    NetworkCommand::OpenStream { reply, .. } => {
+                        let failure = Err(NetworkError::Dial("mock open failure".to_string()));
+                        assert!(reply.send(failure).is_ok(), "send open result");
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let task_manager = TaskManager::default();
+        let mut handle =
+            WorkerNetworkHandle::new_for_test_with_sender(sender, task_manager.get_spawner());
+        handle.update_epoch(0, HashSet::from([peer]));
+
+        let mut digests = BTreeSet::from([B256::default()]);
+        let result = handle.request_batches(&mut digests, None).await;
+        assert!(result.is_err(), "the only peer fails, so nothing is fetched");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let peer = peer.to_string();
+        let count = |name: &str| {
+            snapshot.iter().find_map(|(key, _, _, value)| {
+                let labelled = key.key().labels().any(|l| l.key() == "peer" && l.value() == peer);
+                match value {
+                    DebugValue::Counter(n) if key.key().name() == name && labelled => Some(*n),
+                    _ => None,
+                }
+            })
+        };
+        assert_eq!(count("tn_worker.batch_requests_failed_total"), Some(1));
+        assert_eq!(count("tn_worker.batch_requests_denied_total"), Some(0));
     }
 }

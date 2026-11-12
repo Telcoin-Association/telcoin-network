@@ -2,14 +2,15 @@
 //!
 //! The counter series are exported under the `tn_reth` scope, in four unrelated groups.
 //!
-//! Block building. Two series count transactions that `build_block_from_batch_payload`
-//! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
-//! certified batch carried a transaction whose signer could not be recovered) and
-//! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
-//! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
-//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics. A third series,
-//! `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked hits of the cross-block
-//! execution cache that differed from the parent state, and a fourth,
+//! Block building. Two series count transactions that block building
+//! (`build_block_from_batch_payload`, or `recover_output_signers` followed by
+//! `build_block_from_recovered_payload`) declines to include in a block:
+//! `tn_reth.unrecoverable_txs_dropped_total` (alertable - a certified batch carried a transaction
+//! whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total` (expected -
+//! duplicates/invalid transactions across independently-batching workers, labeled by `reason`, see
+//! [`InvalidTxSkipReason`]). See [`RethEnvMetrics`] and the skip-reason docs for per-series
+//! semantics. A third series, `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked
+//! hits of the cross-block execution cache that differed from the parent state, and a fourth,
 //! `tn_reth.parallel_state_root_mismatches_total` (alertable), sampled block roots whose parallel
 //! storage roots differed from the serial computation. A fifth,
 //! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
@@ -17,9 +18,10 @@
 //! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
 //! storage tries whose split storage root was not used.
 //!
-//! Six histograms in the same group time the stages of each block that function builds, one
-//! sample per block each: `tn_reth.block_execute_seconds` (with
-//! `tn_reth.block_signer_recovery_seconds` inside it), `tn_reth.block_finish_seconds` (with
+//! Six histograms in the same group time the stages of each block built, one sample per block
+//! each: `tn_reth.block_signer_recovery_seconds` (per batch, ahead of the build: in the bytes
+//! build before the builder is set up, in `recover_output_signers` concurrently across the
+//! output's batches), then `tn_reth.block_execute_seconds`, `tn_reth.block_finish_seconds` (with
 //! `tn_reth.block_hashed_state_seconds` and `tn_reth.block_state_root_seconds` inside it), and
 //! `tn_reth.block_overlay_extend_seconds`. Execute, finish and overlay extend run back to back.
 //! See [`RethEnvMetrics`] for the span each one covers.
@@ -143,10 +145,10 @@ pub(crate) fn init() {
 /// Metrics for the execution environment: block building from certified batch payloads, plus
 /// the worker pool's canonical-state subscription health and parked-transaction expiry.
 ///
-/// The `block_*_seconds` histograms time the stages of each block
-/// `build_block_from_batch_payload` builds. Each records one sample per block, when its span
-/// completes without error, so a failed build leaves no sample for the stage that failed or any
-/// stage after it.
+/// The `block_*_seconds` histograms time the stages of each block built
+/// (`build_block_from_batch_payload`, or `build_block_from_recovered_payload` after
+/// `recover_output_signers`). Each records one sample per block, when its span completes without
+/// error, so a failed build leaves no sample for the stage that failed or any stage after it.
 ///
 /// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
 /// cover transactions that `build_block_from_batch_payload` silently declines to include in
@@ -166,6 +168,15 @@ pub(crate) struct RethEnvMetrics {
     txpool_expired_txs_total: Counter,
 
     /// Transactions dropped while building a block because their signer could not be recovered.
+    ///
+    /// Counted at recovery: in the bytes build per block, before the builder is set up (a build
+    /// that then fails still counts its drops), and in `recover_output_signers` per consensus
+    /// output, which the engine runs when the output is queued, ahead of its blocks (an output
+    /// dropped from the queue at shutdown and replayed after a restart counts twice). Counting
+    /// ahead of the blocks also counts drops for blocks never built: an output dropped from the
+    /// queue unexecuted (the max-round return, or an earlier output's execution error) has
+    /// already counted its drops, and when one of an output's blocks fails, the counter already
+    /// holds the drops of the batches after it.
     ///
     /// Alert on any nonzero value. A certified sub-DAG is fixed and identical on every honest
     /// node, so an unrecoverable transaction is dropped rather than halting the network (see
@@ -229,16 +240,20 @@ pub(crate) struct RethEnvMetrics {
     /// the pool's view of them stays stale.
     pub(crate) canon_state_resync_read_failures_total: Counter,
 
-    /// Time to execute one block's transactions in `build_block_from_batch_payload`.
+    /// Time to execute one block's transactions.
     ///
-    /// Spans creating the block builder, the pre-execution changes, signer recovery
-    /// ([`RethEnvMetrics::block_signer_recovery_seconds`]) and the transaction loop, and ends
-    /// where [`RethEnvMetrics::block_finish_seconds`] starts.
+    /// Spans creating the block builder, the pre-execution changes and the transaction loop, and
+    /// ends where [`RethEnvMetrics::block_finish_seconds`] starts. Signer recovery runs before it
+    /// ([`RethEnvMetrics::block_signer_recovery_seconds`]).
     pub(crate) block_execute_seconds: Histogram,
 
-    /// Time to recover the signers of one block's transactions, in parallel on rayon.
+    /// Time to recover the signers of one batch's transactions, in parallel on rayon: one sample
+    /// per batch, and so per block built from a batch.
     ///
-    /// Part of [`RethEnvMetrics::block_execute_seconds`].
+    /// Not part of [`RethEnvMetrics::block_execute_seconds`]: the bytes build recovers before the
+    /// builder is set up, and the engine recovers a whole output's batches concurrently in
+    /// `recover_output_signers` on a background job, ahead of the output's blocks, so the samples
+    /// of one output can overlap each other and earlier outputs' execution.
     pub(crate) block_signer_recovery_seconds: Histogram,
 
     /// Time for the block builder's `finish` on one block.
@@ -262,8 +277,8 @@ pub(crate) struct RethEnvMetrics {
     /// Part of [`RethEnvMetrics::block_finish_seconds`].
     pub(crate) block_state_root_seconds: Histogram,
 
-    /// Time from the end of `finish` to the built block: sorting the block's hashed state and
-    /// trie updates, then extending the output's overlay with them
+    /// Time from the end of `finish` to the built block: taking the bundle, sorting the block's
+    /// hashed state and trie updates, then extending the output's overlay with them
     /// (`OutputTrieOverlay::extend_from_block`).
     pub(crate) block_overlay_extend_seconds: Histogram,
 }

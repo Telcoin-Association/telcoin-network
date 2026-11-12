@@ -159,9 +159,14 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
+            // with nothing executed the parent is the default header, whose digest is build-flavor
+            // dependent and is not the anchor adiri's block 1 was built on. block 1 anchors on its
+            // own parent instead, as state-sync catch-up and the epoch-0 pack importer do; its
+            // digest commits to that parent, and the check is strict from block 2 on.
+            let anchors_on_itself = parent.number == 0 && consensus_header.number == 1;
             eyre::ensure!(
                 consensus_header.number == parent.number + 1
-                    && consensus_header.parent_hash == parent.digest(),
+                    && (anchors_on_itself || consensus_header.parent_hash == parent.digest()),
                 "restart replay is not contiguous: expected consensus {} following {}, got {}",
                 parent.number + 1,
                 parent.number,
@@ -1318,7 +1323,8 @@ where
     /// Decide this epoch's [`NodeMode`] and publish it to [`ConsensusBus::node_mode`].
     ///
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
-    /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
+    /// the committee stays inactive until that resolves elsewhere, and entering a new epoch this
+    /// way starts the epoch's rejoin count again (see `RejoinState`). Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
     /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record, or a
     /// certified record for this epoch, proves it must catch up, and otherwise starts as
@@ -1332,6 +1338,10 @@ where
     ) -> eyre::Result<NodeMode> {
         if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
+            // entering a new epoch inactive starts its rejoin count again; a restart inside the
+            // epoch (a demotion) keeps it, so the per-epoch cap on failed promotions holds
+            let epoch = consensus_config.committee().epoch();
+            self.consensus_bus.rejoin_state().send_if_modified(|state| state.enter_epoch(epoch));
             return Ok(NodeMode::CvvInactive);
         }
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );

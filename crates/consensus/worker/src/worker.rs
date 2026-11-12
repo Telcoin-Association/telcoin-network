@@ -10,7 +10,10 @@ use crate::{
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -345,6 +348,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             return Err(BlockSealError::ConsensusShuttingDown);
         }
 
+        // the quorum round trip as the worker sees it: from handing the batch to the quorum
+        // waiter (its requests leave at once) until the attest result, across the cache insert
+        let quorum_start = Instant::now();
         let batch_attest_handle = quorum_waiter.verify_batch(
             sealed_batch.clone(),
             self.timeout,
@@ -372,6 +378,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             worker_id = self.id,
                             batch_size = batch.size(),
                             num_txs = batch.transactions.len(),
+                            digest = %digest,
+                            quorum_ms = millis(quorum_start.elapsed()),
                             "batch sealed"
                         );
                         // Publish the digest for the nodes subscribed to this gossip, i.e. the
@@ -425,10 +433,20 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
 
         // Send the batch to the primary.
         let message = WorkerOwnBatchMessage::new(self.id, digest);
-        if let Err(err) = self.client.report_own_batch(message).await {
+        let report_start = Instant::now();
+        let reported = self.client.report_own_batch(message).await;
+        let report_elapsed = report_start.elapsed();
+        self.metrics.record_batch_report(report_elapsed);
+        if let Err(err) = reported {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             Err(BlockSealError::FailedToReport)
         } else {
+            info!(
+                target: "consensus::metrics",
+                digest = %digest,
+                report_us = micros(report_elapsed),
+                "batch reported"
+            );
             // recorded only after a successful report: a failed report leaves the transactions
             // in the pool for the builder to seal again, and an earlier record would count them
             // once per attempt (issue #1444)
@@ -436,4 +454,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             Ok(())
         }
     }
+}
+
+/// Whole milliseconds of `elapsed` for the `consensus::metrics` lines, saturating.
+fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whole microseconds of `elapsed`, saturating, for stages that are normally sub-millisecond.
+fn micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }

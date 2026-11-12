@@ -295,7 +295,7 @@ The unit test file `etc/prometheus/rules/telcoin-host-network.test.yaml` covers 
 - `rule` values come from nft counter names with the `tn_` prefix. The collector sorts them and keeps the first 32. `tn_host_firewall_rules_truncated` is 1 when it cut the list. An attacker cannot create nft counters, so the operator bounds the vocabulary.
 - `mode` has three values. `network` has `primary` and `worker-{id}`.
 - Committee connectivity is a count. There is no per-peer label, not even for committee members. A per-peer breakdown needs a bounded lifecycle for the label values and is out of scope here.
-- No label carries a source address, a peer identity, a URL or an error text. The artifact test in `crates/network-libp2p/src/tests/ops_artifacts_tests.rs` rejects any dashboard query that matches on `addr`, `address`, `ip`, `src`, `peer_id` or `url`, and any node or host query without `job` and `instance` matchers.
+- No host series or node committee series carries a source address, a peer identity, a URL or an error text. The node's only per-peer label is on series this page does not cover; [Metric label policy](observability-listeners.md#metric-label-policy) describes it. The artifact test in `crates/network-libp2p/src/tests/ops_artifacts_tests.rs` rejects any dashboard query that matches on `addr`, `address`, `ip`, `src`, `peer_id` or `url`, and any node or host query without `job` and `instance` matchers.
 
 ## Related
 

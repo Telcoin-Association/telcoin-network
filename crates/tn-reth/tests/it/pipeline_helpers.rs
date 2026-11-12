@@ -15,16 +15,19 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 #[cfg(not(feature = "faucet"))]
 use tn_reth::mintCall;
 use tn_reth::{
+    error::TnRethResult,
     payload::TNPayload,
+    recover_raw_transaction,
     system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
-    totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
-    TELCOIN_PRECOMPILE_ADDRESS,
+    totalSupplyCall, ExecutedBlock, NewCanonicalChain, OutputBuildScope, OutputTrieOverlay,
+    RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
-    test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
-    TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
+    test_genesis, Address, Batch, BlsSignature, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeader, ConsensusOutput, GenesisAccount, Recovered, ReputationScores,
+    SealedHeader, SignatureVerificationState, TaskManager, TransactionSigned, B256,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 
 // --- Concurrency limiter ---
@@ -276,6 +279,39 @@ impl PipelineTestEnv {
         txs: Vec<Vec<u8>>,
         timestamp: u64,
     ) -> eyre::Result<ExecutedBlock> {
+        self.build_and_persist(timestamp, |reth_env, payload| {
+            reth_env.build_block_from_batch_payload(payload, &txs, &mut OutputTrieOverlay::new())
+        })
+    }
+
+    /// Execute a block from transactions whose signers are already recovered (one batch's entry
+    /// of `RethEnv::recover_output_signers`), the way the engine builds blocks, then persist it
+    /// like [`Self::execute_block`].
+    pub(crate) fn execute_recovered_block(
+        &mut self,
+        recovered: Vec<Recovered<TransactionSigned>>,
+    ) -> eyre::Result<ExecutedBlock> {
+        self.build_and_persist(self.block_timestamp, |reth_env, payload| {
+            reth_env
+                .build_block_from_recovered_payload(
+                    payload,
+                    recovered,
+                    &mut OutputBuildScope::new(),
+                )
+                .map(|(block, _timings)| block)
+        })
+    }
+
+    /// Build one block at `timestamp` with `build`, then chain and persist it.
+    ///
+    /// Each block persists in step 5 before the next build, so `build` passes a fresh empty
+    /// overlay or build scope: the database then already holds the parent state, which makes
+    /// both exact (#1301).
+    fn build_and_persist(
+        &mut self,
+        timestamp: u64,
+        build: impl FnOnce(&RethEnv, TNPayload) -> TnRethResult<ExecutedBlock>,
+    ) -> eyre::Result<ExecutedBlock> {
         // 1. Create consensus output with controlled timestamp
         let output =
             consensus_output_for_test(self.subdag_index as u32, 0, self.subdag_index, timestamp);
@@ -283,13 +319,8 @@ impl PipelineTestEnv {
         // 2. Build TNPayload
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
-        // 3. Build and execute block. Each block persists in step 5 before the next build,
-        // so a fresh empty overlay per block is exact (#1301).
-        let block = self.reth_env.build_block_from_batch_payload(
-            payload,
-            &txs,
-            &mut tn_reth::OutputTrieOverlay::new(),
-        )?;
+        // 3. Build and execute block
+        let block = build(&self.reth_env, payload)?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -374,6 +405,69 @@ impl PipelineTestEnv {
         U256::from_be_slice(&bytes[..32])
     }
 
+    /// A pipeline environment whose governance EOA is an existing but EMPTY genesis account (no
+    /// balance, nonce or code), so a zero-value transfer to it clears it under EIP-161. The
+    /// governance EOA cannot pay for transactions here.
+    pub(crate) fn new_with_empty_governance_eoa() -> Self {
+        let wei = U256::from(10).pow(U256::from(18));
+        let large = wei * U256::from(1_000_000_000u64);
+        Self::new_with_custom_state(
+            U256::from(GENESIS_SUPPLY) * wei,
+            wei * U256::from(1000u64),
+            large,
+            U256::ZERO,
+            large,
+            large,
+        )
+    }
+
+    /// Build the next block of an UNPERSISTED output twice from one pinned payload, then chain it
+    /// in memory only, as the engine does between the blocks of one consensus output.
+    ///
+    /// The first build goes through `build_block_from_batch_payload` with `overlay`, the second
+    /// through `build_block_from_recovered_payload` with `scope`, the output's shared build scope.
+    /// Both carry the output's trie overlay and read through the env's cross-block execution cache:
+    /// the first finds it anchored at the parent whenever the previous block's builds agreed, and
+    /// checks it in at the built block, so the second, on the same parent, starts with an empty
+    /// one. Returns `(fresh, shared)`; the fresh block is the one chained.
+    pub(crate) fn build_unpersisted_fresh_and_shared(
+        &mut self,
+        txs: &Vec<Vec<u8>>,
+        overlay: &mut OutputTrieOverlay,
+        scope: &mut OutputBuildScope,
+    ) -> eyre::Result<(ExecutedBlock, ExecutedBlock)> {
+        let parent = self.canonical_header.clone();
+        let index = self.subdag_index;
+        let output = consensus_output_for_test(index as u32, 0, index, self.block_timestamp);
+        // `new_for_test` randomizes the beneficiary, batch digest and mix hash: pin them so both
+        // builds start from the same payload (one beneficiary for every block of the output)
+        let payload = || {
+            TNPayload::new_for_test_with(
+                parent.clone(),
+                &output,
+                Address::with_last_byte(0xbe),
+                B256::with_last_byte(index as u8),
+                B256::with_last_byte(0x80 | index as u8),
+            )
+        };
+        let fresh = self.reth_env.build_block_from_batch_payload(payload(), txs, overlay)?;
+        let recovered = txs
+            .iter()
+            .map(|tx| recover_raw_transaction(tx))
+            .collect::<TnRethResult<Vec<Recovered<TransactionSigned>>>>()?;
+        let (shared, _timings) =
+            self.reth_env.build_block_from_recovered_payload(payload(), recovered, scope)?;
+
+        let header = fresh.recovered_block.clone_sealed_header();
+        let cims = self.reth_env.canonical_in_memory_state();
+        cims.update_chain(NewCanonicalChain::Commit { new: vec![fresh.clone()] });
+        cims.set_canonical_head(header.clone());
+        self.canonical_header = header;
+        self.block_timestamp += 1;
+        self.subdag_index += 1;
+        Ok((fresh, shared))
+    }
+
     /// Check if a transaction in the most recent block succeeded.
     /// Looks at the receipt status for the given tx index.
     pub(crate) fn tx_succeeded(&self, block: &ExecutedBlock, tx_index: usize) -> bool {
@@ -397,6 +491,73 @@ impl PipelineTestEnv {
             Bytes::new(),
         )
     }
+}
+
+// --- Read-cache differential helpers ---
+
+/// The fields in which two builds of one block differ, among those consensus and the database
+/// observe: block hash, state root, receipts root, gas used, receipts and bundle state. Empty when
+/// the builds are identical.
+pub(crate) fn block_differences(a: &ExecutedBlock, b: &ExecutedBlock) -> Vec<&'static str> {
+    let (header_a, header_b) =
+        (a.recovered_block.clone_sealed_header(), b.recovered_block.clone_sealed_header());
+    [
+        ("block hash", header_a.hash() == header_b.hash()),
+        ("state root", header_a.state_root == header_b.state_root),
+        ("receipts root", header_a.receipts_root == header_b.receipts_root),
+        ("gas used", header_a.gas_used == header_b.gas_used),
+        ("receipts", a.execution_output.result.receipts == b.execution_output.result.receipts),
+        ("bundle state", a.execution_output.state == b.execution_output.state),
+    ]
+    .into_iter()
+    .filter(|(_, same)| !same)
+    .map(|(field, _)| field)
+    .collect()
+}
+
+/// Creation code that deploys `runtime` (at most 255 bytes) as is.
+pub(crate) fn deploy_code(runtime: &[u8]) -> Bytes {
+    let len = u8::try_from(runtime.len()).expect("runtime of at most 255 bytes");
+    // codecopy(0, 0x0a, len); return(0, len): the runtime starts after these 10 bytes
+    let mut code = vec![0x60, len, 0x60, 0x0a, 0x5f, 0x39, 0x60, len, 0x5f, 0xf3];
+    code.extend_from_slice(runtime);
+    code.into()
+}
+
+/// Runtime of the CREATE2 factory: `create2(callvalue, calldata, salt 0)`, reverting when the
+/// create fails, so the child's address depends only on its init code (the calldata).
+pub(crate) const FACTORY_RUNTIME: [u8; 17] = [
+    0x36, 0x5f, 0x5f, 0x37, // calldatacopy(0, 0, calldatasize)
+    0x5f, 0x36, 0x5f, 0x34, 0xf5, // create2(callvalue, 0, calldatasize, 0)
+    0x60, 0x0f, 0x57, // jumpi(0x0f, address)
+    0x5f, 0x5f, 0xfd, // revert(0, 0)
+    0x5b, 0x00, // jumpdest; stop
+];
+
+/// Runtime of the factory's child: `sstore(2, calldataload(0) + sload(1))`, so a call reads the
+/// slot the child's init code wrote and writes a second one.
+pub(crate) const CHILD_RUNTIME: [u8; 10] = [
+    0x60, 0x01, 0x54, // sload(1)
+    0x5f, 0x35, 0x01, // + calldataload(0)
+    0x60, 0x02, 0x55, 0x00, // sstore(2, ..); stop
+];
+
+/// Init code of the factory's child `variant`. Without value it self-destructs at once (created
+/// and destroyed in one transaction); with value it stores `sstore(1, callvalue)` and deploys
+/// [`CHILD_RUNTIME`]. Equal init code means an equal CREATE2 address, so a child can be destroyed
+/// and recreated at one address; the trailing `variant` byte (never executed) gives each variant
+/// its own address.
+pub(crate) fn child_init_code(variant: u8) -> Vec<u8> {
+    let mut code = vec![
+        0x34, 0x15, 0x60, 0x13, 0x57, // jumpi(0x13, iszero(callvalue))
+        0x34, 0x60, 0x01, 0x55, // sstore(1, callvalue)
+        0x60, 0x0a, 0x60, 0x16, 0x5f, 0x39, // codecopy(0, 0x16, 10)
+        0x60, 0x0a, 0x5f, 0xf3, // return(0, 10)
+        0x5b, 0x33, 0xff, // 0x13: jumpdest; selfdestruct(caller)
+    ];
+    code.extend_from_slice(&CHILD_RUNTIME);
+    code.push(variant);
+    code
 }
 
 // --- Consensus output helper ---
@@ -435,6 +596,41 @@ pub(crate) fn consensus_output_for_test(
         false,
         VecDeque::new(),
         Vec::new(),
+    )
+}
+
+/// Wrap `consensus_output_for_test`'s sub-DAG in an output with one certificate per entry of
+/// `certificates`, each carrying one batch per entry of its own (each the batch's encoded
+/// transactions), with the digests in flattened order (certificate, then batch).
+///
+/// For signer recovery only: the batches carry default beneficiaries, base fees and epochs, and
+/// certificate `i` is attributed to `Address::with_last_byte(i)`.
+pub(crate) fn consensus_output_with_batches(
+    subdag_index: u64,
+    timestamp: u64,
+    certificates: Vec<Vec<Vec<Vec<u8>>>>,
+) -> ConsensusOutput {
+    let base = consensus_output_for_test(subdag_index as u32, 0, subdag_index, timestamp);
+    let certified: Vec<CertifiedBatch> = certificates
+        .into_iter()
+        .enumerate()
+        .map(|(i, batches)| CertifiedBatch {
+            address: Address::with_last_byte(i as u8),
+            batches: batches
+                .into_iter()
+                .map(|transactions| Batch { transactions, ..Default::default() })
+                .collect(),
+        })
+        .collect();
+    let digests =
+        certified.iter().flat_map(|cert| cert.batches.iter()).map(Batch::digest).collect();
+    ConsensusOutput::new(
+        base.sub_dag().clone(),
+        ConsensusHeader::default().digest(),
+        subdag_index,
+        false,
+        digests,
+        certified,
     )
 }
 

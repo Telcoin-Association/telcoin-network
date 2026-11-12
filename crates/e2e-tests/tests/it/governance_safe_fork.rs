@@ -78,13 +78,9 @@ use tn_types::{
         GOVERNANCE_SAFE_FORK_CANONICAL_SUITE, GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
         SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH, SAFE_SINGLETON_PRE_FORK_CODE_HASH,
     },
-    keccak256, Address, Epoch, Genesis, B256, U256,
+    keccak256, Address, Epoch, Genesis, ADIRI_CHAIN_ID, B256, U256,
 };
 use tracing::{info, warn};
-
-/// Chain id every node on this lane runs. `adiri` builds accept no other
-/// (`telcoin-network-cli::node`), which is also why no other lane may use it.
-const ADIRI_CHAIN_ID: u64 = 2017;
 
 /// Epoch duration (seconds) for this lane. 5s is the consensus minimum, the same cadence
 /// `epochs.rs` and `basefee.rs` run at, so the fork boundary arrives within the test budget.
@@ -459,6 +455,8 @@ async fn test_governance_safe_fork_boundary() -> eyre::Result<()> {
             accounts: vec![],
             validators: &committee,
             epoch_duration: EPOCH_DURATION,
+            // every node on this lane runs the adiri chain id: `adiri` builds accept no other
+            // (`telcoin-network-cli::node`), which is also why no other lane may use it
             chain_id: Some(ADIRI_CHAIN_ID),
         },
     )?;

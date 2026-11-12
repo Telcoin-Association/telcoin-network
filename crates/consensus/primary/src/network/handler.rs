@@ -3,18 +3,22 @@
 use super::{PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
+    metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBusApp, NodeMode,
+    ConsensusBusApp, ExecutionCheckError, NodeMode,
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
 };
@@ -51,6 +55,10 @@ const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 /// number of frames and a slow reader are not, so this backstops the whole serve
 /// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Minimum interval between two `behind the gc window inside the rejoin grace; holding demotion`
+/// lines from one handler. Every hold is still counted in `rejoin_grace_holds_total`.
+const REJOIN_GRACE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -130,6 +138,14 @@ pub(crate) struct RequestHandler<DB> {
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
+    /// Vote path metric handles, resolved once for this handler's epoch.
+    vote_metrics: Arc<VoteStageHandles>,
+    /// Rate limit for the line logged when a demotion is held inside the rejoin grace.
+    rejoin_grace_log: Arc<Mutex<RejoinGraceLog>>,
+    /// True while the rejoin grace holds a demotion: set by a hold, cleared once an incoming round
+    /// is inside the activity window again. A demotion while it is set is the held one taking
+    /// effect at the end of the grace, so the rejoin it follows counts as failed.
+    rejoin_grace_holding: Arc<AtomicBool>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -159,6 +175,9 @@ where
             epoch_votes_seen: Default::default(),
             deferred_vote_warned: Default::default(),
             consensus_chain,
+            vote_metrics: Arc::new(VoteStageHandles::new()),
+            rejoin_grace_log: Default::default(),
+            rejoin_grace_holding: Default::default(),
         }
     }
 
@@ -171,6 +190,14 @@ where
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
+    ///
+    /// For [`tn_types::REJOIN_DEMOTION_GRACE`] after a rejoin in this epoch, and while the incoming
+    /// round leads the effective round by at most `ROUNDS_TO_KEEP - gc_depth`, a demotion for the
+    /// activity window is held instead: logged, counted in `rejoin_grace_holds_total`, and
+    /// answered as not behind. A demotion for an epoch behind is never held.
+    ///
+    /// A demotion settles the latest rejoin in the rejoin state: it failed when the demotion came
+    /// inside the grace, or was the one the grace held taking effect when the grace ended.
     pub(crate) async fn behind_consensus(
         &self,
         epoch: Epoch,
@@ -202,15 +229,16 @@ where
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
         let processed_consensus_round = self.consensus_bus.last_consensus_round();
-        // The committed round is updated synchronously by the consensus core (Bullshark)
-        // when it commits certificates. This happens before the async engine pipeline processes
-        // them. Including it prevents false-positive "behind" detection when the engine
-        // lags behind a burst of empty consensus rounds.
+        // The committed round is updated by the consensus core (Bullshark) as soon as it commits
+        // certificates, before the async engine pipeline processes them: commits do not wait for
+        // local execution and may run ahead of it by up to `MAX_COMMIT_RUN_AHEAD_ROUNDS`. On an
+        // active node it therefore leads the two execution rounds above, and the window test
+        // below measures how far this node's commits lag the committee, not its execution lag.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
         let (_last_consensus_epoch, last_consensus_number, _) =
             self.consensus_bus.published_consensus_num_hash();
-        // Use GC depth to estimate how many rounds we can be behind.
+        // Use GC depth to bound how many rounds our commits may trail the incoming round.
         // Subtract `GC_ACTIVITY_BUFFER` here so if we are right on the GC depth we will still go
         // inactive (small safety buffer).  The buffer is arbitrary but should make sure we are
         // comfortably within the current DAG. Trying to ride the GC window exactly can lead to
@@ -241,9 +269,66 @@ where
         } else {
             epoch > exec_epoch
         };
+        if outside_gc_window {
+            // a promoted node commits again only once its dag is refilled from peers; until then
+            // the window measures the rejoin, not a new fall behind. an epoch behind is never
+            // held, nor a lag past the rounds peers still keep, which no refill can recover
+            let rebuild_bound = tn_types::ROUNDS_TO_KEEP
+                .saturating_sub(self.consensus_config.parameters().gc_depth);
+            // the epoch the subscriber's `promote` stamped: both come from this epoch's config
+            // (see `RejoinState`)
+            let since_promotion = self
+                .consensus_bus
+                .rejoin_state()
+                .borrow()
+                .promoted_at(self.consensus_config.committee().epoch())
+                .map(|promoted_at| promoted_at.elapsed());
+            if let Some(since_promotion) = since_promotion.filter(|since| {
+                *since < tn_types::REJOIN_DEMOTION_GRACE
+                    && round.saturating_sub(effective_exec_round) <= rebuild_bound
+            }) {
+                self.consensus_bus.metrics().rejoin_grace_holds_total.increment(1);
+                self.rejoin_grace_holding.store(true, Ordering::Relaxed);
+                // every certificate past the window is held, about twenty a second under load,
+                // so the line is rate limited and carries the holds it stands for
+                let due = self.rejoin_grace_log.lock().record_hold(tokio::time::Instant::now());
+                if let Some(holds_since_last_line) = due {
+                    warn!(
+                        target: "primary",
+                        round,
+                        effective_round = effective_exec_round,
+                        since_promotion_ms = millis(since_promotion),
+                        holds_since_last_line,
+                        "behind the gc window inside the rejoin grace; holding demotion"
+                    );
+                }
+                return false;
+            }
+        } else if epoch == exec_epoch {
+            // a round of the executed epoch inside the window: a hold, if any, has ended without
+            // a demotion
+            self.rejoin_grace_holding.store(false, Ordering::Relaxed);
+        }
         if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
+            // the two tests exclude each other: the gc window test needs the executed epoch and
+            // the epoch test a later one
+            let reason = if outside_gc_window {
+                ModeTransitionReason::OutsideGcWindow
+            } else {
+                ModeTransitionReason::EpochBehind
+            };
+            // the newest consensus header this node knows, from its watch: on an active node the
+            // subscriber's newest save, but the state-sync fetchers also write it while the node
+            // follows consensus. the handler never reads the pack here
+            let newest_header_number = self
+                .consensus_bus
+                .last_consensus_header()
+                .borrow()
+                .as_ref()
+                .map_or(0, |header| header.number);
+            let primary_round = self.consensus_bus.primary_round();
             warn!(
                 target: "primary",
                 epoch,
@@ -253,10 +338,30 @@ where
                 exec_round,
                 processed_consensus_round,
                 committed_round,
+                round,
                 effective_exec_round,
+                gc_window = gc_depth,
+                reason = reason.as_str(),
+                newest_header_number,
+                backlog_outputs = newest_header_number.saturating_sub(exec_number),
+                // the engine's processed round covers a failed or empty header lookup, as the
+                // `consensus_exec_lag_rounds` gauge does
+                exec_lag_rounds =
+                    committed_round.saturating_sub(exec_round.max(processed_consensus_round)),
+                commit_lag_rounds = primary_round.saturating_sub(committed_round),
                 "we are behind, go to catchup mode!"
             );
-            self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+            record_mode_transition(previous, NodeMode::CvvInactive, reason);
+            // settle the latest rejoin now rather than when the catch-up loop restarts, which
+            // waits for the engine to drain the outputs already sequenced
+            let released_hold =
+                outside_gc_window && self.rejoin_grace_holding.load(Ordering::Relaxed);
+            let committee_epoch = self.consensus_config.committee().epoch();
+            let now = tokio::time::Instant::now();
+            self.consensus_bus.rejoin_state().send_if_modified(|state| {
+                state.record_demotion(committee_epoch, now, released_hold)
+            });
             self.consensus_config.shutdown().notify();
             true
         } else {
@@ -634,11 +739,74 @@ where
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
+    ///
+    /// [`Self::vote_request`] decides the request. This wrapper times it by stage, records the
+    /// vote metrics and logs one `vote path timing` line per request.
     pub(crate) async fn vote(
         &self,
         peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
+    ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let author = header.author().clone();
+        let (epoch, round) = (header.epoch(), header.round());
+        let mut timing = VoteTiming::new();
+        self.vote_metrics.record_request();
+        let res = self.vote_request(peer, header, parents, &mut timing).await;
+        self.observe_vote(&author, epoch, round, &res, timing);
+        res
+    }
+
+    /// Record the metrics and log the `vote path timing` line for a finished vote request.
+    fn observe_vote(
+        &self,
+        author: &AuthorityIdentifier,
+        epoch: Epoch,
+        round: Round,
+        res: &PrimaryNetworkResult<PrimaryResponse>,
+        mut timing: VoteTiming,
+    ) {
+        let total = timing.finish_at(Instant::now());
+        let outcome = VoteOutcome::of(res, &timing);
+        match outcome {
+            VoteOutcome::Created => self.vote_metrics.record_created(),
+            VoteOutcome::Recast => self.vote_metrics.record_recast(),
+            _ => {}
+        }
+        if let Some(waited) = timing.lock {
+            self.vote_metrics.record_lock_wait(waited);
+        }
+        for stage in VoteStage::ALL {
+            if let Some(spent) = timing.stage(stage) {
+                self.vote_metrics.record_stage(stage, spent);
+            }
+        }
+        debug!(
+            target: "primary::network",
+            author = %author,
+            round,
+            epoch,
+            outcome = outcome.as_str(),
+            lock_ms = timing.lock.map_or(0, millis),
+            validate_ms = timing.stage_ms(VoteStage::Validate),
+            exec_wait_ms = timing.stage_ms(VoteStage::ExecWait),
+            parents_ms = timing.stage_ms(VoteStage::Parents),
+            lead_ms = timing.stage_ms(VoteStage::LeadSleep),
+            batches_ms = timing.stage_ms(VoteStage::SyncBatches),
+            store_ms = timing.stage_ms(VoteStage::VoteStore),
+            persist_ms = timing.stage_ms(VoteStage::Persist),
+            total_ms = millis(total),
+            "vote path timing"
+        );
+    }
+
+    /// Decide a vote request for `header`, stamping each stage into `timing`.
+    async fn vote_request(
+        &self,
+        peer: BlsPublicKey,
+        header: Header,
+        parents: Vec<Certificate>,
+        timing: &mut VoteTiming,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // Sanity check the peer is the author and bounce quick if not.
         // This should keep a malicious validator from corrupting another
@@ -671,6 +839,7 @@ where
                 // barrier after any failed write or sync; end the epoch rather than recast a
                 // non-durable vote (issue #975), after which `run_epoch` finds the store unable
                 // to make writes durable and stops the node.
+                timing.enter(VoteStage::Persist);
                 self.consensus_config
                     .node_storage()
                     .persist::<Votes>()
@@ -683,12 +852,23 @@ where
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
+        // a node that is not an active cvv (an inactive node catching up, or an observer) has no
+        // live dag to check the header's parents against and must not sign a new vote. refuse
+        // here, after the recast above (a vote already signed for this header is still returned)
+        // and before the per-author lock and the execution wait, so the requester learns at once
+        // instead of waiting out the vote timeout. `vote_inner` checks again before it signs
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
         // voted on in parallel but only one vote for an authority can proceed at a time.
         if let Some(auth_lock) = self.auth_last_vote.get(header.author()) {
             // Check for validator equivocation early and reject if so
+            let lock_wait = Instant::now();
             let mut auth_last_vote = auth_lock.lock().await;
+            timing.lock_acquired(lock_wait);
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
             if let Some((last_epoch, last_round, last_digest, last_response)) =
@@ -760,12 +940,29 @@ where
             let digest = header.digest();
             // Bound the whole evaluation, including a wait for a future-dated header's lead, by the
             // vote timeout rather than the header cadence (see `Parameters::vote_timeout`).
-            let res = tokio::time::timeout(
+            let res = match tokio::time::timeout(
                 self.consensus_config.config().parameters.vote_timeout,
-                self.vote_inner(header, parents),
+                self.vote_inner(header, parents, timing),
             )
             .await
-            .unwrap_or_else(|elapsed| Err(elapsed.into()));
+            {
+                Ok(res) => res,
+                Err(elapsed) => {
+                    let now = Instant::now();
+                    let stage = timing.timed_out_at(now);
+                    self.vote_metrics.record_timeout(stage);
+                    warn!(
+                        target: "primary::network",
+                        author = %committee_peer,
+                        round,
+                        epoch,
+                        stage = stage.as_str(),
+                        elapsed_ms = millis(now.saturating_duration_since(timing.started)),
+                        "vote timeout fired"
+                    );
+                    Err(elapsed.into())
+                }
+            };
             // Do this to cache the "full" response.
             // If pulling from the cache it is fine to already be converted
             // but sometimes we want the full error (basically tests) so return
@@ -886,11 +1083,16 @@ where
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
+    ///
+    /// Each stage is stamped into `timing`, which outlives this future when the vote timeout
+    /// drops it mid-stage.
     async fn vote_inner(
         &self,
         header: Header,
         parents: Vec<Certificate>,
+        timing: &mut VoteTiming,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        timing.enter(VoteStage::Validate);
         // current committee
         let committee = self.consensus_config.committee();
 
@@ -902,18 +1104,26 @@ where
         // `check_for_missing_parents` never evaluates `header.round() - 1` at round 0 (see #789).
         ensure!(header.round() != 0, HeaderError::InvalidRound(header.digest()).into());
 
-        let max_round =
-            self.consensus_bus.committed_round() + self.consensus_config.parameters().gc_depth;
+        let committed_round = self.consensus_bus.committed_round();
+        let max_round = committed_round + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
-        ensure!(
-            header.round() <= max_round,
-            HeaderError::TooNew {
+        if header.round() > max_round {
+            self.vote_metrics.record_too_new();
+            debug!(
+                target: "primary::network",
+                author = %header.author(),
+                round = header.round(),
+                max_round,
+                committed_round,
+                "vote refused: header too new"
+            );
+            return Err(HeaderError::TooNew {
                 digest: header.digest(),
                 header_round: header.round(),
                 max_round,
             }
-            .into()
-        );
+            .into());
+        }
 
         // validate parents
         let num_parents = parents.len();
@@ -968,15 +1178,56 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
-        if self.consensus_bus.wait_for_execution(header.latest_execution_block()).await.is_err() {
-            error!(
-                target: "primary",
-                peer_hash = ?header.latest_execution_block(),
-                expected = ?self.consensus_bus.latest_execution_block_num_hash(),
-                "unexpected execution result received"
-            );
-            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block()).into());
+        // the wait is bounded by `VOTE_EXECUTION_WAIT`, well inside the vote timeout: a voter
+        // further behind refuses with a recoverable `ExecutionBehind` instead of holding the
+        // request, so the requester asks again soon and votes once execution has caught up
+        timing.enter(VoteStage::ExecWait);
+        let header_block = header.latest_execution_block();
+        match tokio::time::timeout(
+            VOTE_EXECUTION_WAIT,
+            self.consensus_bus.wait_for_execution(header_block),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(ExecutionCheckError::Fork)) => {
+                error!(
+                    target: "primary",
+                    peer_hash = ?header_block,
+                    expected = ?self.consensus_bus.latest_execution_block_num_hash(),
+                    "unexpected execution result received"
+                );
+                return Err(HeaderError::UnknownExecutionResult(header_block).into());
+            }
+            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
+                // a snapshot-restored voter holds no block below its floor, so it can neither
+                // confirm nor refute the header's and never will: a final refusal without a
+                // penalty, not a fork
+                warn!(
+                    target: "primary",
+                    header_block = header_block.number,
+                    floor,
+                    "header's execution block is below the restored-state floor; not voting"
+                );
+                return Err(HeaderError::BelowRestoreFloor {
+                    header_block: header_block.number,
+                    floor,
+                }
+                .into());
+            }
+            Ok(Err(ExecutionCheckError::Closed)) => {
+                return Err(HeaderError::ClosedWatchChannel.into());
+            }
+            Err(_) => {
+                self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
+                return Err(HeaderError::ExecutionBehind {
+                    header_block: header_block.number,
+                    local_block: self.consensus_bus.latest_execution_block_num_hash().number,
+                }
+                .into());
+            }
         }
+        timing.enter(VoteStage::Parents);
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
 
         // certifier optimistically sends header without parents
@@ -991,6 +1242,7 @@ where
             if !missing_parents.is_empty() {
                 // return request for missing parents
                 debug!(
+                    target: "primary::network",
                     "Received vote request for {:?} with unknown parents {:?}",
                     header, missing_parents
                 );
@@ -1079,6 +1331,7 @@ where
         // lead is usually smaller now, and if the local clock stepped back meanwhile the header
         // is still deferred or rejected. this runs before the batch sync so a refusal costs no
         // batch fetches
+        timing.enter(VoteStage::LeadSleep);
         match self.check_header_lead(&header, subsecond_active)? {
             HeaderLead::Tolerated(lead) => {
                 if !lead.is_zero() {
@@ -1090,6 +1343,7 @@ where
 
         // parents valid - now verify batches
         // NOTE: this blocks until batches become available
+        timing.enter(VoteStage::SyncBatches);
         self.state_sync.sync_header_batches(&header, false, 0).await?;
 
         // Check if node should vote for this header:
@@ -1107,6 +1361,7 @@ where
         // - ensure correct epoch
         // - ensure previous vote is older than current header round
         // - check if digests match to avoid voting twice for header in the same round
+        timing.enter(VoteStage::VoteStore);
         let previous_vote = self
             .consensus_config
             .node_storage()
@@ -1161,6 +1416,7 @@ where
                         );
                     } else {
                         debug!(
+                            target: "primary::network",
                             "Resending vote {vote:?} for {} at round {}",
                             header,
                             header.round()
@@ -1172,6 +1428,7 @@ where
                         // this barrier after any failed write or sync; end the epoch rather than
                         // recast a non-durable vote (issue #975), and `run_epoch` then stops the
                         // node.
+                        timing.enter(VoteStage::Persist);
                         self.consensus_config
                             .node_storage()
                             .persist::<Votes>()
@@ -1186,7 +1443,12 @@ where
             }
         }
 
-        // this node hasn't voted yet
+        // this node hasn't voted yet. read the mode again: a node demoted while this request
+        // waited on execution, parents or batches must not sign a new vote
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         let vote = Vote::new(
             &header,
             self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
@@ -1211,6 +1473,7 @@ where
         // durable and stops the node. The error maps to `PrimaryNetworkError::Storage`,
         // which carries no peer penalty: this is our local disk failure, not the peer's fault
         // (issue #975).
+        timing.enter(VoteStage::Persist);
         self.consensus_config
             .node_storage()
             .persist::<Votes>()
@@ -1220,6 +1483,7 @@ where
                 self.consensus_config.shutdown().notify();
             })?;
 
+        timing.vote_created();
         Ok(PrimaryResponse::Vote(vote))
     }
 
@@ -1650,4 +1914,312 @@ enum HeaderLead {
     /// Tier 2: too far ahead to vote on now. The request ends with a recoverable response
     /// carrying this reason, and the proposer retries.
     Deferred(PrimaryRPCError),
+}
+
+/// Stage stamps for one vote request, owned by the stack of [`RequestHandler::vote`].
+///
+/// `RequestHandler::vote_inner` runs under the vote timeout, which drops it mid-stage when it
+/// fires, so the stamps live with the caller and `vote_inner` only borrows them: the stage in
+/// progress is still known after a timeout.
+#[derive(Debug)]
+struct VoteTiming {
+    /// When the request reached [`RequestHandler::vote`].
+    started: Instant,
+    /// The wait for the author's vote lock, once the lock was acquired.
+    lock: Option<Duration>,
+    /// The stage in progress and when it began.
+    current: Option<(VoteStage, Instant)>,
+    /// Time spent per stage, indexed by [`VoteStage::index`]; `None` for a stage not reached.
+    stages: [Option<Duration>; VoteStage::COUNT],
+    /// Whether this request signed, stored and made durable a new vote.
+    created: bool,
+    /// The stage in progress when the vote timeout fired.
+    timed_out: Option<VoteStage>,
+}
+
+impl VoteTiming {
+    /// Start timing a request that arrived now.
+    fn new() -> Self {
+        Self::started_at(Instant::now())
+    }
+
+    /// Start timing a request that arrived at `started`.
+    fn started_at(started: Instant) -> Self {
+        Self {
+            started,
+            lock: None,
+            current: None,
+            stages: [None; VoteStage::COUNT],
+            created: false,
+            timed_out: None,
+        }
+    }
+
+    /// Record the wait for the author's vote lock, which began at `waiting_since`.
+    fn lock_acquired(&mut self, waiting_since: Instant) {
+        self.lock = Some(waiting_since.elapsed());
+    }
+
+    /// End the stage in progress, if any, and begin `stage` now.
+    fn enter(&mut self, stage: VoteStage) {
+        self.enter_at(stage, Instant::now());
+    }
+
+    /// End the stage in progress, if any, and begin `stage` at `now`.
+    fn enter_at(&mut self, stage: VoteStage, now: Instant) {
+        self.close_at(now);
+        self.current = Some((stage, now));
+    }
+
+    /// Mark that this request returns a new vote.
+    fn vote_created(&mut self) {
+        self.created = true;
+    }
+
+    /// Record that the vote timeout fired at `now`, ending the stage in progress and returning it.
+    ///
+    /// `vote_inner` enters [`VoteStage::Validate`] on its first poll, which the timeout runs
+    /// before checking its deadline, so a stage is always in progress here; `Validate` is the
+    /// fallback all the same.
+    fn timed_out_at(&mut self, now: Instant) -> VoteStage {
+        let stage = self.current.map_or(VoteStage::Validate, |(stage, _)| stage);
+        self.close_at(now);
+        self.timed_out = Some(stage);
+        stage
+    }
+
+    /// End the stage in progress, if any, and return the request's total time at `now`.
+    fn finish_at(&mut self, now: Instant) -> Duration {
+        self.close_at(now);
+        now.saturating_duration_since(self.started)
+    }
+
+    /// End the stage in progress, if any, at `now`, adding its time to the stage's total.
+    fn close_at(&mut self, now: Instant) {
+        if let Some((stage, since)) = self.current.take() {
+            let spent = now.saturating_duration_since(since);
+            let total = &mut self.stages[stage.index()];
+            *total = Some(total.map_or(spent, |prior| prior.saturating_add(spent)));
+        }
+    }
+
+    /// The time spent in `stage`, or `None` if the request never reached it.
+    fn stage(&self, stage: VoteStage) -> Option<Duration> {
+        self.stages[stage.index()]
+    }
+
+    /// The whole milliseconds spent in `stage`, zero if the request never reached it.
+    fn stage_ms(&self, stage: VoteStage) -> u64 {
+        self.stage(stage).map_or(0, millis)
+    }
+}
+
+/// How a vote request ended: the `outcome` field of the `vote path timing` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoteOutcome {
+    /// A new vote was signed, made durable and returned.
+    Created,
+    /// A vote signed earlier for this header was returned again.
+    Recast,
+    /// The header's parents are unknown here and the response asks the proposer for them.
+    MissingParents,
+    /// A recoverable "not yet" response: the header leads the local clock beyond the drift
+    /// tolerance.
+    Deferred,
+    /// The header round is beyond the committed round plus the gc depth.
+    TooNew,
+    /// A recoverable refusal because this node is not ready to vote: it is not an active committee
+    /// validator, or its execution did not reach the header's block within the voter's execution
+    /// wait.
+    Behind,
+    /// The request or its header failed a check, or a cached refusal was returned.
+    Rejected,
+    /// The vote timeout fired before a decision.
+    Timeout,
+    /// A local failure (storage, the durability barrier, a channel, batch sync) ended the request.
+    Error,
+}
+
+impl VoteOutcome {
+    /// Classify a finished vote request from its result and stage stamps.
+    fn of(res: &PrimaryNetworkResult<PrimaryResponse>, timing: &VoteTiming) -> Self {
+        if timing.timed_out.is_some() {
+            return Self::Timeout;
+        }
+        match res {
+            Ok(PrimaryResponse::Vote(_)) if timing.created => Self::Created,
+            Ok(PrimaryResponse::Vote(_)) => Self::Recast,
+            Ok(PrimaryResponse::MissingParents(_)) => Self::MissingParents,
+            Ok(PrimaryResponse::RecoverableError(_)) => Self::Deferred,
+            // a refusal cached for this header's digest
+            Ok(_) => Self::Rejected,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. })) => Self::TooNew,
+            Err(PrimaryNetworkError::InvalidHeader(
+                HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
+            )) => Self::Behind,
+            Err(PrimaryNetworkError::Timeout(_)) => Self::Timeout,
+            Err(PrimaryNetworkError::InvalidHeader(
+                HeaderError::Storage(_)
+                | HeaderError::ClosedWatchChannel
+                | HeaderError::NotCommitteeMember
+                | HeaderError::BelowRestoreFloor { .. }
+                | HeaderError::SyncBatches(_)
+                | HeaderError::TNSend(_)
+                | HeaderError::PendingCertificateOneshot,
+            )) => Self::Error,
+            Err(
+                PrimaryNetworkError::InvalidHeader(_)
+                | PrimaryNetworkError::Certificate(_)
+                | PrimaryNetworkError::PeerNotInCommittee(_)
+                | PrimaryNetworkError::InvalidRequest(_)
+                | PrimaryNetworkError::Decode(_),
+            ) => Self::Rejected,
+            Err(_) => Self::Error,
+        }
+    }
+
+    /// The static `outcome` field value.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Recast => "recast",
+            Self::MissingParents => "missing_parents",
+            Self::Deferred => "deferred",
+            Self::TooNew => "too_new",
+            Self::Behind => "behind",
+            Self::Rejected => "rejected",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Rate limit for the `behind the gc window inside the rejoin grace; holding demotion` line: one
+/// line per [`REJOIN_GRACE_LOG_INTERVAL`] at most, carrying the holds counted since the previous
+/// line. The lines add up to every hold up to the last one logged; holds after it appear on the
+/// next line, or only in `rejoin_grace_holds_total` if the node is demoted or the handler rebuilt
+/// first.
+///
+/// Locked only to record a hold, never across an await. Stamps use the tokio clock so a paused
+/// test clock drives the interval.
+#[derive(Debug, Default)]
+struct RejoinGraceLog {
+    /// When the last line was logged.
+    last_logged: Option<tokio::time::Instant>,
+    /// Holds recorded since the last line.
+    holds: u64,
+}
+
+impl RejoinGraceLog {
+    /// Record a hold at `now`. When a line is due, returns the holds it reports (this one and the
+    /// ones not logged since the previous line) and restarts the interval; otherwise `None`.
+    fn record_hold(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        self.holds = self.holds.saturating_add(1);
+        let due = self.last_logged.is_none_or(|logged_at| {
+            now.saturating_duration_since(logged_at) >= REJOIN_GRACE_LOG_INTERVAL
+        });
+        if !due {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.holds))
+    }
+}
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX`.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+
+    /// Stages accumulate between stamps, a re-entered stage adds up, and a timeout names and
+    /// closes the stage in progress.
+    #[test]
+    fn test_vote_timing_stage_stamps() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut timing = VoteTiming::started_at(t0);
+        timing.enter_at(VoteStage::Validate, at(1));
+        timing.enter_at(VoteStage::ExecWait, at(4));
+        timing.enter_at(VoteStage::Parents, at(10));
+        assert_eq!(timing.timed_out_at(at(5_010)), VoteStage::Parents);
+        assert_eq!(timing.timed_out, Some(VoteStage::Parents));
+        // the timeout closed the stage, so finishing later adds nothing to it
+        assert_eq!(timing.finish_at(at(5_011)), Duration::from_millis(5_011));
+        assert_eq!(timing.stage_ms(VoteStage::Validate), 3);
+        assert_eq!(timing.stage_ms(VoteStage::ExecWait), 6);
+        assert_eq!(timing.stage_ms(VoteStage::Parents), 5_000);
+        for stage in
+            [VoteStage::LeadSleep, VoteStage::SyncBatches, VoteStage::VoteStore, VoteStage::Persist]
+        {
+            assert_eq!(timing.stage(stage), None, "{} was never entered", stage.as_str());
+            assert_eq!(timing.stage_ms(stage), 0);
+        }
+
+        // a stage entered twice (the recast path) sums both spans, and finishing closes the last
+        let mut timing = VoteTiming::started_at(t0);
+        timing.enter_at(VoteStage::Persist, at(2));
+        timing.enter_at(VoteStage::VoteStore, at(7));
+        timing.enter_at(VoteStage::Persist, at(9));
+        assert_eq!(timing.finish_at(at(20)), Duration::from_millis(20));
+        assert_eq!(timing.stage(VoteStage::Persist), Some(Duration::from_millis(16)));
+        assert_eq!(timing.stage(VoteStage::VoteStore), Some(Duration::from_millis(2)));
+        assert_eq!(timing.timed_out, None);
+
+        // a timeout before any stage falls back to the first stage
+        let mut timing = VoteTiming::started_at(t0);
+        assert_eq!(timing.timed_out_at(at(1)), VoteStage::Validate);
+
+        timing.lock_acquired(t0);
+        assert!(timing.lock.is_some());
+        assert_eq!(millis(Duration::MAX), u64::MAX);
+    }
+
+    /// Every outcome the vote path can produce maps to its static label.
+    #[test]
+    fn test_vote_outcome_classification() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let header = fixture.header_from_last_authority();
+        let vote = fixture.authorities().next().expect("committee member").vote(&header);
+        let outcome = |res: PrimaryNetworkResult<PrimaryResponse>, timing: &VoteTiming| {
+            VoteOutcome::of(&res, timing).as_str()
+        };
+        let reason = || PrimaryRPCError("reason".to_string());
+
+        let mut timing = VoteTiming::new();
+        assert_eq!(outcome(Ok(PrimaryResponse::Vote(vote.clone())), &timing), "recast");
+        assert_eq!(
+            outcome(Ok(PrimaryResponse::MissingParents(Vec::new())), &timing),
+            "missing_parents"
+        );
+        assert_eq!(outcome(Ok(PrimaryResponse::RecoverableError(reason())), &timing), "deferred");
+        assert_eq!(outcome(Ok(PrimaryResponse::Error(reason())), &timing), "rejected");
+        let too_new =
+            HeaderError::TooNew { digest: HeaderDigest::default(), header_round: 10, max_round: 5 };
+        assert_eq!(outcome(Err(too_new.into()), &timing), "too_new");
+        assert_eq!(outcome(Err(HeaderError::PeerNotAuthor.into()), &timing), "rejected");
+        assert_eq!(outcome(Err(HeaderError::InvalidParentRound.into()), &timing), "rejected");
+        assert_eq!(outcome(Err(HeaderError::NotActiveCvv.into()), &timing), "behind");
+        let behind = HeaderError::ExecutionBehind { header_block: 12, local_block: 9 };
+        assert_eq!(outcome(Err(behind.into()), &timing), "behind");
+        let storage = HeaderError::Storage(eyre::eyre!("disk"));
+        assert_eq!(outcome(Err(storage.into()), &timing), "error");
+        assert_eq!(
+            outcome(Err(PrimaryNetworkError::Storage(eyre::eyre!("barrier"))), &timing),
+            "error"
+        );
+
+        timing.vote_created();
+        assert_eq!(outcome(Ok(PrimaryResponse::Vote(vote.clone())), &timing), "created");
+
+        // a fired timeout wins over whatever the result carries
+        timing.timed_out_at(Instant::now());
+        assert_eq!(outcome(Ok(PrimaryResponse::Vote(vote)), &timing), "timeout");
+    }
 }

@@ -217,15 +217,19 @@
 //!
 //! - `total`: the wall time of one `execute_consensus_output` call.
 //! - `execute`, `finish` and `overlay extend`: the output's blocks' `tn_reth.block_*_seconds`,
-//!   summed. `execute` includes `signer recovery`; `finish` includes `hashed state` and `state
-//!   root`.
+//!   summed. `finish` includes `hashed state` and `state root`.
+//! - `signer recovery`: the output's per-batch `tn_reth.block_signer_recovery_seconds`, summed.
+//!   `execute_consensus_output` recovers every batch's signers concurrently before the first block,
+//!   so the samples overlap: their sum is not part of `execute`, and the recovery's wall time falls
+//!   in `other`.
 //! - `save_blocks`: reth's `save_blocks_total`. `mdbx` is its database writes, which include
 //!   `insert_block` through `update_history_indices`; `sf` is the static-file writes, which run
 //!   beside them on another thread.
 //! - `commit sf` and `commit mdbx`: the static files' commit and the database commit after
 //!   `save_blocks`, outside `save_blocks_total`.
 //! - `other`: `total` minus `execute`, `finish`, `overlay extend`, `save_blocks`, `commit sf` and
-//!   `commit mdbx`: the engine's own work, announcing the output and finalizing.
+//!   `commit mdbx`: the engine's own work (signer recovery included), announcing the output and
+//!   finalizing.
 //!
 //! reth names the database stages `mdbx` (its metrics `save_blocks_mdbx` and
 //! `save_blocks_commit_mdbx`) whatever the engine, and the labels and JSON keys keep its names: on
@@ -1380,7 +1384,7 @@ const CAPTURED: [(&str, Per); 16] = [
     (COMMIT_MDBX, Per::Output),
 ];
 
-/// A block's EVM execution, signer recovery included.
+/// A block's EVM execution (signer recovery runs before it, once per batch).
 const EXECUTE: &str = "tn_reth.block_execute_seconds";
 /// A block's `builder.finish`, hashed state and state root included.
 const FINISH: &str = "tn_reth.block_finish_seconds";
@@ -2182,7 +2186,7 @@ const STAGES: [(&str, &str, Stage); 18] = [
     ("total", "total", Stage::Total),
     ("  execute", "execute", Stage::Captured(EXECUTE)),
     (
-        "    signer recovery",
+        "  signer recovery",
         "signer_recovery",
         Stage::Captured("tn_reth.block_signer_recovery_seconds"),
     ),

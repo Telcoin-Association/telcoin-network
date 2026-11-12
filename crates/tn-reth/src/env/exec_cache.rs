@@ -11,7 +11,8 @@
 //!
 //! # Where it sits
 //!
-//! [`RethEnv::build_block_from_batch_payload`] wraps the parent's state provider
+//! Every block build ([`RethEnv::build_block_from_batch_payload`], and the engine's
+//! [`RethEnv::build_block_from_recovered_payload`]) wraps the parent's state provider
 //! (`state_by_block_hash(parent)`: the in-memory blocks of the output over the database) in a
 //! [`CachedStateProvider`], under the block's own `CachedReads` and revm `State`. A hit skips the
 //! in-memory overlay scan and the database read (and, in storage layout v2, the keccak of the key).

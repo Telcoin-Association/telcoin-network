@@ -47,6 +47,49 @@ pub(crate) struct EngineMetrics {
     /// epoch 0 has no commit floor, so they are clamped when validator clocks lag the genesis
     /// timestamp.
     pub(crate) evm_timestamp_clamped_total: Counter,
+    /// Time a consensus output waited in the engine's queue, from being received off the
+    /// consensus stream to its execution task being spawned.
+    pub(crate) queue_wait_seconds: Histogram,
+    /// Time to durably persist one executed consensus output (the whole bounded retry,
+    /// including any retry backoff), recorded whether or not the persist succeeded.
+    pub(crate) persist_duration_seconds: Histogram,
+    /// Wall-clock milliseconds the engine spent running execution tasks. The busy fraction of
+    /// the engine is `rate(tn_engine_busy_milliseconds_total[1m]) / 1000`.
+    pub(crate) busy_milliseconds_total: Counter,
+    // bench5 exec-split
+    /// Signer recovery time of one consensus output: the duration of the background job that
+    /// recovers the output's signers when it is queued (or of the inline recovery, on the
+    /// fallback and for callers without a job), logged as `recover_ms` on the `signers
+    /// recovered` line. The job runs beside the execution thread, overlapping earlier outputs'
+    /// execution and sharing the rayon pool with their builds, so unlike the evm, root and
+    /// finish histograms it does not sum to the output's execute time, and that contention can
+    /// stretch it past what the same recovery takes alone. The part the execution thread waited
+    /// for is `recover_wait_ms` on the `output executed` line, which has no `recover_ms` field.
+    pub(crate) recover_seconds: Histogram,
+    /// Builder setup, pre-execution system calls and transaction loop of one consensus output,
+    /// summed over its blocks.
+    pub(crate) evm_seconds: Histogram,
+    /// State-root time of one consensus output, summed over its blocks.
+    pub(crate) root_seconds: Histogram,
+    /// The rest of block finishing for one consensus output (closing system calls, bundle merge,
+    /// hashed post-state, assembly, delta sorts, overlay extend), summed over its blocks.
+    pub(crate) finish_seconds: Histogram,
+    /// Transactions handed to the block builder by fully executed consensus outputs, counted
+    /// before unrecoverable or invalid transactions are dropped (the per-transaction cost
+    /// denominator).
+    pub(crate) executed_transactions_total: Counter,
+    /// Time from the node forwarding a consensus output (stamped just before its send on the
+    /// `to_engine` channel) to the engine taking it off that channel, a send blocked on a full
+    /// channel included. `queue_wait_seconds` covers the next hop.
+    pub(crate) forward_wait_seconds: Histogram,
+    /// Consensus outputs waiting in the `to_engine` channel behind the engine's own queue,
+    /// sampled when an output arrives and when an execution completes.
+    pub(crate) channel_depth: Gauge,
+    // bench5 signer-reuse
+    /// Consensus outputs whose background signer recovery ended without a result (the job
+    /// panicked), so the execution task recovered the signers inline from the same bytes.
+    /// Nonzero is a bug signal; the blocks built are the same either way.
+    pub(crate) recovery_fallback_total: Counter,
 }
 
 #[cfg(test)]
@@ -73,6 +116,17 @@ mod tests {
             metrics.persist_failures_total.increment(1);
             metrics.cross_producer_repacked_txs_total.increment(4);
             metrics.evm_timestamp_clamped_total.increment(5);
+            metrics.queue_wait_seconds.record(0.25);
+            metrics.persist_duration_seconds.record(0.5);
+            metrics.busy_milliseconds_total.increment(750);
+            metrics.recover_seconds.record(0.01);
+            metrics.evm_seconds.record(0.02);
+            metrics.root_seconds.record(0.03);
+            metrics.finish_seconds.record(0.04);
+            metrics.executed_transactions_total.increment(12_500);
+            metrics.forward_wait_seconds.record(0.05);
+            metrics.channel_depth.set(64.0);
+            metrics.recovery_fallback_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -100,5 +154,27 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(4)));
         let (_, _, _, value) = find("tn_engine.evm_timestamp_clamped_total");
         assert!(matches!(value, DebugValue::Counter(5)));
+        let (_, _, _, value) = find("tn_engine.queue_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.25));
+        let (_, _, _, value) = find("tn_engine.persist_duration_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.5));
+        let (_, _, _, value) = find("tn_engine.busy_milliseconds_total");
+        assert!(matches!(value, DebugValue::Counter(750)));
+        let (_, _, _, value) = find("tn_engine.recover_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.01));
+        let (_, _, _, value) = find("tn_engine.evm_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.02));
+        let (_, _, _, value) = find("tn_engine.root_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.03));
+        let (_, _, _, value) = find("tn_engine.finish_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.04));
+        let (_, _, _, value) = find("tn_engine.executed_transactions_total");
+        assert!(matches!(value, DebugValue::Counter(12_500)));
+        let (_, _, _, value) = find("tn_engine.forward_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.05));
+        let (_, _, _, value) = find("tn_engine.channel_depth");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 64.0));
+        let (_, _, _, value) = find("tn_engine.recovery_fallback_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
     }
 }

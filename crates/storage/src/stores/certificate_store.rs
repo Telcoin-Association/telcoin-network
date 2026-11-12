@@ -1,6 +1,6 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies,
 //! apart from `write_all`'s failure path, which needs the crate-internal `FAIL_SAVE_CERT_AFTER`
-//! hook.
+//! hook, and the check that pruning keeps the rounds a rejoining validator rebuilds from.
 
 use std::{
     cmp::{max, Ordering},
@@ -520,13 +520,15 @@ mod test {
 
     use tempfile::TempDir;
     use tn_types::{
-        AuthorityIdentifier, Certificate, Database as _, Hash as _, HeaderBuilder, HeaderDigest,
+        rejoin_round_window, AuthorityIdentifier, Certificate, Database as _, Hash as _,
+        HeaderBuilder, HeaderDigest, Round,
     };
 
     use super::{test_hook::FAIL_SAVE_CERT_AFTER, CertificateStore as _, NOTIFY_SUBSCRIBERS};
     use crate::{
         tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
         tndb::{SplitDatabase, TnDbOptions},
+        ROUNDS_TO_KEEP,
     };
 
     /// tndb with the certificate tables open.
@@ -599,5 +601,60 @@ mod test {
         let err = result.expect("ran").expect_err("the second certificate fails");
         assert!(err.to_string().contains("injected by a test"), "the save error: {err}");
         assert!(!first_notified, "nothing is notified after a failed write");
+    }
+
+    /// A validator that restarts consensus at its last handled leader round `C` (a rejoin, a
+    /// restart) rebuilds its DAG from every round above its GC round `C - gc_depth`, fetched from
+    /// peers whose stores prune below their newest written round `H` minus `ROUNDS_TO_KEEP`. A
+    /// rejoin promotes up to `rejoin_round_window` (20 at `gc_depth` 50) behind the newest header
+    /// and the store's head runs a few rounds past that header, so `H - C` is 25 here, and every
+    /// round from `C - 49` must survive the pruning. The former `ROUNDS_TO_KEEP` of 64 fails this
+    /// (it kept rounds from `H - 64` = 136 while the rebuild needs 126; it fails once `H - C`
+    /// reaches 16).
+    #[test]
+    fn rejoin_rebuild_rounds_survive_pruning() {
+        const COMMITTEE: u8 = 4;
+        const GC_DEPTH: Round = 50;
+        const HEAD: Round = 200;
+        // the rejoin window plus the store's head running 5 rounds past the newest header
+        const REJOIN_ROUND: Round = HEAD - rejoin_round_window(GC_DEPTH) - 5;
+
+        let dir = TempDir::with_prefix("cert_rejoin_rebuild").expect("temp dir");
+        let db = open_db(&dir);
+        for round in 1..=HEAD {
+            for author in 1..=COMMITTEE {
+                let header = HeaderBuilder::default()
+                    .author(AuthorityIdentifier::dummy_for_test(author))
+                    .round(round)
+                    .epoch(0)
+                    .build();
+                let mut certificate = Certificate::default();
+                certificate.update_header_for_test(header);
+                // each write prunes, as on the gossip and fetch paths
+                db.write(certificate).expect("write");
+            }
+        }
+
+        let stored = db.origins_after_round(0).expect("origins");
+        assert_eq!(
+            stored.keys().next(),
+            Some(&(HEAD - ROUNDS_TO_KEEP)),
+            "the store keeps the rounds from its head minus ROUNDS_TO_KEEP"
+        );
+
+        // the consensus restore reads `after_round(gc_round + 1)`; the certificate manager and
+        // bullshark need every one of those rounds for the parents of the rounds above
+        let gc_round = REJOIN_ROUND - GC_DEPTH;
+        let rebuild = db.origins_after_round(gc_round + 1).expect("origins");
+        for round in gc_round + 1..=HEAD {
+            assert_eq!(
+                rebuild.get(&round).map(Vec::len),
+                Some(usize::from(COMMITTEE)),
+                "round {round} of the rebuild from {} was pruned",
+                gc_round + 1
+            );
+        }
+        let restored = db.after_round(gc_round + 1).expect("after round");
+        assert_eq!(restored.len(), (HEAD - gc_round) as usize * usize::from(COMMITTEE));
     }
 }

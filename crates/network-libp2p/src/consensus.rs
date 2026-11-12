@@ -82,6 +82,9 @@ struct PendingOutbound<Res: TNMessage> {
     reply: NetworkResponseSender<Res>,
     /// The time that the swarm sent the request, for the round-trip histogram.
     sent: Instant,
+    /// The service class that the peer serves the request under, for the round-trip histogram's
+    /// `class` label and the request resolution log.
+    class: ServiceClass,
 }
 
 #[cfg(test)]
@@ -1315,28 +1318,46 @@ where
         }
     }
 
-    /// Track an outbound request until its response or failure arrives, stamping the send time
-    /// for the round-trip histogram.
+    /// Track an outbound request of `class` until its response or failure arrives, stamping the
+    /// send time for the round-trip histogram.
     fn track_outbound(
         &mut self,
         peer: PeerId,
         request_id: OutboundRequestId,
+        class: ServiceClass,
         reply: NetworkResponseSender<Res>,
     ) {
         self.outbound_requests
-            .insert((peer, request_id), PendingOutbound { reply, sent: Instant::now() });
+            .insert((peer, request_id), PendingOutbound { reply, sent: Instant::now(), class });
     }
 
-    /// Stop tracking the outbound request `(peer, request_id)`, observe its round trip under
-    /// `outcome`, and return the caller's reply channel when the request was still pending.
+    /// Stop tracking the outbound request `(peer, request_id)` and return the caller's reply
+    /// channel when the request was still pending.
+    ///
+    /// `result` is `Ok` for a response and carries the error otherwise. A pending request
+    /// observes its round trip under the outcome and its service class and logs one
+    /// `network::reqres` line: `response received` or `outbound request failed`.
     fn resolve_outbound(
         &mut self,
         peer: PeerId,
         request_id: OutboundRequestId,
-        outcome: OutboundRequestOutcome,
+        result: Result<(), &dyn std::fmt::Debug>,
     ) -> Option<NetworkResponseSender<Res>> {
         self.outbound_requests.remove(&(peer, request_id)).map(|pending| {
-            self.metrics.record_outbound_request_duration(outcome, pending.sent.elapsed());
+            let elapsed = pending.sent.elapsed();
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let class = pending.class.label();
+            let outcome = match result {
+                Ok(()) => {
+                    debug!(target: "network::reqres", %peer, %request_id, %class, elapsed_ms, "response received");
+                    OutboundRequestOutcome::Response
+                }
+                Err(error) => {
+                    debug!(target: "network::reqres", %peer, %request_id, %class, elapsed_ms, ?error, "outbound request failed");
+                    OutboundRequestOutcome::Failure
+                }
+            };
+            self.metrics.record_outbound_request_duration(outcome, pending.class, elapsed);
             pending.reply
         })
     }
@@ -1704,20 +1725,22 @@ where
                 debug!(target: "network", "send request for bls {peer}");
                 if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     debug!(target: "network", "trying to send to {peer} at {addr:?}");
+                    let class = request.service_class();
                     let request_id = self
                         .swarm
                         .behaviour_mut()
                         .req_res
                         .send_request_with_addresses(&peer, request, addr);
-                    self.track_outbound(peer, request_id, reply);
+                    self.track_outbound(peer, request_id, class, reply);
                 } else {
                     // Best effort to return an error to caller.
                     let _ = reply.send(Err(NetworkError::PeerMissing));
                 }
             }
             NetworkCommand::SendRequestDirect { peer, request, reply } => {
+                let class = request.service_class();
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.track_outbound(peer, request_id, reply);
+                self.track_outbound(peer, request_id, class, reply);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
                 // Rotating an empty list will panic...
@@ -1725,8 +1748,9 @@ where
                     self.connected_peers.rotate_left(1);
                 }
                 if let Some(peer) = self.connected_peers.front() {
+                    let class = request.service_class();
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.track_outbound(*peer, request_id, reply);
+                    self.track_outbound(*peer, request_id, class, reply);
                 } else {
                     // Ignore error since this means other end lost interest and we don't really
                     // care.
@@ -2177,6 +2201,7 @@ where
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
                             let class = request.service_class();
+                            debug!(target: "network::reqres", %peer, %request_id, class = %class.label(), "inbound request");
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
                             let forwarded =
@@ -2225,8 +2250,7 @@ where
                         }
 
                         // try to forward response to original caller
-                        let outcome = OutboundRequestOutcome::Response;
-                        let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
+                        let _ = self.resolve_outbound(peer, request_id, Ok(())).map(|ack| {
                             // The response payload is genuine (we still hold the
                             // matching outbound request). If the responder's BLS
                             // identity has not resolved yet, report a transient
@@ -2301,8 +2325,7 @@ where
                 }
 
                 // try to forward error to original caller
-                let outcome = OutboundRequestOutcome::Failure;
-                let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
+                let _ = self.resolve_outbound(peer, request_id, Err(&error)).map(|ack| {
                     let _ = ack.send(Err(NetworkError::Outbound(error.into())));
                 });
             }
@@ -2361,9 +2384,12 @@ where
                 });
             }
 
-            ReqResEvent::ResponseSent { request_id, .. } => {
+            ReqResEvent::ResponseSent { peer, request_id, connection_id: _ } => {
                 if let Some(entry) = self.inbound_requests.remove(&request_id) {
-                    self.metrics.record_service_time(entry.class, entry.received.elapsed());
+                    let service = entry.received.elapsed();
+                    let service_ms = u64::try_from(service.as_millis()).unwrap_or(u64::MAX);
+                    debug!(target: "network::reqres", %peer, %request_id, class = %entry.class.label(), service_ms, "response sent");
+                    self.metrics.record_service_time(entry.class, service);
                     self.close_inbound(entry);
                 }
             }
@@ -2711,9 +2737,10 @@ where
         } else if self.goodbyes_in_flight() < self.config.max_px_disconnects {
             // attempt to exchange peer information if limits allow
             let (reply, done) = oneshot::channel();
-            let request_id =
-                self.swarm.behaviour_mut().req_res.send_request(&peer_id, peer_exchange.into());
-            self.track_outbound(peer_id, request_id, reply);
+            let request: Req = peer_exchange.into();
+            let class = request.service_class();
+            let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer_id, request);
+            self.track_outbound(peer_id, request_id, class, reply);
 
             let timeout = self.config.px_disconnect_timeout;
             let handle = self.network_handle();
@@ -2810,9 +2837,9 @@ where
                 // remove from outbound_requests and send error
                 for k in keys {
                     let (peer, request_id) = k;
-                    let outcome = OutboundRequestOutcome::Failure;
-                    let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
-                        let _ = ack.send(Err(NetworkError::Disconnected));
+                    let error = NetworkError::Disconnected;
+                    let _ = self.resolve_outbound(peer, request_id, Err(&error)).map(|ack| {
+                        let _ = ack.send(Err(error));
                     });
                 }
             }

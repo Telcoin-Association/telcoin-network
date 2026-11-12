@@ -12,7 +12,9 @@ use tn_test_utils_committee as _;
 
 use std::{future::Future, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics, SYNC_OUTPUT_CHANNEL_CAPACITY};
+use tn_primary::{
+    ConsensusBusApp, ExecutionCheckError, NodeMode, PrimaryMetrics, SYNC_OUTPUT_CHANNEL_CAPACITY,
+};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
@@ -64,6 +66,14 @@ async fn complete_with_stall_ticks<F: Future>(
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
 ///
+/// `committed_round` is primed from the leader round of the last executed consensus block (0 in
+/// a new epoch). `primary_round` is primed from the larger of that round and the leader round of
+/// the newest consensus header this node has seen, when that header belongs to the epoch being
+/// started. A validator promoted back into the committee mid-epoch has followed consensus up to
+/// that header, so its proposer starts at the network head instead of a round the committee left
+/// long ago. On a fresh chain or a new epoch the newest header is absent or from an older epoch,
+/// and both rounds are primed exactly as before.
+///
 /// A failed storage lookup is propagated so startup halts loudly; only a genuinely absent
 /// header (fresh chain or a new epoch) defaults and primes the rounds from a fresh start.
 pub async fn prime_consensus<DB: Database>(
@@ -81,7 +91,7 @@ pub async fn prime_consensus<DB: Database>(
     // check if the latest subdag is from the current epoch
     // this function is called at startup and at each epoch boundary
     let last_subdag = &last_executed_block.sub_dag;
-    let last_consensus_round = if last_subdag.leader_epoch() < current_epoch {
+    let exec_round = if last_subdag.leader_epoch() < current_epoch {
         // new epoch
         0
     } else {
@@ -89,8 +99,29 @@ pub async fn prime_consensus<DB: Database>(
         last_subdag.leader_round()
     };
 
-    consensus_bus.committed_round_updates().send_replace(last_consensus_round);
-    consensus_bus.primary_round_updates().send_replace(last_consensus_round);
+    // the newest header is authenticated by its epoch's committee before it reaches the watch.
+    // rounds restart every epoch, so a header from any other epoch says nothing about this one.
+    // copied out of the watch so its read guard is released before the sends below.
+    let newest_round = consensus_bus
+        .last_consensus_header()
+        .borrow()
+        .as_ref()
+        .filter(|header| header.sub_dag.leader_epoch() == current_epoch)
+        .map_or(0, |header| header.sub_dag.leader_round());
+    let primary_round = exec_round.max(newest_round);
+
+    // never seed committed_round from the newest header: the certificate manager derives its gc
+    // round from committed_round, so a higher value would admit certificates whose parents this
+    // node never received and leave holes in the dag it commits from.
+    consensus_bus.committed_round_updates().send_replace(exec_round);
+    consensus_bus.primary_round_updates().send_replace(primary_round);
+    info!(
+        target: "state-sync",
+        exec_round,
+        newest_round,
+        primary_round,
+        "primed consensus rounds"
+    );
     Ok(())
 }
 
@@ -107,7 +138,8 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvActive => {}
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
-            let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
+            let (config_clone, consensus_bus_clone, consensus_chain_clone) =
+                (config.clone(), consensus_bus.clone(), consensus_chain.clone());
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 async move {
@@ -115,6 +147,7 @@ pub fn spawn_state_sync<DB: Database>(
                     spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
+                        consensus_chain_clone,
                     ).await;
                     Ok(())
                 },
@@ -144,25 +177,39 @@ pub fn spawn_state_sync<DB: Database>(
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
 /// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
-/// pack or 0 if the output already resides in a static (imported) pack. An output whose number
+/// pack or 0 if the output already resides in a static (imported) pack, with how long the
+/// persist after the save took (see [`SavedConsensus`]). An output whose number
 /// does not advance the chain's latest consensus is an error (it used to be a silent 0-byte
 /// no-op, which let a node resuming from a collapsed height 0 discard every output silently).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
     metrics: &PrimaryMetrics,
-) -> eyre::Result<u64> {
+) -> eyre::Result<SavedConsensus> {
     let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
     // Make sure we have persisted the consensus output before we execute. Forwarding it to
     // execution evicts its batches from NodeBatchesCache, which is only safe once the pack holds
     // them.
-    consensus_chain.persist_current().await?;
+    let (pack_persist, slots_persist) = consensus_chain.persist_current_timed().await?;
     // A zero byte count means this output already resides in a static (imported) pack and
     // nothing was written; recording it as the "most recent" output size would be misleading.
     if output_bytes > 0 {
         metrics.record_consensus_output_bytes(output_bytes);
     }
-    Ok(output_bytes)
+    Ok(SavedConsensus { bytes: output_bytes, pack_persist, slots_persist })
+}
+
+/// What [`save_consensus`] wrote for one output and how long making it durable took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedConsensus {
+    /// Bytes the encoded output takes in the current pack, or 0 when the output already resides
+    /// in a static (imported) pack and nothing was written.
+    pub bytes: u64,
+    /// How long the current pack's sync took.
+    pub pack_persist: Duration,
+    /// How long the sync of the latest-consensus slot files took. It runs beside the pack's
+    /// sync, so the persist as a whole takes about the longer of the two.
+    pub slots_persist: Duration,
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.
@@ -588,18 +635,35 @@ async fn catch_up_consensus_from_to<DB: Database>(
             },
         )
         .await;
-        if wait_result.is_err() {
-            // We seem to have forked, so die.
-            error!(
+        match wait_result {
+            Ok(()) => {}
+            // a snapshot-restored node holds no block below its floor and cannot check this one;
+            // the voters that certified the leader checked it against their own chains
+            Err(ExecutionCheckError::BelowFloor { floor }) => warn!(
                 target: "tn::observer",
                 block_number = number,
-                ?base_execution_block,
-                "wait_for_execution failed - execution fork detected"
-            );
-            return Err(eyre::eyre!(
-                "consensus_output has a parent not in our chain, missing {base_execution_block:?} recents: {:?}!",
-                consensus_bus.recent_blocks().borrow()
-            ));
+                base_block = base_execution_block.number,
+                floor,
+                "output's base block is below the restored-state floor; not checked"
+            ),
+            Err(ExecutionCheckError::Closed) => {
+                return Err(eyre::eyre!(
+                    "recent blocks watch closed while checking {base_execution_block:?}"
+                ));
+            }
+            Err(ExecutionCheckError::Fork) => {
+                // We seem to have forked, so die.
+                error!(
+                    target: "tn::observer",
+                    block_number = number,
+                    ?base_execution_block,
+                    "wait_for_execution failed - execution fork detected"
+                );
+                return Err(eyre::eyre!(
+                    "consensus_output has a parent not in our chain, missing {base_execution_block:?} recents: {:?}!",
+                    consensus_bus.recent_blocks().borrow()
+                ));
+            }
         }
         // Deliver the full, verified output (with batches) for execution. The queue is bounded, so
         // this send blocks while the subscriber is behind; the epoch task manager aborts this task
@@ -649,7 +713,7 @@ mod tests {
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
         CommittedSubDag, Committee, ConsensusNumHash, EpochRecord, EpochSeedChainValue, ExecHeader,
-        ReputationScores, SealedHeader, TnReceiver, B256,
+        ReputationScores, Round, SealedHeader, TnReceiver, B256,
     };
 
     /// Consensus output `number` chained on `parent`, built from one round-1 certificate per
@@ -660,19 +724,31 @@ mod tests {
         number: u64,
         parent: ConsensusHeaderDigest,
     ) -> ConsensusOutput {
-        output_of(fixture, &fixture.committee(), number, parent)
+        output_with_leader_round(fixture, number, parent, 1)
     }
 
-    /// [`output_at`] led by `committee`'s epoch.
+    /// Like [`output_at`], with the certificates (and so the sub-dag's leader) at `round` of the
+    /// fixture committee's epoch.
+    fn output_with_leader_round(
+        fixture: &CommitteeFixture<MemDatabase>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        round: Round,
+    ) -> ConsensusOutput {
+        output_of(fixture, &fixture.committee(), number, parent, round)
+    }
+
+    /// [`output_with_leader_round`] led by `committee`'s epoch.
     fn output_of(
         fixture: &CommitteeFixture<MemDatabase>,
         committee: &Committee,
         number: u64,
         parent: ConsensusHeaderDigest,
+        round: Round,
     ) -> ConsensusOutput {
         let certificates: Vec<_> = fixture
             .authorities()
-            .map(|a| fixture.certificate(&a.header_with_round(committee, 1)))
+            .map(|a| fixture.certificate(&a.header_with_round(committee, round)))
             .collect();
         let leader = certificates.last().cloned().expect("fixture yields certificates");
         let sub_dag = CommittedSubDag::new(
@@ -1132,7 +1208,7 @@ mod tests {
                 chain.new_epoch(record, committee.clone()).await?;
             }
             for _ in 0..per_epoch {
-                let output = output_of(fixture, &committee, outputs.len() as u64 + 1, parent);
+                let output = output_of(fixture, &committee, outputs.len() as u64 + 1, parent, 1);
                 parent = output.consensus_header_hash();
                 save_consensus(output.clone(), &mut chain, &PrimaryMetrics::default()).await?;
                 outputs.push(output);
@@ -1204,9 +1280,60 @@ mod tests {
         Ok(())
     }
 
-    /// The `state-sync` INFO events emitted on the thread it is installed on, one line of
-    /// `name=value` fields per event.
-    struct StateSyncInfoLines(Arc<std::sync::Mutex<Vec<String>>>);
+    // ---- bench5 f3-rejoin ----
+
+    /// Leader round of the consensus block 1 the node executed before `prime_consensus` runs.
+    const EXEC_ROUND: Round = 30;
+    /// Leader round of the newest consensus header the node has seen from its peers.
+    const NEWEST_ROUND: Round = 45;
+
+    /// A bus whose latest executed block was built from consensus block 1, committed with its
+    /// leader at [`EXEC_ROUND`] of the fixture's epoch, and the chain holding that block, so
+    /// `prime_consensus` reads [`EXEC_ROUND`] as the last executed leader round.
+    async fn bus_executed_at_exec_round(
+        fixture: &CommitteeFixture<MemDatabase>,
+        temp_dir: &TempDir,
+    ) -> eyre::Result<(ConsensusBusApp, ConsensusChain)> {
+        let mut chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        let executed = output_with_leader_round(fixture, 1, B256::ZERO.into(), EXEC_ROUND);
+        let digest = executed.consensus_header().digest();
+        save_consensus(executed, &mut chain, &PrimaryMetrics::default()).await?;
+        // the engine stamps (epoch, leader round) into the nonce and the consensus digest into
+        // the parent beacon root; prime_consensus finds the executed header through both
+        let nonce = (u64::from(fixture.committee().epoch()) << 32) | u64::from(EXEC_ROUND);
+        let block = ExecHeader {
+            nonce: nonce.into(),
+            parent_beacon_block_root: Some(digest.into()),
+            ..Default::default()
+        };
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                EXEC_ROUND,
+                ConsensusNumHash::new(1, digest),
+                Some(SealedHeader::new(block, B256::ZERO)),
+            )
+        });
+        Ok((consensus_bus, chain))
+    }
+
+    /// Records every `state-sync` info line as `message key=value ...` on the thread it is
+    /// installed on with [`tracing::subscriber::set_default`].
+    struct StateSyncInfoLines(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    /// Appends an event's message and fields to a line in the order the event records them.
+    struct LineVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for LineVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            } else {
+                self.0.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+    }
 
     impl tracing::Subscriber for StateSyncInfoLines {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
@@ -1222,19 +1349,9 @@ mod tests {
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
-            struct Line(String);
-            impl tracing::field::Visit for Line {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!("{}={value:?} ", field.name()));
-                }
-            }
-            let mut line = Line(String::new());
-            event.record(&mut line);
-            self.0.lock().expect("log lines lock").push(line.0);
+            let mut line = String::new();
+            event.record(&mut LineVisitor(&mut line));
+            self.0.lock().push(line);
         }
 
         fn enter(&self, _: &tracing::span::Id) {}
@@ -1247,14 +1364,14 @@ mod tests {
     /// with its sub-dag, into one line.
     #[tokio::test]
     async fn missing_consensus_logs_a_count_and_range_not_the_headers() -> eyre::Result<()> {
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let _log_guard = tracing::subscriber::set_default(StateSyncInfoLines(lines.clone()));
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let temp_dir = TempDir::new()?;
         let (chain, _) = chain_of_epochs(&fixture, &temp_dir, 2, 3).await?;
         let missing = get_missing_consensus(&ConsensusBusApp::new(), &chain, 0).await?;
         assert_eq!(missing.len(), 4);
-        let lines = lines.lock().expect("log lines lock").clone();
+        let lines = lines.lock().clone();
         assert!(
             lines.iter().any(|line| line.contains("count=4")
                 && line.contains("first=Some(1)")
@@ -1266,6 +1383,168 @@ mod tests {
             lines.iter().all(|line| line.len() < header_len),
             "a line is as long as a header ({header_len} bytes): {lines:?}"
         );
+        Ok(())
+    }
+
+    /// A validator promoted back into the committee mid-epoch has followed consensus to a header
+    /// newer than its last executed block. Its proposer must start at that header's round, while
+    /// `committed_round` stays at the executed round so the certificate manager's gc round still
+    /// requires every parent the node has not received.
+    #[tokio::test]
+    async fn prime_consensus_seeds_primary_round_from_a_fresher_same_epoch_header(
+    ) -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (consensus_bus, chain) = bus_executed_at_exec_round(&fixture, &temp_dir).await?;
+        let authority = fixture.authorities().next().expect("fixture yields an authority");
+        let newest = output_with_leader_round(&fixture, 2, B256::ZERO.into(), NEWEST_ROUND);
+        consensus_bus.last_consensus_header().send_replace(Some(newest.consensus_header()));
+
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(StateSyncInfoLines(lines.clone()));
+        prime_consensus(&consensus_bus, &authority.consensus_config(), chain).await?;
+
+        assert_eq!(consensus_bus.primary_round(), NEWEST_ROUND, "proposer starts at the head");
+        assert_eq!(
+            consensus_bus.committed_round(),
+            EXEC_ROUND,
+            "committed_round must never be seeded from the newest header"
+        );
+        assert_eq!(
+            lines.lock().as_slice(),
+            [format!(
+                "primed consensus rounds exec_round={EXEC_ROUND} newest_round={NEWEST_ROUND} \
+                 primary_round={NEWEST_ROUND}"
+            )],
+            "one info line with the three rounds"
+        );
+        Ok(())
+    }
+
+    /// Rounds restart every epoch, so a header from another epoch must not seed the round. At an
+    /// epoch start the newest header is the closing header of the previous epoch and both rounds
+    /// prime to 0 as before; a header from a later epoch leaves the executed round in place.
+    #[tokio::test]
+    async fn prime_consensus_ignores_a_header_from_another_epoch() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let next_epoch = CommitteeFixture::builder(MemDatabase::default).epoch(1).build();
+        let temp_dir = TempDir::new()?;
+        let (consensus_bus, chain) = bus_executed_at_exec_round(&fixture, &temp_dir).await?;
+
+        // epoch 1 starts: the executed block and the newest header both closed epoch 0
+        let old_epoch_header =
+            output_with_leader_round(&fixture, 2, B256::ZERO.into(), NEWEST_ROUND);
+        consensus_bus
+            .last_consensus_header()
+            .send_replace(Some(old_epoch_header.consensus_header()));
+        let entering = next_epoch.authorities().next().expect("fixture yields an authority");
+        prime_consensus(&consensus_bus, &entering.consensus_config(), chain.clone()).await?;
+        assert_eq!(consensus_bus.primary_round(), 0, "an old-epoch header must not seed the round");
+        assert_eq!(consensus_bus.committed_round(), 0, "a new epoch starts at round 0");
+
+        // epoch 0 restarts while peers are already in epoch 1
+        let future_epoch_header =
+            output_with_leader_round(&next_epoch, 3, B256::ZERO.into(), NEWEST_ROUND);
+        consensus_bus
+            .last_consensus_header()
+            .send_replace(Some(future_epoch_header.consensus_header()));
+        let restarting = fixture.authorities().next().expect("fixture yields an authority");
+        prime_consensus(&consensus_bus, &restarting.consensus_config(), chain).await?;
+        assert_eq!(consensus_bus.primary_round(), EXEC_ROUND, "a later-epoch header is ignored");
+        assert_eq!(
+            consensus_bus.committed_round(),
+            EXEC_ROUND,
+            "committed_round is the exec round"
+        );
+        Ok(())
+    }
+
+    /// Without a newest header (a fresh start before any peer header arrived) both rounds prime
+    /// from the last executed leader round, as before.
+    #[tokio::test]
+    async fn prime_consensus_without_a_newest_header_primes_from_the_executed_round(
+    ) -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (consensus_bus, chain) = bus_executed_at_exec_round(&fixture, &temp_dir).await?;
+        let authority = fixture.authorities().next().expect("fixture yields an authority");
+
+        prime_consensus(&consensus_bus, &authority.consensus_config(), chain).await?;
+
+        assert_eq!(consensus_bus.primary_round(), EXEC_ROUND, "primed from the executed round");
+        assert_eq!(
+            consensus_bus.committed_round(),
+            EXEC_ROUND,
+            "committed_round is the exec round"
+        );
+        Ok(())
+    }
+
+    // ---- bench5 f1-commit-lag ----
+
+    /// SEC-6: a snapshot-restored node cannot check a leader block below its floor. Catch-up
+    /// delivers the output to `sync_output` with one warning and returns `Ok`, where a failed
+    /// check would return an error that the stream retries forever.
+    #[tokio::test]
+    async fn catch_up_delivers_an_output_below_the_restore_floor() -> eyre::Result<()> {
+        /// A datadir restored at block 100 that attests no block.
+        struct RestoredAt100;
+        impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+            fn canonical_execution_hash(&self, _: u64) -> Option<B256> {
+                None
+            }
+            fn restored_state_floor(&self) -> Option<u64> {
+                Some(100)
+            }
+        }
+
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _log_guard = tracing::subscriber::set_default(ObserverWarnCounter(warnings.clone()));
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        let block1 = output_at(&fixture, 1, B256::ZERO.into());
+        let leader_block = block1.consensus_header().sub_dag.leader().latest_execution_block();
+        assert!(leader_block.number < 100, "the leader names a block below the floor");
+        let db = MemDatabase::default();
+        db.insert::<ConsensusCache>(&1, &block1)?;
+
+        // executed through block 120 after the restore, with no block at the leader's height
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::default(),
+                Some(SealedHeader::new(
+                    ExecHeader { number: 120, ..Default::default() },
+                    B256::repeat_byte(1),
+                )),
+            )
+        });
+        consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+        let mut rx_sync_output = consensus_bus.subscribe_sync_output();
+
+        let mut from = ConsensusHeader::default();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            catch_up_consensus_from_to(
+                &consensus_bus,
+                &mut from,
+                block1.consensus_header(),
+                &db,
+                &chain,
+                fixture.committee().epoch(),
+                &StateSyncMetrics::default(),
+            ),
+        )
+        .await
+        .expect("catch-up does not wait on a block it cannot check")?;
+
+        assert_eq!(from.number, 1, "the output is recorded as progress");
+        let delivered = rx_sync_output.try_recv().map(|output| output.consensus_header().number);
+        assert_eq!(delivered.ok(), Some(1), "the output reached sync_output");
+        assert_eq!(warnings.load(Ordering::SeqCst), 1, "one below-floor warning");
         Ok(())
     }
 }

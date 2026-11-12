@@ -18,19 +18,23 @@
 use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
+    metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
     ConsensusBus,
 };
+use reth_metrics::metrics::Counter;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
+    fmt,
+    time::Instant,
 };
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
-    EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
-    TnSender, VotingPower, WorkerId,
+    EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer, Round, TaskManager, TaskSpawner,
+    TnReceiver, TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -58,7 +62,8 @@ impl OurDigestMessage {
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
         let OurDigestMessage { digest, worker_id, ack_channel } = self;
-        let digest = ProposerDigest { digest, worker_id };
+        let digest =
+            ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false };
         (ack_channel, digest)
     }
 }
@@ -72,6 +77,15 @@ struct ProposerDigest {
     pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
+    /// When the proposer queued this digest: its arrival from the worker, or its re-queue after
+    /// the header that carried it was not committed. The `header proposed` line and
+    /// `tn_primary_digest_wait_seconds` measure the oldest digest's wait from here.
+    pub received: Instant,
+    /// Whether this digest was re-queued at least once, so `received` marks its latest re-queue
+    /// rather than its arrival from the worker. The `header proposed` line counts these as
+    /// `requeued`, which splits headers whose digest wait may be cut short by a re-queue from the
+    /// rest.
+    pub requeued: bool,
 }
 
 #[cfg(test)]
@@ -147,6 +161,10 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// The seed message binds the header's round, so it cannot be signed once for the epoch; the
     /// signer handle is carried instead and used immediately before each [`Header::new`].
     key_config: KeyConfig,
+    /// The `tn_primary_headers_proposed_total{reason}` counters, resolved once per epoch.
+    headers_proposed: HeadersProposedHandles,
+    /// The `tn_primary_digests_requeued_total{cause}` counters, resolved once per epoch.
+    digests_requeued: DigestsRequeuedHandles,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -171,6 +189,19 @@ struct HeaderIdentity {
     key_config: KeyConfig,
 }
 
+/// Why the proposer builds a header and what its queue held at that moment, carried into
+/// [`Proposer::propose_header`] for the `header proposed` line and the proposal metrics.
+///
+/// Observability only: nothing here changes what the header contains.
+struct ProposalTrigger {
+    /// The propose-condition branch that fired.
+    reason: ProposeReason,
+    /// Digests pending across all workers before this header took its share.
+    pending_before: usize,
+    /// `tn_primary_headers_proposed_total{reason}` for [`Self::reason`].
+    proposed: Counter,
+}
+
 impl<DB: Database> Proposer<DB> {
     /// Create a new instance of Self.
     ///
@@ -185,9 +216,21 @@ impl<DB: Database> Proposer<DB> {
     /// overwritten and the round-`P` header is rebuilt with a *different* digest (`created_at` is
     /// wall-clock and sits inside the digest preimage). Voters holding a durable `Votes` record
     /// for round `P` then reject that new digest with `AlreadyVoted` forever, because nothing
-    /// converts elapsed time into progress. Seeding `round` to `P - 1` makes the first proposal
-    /// land on `P`, so the repropose filter in `Self::propose_next_header` hits and the
-    /// byte-identical header is re-sent - the premise the fail-closed vote guard depends on.
+    /// converts elapsed time into progress. Seeding `round` to `P - 1` makes the next proposal
+    /// land on `P`: the max-delay re-send in `Self::run` re-sends the stored round-`P` header, and
+    /// parents at `P - 1` lead `Self::propose_next_header` to the same header through its
+    /// repropose filter, so only the byte-identical header is ever sent - the premise the
+    /// fail-closed vote guard depends on. A max-delay re-send leaves the round at `P - 1`, so the
+    /// next max-delay interval is timed for round `P` instead of `P + 1`: the leader halving is one
+    /// round off for one interval, which is harmless.
+    ///
+    /// The round never starts below `primary_round`. `prime_consensus` seeds that watch at the
+    /// network head when a validator is promoted back into the committee mid-epoch, and a proposer
+    /// starting below it would follow the certificate manager's replay of the store's last two
+    /// rounds through the future-round branch of `Self::process_parents` and move the watch
+    /// backwards. The genesis certificates are the parents of round 1 only, so they seed
+    /// `last_parents` only when the round starts at 0; a proposer seeded above round 0 waits for
+    /// parents of its own round (see `Self::has_parents_for_round`).
     pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
@@ -197,6 +240,8 @@ impl<DB: Database> Proposer<DB> {
     ) -> Self {
         let rx_shutdown = config.shutdown().subscribe();
         let genesis = Certificate::genesis(config.committee());
+        // one read so the recovery filter and the round floor below see the same value
+        let primary_round = consensus_bus.app().primary_round();
         // create min/max delay intervals
         let min_delay_interval = tokio::time::interval(config.parameters().min_header_delay);
         let max_delay_interval = tokio::time::interval(config.parameters().max_header_delay);
@@ -223,8 +268,12 @@ impl<DB: Database> Proposer<DB> {
             .flatten()
             .filter(|header| header.epoch() == config.committee().epoch())
             .map(|header| header.round())
-            .filter(|round| *round > consensus_bus.app().primary_round())
+            .filter(|round| *round > primary_round)
             .map_or(0, |round| round.saturating_sub(1));
+        let round = recovered_round.max(primary_round);
+        // a header above round 1 built on round-0 parents is rejected by every voter
+        // (`InvalidParentRound`), so genesis seeds the parents of round 1 and nothing else
+        let last_parents = if round == 0 { genesis } else { Vec::new() };
 
         Self {
             authority_id,
@@ -239,8 +288,8 @@ impl<DB: Database> Proposer<DB> {
             rx_shutdown,
             consensus_bus,
             proposer_store: config.node_storage().clone(),
-            round: recovered_round,
-            last_parents: genesis,
+            round,
+            last_parents,
             last_leader: None,
             digests: BTreeMap::new(),
             next_lane: 0,
@@ -250,6 +299,8 @@ impl<DB: Database> Proposer<DB> {
             task_spawner,
             prior_epoch_record: config.prior_epoch_record(),
             key_config: config.key_config().clone(),
+            headers_proposed: HeadersProposedHandles::new(),
+            digests_requeued: DigestsRequeuedHandles::new(),
         }
     }
 
@@ -266,6 +317,7 @@ impl<DB: Database> Proposer<DB> {
         consensus_bus: &ConsensusBus,
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
+        trigger: ProposalTrigger,
     ) -> ProposerResult<Header> {
         let HeaderIdentity {
             round: current_round,
@@ -335,6 +387,13 @@ impl<DB: Database> Proposer<DB> {
             created_at,
         );
 
+        // the oldest digest's wait ends here, once the header carrying it exists; a header
+        // without digests has no wait to report and records no sample
+        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(|r| r.elapsed());
+        if let Some(wait) = oldest_digest_wait {
+            consensus_bus.app().metrics().digest_wait_seconds.record(wait.as_secs_f64());
+        }
+
         // Metric: header_proposed - tracks header proposals
         info!(
             target: "consensus::metrics",
@@ -342,9 +401,15 @@ impl<DB: Database> Proposer<DB> {
             epoch = current_epoch,
             num_batches = digests.len(),
             num_parents = parents.len(),
+            created_at_ms = header.created_at_ms().as_millis(),
+            reason = trigger.reason.as_str(),
+            digests = %HeaderDigests(&digests),
+            oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
+            requeued = digests.iter().filter(|d| d.requeued).count(),
+            pending_before = trigger.pending_before,
             "header proposed"
         );
-        consensus_bus.app().metrics().headers_proposed_total.increment(1);
+        trigger.proposed.increment(1);
 
         if enabled!(target: "primary::proposer", tracing::Level::TRACE) {
             let mut msg = format!("Created header {header:?} with parent certificates:\n");
@@ -413,17 +478,23 @@ impl<DB: Database> Proposer<DB> {
     ) -> ProposerResult<()> {
         // A read error is fatal here: failing it open would fall through to the write and clobber
         // the very record this guard exists to preserve.
+        let read_start = Instant::now();
         let stored = proposer_store
             .get_last_proposed()
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+        let read = read_start.elapsed();
         let supersedes_stored = stored
             .is_none_or(|last| last.epoch() != header.epoch() || header.round() >= last.round());
 
-        if supersedes_stored {
+        // a header that does not supersede the stored one skips the write and the barrier, so
+        // both phases read zero for it
+        let (write, persist) = if supersedes_stored {
             // Store the last header.
+            let write_start = Instant::now();
             proposer_store
                 .write_last_proposed(header)
                 .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+            let write = write_start.elapsed();
 
             // Wait for the `LastProposed` record to be durable before broadcasting. The epoch DB
             // persists asynchronously, so `write_last_proposed` returns before the record hits
@@ -438,14 +509,31 @@ impl<DB: Database> Proposer<DB> {
             // critical task, so returning here stops the node rather than continuing on a lost
             // guard record (issue #975). When another task's failed barrier has already ended the
             // epoch, `run_epoch` stops the node instead, finding the store unable to write.
+            let persist_start = Instant::now();
             proposer_store
                 .persist::<LastProposed>()
                 .await
                 .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
-        }
+            (write, persist_start.elapsed())
+        } else {
+            (Duration::ZERO, Duration::ZERO)
+        };
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
-        consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())
+        let send_start = Instant::now();
+        consensus_bus.headers().send(header.clone()).await.map_err(Box::new)?;
+        debug!(
+            target: "primary::proposer",
+            round = header.round(),
+            epoch = header.epoch(),
+            stored = supersedes_stored,
+            read_ms = duration_ms(read),
+            write_ms = duration_ms(write),
+            persist_ms = duration_ms(persist),
+            send_ms = duration_ms(send_start.elapsed()),
+            "header stored and sent"
+        );
+        Ok(())
     }
 
     /// Calculate the max delay to use when resetting the max_delay_interval.
@@ -551,6 +639,54 @@ impl<DB: Database> Proposer<DB> {
             0 => self.update_leader(),
             _ => self.enough_votes(),
         }
+    }
+
+    /// Whether `last_parents` holds parents for the round the next header builds on.
+    ///
+    /// `Self::propose_next_header` proposes at `max(self.round, primary_round) + 1`, so the parents
+    /// must be certificates of `max(self.round, primary_round)`. The proposer is the only writer of
+    /// `primary_round` while it runs (`reset_for_epoch` and `prime_consensus` write it before
+    /// `Self::new`, and the follower path that also writes it never runs beside a proposer), and
+    /// `Self::new` starts at or above it, so that term is defensive and the target is `self.round`
+    /// in practice. `last_parents` only ever holds one round (`Self::process_parents` replaces it
+    /// on a future round and extends it on the current one, a proposal takes it and a re-proposal
+    /// clears it), so the first parent's round is the round of the whole set. A non-empty set of
+    /// another round would build a header that voters reject with `InvalidParentRound`.
+    ///
+    /// The guard checks the round, not the voting weight. The certificate aggregator sends a
+    /// round's certificates once they reach a quorum and never resets that round's weight, so every
+    /// later certificate of the round arrives alone. A lone certificate is safe only because it
+    /// lands on a set already at quorum: the aggregator is spawned with the proposer, so the first
+    /// message of a round is its quorum, and none of the three places that empty `last_parents`
+    /// leaves it empty at a round whose quorum message the proposer has already accepted. A
+    /// proposal takes it and a re-proposal clears it inside `Self::propose_next_header`, after it
+    /// has moved `self.round` past the set's round, so a later certificate of that round is older
+    /// than the proposer's round and ignored. The `Greater` arm of `Self::process_parents` replaces
+    /// it with the empty set of the certificate validator's empty-parents jump, which moves
+    /// `self.round` onto the jump's round rather than past it. That is safe for another reason: a
+    /// message of that round the proposer had already accepted would have raised `self.round` to
+    /// it, so the jump would not take the `Greater` arm, and the round's quorum message is still
+    /// ahead. Leaving `last_parents` empty at a round whose quorum message was already accepted
+    /// would let one lone certificate pass this guard and build a header with fewer than a quorum
+    /// of parents, which voters reject as inquorate.
+    ///
+    /// - Epoch start: `reset_for_epoch` and `prime_consensus` leave `primary_round` at 0 and the
+    ///   epoch close cleared `LastProposed`, so the proposer starts at round 0 with the genesis
+    ///   certificates (round 0) and proposes round 1 at once, as before.
+    /// - Promotion mid-epoch: `prime_consensus` seeds `primary_round` at the network head `N` and
+    ///   the proposer starts at `N` with no parents. The certificate validator's empty-parents jump
+    ///   moves the round to the network head, and the first quorum of parents at a round `r` at or
+    ///   above the proposer's round makes it propose `r + 1`. It never proposes `N + 1` on round-0
+    ///   parents.
+    /// - Restart with a stored round-`P` header: the proposer starts at `P - 1` with no parents,
+    ///   the max-delay tick re-sends the stored header, and parents at `P - 1` lead to the same
+    ///   header through the repropose filter.
+    ///
+    /// Proposals resume on any quorum of parents at or above the proposer's round, the same
+    /// liveness condition as after any round jump.
+    fn has_parents_for_round(&self) -> bool {
+        let parents_round = self.round.max(self.consensus_bus.app().primary_round());
+        self.last_parents.first().is_some_and(|parent| parent.round() == parents_round)
     }
 
     /// Process certificates received for this round.
@@ -703,6 +839,9 @@ impl<DB: Database> Proposer<DB> {
         let mut digests_to_resend: BTreeMap<WorkerId, VecDeque<ProposerDigest>> = BTreeMap::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
+        // a re-queued digest's wait restarts here: the proposer keeps no arrival time for digests
+        // already in a header
+        let requeued_at = Instant::now();
 
         // walk proposed headers in order by round, up to the committed round
         self.proposed_headers
@@ -710,24 +849,17 @@ impl<DB: Database> Proposer<DB> {
             .take_while(|(header_round, _)| **header_round <= max_committed_round)
             .for_each(|(header_round, header)| {
                 // add payloads from oldest to newest into each worker's lane
-                header.payload().iter().for_each(|(digest, worker_id)| {
-                    digests_to_resend
-                        .entry(*worker_id)
-                        .or_default()
-                        .push_back(ProposerDigest { digest: *digest, worker_id: *worker_id });
-                });
+                push_payload(&mut digests_to_resend, header, requeued_at);
                 retransmit_rounds.push(*header_round);
             });
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
-            let num_digests_to_resend: usize = digests_to_resend.values().map(VecDeque::len).sum();
-
-            // prepend the reproposed batches to each worker's pending queue and update `self`
-            std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
-                digests_to_resend.entry(worker_id).or_default().append(&mut pending);
-            });
-            self.digests = digests_to_resend;
+            let num_digests_to_resend = self.prepend_requeued(
+                digests_to_resend,
+                retransmit_rounds.first().copied().unwrap_or_default(),
+                RequeueCause::Committed,
+            );
 
             // remove the old headers that failed
             // the proposed blocks are included in the next header
@@ -741,6 +873,86 @@ impl<DB: Database> Proposer<DB> {
                 self.proposed_headers.len()
             );
         }
+    }
+
+    /// Process the certifier's report that the own header at `round` with `digest` will never be
+    /// certified: a newer own header cancelled its vote collection.
+    ///
+    /// The header's batch digests go back to the front of their workers' queues, as the commit
+    /// path re-queues an uncommitted header's, so they ride the next header instead of waiting
+    /// for the next own commit. The header itself is never signed or sent again; only its digests
+    /// move, and the header leaves `proposed_headers` so the commit path cannot re-queue them a
+    /// second time.
+    ///
+    /// The report is acted on only for the exact header still tracked at `round`, and only below
+    /// the proposer's round: the max-delay re-send needs a header at or above the round and the
+    /// restart re-propose one at the round just advanced to, so a header below it is never sent to
+    /// the certifier again and cannot be certified after its digests moved. Anything else (the
+    /// commit path already re-queued it, or an unexpected report) is ignored, and the digests
+    /// stay where they are.
+    ///
+    /// Each report prepends on its own, so the two re-queue paths order rounds differently. When
+    /// two reports are handled before the next header is built (the certifier's cancel lags the
+    /// proposer by a round, or the round jumps), the second report's digests land ahead of the
+    /// first's, and the certifier reports in round order, so the newer header's batches go first.
+    /// The commit path re-queues every expired header in one call and keeps them oldest first
+    /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
+    /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
+    /// does to transaction nonces.
+    fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
+        let mut requeued = BTreeMap::new();
+        match self.proposed_headers.get(&round) {
+            Some(header) if round < self.round && header.digest() == digest => {
+                push_payload(&mut requeued, header, Instant::now());
+            }
+            _ => {
+                debug!(
+                    target: "primary::proposer",
+                    round,
+                    %digest,
+                    proposer_round = self.round,
+                    "uncertified own header is not tracked below the round; nothing to re-queue"
+                );
+                return;
+            }
+        }
+        self.proposed_headers.remove(&round);
+        self.prepend_requeued(requeued, round, RequeueCause::Canceled);
+    }
+
+    /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
+    /// first within each worker), to each worker's pending queue, and return how many there are.
+    ///
+    /// A non-empty re-queue logs one `digests resent` line and counts the digests in
+    /// `tn_primary_digests_requeued_total{cause}`. `from_round` is the round of the oldest header
+    /// the digests came from.
+    fn prepend_requeued(
+        &mut self,
+        mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
+        from_round: Round,
+        cause: RequeueCause,
+    ) -> usize {
+        let count: usize = requeued.values().map(VecDeque::len).sum();
+        // a header without digests leaves nothing to re-send
+        if count == 0 {
+            return 0;
+        }
+        info!(
+            target: "consensus::metrics",
+            count,
+            from_round,
+            round = self.round,
+            cause = cause.as_str(),
+            "digests resent"
+        );
+        self.digests_requeued.counter(cause).increment(u64::try_from(count).unwrap_or(u64::MAX));
+
+        // prepend the re-queued digests to each worker's pending queue and update `self`
+        std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
+            requeued.entry(worker_id).or_default().append(&mut pending);
+        });
+        self.digests = requeued;
+        count
     }
 
     /// Total number of digests pending across all workers.
@@ -793,7 +1005,10 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
-    fn propose_next_header(&mut self) -> ProposerResult<PendingHeaderTask> {
+    ///
+    /// `reason` is the propose-condition branch that fired; a new header reports it, a re-sent
+    /// header ignores it.
+    fn propose_next_header(&mut self, reason: ProposeReason) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
         let updated_round = self.consensus_bus.app().primary_round() + 1;
@@ -821,7 +1036,26 @@ impl<DB: Database> Proposer<DB> {
         match possible_header_to_repropose {
             // resend header
             Some(header) => {
-                warn!(target: "primary::proposer", authority=?self.authority_id, current_round, current_epoch, header=?header, "reproposing header");
+                let app = self.consensus_bus.app();
+                // copy out of the watch so its read guard is released before the log write
+                let newest_round = app
+                    .last_consensus_header()
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |newest| newest.sub_dag.leader_round());
+                warn!(
+                    target: "primary::proposer",
+                    authority=?self.authority_id,
+                    current_round,
+                    current_epoch,
+                    header_round = header.round(),
+                    // the round watch before this proposal advanced it to the header round
+                    primary_round = updated_round.saturating_sub(1),
+                    committed_round = app.committed_round(),
+                    newest_round,
+                    header=?header,
+                    "reproposing header"
+                );
                 // clear parents if reproposing after restart
                 self.last_parents.clear();
 
@@ -837,6 +1071,11 @@ impl<DB: Database> Proposer<DB> {
             // create new header
             None => {
                 // collect values from &mut self for this header
+                let trigger = ProposalTrigger {
+                    reason,
+                    pending_before: self.pending_digests_len(),
+                    proposed: self.headers_proposed.counter(reason),
+                };
                 let digests = self.drain_digests_for_header();
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
@@ -859,6 +1098,7 @@ impl<DB: Database> Proposer<DB> {
                         &consensus_bus,
                         parents,
                         digests,
+                        trigger,
                     )
                     .await;
 
@@ -901,12 +1141,47 @@ impl<DB: Database> Proposer<DB> {
             let rx_our_digests = self.consensus_bus.subscribe_our_digests();
             let rx_parents = self.consensus_bus.subscribe_parents();
             let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
+            let rx_uncertified_own_headers = self.consensus_bus.subscribe_uncertified_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                Ok(self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await?)
+                Ok(self
+                    .run(
+                        rx_our_digests,
+                        rx_parents,
+                        rx_committed_own_headers,
+                        rx_uncertified_own_headers,
+                    )
+                    .await?)
             });
         }
         // If not an active CVV then don't propose anything.
+    }
+
+    /// The stored `LastProposed` header the max-delay tick may re-send, if any.
+    ///
+    /// Only a header of this epoch at or above the proposer's round qualifies. A restart starts
+    /// the round at `P - 1` below the stored round-`P` header, so requiring the round to match
+    /// would drop the restart re-send. A header below the round was left behind by a jump to the
+    /// network head (a promotion, or the certificate validator's empty-parents jump): the proposer
+    /// has passed its round, so a re-send cannot help. The record is never deleted here: it stays
+    /// the equivocation guard for its round until the epoch close clears it.
+    ///
+    /// A store read error is logged and skips this re-send; the next proposal reads the record
+    /// again in `Self::propose_next_header`, which fails on the same error.
+    fn resendable_last_proposed(&self) -> Option<Header> {
+        let current_epoch = self.committee.epoch();
+        self.proposer_store
+            .get_last_proposed()
+            .inspect_err(|err| {
+                warn!(
+                    target: "primary::proposer",
+                    ?err,
+                    "could not read LastProposed for the max-delay re-send"
+                );
+            })
+            .ok()
+            .flatten()
+            .filter(|header| header.epoch() == current_epoch && header.round() >= self.round)
     }
 
     /// Wrapper async function to either query the pending header or never resolve.
@@ -927,6 +1202,7 @@ impl<DB: Database> Proposer<DB> {
         mut rx_our_digests: impl TnReceiver<OurDigestMessage>,
         mut rx_parents: impl TnReceiver<(Vec<Certificate>, Round)>,
         mut rx_committed_own_headers: impl TnReceiver<(Round, Vec<Round>)>,
+        mut rx_uncertified_own_headers: impl TnReceiver<(Round, HeaderDigest)>,
     ) -> ProposerResult<()> {
         let mut pending_header = None;
         let mut max_delay_timed_out = false;
@@ -962,6 +1238,10 @@ impl<DB: Database> Proposer<DB> {
                 Some((commit_round, committed_headers)) = rx_committed_own_headers.recv() => {
                     debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "received committed update for own header");
                     self.process_committed_headers(commit_round, committed_headers);
+                }
+                // the certifier cancelled an own header's vote collection for a newer header
+                Some((round, digest)) = rx_uncertified_own_headers.recv() => {
+                    self.process_uncertified_header(round, digest);
                 }
                 res = Self::pending_header(&mut pending_header) => {
                     pending_header = None;
@@ -1004,7 +1284,7 @@ impl<DB: Database> Proposer<DB> {
             // - the worker created enough blocks (header_num_of_batches_threshold)
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
-            let enough_parents = !self.last_parents.is_empty();
+            let enough_parents = self.has_parents_for_round();
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -1043,23 +1323,17 @@ impl<DB: Database> Proposer<DB> {
                     warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "max delay interval expired for round {}", self.round);
                 }
 
-                // obtain reason for logging
-                let reason = if max_delay_timed_out {
-                    "max_timeout"
-                } else if enough_digests {
-                    "threshold_size_reached"
-                } else {
-                    "min_timeout"
-                };
+                // the branch that fired, reported on the `header proposed` line
+                let reason = ProposeReason::select(max_delay_timed_out, enough_digests);
 
-                debug!(target: "primary::proposer", authority=?self.authority_id, ?reason, "proposing next header!");
+                debug!(target: "primary::proposer", authority=?self.authority_id, reason = reason.as_str(), "proposing next header!");
 
                 // propose header
-                pending_header = Some(self.propose_next_header()?);
+                pending_header = Some(self.propose_next_header(reason)?);
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
             } else if should_repropose_header {
-                if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
+                if let Some(last_proposed) = self.resendable_last_proposed() {
                     warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "re-proposing last header after max delay interval expired for round {}", self.round);
                     let (tx, rx) = oneshot::channel();
                     let consensus_bus = self.consensus_bus.clone();
@@ -1081,5 +1355,67 @@ impl<DB: Database> Proposer<DB> {
                 }
             }
         }
+    }
+}
+
+/// The digests of a new header for its `header proposed` line: `[0x…,0x…]`, each the full
+/// lowercase hex of a batch digest, in payload order.
+///
+/// Formatted only when the line is written, and a header holds at most
+/// `max_header_num_of_batches` digests, so the line stays bounded.
+struct HeaderDigests<'a>(&'a VecDeque<ProposerDigest>);
+
+impl fmt::Display for HeaderDigests<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, proposed) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", proposed.digest)?;
+        }
+        f.write_str("]")
+    }
+}
+
+/// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
+/// each stamped as queued at `requeued_at` and marked as re-queued.
+///
+/// The proposer keeps no arrival time for a digest already in a header, so a re-queued digest's
+/// wait restarts at `requeued_at`.
+fn push_payload(
+    lanes: &mut BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
+    header: &Header,
+    requeued_at: Instant,
+) {
+    header.payload().iter().for_each(|(digest, worker_id)| {
+        lanes.entry(*worker_id).or_default().push_back(ProposerDigest {
+            digest: *digest,
+            worker_id: *worker_id,
+            received: requeued_at,
+            requeued: true,
+        });
+    });
+}
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX`, for the timing fields of the
+/// proposer's log lines.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_ms;
+    use std::time::Duration;
+
+    /// Sub-millisecond remainders round down and a duration past `u64::MAX` milliseconds
+    /// saturates instead of wrapping.
+    #[test]
+    fn duration_ms_truncates_and_saturates() {
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+        assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
+        assert_eq!(duration_ms(Duration::from_secs(10)), 10_000);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
     }
 }
