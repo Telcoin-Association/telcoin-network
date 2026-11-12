@@ -328,6 +328,7 @@ impl RethEnv {
                 state_provider,
                 overlay,
                 &self.inner.blockchain_provider,
+                parent_header.number + 1,
             );
             builder.finish(&root_provider)?
         };

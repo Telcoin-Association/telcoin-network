@@ -184,13 +184,19 @@ pub(crate) struct RethEnvMetrics {
     /// Compared block roots whose parallel storage roots gave another root or other trie updates
     /// than the serial computation.
     ///
-    /// Alert on any nonzero value. One block in `CHECK_ONE_BLOCK_IN` with parallel work
-    /// (storage-root tasks or a split account walk) is also computed serially
-    /// (`env/output_overlay/parallel.rs`); a difference means the parallel path is wrong. The
-    /// block uses the serial result, but unchecked blocks may already have forked this node
-    /// from its peers: switch the tasks off (`TN_PARALLEL_STATE_ROOT=0`). The error log says
-    /// whether the split composed the block's root; a split's difference is also counted as
-    /// [`AccountWalkFallback::Mismatch`].
+    /// Alert on any nonzero value. The blocks whose number is a multiple of
+    /// `CHECK_ONE_BLOCK_IN`, of those with parallel work (storage-root tasks or a split account
+    /// walk), are also computed serially (`env/output_overlay/parallel.rs`); a difference means
+    /// the parallel path is wrong. The block uses the serial result. Every node checks the same
+    /// blocks, so nodes running the same code publish the same root either way, but the
+    /// unchecked blocks the same bug hit carry the wrong one on all of them. The response is
+    /// network-wide: switch the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
+    /// or only the split the fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
+    /// `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it;
+    /// switching one node off only parts it from its peers. A node whose pool runs one thread
+    /// runs the same parallel code. The error log says whether the split composed the block's
+    /// root; a split's difference is also counted as [`AccountWalkFallback::Mismatch`], a
+    /// composed storage root's as [`StorageWalkFallback::Mismatch`].
     pub(crate) parallel_state_root_mismatches_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
@@ -442,8 +448,8 @@ pub(crate) enum AccountWalkFallback {
     StoredRootNode,
     /// A sampled serial check found the split's root or trie updates wrong; the block used the
     /// serial result. Alert on any nonzero value: also counted in
-    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off
-    /// (`TN_PARALLEL_ACCOUNT_WALK=0`).
+    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
+    /// (`TN_PARALLEL_ACCOUNT_WALK=0`) and report it.
     Mismatch,
 }
 
@@ -506,8 +512,8 @@ pub(crate) enum StorageWalkFallback {
     StoredRootNode,
     /// A sampled serial check found a block with a composed storage root wrong; the block used
     /// the serial result. Alert on any nonzero value: also counted in
-    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off
-    /// (`TN_PARALLEL_STORAGE_WALK=0`).
+    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
+    /// (`TN_PARALLEL_STORAGE_WALK=0`) and report it.
     Mismatch,
 }
 

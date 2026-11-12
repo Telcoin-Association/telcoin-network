@@ -19,7 +19,10 @@ use crate::{
             AccountWalk,
         },
         layered_factories,
-        parallel::{ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, STORAGE_SPLITS_COMPOSED},
+        parallel::{
+            ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN,
+            STORAGE_SPLITS_COMPOSED,
+        },
     },
     OutputTrieOverlay,
 };
@@ -118,6 +121,7 @@ fn check_output(fixture: &Fixture, blocks: &[HashedPostState]) -> eyre::Result<u
             tx,
             block.clone(),
             ParallelRoots::Shadow(Walks::SPLIT),
+            1,
         )?;
         assert_eq!(shadow, serial, "shadow result differs at block {i}");
         overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -331,6 +335,7 @@ async fn one_task_does_not_split() -> eyre::Result<()> {
                 tx,
                 block.clone(),
                 ParallelRoots::Shadow(walks),
+                1,
             )?,
         ])
     });
@@ -513,8 +518,9 @@ async fn moved_tip_leaves_the_pieces_to_the_walk() -> eyre::Result<()> {
 }
 
 /// A wrong composed storage root (made wrong after its own checks) is used unchecked, but a
-/// sampled block's serial check replaces it with the serial result and counts the `mismatch`
-/// fallback: the production check covers the storage split.
+/// sampled block's serial check (by its number, or forced by the test hook) replaces it with the
+/// serial result and counts the `mismatch` fallback: the production check covers the storage
+/// split.
 #[tokio::test]
 async fn sampled_check_replaces_a_wrong_storage_root() -> eyre::Result<()> {
     let fixture = Fixture::new(base())?;
@@ -530,19 +536,22 @@ async fn sampled_check_replaces_a_wrong_storage_root() -> eyre::Result<()> {
         overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), Walks::SPLIT)?;
     assert_ne!(wrong.0, serial.0, "the corrupted storage root must reach the result unchecked");
 
-    CORRUPT_NEXT_STORAGE_SPLIT.with(|c| c.set(true));
-    CHECK_NEXT_SAMPLED_BLOCK.with(|c| c.set(true));
-    let (checked, fallbacks) = counting_fallbacks(|| {
-        overlay.block_root_with_updates(
-            factory,
-            tx,
-            block.clone(),
-            ParallelRoots::Sampled(Walks::SPLIT),
-        )
-    });
-    assert_eq!(checked?, serial, "a sampled block must use the serial result");
-    assert_eq!(fallbacks.get("mismatch"), Some(&1), "fallbacks: {fallbacks:?}");
-    assert!(!CORRUPT_NEXT_STORAGE_SPLIT.with(|c| c.get()), "the splits were not built");
+    for (number, forced) in [(CHECK_ONE_BLOCK_IN, false), (CHECK_ONE_BLOCK_IN + 1, true)] {
+        CORRUPT_NEXT_STORAGE_SPLIT.with(|c| c.set(true));
+        CHECK_NEXT_SAMPLED_BLOCK.with(|c| c.set(forced));
+        let (checked, fallbacks) = counting_fallbacks(|| {
+            overlay.block_root_with_updates(
+                factory,
+                tx,
+                block.clone(),
+                ParallelRoots::Sampled(Walks::SPLIT),
+                number,
+            )
+        });
+        assert_eq!(checked?, serial, "block {number}: a sampled block must use the serial result");
+        assert_eq!(fallbacks.get("mismatch"), Some(&1), "block {number}: fallbacks: {fallbacks:?}");
+        assert!(!CORRUPT_NEXT_STORAGE_SPLIT.with(|c| c.get()), "the splits were not built");
+    }
     Ok(())
 }
 
@@ -560,6 +569,7 @@ async fn shadow_panics_on_a_wrong_storage_root() {
         provider.tx_ref(),
         hot_block(300, 0),
         ParallelRoots::Shadow(Walks::SPLIT),
+        1,
     );
 }
 

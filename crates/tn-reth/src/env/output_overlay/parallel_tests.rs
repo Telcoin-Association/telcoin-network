@@ -6,8 +6,9 @@
 //! overlay, comparing each block's parallel root with the serial one over the same transaction.
 
 use super::{
-    checked, storage_root_targets, ParallelRoot, ParallelRoots, StorageRootSource as _,
-    StorageRootTasks, StorageSplits, TaskError, TASK_ROOTS_TAKEN,
+    block_is_checked, checked, storage_root_targets, DatabaseError, ParallelRoot, ParallelRoots,
+    ProviderError, StorageRootSource as _, StorageRootTasks, StorageSplits, TaskError,
+    CHECK_ONE_BLOCK_IN, FAIL_NEXT_WALK, INJECTED_WALK_FAILURE, TASKS_STARTED, TASK_ROOTS_TAKEN,
 };
 use crate::{
     env::output_overlay::{AccountWalk, StorageWalk, Walks},
@@ -173,6 +174,7 @@ impl Fixture {
                 tx,
                 block.clone(),
                 ParallelRoots::Shadow(Walks::SPLIT),
+                1,
             )?;
             assert_eq!(shadow, serial, "shadow result differs at block {i}");
             overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -343,6 +345,60 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
     Ok(())
+}
+
+/// A walk that fails (as on a database read error) still claims the tasks that have not started,
+/// so they return at once instead of computing their storage roots before the error comes back,
+/// and the error is the walk's own. Driven from the worker of a one-thread pool, nothing can start
+/// a task before the walk ends, so every task is unstarted when the walk fails.
+#[tokio::test]
+async fn failed_walk_starts_no_task() -> eyre::Result<()> {
+    let fixture = Fixture::new()?;
+    let block = HashedPostState::default().with_storages(
+        (0..SMALL_CONTRACTS)
+            .map(|i| (small(i), HashedStorage::from_iter(false, [(slot(7), U256::from(i + 1))]))),
+    );
+    let targets = storage_root_targets(&block.construct_prefix_sets().freeze()).len();
+    assert_eq!(targets as u64, SMALL_CONTRACTS, "one task per small contract");
+    let factory = fixture.env.blockchain_provider();
+    let overlay = OutputTrieOverlay::new();
+    let walks = Walks::new(AccountWalk::OneThread, StorageWalk::OneTask);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let (result, started) = pool.install(|| -> eyre::Result<_> {
+        let provider = factory.database_provider_ro()?;
+        let before = TASKS_STARTED.with(|n| n.get());
+        FAIL_NEXT_WALK.with(|f| f.set(true));
+        let result =
+            overlay.layered_root_with_updates_parallel(factory, provider.tx_ref(), block, walks);
+        assert!(!FAIL_NEXT_WALK.with(|f| f.get()), "the walk did not run");
+        Ok((result, TASKS_STARTED.with(|n| n.get()) - before))
+    })?;
+    let injected = ProviderError::from(DatabaseError::Other(INJECTED_WALK_FAILURE.into()));
+    let error = result.expect_err("the walk was made to fail");
+    assert_eq!(error.to_string(), injected.to_string(), "the walk's error must come back as is");
+    assert_eq!(started, 0, "{started} of {targets} tasks ran after the walk failed");
+    Ok(())
+}
+
+/// Every node checks the same blocks, one in [`CHECK_ONE_BLOCK_IN`] by number, whatever it has
+/// seen since it started: two nodes in one process, one from genesis and one that joined later,
+/// asked in turn as their engines would be, pick the same blocks where they overlap.
+#[test]
+fn every_node_checks_the_same_blocks() {
+    let end = 4 * CHECK_ONE_BLOCK_IN;
+    let joined = CHECK_ONE_BLOCK_IN + 77;
+    let mut checked = [Vec::new(), Vec::new()];
+    for number in 0..end {
+        if block_is_checked(number) {
+            checked[0].push(number);
+        }
+        if number >= joined && block_is_checked(number) {
+            checked[1].push(number);
+        }
+    }
+    let expected: Vec<_> = (0..4).map(|k| k * CHECK_ONE_BLOCK_IN).collect();
+    assert_eq!(checked[0], expected, "the node from genesis");
+    assert_eq!(checked[1], expected[2..], "the node that joined at block {joined}");
 }
 
 /// A task that fails or panics leaves its account to the walk, and a task the walk claimed

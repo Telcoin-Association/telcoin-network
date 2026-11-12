@@ -86,10 +86,19 @@ all on the busy profile: the busy commit is bound by the disk's IOPS, and its da
 time the state root saved for the same pages written (both sides on one aged base, gap fill fixed at
 4 pages).
 
-One block in 256 with parallel work (storage-root tasks or a split walk) is also computed serially
-and compared; a difference is logged with both roots, counted in
-`tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the block uses the
-serial result. `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
+The blocks whose number is a multiple of 256, of those with parallel work (storage-root tasks or a
+split walk), are also computed serially and compared; a difference is logged with both roots,
+counted in `tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the
+block uses the serial result. The sample is the block number, not a count kept by each node, so
+every node checks the same blocks and nodes running the same code always publish the same root,
+right or wrong. A node whose rayon pool runs one thread runs the same parallel code and composes
+the same roots; only the off switches below compute serially. Any nonzero mismatch count means
+the parallel code computed a wrong root, and the unchecked blocks the same bug hit carry it on every
+node running this code: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`, or
+only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
+`TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning them off
+on one node only parts it from its peers on the next block the bug hits.
+`tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
 ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
 split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
 split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
