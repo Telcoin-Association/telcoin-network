@@ -41,7 +41,7 @@
 #
 #   fmt-clippy       fmt and both clippy passes, the release graph and every target under
 #                    --all-features, under the nightly pin
-#   build-tests      the rocksdb guard, then the three test lanes with `--build-only`, under the
+#   build-tests      the rocksdb guard, then the four test lanes with `--build-only`, under the
 #                    stable pin that builds releases: the same build of the workspace test
 #                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
 #                    2026-10-29
@@ -191,6 +191,11 @@ jobs:
       - name: Build the adiri lane's test binaries
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-adiri --build-only
+
+      # The workspace on tn-reth's `tn-lmdb` feature, likewise.
+      - name: Build the tn-lmdb lane's test binaries
+        if: ${{ !cancelled() }}
+        run: ./etc/ci-lanes.sh test-tn-lmdb --build-only
 
       # The nested vendor/reth workspace's tests and the js-tracer build, likewise.
       - name: Build the vendored reth lane's test binaries

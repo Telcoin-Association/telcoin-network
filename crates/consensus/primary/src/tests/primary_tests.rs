@@ -2,7 +2,10 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{handler::RequestHandler, PrimaryResponse, WorkerReceiverHandler},
+    network::{
+        handler::{RequestHandler, RequestedParents},
+        PrimaryResponse, WorkerReceiverHandler,
+    },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -565,6 +568,171 @@ async fn test_request_vote_accept_missing_parents() {
             .await
             .unwrap();
     assert!(result.is_ok(), "{result:?}");
+}
+
+/// Every author whose header cites a missing parent is recorded for it, and the gc keeps the
+/// round at the limit (issue #1797).
+#[test]
+fn test_requested_parents_records_every_citing_author() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee: Committee = fixture.committee();
+    let mut digests = Certificate::genesis(&committee).into_iter().map(|x| x.digest());
+    let digest = digests.next().unwrap();
+    let other_digest = digests.next().unwrap();
+    let mut ids = fixture.authorities().map(|a| a.id());
+    let first = ids.next().unwrap();
+    let second = ids.next().unwrap();
+
+    let mut requested = RequestedParents::default();
+    requested.record(4, digest, &first);
+    requested.record(4, digest, &second);
+
+    // both citing authors may supply the parent; nobody may supply a parent it was not asked for
+    assert!(requested.asked(4, digest, &first));
+    assert!(requested.asked(4, digest, &second));
+    assert!(!requested.asked(4, other_digest, &first));
+    assert!(!requested.asked(5, digest, &first));
+
+    // gc keeps the round at the limit and drops the rounds below it
+    requested.record(5, digest, &first);
+    requested.drop_below(5);
+    assert!(!requested.asked(4, digest, &first));
+    assert!(requested.asked(5, digest, &first));
+}
+
+/// A parent cited first by an author that never supplies it is still requested from, and
+/// accepted from, every later author whose header cites it (issue #1797).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
+    const NUM_PARENTS: usize = 10;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(NUM_PARENTS).unwrap())
+        .build();
+    let target = fixture.authorities().next().unwrap();
+    // the author that cites the parents first and never supplies them
+    let withholder = fixture.authorities().nth(1).unwrap();
+    let withholder_id = withholder.id();
+    let withholder_peer = *withholder.authority().protocol_key();
+    // the honest author that cites the same parents and supplies them
+    let author = fixture.authorities().nth(2).unwrap();
+    let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
+
+    let certificate_store = target.consensus_config().node_storage().clone();
+    let payload_store = target.consensus_config().node_storage().clone();
+
+    let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
+    // Need a dummy parent so we can request a vote.
+    let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+    let dummy_hash = dummy_parent.hash();
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let handler = RequestHandler::new(
+        target.consensus_config(),
+        cb.app().clone(),
+        synchronizer.clone(),
+        consensus_chain,
+    );
+
+    // Make some mock certificates that are parents of both new headers.
+    let committee: Committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+    let all_certificates = certificates.into_iter().collect::<Vec<_>>();
+    let round_1_certs = all_certificates[..NUM_PARENTS].to_vec();
+    let round_2_certs = all_certificates[NUM_PARENTS..(NUM_PARENTS * 2)].to_vec();
+    let round_2_parents = round_2_certs[..(NUM_PARENTS / 2)].to_vec();
+    let round_2_missing = round_2_certs[(NUM_PARENTS / 2)..].to_vec();
+    let expected_missing: HashSet<_> = round_2_missing.iter().map(|c| c.digest()).collect();
+
+    // Both authors cite the same round 2 parents.
+    let withholder_header = withholder
+        .header_builder_at_round(&fixture.committee(), 3)
+        .author(withholder_id)
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .latest_execution_block(BlockNumHash::new(0, dummy_hash))
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+    let author_header = author
+        .header_builder_at_round(&fixture.committee(), 3)
+        .author(author_id)
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .latest_execution_block(BlockNumHash::new(0, dummy_hash))
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+
+    // Populate all round 1 certificates and half of the round 2 certificates, so both headers
+    // have the same round 2 parents missing.
+    round_1_certs.iter().chain(round_2_parents.iter()).for_each(|cert| {
+        cert.header().payload().iter().for_each(|(digest, worker_id)| {
+            payload_store.write_payload(digest, worker_id).unwrap();
+        });
+        certificate_store.write(cert.clone()).unwrap();
+    });
+    // Populate the honest header's payload so it does not have to be retrieved.
+    author_header.payload().iter().for_each(|(digest, worker_id)| {
+        payload_store.write_payload(digest, worker_id).unwrap();
+    });
+
+    cb.app().committed_round_updates().send_replace(2);
+
+    // TEST PHASE 1: the withholder cites the parents first and is told which ones are missing.
+    // It never supplies them.
+    let missing = if let PrimaryResponse::MissingParents(missing) =
+        handler.vote(withholder_peer, withholder_header, Vec::new()).await.unwrap()
+    {
+        missing
+    } else {
+        panic!("Response not missing!");
+    };
+    let received_missing: HashSet<_> = missing.into_iter().collect();
+    assert_eq!(expected_missing, received_missing);
+
+    // TEST PHASE 2: the honest author cites the same parents and must be told the same missing
+    // parents, although another author cited them first. Before the fix the reply was empty, so
+    // the handler waited for the parents until the vote timeout.
+    let response = timeout(
+        Duration::from_secs(5),
+        handler.vote(author_peer, author_header.clone(), Vec::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response_debug = format!("{response:?}");
+    let missing = if let PrimaryResponse::MissingParents(missing) = response {
+        missing
+    } else {
+        panic!("Expected MissingParents for the second citing author, got: {response_debug}");
+    };
+    let received_missing: HashSet<_> = missing.into_iter().collect();
+    assert_eq!(expected_missing, received_missing);
+
+    // TEST PHASE 3: the parents the honest author attaches are accepted and the vote is cast.
+    // Before the fix they were dropped because another author was recorded as their only owner.
+    let response =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, author_header, round_2_missing))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(matches!(response, PrimaryResponse::Vote(_)), "{response:?}");
 }
 
 #[tokio::test]

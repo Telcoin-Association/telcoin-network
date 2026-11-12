@@ -414,6 +414,14 @@ impl TaskManager {
         self.join_tasks_within(grace).await
     }
 
+    /// Signal every task this manager spawned to exit, as dropping the manager does, and keep the
+    /// manager so [`Self::wait_for_exit`] can wait for them. Reth's blocking tasks
+    /// (`spawn_reth_task` on the blocking pool) end only on this notice: [`Self::abort`] cannot
+    /// stop a blocking task.
+    pub fn signal_shutdown(&self) {
+        self.local_shutdown.notify();
+    }
+
     /// Abort all of our direct tasks (not sub task managers though).
     pub fn abort(&self) {
         for task in self.tasks.iter() {
@@ -641,6 +649,50 @@ impl reth_tasks::TaskSpawner for TaskSpawner {
     }
 }
 
+/// A reth [`reth_tasks::TaskSpawner`] over a [`TaskSpawner`] that spawns reth's critical tasks as
+/// non-critical TN tasks: tracked by the manager, ended by its shutdown signal, but never ending
+/// the node when they exit or panic. For reth code whose "critical" tasks only serve RPC (its eth
+/// state cache, fee-history task and transaction batcher): on reth's own `TokioTaskExecutor` they
+/// ran untracked, and a panic left the RPC cache dead with the node running; tracked, they
+/// release what they hold (the provider, so the database) when the node's tasks shut down, and
+/// a panic still only ends them. [`TaskSpawner::non_critical`] makes one.
+#[derive(Clone, Debug)]
+pub struct NonCriticalTaskSpawner(TaskSpawner);
+
+impl TaskSpawner {
+    /// A reth spawner on this manager whose critical tasks are tracked as non-critical
+    /// ([`NonCriticalTaskSpawner`]).
+    pub fn non_critical(&self) -> NonCriticalTaskSpawner {
+        NonCriticalTaskSpawner(self.clone())
+    }
+}
+
+impl reth_tasks::TaskSpawner for NonCriticalTaskSpawner {
+    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        self.0.spawn_reth_task("reth-task", fut, false, false)
+    }
+
+    fn spawn_critical_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        self.0.spawn_reth_task(name, fut, false, false)
+    }
+
+    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        self.0.spawn_reth_task("reth-blocking-task", fut, false, true)
+    }
+
+    fn spawn_critical_blocking_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        self.0.spawn_reth_task(name, fut, false, true)
+    }
+}
+
 /// Indicate a non-normal exit on a a taskmanager join.
 #[derive(Debug, Error)]
 pub enum TaskJoinError {
@@ -654,7 +706,7 @@ pub enum TaskJoinError {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -851,6 +903,35 @@ mod test {
         assert!(rspong_crit_block.ping(2).await.is_err());
     }
 
+    /// A reth "critical" task spawned through `TaskSpawner::non_critical` ends, or panics,
+    /// without ending the node: `join` keeps waiting, where the spawner's own reth critical
+    /// spawn reports the exit. Both are tracked: the manager's shutdown signal ends them.
+    #[tokio::test]
+    async fn non_critical_reth_tasks_never_end_the_node() {
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner().non_critical();
+        spawner.spawn_critical_task("rpc cache", Box::pin(async { panic!("dead cache") }));
+        spawner.spawn_critical_task("fee history", Box::pin(async {}));
+        spawner.spawn_critical_blocking_task("batcher", Box::pin(async {}));
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            task_manager.join(ShutdownNotifier::default()),
+        )
+        .await;
+        assert!(waited.is_err(), "the node keeps running: {waited:?}");
+        task_manager.signal_shutdown();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "tracked: they exit");
+
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        RethTaskSpawner::spawn_critical_task(&spawner, "rpc cache", Box::pin(async {}));
+        match task_manager.join(ShutdownNotifier::default()).await {
+            Err(TaskJoinError::CriticalExitOk(name)) => assert_eq!(name, "rpc cache"),
+            other => panic!("a reth critical task's exit ends the node: {other:?}"),
+        }
+    }
+
     /// Test that an error produced in a task makes it up to join.
     #[tokio::test]
     async fn test_task_manager_join() {
@@ -910,6 +991,35 @@ mod test {
         );
         task_manager.abort_all_tasks();
         task_manager.wait_for_task_shutdown().await;
+    }
+
+    /// A reth blocking task outlives an abort and ends on `signal_shutdown`, which leaves the
+    /// manager in place so `wait_for_exit` sees it go and what it held is released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_signal_shutdown_ends_reth_blocking_tasks() {
+        let mut task_manager = TaskManager::default();
+        let held = Arc::new(());
+        let task_held = held.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        reth_tasks::TaskSpawner::spawn_blocking_task(
+            &task_manager.get_spawner(),
+            Box::pin(async move {
+                let _held = task_held;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
+        task_manager.update_tasks();
+        // a blocking task that has not started yet is cancelled by an abort; this one is running
+        started_rx.await.expect("the task starts");
+        task_manager.abort();
+        assert!(
+            !task_manager.wait_for_exit(Duration::from_millis(200)).await,
+            "an abort does not stop a blocking task"
+        );
+        task_manager.signal_shutdown();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
+        assert_eq!(Arc::strong_count(&held), 1, "the task released what it held");
     }
 
     /// Regression: each spawn subscribes to the manager's shutdown notifier (a reth task three
