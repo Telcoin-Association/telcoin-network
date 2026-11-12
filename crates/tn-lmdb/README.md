@@ -704,22 +704,37 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
 - **Its counts.** From the step's sorted pages, one pass counts its runs, pages and the sizes of
   its gaps (`Gaps::of`); one pass over the sizes gives, at each candidate width (0, 1, 2, 4, 8,
   16, 32, 64), the gaps it would fill and their pages: the runs it would write are the runs less
-  those gaps, the pages the pages plus theirs. Measured: about 1 ns a page (31 µs for a
-  30,000-page step), the choice 0.04 µs.
+  those gaps, the pages the pages plus theirs. Measured: under 1 ns a page (24 µs for a
+  30,000-page step), the choice 0.4 µs (`the_chooser_costs_microseconds_per_step`, x86 Linux).
 - **Its cost model.** Each scattered step's runs written, pages written and data sync time are a
-  sample. Two forms are fitted to the latest samples, robustly (non-negative least squares,
-  reweighted by Huber's and then Tukey's weights of the residuals, so a stalled sync or a
-  latency spike moves the fit little): the sum `c + a·runs + b·pages` (a drive that pays per
-  write and per byte, such as local NVMe) and the capped form `c + max(a·runs, b·pages)` (a disk
-  capped on writes per second and on bytes per second, whichever binds, such as network block
-  storage, whose best width balances the two caps: the sum, a plane, can only straddle it). The
-  capped form is kept only when it fits markedly better (its trimmed error under 0.7 of the
-  sum's). The fill's own cost per gap tried and the share of gaps it fills are running means of
-  the fill's timer. A fit costs about 20 µs a step.
-- **Its choice.** The width whose predicted step 4, the model's sync time for the runs and pages
-  it would write plus the fill's cost of its gaps, is least (the smaller on a tie). On a drive
-  whose writes are cheap beside its bytes and the fill's cost it is 0; on one that caps its
-  writes, a fill.
+  sample, kept with its width: the latest 16 steps of each width. Two forms are fitted to them,
+  robustly (non-negative least squares, reweighted by Huber's and then Tukey's weights of the
+  residuals, so a stalled sync or a latency spike moves the fit little): the sum
+  `c + a·runs + b·pages` (a drive that pays per write and per byte, such as local NVMe) and the
+  capped form `c + max(a·runs, b·pages)` (a disk capped on writes per second and on bytes per
+  second, whichever binds, such as network block storage, whose best width balances the two caps:
+  the sum, a plane, can only straddle it). The capped form is kept only when it fits markedly
+  better: its error, the root mean square over the widths of each width's median residual (so a
+  probed width's few steps count as much as the choice's many), under 0.7 of the sum's. Each width
+  then has its own correction: the median, over the steps the choice held at that width (its
+  probes if it held none), of their sync time over the model's prediction. The forms are two
+  shapes, and a disk can cost far more at one width than either predicts from the others: on a
+  20,000-IOPS Hyperdisk, a peak output's commit at 0 took 1.3 to 2.2 s, two to three times what a
+  capped fit to the widths from 2 up allows. The fill's own cost per gap tried and the share of
+  gaps it fills are running means of the fill's timer. A fit costs about 13 µs a step.
+- **Its choice.** Each width's predicted step 4 is the model's sync time for the runs and pages it
+  would write, times the width's correction, plus the fill's cost of its gaps. The first choice
+  after a warm-up is the warm-up width that predicts the least. After that the choice moves only
+  to a width beside it, half of it or twice it (at least 2), and only when that is predicted to
+  save 5% of its time; a width beside it that no kept step measured is probed once first. A new
+  choice holds for 4 steps before the next move, so the next decision rests on its own steps. So
+  the choice never jumps to a width no step is near. That jump was how the fit's blind spots
+  became width-0 streaks: once every kept width was bound by its bytes, nothing showed the cost
+  per write, the sum's fit put 0 there, and 0 (the fewest pages) predicted cheapest; the first
+  steps at 0 then read as outliers, and on a disk with a burst allowance of writes they were cheap
+  besides (the first step at 0 after wider ones spends what they saved), so 4 to 5 followed at
+  about three times the cost before the fit turned. On a drive whose writes are cheap beside its
+  bytes and the fill's cost the choice is 0; on one that caps its writes, a fill.
 - **Exploration.** At one width a step's runs and pages move together, so steps at one width
   cannot tell `a` from `b`. An open starts with a warm-up of 12 scattered steps at 8, 0 and 4
   pages in turn; after it, a step is now and then a probe at half the choice or twice it (at
@@ -727,13 +742,13 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
   128, while the choice holds; a new choice brings it back to 16. So a disk whose choice moves is
   explored often and one that settles seldom: on the Mac's SSD, where the choice is 0, a probe's
   fill costs about half its step's sync (a fill costs about 3.7 µs a gap there), a 128th of that
-  over all steps once settled. The fit keeps the latest 48 steps at the choice and, apart, the
-  latest 16 probes, so the probes keep their say.
-- **Re-adaptation.** The windows forget old samples as new ones come. A disk whose costs change
-  at once (a cloud disk's limits raised, a drive that changed speed) is seen sooner: 8 steps in a
-  row whose sync took more than 1.5 times the prediction, or less than 1/1.5 of it, the same way,
-  empty both windows and start the warm-up again. The model is in memory only: each open starts
-  cold.
+  over all steps once settled. Since each width keeps its own steps, the choice's steps never
+  crowd out what the warm-up and the probes measured.
+- **Re-adaptation.** A width's samples give way to its newer steps, and its correction follows
+  them. A disk whose costs change at once (a cloud disk's limits raised, a drive that changed
+  speed) is seen sooner: 8 steps in a row whose sync took more than 1.5 times the corrected
+  prediction, or less than 1/1.5 of it, the same way, empty every width's samples and start the
+  warm-up again. The model is in memory only: each open starts cold.
 - **No byte changes, at any width.** The width only says which clean gaps step 4 rewrites with
   their own bytes, so no choice changes a byte of the file (`a_gap_fill_changes_no_byte_of_the_file`
   runs auto beside 0, 4 and 64; the crash matrices run under auto too,
