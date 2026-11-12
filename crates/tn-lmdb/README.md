@@ -704,8 +704,8 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
 - **Its counts.** From the step's sorted pages, one pass counts its runs, pages and the sizes of
   its gaps (`Gaps::of`); one pass over the sizes gives, at each candidate width (0, 1, 2, 4, 8,
   16, 32, 64), the gaps it would fill and their pages: the runs it would write are the runs less
-  those gaps, the pages the pages plus theirs. Measured: about 1 ns a page (31 µs for a
-  30,000-page step), the choice 0.04 µs.
+  those gaps, the pages the pages plus theirs. Measured: under 1 ns a page (24 µs for a
+  30,000-page step), the choice 0.4 µs (`the_chooser_costs_microseconds_per_step`, x86 Linux).
 - **Its cost model.** Each scattered step's runs written, pages written and data sync time are a
   sample, kept with its width: the latest 16 steps of each width. Two forms are fitted to them,
   robustly (non-negative least squares, reweighted by Huber's and then Tukey's weights of the
@@ -721,7 +721,7 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
   shapes, and a disk can cost far more at one width than either predicts from the others: on a
   20,000-IOPS Hyperdisk, a peak output's commit at 0 took 1.3 to 2.2 s, two to three times what a
   capped fit to the widths from 2 up allows. The fill's own cost per gap tried and the share of
-  gaps it fills are running means of the fill's timer. A fit costs about 20 µs a step.
+  gaps it fills are running means of the fill's timer. A fit costs about 13 µs a step.
 - **Its choice.** Each width's predicted step 4 is the model's sync time for the runs and pages it
   would write, times the width's correction, plus the fill's cost of its gaps. The first choice
   after a warm-up is the warm-up width that predicts the least. After that the choice moves only
