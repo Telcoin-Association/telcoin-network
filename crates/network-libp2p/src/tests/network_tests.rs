@@ -8,7 +8,7 @@ use crate::{
     },
     freshness::RecordTimestamp,
     is_unsupported_protocol,
-    types::{EpochPosition, RecordDomain},
+    types::{EpochPosition, GossipValidation, GossipVerdict, RecordDomain},
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -1937,6 +1937,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             debug!(target: "network", ?peer_id, ?res, "peer network shutdown");
         });
 
+        // a committee peer can relay the target's gossip to nvv, so it must accept each
+        // message (#1772)
+        let (_, idle) = mpsc::channel(1);
+        spawn_gossip_relay(std::mem::replace(&mut peer._network_events, idle));
+
         peer.network_handle.start_listening(peer.config.primary_address()).await?;
 
         // add peers to each other's known peers
@@ -1968,9 +1973,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         .await?;
     }
 
-    // allow heartbeat to trigger peer pruning - increased to give libp2p time to
-    // stabilize internal connection state and avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+    // wait until target counts every committee peer; heartbeat pruning keeps the count at or
+    // below max_peers
+    let committee_size = other_peers.len();
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(9), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == committee_size)
+    })
+    .await?;
 
     // check that target has limited peers
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -1993,8 +2003,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         config: peer2_config,
         network_handle: peer2,
         network: peer2_network,
-        network_events: _,
+        network_events: peer2_events,
     } = peer2;
+
+    // peer2 relays the target's gossip to nvv, so it must accept each message (#1772)
+    spawn_gossip_relay(peer2_events);
 
     // connect peer2
     tokio::spawn(async move {
@@ -2017,9 +2030,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect to target
     peer2.dial_by_bls(target_peer_bls).await?;
 
-    // give time for connection to establish and libp2p state to stabilize
-    // target should be at max capacity
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until target counts peer2; target is then at its peer target
+    wait_until(Duration::from_secs(5), "target accepts peer2", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() > committee_size)
+    })
+    .await?;
 
     // spawn nvv that goes through px
     let NetworkPeer {
@@ -2050,9 +2065,27 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect nvv to target (which already has too many peers)
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // allow time for kademlia records to propagate and libp2p connection state to
-    // stabilize after disconnection - increased to avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // wait until target prunes nvv as an excess peer and nvv reaches the mesh through the peers
+    // that target exchanged; an empty nvv peer set does not count, because nvv starts empty
+    let nvv_bls = *nvv_config.config().primary_bls_key();
+    let nvv_handle = &nvv;
+    wait_until(
+        Duration::from_secs(15),
+        "target prunes nvv and nvv reaches exchanged peers",
+        move || async move {
+            let target_drops_nvv = !target_handle.connected_peers().await?.contains(&nvv_bls);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|nvv_peers| {
+                    target_drops_nvv
+                        && !nvv_peers.contains(&target_peer_id)
+                        && !nvv_peers.is_empty()
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
@@ -2112,6 +2145,21 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     assert!(received, "nvv MUST receive gossip message through mesh propagation");
 
     Ok(())
+}
+
+/// Drain `events` and accept every gossip message, so the peer relays it to the mesh.
+///
+/// Gossipsub forwards a message only after the consumer accepts it (#1772). A test peer that
+/// only relays has no consumer, so this task stands in for one.
+fn spawn_gossip_relay(events: mpsc::Receiver<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>) {
+    let incoming = futures::stream::unfold(events, |mut events| async move {
+        events.recv().await.map(|event| (event, events))
+    });
+    tokio::spawn(futures::StreamExt::for_each(incoming, |event| async move {
+        if let NetworkEvent::Gossip(mut gossip) = event {
+            gossip.validation.accept().await;
+        }
+    }));
 }
 
 /// A pruned peer that does not support the dedicated peer-exchange protocol still
@@ -2453,7 +2501,10 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
 /// Every signed endpoint gets a fresh QUIC window, and the caller survives intermediate timeouts.
 #[tokio::test]
 async fn serial_dial_reaches_last_live_signed_address() -> eyre::Result<()> {
-    let mut settings = NetworkConfig::default();
+    // A 4 s QUIC handshake window keeps the serial fallback over three silent endpoints at about
+    // 12 s, not 30 s, and still longer than the 10 s libp2p default connection timeout.
+    let mut settings: NetworkConfig =
+        serde_yaml::from_str("quic_config: {handshake_timeout: {secs: 4, nanos: 0}}")?;
     settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     // A legacy or explicitly short peer timeout must not race the transport's fallback sequence.
     settings.peer_config_mut().dial_timeout = Duration::from_millis(1);
@@ -3208,8 +3259,12 @@ async fn test_get_kad_records() -> eyre::Result<()> {
             .await?;
     }
 
-    // Allow time for heartbeats to happen
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // Check connected peers on target - should be limited based on config
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -3244,16 +3299,39 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     )
     .await?;
 
-    // give time for connection to establish
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait for the connection to establish
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(3), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
 
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
 
-    // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // wait until nvv dials every committee peer that kad found
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|peer| peer.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to target and every committee peer",
+        move || async move {
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    connected.contains(&target_peer_id)
+                        && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // assert nvv is connected with other peers
     let connected = nvv.connected_peer_ids().await?;
@@ -4406,7 +4484,12 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         .await?;
     }
 
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // spawn the 6th non-validator peer
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -4429,13 +4512,41 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         target_peer_addr.clone(),
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(3), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
 
     // ask the network to locate every committee member via kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // wait until nvv dials every committee peer that kad found and resolves target's rpc; the
+    // records of the other peers must be in place before the asserts check that they carry none
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|p| p.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    let target_rpc = &rpc;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to every committee peer and resolves target rpc",
+        move || async move {
+            let target_rpc_known =
+                nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    target_rpc_known && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // snapshot the advertised RPCs known on the NVV; only the target advertised
     let mut all = nvv.get_all_validator_rpcs().await?;
@@ -4539,7 +4650,12 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         .await?;
     }
 
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // spawn the 6th non-validator peer
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -4563,8 +4679,12 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
     })
     .await?;
-    // let target's self-advertised push land while the nvv's committee set is still empty
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target's self-advertised push lands while the nvv's committee set is still empty
+    let target_rpc = &rpc;
+    wait_until(Duration::from_secs(3), "nvv caches target's pushed rpc", move || async move {
+        Ok(nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc))
+    })
+    .await?;
     // the push must be admitted for the pinned key NOW, while no committee slot is seeded;
     // without this check the stub re-discovery after `update_committees` recovers the record
     // from the nvv's own kad store and masks a regression of the pinned-key admission
@@ -4584,7 +4704,31 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // wait until nvv dials every committee peer that kad found and resolves target's rpc; the
+    // records of the other peers must be in place before the asserts check that they carry none
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|p| p.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    let target_rpc = &rpc;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to every committee peer and resolves target rpc",
+        move || async move {
+            let target_rpc_known =
+                nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    target_rpc_known && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // snapshot the advertised RPCs known on the NVV; only the target advertised
     let mut all = nvv.get_all_validator_rpcs().await?;
@@ -5571,7 +5715,7 @@ fn test_gossip_message() -> GossipMessage {
 fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message.clone(), None, None);
+        accepted_gossip_event(message.clone(), None, None, GossipValidation::detached());
     assert_matches!(
         event,
         NetworkEvent::Gossip(payload)
@@ -5588,7 +5732,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, Some(bls), None);
+        accepted_gossip_event(message, Some(bls), None, GossipValidation::detached());
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
@@ -5869,7 +6013,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let author = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, None, Some(author));
+        accepted_gossip_event(message, None, Some(author), GossipValidation::detached());
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }
@@ -6672,5 +6816,88 @@ async fn forged_committee_record_cannot_rebind_another_peer_id() -> eyre::Result
         network.swarm.behaviour().peer_manager.peer_to_bls(&victim_peer_id),
         Some(attacker_bls)
     );
+    Ok(())
+}
+
+/// A gossip validation ticket reports one verdict at most, and a ticket dropped without a
+/// verdict reports `Ignore` (#1772).
+#[tokio::test]
+async fn gossip_validation_reports_each_verdict_once() -> eyre::Result<()> {
+    let (sender, mut commands) =
+        mpsc::channel::<NetworkCommand<TestWorkerRequest, TestWorkerResponse>>(4);
+    let source = PeerId::random();
+    let ticket = |id: &[u8]| {
+        GossipValidation::new(gossipsub::MessageId::from(id.to_vec()), source, sender.clone())
+    };
+
+    // a ticket dropped without a verdict reports `Ignore` for its message and relayer
+    drop(ticket(b"dropped"));
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation {
+            message_id,
+            propagation_source,
+            verdict: GossipVerdict::Ignore,
+        }) if message_id == gossipsub::MessageId::from(b"dropped".to_vec())
+            && propagation_source == source
+    ));
+
+    // `accept` reports `Accept`; a later `reject` and the drop report nothing
+    let mut accepted = ticket(b"accepted");
+    assert!(accepted.is_pending());
+    accepted.accept().await;
+    assert!(!accepted.is_pending());
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation { verdict: GossipVerdict::Accept, .. })
+    ));
+    accepted.reject().await;
+    drop(accepted);
+    assert!(commands.try_recv().is_err(), "a ticket reports one verdict at most");
+
+    // `reject` reports `Reject`; the drop after it reports nothing
+    let mut rejected = ticket(b"rejected");
+    rejected.reject().await;
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation { verdict: GossipVerdict::Reject, .. })
+    ));
+    drop(rejected);
+    assert!(commands.try_recv().is_err(), "a rejected ticket reports nothing on drop");
+
+    // a detached ticket reports nothing
+    drop(GossipValidation::<TestWorkerRequest, TestWorkerResponse>::detached());
+    assert!(commands.try_recv().is_err(), "a detached ticket reports nothing");
+    Ok(())
+}
+
+/// An accepted gossip event that never reaches the application drops its ticket, and the
+/// ticket reports `Ignore` for the held message. Gossipsub then never forwards a message this
+/// node did not verify (#1772). The swarm passes the reported verdict to gossipsub in the
+/// `ReportGossipValidation` command arm.
+#[tokio::test]
+async fn dropped_gossip_event_reports_ignore() -> eyre::Result<()> {
+    let (sender, mut commands) =
+        mpsc::channel::<NetworkCommand<TestWorkerRequest, TestWorkerResponse>>(1);
+    let message_id = gossipsub::MessageId::from(b"shed-gossip".to_vec());
+    let source = PeerId::random();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> = accepted_gossip_event(
+        test_gossip_message(),
+        None,
+        None,
+        GossipValidation::new(message_id.clone(), source, sender),
+    );
+    // the application side of the event stream is closed, as at an epoch boundary
+    let (events, closed) = mpsc::channel(1);
+    drop(closed);
+    assert!(events.try_send(event).is_err(), "a closed event stream refuses the event");
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation {
+            message_id: reported,
+            propagation_source,
+            verdict: GossipVerdict::Ignore,
+        }) if reported == message_id && propagation_source == source
+    ));
     Ok(())
 }

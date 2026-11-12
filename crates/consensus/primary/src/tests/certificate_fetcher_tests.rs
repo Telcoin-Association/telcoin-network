@@ -129,7 +129,10 @@ impl MissingCertFetcher for MockFetcher {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -717,7 +720,10 @@ async fn test_gc_round_update_during_fetch() {
         .unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_network_failure_keeps_trying() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -786,7 +792,10 @@ async fn test_network_failure_keeps_trying() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_partial_response_handling_rejects_invalid_cert() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -868,7 +877,10 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     verify_certificates_not_in_store(&certificate_store, &[bad_cert]);
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_bad_cert_in_fetch_rejects_all() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();

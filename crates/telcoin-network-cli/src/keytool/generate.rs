@@ -308,7 +308,7 @@ impl KeygenArgs {
 
     /// Test-only twin of [`Self::execute`] that wraps the generated BLS key with an
     /// intentionally weak PBKDF2 round count. NEVER call this outside tests.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn execute_insecure<TND: TelcoinDirs>(
         &self,
         tn_datadir: &TND,

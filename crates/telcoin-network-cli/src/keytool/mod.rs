@@ -77,7 +77,7 @@ impl KeyArgs {
     /// Test-only twin of [`Self::execute`]: `generate validator|observer` wrap the fresh BLS
     /// key with an intentionally weak PBKDF2 round count; every other subcommand never writes
     /// keys and behaves exactly like [`Self::execute`]. NEVER call this outside tests.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn execute_insecure(
         &self,
         datadir: PathBuf,
@@ -143,16 +143,23 @@ impl KeyArgs {
 mod tests {
     use super::{
         export_staking_args::ExportStakingArgs, generate::KeygenArgs, pop::PopArgs,
-        set_rpc::SetRpcArgs,
+        set_rpc::SetRpcArgs, KeyArgs,
     };
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
     use tn_types::{
-        hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo, DEFAULT_WORKER_ID,
+        hex, test_utils::CommandParser, verify_proof_of_possession_bls, Address, BlsPublicKey,
+        RpcInfo, DEFAULT_WORKER_ID,
     };
     use url::Url;
     use zeroize::Zeroizing;
+
+    /// PBKDF2 rounds for tests that do not pin the BLS key-wrap work factor.
+    ///
+    /// Must stay 1: the keyfile does not store its round count, and the loader tries only
+    /// 1 round and then the production count.
+    const TEST_KDF_ROUNDS: u32 = 1;
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -249,6 +256,10 @@ mod tests {
     /// library's owner-only directory mode into a no-op for every fresh CLI install. The
     /// pre-created case seeds an explicit 0755 (an older build's layout, or a packaging
     /// script's mkdir), so the check does not depend on the ambient umask.
+    ///
+    /// The keytool path is the same as `generate validator` (`init_path`, then the key
+    /// writer), but the BLS key is wrapped with the test KDF: this test pins the directory
+    /// mode, not the work factor.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_keytool_generate_key_dir_is_owner_only() {
@@ -265,23 +276,24 @@ mod tests {
                     .expect("loosen keys dir");
             }
 
-            let tn = Cli::<NoArgs>::try_parse_from([
-                "telcoin-network",
-                "keytool",
+            let keys_command = CommandParser::<KeyArgs>::try_parse_from([
+                "tn",
                 "generate",
                 "validator",
                 "--workers",
                 "1",
-                "--datadir",
-                temp_path.to_str().expect("tempdir path clean"),
                 "--address",
                 "0",
             ])
             .expect("cli parsed");
-            tn.run(Some(Zeroizing::new("key_dir_mode_test".to_string())), |_, _, _, _, _| {
-                tokio::spawn(async { Ok(()) })
-            })
-            .expect("generate keys command");
+            keys_command
+                .args
+                .execute_insecure(
+                    temp_path.to_path_buf(),
+                    Some(Zeroizing::new("key_dir_mode_test".to_string())),
+                    TEST_KDF_ROUNDS,
+                )
+                .expect("generate keys command");
 
             let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
             assert_eq!(
@@ -958,11 +970,12 @@ mod tests {
     /// generate keys (which would be wrong and destructive).
     #[tokio::test]
     async fn test_generate_pop_wrong_passphrase_hint() {
-        // Generate an encrypted keyfile (bls.kw) with the correct passphrase.
+        // Generate an encrypted keyfile (bls.kw) with the correct passphrase. The test KDF
+        // is enough: the assert is on the error text, not on the work factor.
         let dir = tempfile::TempDir::new().expect("tempdir created");
         let path = dir.path().to_path_buf();
         keygen_args(None)
-            .execute(&path, Some(Zeroizing::new("correct".to_string())))
+            .execute_insecure(&path, Some(Zeroizing::new("correct".to_string())), TEST_KDF_ROUNDS)
             .expect("generate keys with passphrase");
 
         let err = PopArgs { address: new_test_address() }
