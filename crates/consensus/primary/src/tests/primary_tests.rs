@@ -1032,6 +1032,57 @@ async fn test_request_vote_skips_attached_parent_already_pending() {
     assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
 }
 
+/// A vote request dropped while it waits, as the network layer drops one its requester cancels,
+/// leaves the author's entry in the vote guard as it found it, so a second header from that
+/// author at the same round is still refused before it can record missing parents (#1822
+/// follow-up).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_dropped_request_keeps_author_entry() {
+    let voter = PendingParentVoter::new().await;
+    let (author_peer, header) = voter.header(2);
+    let (_, second_header) = voter.header(2);
+    assert_ne!(header.digest(), second_header.digest());
+    let expected_missing = voter.missing_digests();
+
+    // TEST PHASE 1: the author is told which parents are missing, which the guard records.
+    let response = voter.handler.vote(author_peer, header.clone(), Vec::new()).await.unwrap();
+    let PrimaryResponse::MissingParents(missing) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 2: the author attaches them. They are parked as pending and the vote waits for
+    // them, and the request is dropped during that wait, before the vote timeout.
+    let dropped = timeout(
+        Duration::from_secs(1),
+        voter.handler.vote(author_peer, header.clone(), voter.round_2_missing.clone()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the request ended before it was dropped: {dropped:?}");
+    assert!(voter.missing_parents_pending(&header).await);
+
+    // TEST PHASE 3: the guard still holds the author's `MissingParents` for this header, so a
+    // fresh request for it is told the same missing parents at once.
+    let response = voter.handler.vote(author_peer, header, Vec::new()).await;
+    let Ok(PrimaryResponse::MissingParents(missing)) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 4: a second header from the author at the same round is refused by the guard.
+    let response = voter.handler.vote(author_peer, second_header, Vec::new()).await;
+    assert!(
+        matches!(
+            response,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+                theirs: 3,
+                ours: 3
+            }))
+        ),
+        "{response:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_request_vote_missing_batches() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)

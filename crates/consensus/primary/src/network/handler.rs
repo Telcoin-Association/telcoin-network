@@ -801,6 +801,11 @@ where
                     .into());
                 }
             }
+            // put the entry back while the request is evaluated: the network layer drops this
+            // future when the requester cancels the request, and a dropped request must leave the
+            // guard as it found it. an empty entry would let another header from this author at
+            // the same round past the check above and into `check_for_missing_parents`
+            *auth_last_vote = previous_vote.clone();
             let epoch = header.epoch();
             let round = header.round();
             let digest = header.digest();
