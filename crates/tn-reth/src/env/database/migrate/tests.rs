@@ -17,6 +17,7 @@ use reth_db::{
 use reth_node_core::args::DatabaseArgs;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
+use tn_lmdb_reth::RethTableStat;
 
 /// One table's raw rows: encoded keys and compressed values, in order.
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -617,7 +618,8 @@ fn a_migration_stopped_before_its_commit_point_migrates_again_at_the_next_open()
 
 /// A migration stopped after its commit point (`tn-lmdb.dat` in place beside MDBX's files, no
 /// marker) is finished by the next open: MDBX's files and the temp directory are removed, the
-/// marker is written, and the migrated rows are intact.
+/// marker is written, and the migrated rows are intact. The temp directory holds the record of
+/// `mdbx.dat` the migration took before its commit point, and the unchanged file passes it.
 #[test]
 fn a_migration_stopped_after_its_commit_point_is_finished() {
     let marker = stop_then_reopen(Step::AfterRename, 0, |path| {
@@ -625,8 +627,203 @@ fn a_migration_stopped_after_its_commit_point_is_finished() {
             assert!(exists(&path.join(present)), "{present} is left as a kill leaves it");
         }
         assert!(!exists(&path.join(MIGRATED_MARKER)));
+        let recorded =
+            MdbxSource::read(&path.join(MIGRATING_DIR)).expect("read").expect("a record");
+        let now = MdbxSource::stat(&path.join(MDBX_DATA_FILE), recorded.last_txnid).expect("stat");
+        assert_eq!(recorded, now, "mdbx.dat is as recorded");
+        assert!(recorded.last_txnid > 0, "MDBX's last transaction id: {recorded:?}");
     });
     assert!(marker.contains("finished by a later open"), "{marker}");
+}
+
+/// How a test writes `mdbx.dat` after a migration's commit point, as a build running reth on MDBX
+/// alone would in the window before the version file: a byte appended (its length and
+/// modification time change), or the modification time alone moved (as a write that keeps the
+/// length would).
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Append,
+    Touch,
+}
+
+/// Between a migration's commit point and its version file, a build running reth on MDBX alone can
+/// open and advance `mdbx.dat`, which finishing the migration would then remove: the migration
+/// records the file's length and modification time before its commit point, and the open that
+/// finds the stopped migration refuses an `mdbx.dat` that differs, naming both files and keeping
+/// them, with the temp directory and its record. `db stats` refuses the directory as unfinished.
+/// Once resolved by hand (here `mdbx.dat` removed), the next open finishes the migration.
+#[test]
+fn mdbx_written_after_the_commit_point_is_refused() {
+    use std::io::Write as _;
+    for change in [Change::Append, Change::Touch] {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        STOP_AT.set(Some(Step::AfterRename));
+        let err = open(&path).expect_err("the migration is stopped");
+        assert!(matches!(err.downcast_ref::<Killed>(), Some(Killed(Step::AfterRename))), "{err:#}");
+        let record = path.join(MIGRATING_DIR).join(MDBX_SOURCE_RECORD);
+        let recorded = std::fs::read_to_string(&record).expect("the record");
+        assert!(recorded.starts_with("len ") && recorded.contains("\nlast_txnid "), "{recorded}");
+
+        let mdbx = path.join(MDBX_DATA_FILE);
+        match change {
+            Change::Append => {
+                let mut file =
+                    std::fs::OpenOptions::new().append(true).open(&mdbx).expect("open to append");
+                file.write_all(b"x").expect("append");
+            }
+            Change::Touch => {
+                let file = std::fs::OpenOptions::new().write(true).open(&mdbx).expect("open");
+                let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+                file.set_modified(later).expect("touch");
+            }
+        }
+        let written = std::fs::read(&mdbx).expect("mdbx.dat");
+        let tn_lmdb = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+
+        let err = open(&path).expect_err("mdbx.dat written after the commit point");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("was written since"), "{change:?}: says why: {msg}");
+        assert!(msg.contains("stopped after its commit point"), "{change:?}: {msg}");
+        for file in [MDBX_DATA_FILE, DATA_FILE] {
+            let named = msg.contains(&path.join(file).display().to_string());
+            assert!(named, "{change:?}: names {file}: {msg}");
+        }
+        assert_eq!(std::fs::read(&mdbx).expect("mdbx.dat"), written, "{change:?}: mdbx.dat kept");
+        let now = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+        assert!(now == tn_lmdb, "{change:?}: tn-lmdb.dat kept");
+        assert!(!exists(&path.join(MIGRATED_MARKER)), "{change:?}: no marker");
+        assert_eq!(std::fs::read_to_string(&record).expect("kept"), recorded, "{change:?}");
+        let stats = format!("{:#}", db_table_stats(&path).expect_err("unfinished"));
+        assert!(stats.contains("pending or unfinished"), "{change:?}: {stats}");
+
+        std::fs::remove_file(&mdbx).expect("resolved by hand");
+        let db = open(&path).expect("the next open finishes the migration");
+        let mut rows = raw_rows(&*db);
+        rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+        assert!(rows == expected, "{change:?}: every row, as MDBX held it");
+        let marker = std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker");
+        assert!(marker.contains("finished by a later open"), "{change:?}: {marker}");
+        assert!(!exists(&path.join(MIGRATING_DIR)), "{change:?}: the temp directory is gone");
+    }
+}
+
+/// While `mdbx.dat` or the temp directory is in the database directory, the open holds an
+/// exclusive lock on the directory itself: a second process migrating the same directory (two
+/// datadirs naming one `db/`) is refused, naming the directory, and changes nothing; once the lock
+/// is released the open migrates.
+#[test]
+fn a_migration_is_refused_while_another_process_holds_the_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+    // Another process's lock: a second handle on the directory, as `flock` counts handles.
+    let held = std::fs::File::open(&path).expect("open the directory");
+    held.try_lock().expect("lock the directory");
+    let err = open(&path).expect_err("the directory is locked");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("another process is migrating this database"), "{msg}");
+    assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
+    assert_untouched(&path, &mdbx, "locked");
+
+    drop(held);
+    let mut rows = raw_rows(&*open(&path).expect("migrates once the lock is released"));
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert_eq!(rows, expected);
+}
+
+/// MDBX's `MDBX_WANNA_RECOVERY` on the read-only open (an environment stopped uncleanly under
+/// `safe-no-sync`) gets the hint to run the previous binary once and stop it cleanly, over the
+/// error as reth reports it; any other open error is left as it is.
+#[test]
+fn an_mdbx_open_refused_for_recovery_gets_a_hint() {
+    let open_error = |e: MdbxError| {
+        eyre::Report::new(DatabaseError::Open(e.into()))
+            .wrap_err("Could not open database at path: db")
+    };
+    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::WannaRecovery)));
+    assert!(msg.contains(WANNA_RECOVERY_HINT), "{msg}");
+    assert!(msg.contains("Could not open database at path: db"), "{msg}");
+    assert!(msg.contains("MDBX_WANNA_RECOVERY"), "MDBX's own text: {msg}");
+    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::Busy)));
+    assert!(!msg.contains(WANNA_RECOVERY_HINT), "{msg}");
+    assert!(msg.contains("Could not open database at path: db"), "{msg}");
+}
+
+/// `migrate_reth_db` (behind `db migrate-execution`) migrates an MDBX database with the node's
+/// `--db.*` settings and returns the marker's text, without opening the database after (no client
+/// version is recorded); run again it has nothing to migrate, and the node's open after it is a
+/// normal one. On a directory with no database it creates nothing. A migration stopped after its
+/// commit point is finished, and the marker says so.
+#[test]
+fn migrate_reth_db_migrates_without_opening_the_database() {
+    use crate::env::database::{migrate_reth_db, TN_LMDB_DB_VERSION};
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let args = tn_lmdb_db_args();
+
+    let marker = migrate_reth_db(&path, &args).expect("migrates").expect("a migration ran");
+    assert!(marker.starts_with("migrated from MDBX to tn-lmdb: "), "{marker}");
+    assert_eq!(std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker"), marker);
+    for gone in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATING_DIR] {
+        assert!(!exists(&path.join(gone)), "{gone} is removed");
+    }
+    assert_eq!(reth_db::version::get_db_version(&path).expect("version"), TN_LMDB_DB_VERSION);
+    let read_only =
+        TnLmdbEnv::open(&path, TnLmdbEnvKind::RO, TnLmdbArgs::default()).expect("read-only");
+    assert_eq!(read_only.page_size(), TN_LMDB_PAGE_SIZE as u32, "the configured page size");
+    assert_eq!(raw_rows(&read_only), expected, "every row, and no client version recorded");
+    drop(read_only);
+    assert_eq!(migrate_reth_db(&path, &args).expect("a tn-lmdb database"), None);
+
+    let db = open(&path).expect("a normal open");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert_eq!(rows, expected);
+    drop(db);
+
+    let none = tmp.path().join("none");
+    assert_eq!(migrate_reth_db(&none, &args).expect("no database"), None);
+    assert!(!exists(&none), "nothing is created");
+
+    let path = tmp.path().join("stopped");
+    build_mdbx(&path);
+    STOP_AT.set(Some(Step::BeforeMarker));
+    let err = open(&path).expect_err("stopped before the marker");
+    assert!(matches!(err.downcast_ref::<Killed>(), Some(Killed(Step::BeforeMarker))), "{err:#}");
+    let marker = migrate_reth_db(&path, &args).expect("finishes").expect("a migration finished");
+    assert!(marker.contains("finished by a later open"), "{marker}");
+    assert!(!exists(&path.join(MIGRATING_DIR)), "the temp directory is gone");
+}
+
+/// The bytes of the pages reth's tables take in the tn-lmdb database `db` (the page size times
+/// each table's pages), the figures `db stats` reports on the tn-lmdb build.
+fn tn_lmdb_table_bytes(db: &TnLmdbEnv) -> u64 {
+    let pages: u64 = db.table_stats().expect("stats").iter().map(RethTableStat::pages).sum();
+    u64::from(db.page_size()) * pages
+}
+
+/// The quarter [`needed_bytes`] adds to MDBX's live bytes holds the test database's tables on
+/// tn-lmdb (at a different page size from MDBX's): its tables take at most the live bytes plus a
+/// quarter. The margin is unmeasured on a production database; this keeps it honest on the
+/// tables the tests build.
+#[test]
+fn the_migrated_tables_fit_the_headroom() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    build_mdbx(&path);
+    let live = mdbx_live(&path);
+    let db = open(&path).expect("the open migrates");
+    let used = tn_lmdb_table_bytes(&db);
+    println!(
+        "tn-lmdb's tables take {used} bytes of pages, MDBX's {live}: {:.3}",
+        used as f64 / live as f64
+    );
+    assert!(used <= live + live / 4, "tn-lmdb's tables take {used} bytes of pages, MDBX's {live}");
 }
 
 /// A migration stopped after it removed MDBX's files, before it wrote the marker, is finished by
@@ -1116,7 +1313,9 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 /// On demand: migrate a copy of a real reth database through `open_rw` with the default `--db.*`
 /// settings, and check every table's rows and their hash against the copy's MDBX. It prints the
 /// live bytes of the copy's tables and the free space the migration needs ([`needed_bytes`]), then
-/// the time, the sizes of `mdbx.dat` and `tn-lmdb.dat`, and each table's rows.
+/// the time, the sizes of `mdbx.dat` and `tn-lmdb.dat`, each table's rows, and the bytes of pages
+/// tn-lmdb's tables take against MDBX's live bytes, with their ratio (the measure of
+/// `needed_bytes`'s quarter margin).
 ///
 /// `TN_RETH_MIGRATE_SRC` names a reth database directory holding `mdbx.dat` (a stopped node's
 /// `<datadir>/db`). The test copies its `mdbx.dat` and `database.version` into a temp dir and
@@ -1195,5 +1394,11 @@ fn migrates_a_copy_of_a_real_database() {
     let rows: u64 = before.iter().map(|digest| digest.rows).sum();
     println!(
         "migrated {rows} rows in {elapsed:?}: mdbx.dat {mdbx_len} bytes, tn-lmdb.dat {tn_lmdb_len} bytes"
+    );
+    let used = tn_lmdb_table_bytes(&db);
+    println!(
+        "tn-lmdb's tables take {used} bytes of pages, MDBX's live pages {live} bytes: ratio {:.3} \
+         (needed_bytes allows 1.25)",
+        used as f64 / live as f64
     );
 }

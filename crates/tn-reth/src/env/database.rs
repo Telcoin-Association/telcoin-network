@@ -303,7 +303,9 @@ pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
 ///
 /// The tn-lmdb build refuses a directory holding MDBX's data file (`mdbx.dat`), whatever its
 /// database holds: the open would migrate it, or finish a stopped migration, which removes MDBX's
-/// files.
+/// files. It also refuses one holding a migration stopped after its commit point whose `mdbx.dat`
+/// is already gone (the temp directory emptied by the rename, beside `tn-lmdb.dat`, and no
+/// marker: `migrate::stopped_after_commit_point`), which the open would finish.
 #[cfg(not(feature = "mdbx"))]
 pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
     let mdbx = path.join(MDBX_DATA_FILE);
@@ -315,7 +317,70 @@ pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
             mdbx.display(),
         );
     }
+    if migrate::stopped_after_commit_point(path)? {
+        eyre::bail!(
+            "the reth database at {} holds an unfinished MDBX to tn-lmdb migration ({} beside {}, \
+             without the marker {}), which the node's next start finishes: refused before anything \
+             opens it",
+            path.display(),
+            path.join(MIGRATING_DIR).display(),
+            path.join(tn_lmdb_reth::DATA_FILE).display(),
+            path.join(MIGRATED_MARKER).display(),
+        );
+    }
     Ok(())
+}
+
+/// Migrate the reth database in directory `path` from MDBX to tn-lmdb without opening it after
+/// (`telcoin-network db migrate-execution`): the version check, the backend guard (which migrates
+/// an MDBX database, finishes a migration stopped after its commit point, and refuses what the
+/// node's open refuses) and the version file, as [`open_rw`] runs them before its open, with
+/// `db_args` the `--db.*` flags the node runs with, so the file gets their page size, reservation
+/// and growth step. Returns the marker's text when a migration ran or was finished, and `None`
+/// when there was nothing to migrate (a tn-lmdb database, or none, is left as it is, and no
+/// directory is created).
+#[cfg(not(feature = "mdbx"))]
+pub fn migrate_reth_db(path: &Path, db_args: &DatabaseArgs) -> eyre::Result<Option<String>> {
+    warn_max_size_is_a_reservation(db_args);
+    let args = tn_lmdb_args(db_args)?;
+    let pending =
+        file_exists(&path.join(MDBX_DATA_FILE))? || migrate::stopped_after_commit_point(path)?;
+    check_db_version_file(path)?;
+    check_backend(path, args)?;
+    if !pending {
+        return Ok(None);
+    }
+    record_db_version_file(path)?;
+    let marker = path.join(MIGRATED_MARKER);
+    std::fs::read_to_string(&marker)
+        .map(Some)
+        .wrap_err_with(|| format!("failed to read {}", marker.display()))
+}
+
+/// [`migrate_reth_db`] on the MDBX build: refused, this build runs reth on MDBX and never
+/// migrates. The directory is not opened.
+#[cfg(feature = "mdbx")]
+pub fn migrate_reth_db(path: &Path, db_args: &DatabaseArgs) -> eyre::Result<Option<String>> {
+    let _ = db_args;
+    eyre::bail!(
+        "`db migrate-execution` moves the reth database from MDBX to tn-lmdb, and this build runs \
+         reth on MDBX (the database at {} was not opened): build without the `mdbx` feature",
+        path.display()
+    )
+}
+
+/// Warn that `--db.max-size`, when set, is the tn-lmdb mapping's address-space reservation, not
+/// the cap reth's help for the flag describes: past it the engine remaps at double the size, and
+/// the node does not stop. Called where the flag is read from the command line (`RethConfig::new`
+/// and [`migrate_reth_db`]), not in [`tn_lmdb_args`], which a temp chain's own reservation also
+/// goes through. The MDBX build runs reth's cap, so it warns of nothing.
+pub(crate) fn warn_max_size_is_a_reservation(db_args: &DatabaseArgs) {
+    if cfg!(feature = "mdbx") {
+        return;
+    }
+    if let Some(max_size) = db_args.max_size {
+        tracing::warn!(target: "tn::reth", max_size, "--db.max-size is the tn-lmdb mapping's address-space reservation, not a cap on the database's size: past it the engine remaps at double the size, and the node does not stop (reth's help for the flag describes MDBX)");
+    }
 }
 
 /// The figures of one of reth's tables in the database's newest committed state
