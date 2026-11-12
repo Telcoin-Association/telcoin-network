@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::{ConsensusConfig, KeyConfig, Parameters};
+use tn_config::{ConsensusConfig, KeyConfig, Parameters, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
@@ -2040,54 +2040,123 @@ async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<(
     Ok(())
 }
 
-/// When `vote_inner` blocks longer than [`Parameters::vote_timeout`], `vote()` must return
-/// `PrimaryNetworkError::Timeout` once that timeout elapses.
+/// A voter whose execution has not reached the header's block refuses the vote as
+/// `ExecutionBehind` once [`VOTE_EXECUTION_WAIT`] passes, well inside the 5 s default
+/// [`Parameters::vote_timeout`], and a block that executes within the wait lets the vote proceed.
 ///
-/// `vote_timeout` is the voter-side limit on evaluating one vote request, including every wait for
-/// execution, parents, batches, or a future-dated header's lead. To force a reliable block the
-/// header's `latest_execution_block` is at block number 1 while the test environment only has
-/// block 0, so `wait_for_execution` suspends on the watch channel. The paused clock jumps from
-/// timer to timer, so the virtual time the call takes pins the configured timeout rather than the
-/// 5 s default or any other header-cadence setting.
+/// To force a reliable block the header's `latest_execution_block` is at block number 1 while the
+/// test environment only has block 0, so `wait_for_execution` suspends on the watch channel. The
+/// paused clock jumps from timer to timer, so the virtual time the call takes pins the execution
+/// wait rather than the vote timeout or any header-cadence setting.
 ///
-/// The timeout is recoverable: it carries no penalty and answers the requester with a
-/// `RecoverableError`, so the proposer asks again instead of giving up on this voter.
+/// The refusal is recoverable: it carries no penalty and answers the requester with a
+/// `RecoverableError`, so the proposer asks again instead of giving up on this voter. It also
+/// leaves the author's vote-cache entry as it was, so a header from the same author for the same
+/// round still earns a vote once block 1 executes within the wait. A block that executes within
+/// the wait at the header's height but with another hash still fails the fork check
+/// (`UnknownExecutionResult`) and stores no vote.
 #[tokio::test(start_paused = true)]
 async fn test_vote_inner_timeout() -> eyre::Result<()> {
-    let vote_timeout = Duration::from_millis(10);
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_with_vote_timeout(temp_dir.path(), vote_timeout).await;
-
-    // Block number 1 will never be executed in this test; vote_inner blocks in
-    // wait_for_execution until the outer timeout fires.
-    let future_block = BlockNumHash::new(1, BlockHash::random());
-    let header = committee
-        .header_builder_last_authority()
-        .latest_execution_block(future_block)
-        .created_at(1)
-        .build();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let vote_timeout = Parameters::default().vote_timeout;
+    assert!(VOTE_EXECUTION_WAIT < vote_timeout, "the execution wait must end first");
     let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || committee.header_builder_last_authority().created_at(1);
 
+    // block 1 has not executed, so vote_inner waits for it until the execution wait runs out
+    let header =
+        builder().latest_execution_block(BlockNumHash::new(1, BlockHash::random())).build();
     let start = tokio::time::Instant::now();
     let err = handler
         .vote(peer, header, vec![])
         .await
-        .expect_err("a vote request that never finishes evaluating must time out");
+        .expect_err("a voter behind on execution must refuse the vote");
     let waited = start.elapsed();
 
-    assert_matches!(err, PrimaryNetworkError::Timeout(_), "expected Timeout error");
-    assert!(
-        waited >= vote_timeout && waited < vote_timeout * 2,
-        "the vote must time out after the configured vote_timeout {vote_timeout:?}, waited \
-         {waited:?}"
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+            header_block: 1,
+            local_block: 0
+        }),
+        "expected ExecutionBehind error"
     );
-    assert!(Option::<Penalty>::from(&err).is_none(), "a vote timeout must not penalize the author");
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "the voter must refuse after the execution wait {VOTE_EXECUTION_WAIT:?}, not the vote \
+         timeout {vote_timeout:?}, waited {waited:?}"
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
     assert_matches!(
         PrimaryResponse::into_error_ref(&err),
         PrimaryResponse::RecoverableError(_),
-        "a vote timeout must answer the requester with a retryable response"
+        "the refusal must answer the requester with a retryable response"
     );
+
+    // block 1 executes half-way through the wait: the vote proceeds
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = builder().latest_execution_block(BlockNumHash::new(1, block.hash())).build();
+    let half = VOTE_EXECUTION_WAIT / 2;
+    let executed = consensus_bus.clone();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        executed.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a block executed within the wait must let the vote proceed"
+    );
+    assert!(start.elapsed() >= half, "the vote must have waited for block 1");
+    execute.await?;
+
+    // block 2 executes within the wait with another hash than the header's: the fork check refuses
+    let other = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let forked = SealedHeader::seal_slow(ExecHeader {
+        number: 2,
+        parent_hash: BlockHash::random(),
+        ..Default::default()
+    });
+    let header = other
+        .header_builder(&committee.committee())
+        .created_at(1)
+        .latest_execution_block(BlockNumHash::new(2, BlockHash::random()))
+        .build();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                2,
+                ConsensusNumHash::new(2, ConsensusHeaderDigest::default()),
+                Some(forked),
+            )
+        });
+    });
+    assert_matches!(
+        handler.vote(*other.authority().protocol_key(), header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(_))),
+        "a block of another hash at the header's height must fail the fork check"
+    );
+    execute.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&other.id())?;
+    assert!(vote_info.is_none(), "a failed fork check must store no vote");
 
     Ok(())
 }
@@ -4471,4 +4540,665 @@ async fn gossip_slots_cap_per_author() {
         slots.admit(validation, Some(author_a), None).is_some(),
         "author A must get a slot once its held messages settle"
     );
+}
+
+// ---- bench5 f1-commit-lag ----
+
+/// A node whose committed round freezes is demoted once a certificate passes the activity window:
+/// committed 360 (execution at 352), certificate 403, window 40.
+///
+/// This is the path a commit held by the run-ahead gate takes: the gate stops the committed round,
+/// and the demotion follows 40 rounds later.
+#[tokio::test]
+async fn frozen_commit_is_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+
+    assert!(handler.behind_consensus(0, 403, None).await, "a frozen commit is behind");
+}
+
+/// Execution far behind the committed round is not behind while commits keep up with the
+/// committee: execution at 100, committed 400, certificate 403.
+///
+/// A pin: it duplicates `test_behind_consensus_committed_round_prevents_false_positive` with the
+/// lag consensus can now run ahead of execution.
+#[tokio::test]
+async fn execution_lag_beyond_window_is_not_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(100, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(400);
+
+    assert!(!handler.behind_consensus(0, 403, None).await, "execution lag alone is not behind");
+}
+
+// ---- bench5 f3-rejoin (vote path) ----
+
+/// A `CvvInactive` voter refuses a vote request at once with `NotActiveCvv`.
+///
+/// The header's execution block is never executed here, so a voter that reached
+/// `wait_for_execution` would hold the request until the vote timeout. The paused clock does not
+/// move, no time is recorded for the `exec_wait` stage, and the refusal counter moves by one. The
+/// refusal carries no penalty and answers the requester with a retryable response: the requester's
+/// `request_vote` asks again and leaves the vote retryable, and all its attempts together take less
+/// than one vote timeout.
+///
+/// A header an active voter signs (its block executed, genesis parents) from a second author is
+/// refused too and leaves no vote stored; once the node is active again the same header is signed.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
+        // the bus and the handler register their metrics with the recorder active while built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("an inactive voter must refuse a new vote request");
+    assert_eq!(start.elapsed(), Duration::ZERO, "the refusal must not wait on execution");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "the refusal must answer the requester with a retryable response"
+    );
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let refused = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.votes_refused_inactive_total").then_some(value)
+    });
+    assert_matches!(refused, Some(DebugValue::Counter(1)), "the refusal must be counted");
+    let exec_wait = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.vote_stage_seconds"
+            && key.key().labels().any(|l| l.key() == "stage" && l.value() == "exec_wait"))
+        .then_some(value)
+    });
+    assert!(
+        !matches!(exec_wait, Some(DebugValue::Histogram(samples)) if !samples.is_empty()),
+        "the refusal must not reach the execution wait"
+    );
+
+    let voter = *committee.first_authority().authority().protocol_key();
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, peer, header).await;
+    assert_matches!(result, Err(NetworkError::RPCRetryable(_)), "the vote must stay retryable");
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the requester must retry, and every refusal must be recoverable: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the requester's attempts must not wait on the inactive voter, took {:?}",
+        start.elapsed()
+    );
+
+    let second = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let second_peer = *second.authority().protocol_key();
+    let signable = second
+        .header_builder(&committee.committee())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let node_storage = committee.first_authority().consensus_config().node_storage().clone();
+    assert_matches!(
+        handler.vote(second_peer, signable.clone(), vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must not sign a header an active voter signs"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_none(), "no vote may be stored");
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    assert_matches!(
+        handler.vote(second_peer, signable, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the same header must be signed once the node is active"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_some(), "the vote must be stored");
+
+    Ok(())
+}
+
+/// A voter demoted while a vote request waits on execution refuses at the signature instead of
+/// signing, and stores no vote.
+///
+/// Block 1 executes half a second into the request in the same step that turns the node inactive,
+/// so the request passes every check and reaches the signature as an inactive node.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_when_demoted_mid_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let demote = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "a node demoted before it signs must refuse"
+    );
+    demote.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a node demoted before it signs must store no vote");
+
+    Ok(())
+}
+
+/// A vote this node signed while active is still recast after it turns inactive, and a new header
+/// from the same author is refused.
+///
+/// The inactive refusal sits after the recast fast path, so an author whose header this node
+/// already voted for gets the same vote back instead of a refusal.
+#[tokio::test]
+async fn test_vote_recast_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1)
+    };
+    let header = builder().build();
+
+    let PrimaryResponse::Vote(vote) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an active voter must vote for a valid header");
+    };
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    let PrimaryResponse::Vote(recast) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an inactive voter must recast the vote it already signed for this header");
+    };
+    assert_eq!(recast.header_digest(), vote.header_digest());
+    assert_eq!(recast.author(), vote.author());
+    assert_eq!(recast.signature(), vote.signature());
+
+    let next = builder().round(2).build();
+    assert_ne!(next.digest(), header.digest());
+    assert_matches!(
+        handler.vote(peer, next, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must refuse a header it has not voted for"
+    );
+
+    Ok(())
+}
+
+/// A voter a moment behind on execution still votes on the requester's retry.
+///
+/// Block 1 executes 1.5 s after the first request, so the first attempt waits out
+/// [`VOTE_EXECUTION_WAIT`] and is refused as recoverable, and the requester's retry 250 ms later
+/// finds the block executed within its own wait and earns the vote. Before the bound, the first
+/// attempt held the request until the 5 s vote timeout.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_retry_votes_once_execution_catches_up() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let lag = VOTE_EXECUTION_WAIT + VOTE_EXECUTION_WAIT / 2;
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(lag).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+    assert_matches!(result, Ok(RequestVoteResult::Vote(_)), "the retry must earn the vote");
+    assert_matches!(
+        responses.as_slice(),
+        [PrimaryResponse::RecoverableError(_), PrimaryResponse::Vote(_)],
+        "one recoverable refusal, then the vote: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the vote must arrive before a single vote timeout, took {:?}",
+        start.elapsed()
+    );
+    execute.await?;
+
+    Ok(())
+}
+
+/// Records every `primary` warn line as `message key=value ...` on the thread it is installed on
+/// with [`tracing::subscriber::set_default`].
+struct PrimaryWarnLines(Arc<Mutex<Vec<String>>>);
+
+/// Appends an event's message and fields to a line in the order the event records them.
+struct LineVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for LineVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.push_str(&format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for PrimaryWarnLines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "primary" && *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LineVisitor(&mut line));
+        self.0.lock().push(line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The `we are behind` line ends with the execution backlog and both round lags: the newest known
+/// header is output 4,500 and the engine processed output 3 at round 352 (its stored header reads
+/// leader round 0, so the execution lag takes the processed round), consensus committed round 360
+/// and the proposer is at round 405.
+#[tokio::test]
+async fn behind_line_reports_execution_and_commit_lag() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+    for number in 1..=3u64 {
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag(number)).await;
+    }
+    // the engine processed output 3, the header `write_subdag_for_test` stored for it
+    let processed = tn_types::ConsensusOutput::new(
+        sub_dag(3),
+        ConsensusHeaderDigest::default(),
+        3,
+        false,
+        Default::default(),
+        Vec::new(),
+    );
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, processed.num_hash(), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+    consensus_bus.primary_round_updates().send_replace(405);
+    consensus_bus
+        .last_consensus_header()
+        .send_replace(Some(tn_types::ConsensusHeader { number: 4_500, ..Default::default() }));
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    assert!(handler.behind_consensus(0, 403, None).await, "committed 360 + 40 < 403 is behind");
+
+    let lines = lines.lock();
+    let behind: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("we are behind, go to catchup mode!"))
+        .collect();
+    assert_eq!(behind.len(), 1, "one behind line: {lines:?}");
+    assert!(
+        behind[0].contains(" exec_number=3 exec_round=0 processed_consensus_round=352 "),
+        "the stored output resolves the executed number: {}",
+        behind[0]
+    );
+    assert!(
+        behind[0].ends_with(
+            " reason=\"outside_gc_window\" newest_header_number=4500 backlog_outputs=4497 \
+             exec_lag_rounds=8 commit_lag_rounds=45"
+        ),
+        "the lag fields follow the existing ones: {}",
+        behind[0]
+    );
+}
+
+// ---- bench5 f3-rejoin ----
+
+/// The `tn_primary.rejoin_grace_holds_total` holds counted since the previous snapshot (a
+/// snapshot swaps every counter it reads back to zero); zero while unregistered.
+fn rejoin_grace_holds(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.rejoin_grace_holds_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A handler whose committed round (5) is outside the gc window of a round-60 certificate, with
+/// its bus metrics bound to `recorder`.
+async fn create_test_types_outside_gc_window(
+    path: &Path,
+    recorder: &DebuggingRecorder,
+) -> TestTypes {
+    let types = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(recorder);
+        create_test_types(path).await
+    };
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    types.consensus_bus.recent_blocks().send_replace(recent);
+    types.consensus_bus.committed_round_updates().send_replace(5);
+    types
+}
+
+/// A node promoted back into consensus holds its gc-window demotion for `REJOIN_DEMOTION_GRACE`:
+/// inside the grace a certificate past the window (committed 5 + 40 < 60) is counted but the node
+/// stays active, and once the grace has passed the same certificate demotes it. Every hold is
+/// counted, but the hold line is logged at most once a second and reports the holds since the
+/// previous line. The held demotion taking effect fails the rejoin.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_holds_gc_window_demotion() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    let hold_lines = || {
+        lines
+            .lock()
+            .iter()
+            .filter(|line| {
+                line.starts_with("behind the gc window inside the rejoin grace; holding demotion")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // two holds within a second: both counted, one line
+    tokio::time::advance(Duration::from_secs(28)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held inside the grace");
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held again inside the grace");
+    assert!(consensus_bus.is_active_cvv(), "still active inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 2, "every hold is counted");
+    let held = hold_lines();
+    assert_eq!(held.len(), 1, "two holds within a second log one line: {held:?}");
+    assert!(held[0].ends_with(" holds_since_last_line=1"), "{}", held[0]);
+
+    // the next line, a second later, carries the hold that was not logged
+    tokio::time::advance(
+        tn_types::REJOIN_DEMOTION_GRACE - Duration::from_millis(28_500) - Duration::from_millis(1),
+    )
+    .await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held until the grace ends");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1);
+    let held = hold_lines();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert!(held[1].ends_with(" holds_since_last_line=2"), "{}", held[1]);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted once the grace has passed");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive after the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0, "a demotion is not a hold");
+    assert_eq!(hold_lines().len(), 2, "a demotion logs no hold line");
+    let state = *consensus_bus.rejoin_state().borrow();
+    assert_eq!(state.attempts(0), 1, "the held demotion fails the rejoin");
+    assert!(!state.is_pending(0), "the demotion settles the rejoin");
+}
+
+/// The grace holds only the gc-window demotion: a node an epoch behind is demoted at once, which
+/// fails the rejoin, and a promotion recorded for another epoch holds nothing and is not settled
+/// by this epoch's demotion.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_does_not_hold_epoch_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+
+    // a certificate past the early rounds of the next epoch: epoch_behind, not the gc window
+    assert!(handler.behind_consensus(1, 60, None).await, "an epoch behind is never held");
+    assert!(consensus_bus.is_cvv_inactive(), "demoted inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+    assert_eq!(consensus_bus.rejoin_state().borrow().attempts(0), 1, "a failed rejoin");
+
+    // a promotion keyed to another epoch does not hold this epoch's gc-window demotion
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(7, tokio::time::Instant::now(), false));
+    assert!(handler.behind_consensus(0, 60, None).await, "another epoch's promotion holds nothing");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+    let state = *consensus_bus.rejoin_state().borrow();
+    assert_eq!(state.attempts(7), 0);
+    assert!(state.is_pending(7), "another epoch's promotion is not settled");
+}
+
+/// The grace holds only while the incoming round leads the committed round by at most
+/// `ROUNDS_TO_KEEP - gc_depth`: one round past that bound peers have pruned rounds the rebuild
+/// needs, so a node promoted a moment ago is demoted, which fails the rejoin.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_is_bounded_by_the_rebuild_window() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    let gc_depth = committee.first_authority().consensus_config().parameters().gc_depth;
+    let bound = tn_types::ROUNDS_TO_KEEP - gc_depth;
+
+    // committed 5: a certificate at the bound is held, one past it demotes inside the time grace
+    assert!(!handler.behind_consensus(0, 5 + bound, None).await, "held at the rebuild bound");
+    assert!(consensus_bus.is_active_cvv(), "still active at the bound");
+    assert!(handler.behind_consensus(0, 5 + bound + 1, None).await, "demoted past the bound");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive inside the time grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1, "only the hold at the bound is counted");
+    assert_eq!(consensus_bus.rejoin_state().borrow().attempts(0), 1, "a failed rejoin");
+}
+
+/// A rejoin fails only when its demotion comes inside the grace or is the one the grace held. A
+/// node whose held demotion ends with a round inside the activity window before the grace runs
+/// out, and a node that sees no certificate during the grace (cut off) and is demoted after it,
+/// both keep the attempt.
+#[tokio::test(start_paused = true)]
+async fn rejoin_outlasting_the_grace_is_not_a_failed_attempt() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    let attempts = || consensus_bus.rejoin_state().borrow().attempts(0);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+
+    // held, then a round inside the window (committed 5 + 40 is not below 45): the hold ends
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held inside the grace");
+    assert!(!handler.behind_consensus(0, 45, None).await, "inside the window again");
+    // past the grace and behind again: demoted, but the rejoin outlasted the grace
+    tokio::time::advance(tn_types::REJOIN_DEMOTION_GRACE).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted after the grace");
+    assert_eq!(attempts(), 0, "a rejoin that held past the grace is not a failed attempt");
+    assert!(!consensus_bus.rejoin_state().borrow().is_pending(0), "the demotion settles it");
+
+    // promoted again, then nothing arrives until the grace has passed
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    tokio::time::advance(tn_types::REJOIN_DEMOTION_GRACE + Duration::from_secs(1)).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted on the first certificate");
+    assert_eq!(attempts(), 0, "a node cut off for the whole grace keeps its attempt");
+}
+
+// ---- bench5 f1-commit-lag ----
+
+/// SEC-6 / N1: a snapshot-restored voter can never check a header's execution block below its
+/// floor. It refuses at once with the final, unpenalized `BelowRestoreFloor`, neither the fork
+/// error `UnknownExecutionResult` nor the retryable `ExecutionBehind`, counts no execution-behind
+/// refusal and stores no vote.
+#[tokio::test]
+async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<()> {
+    /// A datadir restored at block 100 that attests no block.
+    struct RestoredAt100;
+    impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+        fn canonical_execution_hash(&self, _: u64) -> Option<BlockHash> {
+            None
+        }
+        fn restored_state_floor(&self) -> Option<u64> {
+            Some(100)
+        }
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    // executed through block 120 after a restore at block 100
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::seal_slow(ExecHeader { number: 120, ..Default::default() })),
+        )
+    });
+    consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+
+    let author = committee.last_authority();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(50, BlockHash::ZERO))
+        .build();
+    let err = handler
+        .vote(*author.authority().protocol_key(), header, vec![])
+        .await
+        .expect_err("a block below the floor cannot be checked");
+
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+            header_block: 50,
+            floor: 100
+        })
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "the refusal is final, so the requester stops asking this voter"
+    );
+    let behind =
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.votes_refused_execution_behind_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        });
+    assert_eq!(behind.unwrap_or_default(), 0, "not an execution-behind refusal");
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a refused header stores no vote");
+    Ok(())
 }

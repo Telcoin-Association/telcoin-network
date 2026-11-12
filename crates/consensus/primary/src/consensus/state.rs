@@ -5,6 +5,7 @@ use crate::{
         bullshark::Bullshark, liveness::RoundQuorumObserver, utils::gc_round, ConsensusError,
         Outcome,
     },
+    metrics::{record_mode_transition, ModeTransitionReason},
     ConsensusBus, NodeMode,
 };
 use std::{
@@ -12,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -23,7 +24,7 @@ use tn_types::{
     forks::subsecond_timestamp_active, AuthorityIdentifier, Certificate, CommittedSubDag,
     Committee, ConsensusChainReader, Database, Epoch, EpochSeedChainError, EpochSeedChainValue,
     Hash as _, HeaderDigest, Noticer, Round, TaskManager, TimestampMs, TimestampSec, TnReceiver,
-    TnSender,
+    TnSender, MAX_COMMIT_RUN_AHEAD_ROUNDS,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -160,6 +161,15 @@ impl ConsensusState {
             }
         }
         info!("Dag is restored and contains {} certs for {} rounds", num_certs, dag.len());
+        debug!(
+            target: "primary::consensus_state",
+            num_certs,
+            rounds = dag.len(),
+            gc_round,
+            min_round = dag.first_key_value().map_or(0, |(round, _)| *round),
+            max_round = dag.last_key_value().map_or(0, |(round, _)| *round),
+            "dag restored"
+        );
 
         Ok(dag)
     }
@@ -223,7 +233,10 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        // Metric: certificate_commit_latency_ms - time from certificate creation to commit
+        // Metric: certificate_commit_latency_ms - time from certificate creation to commit. the
+        // age reads the wall clock against the header's own creation time, so it is a log field
+        // only and never feeds a consensus decision
+        let created_at = certificate.header().created_at_ms();
         info!(
             target: "consensus::metrics",
             round = certificate.round(),
@@ -231,6 +244,8 @@ impl ConsensusState {
             digest = ?certificate.digest(),
             committed_round = self.last_round.committed_round,
             gc_round = self.last_round.gc_round,
+            created_at_ms = created_at.as_millis(),
+            age_ms = u64::try_from(created_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             "certificate committed"
         );
 
@@ -332,6 +347,20 @@ pub struct Consensus<DB> {
     /// ended and stops the node if the seal reports a failed save: an error this task returned
     /// after the epoch's shutdown was signalled would only be logged.
     certificate_pack: Option<Arc<CertificatePack>>,
+
+    /// The consensus pack's committed round when this task was spawned: the floor of the executed
+    /// round the run-ahead gate measures commits against.
+    ///
+    /// Initial and new-epoch starts replay the pack and wait for its execution before consensus
+    /// starts, so there the floor matches execution. After a promotion from catch-up nothing is
+    /// replayed and the pack written by state sync can lead execution; the floor keeps that lead
+    /// from holding the first commits.
+    exec_floor: Round,
+
+    /// How many rounds a committed leader may run ahead of the executed round before its commit
+    /// is held: [`MAX_COMMIT_RUN_AHEAD_ROUNDS`], kept as a field so a test can hold a commit
+    /// without building a thousand rounds.
+    max_run_ahead: Round,
 }
 
 /// The outcome of archiving a certificate in this epoch's certificate pack, given what
@@ -439,6 +468,79 @@ fn resolve_epoch_commit_floor(
     Some(TimestampMs::from_parts(close_secs, 0))
 }
 
+/// Whether a sub-dag committed at `leader_round` may go on to execution while this node has
+/// executed through leader round `exec_round`: true unless the leader runs more than
+/// `max_run_ahead` rounds ahead. The sum saturates, so no round overflows the check.
+pub(crate) const fn commit_run_ahead_ok(
+    leader_round: Round,
+    exec_round: Round,
+    max_run_ahead: Round,
+) -> bool {
+    leader_round <= exec_round.saturating_add(max_run_ahead)
+}
+
+/// The lowest round of a restored DAG holding a certificate that ordering can still reach and
+/// whose parent is missing from the DAG, or `None` when there is no such certificate.
+///
+/// The restore reads every stored certificate above `gc_round` without checking its parents (see
+/// `construct_dag_from_cert_store`). Ordering walks parents only from the certificates it can
+/// still sequence: `order_dag` skips a certificate at or below its author's round in
+/// `last_committed` without looking at its parents, and `linked` walks only rounds above the
+/// committed round, where every certificate is uncommitted. Where ordering does look, it skips a
+/// parent missing from the DAG instead of failing, so ordering over such a hole can sequence a
+/// sub-dag no other node commits. A certificate is therefore a hole's top when it is above its
+/// author's committed round, at least two rounds above `gc_round` (ordering never looks below
+/// the round after a leader's gc round, which is at or above this one) and has a parent missing
+/// from the round below it.
+///
+/// Every certificate inserted after the restore has its parents checked (`check_parents`), and
+/// the certificate manager writes one to the store, and hands it to consensus, only once its
+/// parents are stored, fetching the missing ones from peers. So a hole can only come from the
+/// restore, and only these histories leave one:
+/// - execution lagged: the certificate store prunes from its newest round, and the consensus pack
+///   can trail that round by more than the prune depth less `gc_depth`, so the uncommitted
+///   certificates at the bottom of the DAG lost their parents;
+/// - a DAG detached above the committed round, whose lowest certificates are uncommitted by
+///   definition.
+///
+/// A store left stale by a period as a follower is not a hole: the follower path writes no
+/// certificates, so a promotion after catch-up restores only the certificates stored before the
+/// demotion. The certificate manager stored each of them after its parents, so they carry no hole
+/// of their own, and the rounds between them and the committed round are fetched from peers once
+/// new certificates reference them. `None` also for an empty DAG.
+fn restored_dag_gap(
+    last_committed: &HashMap<AuthorityIdentifier, Round>,
+    gc_round: Round,
+    dag: &Dag,
+) -> Option<Round> {
+    // the dag's inner maps are hash maps, but each check below only asks whether any certificate
+    // of a round matches, which does not depend on their iteration order.
+    //
+    // the check is conservative at the committed boundary: with every authority committed through
+    // C and the dag's bottom at C + 1, the round-C parents are missing and this reports C + 1,
+    // although ordering never needs them (present, `order_dag` would skip each as committed,
+    // `round <= last_committed[origin]`). the node goes inactive and resyncs where it could have
+    // carried on. a missing parent's digest does not name its author, so the per-author rule
+    // cannot apply here. a possible refinement skips a missing parent when `round - 1` is at or
+    // below the lowest committed round of the whole committee (an authority absent from
+    // `last_committed` counting as 0). `restored_dag_gap_boundaries` pins the current answer.
+    dag.range(gc_round.saturating_add(2)..).find_map(|(round, certificates)| {
+        let parents: BTreeSet<&HeaderDigest> = dag
+            .get(&round.saturating_sub(1))
+            .map(|parents| parents.values().map(|(digest, _)| digest).collect())
+            .unwrap_or_default();
+        certificates
+            .values()
+            .any(|(_, certificate)| {
+                let reachable = certificate.round()
+                    > last_committed.get(certificate.origin()).copied().unwrap_or_default();
+                reachable
+                    && certificate.header().parents().iter().any(|parent| !parents.contains(parent))
+            })
+            .then_some(*round)
+    })
+}
+
 impl<DB: Database> Consensus<DB> {
     pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
@@ -512,6 +614,44 @@ impl<DB: Database> Consensus<DB> {
             .committed_round_updates()
             .send_replace(state.last_round.committed_round);
 
+        // an active cvv must not order from a restored dag in which a certificate it can still
+        // order has a missing parent (see `restored_dag_gap`); it goes inactive and catches up
+        // from its peers instead
+        if consensus_bus.is_active_cvv() {
+            let gc_round = state.last_round.gc_round;
+            if let Some(hole_round) = restored_dag_gap(&state.last_committed, gc_round, &state.dag)
+            {
+                // the hole can lie below the committed round (an author's uncommitted certificates
+                // there are still orderable), so `hole_round` is the fact; the message text is
+                // the restart-gap log contract the analysis tools match, and it stays as it is
+                info!(
+                    target: "primary::consensus",
+                    last_committed_round,
+                    dag_min_round = state.dag.first_key_value().map_or(0, |(round, _)| *round),
+                    hole_round,
+                    gc_round,
+                    "restored dag has a gap above the committed round; going inactive"
+                );
+                let previous = consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
+                record_mode_transition(
+                    previous,
+                    NodeMode::CvvInactive,
+                    ModeTransitionReason::RestartGap,
+                );
+                // settle the latest rejoin at this demotion's own time. `spawn` runs before the
+                // subscriber reads the node mode in this same epoch run, so the subscriber's
+                // catch-up loop settles it at its entry right after this anyway; settling here
+                // only removes the dependence on when that loop is first polled
+                let now = tokio::time::Instant::now();
+                consensus_bus
+                    .app()
+                    .rejoin_state()
+                    .send_if_modified(|state| state.record_demotion(current_epoch, now, false));
+                consensus_config.shutdown().notify();
+                return Ok(());
+            }
+        }
+
         let s = Self {
             committee: consensus_config.committee().clone(),
             consensus_bus: consensus_bus.clone(),
@@ -521,6 +661,8 @@ impl<DB: Database> Consensus<DB> {
             state,
             active: false,
             certificate_pack,
+            exec_floor: last_committed_round,
+            max_run_ahead: MAX_COMMIT_RUN_AHEAD_ROUNDS,
         };
 
         // Only run the consensus task if we are an active CVV.
@@ -552,17 +694,22 @@ impl<DB: Database> Consensus<DB> {
 
         // Listen to incoming certificates.
         loop {
+            // biased so shutdown is checked first: once a commit returned on shutdown (a held
+            // run-ahead gate), no certificate queued meanwhile may commit past the held sub-dag.
+            // the tick goes before the certificates, so a certificate burst cannot starve it
             tokio::select! {
+                biased;
+
                 // The epoch's owner seals the certificate pack once this task has ended.
                 _ = &self.rx_shutdown => return Ok(()),
 
+                _ = observation_tick.tick() => {
+                    observer.evaluate_expired(tokio::time::Instant::now());
+                },
                 Some(certificate) = rx_new_certificates.recv() => {
                     self.new_certificate(certificate, &mut observer).await.inspect_err(|e| {
                         error!(target: "epoch-manager", ?e, "new certificate failed");
                     })?;
-                },
-                _ = observation_tick.tick() => {
-                    observer.evaluate_expired(tokio::time::Instant::now());
                 },
             }
         }
@@ -602,24 +749,14 @@ impl<DB: Database> Consensus<DB> {
             let authority_id = self.consensus_config.authority_id();
 
             // Output the sequence in the right order.
-            let csd_len = committed_sub_dags.len();
-            for (i, committed_sub_dag) in committed_sub_dags.into_iter().enumerate() {
-                // We need to make sure execution has caught up so we can verify we have not forked.
-                // This will force the follow function to not outrun execution...  this is probably
-                // fine. Also once we can follow gossiped consensus output this will not really be
-                // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader().latest_execution_block();
-                if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
-                {
-                    // This seems to be a bogus sub dag, we are out of sync...
-                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
-                    // Going inactive will probably not help us at this point....
-                    self.consensus_bus
-                        .app()
-                        .node_mode()
-                        .send_modify(|v| *v = NodeMode::CvvInactive);
-                    self.consensus_config.shutdown().notify();
-                    tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
+            for committed_sub_dag in committed_sub_dags {
+                // commits do not wait for local execution: the subscriber checks each leader's
+                // execution block against this node's chain before it assembles and saves the
+                // output. this gate only bounds how far commits run ahead of execution
+                if !self.hold_commit_run_ahead(committed_sub_dag.leader_round()).await? {
+                    // the epoch is shutting down: the rest of the batch, the own-header report and
+                    // the commit-accounting check are skipped (a partial batch would fail that
+                    // check); the next epoch start re-primes the committed round from the pack
                     return Ok(());
                 }
 
@@ -641,6 +778,13 @@ impl<DB: Database> Consensus<DB> {
                 let commit_latency = committed_sub_dag.leader().created_at_ms().elapsed();
                 metrics.commit_latency_seconds.record(commit_latency.as_secs_f64());
 
+                // copied out before the send moves the sub-dag
+                let subdag_index = committed_sub_dag.leader().nonce();
+                let leader_round = committed_sub_dag.leader_round();
+                let commit_timestamp_ms = committed_sub_dag.commit_timestamp_ms().as_millis();
+                let base_execution_block =
+                    committed_sub_dag.leader().latest_execution_block().number;
+
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
                 self.consensus_bus
@@ -648,6 +792,17 @@ impl<DB: Database> Consensus<DB> {
                     .send(committed_sub_dag)
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
+
+                // the sub-dag is final once the run-ahead gate let it through; this line marks its
+                // hand-off to the subscriber, which owns the execution wait that follows
+                info!(
+                    target: "consensus::metrics",
+                    subdag_index,
+                    leader_round,
+                    commit_timestamp_ms,
+                    base_execution_block,
+                    "subdag sequenced"
+                );
                 observer.record_commit();
             }
 
@@ -659,8 +814,8 @@ impl<DB: Database> Consensus<DB> {
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 
                 // Commit-accounting invariant: the last committed round must equal the max
-                // header round we just sequenced. If it ever disagrees, mirror the bogus-sub-dag
-                // handling above (go inactive + shut down cleanly) instead of panicking on the
+                // header round we just sequenced. If it ever disagrees, go inactive and shut down
+                // cleanly (as the subscriber's fork check does) instead of panicking on the
                 // single consensus task; the notified shutdown ends the run loop on the next
                 // select, so the trailing `Ok(())` is reached without further processing.
                 if self.state.last_round.committed_round == leader_commit_round {
@@ -675,15 +830,301 @@ impl<DB: Database> Consensus<DB> {
                         leader_commit_round,
                         "commit-accounting invariant violated: last committed round does not match leader commit round; going inactive and shutting down",
                     );
+                    let previous =
+                        self.consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
+                    record_mode_transition(
+                        previous,
+                        NodeMode::CvvInactive,
+                        ModeTransitionReason::CommitAccounting,
+                    );
+                    // settle the latest rejoin at this demotion's own time: the catch-up loop
+                    // that would otherwise settle it starts only after the epoch's tasks restart,
+                    // possibly past the grace
+                    let epoch = self.committee.epoch();
+                    let now = tokio::time::Instant::now();
                     self.consensus_bus
                         .app()
-                        .node_mode()
-                        .send_modify(|v| *v = NodeMode::CvvInactive);
+                        .rejoin_state()
+                        .send_if_modified(|state| state.record_demotion(epoch, now, false));
                     self.consensus_config.shutdown().notify();
                 }
             }
         }
         Ok(())
+    }
+
+    /// Hold the commit of a sub-dag led at `leader_round` while it runs more than
+    /// [`Self::max_run_ahead`] rounds ahead of the leader round this node has executed.
+    ///
+    /// The executed round is the last leader round the engine processed, raised to
+    /// [`Self::exec_floor`]. A hold logs one warning and counts once in
+    /// `commit_run_ahead_blocked_total`, then ends, with an info line giving its length, when
+    /// execution advances far enough.
+    ///
+    /// Returns `Ok(false)` if the epoch shuts down while the commit is held, so the caller can
+    /// return before it reports a partial batch.
+    async fn hold_commit_run_ahead(&self, leader_round: Round) -> Result<bool, ConsensusError> {
+        let app = self.consensus_bus.app();
+        let exec_round = || app.last_consensus_round().max(self.exec_floor);
+        if commit_run_ahead_ok(leader_round, exec_round(), self.max_run_ahead) {
+            return Ok(true);
+        }
+        // subscribe, then read again: an execution update between the first read and the
+        // subscription is seen by the second read, any later one wakes the wait
+        let mut rx_recent_blocks = app.recent_blocks().subscribe();
+        if commit_run_ahead_ok(leader_round, exec_round(), self.max_run_ahead) {
+            return Ok(true);
+        }
+        let held_at = Instant::now();
+        warn!(
+            target: "primary::consensus",
+            leader_round,
+            exec_round = exec_round(),
+            "commit held: execution more than MAX_COMMIT_RUN_AHEAD_ROUNDS behind"
+        );
+        app.metrics().commit_run_ahead_blocked_total.increment(1);
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = &self.rx_shutdown => return Ok(false),
+                changed = rx_recent_blocks.changed() => {
+                    // the bus owns the sender, so this fails only once the bus is gone
+                    changed.map_err(|_| ConsensusError::ShuttingDown)?;
+                    // the executed round is a field of the watched `recent_blocks` value: the
+                    // engine's `push_latest` sets it with the block in one `send_modify`, so the
+                    // read after a wake sees the round of the change that woke it, or a later
+                    // one. a change that leaves the round short of the bound only waits for the
+                    // next change; there is no separate round write that a wake could run ahead of
+                    let executed = exec_round();
+                    if commit_run_ahead_ok(leader_round, executed, self.max_run_ahead) {
+                        info!(
+                            target: "primary::consensus",
+                            leader_round,
+                            exec_round = executed,
+                            held_ms = u64::try_from(held_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            "commit hold released"
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_run_ahead_tests {
+    use super::{commit_run_ahead_ok, restored_dag_gap, Dag};
+    use crate::test_utils::{make_optimal_certificates, mock_certificate};
+    use std::collections::{BTreeSet, HashMap};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::{
+        AuthorityIdentifier, Certificate, Hash as _, Round, MAX_COMMIT_RUN_AHEAD_ROUNDS,
+    };
+
+    /// The executed round every boundary case measures from.
+    const EXEC: Round = 300;
+
+    #[test]
+    fn commit_run_ahead_ok_at_the_executed_round() {
+        assert!(commit_run_ahead_ok(EXEC, EXEC, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_one_round_ahead() {
+        assert!(commit_run_ahead_ok(EXEC + 1, EXEC, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_at_the_bound() {
+        assert!(commit_run_ahead_ok(
+            EXEC + MAX_COMMIT_RUN_AHEAD_ROUNDS,
+            EXEC,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+        // a fresh start (nothing executed) commits up to the bound itself
+        assert!(commit_run_ahead_ok(MAX_COMMIT_RUN_AHEAD_ROUNDS, 0, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_holds_past_the_bound() {
+        assert!(!commit_run_ahead_ok(
+            EXEC + MAX_COMMIT_RUN_AHEAD_ROUNDS + 1,
+            EXEC,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+        assert!(!commit_run_ahead_ok(
+            MAX_COMMIT_RUN_AHEAD_ROUNDS + 1,
+            0,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_saturates_at_the_round_ceiling() {
+        assert!(commit_run_ahead_ok(Round::MAX, Round::MAX, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+        assert!(commit_run_ahead_ok(Round::MAX, Round::MAX - 1, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+        // an executed round ahead of the leader (an earlier epoch's last round) never holds
+        assert!(commit_run_ahead_ok(2, Round::MAX, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    /// Four authorities, every certificate of rounds `1..=70` referencing the whole round below.
+    fn optimal_rounds() -> (Vec<AuthorityIdentifier>, Vec<Certificate>) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+        let (certificates, _) = make_optimal_certificates(&committee, 1..=70, &genesis, &ids);
+        (ids, certificates.into_iter().collect())
+    }
+
+    /// The dag the restore builds from the stored `certificates` that `stored` keeps.
+    fn restored(certificates: &[Certificate], stored: impl Fn(&Certificate) -> bool) -> Dag {
+        let mut dag = Dag::new();
+        for certificate in certificates.iter().filter(|certificate| stored(certificate)) {
+            dag.entry(certificate.round())
+                .or_default()
+                .insert(certificate.origin().clone(), (certificate.digest(), certificate.clone()));
+        }
+        dag
+    }
+
+    /// Every authority committed through `round`, except `lagging`, committed through `its_round`
+    /// (absent from the map when that is 0, as for an authority nothing of which was committed).
+    fn committed(
+        ids: &[AuthorityIdentifier],
+        round: Round,
+        lagging: Option<(&AuthorityIdentifier, Round)>,
+    ) -> HashMap<AuthorityIdentifier, Round> {
+        ids.iter()
+            .filter_map(|id| match lagging {
+                Some((lagging, its_round)) if lagging == id => {
+                    (its_round > 0).then(|| (id.clone(), its_round))
+                }
+                _ => Some((id.clone(), round)),
+            })
+            .collect()
+    }
+
+    /// The restart that `restarts::test_restartstt` hits: a validator killed around round 8,
+    /// caught up through the consensus pack to committed round 18 and promoted. The follower path
+    /// stores no certificates, so the store still holds rounds 1 to 8 and nothing for 9 to 18.
+    /// Every one of those certificates is at or below its author's committed round, so ordering
+    /// never walks their parents, and the certificate manager fetches rounds 9 on from peers.
+    #[test]
+    fn restored_dag_gap_ignores_a_store_left_stale_by_catch_up() {
+        let (ids, certificates) = optimal_rounds();
+        // gc_depth 25 (the e2e committee) keeps the gc round at 0 through committed round 25
+        let stale = restored(&certificates, |c| c.round() <= 8);
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, None), 0, &stale), None);
+        // the killed validator's last certificates were never committed: they are reachable, and
+        // the manager stored them after their parents
+        let killed = Some((&ids[3], 6));
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, killed), 0, &stale), None);
+        // the same store holding a certificate the killed validator stored without one of its
+        // parents (impossible through the manager) is a hole at that certificate's round
+        let without_parent = restored(&certificates, |c| {
+            c.round() <= 8 && !(c.round() == 7 && c.origin() == &ids[0])
+        });
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, killed), 0, &without_parent), Some(8));
+    }
+
+    /// A restored dag is a gap exactly when a certificate ordering can reach (above its author's
+    /// committed round, two rounds or more above the gc round) has a parent missing from it.
+    #[test]
+    fn restored_dag_gap_boundaries() {
+        const C: Round = 60;
+        const GC_ROUND: Round = 35;
+        let (ids, certificates) = optimal_rounds();
+        let all = committed(&ids, C, None);
+        let slow = committed(&ids, C, Some((&ids[3], 40)));
+        let never = committed(&ids, C, Some((&ids[3], 0)));
+        let in_rounds = |low: Round, high: Round| {
+            restored(&certificates, move |c| (low..=high).contains(&c.round()))
+        };
+
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &Dag::new()), None, "an empty dag");
+        assert_eq!(
+            restored_dag_gap(&slow, GC_ROUND, &in_rounds(GC_ROUND + 1, 65)),
+            None,
+            "a full window"
+        );
+        assert_eq!(
+            restored_dag_gap(&slow, GC_ROUND, &in_rounds(1, 65)),
+            None,
+            "rounds below it too"
+        );
+
+        // a dag detached above the committed round (the f1-1 boundary): its lowest certificates
+        // are uncommitted and their parents are missing
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(C + 2, 65)), Some(C + 2));
+        // the round right above the committed round is uncommitted too: f1-1 admitted this one
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(C + 1, 65)), Some(C + 1));
+
+        // sec-3, lagged execution: the store pruned from its newest round lost the window's
+        // bottom. a slow authority's certificates there are still uncommitted, so ordering would
+        // walk into the hole
+        assert_eq!(restored_dag_gap(&slow, GC_ROUND, &in_rounds(45, 65)), Some(45));
+        // with every certificate there committed nothing reachable lacks a parent
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(45, 65)), None);
+
+        // a hole in the middle of the window, under an uncommitted certificate and under committed
+        // ones only
+        let middle_hole = restored(&certificates, |c| c.round() > GC_ROUND && c.round() != 50);
+        assert_eq!(restored_dag_gap(&slow, GC_ROUND, &middle_hole), Some(51));
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &middle_hole), None);
+        // one missing certificate above the committed round, which every certificate of the round
+        // above references
+        let one_missing = restored(&certificates, |c| {
+            c.round() > GC_ROUND && !(c.round() == 62 && c.origin() == &ids[1])
+        });
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &one_missing), Some(63));
+
+        // the gc boundary: ordering never looks at the parents of a certificate in the round
+        // after the gc round, only from the round after that
+        assert_eq!(restored_dag_gap(&never, GC_ROUND, &in_rounds(GC_ROUND + 1, 65)), None);
+        assert_eq!(
+            restored_dag_gap(&never, GC_ROUND, &in_rounds(GC_ROUND + 2, 65)),
+            Some(GC_ROUND + 2)
+        );
+
+        // nothing committed yet (a fresh epoch, gc round 0): round 1's genesis parents are never
+        // looked at, so only a dag missing its first rounds is a gap
+        let nothing = HashMap::new();
+        assert_eq!(restored_dag_gap(&nothing, 0, &in_rounds(1, 10)), None);
+        assert_eq!(restored_dag_gap(&nothing, 0, &in_rounds(3, 10)), Some(3));
+    }
+
+    /// Only the parents a certificate references count: with one certificate of round 62 missing
+    /// from the store, a round 63 whose certificates each reference the 2f+1 stored ones leaves
+    /// no hole, where a round 63 referencing the whole round 62 is one (`one_missing` in
+    /// `restored_dag_gap_boundaries`).
+    #[test]
+    fn restored_dag_gap_counts_only_referenced_parents() {
+        const C: Round = 60;
+        const GC_ROUND: Round = 35;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+        let (certificates, _) = make_optimal_certificates(&committee, 1..=62, &genesis, &ids);
+        let lost = |c: &Certificate| c.round() == 62 && c.origin() == &ids[1];
+        let quorum: BTreeSet<_> = certificates
+            .iter()
+            .filter(|c| c.round() == 62 && !lost(c))
+            .map(|c| c.digest())
+            .collect();
+        assert_eq!(quorum.len(), 3, "2f+1 of four");
+        let quorum_linked =
+            ids.iter().map(|id| mock_certificate(&committee, id.clone(), 63, quorum.clone()).1);
+        let stored: Vec<_> = certificates.into_iter().chain(quorum_linked).collect();
+        let dag = restored(&stored, |c| c.round() > GC_ROUND && !lost(c));
+        assert_eq!(restored_dag_gap(&committed(&ids, C, None), GC_ROUND, &dag), None);
     }
 }
 

@@ -321,6 +321,7 @@ mod tests {
         Config::load_or_default(&temp_dir.path().to_path_buf(), "test")
             .expect("default config files written to tempdir");
         std::env::set_var("RUST_LOG", "info,evm=debug");
+        // the default config is a test chain, so a faucet build needs the opt-in to start
         let tn = Cli::<NoArgs>::try_parse_args_from([
             "tn",
             "node",
@@ -328,6 +329,7 @@ mod tests {
             temp_dir.path().to_str().unwrap(),
             "--log.file.filter",
             "debug,net=trace",
+            "--allow-faucet-on-chain",
         ])
         .unwrap();
         // run() will create a tokio runtime so we can use tokio::spawn but need to use a normal

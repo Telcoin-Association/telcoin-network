@@ -4,9 +4,11 @@ use crate::consensus::{
     utils, ConsensusError, ConsensusInvariant, ConsensusState, Dag, LeaderSchedule,
     LeaderSwapTable, Outcome,
 };
-use std::collections::VecDeque;
+use metrics::{counter, Counter};
+use std::collections::{BTreeMap, VecDeque};
 use tn_types::{
-    Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
+    AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores,
+    Round, VotingPower,
 };
 use tokio::time::Instant;
 use tracing::{debug, error_span, info, instrument};
@@ -35,6 +37,8 @@ pub struct Bullshark {
     pub leader_schedule: LeaderSchedule,
     /// The bad node stake threshold for [`LeaderSwapTable`].
     pub bad_nodes_stake_threshold: u64,
+    /// Leader outcome counters, pre-resolved for every committee member.
+    leader_metrics: LeaderMetrics,
 }
 
 impl Bullshark {
@@ -45,6 +49,7 @@ impl Bullshark {
         leader_schedule: LeaderSchedule,
         bad_nodes_stake_threshold: u64,
     ) -> Self {
+        let leader_metrics = LeaderMetrics::new(&committee);
         Self {
             committee,
             last_successful_leader_election_timestamp: Instant::now(),
@@ -52,6 +57,7 @@ impl Bullshark {
             num_sub_dags_per_schedule,
             leader_schedule,
             bad_nodes_stake_threshold,
+            leader_metrics,
         }
     }
 
@@ -229,6 +235,9 @@ impl Bullshark {
 
             debug!("Leader {:?} has enough support", leader);
 
+            // before `state.update` moves the committed round to this leader's round
+            self.record_scheduled_leaders(&leader, state);
+
             let mut min_round = leader.round();
             let sequence = utils::order_dag(&leader, state);
 
@@ -268,8 +277,12 @@ impl Bullshark {
                 num_certificates = num_certificates,
                 min_round = min_round,
                 committed_round = state.last_round.committed_round,
+                leader = %leader.origin(),
+                leader_created_at_ms = leader.header().created_at_ms().as_millis(),
+                commit_timestamp_ms = sub_dag.commit_timestamp_ms().as_millis(),
                 "subdag committed"
             );
+            self.leader_metrics.record_commit(leader.origin());
 
             // Update the last sub dag
             state.last_committed_sub_dag = Some(sub_dag.clone());
@@ -293,6 +306,34 @@ impl Bullshark {
         }
 
         Ok((Outcome::Commit, committed_sub_dags))
+    }
+
+    /// Logs and counts the scheduled leader of every leader round that committing `leader`
+    /// decides, once per round.
+    ///
+    /// The decided rounds are the even rounds after the last committed round up to and including
+    /// the leader's round. Must run before the leader's sub dag updates `state`, so the committed
+    /// round still marks the previous commit. Earlier rounds in the range are skipped by this
+    /// commit: their `found` reports whether the scheduled leader's certificate reached the DAG
+    /// at all, which separates absent leaders from leaders that arrived but were not linked.
+    /// Rounds still undecided when the epoch ends are never reported.
+    fn record_scheduled_leaders(&self, leader: &Certificate, state: &ConsensusState) {
+        // the smallest even round above the last committed round
+        let first = state.last_round.committed_round.saturating_add(2) & !1;
+        for leader_round in (first..=leader.round()).step_by(2) {
+            let (authority, certificate, swapped) =
+                self.leader_schedule.leader_certificate_with_swap(leader_round, &state.dag);
+            let found = certificate.is_some();
+            debug!(
+                target: "primary::bullshark",
+                leader_round,
+                leader = %authority.id(),
+                swapped,
+                found,
+                "scheduled leader"
+            );
+            self.leader_metrics.record_round(&authority.id(), swapped, found);
+        }
     }
 
     /// Order the past leaders that we didn't already commit. It orders the leaders from the one
@@ -381,5 +422,185 @@ impl Bullshark {
     fn update_max_inserted_round(&mut self, certificate_round: Round) {
         self.max_inserted_certificate_round =
             self.max_inserted_certificate_round.max(certificate_round);
+    }
+}
+
+/// Leader outcome counters for one epoch's committee, keyed by authority.
+///
+/// Every handle is registered when [`Bullshark`] is built, so each committee member exports all
+/// of its series (at zero) from the start of the epoch and recording a round does no registry
+/// lookup. Label values are bs58 authority ids, bounded by the committee size.
+#[derive(Debug)]
+struct LeaderMetrics {
+    /// The handles for each committee member.
+    by_leader: BTreeMap<AuthorityIdentifier, LeaderHandles>,
+}
+
+impl LeaderMetrics {
+    /// Registers the handles for every member of `committee`.
+    fn new(committee: &Committee) -> Self {
+        let by_leader = committee
+            .authorities()
+            .iter()
+            .map(|authority| {
+                let leader = authority.id().to_string();
+                let rounds = |swapped: bool, found: bool| {
+                    counter!(
+                        "tn_primary.leader_rounds_total",
+                        "leader" => leader.clone(),
+                        "swapped" => bool_label(swapped),
+                        "found" => bool_label(found),
+                    )
+                };
+                let handles = LeaderHandles {
+                    rounds: [
+                        [rounds(false, false), rounds(false, true)],
+                        [rounds(true, false), rounds(true, true)],
+                    ],
+                    commits: counter!("tn_primary.leader_commits_total", "leader" => leader.clone()),
+                };
+                (authority.id(), handles)
+            })
+            .collect();
+        Self { by_leader }
+    }
+
+    /// Counts one decided leader round for `leader`.
+    fn record_round(&self, leader: &AuthorityIdentifier, swapped: bool, found: bool) {
+        if let Some(handles) = self.by_leader.get(leader) {
+            handles.rounds[usize::from(swapped)][usize::from(found)].increment(1);
+        }
+    }
+
+    /// Counts one committed sub dag led by `leader`.
+    fn record_commit(&self, leader: &AuthorityIdentifier) {
+        if let Some(handles) = self.by_leader.get(leader) {
+            handles.commits.increment(1);
+        }
+    }
+}
+
+/// The metric handles for one committee member.
+#[derive(Debug)]
+struct LeaderHandles {
+    /// `tn_primary_leader_rounds_total`, indexed by `[swapped][found]`.
+    rounds: [[Counter; 2]; 2],
+    /// `tn_primary_leader_commits_total`.
+    commits: Counter,
+}
+
+/// Returns the static label value for a boolean outcome.
+fn bool_label(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+#[cfg(test)]
+mod leader_metrics_tests {
+    use super::*;
+    use crate::test_utils::make_optimal_certificates;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::collections::BTreeSet;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+
+    /// Counts the scheduled leader of every decided leader round and the leader of every commit.
+    ///
+    /// The round 2 leader is absent for rounds 1 and 2, so its round is decided as not found when
+    /// round 4 commits. The round 6 round-robin authority is the one bad node of the swap table,
+    /// so round 6 commits a swapped-in good node.
+    #[test]
+    fn leader_counters_track_rounds_and_commits() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<AuthorityIdentifier> =
+            committee.authorities().iter().map(|authority| authority.id()).collect();
+        assert_eq!(ids.len(), 4);
+
+        let mut scores = ReputationScores::new(&committee);
+        scores.final_of_schedule = true;
+        for (position, id) in ids.iter().enumerate() {
+            scores.add_score(id, if position == 2 { 0 } else { 10 });
+        }
+        let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+        let schedule = LeaderSchedule::new(committee.clone(), table);
+
+        // the round 2 leader is missing for rounds 1 and 2, everyone is present for rounds 3 to 7
+        let absent = schedule.leader(2).id();
+        let present: Vec<_> = ids.iter().filter(|id| **id != absent).cloned().collect();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+        let (mut certificates, parents) =
+            make_optimal_certificates(&committee, 1..=2, &genesis, &present);
+        let (rest, _) = make_optimal_certificates(&committee, 3..=7, &parents, &ids);
+        certificates.extend(rest);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let committed_leaders = metrics::with_local_recorder(&recorder, || {
+            // built inside the closure so the pre-resolved handles bind to the local recorder
+            let mut bullshark = Bullshark::new(committee.clone(), 100, schedule.clone(), 33);
+            let mut state = ConsensusState::new(50);
+            let mut committed_leaders = Vec::new();
+            for certificate in certificates {
+                let (_, sub_dags) = bullshark.process_certificate(&mut state, certificate).unwrap();
+                committed_leaders.extend(sub_dags.iter().map(|d| d.leader().round()));
+            }
+            committed_leaders
+        });
+        assert_eq!(committed_leaders, vec![4, 6]);
+
+        // (leader, swapped, found) -> count for the three decided leader rounds
+        let mut expected_rounds = BTreeMap::new();
+        let mut expected_commits = BTreeMap::new();
+        for (round, found) in [(2, false), (4, true), (6, true)] {
+            let (leader, swapped) = schedule.leader_with_swap(round);
+            assert_eq!(swapped, round == 6, "only the round 6 leader is swapped");
+            *expected_rounds.entry((leader.id().to_string(), swapped, found)).or_insert(0u64) += 1;
+            if found {
+                *expected_commits.entry(leader.id().to_string()).or_insert(0u64) += 1;
+            }
+        }
+
+        let mut rounds_series = 0;
+        let mut commits_series = 0;
+        let mut actual_rounds = BTreeMap::new();
+        let mut actual_commits = BTreeMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let label = |name: &str| {
+                key.key()
+                    .labels()
+                    .find(|label| label.key() == name)
+                    .map(|label| label.value().to_string())
+                    .unwrap_or_else(|| panic!("missing label {name}"))
+            };
+            let DebugValue::Counter(count) = value else { continue };
+            match key.key().name() {
+                "tn_primary.leader_rounds_total" => {
+                    rounds_series += 1;
+                    if count > 0 {
+                        let entry =
+                            (label("leader"), label("swapped") == "true", label("found") == "true");
+                        actual_rounds.insert(entry, count);
+                    }
+                }
+                "tn_primary.leader_commits_total" => {
+                    commits_series += 1;
+                    if count > 0 {
+                        actual_commits.insert(label("leader"), count);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // every committee member exports all four outcomes and its commits from the start
+        assert_eq!(rounds_series, 16);
+        assert_eq!(commits_series, 4);
+        assert_eq!(actual_rounds, expected_rounds);
+        assert_eq!(actual_commits, expected_commits);
     }
 }

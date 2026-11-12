@@ -18,6 +18,20 @@ use metrics_exporter_prometheus::{
 const SECONDS_BUCKETS: &[f64] =
     &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 
+/// Buckets for the latency histograms whose typical sample is under 5 ms, 100us..30s.
+///
+/// [`SECONDS_BUCKETS`] starts at 5 ms, so `histogram_quantile` interpolates every sample under
+/// it linearly inside [0, 5 ms] and reports about 2.5 ms for p50 whatever the real value is. The
+/// voter's fast vote stages (`tn_primary_vote_stage_seconds`), the engine's queue wait
+/// (`tn_engine_queue_wait_seconds`) and the worker's in-process batch report to its primary
+/// (`tn_worker_batch_report_seconds`, `tn_executor_consensus_pack_persist_seconds`) normally finish
+/// in that range. This layout adds sub-ms bounds below [`SECONDS_BUCKETS`] and keeps all of its
+/// bounds, so a query that pins one of them (for example `le="0.005"`) still finds its series.
+const SUB_MS_SECONDS_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0,
+];
+
 /// Buckets for histograms ending in `_bytes` (payload sizes), 1KiB..4MiB.
 const BYTES_BUCKETS: &[f64] =
     &[1_024.0, 4_096.0, 16_384.0, 65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0];
@@ -148,10 +162,32 @@ pub fn build_recorder() -> eyre::Result<(impl Recorder + Send + Sync + 'static, 
 ///
 /// Buckets are REQUIRED for aggregatable histograms - without them the exporter renders
 /// histograms as quantile summaries, which cannot be aggregated or re-quantiled in Grafana.
-/// Matchers apply to the final (sanitized) metric name, after the selective prefix.
+/// Matchers apply to the final (sanitized) metric name, after the selective prefix. When more
+/// than one matcher applies, the exporter takes `Full` before `Prefix` before `Suffix`, whatever
+/// the order they are set in here, so the `Full` overrides below win over the `_seconds` suffix.
 fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
     let builder = PrometheusBuilder::new()
         .set_buckets_for_metric(Matcher::Suffix("_seconds".to_string()), SECONDS_BUCKETS)?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_primary_vote_stage_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_queue_wait_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_forward_wait_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_worker_batch_report_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_executor_consensus_pack_persist_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
         .set_buckets_for_metric(Matcher::Suffix("_bytes".to_string()), BYTES_BUCKETS)?
         .set_buckets_for_metric(Matcher::Full("tn_engine_block_gas_used".to_string()), GAS_BUCKETS)?
         .set_buckets_for_metric(
@@ -341,6 +377,64 @@ mod tests {
         let rendered = handle.render();
         assert!(rendered.contains("tn_test_duration_seconds_bucket"), "{rendered}");
         assert!(rendered.contains("le=\"0.5\""), "{rendered}");
+    }
+
+    /// The vote stage, engine queue wait and engine forward wait histograms take the sub-ms
+    /// layout through their `Full` matchers, which win over the `_seconds` suffix, and every
+    /// other `_seconds` histogram keeps [`SECONDS_BUCKETS`].
+    #[test]
+    fn test_sub_ms_histograms_render_sub_ms_buckets() {
+        let inner = build_prometheus_recorder().expect("recorder builds");
+        let handle = inner.handle();
+        let recorder = TnPrefixRecorder { inner };
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => "validate")
+                .record(0.0003);
+            metrics::histogram!("tn_engine.queue_wait_seconds").record(0.0003);
+            metrics::histogram!("tn_engine.forward_wait_seconds").record(0.0003);
+            metrics::histogram!("tn_worker.batch_report_seconds", "worker" => "0").record(0.0003);
+            metrics::histogram!("tn_executor.consensus_pack_persist_seconds").record(0.0003);
+            metrics::histogram!("tn_test.other_seconds").record(0.0003);
+        });
+
+        let rendered = handle.render();
+        [
+            "tn_primary_vote_stage_seconds_bucket{stage=\"validate\",le=\"0.0001\"} 0\n",
+            "tn_primary_vote_stage_seconds_bucket{stage=\"validate\",le=\"0.00025\"} 0\n",
+            "tn_primary_vote_stage_seconds_bucket{stage=\"validate\",le=\"0.0005\"} 1\n",
+            "tn_primary_vote_stage_seconds_bucket{stage=\"validate\",le=\"30\"} 1\n",
+            "tn_engine_queue_wait_seconds_bucket{le=\"0.0001\"} 0\n",
+            "tn_engine_queue_wait_seconds_bucket{le=\"0.00025\"} 0\n",
+            "tn_engine_queue_wait_seconds_bucket{le=\"0.0005\"} 1\n",
+            "tn_engine_queue_wait_seconds_bucket{le=\"30\"} 1\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"0.00025\"} 0\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"0.0005\"} 1\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"30\"} 1\n",
+            "tn_worker_batch_report_seconds_bucket{worker=\"0\",le=\"0.00025\"} 0\n",
+            "tn_worker_batch_report_seconds_bucket{worker=\"0\",le=\"0.0005\"} 1\n",
+            "tn_executor_consensus_pack_persist_seconds_bucket{le=\"0.00025\"} 0\n",
+            "tn_executor_consensus_pack_persist_seconds_bucket{le=\"0.0005\"} 1\n",
+            "tn_test_other_seconds_bucket{le=\"0.005\"} 1\n",
+        ]
+        .into_iter()
+        .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
+        assert!(!rendered.contains("tn_test_other_seconds_bucket{le=\"0.0005\"}"), "{rendered}");
+    }
+
+    /// The sub-ms layout is strictly ascending and keeps every bound of [`SECONDS_BUCKETS`].
+    #[test]
+    fn test_sub_ms_seconds_buckets_extend_seconds_buckets() {
+        assert!(
+            SUB_MS_SECONDS_BUCKETS.windows(2).all(|pair| pair.first() < pair.last()),
+            "layout {SUB_MS_SECONDS_BUCKETS:?} is not strictly ascending"
+        );
+        let missing: Vec<f64> = SECONDS_BUCKETS
+            .iter()
+            .copied()
+            .filter(|bound| !SUB_MS_SECONDS_BUCKETS.iter().any(|b| b.to_bits() == bound.to_bits()))
+            .collect();
+        assert!(missing.is_empty(), "sub-ms layout drops {missing:?}");
     }
 
     /// A full batch of minimum-gas transactions must land in a finite bucket of

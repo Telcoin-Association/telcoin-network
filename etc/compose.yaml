@@ -109,6 +109,8 @@ services:
     depends_on:
       - comittee
     environment:
+      # engine=debug logs execution as hashes and counts; the output and block struct dumps
+      # need engine::dump=trace, the per-transaction EVM lines engine::evm=trace.
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup1 service
     user: "1101:1101"

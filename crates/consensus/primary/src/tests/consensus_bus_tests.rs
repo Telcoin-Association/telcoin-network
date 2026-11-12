@@ -213,30 +213,47 @@ async fn test_epoch_record_watch_updates() {
 // wait_for_execution canonical-DB fallback on a ring miss (issue #1036)
 // ---------------------------------------------------------------------------
 
-use std::{collections::HashMap, sync::Arc};
+use crate::{ExecutionCheck, ExecutionCheckError};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_types::{
-    BlockHash, BlockNumber, CanonicalExecutionReader, ConsensusHeaderDigest, ConsensusNumHash,
-    ExecHeader, SealedHeader,
+    BlockHash, BlockNumHash, BlockNumber, CanonicalExecutionReader, ConsensusHeaderDigest,
+    ConsensusNumHash, ExecHeader, SealedHeader,
 };
 
 /// In-memory [`CanonicalExecutionReader`] for tests: answers from a fixed number -> hash map, so
-/// the ring-eviction fallback can be exercised without a real execution database.
+/// the ring-eviction fallback can be exercised without a real execution database. A height missing
+/// from the map reads as `None`, the answer of a failed or not yet persisted read.
 #[derive(Debug, Default)]
 struct FakeCanonicalReader {
     by_number: HashMap<BlockNumber, BlockHash>,
+    floor: Option<BlockNumber>,
 }
 
 impl FakeCanonicalReader {
     fn with(number: BlockNumber, hash: BlockHash) -> Self {
         let mut by_number = HashMap::new();
         by_number.insert(number, hash);
-        Self { by_number }
+        Self { by_number, floor: None }
+    }
+
+    /// The same reader for a datadir restored from a snapshot at `floor`.
+    fn restored_at(mut self, floor: BlockNumber) -> Self {
+        self.floor = Some(floor);
+        self
     }
 }
 
 impl CanonicalExecutionReader for FakeCanonicalReader {
     fn canonical_execution_hash(&self, number: BlockNumber) -> Option<BlockHash> {
+        // like the execution environment, nothing below the floor is attested
+        if self.floor.is_some_and(|floor| number < floor) {
+            return None;
+        }
         self.by_number.get(&number).copied()
+    }
+
+    fn restored_state_floor(&self) -> Option<BlockNumber> {
+        self.floor
     }
 }
 
@@ -290,7 +307,7 @@ async fn wait_for_execution_reports_fork_when_canonical_hash_differs() {
         forked.num_hash().hash,
     )));
 
-    assert!(bus.wait_for_execution(target.num_hash()).await.is_err());
+    assert_eq!(bus.wait_for_execution(target.num_hash()).await, Err(ExecutionCheckError::Fork));
 }
 
 #[tokio::test]
@@ -302,4 +319,149 @@ async fn wait_for_execution_without_reader_keeps_ring_only_fork_check() {
 
     // No reader installed (tests / engine-less tools): a ring miss is still reported as a fork.
     assert!(bus.wait_for_execution(target.num_hash()).await.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// the three-way execution check: number and hash, the restore floor, read errors (SEC-1/6/8)
+// ---------------------------------------------------------------------------
+
+/// A block in the ring matches only by its own number and hash; a block above the executed tip
+/// (or any block before anything is executed) is not yet checkable.
+#[test]
+fn execution_check_matches_in_ring_and_waits_above_tip() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    let executed = sealed_at(10, 1);
+    assert_eq!(bus.check_execution_block(executed.num_hash()), ExecutionCheck::NotYet, "empty");
+
+    push_tip(&bus, executed.clone());
+    assert_eq!(bus.check_execution_block(executed.num_hash()), ExecutionCheck::Match);
+    let above = sealed_at(11, 1);
+    assert_eq!(bus.check_execution_block(above.num_hash()), ExecutionCheck::NotYet);
+}
+
+/// SEC-1: a header naming block 11 with the hash of executed block 10 is not a match, with or
+/// without the canonical database, although the ring holds that hash.
+#[test]
+fn execution_check_same_hash_at_another_number_is_not_a_match() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    let executed = sealed_at(10, 1);
+    push_tip(&bus, executed.clone());
+    push_tip(&bus, sealed_at(12, 2));
+    let poisoned = BlockNumHash::new(11, executed.hash());
+
+    assert_eq!(bus.check_execution_block(poisoned), ExecutionCheck::Fork, "ring only");
+
+    let block11 = sealed_at(11, 3);
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::with(11, block11.hash())));
+    assert_eq!(bus.check_execution_block(poisoned), ExecutionCheck::Fork, "with the database");
+    assert_eq!(bus.check_execution_block(block11.num_hash()), ExecutionCheck::Match);
+}
+
+/// A ring miss at or below the tip with a different canonical hash in the database is a fork.
+#[test]
+fn execution_check_reports_fork_on_a_different_canonical_hash() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    push_tip(&bus, sealed_at(12, 2));
+    let canonical = sealed_at(10, 1);
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::with(10, canonical.hash())));
+
+    assert_eq!(bus.check_execution_block(sealed_at(10, 9).num_hash()), ExecutionCheck::Fork);
+    assert_eq!(bus.check_execution_block(canonical.num_hash()), ExecutionCheck::Match);
+}
+
+/// SEC-6: below the restored-state floor the node can neither confirm nor refute a block, so the
+/// check names the floor instead of a fork; at the floor the hash decides again.
+#[test]
+fn execution_check_below_the_restore_floor_is_not_a_fork() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    push_tip(&bus, sealed_at(120, 2));
+    let at_floor = sealed_at(100, 1);
+    bus.set_canonical_reader(Arc::new(
+        FakeCanonicalReader::with(100, at_floor.hash()).restored_at(100),
+    ));
+
+    // a zero-hash scaffold height and a real-looking hash below the floor alike
+    assert_eq!(
+        bus.check_execution_block(BlockNumHash::new(50, BlockHash::ZERO)),
+        ExecutionCheck::BelowFloor { floor: 100 }
+    );
+    assert_eq!(
+        bus.check_execution_block(sealed_at(99, 7).num_hash()),
+        ExecutionCheck::BelowFloor { floor: 100 }
+    );
+    assert_eq!(bus.check_execution_block(at_floor.num_hash()), ExecutionCheck::Match);
+    assert_eq!(bus.check_execution_block(sealed_at(100, 9).num_hash()), ExecutionCheck::Fork);
+}
+
+/// SEC-8: a database that cannot answer at or below the tip (a read error, or a block not
+/// persisted yet) leaves the block unconfirmed, not forked.
+#[test]
+fn execution_check_read_error_is_unconfirmed() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    push_tip(&bus, sealed_at(12, 2));
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::default()));
+
+    assert_eq!(bus.check_execution_block(sealed_at(10, 1).num_hash()), ExecutionCheck::Unconfirmed);
+}
+
+/// The wait asks an unanswering database again instead of failing, and resolves once it
+/// confirms the block.
+#[tokio::test(start_paused = true)]
+async fn wait_for_execution_retries_an_unconfirmed_block() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    push_tip(&bus, sealed_at(12, 2));
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::default()));
+    let target = sealed_at(10, 1);
+
+    let mut wait = Box::pin(bus.wait_for_execution(target.num_hash()));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), &mut wait).await.is_err(),
+        "an unconfirmed block keeps the wait pending"
+    );
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::with(10, target.hash())));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), wait).await, Ok(Ok(())));
+}
+
+/// The wait returns the floor for a block below it at once.
+#[tokio::test]
+async fn wait_for_execution_reports_the_restore_floor() {
+    let bus = ConsensusBusApp::new_with_recent_blocks(4);
+    push_tip(&bus, sealed_at(120, 2));
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::default().restored_at(100)));
+
+    assert_eq!(
+        bus.wait_for_execution(BlockNumHash::new(50, BlockHash::ZERO)).await,
+        Err(ExecutionCheckError::BelowFloor { floor: 100 })
+    );
+}
+
+/// A database that keeps failing reads is visible: every retry counts in
+/// `tn_primary.execution_check_retries_total`, and the first and every 25th retry log a warning
+/// naming the block.
+#[tokio::test(start_paused = true)]
+async fn wait_for_execution_reports_its_retries() {
+    use crate::{log_capture::LogCapture, metrics::test_recorder::TestMetricsRecorder};
+    use metrics_util::debugging::DebugValue;
+
+    let capture = LogCapture::new("primary");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = TestMetricsRecorder::new();
+    let bus =
+        metrics::with_local_recorder(&recorder, || ConsensusBusApp::new_with_recent_blocks(4));
+    push_tip(&bus, sealed_at(12, 2));
+    bus.set_canonical_reader(Arc::new(FakeCanonicalReader::default()));
+    let target = sealed_at(10, 1);
+
+    // retries at 0, 0.2, ... 5.2 s: 27 retries before the timeout at 5.3 s
+    let wait = bus.wait_for_execution(target.num_hash());
+    assert!(tokio::time::timeout(Duration::from_millis(5_300), wait).await.is_err());
+
+    let warnings = capture.events("execution block not readable from the canonical db; retrying");
+    let retries: Vec<_> = warnings.iter().filter_map(|event| event.u64_field("retries")).collect();
+    assert_eq!(retries, [1, 25], "the first retry and every 25th");
+    assert_eq!(warnings[0].u64_field("block_number"), Some(10));
+    assert!(matches!(
+        recorder.metric("tn_primary.execution_check_retries_total"),
+        Some(DebugValue::Counter(27))
+    ));
 }

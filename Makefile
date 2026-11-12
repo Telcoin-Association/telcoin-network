@@ -55,7 +55,7 @@ help:
 	@echo "    :::> Run all tests using cargo test (fallback if nextest not installed)." ;
 	@echo ;
 	@echo "make test-faucet" ;
-	@echo "    :::> Test faucet integration test in main binary." ;
+	@echo "    :::> Run the faucet e2e test (e2e-tests built with its faucet feature)." ;
 	@echo ;
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
@@ -188,9 +188,10 @@ test:
 test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 
-# run faucet integration test
+# run the faucet e2e test; `crates/e2e-tests/tests/it/faucet.rs` compiles only with the e2e-tests
+# `faucet` feature
 test-faucet:
-	cargo nextest run --package telcoin-network --features faucet --test it ;
+	cargo nextest run --package e2e-tests --features faucet --test it faucet:: ;
 
 # Build the node binary once so e2e test processes reuse it via TN_BIN_PATH instead of
 # rebuilding it through escargot (~3-10s of cargo overhead per test process). Built under the
@@ -530,7 +531,9 @@ docker-adiri:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-adiri-$(TAG)" . --push ;
 
 # build and push an ad-hoc devnet image for amd64 and arm64 as dev-devnet-$(TAG)
-# CARGO_FEATURES=faucet compiles in the faucet support only
+# CARGO_FEATURES=faucet compiles in the faucet support only. A faucet build refuses mainnet
+# (chain id 731) and starts on any other chain but adiri only with --allow-faucet-on-chain
+# (TN_ALLOW_FAUCET_ON_CHAIN=true).
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 

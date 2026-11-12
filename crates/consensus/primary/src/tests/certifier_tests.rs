@@ -106,6 +106,7 @@ impl<DB: Database> CertifierContext<DB> {
             proposal_lock: Arc::new(Mutex::new(())),
             in_flight: Arc::default(),
             metrics: cx.consensus_bus.app().metrics().clone(),
+            consensus_bus: cx.consensus_bus.clone(),
             config,
         };
         (cx, certifier)
@@ -2286,7 +2287,17 @@ async fn run_bad_signature_row(row: BadSignatureRow) {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn certifier_stops_on_shutdown() {
     let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
     let header = cx.proposer_header();
+    // bench5 cert-requeue: a proposal in flight when the signal lands is cancelled by it, and a
+    // shutdown cancel is never reported to the proposer
+    let in_flight = cx.proposer().header_builder(&committee).created_at(1000).build();
+    assert_ne!(in_flight.digest(), header.digest(), "precondition: two distinct headers");
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+    cx.consensus_bus.headers().send(in_flight).await.expect("send the in-flight header");
+    let peers = cx.peers().count();
+    let _held =
+        cx.network.respond(peers, "in flight: every request held", |_, _| Reply::Hold).await;
 
     // on the paused clock each sleep ends only once every task is idle: the certifier is parked
     // in its loop before the signal, and has acted on the signal before the header
@@ -2298,4 +2309,174 @@ async fn certifier_stops_on_shutdown() {
     cx.network
         .assert_closed("after shutdown: the certifier task must end without proposing the header")
         .await;
+    if let Ok(Some(report)) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
+        panic!("a shutdown cancel must not be reported, got {report:?}");
+    }
+}
+
+// ---- bench5 cert-requeue ----
+
+/// Wait until the certifier has stored its certificate for the header with `digest`: the header
+/// is certified, whether or not the certificate manager then accepts it.
+async fn certified(cx: &CertifierContext<MemDatabase>, digest: HeaderDigest, context: &str) {
+    let storage = cx.proposer().consensus_config().node_storage().clone();
+    let stored = async {
+        while !matches!(storage.get::<ProposedCertificates>(&digest), Ok(Some(_))) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    if tokio::time::timeout(STEP_TIMEOUT, stored).await.is_err() {
+        panic!("{context}: no certificate stored within {STEP_TIMEOUT:?}");
+    }
+}
+
+/// A newer header that cancels the proposal in flight reports the cancelled header to the
+/// proposer, once, by round and digest; the newer header is certified and not reported.
+///
+/// Catches: a cancel that is not reported (the digests wait for the next own commit), a report
+/// carrying the newer header, and a report for a header that was certified.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn canceled_header_is_reported_to_the_proposer() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    // the newer header is the next round's, as the proposer builds it
+    let header1 = cx.proposer().header_builder(&committee).created_at(1000).build();
+    let header2 = cx.proposer().header_builder_at_round(&committee, header1.round() + 1).build();
+    let h2_digest = header2.digest();
+    let votes = cx.peer_votes(&header2);
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+
+    cx.consensus_bus.headers().send(header1.clone()).await.unwrap();
+    // held, not dropped: a dropped request fails and its vote task would retry
+    let _header1_requests =
+        cx.network.respond(votes.len(), "header 1: every request held", |_, _| Reply::Hold).await;
+
+    cx.consensus_bus.headers().send(header2).await.unwrap();
+    let report = tokio::time::timeout(STEP_TIMEOUT, rx_uncertified.recv())
+        .await
+        .expect("header 2 cancels header 1 and reports it")
+        .expect("report channel open");
+    assert_eq!(report, (header1.round(), header1.digest()), "the report names header 1");
+
+    cx.network
+        .respond(votes.len(), "header 2: every peer votes", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    certified(&cx, h2_digest, "header 2").await;
+    if let Ok(report) = tokio::time::timeout(QUIET_WINDOW, rx_uncertified.recv()).await {
+        panic!("expected one report, for header 1 only, got another: {report:?}");
+    }
+    let lines = capture.events("header uncertified");
+    assert_eq!(lines.len(), 1, "one line per cancelled header, none for the certified one");
+    assert_eq!(lines[0].field("reason"), Some("canceled"));
+    assert_eq!(lines[0].u64_field("round"), Some(u64::from(header1.round())));
+    assert_eq!(lines[0].u64_field("epoch"), Some(u64::from(header1.epoch())));
+}
+
+/// The identical header re-sent on the max-delay tick is never reported: not while its proposal
+/// is in flight, and not once it is certified, even when a newer header supersedes the re-send
+/// before its proposal task runs. That task returns before the already-certified check, so only
+/// the stored certificate tells it the header was certified.
+///
+/// Catches: a report for a header that is, or may still be, certified, which would put its
+/// digests in a second header.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_resend_is_never_reported() {
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    let header = cx.proposer().header_builder(&committee).created_at(1000).build();
+    let newer = cx.proposer().header_builder_at_round(&committee, header.round() + 1).build();
+    let votes = cx.peer_votes(&header);
+    let mut cert_rx = cx.subscribe_new_certificates();
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+
+    // in flight: every request held, then the identical header again
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let responses =
+        cx.network.respond(votes.len(), "first send: every request held", |_, _| Reply::Hold).await;
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.network.assert_quiet("identical re-send: the proposal keeps its requests").await;
+    if let Ok(report) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
+        panic!("identical re-send in flight: expected no report, got {report:?}");
+    }
+
+    // every held request answers with its vote: the header is certified and gossiped
+    for (request, reply) in responses.requests.iter().zip(responses.held) {
+        let vote = PrimaryResponse::Vote(votes[&request.peer].clone());
+        assert!(
+            reply.send(Ok(NetworkResponseMessage { peer: request.peer, result: vote })).is_ok(),
+            "a held request stopped waiting before its vote"
+        );
+    }
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the header is certified")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), header.digest());
+    cx.network.next_publish("gossip of the certificate").await;
+    // on the paused clock a sleep ends only once every task is idle, so the proposal has ended
+    // before the header is sent again
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // the re-send and the newer header queue together: the re-send's task runs first and finds
+    // itself superseded before it reaches the already-certified republish
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.consensus_bus.headers().send(newer.clone()).await.unwrap();
+    let newer_requests = cx
+        .network
+        .respond(votes.len(), "newer header: every request held", |_, _| Reply::Hold)
+        .await;
+    assert!(
+        newer_requests.requests.iter().all(|request| request.header == newer.digest()),
+        "every vote request after the re-send must be for the newer header"
+    );
+    cx.network.assert_quiet("the superseded re-send neither republishes nor asks for votes").await;
+    if let Ok(report) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
+        panic!("certified header superseded on its re-send: expected no report, got {report:?}");
+    }
+}
+
+/// A full report queue never stalls the certifier: the cancel's report is dropped, the queued
+/// reports are kept in order, and the newer header is still proposed and certified.
+///
+/// Catches: a certifier that waits for room in the queue, which would stop every later proposal
+/// behind a proposer that is not draining it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn full_report_queue_drops_the_report_without_stalling() {
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    let header1 = cx.proposer().header_builder(&committee).created_at(1000).build();
+    let header2 = cx.proposer().header_builder_at_round(&committee, header1.round() + 1).build();
+    let h2_digest = header2.digest();
+    let votes = cx.peer_votes(&header2);
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+    let capacity = crate::consensus_bus::UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY;
+    for round in 0..capacity {
+        let filler = (Round::try_from(round).expect("small round"), HeaderDigest::default());
+        cx.consensus_bus.uncertified_own_headers().try_send(filler).expect("room for the filler");
+    }
+
+    cx.consensus_bus.headers().send(header1).await.unwrap();
+    let _header1_requests =
+        cx.network.respond(votes.len(), "header 1: every request held", |_, _| Reply::Hold).await;
+    cx.consensus_bus.headers().send(header2).await.unwrap();
+    cx.network
+        .respond(votes.len(), "header 2: every peer votes", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    certified(&cx, h2_digest, "header 2 behind a full report queue").await;
+
+    for round in 0..capacity {
+        let (reported, _) = rx_uncertified.recv().await.expect("report channel open");
+        assert_eq!(usize::try_from(reported).ok(), Some(round), "queued reports keep their order");
+    }
+    if let Ok(report) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
+        panic!("the cancel's report should have been dropped, got {report:?}");
+    }
 }

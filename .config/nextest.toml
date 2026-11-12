@@ -35,6 +35,13 @@ slow-timeout = { period = "720s", terminate-after = 3 }
 filter = "package(tn-storage) & not test(/_bench::/)"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# tn-node's tests finish in seconds (the slowest took about 4 s in CI) and its integration tests
+# bound each wait at 30 s, so one still running after five minutes is hung. End it there instead
+# of at the 45-minute job limit, which one hung tn-node test reached on #1817.
+[[profile.default.overrides]]
+filter = "package(tn-node)"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Fleet-timed crash captures have longer bounded waits than the ordinary e2e lane.
 # Keep the ordinary lane's limits; select this profile explicitly for SIGKILL captures.
 [profile.sigkill]
@@ -58,6 +65,10 @@ slow-timeout = { period = "720s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = "package(tn-storage) & not test(/_bench::/)"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = "package(tn-node)"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The engine's and the adapter's randomized tests take a new seed each run and print it, so a

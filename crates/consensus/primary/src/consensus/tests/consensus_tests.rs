@@ -1656,3 +1656,499 @@ async fn spawn_before_subsecond_fork_ignores_prior_epoch_close() {
     );
     assert!(first.commit_timestamp() < PRIOR_EPOCH_CLOSE);
 }
+
+// ---- bench5 f1-commit-lag ----
+
+/// Consensus commits sub-dags and publishes its committed round while nothing has executed.
+///
+/// The recent blocks ring stays empty for the whole test: the execution wait the commit path used
+/// to make never returns on an empty ring, so this fails if commits wait for execution again.
+#[tokio::test]
+async fn commits_advance_without_execution() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let mut rx_sequence = cb.subscribe_sequence();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    for certificate in certificates {
+        cb.new_certificates().send(certificate).await.unwrap();
+    }
+
+    let mut leader_rounds = Vec::new();
+    while leader_rounds.len() < 2 {
+        let sub_dag = tokio::time::timeout(Duration::from_secs(10), rx_sequence.recv())
+            .await
+            .expect("a commit does not wait for execution")
+            .expect("sequence channel stayed open");
+        leader_rounds.push(sub_dag.leader_round());
+    }
+    assert_eq!(leader_rounds, [2, 4]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while cb.app().committed_round() < 4 {
+        assert!(std::time::Instant::now() < deadline, "the committed round never advanced");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(cb.app().recent_blocks().borrow().is_empty(), "nothing executed during the test");
+    assert!(cb.is_active_cvv());
+
+    config.shutdown().notify();
+}
+
+/// A consensus driver, built directly rather than spawned, whose run-ahead gate holds leader 4.
+///
+/// Leader 2 gets too little support at round 3 to commit there, and leader 4 links to it, so the
+/// second round-5 certificate commits both in one batch. With nothing executed and a bound of two
+/// rounds, leader 2 goes on and leader 4 is held. Returns the driver's config, the driver, its
+/// quorum observer, the certificates of rounds 1 to 4 and those of round 5.
+fn consensus_holding_leader_4(
+    cb: &ConsensusBus,
+) -> (
+    ConsensusConfig<MemDatabase>,
+    Consensus<MemDatabase>,
+    super::RoundQuorumObserver,
+    Vec<Certificate>,
+    Vec<Certificate>,
+) {
+    use crate::test_utils::{
+        make_certificates_with_leader_configuration, TestLeaderConfiguration, TestLeaderSupport,
+    };
+    use std::collections::HashMap;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let leader_configurations = HashMap::from([(
+        2,
+        TestLeaderConfiguration {
+            round: 2,
+            authority: schedule.leader(2).id(),
+            should_omit: false,
+            support: Some(TestLeaderSupport::Weak),
+        },
+    )]);
+    let (certificates, _) = make_certificates_with_leader_configuration(
+        &committee,
+        1..=5,
+        &genesis,
+        &ids,
+        leader_configurations,
+    );
+
+    let consensus = Consensus {
+        committee: committee.clone(),
+        consensus_bus: cb.clone(),
+        consensus_config: config.clone(),
+        rx_shutdown: config.shutdown().subscribe(),
+        protocol: Bullshark::new(
+            committee.clone(),
+            FLOOR_SUB_DAGS_PER_SCHEDULE,
+            schedule,
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        ),
+        state: ConsensusState::new(FLOOR_GC_DEPTH),
+        active: true,
+        certificate_pack: None,
+        exec_floor: 0,
+        max_run_ahead: 2,
+    };
+    let observer = super::RoundQuorumObserver::from_recovered_dag(
+        committee,
+        cb.app().metrics().clone(),
+        0,
+        &consensus.state.dag,
+    );
+    let (early, round_5) =
+        certificates.into_iter().partition(|certificate| certificate.round() < 5);
+    (config, consensus, observer, early, round_5)
+}
+
+/// A commit the run-ahead gate holds returns as soon as the epoch shuts down, before the
+/// own-header report and the commit-accounting check.
+///
+/// Leader 2 goes on and leader 4 is held (see [`consensus_holding_leader_4`]). Checking that
+/// partial batch would find the committed round (4) above the highest sequenced header round (2)
+/// and demote the node for a commit-accounting violation that never happened.
+#[tokio::test]
+async fn gate_returns_on_shutdown_without_commit_accounting() {
+    use crate::metrics::test_recorder::TestMetricsRecorder;
+    use metrics_util::debugging::DebugValue;
+
+    let recorder = TestMetricsRecorder::new();
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let (config, mut consensus, mut observer, early, round_5) = consensus_holding_leader_4(&cb);
+    let mut rx_sequence = cb.subscribe_sequence();
+    let mut rx_own_headers = cb.subscribe_committed_own_headers();
+
+    for certificate in early {
+        consensus.new_certificate(certificate, &mut observer).await.unwrap();
+    }
+    assert!(rx_sequence.try_recv().is_err(), "leader 2 lacks the support to commit at round 3");
+
+    config.shutdown().notify();
+    for certificate in round_5 {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            consensus.new_certificate(certificate, &mut observer),
+        )
+        .await
+        .expect("a held commit returns once the epoch shuts down")
+        .unwrap();
+    }
+
+    assert_eq!(rx_sequence.try_recv().map(|sub_dag| sub_dag.leader_round()).ok(), Some(2));
+    assert!(rx_sequence.try_recv().is_err(), "leader 4 stays held");
+    assert!(rx_own_headers.try_recv().is_err(), "a partial batch reports no own headers");
+    assert_eq!(cb.app().committed_round(), 0, "a partial batch publishes no committed round");
+    assert!(cb.is_active_cvv(), "no commit-accounting demotion");
+    assert!(matches!(
+        recorder.metric("tn_primary.commit_run_ahead_blocked_total"),
+        Some(DebugValue::Counter(1))
+    ));
+}
+
+/// A held commit goes on once execution advances far enough, and its batch then passes the
+/// commit-accounting check.
+///
+/// Leader 4 is held (see [`consensus_holding_leader_4`]) until a task that waits for the hold to
+/// begin records the output led at round 2 as executed, so the release depends on the hold's
+/// wakeup. Both leaders are then sequenced in order and the committed round reaches 4.
+#[tokio::test]
+async fn gate_releases_when_execution_advances() {
+    use crate::metrics::test_recorder::TestMetricsRecorder;
+    use metrics_util::debugging::DebugValue;
+    use std::sync::Arc;
+
+    let recorder = Arc::new(TestMetricsRecorder::new());
+    let cb = metrics::with_local_recorder(&*recorder, ConsensusBus::new);
+    let (config, mut consensus, mut observer, early, round_5) = consensus_holding_leader_4(&cb);
+    let mut rx_sequence = cb.subscribe_sequence();
+    let mut rx_own_headers = cb.subscribe_committed_own_headers();
+
+    for certificate in early {
+        consensus.new_certificate(certificate, &mut observer).await.unwrap();
+    }
+    let execution = tokio::spawn({
+        let recorder = recorder.clone();
+        let app = cb.app().clone();
+        async move {
+            while !matches!(
+                recorder.metric("tn_primary.commit_run_ahead_blocked_total"),
+                Some(DebugValue::Counter(1))
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            app.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(
+                    2,
+                    ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                    None,
+                )
+            });
+        }
+    });
+    for certificate in round_5 {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            consensus.new_certificate(certificate, &mut observer),
+        )
+        .await
+        .expect("execution of leader 2's output releases the hold")
+        .unwrap();
+    }
+    execution.await.unwrap();
+
+    let leader_rounds: Vec<_> = std::iter::from_fn(|| rx_sequence.try_recv().ok())
+        .map(|sub_dag| sub_dag.leader_round())
+        .collect();
+    assert_eq!(leader_rounds, [2, 4]);
+    assert_eq!(
+        rx_own_headers.try_recv().map(|(round, _)| round).ok(),
+        Some(4),
+        "the whole batch reports its own headers"
+    );
+    assert_eq!(cb.app().committed_round(), 4);
+    assert!(cb.is_active_cvv(), "the commit-accounting check passed");
+    assert!(matches!(
+        recorder.metric("tn_primary.commit_run_ahead_blocked_total"),
+        Some(DebugValue::Counter(1))
+    ));
+    config.shutdown().notify();
+}
+
+/// An active CVV whose restored DAG holds a certificate that ordering can still reach with a
+/// parent missing from the DAG goes inactive and starts no consensus task. A promotion before the
+/// restart is settled by the demotion as a failed one.
+///
+/// The pack committed leader C in a sub-dag that holds only the leader, so no other authority
+/// has a committed round, while the certificate store kept only the rounds from
+/// `C - gc_depth + 2` (it prunes from its newest round). The other authorities' certificates of
+/// that bottom round are therefore still orderable, and their parents (genesis digests standing in
+/// for round `C - gc_depth + 1`) are missing from the DAG, so ordering from it would walk into the
+/// hole. The DAG reaches below `C + 1`, so a check of its lowest round alone would let it through.
+#[tokio::test]
+async fn spawn_demotes_on_restored_dag_gap() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let gc_depth = config.parameters().gc_depth;
+    let committed_round = gc_depth + 20;
+    let first_stored_round = committed_round - gc_depth + 2;
+
+    let (_, leader) =
+        mock_certificate(&committee, ids[0].clone(), committed_round, BTreeSet::new());
+    let committed = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(committee.epoch()),
+    );
+    consensus_chain.write_subdag_for_test(1, committed).await;
+    let (stored, _) = make_optimal_certificates(
+        &committee,
+        first_stored_round..=committed_round + 10,
+        &genesis,
+        &ids,
+    );
+    for certificate in stored {
+        config.node_storage().write(certificate).unwrap();
+    }
+
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    // the restart is the one that follows a promotion
+    let epoch = config.epoch();
+    cb.app()
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(epoch, tokio::time::Instant::now(), false));
+    let rx_shutdown = config.shutdown().subscribe();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    assert!(cb.is_cvv_inactive(), "the node goes inactive");
+    assert!(rx_shutdown.noticed(), "the epoch shuts down to restart in catch-up");
+    // the demotion settled the promotion at its own time, inside the grace, so it counts toward
+    // the rejoin cap however late the catch-up loop starts
+    let rejoin = *cb.app().rejoin_state().borrow();
+    assert!(!rejoin.is_pending(epoch), "settled by the demotion, not left to the catch-up loop");
+    assert_eq!(rejoin.attempts(epoch), 1, "a failed promotion");
+    assert_eq!(
+        cb.app().committed_round(),
+        committed_round,
+        "the committed round is primed from the pack"
+    );
+    // the consensus task subscribes before it is spawned and a second subscription panics, so
+    // this subscription succeeding shows no task was spawned
+    let _rx_new_certificates = cb.subscribe_new_certificates();
+}
+
+/// An active CVV promoted after catching up through the consensus pack restores a store the
+/// follower path left stale: the certificates of rounds 1 to 8, stored before its demotion, and
+/// none of the rounds 9 to 18 it followed. None of them is above its author's committed round, so
+/// the restore is no gap and the node stays active (`restarts::test_restartstt`, which the window
+/// check this replaced demoted on every promotion).
+#[tokio::test]
+async fn spawn_stays_active_on_a_store_left_stale_by_catch_up() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let committed_round = 18;
+    let (certificates, _) =
+        make_optimal_certificates(&committee, 1..=committed_round, &genesis, &ids);
+
+    // the sub-dag of the round-18 leader holds round 17: the pack's committed rounds are 18 for
+    // the leader's author and 17 for the rest
+    let leader = certificates
+        .iter()
+        .find(|c| c.round() == committed_round && c.origin() == &ids[0])
+        .cloned()
+        .unwrap();
+    let mut sub_dag: Vec<_> =
+        certificates.iter().filter(|c| c.round() == committed_round - 1).cloned().collect();
+    sub_dag.push(leader.clone());
+    let committed = CommittedSubDag::new(
+        sub_dag,
+        leader,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(committee.epoch()),
+    );
+    consensus_chain.write_subdag_for_test(1, committed).await;
+    for certificate in certificates.into_iter().filter(|c| c.round() <= 8) {
+        config.node_storage().write(certificate).unwrap();
+    }
+
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let rx_shutdown = config.shutdown().subscribe();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    assert!(cb.is_active_cvv(), "the node stays active");
+    assert!(!rx_shutdown.noticed(), "the epoch keeps running");
+    assert_eq!(cb.app().committed_round(), committed_round, "primed from the pack");
+    config.shutdown().notify();
+}
+
+// ---- bench5 land-path-obs ----
+
+/// A commit logs the land-path timestamps the stage analysis joins on: `certificate committed`
+/// with each certificate's creation time and age, `subdag committed` with its leader's creation
+/// time and the commit timestamp, and `subdag sequenced` (index, leader round, commit timestamp
+/// and base execution block, no execution wait) once the sub-dag is handed to the subscriber.
+///
+/// Catches: a `subdag sequenced` line missing after a commit or logged for another sub-dag, an
+/// execution wait creeping back onto the consensus side, and creation times read from anything
+/// other than the header's own `created_at`.
+#[tokio::test]
+async fn commit_logs_land_path_timestamps() {
+    use crate::log_capture::LogCapture;
+    use tn_types::now_ms;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let mut rx_sequence = cb.subscribe_sequence();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    let start_ms = now_ms().as_millis();
+    for certificate in certificates {
+        cb.new_certificates().send(certificate).await.unwrap();
+    }
+    // rounds 1 to 7 commit the leaders of rounds 2, 4 and 6
+    let mut sub_dags = Vec::new();
+    while sub_dags.len() < 3 {
+        let sub_dag = tokio::time::timeout(Duration::from_secs(10), rx_sequence.recv())
+            .await
+            .expect("committed before the timeout")
+            .expect("sequence channel stayed open");
+        sub_dags.push(sub_dag);
+    }
+    assert_eq!(sub_dags.iter().map(CommittedSubDag::leader_round).collect::<Vec<_>>(), [2, 4, 6]);
+    // the line follows the send, so wait for the consensus task to write the last one
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while capture.events("subdag sequenced").len() < sub_dags.len() {
+        assert!(std::time::Instant::now() < deadline, "no subdag sequenced line per commit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let end_ms = now_ms().as_millis();
+
+    let sequenced = capture.events("subdag sequenced");
+    assert_eq!(sequenced.len(), sub_dags.len(), "one line per sequenced sub-dag");
+    let committed = capture.events("subdag committed");
+    for (sub_dag, line) in sub_dags.iter().zip(&sequenced) {
+        let leader = sub_dag.leader();
+        let names: Vec<_> = line.fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["subdag_index", "leader_round", "commit_timestamp_ms", "base_execution_block"],
+            "subdag sequenced carries no wait field"
+        );
+        assert_eq!(line.u64_field("subdag_index"), Some(leader.nonce()));
+        assert_eq!(line.u64_field("leader_round"), Some(u64::from(sub_dag.leader_round())));
+        let commit_ms = sub_dag.commit_timestamp_ms().as_millis();
+        assert_eq!(line.u64_field("commit_timestamp_ms"), Some(commit_ms));
+        assert_eq!(
+            line.u64_field("base_execution_block"),
+            Some(leader.latest_execution_block().number)
+        );
+
+        let line = committed
+            .iter()
+            .find(|line| line.u64_field("leader_round") == Some(u64::from(leader.round())))
+            .expect("subdag committed for the sequenced leader");
+        assert_eq!(line.u64_field("subdag_index"), Some(leader.nonce()));
+        assert!(line.field("leader").is_some(), "the leader id stays on the line");
+        assert_eq!(
+            line.u64_field("leader_created_at_ms"),
+            Some(leader.created_at_ms().as_millis())
+        );
+        assert_eq!(line.u64_field("commit_timestamp_ms"), Some(commit_ms));
+    }
+
+    let certificates = capture.events("certificate committed");
+    assert!(!certificates.is_empty(), "the commits logged their certificates");
+    for line in &certificates {
+        assert!(line.u64_field("round").is_some() && line.field("origin").is_some());
+        let created_at = line.u64_field("created_at_ms").expect("created_at_ms");
+        let age = line.u64_field("age_ms").expect("age_ms");
+        // age is now minus created_at at the commit, which happened inside the test window
+        let committed_at = created_at + age;
+        assert!(
+            (start_ms..=end_ms).contains(&committed_at) || age == 0,
+            "created {created_at} + age {age} lies outside the commit window {start_ms}..={end_ms}"
+        );
+    }
+
+    config.shutdown().notify();
+}

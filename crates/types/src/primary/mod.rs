@@ -52,8 +52,8 @@ pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 pub const MAX_GC_DEPTH: Round = 50;
 
 /// Rounds subtracted from a node's configured `gc_depth` when the consensus network handler
-/// computes its "activity window", the number of rounds a node may lag execution before it steps
-/// back as too far behind to be an active voter.
+/// computes its "activity window", the number of rounds a node's committed round may trail an
+/// incoming round before it steps back as too far behind to be an active voter.
 ///
 /// The buffer makes a node go inactive *before* it rides the garbage-collection horizon exactly,
 /// where subtle races live.  Because the window is `gc_depth - GC_ACTIVITY_BUFFER`, a configured
@@ -65,10 +65,13 @@ pub const GC_ACTIVITY_BUFFER: Round = 10;
 
 /// The activity window for a configured `gc_depth`: `gc_depth - GC_ACTIVITY_BUFFER`, saturating.
 ///
-/// An active CVV whose executed round trails an incoming round by more than this many rounds steps
-/// back to `CvvInactive` (the consensus network handler's `behind_consensus`).  The subtraction
-/// saturates so a test fixture with a `gc_depth` at or below the buffer gets a zero window instead
-/// of an underflow; production startup rejects that configuration.
+/// An active CVV whose committed round (or executed round, when that is higher) trails an incoming
+/// round by more than this many rounds steps back to `CvvInactive` (the consensus network handler's
+/// `behind_consensus`).  Consensus commits without waiting for local execution, so the window
+/// measures how far the node's commits lag the committee, not how far its execution lags: execution
+/// may trail the committed round by up to [`MAX_COMMIT_RUN_AHEAD_ROUNDS`] without a demotion.  The
+/// subtraction saturates so a test fixture with a `gc_depth` at or below the buffer gets a zero
+/// window instead of an underflow; production startup rejects that configuration.
 pub const fn gc_activity_window(gc_depth: Round) -> Round {
     gc_depth.saturating_sub(GC_ACTIVITY_BUFFER)
 }
@@ -84,6 +87,134 @@ pub const fn gc_activity_window(gc_depth: Round) -> Round {
 pub const fn rejoin_round_window(gc_depth: Round) -> Round {
     gc_activity_window(gc_depth) / 2
 }
+
+/// How long after a rejoin an active CVV holds its activity-window demotion.
+///
+/// A catching-up CVV is promoted once the output it handled is within [`rejoin_round_window`] of
+/// the newest known header, and restarts its epoch tasks from the committed round in its pack.
+/// That round only advances once the DAG above it is refilled from peers, so until then incoming
+/// certificates can lie past the activity window ([`gc_activity_window`]) and would demote the
+/// node before it commits once. The grace covers the fetches that those certificates' missing
+/// parents start and the commits that follow once the DAG is whole: thirty seconds is about 60
+/// rounds at two rounds a second. It does not wait for the certificate fetcher's fallback kick:
+/// the promotion is stamped before the epoch tasks restart, and the fallback timer (the sync
+/// config's `max_consenus_round_timeout`, 30 seconds by default) starts only in the restarted
+/// primary, so its first kick lands after the grace has ended.
+///
+/// Only the activity-window demotion is held, and only while the incoming round leads the node's
+/// committed round by at most `ROUNDS_TO_KEEP - gc_depth` rounds ([`ROUNDS_TO_KEEP`]): past that,
+/// peers have pruned rounds the rebuild needs and holding cannot help. A node an epoch behind is
+/// demoted at once.
+pub const REJOIN_DEMOTION_GRACE: Duration = Duration::from_secs(30);
+
+/// Failed promotions back to an active CVV a catching-up node takes in one epoch before it stops
+/// trying.
+///
+/// In the bench data a third promotion within one epoch has never succeeded: whatever demoted the
+/// node twice demotes it again, and every round trip costs the committee a member that proposes
+/// without committing. After two failures, the node keeps following consensus as an inactive CVV
+/// until the epoch boundary. The rejoin count is keyed by epoch, so the key alone starts the next
+/// epoch at zero; the sticky inactive entry into that epoch also resets it, as a second safeguard.
+///
+/// Only failed promotions count. A promotion fails when the node is demoted again inside the
+/// rejoin grace ([`REJOIN_DEMOTION_GRACE`]), including a demotion the grace held that took effect
+/// when the grace ended. A promotion that holds past the grace never counts, so the demotions a
+/// node takes later in the epoch, after rejoins that worked, do not use up its attempts.
+///
+/// The cap neither refuses a rejoin on a stalled consensus head ([`REJOIN_STALLED_HEAD_AFTER`])
+/// nor counts it when it fails: refusing it would keep a committee halted below quorum for the
+/// rest of the epoch. That rule backs off instead.
+pub const MAX_REJOIN_ATTEMPTS_PER_EPOCH: u32 = 2;
+
+/// How long a catching-up CVV must watch the consensus head stall, at a header it has replayed,
+/// before it rejoins consensus without waiting for a fresher one.
+///
+/// A catching-up CVV normally rejoins only on a fresh head, a header committed a few seconds ago,
+/// so that a stale record cannot promote a node that has not caught up. But a committee commits
+/// only while a quorum of its members is active. If this node's demotion left fewer than a quorum
+/// active, no new output arrives, the newest header only ages and the freshness rule can never be
+/// met: without another path the committee stays halted until an operator restarts an inactive
+/// member. So while it is inactive the node also checks on a timer, and rejoins whatever the
+/// header's age once all of these hold:
+/// - the newest header it knows is at least this old, and has stayed its newest for at least this
+///   long since the node started catching up. The node must watch the stall itself: its header
+///   watch moves only with its own saves while it is active, so right after a demotion the header
+///   reads old however fast the committee commits;
+/// - no peer advertises a newer consensus number. A number heard before the demotion counts too.
+///   State sync fetches it when the node starts catching up, and each check whose newest header has
+///   not moved for a check interval asks for the outputs up to it again, so a lost fetch does not
+///   hold the node below a frontier no later gossip will move;
+/// - the node has replayed everything up to that header, so nothing is left to catch up;
+/// - the header is in the node's epoch, or is the final header of the epoch before it (a committee
+///   that halted at the start of an epoch, where every member starts with an empty DAG).
+///
+/// A loaded committee that still commits moves the node's header watch and the advertised number
+/// well inside this time: twenty seconds is about forty rounds at two rounds a second. The idle
+/// margin is thin. Without transactions a primary proposes once per `max_header_delay` (2.5 s by
+/// default), so an idle committee commits about four times in twenty seconds, and three absent
+/// leaders in a row (possible with f = 3 at n = 10) leave about twenty seconds without a commit. A
+/// node can then rejoin through this rule while the committee still commits. That is harmless,
+/// because the node has replayed up to the frontier and joins as a current member, but such a
+/// rejoin bypasses the cap.
+///
+/// The rejoin cap ([`MAX_REJOIN_ATTEMPTS_PER_EPOCH`]) neither refuses this rejoin nor counts it.
+/// Instead the stall the node must watch doubles with each such rejoin that fails in the epoch, up
+/// to eight times this. If the node was only cut off and the committee moved on without it, a
+/// certificate it receives after the rejoin demotes it again: at once when the node trails by more
+/// than `ROUNDS_TO_KEEP - gc_depth` rounds, otherwise when the rejoin grace
+/// ([`REJOIN_DEMOTION_GRACE`]) ends, up to thirty seconds later.
+pub const REJOIN_STALLED_HEAD_AFTER: Duration = Duration::from_secs(20);
+
+/// Rounds of certificates the certificate store keeps below the newest round it writes.
+///
+/// Each certificate write prunes every round below `H - ROUNDS_TO_KEEP`, where `H` is the round
+/// just written; the store's head runs 2 to 10 rounds past the newest committed header. Peers
+/// serve certificates only from this window, so it bounds how far behind a validator may restart
+/// consensus and still rebuild its DAG. A validator restarting from its last handled leader round
+/// `C` (a rejoin after catching up, or a restart) sets its GC round to `C - gc_depth`. Its
+/// certificate manager accepts a fetched certificate above `C - gc_depth + 1` only once the
+/// certificate's parents are accepted, and Bullshark's `check_parents` needs the same rounds, so
+/// every round from `C - gc_depth + 1` up must still exist on some peer. A round pruned on every
+/// peer parks all the fetched certificates above it: nothing commits, and the node is demoted
+/// again.
+///
+/// The rebuild is therefore complete while `H - C <= ROUNDS_TO_KEEP - gc_depth + 1`. The rejoin
+/// rule promotes once `C` trails the newest header by at most [`rejoin_round_window`] (20 rounds
+/// at `gc_depth` 50), so `H - C` reaches about 30 by the time the rejoined node fetches, and an
+/// active node trails by up to [`gc_activity_window`] (40 rounds) before it is demoted. Inside the
+/// rejoin grace ([`REJOIN_DEMOTION_GRACE`]) that demotion is held only while the node trails by
+/// at most `ROUNDS_TO_KEEP - gc_depth` rounds (78 at `gc_depth` 50), within this bound. With the
+/// former value of 64 the rebuild failed once `H - C` reached 16; 128 holds up to an `H - C` of
+/// 79 at `gc_depth` 50. The cost is about twice the store's live footprint; the pruning cadence
+/// is unchanged.
+///
+/// `Parameters::validate_operational_floors` requires
+/// `gc_depth + gc_activity_window(gc_depth) + RETENTION_SLACK <= ROUNDS_TO_KEEP` (100 <= 128 at
+/// `gc_depth` 50), which refuses any `gc_depth` above 64.
+pub const ROUNDS_TO_KEEP: Round = 128;
+
+/// Rounds of certificate retention reserved beyond `gc_depth + gc_activity_window(gc_depth)`.
+///
+/// A node's lag is measured against the round of an incoming certificate or of the newest header,
+/// while the certificate store prunes from the highest round it has written, which can run up to
+/// about 10 rounds further ahead. See [`ROUNDS_TO_KEEP`].
+pub const RETENTION_SLACK: Round = 10;
+
+/// Maximum number of rounds a committed leader may run ahead of the leader round this node has
+/// executed before the consensus task holds its next commit.
+///
+/// Consensus commits sub-dags without waiting for local execution; the fork check against each
+/// leader's execution block runs in the executor's subscriber, which saves an output only after
+/// that check passes.  On a validator whose execution is slower than the committee's, the
+/// committed round therefore leads the executed round, and this bound caps that lead.  Committed
+/// sub-dags carry headers only, so the bound holds at most about 500 of them (one leader every
+/// two rounds) between consensus and execution.  It equals the certificate validator's default
+/// `max_diff_between_external_cert_round_and_highest_local_round`, about eight minutes at two
+/// rounds a second.  While a commit is held the committed round stops advancing, so a node whose
+/// execution falls this far behind is demoted by the activity window ([`gc_activity_window`]).
+/// Rounds restart at every epoch, so until the first output of a new epoch executes, the executed
+/// round still reads the previous epoch's last leader round and the bound does not hold a commit.
+pub const MAX_COMMIT_RUN_AHEAD_ROUNDS: Round = 1_000;
 
 /// Maximum number of batch digests a single primary `Header` may reference.
 ///

@@ -187,8 +187,8 @@ The node therefore carries `patches/libp2p-gossipsub`, which expires promises on
 Gossipsub holds each message until the node reports a verdict.
 With a history length of 12 and a 1 second heartbeat, a held message stays reportable for about 12 seconds.
 A deferred verdict can land after the primary's epoch gap.
-In a gap the primary event queue holds only epoch votes (#1786), so this window covers the verdicts of the epoch votes held through the gap.
-Certificate and consensus-output gossip that arrives in a gap is shed, its ticket reports Ignore, and this node does not relay it.
+In a gap the primary event queue holds the epoch votes (#1786) and the newest consensus result of each author, so this window covers the verdicts of the gossip held through the gap.
+Certificate gossip that arrives in a gap, and a consensus result that a newer result of its author replaces there, is shed, its ticket reports Ignore, and this node does not relay it.
 The author's flood publish and the committee dials still deliver it to the committee.
 The network layer admits a message first: it checks the size and that the author is an authorized publisher for the topic.
 An admitted message goes to the application with a validation ticket, and the network layer does not accept it yet.
@@ -207,7 +207,7 @@ A certificate for the next epoch that fails against the provisional committee al
 A certificate that this node already holds or verified recently, or one below its garbage-collection round, is recognized before the aggregate check, so a replayed certificate frame reports Ignore without a verification and is not forwarded.
 This known-certificate check applies to current-epoch certificates.
 Duplicate consensus results and epoch votes, stale consensus results and messages over the per-peer cap also report Ignore.
-Certificate and consensus-output gossip that arrives in the epoch gap also reports Ignore, and this node does not relay it.
+Certificate gossip that arrives in the epoch gap, and a consensus result replaced there by a newer result of its author, also reports Ignore, and this node does not relay it.
 Ignore drops the message without a penalty.
 A ticket dropped without a verdict reports Ignore, so no message is forwarded by default.
 The verdict frees the verification slot, so downstream work on verified gossip is not bounded by the cap.

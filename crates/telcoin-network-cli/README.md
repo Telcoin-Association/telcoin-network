@@ -110,6 +110,8 @@ Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000
 
 The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
 
+When a passphrase is supplied but `node-keys/bls.kw` does not exist, `node` and `keytool generate pop` stop with an error instead of reading a cleartext `bls.key`. To use a cleartext key on purpose, pass `--bls-passphrase-source no-passphrase`. Mainnet refuses a cleartext key; see [Mainnet checks](#mainnet-checks).
+
 ### Generated files
 
 After running `keytool generate`, the data directory contains:
@@ -300,7 +302,7 @@ telcoin-network node \
     --metrics 127.0.0.1:9101
 ```
 
-Available named chains: `adiri` and `test-net`, which both load the Adiri testnet config, and `main-net`.
+Available named chains: `adiri` and `test-net`, which both load the Adiri testnet config, and `mainnet`.
 
 The `--chain` flag overrides local genesis files with the embedded config for that network.
 
@@ -339,7 +341,7 @@ telcoin-network node \
 
 | Flag                     | Default        | Description                                                                                                                                                                                         |
 | ------------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--chain`                | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                                                                                                                              |
+| `--chain`                | none           | Join a named network (`adiri`, `test-net`, `mainnet`)                                                                                                                                               |
 | `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the genesis fallback                                                                        |
 | `--bootstrap-peers-file` | none           | Read the `--bootstrap-peers` map from a file (same format; checked at argument parsing). Conflicts with `--bootstrap-peers`. A relative path resolves from the working directory, `/` under systemd |
 | `--instance`             | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup)                                                                                                      |
@@ -348,6 +350,31 @@ telcoin-network node \
 | `--node-name`            | auto-generated | Name for OpenTelemetry service identification                                                                                                                                                       |
 | `--tracing-url`          | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`                                                                                                                 |
 | `--with-unused-ports`    | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                                                                                                                                  |
+
+### Mainnet checks
+
+Mainnet uses chain id 731. On that chain id the node refuses to start in two cases, and no flag lifts either:
+
+- The BLS key was read from the cleartext `node-keys/bls.key` without a passphrase, for example with `--bls-passphrase-source no-passphrase`. Use a passphrase-encrypted key (`bls.kw`) and a passphrase source instead.
+- The binary was built with the `faucet` feature. A faucet build also refuses the embedded mainnet genesis, whatever chain id its config carries.
+
+When the node loads its key from `bls.kw` and a cleartext `bls.key` is still in `node-keys/`, it starts on mainnet but logs a WARN naming that file. The node never reads it, but it is a cleartext copy of a BLS private key, so delete it.
+
+A faucet build starts on any other chain only with `--allow-faucet-on-chain` set, except adiri (chain id 2017), which needs no flag. The in-tree devnets (`etc/compose.yaml`, `etc/local-testnet.sh`) build without the faucet and need nothing; a `make docker-devnet` faucet image on the chain id 487 genesis from `etc/genesis.sh` must set `TN_ALLOW_FAUCET_ON_CHAIN=true` where it is deployed.
+
+| Flag                      | Default | Description                                                                                      |
+| ------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `--allow-faucet-on-chain` | `false` | Let a faucet build start on a chain other than adiri or mainnet. Env: `TN_ALLOW_FAUCET_ON_CHAIN` |
+
+The flag shows in `node --help` but not in `node -h`. `TN_ALLOW_FAUCET_ON_CHAIN` accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, `t`/`f` and `y`/`n`, in any case. An empty value leaves the flag off. Any other value is an argument error, and `node` or `db load-state` exits without starting. `db load-state` takes `--allow-faucet-on-chain` as well.
+
+At startup, before these checks, the node logs one INFO line with the build features and the loaded chain:
+
+```text
+node build: faucet=false adiri=false chain_id=731 genesis_hash=0x...
+```
+
+`faucet` is true for any binary that carries the faucet mint, however the feature was enabled, including `adiri` builds. `telcoin-network --version` lists the cli crate's own features on its `Build Features:` line, so it agrees with the startup line for the supported builds: a `faucet` build lists `faucet`, and an `adiri` build lists both `adiri` and `faucet`. A build that enables `tn-node/faucet` or `tn-reth/faucet` directly logs `faucet=true` at startup but does not list `faucet` in `--version`, so use the startup line to check for the faucet mint.
 
 ### global flags
 
@@ -374,18 +401,19 @@ Default data directory by platform:
 
 ### Environment variables
 
-| Variable                       | Used by          | Description                                                                                                                                                     |
-| ------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TN_BLS_PASSPHRASE`            | keytool, node    | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, so the name and one zero byte per value byte stay visible) |
-| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node    | Credential name for `--bls-passphrase-source credential`                                                                                                        |
-| `CREDENTIALS_DIRECTORY`        | keytool, node    | Set by systemd; where the `credential` source looks                                                                                                             |
-| `EXECUTION_ADDRESS`            | keytool generate | Fee recipient address                                                                                                                                           |
-| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate | External multiaddr for primary P2P                                                                                                                              |
-| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate | External multiaddrs for worker P2P (comma-separated)                                                                                                            |
-| `TN_TRACING_URL`               | node             | OpenTelemetry collector endpoint                                                                                                                                |
-| `HEALTHCHECK_TCP_PORT`         | node             | Health listener bind: port or socket address (same as `--healthcheck`)                                                                                          |
-| `TN_FORWARD_TXS`               | node             | Target list for `--forward-txs`, kept off the command line                                                                                                      |
-| `RUST_LOG`                     | all              | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                                                                      |
+| Variable                       | Used by             | Description                                                                                                                                                     |
+| ------------------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TN_BLS_PASSPHRASE`            | keytool, node       | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, so the name and one zero byte per value byte stay visible) |
+| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node       | Credential name for `--bls-passphrase-source credential`                                                                                                        |
+| `CREDENTIALS_DIRECTORY`        | keytool, node       | Set by systemd; where the `credential` source looks                                                                                                             |
+| `EXECUTION_ADDRESS`            | keytool generate    | Fee recipient address                                                                                                                                           |
+| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate    | External multiaddr for primary P2P                                                                                                                              |
+| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate    | External multiaddrs for worker P2P (comma-separated)                                                                                                            |
+| `TN_TRACING_URL`               | node                | OpenTelemetry collector endpoint                                                                                                                                |
+| `HEALTHCHECK_TCP_PORT`         | node                | Health listener bind: port or socket address (same as `--healthcheck`)                                                                                          |
+| `TN_FORWARD_TXS`               | node                | Target list for `--forward-txs`, kept off the command line                                                                                                      |
+| `TN_ALLOW_FAUCET_ON_CHAIN`     | node, db load-state | Faucet-build opt-in for a chain other than adiri or mainnet, same as `--allow-faucet-on-chain`; see [Mainnet checks](#mainnet-checks)                           |
+| `RUST_LOG`                     | all                 | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                                                                      |
 
 ## Data directory layout
 
@@ -589,7 +617,7 @@ Set it to `true` only when every committee member is under the same operator as 
 EVM credits this account on every transaction, so its balance enters the state root and every node
 on the network must hold the same value. A parameters file that omits the key fails to parse, so
 the node refuses to start rather than falling back in silence. The `genesis` commands write the
-key for you, and the `main-net` and `adiri` chain presets carry their own value.
+key for you, and the `mainnet` and `adiri` chain presets carry their own value.
 
 Example, the testnet preset (`chain-configs/testnet/parameters.yaml`). It leaves `vote_timeout` at the 5 s default:
 
@@ -636,7 +664,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
 | `vote_timeout` below 10 s                                                | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires                                                        |
 
-With `--chain adiri` or `--chain main-net`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
+With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.
 The testnet preset's `max_header_delay` is 3 s, which leaves room for a tolerance of up to 2 s; the mainnet preset's is 1 s, which leaves room for up to 4 s.
 The default `250ms` and a legacy `1` pass with both.
@@ -789,8 +817,11 @@ See [Private observability listeners](../../docs/src/getting-started/observabili
 Use `RUST_LOG` for fine-grained control:
 
 ```bash
-RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
+RUST_LOG=info,consensus=debug,engine::evm=trace telcoin-network node ...
 ```
+
+`engine=debug` logs execution as hashes, numbers and counts.
+The `ConsensusOutput` and `ExecutedBlock` struct dumps are at trace under the target `engine::dump`, and the per-transaction EVM lines at trace under `engine::evm`, so name the target you need, as the example does.
 
 ## Multi-instance setup
 
