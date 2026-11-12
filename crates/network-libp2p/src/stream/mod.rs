@@ -21,4 +21,6 @@ mod handler;
 mod upgrade;
 
 pub(crate) use behavior::{StreamBehavior, StreamEvent};
+#[cfg(any(test, feature = "test-utils"))]
+pub use upgrade::unsupported_protocol_error;
 pub use upgrade::{is_unsupported_protocol, StreamError};

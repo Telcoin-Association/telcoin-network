@@ -48,6 +48,8 @@ pub use peers::{
 };
 pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
+#[cfg(any(test, feature = "test-utils"))]
+pub use stream::unsupported_protocol_error;
 pub use stream::{is_unsupported_protocol, StreamError};
 pub use sync::{
     read_frame, write_frame, DenyReason, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,

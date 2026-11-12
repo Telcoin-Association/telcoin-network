@@ -50,6 +50,8 @@ The outbound open is lazy.
 The requester writes `Req` without waiting for the responder to accept the protocol, so the request frame travels in the same flight as the protocol proposal and is already buffered when the responder starts its opening read.
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
+On a primary that probe counts as failed, and the peer is marked for the fetched epoch.
+A protocol rejection, a clean close or a reset on the first read of a consensus-output request, and a rejection of a partial epoch-pack request, leave no mark only when they come within 1 second of the request write (`SYNC_BUSY_DENY_WINDOW`); later they count as a failed probe too, so a peer cannot hold every probe for most of the timeout and then close to stay unmarked.
 On the worker, the whole batch stream is also bounded (95 seconds), so one peer can use at most 120 seconds of a 480-second `request_batches` call: the batches validated before the bound are kept, and the peer is recorded as stalled for the epoch and asked after the unmarked peers of its tier on later calls; a complete exchange slower than its allowance (15 seconds plus 1 second per batch) is marked too, and an empty answer is marked only when it took 5 seconds or more.
 Each tier of the connected-peer list is shuffled per request so no peer keeps a fixed early place.
 On the responding side, a peer that opens a stream and never sends its request frame is dropped after 1 second if it is a public-tier peer and after 5 seconds if it is a committee peer.
@@ -58,6 +60,7 @@ A public-tier peer is charged a mild penalty for a silent, unreadable or unexpec
 A late request is charged whether it is then admitted or refused; a prompt `AtCapacity` or `Busy` refusal is not charged (see [Admission](#admission)).
 A full pool answers `Deny(AtCapacity)`; on a primary, the per-peer cap and a per-key hold budget answer `Deny(Busy)`.
 A requester that receives `Busy` skips that responder for the rest of the walk and does not mark it failed.
+On a primary the requester probes it after the fresh peers on later walks of that epoch; a `Busy` that arrives more than 1 second after the request write (`SYNC_BUSY_DENY_WINDOW`) puts the responder with the peers marked failed for that epoch instead, still without a failure mark.
 
 ## Frame tags
 
@@ -130,9 +133,11 @@ It writes a `Deny` and closes.
 A full pool answers `Deny(AtCapacity)`.
 On a primary, a refusal by the per-peer cap or by a per-key hold budget answers `Deny(Busy)`: the responder has room, but not for this key now.
 A requester that receives `Busy` skips that responder for the rest of the walk at debug level, and does not mark the responder failed or forget it as a sync server.
+On a primary it probes that responder after every fresh peer on the later walks of the same epoch, and, when the `Busy` came more than 1 second after the request write, among the peers marked failed for that epoch, so a peer cannot hold every probe for most of the 5-second ack timeout and still sort ahead of them.
+The 1-second window starts at the requester's own write, so it also covers the round trip and any queueing on the connection; an honest `Busy` that arrives late costs its server only that place in the probe order.
 
 That distinction matters to a requester's wall-clock cost.
-A dropped stream costs the requester its full 5-second ack timeout before it can try elsewhere; an explicit `Deny` costs it one round trip.
+A dropped stream costs the requester its full 5-second ack timeout before it can try elsewhere; an explicit `Deny` costs it the open, the request write and one round trip.
 A node catching up against a busy committee therefore keeps moving instead of serializing on timeouts, and a busy responder sheds load without being scored for it.
 
 `Deny(Unavailable)` is the other normal case: the peer speaks the protocol and has capacity but does not hold the requested data.

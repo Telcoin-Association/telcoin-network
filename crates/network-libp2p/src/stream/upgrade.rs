@@ -124,6 +124,14 @@ pub fn is_unsupported_protocol(error: &std::io::Error) -> bool {
     crate::error::is_negotiation_failure(error)
 }
 
+/// The first-read error of a lazily opened stream whose listener rejected the protocol, the
+/// error that [`is_unsupported_protocol`] recognizes. Callers that classify it need it in their
+/// tests, and they cannot build a `NegotiationError` without a direct `libp2p` dependency.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn unsupported_protocol_error() -> std::io::Error {
+    std::io::Error::from(libp2p::core::upgrade::NegotiationError::Failed)
+}
+
 /// A classified stream failure used to score the remote peer.
 ///
 /// Mirrors the request-response failure taxonomy so the stream path and the RPC

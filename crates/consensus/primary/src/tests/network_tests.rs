@@ -3825,8 +3825,15 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
     let failed: HashSet<(BlsPublicKey, Epoch)> =
         [(peers[0], 7), (peers[1], 7), (peers[2], 6)].into_iter().collect();
 
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &failed, 7, None, false, &mut rng);
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
 
     // Same set, no drops.
     assert_eq!(
@@ -3984,6 +3991,7 @@ fn test_order_probe_peers_puts_last_server_first() {
         let ordered = crate::network::order_probe_peers(
             peers.clone(),
             &none_failed,
+            &HashMap::new(),
             7,
             Some(preferred),
             false,
@@ -3999,6 +4007,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let ordered = crate::network::order_probe_peers(
         peers.clone(),
         &failed,
+        &HashMap::new(),
         7,
         Some(peers[0]),
         false,
@@ -4012,6 +4021,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let ordered = crate::network::order_probe_peers(
         peers.clone(),
         &stale,
+        &HashMap::new(),
         7,
         Some(peers[0]),
         false,
@@ -4024,13 +4034,21 @@ fn test_order_probe_peers_puts_last_server_first() {
     let with_stranger = crate::network::order_probe_peers(
         peers.clone(),
         &none_failed,
+        &HashMap::new(),
         7,
         Some(stranger),
         false,
         &mut rng.clone(),
     );
-    let without =
-        crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, false, &mut rng);
+    let without = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
     assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
     assert_eq!(
         with_stranger.into_iter().collect::<BTreeSet<_>>(),
