@@ -19,6 +19,9 @@ pub(crate) struct EpochMetrics {
     pub(crate) boundary_timestamp_seconds: Gauge,
     /// Consensus outputs replayed from the consensus chain after a restart.
     pub(crate) replayed_outputs_total: Counter,
+    /// Stored epoch records whose `final_state` is not the closing block this node executed for
+    /// the epoch. Each one stops the node.
+    pub(crate) final_state_mismatches_total: Counter,
 }
 
 impl EpochMetrics {
@@ -63,6 +66,7 @@ mod tests {
             metrics.current.set(3.0);
             metrics.boundary_timestamp_seconds.set(1_700_000_000.0);
             metrics.replayed_outputs_total.increment(2);
+            metrics.final_state_mismatches_total.increment(1);
             metrics.record_epoch_run(&RunEpochMode::Initial);
             EpochMetrics::record_provider_fault_retry("epoch-entry state read");
         });
@@ -82,6 +86,8 @@ mod tests {
         assert!(key.key().labels().any(|l| l.key() == "mode" && l.value() == "initial"));
         find("tn_epoch.boundary_timestamp_seconds");
         find("tn_epoch.replayed_outputs_total");
+        let (_, _, _, value) = find("tn_epoch.final_state_mismatches_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
         let (key, _, _, value) = find("tn_epoch.provider_fault_retries_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         assert!(key

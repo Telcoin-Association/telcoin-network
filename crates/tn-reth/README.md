@@ -480,6 +480,12 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 What restore does *not* verify: the authenticity of the header window itself — that is the
 caller's trust decision (the window is validated upstream against consensus data).
 
+A restored node did not execute `B`, so its epoch-record check (see "Rebuilding in the new layout"
+below) skips the one record whose closing block is `B`: when the node enters the epoch after it,
+the restored epoch's record is not compared with `B`. `db load-state` already bound that record's
+`final_state` to the pack's final block. The restored-state floor marker (`restored-state-floor`)
+is what tells the node `B` was imported; every epoch it closes above `B` is compared.
+
 ## Database backend
 
 TN's reth execution database lives in `<datadir>/db`. The default build runs it on the tn-lmdb
@@ -894,10 +900,43 @@ refuses to start while a `.partial` directory is there, and running the command 
   telcoin-network node --datadir <datadir> ...                     # rebuilds from genesis
   ```
 
-  The node re-executes every consensus output from its own consensus database and from peers, and
-  each epoch is checked against its certified record. It is out of the committee's work for the
-  whole rebuild. On a five-validator committee with a quorum of four, one validator out leaves no
-  margin, so validators take the swap below.
+  The node re-executes every consensus output from its own consensus database and from peers. Each
+  epoch it re-executes is checked against the epoch record it already holds (certified, or its own
+  from before the reset): when it closes the epoch, and again when it enters the next one, the
+  record's `final_state` must be the epoch's closing block in the rebuilt chain, number and hash.
+  Block hashes chain, so this covers every block up to that closing block: the check finds the
+  first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
+  final_state does not match this node's closing block` with the epoch and both blocks, counts
+  `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
+  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. The reset
+  moves `restored-state-floor` aside with the execution database, so on a datadir once restored
+  from a state pack the rebuild executes and compares every epoch, the restored one included (the
+  restored-block exemption under "Snapshot export / restore" does not apply here). It is out of the
+  committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
+  validator out leaves no margin, so validators take the swap below.
+
+  A record of the node's own that a bad execution wrote stops every rebuild on this release. A
+  node that forked (its execution diverged, and it built and stored its own record for that
+  epoch, which no quorum certified) still holds that record after the reset. The rebuild, on a
+  fixed binary, stops at that epoch with an `uncertified` mismatch, and again on every restart.
+  Nothing replaces the record in place: the consensus database keeps one record per epoch, refuses
+  a different one (a peer's certified record too), and no `db` command removes or rewrites one.
+  The recovery is a fresh datadir, which keeps the keys and config:
+
+  ```sh
+  # node stopped
+  telcoin-network db reset-execution --datadir <datadir> --force   # db/, static_files/, floor
+  mv <datadir>/consensus-db <datadir>/consensus-db.forked           # the stale record's store
+  telcoin-network node --datadir <datadir> ...                       # syncs from genesis
+  ```
+
+  The node then syncs like a new one: the certified records from peers, and the chain from
+  genesis (or restore it from a state pack with `db load-state`, which needs this fresh datadir).
+  A validator's votes and proposals for the epoch it was in stay in the moved-aside
+  `consensus-db.forked/`, so a validator stays stopped until the network has closed the last
+  epoch it took part in, as for a fresh datadir under Rollback below. The side-observer swap below
+  is no way around this: it keeps the validator's `consensus-db/`, and the stale record with it.
+  Keep the moved-aside directories until the cause is known: they hold the diverged chain.
 - **Side-observer swap** (validators): build the new execution database on another node, then swap
   it in, so the validator is down only for the swap.
   1. Run an observer on the new binary with the validator's chain config in a fresh datadir (another

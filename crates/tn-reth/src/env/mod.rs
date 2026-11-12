@@ -392,6 +392,15 @@ impl RethEnv {
             })
     }
 
+    /// The restored-state floor of a snapshot-restored datadir: block `B`, the snapshot's final
+    /// block, read from the marker at construction. `None` on a datadir that was not restored.
+    ///
+    /// This node did not execute `B` or any block below it: the restore imported `B`'s state and
+    /// scaffolded the headers below it. Every block above `B` was executed here.
+    pub fn restored_state_floor(&self) -> Option<u64> {
+        self.inner.restored_state_floor
+    }
+
     /// Return the lowest block number whose header is guaranteed REAL on this datadir.
     ///
     /// `0` on a normally-synced node: every persisted header is real down to genesis. On a
