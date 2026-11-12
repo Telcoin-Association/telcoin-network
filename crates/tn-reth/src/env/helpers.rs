@@ -127,7 +127,9 @@ impl RethEnv {
     }
 
     /// TEST-ONLY: `overlay`'s layered root for `current` over this env's database with the
-    /// parallel storage-root tasks and no serial comparison (`output_overlay/parallel.rs`).
+    /// parallel storage-root tasks, the account walk split when the block is worth it, and no
+    /// serial comparison (`output_overlay/parallel.rs`). The walk is chosen here, not by
+    /// `TN_PARALLEL_ACCOUNT_WALK`.
     ///
     /// The #1301 trie-level differential test checks it against the same oracle as the serial
     /// root.
@@ -142,6 +144,7 @@ impl RethEnv {
             &self.inner.blockchain_provider,
             reth_provider::DBProvider::tx_ref(&provider),
             current,
+            crate::env::output_overlay::AccountWalk::Split,
         )?)
     }
 

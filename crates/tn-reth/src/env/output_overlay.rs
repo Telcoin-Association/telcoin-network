@@ -43,6 +43,7 @@ use tn_types::{Address, B256};
 
 use crate::{metrics::RETH_METRICS, traits::TelcoinNode};
 
+mod account_split;
 mod cursors;
 mod parallel;
 mod sorted_runs;
@@ -51,6 +52,8 @@ mod storage_cursor;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use account_split::AccountWalk;
 use cursors::RunCursorFactory;
 use parallel::ParallelRoots;
 use sorted_runs::SortedTrieRuns;
