@@ -344,12 +344,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
 fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
     // Nodes 0/1/3 stay live (index 2 is the killed one).
-    let peer_height = || {
-        [&client_urls[0], &client_urls[1], &client_urls[3]]
-            .into_iter()
-            .filter_map(|url| get_latest_consensus_header_number(url).ok())
-            .max()
-    };
+    let peer_height = || peer_consensus_height(client_urls);
 
     let start_height = peer_height();
     let start = Instant::now();
@@ -387,6 +382,15 @@ fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<(
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// The highest consensus header number that the peers 0/1/3 report, or `None` if none answers.
+/// Index 2 is the node the restart tests stop.
+fn peer_consensus_height(client_urls: &[String; 4]) -> Option<u64> {
+    [&client_urls[0], &client_urls[1], &client_urls[3]]
+        .into_iter()
+        .filter_map(|url| get_latest_consensus_header_number(url).ok())
+        .max()
 }
 
 /// Garbage-collection depth (DAG rounds) used for the delayed restart tests. Lowering it from the
@@ -471,7 +475,19 @@ fn test_restart_catch_up_requires_active_cvv() {
     });
 }
 
-fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
+/// How [`do_restarts`] stops the committee between phase 1 and the cold restart of phase 2.
+#[derive(Clone, Copy, Debug)]
+enum Phase1Stop {
+    /// One `kill_all` stops all four nodes in parallel. Phase 2 restarts four nodes that stopped
+    /// together.
+    Together,
+    /// Node 2 stops first, and 0/1/3 commit at least one more consensus header before they stop.
+    /// Phase 2 then cold-restarts a committee with one member behind (inside the GC window) and
+    /// asserts that node 2 reaches the consensus height its peers had at the stop.
+    Node2First,
+}
+
+fn do_restarts(delay: u64, lagged: bool, stop: Phase1Stop, test: &str) -> eyre::Result<()> {
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
@@ -524,18 +540,44 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
-    let assert_str = match res1 {
-        Ok(mut child2_restarted) => {
-            kill_child(&mut child2_restarted);
-            "".to_string()
-        }
-        Err(err) => {
+    let assert_str = res1.map_or_else(
+        |err| {
             tracing::error!(target: "restart-test", "Got error: {err}");
             err.to_string()
-        }
+        },
+        |mut child2_restarted| {
+            match stop {
+                // Hand the restarted node back to its slot: `kill_all` below then stops all four
+                // nodes in parallel under one wait.
+                Phase1Stop::Together => {
+                    guard.replace(2, child2_restarted);
+                }
+                // Stop node 2 alone first, so 0/1/3 commit past it before `kill_all` stops them.
+                Phase1Stop::Node2First => {
+                    kill_child(&mut child2_restarted);
+                }
+            }
+            String::new()
+        },
+    );
+
+    // `Node2First`: wait until the peers commit at least one more consensus header while node 2
+    // is down (`min_round_gap = 1`), then keep their height. Phase 2 asserts node 2 reaches it.
+    let node2_catch_up_height = match stop {
+        Phase1Stop::Together => None,
+        Phase1Stop::Node2First => is_ok
+            .then(|| {
+                wait_for_downtime(&client_urls, 2)?;
+                peer_consensus_height(&client_urls)
+                    .ok_or_else(|| Report::msg("no peer reported a consensus height"))
+            })
+            .transpose()?,
     };
 
-    // Kill all remaining children (child2 slot is already None from take)
+    // Stop every node gracefully, so phase 2 restarts from a clean shutdown. With `Together` this
+    // stops all four, and phase 2 restarts four nodes that stopped together. With `Node2First` it
+    // stops 0/1/3 after node 2, and phase 2 starts with node 2 behind. On the error path slot 2 is
+    // empty, because phase 1 took it.
     guard.kill_all();
 
     // Make sure we shutdown nodes even if an error in first testing.
@@ -555,11 +597,16 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     }
 
     info!(target: "restart-test", "Running restart tests 2");
-    let res2 = run_restart_tests2(&client_urls);
+    let res2 = run_restart_tests2(&client_urls).and_then(|()| {
+        // `Node2First`: node 2 restarted behind its peers and must reach their height at the stop.
+        node2_catch_up_height
+            .map_or(Ok(()), |height| wait_for_consensus_height(&client_urls[2], height))
+    });
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
-    // guard.drop() handles final cleanup
-    res2
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    res2.inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
@@ -567,7 +614,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(2, false, "restarts")
+    do_restarts(2, false, Phase1Stop::Together, "restarts")
 }
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
@@ -578,6 +625,15 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
         || Ok(get_block_number(node).map(|n| n >= target_block).unwrap_or(false)),
     )?;
     Ok(())
+}
+
+/// Wait for `node` to reach at least consensus height `height`, polling for up to 60 seconds.
+fn wait_for_consensus_height(node: &str, height: u64) -> eyre::Result<()> {
+    wait_until_blocking(
+        Duration::from_secs(60),
+        &format!("node {node} to reach consensus height {height}"),
+        || Ok(get_latest_consensus_header_number(node).is_ok_and(|n| n >= height)),
+    )
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -655,17 +711,19 @@ fn test_restarts_observer() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
-    // Guard cleanup handles all process shutdown on drop
-    run_observer_tests(&client_urls, &obs_url)
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    run_observer_tests(&client_urls, &obs_url).inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
-/// the consensus chain.
+/// the consensus chain. Phase 1 ends with node 2 stopped first, so phase 2 cold-restarts the
+/// committee with node 2 behind and checks that it catches up.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, "restarts_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, Phase1Stop::Node2First, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -674,7 +732,7 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, Phase1Stop::Together, "restarts_lagged_delayed")
 }
 
 /// The epoch whose close every validator stops inside in
