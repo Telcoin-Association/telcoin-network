@@ -81,15 +81,33 @@
 //! # Checks
 //!
 //! A wrong root forks the chain, and TN builds its own blocks: no payload's root checks this one.
-//! In production one block in [`CHECK_ONE_BLOCK_IN`] (of those with parallel work: storage-root
-//! tasks or a split account walk) also computes the root serially and compares the roots and the
-//! trie updates; on a difference it logs both roots, whether the split composed the block's and
-//! how many split storage roots it took, counts it (`tn_reth.parallel_state_root_mismatches_total`,
-//! a split walk's also in `tn_reth.account_walk_fallbacks_total` and a block with split storage
-//! roots also in `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial
-//! result. With
-//! `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every such
-//! block is compared and a difference panics: the shadow runs of the exec bench compare every
+//! In production the blocks whose number is a multiple of [`CHECK_ONE_BLOCK_IN`] (of those with
+//! parallel work: storage-root tasks or a split account walk) also compute the root serially and
+//! compare the roots and the trie updates; on a difference the block logs both roots, whether the
+//! split composed the block's and how many split storage roots it took, counts it
+//! (`tn_reth.parallel_state_root_mismatches_total`, a split walk's also in
+//! `tn_reth.account_walk_fallbacks_total` and a block with split storage roots also in
+//! `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial result.
+//!
+//! The sample is a function of the block alone, never of what one node has seen since it started,
+//! so every node checks the same blocks. A repeatable bug in a parallel path then gives every node
+//! running the same code the same root: the serial one on a checked block, the same wrong one on an
+//! unchecked block. (A per-node count would split such nodes by their counts' phase.) The one
+//! per-node difference left is a task that fails (logged): its part goes to the serial
+//! computation on that node only. The pool's thread count is no such difference: it changes which
+//! thread computes a part, not how, so a node whose pool runs one thread runs the same parallel
+//! code (on the calling thread and that one pool thread) and composes the same roots as its peers;
+//! only the off switches compute serially.
+//!
+//! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and the
+//! unchecked blocks the same bug hit carry it on every node running this code. The response is
+//! network-wide, not local: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
+//! or only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
+//! `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning
+//! them off on one node only parts it from its peers on the next block the bug hits.
+//!
+//! With `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every
+//! such block is compared and a difference panics: the shadow runs of the exec bench compare every
 //! block, split ones (account walk and storage tries) included.
 //!
 //! # Off switch
@@ -128,16 +146,14 @@ use reth_trie::{
 use reth_trie_db::DatabaseStorageRoot as _;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
-    },
+    sync::{Arc, OnceLock},
 };
 use tn_types::{BlockNumber, B256};
 use tracing::{error, info, warn};
 
-/// One block in this many, of those with storage-root tasks, is also computed serially and
-/// compared in production (see the module docs). A power of two.
+/// One block in this many, of those with parallel work, is also computed serially and compared
+/// in production: the blocks whose number is a multiple of it (see the module docs). A power of
+/// two.
 ///
 /// A check costs one serial root on top of the parallel one. On the exec bench (Mac, storage v2)
 /// a serial root takes 32.6 ms a block at peak and 16.7 ms on the busy profile, and the tasks save
@@ -228,26 +244,28 @@ fn shadow_from_env() -> bool {
     }
 }
 
-/// Whether the next sampled block is compared: one in [`CHECK_ONE_BLOCK_IN`], the first included.
-fn next_block_is_checked() -> bool {
+/// Whether block `number`'s root, when it has parallel work, is also computed serially and
+/// compared: one block in [`CHECK_ONE_BLOCK_IN`], by number alone, so every node checks the same
+/// blocks (module docs).
+fn block_is_checked(number: BlockNumber) -> bool {
     #[cfg(test)]
     if CHECK_NEXT_SAMPLED_BLOCK.with(|c| c.replace(false)) {
         return true;
     }
-    static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    BLOCKS.fetch_add(1, Ordering::Relaxed).is_multiple_of(CHECK_ONE_BLOCK_IN)
+    number.is_multiple_of(CHECK_ONE_BLOCK_IN)
 }
 
 impl OutputTrieOverlay {
-    /// A block's state root and trie updates, as [`Self::layered_root_with_updates`] computes them,
-    /// with the storage roots of the accounts with changed storage on rayon's pool as `mode` says.
-    /// `factory` opens the tasks' transactions; it must be `tx`'s database.
+    /// Block `number`'s state root and trie updates, as [`Self::layered_root_with_updates`]
+    /// computes them, with the storage roots of the accounts with changed storage on rayon's pool
+    /// as `mode` says. `factory` opens the tasks' transactions; it must be `tx`'s database.
     pub(crate) fn block_root_with_updates<F, TX>(
         &self,
         factory: &F,
         tx: &TX,
         current: HashedPostState,
         mode: ParallelRoots,
+        number: BlockNumber,
     ) -> ProviderResult<(B256, TrieUpdates)>
     where
         F: DatabaseProviderFactory,
@@ -267,7 +285,7 @@ impl OutputTrieOverlay {
             return self.serial_root(tx, &current, prefix_sets);
         }
         let storage = walks.storage;
-        if !shadow && !next_block_is_checked() {
+        if !shadow && !block_is_checked(number) {
             return Ok(self
                 .parallel_root(factory, tx, &current, prefix_sets, targets, split, storage)?
                 .result);
@@ -343,6 +361,14 @@ impl OutputTrieOverlay {
         let subtries = (split && !stored_root_node).then(|| Subtries::new(&prefix_sets));
         let root = rayon::in_place_scope(|scope| -> ProviderResult<ParallelRoot> {
             let shared = &*tasks;
+            // However the walk below ends, a task not yet started returns at once: the scope's end
+            // waits for every job.
+            let _claim = ClaimUnstartedOnExit(shared);
+            // The slot jobs go first and the helpers after. From the engine thread (not a pool
+            // worker) both enter the pool's FIFO queue, so the helpers start only after every slot
+            // job has been taken; spawning them first would start the hot pieces and the subtries
+            // sooner on a block with many small targets, but it moves work between threads on
+            // every block, so it waits for a timing A/B on the many-small-contracts profile.
             for slot in &shared.slots {
                 scope.spawn(move |_| {
                     shared.run(slot, || storage_root_task(factory, walk_tip, runs, current, slot))
@@ -373,6 +399,10 @@ impl OutputTrieOverlay {
                     if subtries.is_some() {
                         record_account_walk_fallback(AccountWalkFallback::Shape);
                     }
+                    #[cfg(test)]
+                    if FAIL_NEXT_WALK.with(|f| f.replace(false)) {
+                        return Err(DatabaseError::Other(INJECTED_WALK_FAILURE.into()).into());
+                    }
                     let result = StateRoot::new(&trie, &hashed)
                         .with_prefix_sets(prefix_sets)
                         .with_storage_roots(Arc::clone(&source))
@@ -380,7 +410,6 @@ impl OutputTrieOverlay {
                     (result, false)
                 }
             };
-            shared.claim_unstarted();
             Ok(ParallelRoot { result, composed, storage_composed: splits.composed() })
         });
         tasks.log_failures();
@@ -630,6 +659,8 @@ impl StorageRootTasks {
             }
             *state = TaskState::Running;
         }
+        #[cfg(test)]
+        TASKS_STARTED.with(|n| n.set(n.get() + 1));
         let result = catch_unwind(AssertUnwindSafe(task)).unwrap_or(Err(TaskError::Panicked));
         let root = result.map_err(|error| self.record_failure(error)).ok();
         *slot.state.lock() = TaskState::Done(root);
@@ -643,7 +674,8 @@ impl StorageRootTasks {
         failures.1.get_or_insert(error);
     }
 
-    /// Mark the tasks that have not started as claimed, so they return at once (the walk is done).
+    /// Mark the tasks that have not started as claimed, so they return at once (the walk is done
+    /// or failed).
     fn claim_unstarted(&self) {
         for slot in &self.slots {
             let mut state = slot.state.lock();
@@ -664,6 +696,17 @@ impl StorageRootTasks {
                 warn!(target: "engine", %error, count, tasks, "root tasks failed; computed serially");
             }
         }
+    }
+}
+
+/// Claims a block's unstarted storage-root tasks when the walk ends, with a result, an error or a
+/// panic. The walk's early exits all come after the calling thread's `work` calls, which leave no
+/// piece or subtrie unclaimed, so the slot tasks are all that is left to stop.
+struct ClaimUnstartedOnExit<'a>(&'a StorageRootTasks);
+
+impl Drop for ClaimUnstartedOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.claim_unstarted();
     }
 }
 
@@ -736,7 +779,16 @@ thread_local! {
     /// Set by a test to make this thread's next sampled block a compared one.
     pub(super) static CHECK_NEXT_SAMPLED_BLOCK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Storage-root tasks this thread started (not claimed before they ran).
+    static TASKS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Set by a test to make this thread's next walk on one thread fail before it reads anything,
+    /// as a database read error would.
+    static FAIL_NEXT_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// The error a walk failed by [`FAIL_NEXT_WALK`] returns.
+#[cfg(test)]
+const INJECTED_WALK_FAILURE: &str = "injected walk failure";
 
 #[cfg(test)]
 #[path = "parallel_tests.rs"]

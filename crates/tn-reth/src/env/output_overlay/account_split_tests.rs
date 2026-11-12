@@ -15,7 +15,7 @@ use super::{
 use crate::{
     env::output_overlay::{
         layered_factories,
-        parallel::{ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK},
+        parallel::{ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN},
         storage_split::StorageWalk,
     },
     OutputTrieOverlay, RethChainSpec, RethEnv,
@@ -195,6 +195,7 @@ impl Fixture {
                 tx,
                 block.clone(),
                 ParallelRoots::Shadow(Walks::SPLIT),
+                1,
             )?;
             assert_eq!(shadow, serial, "shadow result differs at block {i}");
             overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -452,6 +453,7 @@ async fn one_thread_walk_does_not_split() -> eyre::Result<()> {
                 tx,
                 block.clone(),
                 ParallelRoots::Shadow(ONE_THREAD),
+                1,
             )?,
         ])
     });
@@ -568,9 +570,10 @@ async fn moved_tip_leaves_the_subtries_to_the_walk() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A wrong root from the split (made wrong after its own checks) is used unchecked, but a
-/// sampled block's serial check replaces it with the serial result and counts the `mismatch`
-/// fallback: the production check covers the split.
+/// A wrong root from the split (made wrong after its own checks) is used unchecked on a block
+/// the sample skips, but a sampled block's serial check (by its number, or forced by the test
+/// hook) replaces it with the serial result and counts the `mismatch` fallback: the production
+/// check covers the split.
 #[tokio::test]
 async fn sampled_check_replaces_a_wrong_split_root() -> eyre::Result<()> {
     let fixture = Fixture::new(large_base())?;
@@ -580,25 +583,39 @@ async fn sampled_check_replaces_a_wrong_split_root() -> eyre::Result<()> {
     let tx = provider.tx_ref();
     let overlay = OutputTrieOverlay::new();
     let serial = overlay.layered_root_with_updates(tx, block.clone())?;
+    let sampled_root = |number| {
+        CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.set(true));
+        let (root, fallbacks) = counting_fallbacks(|| {
+            overlay.block_root_with_updates(
+                factory,
+                tx,
+                block.clone(),
+                ParallelRoots::Sampled(Walks::SPLIT),
+                number,
+            )
+        });
+        assert!(!CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.get()), "the split did not compose");
+        (root, fallbacks)
+    };
 
-    CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.set(true));
-    let wrong =
-        overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), Walks::SPLIT)?;
-    assert_ne!(wrong.0, serial.0, "the corrupted split root must reach the result unchecked");
-
-    CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.set(true));
+    for skipped in [1, CHECK_ONE_BLOCK_IN - 1, CHECK_ONE_BLOCK_IN + 1] {
+        let (wrong, fallbacks) = sampled_root(skipped);
+        assert_ne!(wrong?.0, serial.0, "block {skipped}: the corrupted root must go unchecked");
+        assert_eq!(fallbacks.get("mismatch"), None, "block {skipped}: fallbacks: {fallbacks:?}");
+    }
+    for sampled in [0, CHECK_ONE_BLOCK_IN, 7 * CHECK_ONE_BLOCK_IN] {
+        let (checked, fallbacks) = sampled_root(sampled);
+        assert_eq!(checked?, serial, "block {sampled}: a sampled block must use the serial result");
+        assert_eq!(
+            fallbacks.get("mismatch"),
+            Some(&1),
+            "block {sampled}: fallbacks: {fallbacks:?}"
+        );
+    }
     CHECK_NEXT_SAMPLED_BLOCK.with(|c| c.set(true));
-    let (checked, fallbacks) = counting_fallbacks(|| {
-        overlay.block_root_with_updates(
-            factory,
-            tx,
-            block.clone(),
-            ParallelRoots::Sampled(Walks::SPLIT),
-        )
-    });
-    assert_eq!(checked?, serial, "a sampled block must use the serial result");
-    assert_eq!(fallbacks.get("mismatch"), Some(&1), "fallbacks: {fallbacks:?}");
-    assert!(!CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.get()), "the split did not compose");
+    let (checked, fallbacks) = sampled_root(CHECK_ONE_BLOCK_IN + 1);
+    assert_eq!(checked?, serial, "a forced sample must use the serial result");
+    assert_eq!(fallbacks.get("mismatch"), Some(&1), "forced: fallbacks: {fallbacks:?}");
     Ok(())
 }
 
@@ -617,5 +634,6 @@ async fn shadow_panics_on_a_wrong_split_root() {
         provider.tx_ref(),
         block,
         ParallelRoots::Shadow(Walks::SPLIT),
+        1,
     );
 }

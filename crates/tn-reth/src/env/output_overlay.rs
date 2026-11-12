@@ -39,7 +39,7 @@ use reth_trie::{
     MultiProofTargets, StateRoot, StorageMultiProof, TrieInput,
 };
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
-use tn_types::{Address, B256};
+use tn_types::{Address, BlockNumber, B256};
 
 use crate::{metrics::RETH_METRICS, traits::TelcoinNode};
 
@@ -193,17 +193,21 @@ pub(crate) struct OverlayRootStateProvider<'a, P> {
     /// computation; the database tip equals the overlay anchor for the whole output
     /// because TN persists strictly after the output's builds and has no reorg path.
     blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
+    /// The number of the block whose root this computes: it picks the blocks whose parallel
+    /// root is checked (`parallel.rs`).
+    block_number: BlockNumber,
 }
 
 impl<'a, P> OverlayRootStateProvider<'a, P> {
-    /// Wrap `inner`, routing state-root computation through `overlay` layered over
-    /// `blockchain_provider`'s database.
+    /// Wrap `inner`, routing block `block_number`'s state-root computation through `overlay`
+    /// layered over `blockchain_provider`'s database.
     pub(crate) fn new(
         inner: &'a P,
         overlay: &'a OutputTrieOverlay,
         blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
+        block_number: BlockNumber,
     ) -> Self {
-        Self { inner, overlay, blockchain_provider }
+        Self { inner, overlay, blockchain_provider, block_number }
     }
 }
 
@@ -279,6 +283,7 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
                 provider.tx_ref(),
                 hashed_state,
                 ParallelRoots::from_env(),
+                self.block_number,
             )?
         };
         RETH_METRICS.block_state_root_seconds.record(started.elapsed());
