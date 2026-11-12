@@ -154,9 +154,14 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
+            // with nothing executed the parent is the default header, whose digest is build-flavor
+            // dependent and is not the anchor adiri's block 1 was built on. block 1 anchors on its
+            // own parent instead, as state-sync catch-up and the epoch-0 pack importer do; its
+            // digest commits to that parent, and the check is strict from block 2 on.
+            let anchors_on_itself = parent.number == 0 && consensus_header.number == 1;
             eyre::ensure!(
                 consensus_header.number == parent.number + 1
-                    && consensus_header.parent_hash == parent.digest(),
+                    && (anchors_on_itself || consensus_header.parent_hash == parent.digest()),
                 "restart replay is not contiguous: expected consensus {} following {}, got {}",
                 parent.number + 1,
                 parent.number,
