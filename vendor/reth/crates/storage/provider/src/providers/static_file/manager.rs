@@ -452,7 +452,7 @@ pub struct StaticFileProviderInner<N> {
     _lock_file: Option<StorageLock>,
     /// Genesis block number, default is 0;
     genesis_block_number: u64,
-    /// TN(TN-0052): sync timings since the last [`StaticFileProvider::take_sync_stats`].
+    /// TN(TN-0119): sync timings since the last [`StaticFileProvider::take_sync_stats`].
     sync_stats: parking_lot::Mutex<StaticFileSyncStats>,
     /// TN(TN-0122): whether the jars this provider creates carry checksums.
     jar_checksums: AtomicBool,
@@ -463,13 +463,13 @@ pub struct StaticFileProviderInner<N> {
 }
 
 impl<N> StaticFileProviderInner<N> {
-    /// TN(TN-0052): returns the per-segment sync timings recorded since the last call and starts
+    /// TN(TN-0119): returns the per-segment sync timings recorded since the last call and starts
     /// a new period. A bench calls it after each persist's commit for that persist's split.
     pub fn take_sync_stats(&self) -> StaticFileSyncStats {
         std::mem::take(&mut *self.sync_stats.lock())
     }
 
-    /// TN(TN-0052): records one sync phase of `segment`.
+    /// TN(TN-0119): records one sync phase of `segment`.
     pub(crate) fn record_sync(
         &self,
         segment: StaticFileSegment,
@@ -876,7 +876,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            // TN(TN-0044): the plain slot, as in v1's changesets (upstream
+                            // TN(TN-0112): the plain slot, as in v1's changesets (upstream
                             // 815037e27).
                             key: StorageSlotKey::from_u256(key).as_b256(),
                             value: revert_to_slot.to_previous_value(),
@@ -904,7 +904,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     {
         let mut w = self.get_writer(first_block_number, segment)?;
         f(&mut w)?;
-        // TN(TN-0051): the configuration is written here, in the segment's thread, not by
+        // TN(TN-0118): the configuration is written here, in the segment's thread, not by
         // `finalize` on the commit thread, which only updates the reader index.
         w.sync_and_freeze()
     }
@@ -1378,7 +1378,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// Publishing first is safe when the segment grows: lookups route by the index, which still
     /// stops at the old tip, and the new jar holds every row the old one did. A jar loaded on a
-    /// cache miss can hold rows past the index tip in the same way (TN-0051). When the segment
+    /// cache miss can hold rows past the index tip in the same way (TN-0118). When the segment
     /// shrinks or stays, the jar is published under the lock with the index, as upstream does,
     /// so no lookup routed by the old index meets a jar without its rows.
     fn prepare_index_update(
@@ -3024,7 +3024,7 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                     .get_one::<StorageChangesetMask>(i.into())?
                     .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
                 let block_address = BlockNumberAddress((block_number, change.address));
-                // TN(TN-0044): static-file storage changesets hold plain slots.
+                // TN(TN-0112): static-file storage changesets hold plain slots.
                 let entry =
                     ChangesetEntry { key: StorageSlotKey::plain(change.key), value: change.value };
                 changeset.push((block_address, entry));
@@ -3068,7 +3068,7 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
         {
-            // TN(TN-0044): static-file storage changesets hold plain slots.
+            // TN(TN-0112): static-file storage changesets hold plain slots.
             return Ok(Some(ChangesetEntry {
                 key: StorageSlotKey::plain(change.key),
                 value: change.value,
@@ -3926,7 +3926,7 @@ mod tests {
         Ok(())
     }
 
-    /// TN(TN-0051): `sync_and_freeze` writes the configuration in the segment's thread, before
+    /// TN(TN-0118): `sync_and_freeze` writes the configuration in the segment's thread, before
     /// `finalize` updates the index on the commit thread, so for the rest of `save_blocks` a jar
     /// loaded on a cache miss holds rows the index does not name yet. Readers route by the index,
     /// so reads by number still find nothing past the old tip, and `finalize` replaces the cached
@@ -4033,7 +4033,7 @@ mod tests {
         Ok(())
     }
 
-    /// TN(TN-0052): a persist records each sync phase once for its segment, `.csoff` only for
+    /// TN(TN-0119): a persist records each sync phase once for its segment, `.csoff` only for
     /// changeset segments, and a take drains what was recorded.
     #[test]
     fn sync_stats_record_each_phase_per_segment() -> eyre::Result<()> {
@@ -4075,7 +4075,7 @@ mod tests {
         Ok(())
     }
 
-    /// TN(TN-0051): after `sync_and_freeze` the writer is clean, so a commit of every writer
+    /// TN(TN-0118): after `sync_and_freeze` the writer is clean, so a commit of every writer
     /// (`StaticFileWriters::commit`, which `DatabaseProvider::commit` runs instead of `finalize`
     /// in unwind order or with an unwind queued) has nothing to write, but must still publish
     /// the frozen rows.
@@ -4104,7 +4104,7 @@ mod tests {
         Ok(())
     }
 
-    /// TN(TN-0051): `sync_and_freeze` leaves the writer unsynced, so `finalize` syncs the rows
+    /// TN(TN-0118): `sync_and_freeze` leaves the writer unsynced, so `finalize` syncs the rows
     /// appended after it before it writes their configuration.
     #[test]
     fn finalize_syncs_rows_appended_after_sync_and_freeze() -> eyre::Result<()> {

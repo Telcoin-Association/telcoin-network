@@ -12,6 +12,8 @@ Runs bundles of calls in sequence on one block's state, without creating transac
 
 When all of the block's transactions are replayed (the default), the bundles run on the state after the block. With a smaller `transactionIndex` the node starts from the block's parent state and replays that many of the block's transactions first; this path does not apply the block's pre-transaction system calls.
 
+The request shares a gas budget of `--rpc.gascap` across all its calls. A request with more calls than the budget can hold at 21,000 gas each is refused before any runs, and the request fails once the gas its calls used exceeds the budget.
+
 #### Parameters
 
 `Array` - The bundles, run in order. Each bundle is an object:
@@ -21,7 +23,7 @@ When all of the block's transactions are replayed (the default), the bundles run
 
 `Object` - (optional) The state context:
 
-* `blockNumber`: `QUANTITY|TAG|DATA` - (optional) The block to run on: a hexadecimal block number, a string tag such as `latest` or `pending`, or a 32-byte block hash. Defaults to `latest`.
+* `blockNumber`: `QUANTITY|TAG|DATA` - (optional) The block to run on: a hexadecimal block number, a string tag such as `latest` or `pending`, or a 32-byte block hash. Defaults to `latest`. Under the default `--rpc.pending-block none`, `pending` selects the latest block.
 * `transactionIndex`: `Number` - (optional) How many of the block's transactions to replay before the bundles, as a JSON integer. `-1`, the default, replays all of them.
 
 `Object` - (optional) The tracing options: the fields [debug\_traceTransaction](debug_tracetransaction.md#parameters) takes (`tracer`, `tracerConfig`, `enableMemory`, `disableStack`, `disableStorage`, `enableReturnData`), plus `stateOverrides`, which is applied once, before the first call. `blockOverrides` and `txIndex` are ignored here; use each bundle's `blockOverride` and the state context instead.

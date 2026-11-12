@@ -733,7 +733,7 @@ one of reth's: its rows are not copied (reth does not read them either).
 reth has two storage layouts (`StorageSettings`). **v1** keeps change sets, transaction senders and
 the history indices in database tables, and plain state beside hashed state. **v2** (here without
 RocksDB) moves change sets and senders into static files and keeps only hashed state; its storage
-change sets and history are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0044).
+change sets and history are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0112).
 v2 runs only on tn-lmdb. Nothing converts a datadir from one
 layout to the other: flipping the recorded layout alone would misread every history index, so a
 datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
@@ -745,7 +745,7 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   than misread it.
 - **A new datadir** gets `StorageLayout::for_new_datadirs()`: always v1 on the MDBX build, and
   `NEW_DATADIR_LAYOUT_TN_LMDB`, v2, on the tn-lmdb build (the v2 write path keeps the history
-  indices and the transaction-hash index in the database: vendor/reth CHANGES.md TN-0042..0044).
+  indices and the transaction-hash index in the database: vendor/reth CHANGES.md TN-0110..0112).
   `the_default_build_gives_new_datadirs_v2` pins both, through the node's own config, and
   `etc/backend-gate.sh` (run by `./etc/ci-lanes.sh test-default`) fails if any crate turns the
   `mdbx` feature on in the release graphs or that lane. Benches and tests pick a layout with
@@ -1010,7 +1010,7 @@ accounts; the median of 5 alternating runs per build; ms per commit):
 Both are well inside the reference (tn-lmdb's per-block persist p99 at most 1.25× MDBX's). Most of a
 persist on macOS is reth's static files: their commit was then a `File::sync_all`, which is
 `F_FULLFSYNC` on macOS, on every commit in both builds (a plain `fsync` since vendor/reth
-TN-0050). The verdict uses the no-sync runs
+TN-0117). The verdict uses the no-sync runs
 (MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`). The durable runs
 (3+3: p99 ratio 0.93 and 0.91) predate tn-lmdb's `msync` of mapped pages on macOS. Its scattered
 commits then took a plain `fsync`, which leaves some of those pages unwritten there, so they priced

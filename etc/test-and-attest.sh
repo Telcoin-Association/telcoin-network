@@ -131,6 +131,15 @@ fi
 cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe
 cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --skip tn_lmdb_vs_mdbx
 
+# The vendored reth's own invariants: every TN change to the copy is named by a ledger entry,
+# the copy matches the upstream pin plus the ledger, and the manifests stay inside the carried
+# crate set. They need the upstream clone (~/.cache/tn-vendor/reth, cloned on first use), which
+# CI does not have; the attested run makes the claim the ledger otherwise only asserts
+# (vendored reth review R29).
+python3 -I vendor/reth/tn/vendor.py status > /dev/null
+python3 -I vendor/reth/tn/vendor.py ledger
+python3 -I vendor/reth/tn/vendor.py check
+
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via

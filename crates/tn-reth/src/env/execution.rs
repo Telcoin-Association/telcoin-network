@@ -755,7 +755,7 @@ impl RethEnv {
     /// BENCH-ONLY: the static files' sync timings since the last call, per segment and phase
     /// (data, offsets and `.csoff` syncs and the `.conf` freeze, which `save_blocks` runs in
     /// each segment's thread, and the index update in the commit), and starts a new period
-    /// (vendored TN-0052). Call it after each [`Self::persist_executed_output`] for that
+    /// (vendored TN-0119). Call it after each [`Self::persist_executed_output`] for that
     /// persist's split. Timings are this environment's own; no other provider adds to them.
     #[cfg(any(feature = "test-utils", test))]
     pub fn take_static_file_sync_stats(&self) -> reth_provider::providers::StaticFileSyncStats {

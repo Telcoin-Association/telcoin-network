@@ -237,7 +237,7 @@ pub struct StaticFileProviderRW<N> {
     prune_on_commit: Option<PruneStrategy>,
     /// Whether `sync_all()` has been called. Used by `finalize()` to avoid redundant syncs.
     synced: bool,
-    /// TN(TN-0051): set when [`Self::sync_and_freeze`] wrote the configuration, so the next
+    /// TN(TN-0118): set when [`Self::sync_and_freeze`] wrote the configuration, so the next
     /// [`Self::finalize`] or [`Self::commit`] still updates the reader index.
     index_pending: bool,
     /// Changeset offsets sidecar writer (only for changeset segments).
@@ -492,7 +492,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     .open(&csoff_path)
                     .map_err(ProviderError::other)?;
                 file.set_len(correct_blocks * record_size).map_err(ProviderError::other)?;
-                // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`).
+                // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`).
                 reth_fs_util::fsync_file(&file).map_err(ProviderError::other)?;
 
                 tracing::debug!(
@@ -596,7 +596,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         if self.writer.is_dirty() {
-            // TN(TN-0052): `NippyJarWriter::sync_all`'s two halves, timed apart.
+            // TN(TN-0119): `NippyJarWriter::sync_all`'s two halves, timed apart.
             let start = Instant::now();
             self.writer.sync_data().map_err(ProviderError::other)?;
             self.record_sync(SyncPhase::Data, start.elapsed());
@@ -611,7 +611,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// Syncs all data like [`Self::sync_all`], then writes the configuration to disk, leaving
     /// only the reader index update to [`Self::finalize`].
     ///
-    /// TN(TN-0051): `StaticFileProvider::write_blocks_data` calls this in each segment's thread,
+    /// TN(TN-0118): `StaticFileProvider::write_blocks_data` calls this in each segment's thread,
     /// so the configuration's write and syncs (temp file `fsync`, rename, directory `fsync`) run
     /// beside the database writes of `save_blocks` instead of one segment after another in
     /// `DatabaseProvider::commit`. The configuration is still durable before the database commit
@@ -662,7 +662,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             self.record_sync(SyncPhase::ConfFreeze, start.elapsed());
             self.index_pending = true;
         }
-        // TN(TN-0051): also after `sync_and_freeze`, which wrote the configuration already.
+        // TN(TN-0118): also after `sync_and_freeze`, which wrote the configuration already.
         if self.index_pending {
             self.update_index()?;
             self.index_pending = false;
@@ -745,7 +745,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
             self.update_index()?;
         } else if self.index_pending {
-            // TN(TN-0051): `sync_and_freeze` wrote the configuration; publish it.
+            // TN(TN-0118): `sync_and_freeze` wrote the configuration; publish it.
             self.update_index()?;
         }
         self.index_pending = false;
@@ -818,7 +818,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
-    /// TN(TN-0052): records a sync phase of this writer's segment in its provider's
+    /// TN(TN-0119): records a sync phase of this writer's segment in its provider's
     /// [`StaticFileSyncStats`](super::StaticFileSyncStats), if the provider is still alive.
     fn record_sync(&self, phase: SyncPhase, elapsed: std::time::Duration) {
         if let Some(reader) = self.reader.upgrade() {

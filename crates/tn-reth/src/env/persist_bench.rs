@@ -359,7 +359,7 @@ struct Split {
     db_commit: Duration,
     /// The static-file writes of `save_blocks`, on their own thread.
     sf_write: Duration,
-    /// The static files' commit (`finalize`: since vendored TN-0051 only the index updates),
+    /// The static files' commit (`finalize`: since vendored TN-0118 only the index updates),
     /// before the database commit.
     sf_commit: Duration,
     /// The slowest segment's syncs in `sf_write`: data, offsets and `.csoff` syncs and the

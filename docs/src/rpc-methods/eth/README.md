@@ -13,8 +13,8 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | Method | Notes |
 | --- | --- |
 | `eth_blobBaseFee` | |
-| `eth_callBundle` | Waits for the same concurrency permit as `eth_call` |
-| `eth_callMany` | |
+| `eth_callBundle` | Waits for the same concurrency permit as `eth_call`. The bundle's transactions share one block gas limit (`gasLimit`, or the node's call gas cap): a transaction whose gas limit exceeds what the earlier ones left fails the whole request, and a bundle with more transactions than that limit can hold at 21,000 gas each is refused before any is decoded |
+| `eth_callMany` | One request shares a gas budget of `--rpc.gascap` across all its calls: a request with more calls than the budget can hold at 21,000 gas each is refused, and the request fails once the gas its calls used exceeds the budget. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
 | `eth_fillTransaction` | Missing fee fields are filled from the worker's epoch base fee |
 | `eth_getAccount` | |
 | `eth_getAccountInfo` | |
@@ -23,9 +23,9 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | `eth_getRawTransactionByBlockHashAndIndex` | |
 | `eth_getRawTransactionByBlockNumberAndIndex` | |
 | `eth_getRawTransactionByHash` | |
-| `eth_getTransactionBySenderAndNonce` | |
+| `eth_getTransactionBySenderAndNonce` | `null` when the sender's nonce moved without a transaction of theirs in the block (a contract creation, or a system call) |
 | `eth_sendRawTransactionSync` | Guarded by `--rpc.txfeecap` like `eth_sendRawTransaction` |
-| `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks` |
+| `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks`. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
 | `eth_subscribe`, `eth_unsubscribe` | WebSocket and IPC only |
 
 These are registered but cannot do useful work on Telcoin Network:

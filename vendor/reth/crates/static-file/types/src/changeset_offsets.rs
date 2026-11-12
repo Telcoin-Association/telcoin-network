@@ -140,7 +140,7 @@ impl ChangesetOffsetWriter {
                 "Truncating partial changeset offset record"
             );
             file.set_len(truncated_len)?;
-            // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and below.
+            // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and below.
             reth_fs_util::fsync_file(&file)?; // Sync required for crash safety
             truncated_len
         } else {

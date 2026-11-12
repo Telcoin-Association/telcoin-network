@@ -430,11 +430,11 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Flushes and syncs the data file, the first half of [`Self::sync_all`];
     /// [`Self::commit_offsets`] is the second.
     ///
-    /// TN(TN-0052): split out, and `commit_offsets` made public, so the static-file writer can
+    /// TN(TN-0119): split out, and `commit_offsets` made public, so the static-file writer can
     /// time the two syncs apart.
     pub fn sync_data(&mut self) -> Result<(), NippyJarError> {
         self.data_file.flush()?;
-        // TN(TN-0050): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and at every sync below.
+        // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`), here and at every sync below.
         reth_fs_util::fsync_file(self.data_file.get_ref())?;
         Ok(())
     }

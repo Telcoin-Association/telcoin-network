@@ -58,7 +58,7 @@ mod metrics;
 mod chain;
 pub use chain::*;
 
-// TN(TN-0045): storage v2 against v1 on the same generated chain.
+// TN(TN-0113): storage v2 against v1 on the same generated chain.
 #[cfg(test)]
 mod tn_v2_tests;
 

@@ -15,6 +15,13 @@ pub const DEFAULT_MAX_BLOCKS_PER_FILTER: u64 = 100_000;
 /// The default maximum of logs in a single response.
 pub const DEFAULT_MAX_LOGS_PER_RESPONSE: usize = 20_000;
 
+/// TN(TN-0055): the most calls one JSON-RPC batch may carry, on every transport.
+pub const DEFAULT_MAX_BATCH_REQUESTS: u32 = 100;
+
+/// TN(TN-0056): the most filters (`eth_newFilter`, `eth_newBlockFilter`,
+/// `eth_newPendingTransactionFilter`) a node keeps installed at once.
+pub const DEFAULT_MAX_ACTIVE_FILTERS: usize = 1000;
+
 /// The default maximum number of blocks for `trace_filter` requests.
 pub const DEFAULT_MAX_TRACE_FILTER_BLOCKS: u64 = 100;
 
@@ -111,11 +118,11 @@ pub mod gas_oracle {
 
 /// Cache specific constants
 pub mod cache {
-    /// Default cache size for the block cache: 5000 blocks.
-    pub const DEFAULT_BLOCK_CACHE_MAX_LEN: u32 = 5000;
+    /// Default cache size for the block cache: 1000 blocks.
+    pub const DEFAULT_BLOCK_CACHE_MAX_LEN: u32 = 1000;
 
-    /// Default cache size for the receipts cache: 2000 receipts.
-    pub const DEFAULT_RECEIPT_CACHE_MAX_LEN: u32 = 2000;
+    /// Default cache size for the receipts cache: 500 blocks' receipts.
+    pub const DEFAULT_RECEIPT_CACHE_MAX_LEN: u32 = 500;
 
     /// Default cache size for the header cache: 1000 headers.
     pub const DEFAULT_HEADER_CACHE_MAX_LEN: u32 = 1000;

@@ -133,6 +133,7 @@ mod evm;
 pub mod forward;
 mod forward_pending;
 mod metrics;
+mod rpc_blocking;
 mod rpc_bundle;
 mod rpc_call;
 mod rpc_debug;

@@ -986,7 +986,14 @@ impl WorkerTxPool {
 
 impl TxPool for WorkerTxPool {
     fn best_transactions(&self) -> BestTxns {
-        BestTxns { inner: self.0.best_transactions() }
+        let mut inner = self.0.best_transactions();
+        // A build packs the pending set as of this call. Left on, the iterator also pulls
+        // transactions admitted during the build from a bounded broadcast channel and drops
+        // what it missed when it lags; a sender's nonce N can then be dropped while N+1 is
+        // yielded as independent, and the builder, which does not execute, would pack N+1
+        // without N (vendored reth review R7). The next build sees the newcomers anyway.
+        inner.no_updates();
+        BestTxns { inner }
     }
 
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
@@ -1611,6 +1618,36 @@ mod tests {
         assert_eq!(s.pending, 0);
         assert_eq!(s.blob, 0);
         assert_eq!(s.queued, 0);
+    }
+
+    /// A build sees the pending set as of its start: a transaction admitted after the iterator
+    /// was created, even a child of one it holds, is left to the next build (review R7).
+    #[tokio::test]
+    async fn best_transactions_ignore_admissions_after_the_build_started() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new_random();
+        let (chain, _reth_env, pool) = funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let tx = |factory: &mut TransactionFactory| {
+            factory.create_eip1559(
+                chain.clone(),
+                Some(21_000),
+                7,
+                Some(Address::ZERO),
+                U256::from(100),
+                Bytes::new(),
+            )
+        };
+        pool.add_raw_transaction_external(tx(&mut factory)).await.unwrap();
+
+        let mut best = pool.best_transactions();
+        pool.add_raw_transaction_external(tx(&mut factory)).await.unwrap();
+        assert_eq!(pool.pool_size().pending, 2, "the child of a pending transaction is pending");
+
+        let nonces: Vec<u64> = best.by_ref().map(|tx| tx.nonce()).collect();
+        assert_eq!(nonces, vec![0], "only the transaction pending at the start is packed");
+        let nonces: Vec<u64> = pool.best_transactions().map(|tx| tx.nonce()).collect();
+        assert_eq!(nonces, vec![0, 1], "the next build packs both");
     }
 
     /// The pool refuses EIP-7702 (set-code) transactions at admission. Prague is active at

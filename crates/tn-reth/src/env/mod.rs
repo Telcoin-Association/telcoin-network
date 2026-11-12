@@ -456,7 +456,7 @@ impl RethEnv {
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
         // multi-backend commit: static files are made durable, RocksDB commits, then MDBX commits
         // last. The static files' segment threads in `save_blocks` sync each segment and write
-        // its configuration (vendored TN-0051), so from the end of `save_blocks` a crash, or a
+        // its configuration (vendored TN-0118), so from the end of `save_blocks` a crash, or a
         // failure before the MDBX commit, durably leaves static files and/or RocksDB one output
         // ahead of the MDBX tip. `check_consistency` heals exactly that direction in place: it
         // prunes the leading backends down to the MDBX stage checkpoints, which
@@ -642,7 +642,7 @@ mod tests {
     ///
     /// The test persists block 1 through the production path, then reproduces the crash window
     /// for block 2 by hand: `save_blocks` appends block 2 to both backends and makes the static
-    /// files durable (each segment's configuration included, vendored TN-0051), the headers
+    /// files durable (each segment's configuration included, vendored TN-0118), the headers
     /// writer's commit publishes its index, and the MDBX transaction is dropped uncommitted. On
     /// disk the static files are durably at 2 while MDBX is at 1, exactly the post-crash state.
     /// A "restart" (a second `RethEnv` over the same datadir) must then (a) construct Ok,
@@ -689,10 +689,13 @@ mod tests {
             Some(2),
             "crash window must leave the headers static file durably at 2"
         );
+        // the committed tip reads from the `Finish` checkpoint, so it stays at 1 although the
+        // headers static file is at 2 (review R16); the provider's own `last_block_number`
+        // resolves through that static file and would say 2 here
+        assert_eq!(env1.last_block_number()?, 1, "the committed tip must ignore the torn header");
         // the MDBX-side oracle is the Headers stage checkpoint: it is exactly what
-        // `check_consistency` compares the static-file tip against, and unlike
-        // `last_block_number` (which resolves through the headers static file, now at 2) it
-        // only moves when the MDBX transaction commits
+        // `check_consistency` compares the static-file tip against, and like the `Finish`
+        // checkpoint it only moves when the MDBX transaction commits
         let headers_checkpoint = env1
             .blockchain_provider()
             .database_provider_ro()?

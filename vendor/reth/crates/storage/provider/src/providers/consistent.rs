@@ -223,7 +223,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
     /// values are read directly from [`reth_db_api::tables::HashedStorages`]. Otherwise, values
     /// are read via [`StateProvider::storage`] which queries plain state tables.
     ///
-    /// TN(TN-0044): changeset keys are plain in both storage layouts, so every value is read with
+    /// TN(TN-0112): changeset keys are plain in both storage layouts, so every value is read with
     /// [`StateProvider::storage`], which hashes the slot itself under v2.
     fn populate_bundle_state(
         &self,
@@ -1330,7 +1330,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                 .flatten()
                 .flat_map(|revert: PlainStorageRevert| {
                     revert.storage_revert.into_iter().map(move |(key, value)| {
-                        // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                        // TN(TN-0112): changesets hold plain slots in both storage layouts.
                         let tagged_key = StorageSlotKey::from_u256(key);
                         (
                             BlockNumberAddress((block_number, revert.address)),
@@ -1388,7 +1388,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                         return None
                     }
                     revert.storage_revert.into_iter().find_map(|(key, value)| {
-                        // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                        // TN(TN-0112): changesets hold plain slots in both storage layouts.
                         let tagged_key = StorageSlotKey::from_u256(key);
                         (tagged_key.as_b256() == storage_key).then(|| ChangesetEntry {
                             key: tagged_key,
@@ -1440,7 +1440,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
                     .flatten()
                     .flat_map(|revert: PlainStorageRevert| {
                         revert.storage_revert.into_iter().map(move |(key, value)| {
-                            // TN(TN-0044): changesets hold plain slots in both storage layouts.
+                            // TN(TN-0112): changesets hold plain slots in both storage layouts.
                             let tagged_key = StorageSlotKey::from_u256(key);
                             (
                                 BlockNumberAddress((state.number(), revert.address)),
@@ -2157,7 +2157,7 @@ mod tests {
         let account_state = state.get(&address).expect("should have account in bundle state");
         let storage = &account_state.storage;
 
-        // TN(TN-0044): v2 changesets hold plain slots, so the bundle is keyed by the plain slot.
+        // TN(TN-0112): v2 changesets hold plain slots, so the bundle is keyed by the plain slot.
         let storage_slot = storage.get(&slot).expect("should have the slot in storage");
 
         assert_eq!(
@@ -2342,7 +2342,7 @@ mod tests {
 
         assert_eq!(
             db_key, mem_key,
-            "DB and in-memory changesets should return the same key format (plain, TN-0044) for the same logical slot"
+            "DB and in-memory changesets should return the same key format (plain, TN-0112) for the same logical slot"
         );
 
         Ok(())

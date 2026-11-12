@@ -360,7 +360,7 @@ where
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where `sync_all` is
 /// `fcntl(F_FULLFSYNC)` (a drive cache flush on every call) and this is a plain `fsync`.
 ///
-/// TN(TN-0050): every static-file sync (`NippyJar` data, offsets and config, the `.csoff`
+/// TN(TN-0117): every static-file sync (`NippyJar` data, offsets and config, the `.csoff`
 /// sidecar, their directory) goes through here, so a persist on macOS pays no `F_FULLFSYNC`. A
 /// plain `fsync` there hands the writes to the drive without flushing its cache, the durability
 /// TN's own stores give on macOS; Linux keeps `sync_all`, which is `fsync`. An interrupted call is

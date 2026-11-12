@@ -276,7 +276,7 @@ where
             // no intermediate state, create new hash builder and node iter for state root
             // calculation
             let hash_builder = HashBuilder::default().with_updates(retain_updates);
-            let walker = TrieWalker::state_trie(trie_cursor, self.prefix_sets.account_prefix_set)
+            let walker = TrieWalker::state_trie(trie_cursor, self.prefix_sets.account_prefix_set)?
                 .with_deletions_retained(retain_updates);
             let node_iter = TrieNodeIter::state_trie(walker, hashed_account_cursor);
             (hash_builder, node_iter)
@@ -798,7 +798,7 @@ where
             }
             None => {
                 let hash_builder = HashBuilder::default().with_updates(retain_updates);
-                let walker = TrieWalker::storage_trie(trie_cursor, prefix_set)
+                let walker = TrieWalker::storage_trie(trie_cursor, prefix_set)?
                     .with_deletions_retained(retain_updates);
                 let node_iter = TrieNodeIter::storage_trie(walker, hashed_storage_cursor);
                 (hash_builder, node_iter)

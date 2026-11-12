@@ -711,8 +711,11 @@ async fn test_rpc_simulation_multiple_bundles() -> eyre::Result<()> {
 }
 
 /// Pending calls preserve default HeaderNotFound errors and work when full pending is enabled.
+/// Under the default `--rpc.pending-block none`, `pending` selects the latest block for every
+/// simulation method, as it does for `eth_call`; before, reth's multi-call methods answered
+/// "block not found: pending".
 #[tokio::test]
-async fn test_rpc_simulation_default_pending_errors() -> eyre::Result<()> {
+async fn test_rpc_simulation_default_pending_falls_back_to_latest() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
@@ -724,30 +727,7 @@ async fn test_rpc_simulation_default_pending_errors() -> eyre::Result<()> {
         &tmp_dir,
     )?;
     let request = priced_transfer(80);
-    let methods = &methods;
-    try_join_all(remaining_requests(&request, Some(BlockId::pending()), &None, &None).map(
-        |(method, params, _)| async move {
-            let result = methods.call::<_, Value>(method, params).await;
-            if method == "eth_callMany"
-                || method == "eth_simulateV1"
-                || method == "debug_traceCallMany"
-            {
-                assert!(
-                    result.as_ref().err().is_some_and(|err| {
-                        err.to_string().contains("block not found: pending")
-                    }),
-                    "{method}: {result:?}"
-                );
-            } else {
-                let response = result?;
-                assert_eq!(response.get("output").and_then(Value::as_str).unwrap_or("0x"), "0x");
-                assert!(response.get("error").is_none());
-            }
-            Ok::<(), eyre::Report>(())
-        },
-    ))
-    .await?;
-    Ok(())
+    assert_remaining_output(&methods, &request, Some(BlockId::pending()), None, None, "0x").await
 }
 
 /// The two signed fee representations whose validation is owned by reth's bundle handler.

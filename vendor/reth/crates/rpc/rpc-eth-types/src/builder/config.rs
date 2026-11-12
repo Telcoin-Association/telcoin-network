@@ -8,9 +8,9 @@ use crate::{
 };
 use reqwest::Url;
 use reth_rpc_server_types::constants::{
-    default_max_tracing_requests, DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_BLOCKING_IO_REQUEST,
-    DEFAULT_MAX_BLOCKS_PER_FILTER, DEFAULT_MAX_LOGS_PER_RESPONSE, DEFAULT_MAX_SIMULATE_BLOCKS,
-    DEFAULT_MAX_TRACE_FILTER_BLOCKS, DEFAULT_PROOF_PERMITS,
+    default_max_tracing_requests, DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_ACTIVE_FILTERS,
+    DEFAULT_MAX_BLOCKING_IO_REQUEST, DEFAULT_MAX_BLOCKS_PER_FILTER, DEFAULT_MAX_LOGS_PER_RESPONSE,
+    DEFAULT_MAX_SIMULATE_BLOCKS, DEFAULT_MAX_TRACE_FILTER_BLOCKS, DEFAULT_PROOF_PERMITS,
     RPC_DEFAULT_SEND_RAW_TX_SYNC_TIMEOUT_SECS,
 };
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,8 @@ pub struct EthConfig {
     pub max_blocks_per_filter: u64,
     /// Maximum number of logs that can be returned in a single response in `eth_getLogs` calls.
     pub max_logs_per_response: usize,
+    /// TN(TN-0056): maximum number of installed filters across all clients.
+    pub max_active_filters: usize,
     /// Gas limit for `eth_call` and call tracing RPC methods.
     ///
     /// Defaults to [`RPC_DEFAULT_GAS_CAP`]
@@ -120,6 +122,7 @@ impl EthConfig {
         EthFilterConfig::default()
             .max_blocks_per_filter(self.max_blocks_per_filter)
             .max_logs_per_response(self.max_logs_per_response)
+            .max_active_filters(self.max_active_filters)
             .stale_filter_ttl(self.stale_filter_ttl)
     }
 }
@@ -135,6 +138,7 @@ impl Default for EthConfig {
             max_trace_filter_blocks: DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             max_blocks_per_filter: DEFAULT_MAX_BLOCKS_PER_FILTER,
             max_logs_per_response: DEFAULT_MAX_LOGS_PER_RESPONSE,
+            max_active_filters: DEFAULT_MAX_ACTIVE_FILTERS,
             rpc_gas_cap: RPC_DEFAULT_GAS_CAP.into(),
             rpc_max_simulate_blocks: DEFAULT_MAX_SIMULATE_BLOCKS,
             stale_filter_ttl: DEFAULT_STALE_FILTER_TTL,
@@ -190,6 +194,12 @@ impl EthConfig {
     /// Configures the maximum number of logs per response
     pub const fn max_logs_per_response(mut self, max_logs: usize) -> Self {
         self.max_logs_per_response = max_logs;
+        self
+    }
+
+    /// TN(TN-0056): configures the maximum number of installed filters across all clients.
+    pub const fn max_active_filters(mut self, max_filters: usize) -> Self {
+        self.max_active_filters = max_filters;
         self
     }
 
@@ -272,9 +282,18 @@ pub struct EthFilterConfig {
     /// A filter is considered stale if it has not been polled for longer than this duration and
     /// will be removed.
     pub stale_filter_ttl: Duration,
+    /// TN(TN-0056): maximum number of installed filters across all clients; `eth_new*Filter`
+    /// fails once reached, until a filter is uninstalled or goes stale.
+    pub max_active_filters: usize,
 }
 
 impl EthFilterConfig {
+    /// TN(TN-0056): sets the maximum number of installed filters across all clients.
+    pub const fn max_active_filters(mut self, num: usize) -> Self {
+        self.max_active_filters = num;
+        self
+    }
+
     /// Sets the maximum number of blocks that a filter can scan for logs.
     pub const fn max_blocks_per_filter(mut self, num: u64) -> Self {
         self.max_blocks_per_filter = Some(num);
@@ -302,6 +321,7 @@ impl Default for EthFilterConfig {
             max_logs_per_response: None,
             // 5min
             stale_filter_ttl: DEFAULT_STALE_FILTER_TTL,
+            max_active_filters: DEFAULT_MAX_ACTIVE_FILTERS,
         }
     }
 }

@@ -24,6 +24,8 @@ Each worker selects the best transactions from their respective transaction pool
 Workers only propose one batch at a time. Transactions selected into a batch are removed from the pool as mined only once that batch reaches quorum (2f+1).
 
 Transactions are sorted by default based on the highest fees, although this is not a strict requirement of the protocol.
+A build selects from the pending set as it stood when the build started: transactions admitted during a build wait for the next one.
+Reth's iterator can also pull in transactions admitted mid-build, but it drops the ones it misses when it lags, and a sender's later nonce could then be packed without the earlier one, which the builder, unlike a block builder, does not execute and so would not notice (vendored reth review R7).
 
 The only requirement is that transactions must extend the current canonical tip.
 The canonical tip is extended once a batch is settled in a DAG commit.

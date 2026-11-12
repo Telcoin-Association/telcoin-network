@@ -2,12 +2,12 @@
 //! [`SfSyncStats`], and [`SfSyncSource`], what reads (and resets) it from an env.
 //!
 //! A persist syncs each static-file segment it wrote, in the segment's own thread inside
-//! `save_blocks` (vendor/reth CHANGES.md TN-0051): the data file, its offsets (`.off`), a
+//! `save_blocks` (vendor/reth CHANGES.md TN-0118): the data file, its offsets (`.off`), a
 //! changeset segment's `.csoff` sidecar, then the `.conf` freeze (temp file, `fsync`, rename and
 //! the directory's `fsync`). The commit then only updates the readers' index. reth's metrics time
 //! the static-file arm and its commit whole (`save_blocks_sf`, `save_blocks_commit_sf`); these
 //! split them by segment and phase, from the static-file provider's own timers
-//! (`StaticFileProvider::take_sync_stats`, TN-0052, through
+//! (`StaticFileProvider::take_sync_stats`, TN-0119, through
 //! [`RethEnv::take_static_file_sync_stats`]).
 
 use crate::RethEnv;

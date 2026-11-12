@@ -13,11 +13,13 @@
 #   1. Cargo.lock holds no package whose name contains "rocksdb" (rocksdb, librocksdb-sys, and
 #      renamed forks such as rust-librocksdb-sys). The lockfile resolves every feature, target
 #      and dev-dependency of the workspace, so this covers optional and transitive paths too.
+#      Neither does vendor/reth/tn/test-only.lock, which pins what only the vendored reth's own
+#      tests need (vendor/reth/tn/lockfile.py).
 #   2. No manifest under vendor/reth, the TN crates or the carried patches/ crates mentions
 #      rocksdb outside a comment. That catches a re-added optional dependency or feature
 #      before anyone enables it.
 #
-# Fails closed: a missing Cargo.lock or scanned directory is an error, not a pass.
+# Fails closed: a missing lockfile or scanned directory is an error, not a pass.
 #
 # etc/test_rocksdb_gate.py runs this script against planted lockfiles and manifests.
 #
@@ -30,10 +32,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ ! -f Cargo.lock ]]; then
-    echo "rocksdb guard FAILED: Cargo.lock not found in $ROOT_DIR."
-    exit 1
-fi
+LOCKFILES=(Cargo.lock vendor/reth/tn/test-only.lock)
+for lockfile in "${LOCKFILES[@]}"; do
+    if [[ ! -f "$lockfile" ]]; then
+        echo "rocksdb guard FAILED: $lockfile not found in $ROOT_DIR."
+        exit 1
+    fi
+done
 
 # Directories and files whose Cargo.toml files are scanned. patches/ holds the crates that the
 # root [patch.crates-io] puts into the build.
@@ -47,12 +52,14 @@ done
 
 failed=0
 
-locked=$(grep -iE '^name = "[^"]*rocksdb[^"]*"$' Cargo.lock || true)
-if [[ -n "$locked" ]]; then
-    echo "rocksdb guard FAILED: Cargo.lock contains RocksDB packages:"
-    echo "$locked"
-    failed=1
-fi
+for lockfile in "${LOCKFILES[@]}"; do
+    locked=$(grep -iE '^name = "[^"]*rocksdb[^"]*"$' "$lockfile" || true)
+    if [[ -n "$locked" ]]; then
+        echo "rocksdb guard FAILED: $lockfile contains RocksDB packages:"
+        echo "$locked"
+        failed=1
+    fi
+done
 
 # Comment lines are skipped: manifests may explain that RocksDB is gone.
 manifests=$(grep -rIilE --include=Cargo.toml '^[^#]*rocksdb' "${SCANNED[@]}" || true)
@@ -73,4 +80,4 @@ EOF
     exit 1
 fi
 
-echo "rocksdb guard passed: no rocksdb package in Cargo.lock and no rocksdb in any manifest"
+echo "rocksdb guard passed: no rocksdb package in either lockfile and no rocksdb in any manifest"

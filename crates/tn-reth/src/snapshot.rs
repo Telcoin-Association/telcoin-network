@@ -28,7 +28,7 @@
 //! The pack holds plain addresses and plain storage slots. In reth's storage v1 layout the export
 //! walks the plain state tables. Storage v2 keeps no plain state, only the hashed tables, so the
 //! export takes the plain keys from the history indices instead: `AccountsHistory` is keyed by
-//! plain address and `StoragesHistory` by plain `(address, slot)` (TN-0044), and every key that
+//! plain address and `StoragesHistory` by plain `(address, slot)` (TN-0112), and every key that
 //! holds state has a history shard (see [`PinnedStateView::export_state_pack`]). It then reads each
 //! key's current value through reth's latest state provider, which hashes the key. Both layouts
 //! emit the same accounts and slots in the same order, so the same state gives the same pack
@@ -190,14 +190,14 @@ impl PinnedStateView {
     /// - **v2** (no plain state): the plain keys come from the history indices, and each value from
     ///   reth's latest state provider, which reads `HashedAccounts`/`HashedStorages` by the key's
     ///   hash. `AccountsHistory` yields every address with a shard and `StoragesHistory` every
-    ///   `(address, slot)` with a shard (both keyed plain, TN-0044, in the same order as the plain
+    ///   `(address, slot)` with a shard (both keyed plain, TN-0112, in the same order as the plain
     ///   tables); an address or slot that no longer holds state (an account emptied away, a slot
     ///   set back to zero) reads as absent and is skipped, exactly as v1 has no row for it.
     ///
     /// The v2 walk is complete because every key that holds state has a history shard. Genesis
     /// writes one for each allocated account and slot (`insert_genesis_history`). A block writes
     /// one for each account whose info its reverts change and each slot its reverts list
-    /// (`HistoryTransitions::from_reverts`, TN-0043): an account the block creates, even with no
+    /// (`HistoryTransitions::from_reverts`, TN-0111): an account the block creates, even with no
     /// storage, reverts to "absent", and every slot a block sets is in the account's storage
     /// revert. A snapshot restore writes one for each account and slot it imports
     /// ([`SnapshotRestorer::import_state`]). Validators are archive nodes and never prune history
@@ -873,7 +873,7 @@ impl SnapshotRestorer {
     /// The datadir's storage layout decides the plain rows. Under storage v1 they are written;
     /// storage v2 keeps no plain state, so only the hashed tables, the history indices and
     /// `Bytecodes` are written (`write_state_changes` itself skips the plain tables there). The
-    /// history indices are keyed by plain address and plain slot in both layouts (TN-0044), so a
+    /// history indices are keyed by plain address and plain slot in both layouts (TN-0112), so a
     /// pack from either layout restores into either. The state
     /// root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
     /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk
@@ -1180,7 +1180,7 @@ impl SnapshotRestorer {
         provider.insert_storage_for_hashing([(address, hashed_entries)])?;
 
         // storage history: one `[b]` transition per slot, keyed by (address, plain slot) in both
-        // storage layouts (TN-0044).
+        // storage layouts (TN-0112).
         let history = chunk.iter().map(|(slot, _)| ((address, *slot), [b]));
         provider.insert_storage_history_index(history)?;
 
