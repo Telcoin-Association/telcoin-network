@@ -21,4 +21,4 @@ Developers should use [Chainlist](https://chainlist.org/?testnets=true&search=ad
 
 ## Mainnet
 
-Mainnet has not launched. It will use chain ID `0x1e7` (487) and the public RPC URL https://rpc.telcoin.network. That hostname does not serve mainnet before launch, so check that `eth_chainId` returns `0x1e7` before sending anything through it.
+Mainnet has not launched. It will use chain ID `0x2db` (731) and the public RPC URL https://rpc.telcoin.network. That hostname does not serve mainnet before launch, so check that `eth_chainId` returns `0x2db` before sending anything through it.

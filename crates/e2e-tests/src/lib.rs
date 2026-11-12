@@ -421,6 +421,10 @@ pub fn spawn_local_testnet(
         // seed reth's process-global defaults before the parse resolves
         // `--txpool.max-account-slots`
         init_reth_defaults();
+        // The harness runs test chains (the ceremony's genesis defaults to chain id 911329), and
+        // `make test-faucet`, like any `--all-features` run of this crate, compiles
+        // `tn-reth/faucet` in, so without the faucet opt-in every in-process node would be
+        // refused at startup.
         let command = NodeCommand::parse_from([
             "tn",
             "--http",
@@ -431,9 +435,12 @@ pub fn spawn_local_testnet(
             &ws_port.to_string(),
             "--ipcpath",
             &ipc_path_str,
+            "--allow-faucet-on-chain",
         ]);
 
-        let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string().into()))?;
+        // config_local_testnet above generated these keys without a passphrase (cleartext
+        // bls.key), so they are read without one
+        let key_config = KeyConfig::read_config(&dir, None)?;
         let tx = tx.clone();
         let name = v.to_string();
 

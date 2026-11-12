@@ -229,7 +229,7 @@ mod tests {
         });
         assert!(run.is_err(), "an invalid worker RPC scheme must abort key generation");
         assert!(
-            !KeyConfig::keys_exist(&temp_path.to_path_buf()),
+            !KeyConfig::keys_exist(&temp_path.to_path_buf()).expect("keys dir readable"),
             "no keys may be written on the aborted run"
         );
 
@@ -1263,6 +1263,80 @@ mod tests {
                 assert!(keytool.needs_passphrase(), "generate pop must require the BLS passphrase")
             }
             _ => panic!("expected a keytool command"),
+        }
+    }
+
+    /// A passphrase against a cleartext-only key dir is refused rather than silently ignored, and
+    /// `generate pop` points the operator at the passphrase source that loads a cleartext key.
+    #[tokio::test]
+    async fn test_generate_pop_cleartext_key_with_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None).execute(&path, None).expect("generate cleartext keys");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, Some(Zeroizing::new("unused".to_string())))
+            .expect_err("a passphrase must not load the cleartext key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to load the cleartext bls.key"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source no-passphrase"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+
+        PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect("the cleartext key loads without a passphrase");
+    }
+
+    /// An encrypted-only key dir read without a passphrase names the encrypted file and points
+    /// at the passphrase source, not at a wrong passphrase or at key generation.
+    #[tokio::test]
+    async fn test_generate_pop_encrypted_key_without_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None)
+            .execute(&path, Some(Zeroizing::new("correct".to_string())))
+            .expect("generate keys with passphrase");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect_err("the encrypted key needs its passphrase");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bls.kw"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source"), "got: {msg}");
+        assert!(!msg.contains("verify the BLS passphrase is correct"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+    }
+
+    /// When `node-keys/` cannot be searched, `generate pop` points at the directory's access
+    /// rather than saying that no keys exist and should be generated, with or without a
+    /// passphrase.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_generate_pop_unsearchable_keys_dir_hint() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::TelcoinDirs as _;
+
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None).execute(&path, None).expect("generate cleartext keys");
+        let keys_dir = path.node_keys_path();
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("lock keys dir");
+        // root reads through a mode 000 directory, so there is nothing to check as root
+        let locked = std::fs::exists(keys_dir.join(tn_config::BLS_KEYFILE)).is_err();
+        let results = [None, Some(Zeroizing::new("unused".to_string()))]
+            .map(|passphrase| PopArgs { address: new_test_address() }.execute(&path, passphrase));
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock keys dir");
+        if !locked {
+            return;
+        }
+        for result in results {
+            let msg = format!("{:#}", result.expect_err("unsearchable keys dir"));
+            assert!(msg.contains("cannot check key file"), "got: {msg}");
+            assert!(msg.contains("owner and permissions"), "got: {msg}");
+            assert!(!msg.contains("no BLS keys found"), "got: {msg}");
+            assert!(!msg.contains("generate keys first"), "got: {msg}");
         }
     }
 }
