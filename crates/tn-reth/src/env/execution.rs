@@ -18,11 +18,12 @@
 //! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
 //! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
 //! cost bound. The storage roots of the accounts with changed storage run on parallel tasks
-//! beside the account walk, and a block with many changed accounts splits the walk itself by first
-//! nibble (`output_overlay/parallel.rs`, `output_overlay/account_split.rs`;
-//! `TN_PARALLEL_STATE_ROOT=0` turns both off, `TN_PARALLEL_ACCOUNT_WALK=0` the split). All other
-//! state reads go through the cross-block execution cache (`exec_cache.rs`: values at the parent
-//! block, kept across blocks and outputs) and, on a miss, reth's memory overlay.
+//! beside the account walk, a block with many changed accounts splits the walk itself by first
+//! nibble, and a hot contract's storage root is split the same way (`output_overlay/parallel.rs`,
+//! `output_overlay/account_split.rs`, `output_overlay/storage_split.rs`; `TN_PARALLEL_STATE_ROOT=0`
+//! turns all off, `TN_PARALLEL_ACCOUNT_WALK=0` and `TN_PARALLEL_STORAGE_WALK=0` each split). All
+//! other state reads go through the cross-block execution cache (`exec_cache.rs`: values at the
+//! parent block, kept across blocks and outputs) and, on a miss, reth's memory overlay.
 //!
 //! # Deliberate transaction drops (fork safety)
 //!

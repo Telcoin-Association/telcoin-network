@@ -29,7 +29,8 @@
 //! running, so the wait never depends on a job the pool has not started. A nibble whose task
 //! failed (a database error, a panic) is recomputed on the calling thread's transaction; the split
 //! still composes. The subtrie walks take the storage roots from the storage-root tasks like the
-//! one-thread walk does.
+//! one-thread walk does; the same threads first work the pieces of the hot contracts' split storage
+//! tries (`storage_split.rs`), whose roots the subtrie walks consume.
 //!
 //! # When the walk runs on one thread
 //!

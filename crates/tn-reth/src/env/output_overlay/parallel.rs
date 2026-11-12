@@ -34,7 +34,7 @@
 //!
 //! A block with at least `SPLIT_MIN_ACCOUNTS` changed accounts also splits the account walk by
 //! the first nibble of the hashed address (`account_split.rs`): sixteen subtrie walks, claimed in
-//! order by the calling thread and up to [`SUBTRIE_HELPERS`] pool jobs (each on its own read-only
+//! order by the calling thread and up to [`WALK_HELPERS`] pool jobs (each on its own read-only
 //! transaction, with the tip check below), take the storage roots from the tasks above, and the
 //! calling thread composes the root branch and the union of their trie updates. A shape the split
 //! does not compose (a small trie, a root that is not a branch) runs the walk on the calling thread
@@ -43,6 +43,21 @@
 //! the walk on one thread with the storage-root tasks): the root fell from 311 to 198 ms an output
 //! at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to 322 and from 113 to
 //! 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the split off on its own.
+//!
+//! # Hot storage tries
+//!
+//! With the walk split, a busy block's root waits on its hottest contract's storage root. A target
+//! with at least `SPLIT_MIN_SLOTS` changed slots whose stored trie has all sixteen first-nibble
+//! nodes over hashed children is split the same way (`storage_split.rs`): sixteen pieces, each
+//! reth's `StorageRoot` over storage cursors restricted to one nibble, claimed by the calling
+//! thread and the same pool jobs before any account subtrie, so the walk that reaches the
+//! contract's leaf only waits for running pieces; it composes the storage root and the union of
+//! the pieces' trie updates through the storage-root source. Other targets stay one task each, and
+//! a split that composes nothing leaves the storage root to the walk, counted in
+//! `tn_reth.storage_walk_fallbacks_total`. Measured on the exec bench (storage v2, against the
+//! account split alone): the root fell from 199 to 106 ms an output at peak and from 41 to 22 ms on
+//! the busy profile on the Mac.
+//! `TN_PARALLEL_STORAGE_WALK=0` turns this split off on its own.
 //!
 //! # Why the tasks' transactions see the walk's state
 //!
@@ -68,23 +83,26 @@
 //! A wrong root forks the chain, and TN builds its own blocks: no payload's root checks this one.
 //! In production one block in [`CHECK_ONE_BLOCK_IN`] (of those with parallel work: storage-root
 //! tasks or a split account walk) also computes the root serially and compares the roots and the
-//! trie updates; on a difference it logs both roots and whether the split composed the block's,
-//! counts it (`tn_reth.parallel_state_root_mismatches_total`, and a split's also in
-//! `tn_reth.account_walk_fallbacks_total` as `mismatch`) and uses the serial result. With
+//! trie updates; on a difference it logs both roots, whether the split composed the block's and
+//! how many split storage roots it took, counts it (`tn_reth.parallel_state_root_mismatches_total`,
+//! a split walk's also in `tn_reth.account_walk_fallbacks_total` and a block with split storage
+//! roots also in `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial
+//! result. With
 //! `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every such
 //! block is compared and a difference panics: the shadow runs of the exec bench compare every
-//! block, split ones included.
+//! block, split ones (account walk and storage tries) included.
 //!
 //! # Off switch
 //!
 //! `TN_PARALLEL_STATE_ROOT=0` computes every root serially, as before; unset or `1` uses the tasks.
 //! Any other value is logged as an error and also turns them off (the serial root is the
 //! reference). It is read once, at the first block. `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
-//! storage-root tasks and runs the account walk on one thread (`account_split.rs`). An environment
-//! variable rather than a constant, so an operator can turn the tasks off without a new release,
-//! and rather than a config field or CLI flag, which would carry a setting with no use once the
-//! code has proven itself; TN reads deployment overrides from the environment elsewhere too (the
-//! swarm listener addresses).
+//! storage-root tasks and runs the account walk on one thread (`account_split.rs`);
+//! `TN_PARALLEL_STORAGE_WALK=0` keeps every storage root on one task (`storage_split.rs`). An
+//! environment variable rather than a constant, so an operator can turn the tasks off without a new
+//! release, and rather than a config field or CLI flag, which would carry a setting with no use
+//! once the code has proven itself; TN reads deployment overrides from the environment elsewhere
+//! too (the swarm listener addresses).
 
 use super::{
     account_split::{AccountWalk, Subtries},
