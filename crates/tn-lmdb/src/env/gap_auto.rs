@@ -12,8 +12,9 @@
 //!   block storage. Its best width balances the two caps, which the sum, a plane, can only
 //!   straddle: fitted to such a disk it swings between widths on either side.
 //!
-//! The capped form is kept only when its residuals are markedly smaller (their median under
-//! [`CAPPED_GAIN`] times the sum's), so the sum serves wherever the two fit alike. The fill costs
+//! The capped form is kept only when its residuals are markedly smaller (its error, each width the
+//! samples cover counted once, under [`CAPPED_GAIN`] times the sum's), so the sum serves wherever
+//! the two fit alike. The fill costs
 //! the writer `f` per gap it tries (its read and its write, timed), and fills a share `h` of them
 //! (the others are not in memory). [`AutoGap::observe`] fits `c`, `a` and `b` (each at least 0) to
 //! the recent steps' runs written, pages written and sync time, robustly (least squares over the
@@ -25,27 +26,44 @@
 //! gap sizes ([`Gaps`], one pass over its pages; the candidates' counts in one pass over the
 //! sizes): `gaps(g)`, the gaps of at most `g` clean pages, and `gap_pages(g)`, their pages. Step 4
 //! is predicted to take the model's time for `runs − h·gaps(g)` runs of `pages + h·gap_pages(g)`
-//! pages, plus `f·gaps(g)`, and the width is the candidate that predicts the least, the smaller one
-//! on a tie.
+//! pages, times the width's own correction, plus `f·gaps(g)`. The correction is the median, over
+//! the latest steps the choice held at that width (its probes if it held none), of their sync time
+//! over the model's prediction for them (1 for a width with none): the forms are only two shapes,
+//! and a disk can cost more or less at one width than either predicts from the others (a cloud
+//! disk's writes past a burst allowance cost far more each than within it), so each width the
+//! samples cover is anchored to what its own steps took. Held steps first, because a probe, one
+//! step at a narrower width after wider ones, spends the burst allowance they left and looks
+//! cheaper than the width is when held.
+//!
+//! The choice moves only to a width beside it: half of it or twice it (at least 2), the widths
+//! the probes measure, and only when that is predicted to save [`MOVE_GAIN`] of the choice's time;
+//! a width beside it that no kept step measured is probed first, once. A new choice holds for
+//! [`HOLD`] steps before the next move, so the next decision rests on the new width's own steps.
+//! The first choice past a warm-up is the cheapest of the warm-up's widths. So the choice never
+//! jumps to a width no step is near: a fit that cannot see a cost (every sampled width bound by
+//! its bytes says nothing of the cost per write, and the sum's fit then puts 0 there, which makes
+//! the fewest pages, 0, the cheapest) moves it one width at most, which that width's steps then
+//! correct.
 //!
 //! **Exploration.** At one width a step's runs and pages move together (their ratio is the
 //! workload's), so steps at one width cannot tell `a` from `b`. A warm-up of [`WARMUP_STEPS`]
-//! steps cycles the widths of [`WARMUP`] (0, 4 and 8); after it, a step is a probe at another
-//! width than the choice, half of it or twice it (at least 2), alternately (only the one that
-//! exists at 0 and at [`MAX_GAP_FILL`]). Probes start [`PROBE_EVERY`] steps apart, and the
-//! interval doubles after each, up to [`PROBE_EVERY_MAX`], while the choice holds: a new choice
-//! brings it back to [`PROBE_EVERY`]. So a disk whose choice moves is explored often, and one
-//! that settles (a fast drive at 0, where a probe's fill costs about half that step's sync on the
-//! Mac) seldom. The fit keeps the latest [`BASE_WINDOW`] steps at the chosen width and, apart,
-//! the latest [`PROBE_WINDOW`] probes, so the probes keep their weight in the fit without a high
-//! probe rate.
+//! steps cycles the widths of [`WARMUP`] (0, 4 and 8); after it, a step is a probe at a width
+//! beside the choice, half of it or twice it, alternately (only the one that exists at 0 and at
+//! [`MAX_GAP_FILL`]). Probes start [`PROBE_EVERY`] steps apart, and the interval doubles after
+//! each, up to [`PROBE_EVERY_MAX`], while the choice holds: a new choice brings it back to
+//! [`PROBE_EVERY`]. So a disk whose choice moves is explored often, and one that settles (a fast
+//! drive at 0, where a probe's fill costs about half that step's sync on the Mac) seldom. The fit
+//! keeps the latest [`PER_WIDTH`] steps of each width, so the steps at the choice cannot crowd out
+//! what the probes and the warm-up measured elsewhere.
 //!
-//! **Re-adaptation.** The windows forget a disk's old costs as new steps arrive. A disk whose
-//! costs change at once (a cloud disk's limits raised, a drive that changed speed) is seen
-//! sooner: [`SHIFT_STREAK`] steps in a row whose sync took more than [`SHIFT_FACTOR`] times the
-//! prediction, or less than its inverse, the same way, empty both windows (but that step) and
-//! start the warm-up again (`IoStats::gap_auto_readapts`). Each open starts cold: the model lives
-//! in memory only.
+//! **Re-adaptation.** A width's samples give way to its newer steps. A disk whose costs change at
+//! once (a cloud disk's limits raised, a drive that changed speed) is seen sooner:
+//! [`SHIFT_STREAK`] steps in a row whose sync took more than [`SHIFT_FACTOR`] times the corrected
+//! prediction, or less than its inverse, the same way, empty every width's samples (but that
+//! step's) and start the warm-up again (`IoStats::gap_auto_readapts`). The correction follows a
+//! width within about half its samples, so the streak is short; a width with few samples (a new
+//! choice) follows its own first steps and never reads as a changed disk. Each open starts cold:
+//! the model lives in memory only.
 //!
 //! **Safety.** The width only says which clean gaps step 4 rewrites with the bytes they hold, so
 //! no choice, good or bad, changes a byte of the file or anything a reader sees: only how long
@@ -79,15 +97,22 @@ const PROBE_EVERY: u64 = 16;
 /// of that over all steps once settled.
 const PROBE_EVERY_MAX: u64 = 128;
 
-/// The steps at the chosen width the fit keeps: about a minute of a node's commits.
-const BASE_WINDOW: usize = 48;
+/// The latest steps of each width the chooser keeps: the fit takes every width's, a width's
+/// correction its own. At the choice, about a quarter of a minute of a node's commits.
+const PER_WIDTH: usize = 16;
 
-/// The probes the fit keeps: from [`PROBE_WINDOW`] · [`PROBE_EVERY`] steps' worth to
-/// [`PROBE_WINDOW`] · [`PROBE_EVERY_MAX`].
-const PROBE_WINDOW: usize = 16;
+/// The steps a new choice holds before the next move may leave it (no probe runs among them): its
+/// correction then rests on them, past the first, which may spend a burst allowance the wider
+/// width left.
+const HOLD: u32 = 4;
 
-/// Steps in a row off the prediction by more than [`SHIFT_FACTOR`], the same way, that restart
-/// the warm-up.
+/// The share of the choice's predicted time a move to a width beside it must save: two widths that
+/// cost about the same do not trade places on noise.
+const MOVE_GAIN: f64 = 0.05;
+
+/// Steps in a row off the corrected prediction by more than [`SHIFT_FACTOR`], the same way, that
+/// restart the warm-up: at most half of [`PER_WIDTH`], since the correction follows the choice's
+/// newer steps once they are half its samples.
 const SHIFT_STREAK: u32 = 8;
 
 /// How far a step's sync time must be off the prediction, as a factor either way, to count
@@ -110,6 +135,22 @@ const IRLS_ROUNDS: usize = 3;
 
 /// The fewest samples the fit runs on.
 const MIN_SAMPLES: usize = 4;
+
+/// The position of `width`, one of [`CANDIDATES`], in it: 0 for 0, else one past its power of two.
+fn slot(width: u32) -> usize {
+    debug_assert!(CANDIDATES.contains(&width), "a candidate width: {width}");
+    if width == 0 {
+        0
+    } else {
+        width.trailing_zeros() as usize + 1
+    }
+}
+
+/// The widths beside `width`, one of [`CANDIDATES`]: half of it (none at 0) and twice it, at least
+/// 2 (none at [`MAX_GAP_FILL`]). The probes measure them, and the choice moves only to them.
+fn beside(width: u32) -> [Option<u32>; 2] {
+    [(width >= 1).then_some(width / 2), (width < MAX_GAP_FILL).then_some((2 * width).max(2))]
+}
 
 /// The gap sizes of one durable step's pages (ascending, distinct): its runs of adjacent pages,
 /// its pages, and the gaps of each size from 1 to [`MAX_GAP_FILL`] clean pages between two runs.
@@ -155,6 +196,14 @@ impl Gaps {
     }
 }
 
+/// A kept step: its sample, and whether the choice held its width (a step at the choice past the
+/// warm-up, not a probe).
+#[derive(Clone, Copy, Debug)]
+struct Kept {
+    sample: Sample,
+    held: bool,
+}
+
 /// One step's sync, for the fit: what it wrote, and how long the sync took.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -194,7 +243,7 @@ impl Model {
 pub(crate) struct Choice {
     /// The widest gap to fill, one of [`CANDIDATES`].
     pub(crate) width: u32,
-    /// Whether the width differs from the model's choice: a warm-up step at another width, or a
+    /// Whether the width differs from the choice: a warm-up step at another width than 0, or a
     /// probe.
     pub(crate) probe: bool,
 }
@@ -220,11 +269,10 @@ pub(crate) struct Outcome {
 /// cost and hit share, and the schedule.
 #[derive(Debug)]
 pub(crate) struct AutoGap {
-    /// The latest steps at the model's choice (warm-up steps at 0 too), oldest first.
-    base: VecDeque<Sample>,
-    /// The latest steps at another width, oldest first.
-    probes: VecDeque<Sample>,
-    /// The fit of [`Self::base`] and [`Self::probes`]; zero until they hold [`MIN_SAMPLES`].
+    /// The latest [`PER_WIDTH`] steps at each width of [`CANDIDATES`] (by [`slot`]), oldest
+    /// first.
+    kept: [VecDeque<Kept>; CANDIDATES.len()],
+    /// The fit of every width's [`Self::kept`] samples; zero until they number [`MIN_SAMPLES`].
     model: Model,
     /// The fill's time per gap tried, ns: [`FILL_PRIOR_NS`] until a fill is timed.
     fill_ns: f64,
@@ -240,21 +288,23 @@ pub(crate) struct AutoGap {
     interval: u64,
     /// The step ([`Self::steps`]) of the next probe.
     next_probe: u64,
-    /// The model's choice at the last step past the warm-up.
-    last_best: u32,
+    /// The choice: the width of every step past the warm-up but the probes (0 during a warm-up).
+    choice: u32,
+    /// Steps the choice still holds before a move may leave it ([`HOLD`]).
+    hold: u32,
     /// Whether the next probe that has two widths to pick from takes the larger.
     higher: bool,
     /// Steps in a row off the prediction past [`SHIFT_FACTOR`]: positive slower, negative faster.
     streak: i32,
-    /// The last [`Self::choose`]'s answer, which [`Self::observe`] files its sample under.
-    pending: Option<Choice>,
+    /// The last [`Self::choose`]'s answer, which [`Self::observe`] files its sample under, and
+    /// whether the choice held its width.
+    pending: Option<(Choice, bool)>,
 }
 
 impl Default for AutoGap {
     fn default() -> Self {
         AutoGap {
-            base: VecDeque::with_capacity(BASE_WINDOW + 1),
-            probes: VecDeque::with_capacity(PROBE_WINDOW + 1),
+            kept: std::array::from_fn(|_| VecDeque::with_capacity(PER_WIDTH + 1)),
             model: Model::default(),
             fill_ns: FILL_PRIOR_NS,
             fill_timed: false,
@@ -263,7 +313,8 @@ impl Default for AutoGap {
             steps: 0,
             interval: PROBE_EVERY,
             next_probe: PROBE_EVERY,
-            last_best: 0,
+            choice: 0,
+            hold: 0,
             higher: true,
             streak: 0,
             pending: None,
@@ -273,40 +324,60 @@ impl Default for AutoGap {
 
 impl AutoGap {
     /// The width for a step whose gap sizes are `gaps`: the warm-up's next width during a
-    /// warm-up, else the model's choice, but a probe's width at the probe schedule's steps
-    /// (module docs, "Exploration").
+    /// warm-up, else the choice (moved first, when its hold is over, to the width beside it that
+    /// is predicted to save [`MOVE_GAIN`]), but a probe's width at the probe schedule's steps
+    /// (module docs, "The choice", "Exploration").
     pub(crate) fn choose(&mut self, gaps: &Gaps) -> Choice {
-        let best = if self.warm == 0 { self.best(gaps) } else { 0 };
         let width = if self.warm > 0 {
             let done = (WARMUP_STEPS - self.warm) as usize;
             self.warm -= 1;
             WARMUP[done % WARMUP.len()]
         } else {
             self.steps += 1;
-            if best != self.last_best {
-                // A new choice: explore around it soon.
-                self.last_best = best;
-                self.interval = PROBE_EVERY;
-                self.next_probe = self.next_probe.min(self.steps + PROBE_EVERY);
+            let mut unmeasured = None;
+            if self.steps == 1 {
+                // The warm-up's end: the cheapest of the widths it measured.
+                let upto = gaps.upto();
+                self.take(cheapest(WARMUP.into_iter(), |w| self.predict(gaps, &upto, w)).0);
+            } else if self.hold == 0 {
+                match self.better_beside(gaps) {
+                    Some(width) if self.kept[slot(width)].is_empty() => unmeasured = Some(width),
+                    Some(width) => self.take(width),
+                    None => {}
+                }
             }
-            if self.steps >= self.next_probe {
+            if let Some(width) = unmeasured {
+                // Measured once, as a probe, before the choice may move there.
+                width
+            } else if self.hold > 0 {
+                self.hold -= 1;
+                self.choice
+            } else if self.steps >= self.next_probe {
                 self.interval = (2 * self.interval).min(PROBE_EVERY_MAX);
                 self.next_probe = self.steps + self.interval;
-                self.probe(best)
+                self.probe(self.choice)
             } else {
-                best
+                self.choice
             }
         };
-        let choice = Choice { width, probe: width != best };
-        self.pending = Some(choice);
+        let choice = Choice { width, probe: width != self.choice };
+        self.pending = Some((choice, self.steps > 0 && !choice.probe));
         choice
     }
 
+    /// Make `width` the choice: hold it [`HOLD`] steps, and explore around it soon.
+    fn take(&mut self, width: u32) {
+        self.choice = width;
+        self.hold = HOLD;
+        self.interval = PROBE_EVERY;
+        self.next_probe = self.next_probe.min(self.steps + PROBE_EVERY);
+    }
+
     /// File the outcome of the step [`Self::choose`] last answered for: update the fill's cost
-    /// and hit share, watch for a change of the disk's costs, and refit. Returns whether the step
-    /// restarted the warm-up (module docs, "Re-adaptation").
+    /// and hit share, watch for a change of the disk's costs, keep the sample with its width's,
+    /// and refit. Returns whether the step restarted the warm-up (module docs, "Re-adaptation").
     pub(crate) fn observe(&mut self, outcome: Outcome) -> bool {
-        let Some(choice) = self.pending.take() else { return false };
+        let Some((choice, held)) = self.pending.take() else { return false };
         if outcome.tried > 0 {
             let per_gap = outcome.fill_ns as f64 / outcome.tried as f64;
             let hit = outcome.filled as f64 / outcome.tried as f64;
@@ -322,21 +393,18 @@ impl AutoGap {
             pages: outcome.pages as f64,
             ns: outcome.sync_ns as f64,
         };
-        let readapt = self.warm == 0 && self.shifted(sample);
+        let at = slot(choice.width);
+        let readapt = self.warm == 0 && self.shifted(sample, at);
         if readapt {
-            self.base.clear();
-            self.probes.clear();
+            self.kept.iter_mut().for_each(VecDeque::clear);
             (self.warm, self.steps, self.streak) = (WARMUP_STEPS, 0, 0);
             (self.interval, self.next_probe) = (PROBE_EVERY, PROBE_EVERY);
+            (self.choice, self.hold) = (0, 0);
         }
-        let (window, cap) = if choice.probe {
-            (&mut self.probes, PROBE_WINDOW)
-        } else {
-            (&mut self.base, BASE_WINDOW)
-        };
-        window.push_back(sample);
-        if window.len() > cap {
-            window.pop_front();
+        let kept = &mut self.kept[at];
+        kept.push_back(Kept { sample, held });
+        if kept.len() > PER_WIDTH {
+            kept.pop_front();
         }
         self.refit();
         readapt
@@ -352,44 +420,69 @@ impl AutoGap {
         self.fill_ns
     }
 
-    /// The candidate that predicts the least time for step 4, fill and sync, of a step with
-    /// `gaps`; the smaller on a tie.
-    fn best(&self, gaps: &Gaps) -> u32 {
-        let (runs, pages) = (gaps.runs as f64, gaps.pages as f64);
-        let mut best = (0, f64::INFINITY);
-        for (&width, &(n, gap_pages)) in CANDIDATES.iter().zip(&gaps.upto()) {
-            let (n, gap_pages) = (n as f64, gap_pages as f64);
-            let cost = self.model.predict(runs - self.hit * n, pages + self.hit * gap_pages)
-                + self.fill_ns * n;
-            if cost < best.1 {
-                best = (width, cost);
-            }
-        }
-        best.0
+    /// The width beside the choice ([`beside`]) predicted to take the least time for a step with
+    /// `gaps`, if that saves [`MOVE_GAIN`] of the choice's predicted time.
+    fn better_beside(&self, gaps: &Gaps) -> Option<u32> {
+        let upto = gaps.upto();
+        let cost = |width: u32| self.predict(gaps, &upto, width);
+        let (width, time) = cheapest(beside(self.choice).into_iter().flatten(), cost);
+        (time < (1.0 - MOVE_GAIN) * cost(self.choice)).then_some(width)
     }
 
-    /// A probe's width beside the choice `best`: half of it or twice it (at least 2),
-    /// alternately, or the one of the two that exists.
-    fn probe(&mut self, best: u32) -> u32 {
-        let lower = (best >= 1).then_some(best / 2);
-        let higher = (best < MAX_GAP_FILL).then_some((2 * best).max(2));
+    /// The predicted time of step 4 at `width` for a step with `gaps` (`upto`: its candidates'
+    /// counts): the model's sync time for the runs and pages it would write, times the width's
+    /// correction ([`Self::correction`]), plus the fill's cost of its gaps.
+    fn predict(&self, gaps: &Gaps, upto: &[(u64, u64); CANDIDATES.len()], width: u32) -> f64 {
+        let at = slot(width);
+        let (n, gap_pages) = (upto[at].0 as f64, upto[at].1 as f64);
+        let sync = self
+            .model
+            .predict(gaps.runs as f64 - self.hit * n, gaps.pages as f64 + self.hit * gap_pages);
+        self.correction(at) * sync + self.fill_ns * n
+    }
+
+    /// The correction of the width at `at` ([`slot`]): the median, over its kept steps the choice
+    /// held (all its kept steps if it held none), of their sync time over the model's prediction
+    /// for them; 1 for a width with none (module docs, "The choice").
+    fn correction(&self, at: usize) -> f64 {
+        let kept = &self.kept[at];
+        let held = kept.iter().any(|k| k.held);
+        let mut ratios = [0.0f64; PER_WIDTH];
+        let mut n = 0;
+        for k in kept.iter().filter(|k| k.held || !held) {
+            let s = k.sample;
+            ratios[n] = s.ns / self.model.predict(s.runs, s.pages).max(1.0);
+            n += 1;
+        }
+        if n == 0 {
+            1.0
+        } else {
+            median(&mut ratios[..n])
+        }
+    }
+
+    /// A probe's width beside the choice `choice`: half of it or twice it (at least 2),
+    /// alternately, or the one of the two that exists ([`beside`]).
+    fn probe(&mut self, choice: u32) -> u32 {
         self.higher = !self.higher;
-        match (lower, higher) {
-            (Some(lower), Some(higher)) => {
+        match beside(choice) {
+            [Some(lower), Some(higher)] => {
                 if self.higher {
                     higher
                 } else {
                     lower
                 }
             }
-            (Some(width), None) | (None, Some(width)) => width,
-            (None, None) => unreachable!("every candidate has a neighbour"),
+            [Some(width), None] | [None, Some(width)] => width,
+            [None, None] => unreachable!("every candidate has a neighbour"),
         }
     }
 
-    /// Whether `sample` ends a streak of [`SHIFT_STREAK`] steps off the prediction the same way.
-    fn shifted(&mut self, sample: Sample) -> bool {
-        let predicted = self.model.predict(sample.runs, sample.pages).max(1.0);
+    /// Whether `sample`, a step at the width at `at` ([`slot`]), ends a streak of
+    /// [`SHIFT_STREAK`] steps off the corrected prediction the same way.
+    fn shifted(&mut self, sample: Sample, at: usize) -> bool {
+        let predicted =
+            (self.correction(at) * self.model.predict(sample.runs, sample.pages)).max(1.0);
         let ratio = sample.ns / predicted;
         let way = if ratio > SHIFT_FACTOR {
             1
@@ -402,35 +495,55 @@ impl AutoGap {
         self.streak.unsigned_abs() >= SHIFT_STREAK
     }
 
-    /// Fit the model to the windows' samples, once they hold [`MIN_SAMPLES`].
+    /// Fit the model to every width's kept samples, once they number [`MIN_SAMPLES`].
     fn refit(&mut self) {
         let mut samples = [Sample { runs: 0.0, pages: 0.0, ns: 0.0 }; MAX_SAMPLES];
+        let mut groups = [0u8; MAX_SAMPLES];
         let mut n = 0;
-        for (slot, s) in samples.iter_mut().zip(self.base.iter().chain(&self.probes)) {
-            *slot = *s;
-            n += 1;
+        for (at, kept) in self.kept.iter().enumerate() {
+            for k in kept {
+                (samples[n], groups[n]) = (k.sample, at as u8);
+                n += 1;
+            }
         }
-        self.model = if n >= MIN_SAMPLES { fit(&samples[..n]) } else { Model::default() };
+        self.model =
+            if n >= MIN_SAMPLES { fit(&samples[..n], &groups[..n]) } else { Model::default() };
     }
 }
 
-/// The data sync's cost model fitted to `samples` (module docs): each form's robust fit
-/// ([`fit_form`]), and the capped one only when its trimmed error is under [`CAPPED_GAIN`] times
-/// the sum's (the sum fits a capped disk's samples on one side of its cap as well, and is the one
-/// to keep when the two fit alike).
-fn fit(samples: &[Sample]) -> Model {
-    let n = samples.len().min(MAX_SAMPLES);
+/// The cheapest of `widths` by `cost`, and its cost; the smaller width on a tie.
+fn cheapest(widths: impl Iterator<Item = u32>, cost: impl Fn(u32) -> f64) -> (u32, f64) {
+    let mut best = (u32::MAX, f64::INFINITY);
+    for width in widths {
+        let time = cost(width);
+        if time < best.1 || (time == best.1 && width < best.0) {
+            best = (width, time);
+        }
+    }
+    best
+}
+
+/// The data sync's cost model fitted to `samples`, each of the width `groups` names (its
+/// [`slot`]; module docs): each form's robust fit ([`fit_form`]), and the capped one only when
+/// its error over the widths ([`width_error`]) is under [`CAPPED_GAIN`] times the sum's (the sum
+/// fits a capped disk's samples on one side of its cap as well, and is the one to keep when the
+/// two fit alike).
+fn fit(samples: &[Sample], groups: &[u8]) -> Model {
+    let n = samples.len().min(groups.len()).min(MAX_SAMPLES);
     let mut data = Data::default();
-    for (i, s) in samples.iter().take(n).enumerate() {
+    for (i, (s, &group)) in samples.iter().zip(groups).take(n).enumerate() {
         data.runs[i] = s.runs / 1e3;
         data.pages[i] = s.pages / 1e3;
         data.ys[i] = s.ns / 1e6;
+        data.groups[i] = group;
     }
     data.n = n;
     let mut ys = data.ys;
     let typical = median(&mut ys[..n]);
-    let (sum, sum_err) = fit_form(&data, Form::Sum, typical);
-    let (capped_beta, capped_err) = fit_form(&data, Form::Capped, typical);
+    let sum = fit_form(&data, Form::Sum, typical);
+    let capped_beta = fit_form(&data, Form::Capped, typical);
+    let (sum_err, capped_err) =
+        (width_error(&data, Form::Sum, &sum), width_error(&data, Form::Capped, &capped_beta));
     // Two fits within a thousandth of a typical sync of exact are alike.
     let floor = typical / 1e3;
     let capped = capped_err + floor < CAPPED_GAIN * (sum_err + floor);
@@ -452,17 +565,33 @@ fn median(xs: &mut [f64]) -> f64 {
     }
 }
 
-/// The most samples a fit takes: both windows.
-const MAX_SAMPLES: usize = BASE_WINDOW + PROBE_WINDOW;
+/// The most samples a fit takes: every width's.
+const MAX_SAMPLES: usize = PER_WIDTH * CANDIDATES.len();
 
-/// The capped form is kept when its trimmed error ([`TRIM`]) is under this share of the sum's.
+/// The capped form is kept when its error over the widths ([`width_error`]) is under this share of
+/// the sum's.
 const CAPPED_GAIN: f64 = 0.7;
 
-/// The share of a fit's samples its trimmed error counts, the closest first: the root mean
-/// square of their residuals. It leaves out the stalls, but not the probes (a quarter of the
-/// samples), which a form that misfits them could otherwise wave off as outliers: a median would
-/// not see a sum that fits the chosen width's samples, most of the window, and misses the rest.
-const TRIM: f64 = 0.9;
+/// `form`'s error at `beta` on `data`, each width counted once: the root mean square, over the
+/// widths the samples cover, of the median absolute residual of each width's samples. A stall
+/// among a width's steps moves its median little, and a probed width's few steps count as much as
+/// the choice's many: a form that fits the choice and misses them cannot hide them among the rest.
+fn width_error(data: &Data, form: Form, beta: &[f64; 3]) -> f64 {
+    let (mut squares, mut widths) = (0.0, 0usize);
+    let mut abs = [0.0f64; MAX_SAMPLES];
+    for group in 0..CANDIDATES.len() as u8 {
+        let mut n = 0;
+        for i in (0..data.n).filter(|&i| data.groups[i] == group) {
+            abs[n] = (data.ys[i] - predict_form(form, beta, data, i)).abs();
+            n += 1;
+        }
+        if n > 0 {
+            squares += median(&mut abs[..n]).powi(2);
+            widths += 1;
+        }
+    }
+    (squares / widths.max(1) as f64).sqrt()
+}
 
 /// Tukey's bisquare constant: a residual past this many robust standard deviations gets no
 /// weight in the fit's last rounds.
@@ -472,18 +601,25 @@ const BISQUARE: f64 = 4.685;
 const BISQUARE_ROUNDS: usize = 2;
 
 /// A fit's samples, scaled: runs and pages in thousands, times in milliseconds, so the normal
-/// equations stay well conditioned whatever the steps' sizes.
+/// equations stay well conditioned whatever the steps' sizes; and each one's width ([`slot`]).
 #[derive(Debug)]
 struct Data {
     runs: [f64; MAX_SAMPLES],
     pages: [f64; MAX_SAMPLES],
     ys: [f64; MAX_SAMPLES],
+    groups: [u8; MAX_SAMPLES],
     n: usize,
 }
 
 impl Default for Data {
     fn default() -> Self {
-        Data { runs: [0.0; MAX_SAMPLES], pages: [0.0; MAX_SAMPLES], ys: [0.0; MAX_SAMPLES], n: 0 }
+        Data {
+            runs: [0.0; MAX_SAMPLES],
+            pages: [0.0; MAX_SAMPLES],
+            ys: [0.0; MAX_SAMPLES],
+            groups: [0; MAX_SAMPLES],
+            n: 0,
+        }
     }
 }
 
@@ -507,15 +643,15 @@ fn predict_form(form: Form, beta: &[f64; 3], data: &Data, i: usize) -> f64 {
     }
 }
 
-/// `form`'s coefficients fitted to `data` (scaled, each at least 0), and the fit's trimmed error
-/// ([`TRIM`]): one unweighted fit ([`solve_form`]), [`IRLS_ROUNDS`] reweighted by Huber's
+/// `form`'s coefficients fitted to `data` (scaled, each at least 0): one unweighted fit
+/// ([`solve_form`]), [`IRLS_ROUNDS`] reweighted by Huber's
 /// weights of the residuals, then [`BISQUARE_ROUNDS`] by Tukey's bisquare, which gives a stall far
 /// off the rest no weight at all (skipped when it would leave under [`MIN_SAMPLES`] weighted).
 /// Each round's scale is the residuals' median absolute value times 1.4826 (a normal
 /// deviation's), but at least a hundredth of `typical`, the samples' median time: a fit closer
 /// than that is exact, and no sample of it loses weight (a probe the fit matches to rounding
 /// must keep its say).
-fn fit_form(data: &Data, form: Form, typical: f64) -> ([f64; 3], f64) {
+fn fit_form(data: &Data, form: Form, typical: f64) -> [f64; 3] {
     let n = data.n;
     let mut weights = [1.0f64; MAX_SAMPLES];
     let mut beta = solve_form(data, form, &weights, None);
@@ -558,16 +694,7 @@ fn fit_form(data: &Data, form: Form, typical: f64) -> ([f64; 3], f64) {
         weights = next;
         beta = solve_form(data, form, &weights, Some(&beta));
     }
-    median_abs(&beta, &mut abs);
-    let mut squares = [0.0f64; MAX_SAMPLES];
-    for (sq, r) in squares.iter_mut().zip(&abs[..n]) {
-        *sq = r * r;
-    }
-    let squares = &mut squares[..n];
-    squares.sort_unstable_by(f64::total_cmp);
-    let kept = ((n as f64 * TRIM).ceil() as usize).clamp(1, n.max(1));
-    let trimmed = (squares[..kept.min(n)].iter().sum::<f64>() / kept as f64).sqrt();
-    (beta, trimmed)
+    beta
 }
 
 /// `form`'s weighted non-negative least squares on `data`. The sum: [`nnls`] on `[1, runs,
