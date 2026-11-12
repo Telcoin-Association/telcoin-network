@@ -9,10 +9,9 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     thread,
-    time::{Duration, Instant},
 };
 
 use super::*;
@@ -303,8 +302,9 @@ fn owned_scan(ro: &Arc<crate::RoTxn>, pause: impl FnOnce()) -> (u64, u64) {
 /// mode of values inline, in one-page runs and in runs of several pages, replaced and deleted so
 /// runs are freed and reused, in a file that grows past a small mapping reservation (1 MiB): the
 /// mapping moves while the readers read. Each scan takes a fresh snapshot and must match the
-/// digest stored with it; reader 0 holds its half-done scan across commits, and reader 3 runs
-/// `Env::check` after each scan, beside the writer.
+/// digest stored with it; reader 0 holds its half-done scan across commits (the writer's rounds
+/// start once its first scan is half done, so a scan is held across them whatever the timing),
+/// and reader 3 runs `Env::check` after each scan, beside the writer.
 fn owned_readers_under_runs_and_remaps(commits: u32, sync: SyncMode, seed: u64) {
     let (_dir, path) = temp("tn_lmdb_owned_readers");
     let options = EnvOptions { map_reserve: 1 << 20, ..options(sync) };
@@ -343,10 +343,14 @@ fn owned_readers_under_runs_and_remaps(commits: u32, sync: SyncMode, seed: u64) 
     let mut rng = Rng(seed);
     write(&mut rng, &mut model, 0);
     let before = mapping_base(&env);
+    // Reader 0 sends once, from inside its first scan's pause; the writer's rounds wait for it.
+    let (half_done, half_done_rx) = mpsc::channel::<()>();
+    let mut half_done = Some(half_done);
     thread::scope(|s| {
         for r in 0..4 {
             let (env, stop, committed) = (&env, &stop, &committed);
             let (scans, held, checks) = (&scans, &held, &checks);
+            let mut half_done = if r == 0 { half_done.take() } else { None };
             s.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let ro = Arc::new(env.begin_ro().expect("ro"));
@@ -356,9 +360,10 @@ fn owned_readers_under_runs_and_remaps(commits: u32, sync: SyncMode, seed: u64) 
                         if r != 0 {
                             return;
                         }
-                        let until = Instant::now() + Duration::from_millis(300);
+                        if let Some(half_done) = half_done.take() {
+                            half_done.send(()).expect("the writer waits for it");
+                        }
                         while committed.load(Ordering::Acquire) < at + 3
-                            && Instant::now() < until
                             && !stop.load(Ordering::Relaxed)
                         {
                             thread::yield_now();
@@ -377,6 +382,8 @@ fn owned_readers_under_runs_and_remaps(commits: u32, sync: SyncMode, seed: u64) 
             });
         }
         let _stop = StopOnDrop(&stop);
+        // `Err` only when reader 0 ended before its first pause (a panic the scope reports).
+        let _ = half_done_rx.recv();
         for round in 1..commits {
             write(&mut rng, &mut model, round);
         }

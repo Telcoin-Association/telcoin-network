@@ -78,8 +78,9 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   so the base does not move while the file grows within it (past it the mapping moves, and the
   old one is kept for its readers). The OS page cache is the cache.
 - **Fail-stop.** Any I/O or commit error, and any damage a read finds, latches the environment.
-  From then on writes and commits return `Failed` and reads continue. A reopen recovers from the
-  metas.
+  From then on writes and commits return `Failed` and reads continue (a latched write
+  transaction's own reads serve what its failed write left half-applied, which its refused
+  commit never publishes). A reopen recovers from the metas.
 - **Deletes merge.** A page a delete leaves under a quarter full absorbs same-parent siblings
   while they fit, up the tree. A merge allocates nothing and never splits. See
   [Deletes and merging](#deletes-and-merging).
@@ -108,7 +109,7 @@ Each meta page holds a 128-byte record at offset 0, and the rest of the page is 
 | off | size | field |
 |---|---|---|
 | 0 | 8 | magic `b"tn-lmdb\0"` |
-| 8 | 4 | format version = 6 |
+| 8 | 4 | format version = 8 |
 | 12 | 4 | page size P |
 | 16 | 8 | txn id |
 | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -141,7 +142,9 @@ Decoding (`Meta::decode`) runs its checks in this order:
    would fail `page::validate`'s canonical-length rule. Version 6 put the flags word and the boot
    id in bytes 96..116, which version 5 reserved, for the weak record. Version 7 put the tree tag
    in bytes 18..22 of every tree page's header, which version 6 reserved ([Tree
-   pages](#tree-pages-pagers)).
+   pages](#tree-pages-pagers)). Version 8 put the tree tag in bytes 20..24 of every overflow
+   run's header, where version 7 kept the run's page count, which its `len` already implies
+   ([Overflow runs](#overflow-runs-overflowrs)).
 3. The CRC must match, else `Corrupt`.
 4. The remaining fields must be possible, else `Corrupt`: a valid page size, no flag but bit 0,
    no non-zero reserved byte, well-formed tree roots, a `page_count` of at least 2, and a next
@@ -282,8 +285,14 @@ overflow cell:  vlen u32 = 12 | klen u16 | flags u16 = 1 | key | ovf_pgno u32 | 
 
 run (n·P bytes, n = ceil((28 + len) / P)):
   @0  pgno u32 | @4 kind u8 = 3 | @5 flags u8 = 0 | @6 reserved u16 = 0 | @8 txn u64
-  @16 len u32  | @20 npages u32 | @24 value (len bytes) | zero pad | CRC32 u32 at n·P − 4
+  @16 len u32  | @20 tag u32 | @24 value (len bytes) | zero pad | CRC32 u32 at n·P − 4
 ```
+
+- **The run names its tree.** `tag` is the tag of the tree whose leaf names the run (the same
+  tag the leaf's header carries, [Tree pages](#tree-pages-pagers)); the cell does not store it,
+  a read takes it from the leaf the cell is in (`Ovf::tag`). So a reference that damage
+  redirects to another tree's run of the same txn and length is `Corrupt`, as a child pointer
+  redirected to another tree's page is.
 
 - **The cell is canonical.** `ovf_pgno` is the run's first page, `ovf_txn` the low 32 bits of the
   txn that wrote it (the identity check, as a branch cell's `child_txn`), and `len` the value's
@@ -809,10 +818,14 @@ nothing under auto) from what the disk's syncs were measured to cost (`env/gap_a
   transaction named by a page it did not write, or by an untrusted root handle, is `Corrupt`, and
   a private child must be the page and txn its parent names. A freed private page goes back to
   the pool at once, so a forged pointer to a page this transaction allocated for another tree
-  must not free it. A tree whose `overflow_pages` is 0 reads its branches, its first leaf and its
-  private leaves (in memory) only. A tree with runs reads every leaf, checks each run's header,
-  identity and provenance (`leaving_run`, without the CRC: the value is not read), and requires
-  the run pages to add up to `overflow_pages`. Every tree a free walk meets (a plain table's, a
+  must not free it. Every leaf is read with a descent's checks (the page, its tree's tag and the
+  txn its parent names), so a leaf pointer redirected to another table's page frees nothing. A
+  tree whose `overflow_pages` is 0 verifies no leaf's CRC and refuses any overflow cell it finds
+  (a handle that miscounts its runs would otherwise leak them). A tree with runs verifies every
+  leaf unless private or stamped, checks each run's header, identity and provenance
+  (`leaving_run`, without the CRC: the value is not read), and requires the run pages to add up
+  to `overflow_pages`. A one-page tree walked on its own keeps no set of the pages reached (the
+  set is a bitset sized by the highest page number inserted). Every tree a free walk meets (a plain table's, a
   dup table's outer and nested trees, `delete_prefix`'s nested tree) must also hold exactly the
   branch and leaf pages its handle counts, counted from the levels the walk reads, so a root that
   miscounts its pages is refused too. Damage refuses the free with `Corrupt`, before any page is
@@ -1128,7 +1141,7 @@ against its cell before returning a byte:
 - its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
 - its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
   `ovf_txn`, so a redirected or stale reference is `Corrupt`;
-- its `len` and `npages` are the ones the cell implies;
+- its `len` is the cell's, and its `tag` is the tag of the tree whose leaf holds the cell;
 - unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
   page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
   ties them to it: without it a reused or redirected middle page would return wrong data.
@@ -1410,7 +1423,12 @@ so no later transaction rewrote it in place. It was on the disk before S's meta 
   the steady state beside it, whose pages are durable, and stamps every page with a txn past the
   head's (step 6), so it names no page of the head's commits. A read-only open writes nothing.
 
-A volume loss keeps what reached the disk, so every skipped page is intact. The parents name
+A volume loss keeps what reached the disk, so every skipped page is intact. An open that passed
+over a weak head W with `trust_unsynced = false` builds on S's free list and page count, which
+are W's commits' pages: any write transaction after it, committed, aborted or crashed, may
+reuse them (W's meta stays in its slot until the first commit that changes something writes
+over it), after which a trusting open's check of W fails and it opens at S with a warning.
+ The parents name
 txns by their low 32 bits (a branch cell's `child_txn`, a `TreeRoot`'s `root_txn`, an overflow
 cell's txn), so the walk compares them by wrapping distance from S's (`check::named_after`): a
 txn is after S when it is 1 to 2^31 − 1 past it. That is exact for every txn after S while W is
@@ -1542,7 +1560,11 @@ in order:
 ## Failure latch
 
 `latch.rs` keeps the first cause and never clears it, and only the first cause is logged
-(`tracing::error!`, target `tn_lmdb`).
+(`tracing::error!`, target `tn_lmdb`). Reads of the published snapshots continue after a
+latch; the latched write transaction's own reads and cursor moves are not refused either and
+serve its working state as the failed write left it, half-applied (a dup write's nested root
+changed but its outer cell not, a dropped table's pages freed but its record kept), which its
+refused commit never publishes.
 
 | latches (later writes and commits return `Failed`) | does not latch |
 |---|---|
@@ -1817,7 +1839,9 @@ outer cell, and the tree's last leaf is freed. `delete_prefix(k)` frees `k`'s wh
 one walk, which collects every page and run before it frees any (damage, a root whose counters
 miss its pages included, is refused first), removes
 the cell and returns the rows removed (0, and no change, when `k` holds none). On a packed key the
-same calls work on its set, below.
+same calls work on its set, below: a row delete that keeps the set rewrites the outer cell as a
+replace does, which never merges; only the delete of a set's last row removes the cell and can
+merge (a shrinking replace of a plain table's value does not merge either).
 
 **Packed sets.** In a table whose `packed_max` is above 0, a new outer key whose first row encodes
 within the bound (`2 + 4 + |s| + |v|` bytes, [Packed sets](#packed-sets)) is created as a packed
@@ -2405,7 +2429,8 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   growth, not a `SIGBUS` on a mapped write. That holds only where preallocation works. On a file
   system without it (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on NFS before version 4.2
   and FUSE file systems that do not implement it, or `F_PREALLOCATE` with `ENOTSUP`), growth is a
-  sparse `set_len`, and a full disk can then be a `SIGBUS` on a mapped write. Growth is geometric:
+  sparse `set_len` (warned once per process, target `tn_lmdb`), and a full disk can then be a
+  `SIGBUS` on a mapped write. Growth is geometric:
   at least `clamp(len, 1 MiB, max_growth)` more (`EnvOptions::max_growth`, default 1 GiB, at least
   `MIN_GROWTH`, 1 MiB), rounded to the OS page, so a running file holds a preallocated tail of up to
   one step past its pages. A clean close truncates the file to its pages, rounded up to the OS page
@@ -2590,13 +2615,23 @@ argument and the measurements. Code and other docs cite the items by number, so 
      the writer rewrites in place and no reader slices, aside), retired mappings outlive every view
      of them, and a read-only open's shared lock keeps every writer out. It also rests on a truthful
      free list: a crafted file whose free list names a live page can make a write overwrite bytes a
-     reader still holds ([Free list and page reuse](#free-list-and-page-reuse)). Copy-on-write adds
-     no `unsafe` ([Commit protocol](#commit-protocol)).
+     reader still holds ([Free list and page reuse](#free-list-and-page-reuse)); and on undamaged
+     published pointers: reads do not recompute CRCs, so a branch cell, overflow reference or
+     nested root damaged at rest can name a page the writer is reusing in its open transaction
+     (one freed below every reader's snapshot), and the reader slices it and reads its trailer
+     and header while the writer stores into it. The checks that follow the slice refuse the
+     page (its new txn is after the snapshot's, or its old bytes fail the tag or identity
+     check), so the outcome is `Corrupt` or torn bytes, never a page the reader keeps; but the
+     overlap is a data race by Rust's rules, the same class LMDB and MDBX accept. A read path that
+     verified every page's CRC before use (do-not-flag item 3) or copied pages out of the mapping
+     would close it. Copy-on-write adds no `unsafe` ([Commit protocol](#commit-protocol)).
    - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf`, `flock`
      and, on macOS, `sysctlbyname("kern.bootsessionuuid")` (the boot id, into a stack buffer),
      each on a live file descriptor (`sysconf` and `sysctlbyname` take none).
    - `crc.rs`: the aarch64 PMULL kernel (`pmull::update`, a copy of `tn-storage`'s), called only
-     after the CPU feature is detected at runtime.
+     after the CPU feature is detected at runtime. The pull-request test lanes run on x86_64,
+     where it is not compiled; `.github/workflows/arm64-crc.yaml` runs its `crc::tests` on an
+     arm64 runner.
    - `page::prefetch`: a one-instruction prefetch hint (`prfm` or `prefetcht0`) at a byte of the
      page, for a search's next probes and a level's first cells; a hint never faults or changes
      memory.
@@ -2762,7 +2797,8 @@ relies on and every platform switch in the code, for a port to another OS.
 | `lib.rs` | crate docs, `compile_error!` off Linux and macOS, re-exports |
 | `error.rs` | `Error`, `Result` |
 | `stats.rs` | `IoStats`, the writer's I/O and allocation counters (`Env::io_stats`) |
-| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
+| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit (step 4's gap fill included), `sync` |
+| `env/gap_auto.rs` | `GapFill::Auto`'s chooser (`AutoGap`): the gap-fill width per scattered commit from the measured sync costs, probing less once its choice settles |
 | `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial), `DupRoCursor`, `DupTxnCursor` (the dup cursors, over `tree::dup_cursor::DupWalk`); dup tables' point ops, `delete_prefix` and the per-transaction map of their nested trees, flushed at commit; commit steps 1–3 and 7 |
 | `meta.rs` | the 128-byte meta record, `choose_meta`, `slot_to_write` |
 | `page.rs` | the slotted page codec (inline, overflow and nested leaf cells, `Val`), `Geometry` (limits, `place`: inline or overflow), `validate` |
@@ -2780,7 +2816,7 @@ relies on and every platform switch in the code, for a port to another OS.
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `drop_cached_pages`, `will_need`, `flock_exclusive`, `flock_shared`, `boot_id` |
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`crc.rs` differs in its docs, two `dead_code` allows and `#[inline]` on `crc_is_zero`, which a sync keeps; `page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
-| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
+| `tests/`, `*/tests.rs`, `env/*_tests.rs` | crash, damage (nested cells, dup records, overflow runs and packed sets included), dup tables against a composite-key model (the dup cursors' and packed sets' suites with them), multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests (`env/gap_fill_tests.rs`, `env/io_stats_tests.rs`: step 4's gap fill and the I/O counters) |
 | `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch, and the on-demand probe of step 3's thread count (`stamp_probe`) |
 
 ---

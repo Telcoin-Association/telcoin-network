@@ -6,8 +6,14 @@
 //!
 //! run (n·P bytes, n = ceil((28 + len) / P)):
 //!   @0  pgno u32 | @4 kind u8 = 3 | @5 flags u8 = 0 | @6 reserved u16 = 0 | @8 txn u64
-//!   @16 len u32  | @20 npages u32 | @24 value (len bytes) | zero pad | CRC u32 at n·P − 4
+//!   @16 len u32  | @20 tag u32 | @24 value (len bytes) | zero pad | CRC u32 at n·P − 4
 //! ```
+//!
+//! **A run names its tree.** `tag` is the tag of the tree whose leaf names the run
+//! ([`crate::tree::tags`]: the leaf's header carries the same tag, verified when the leaf was
+//! fetched), so a reference that damage redirects to another tree's run of the same txn and
+//! length is refused, as a redirected child pointer is. The cell does not store the tag: a read
+//! takes it from the leaf the cell is in ([`Ovf::tag`]).
 //!
 //! **One CRC per run.** The trailer covers `[0, n·P − 4)`: pages 2..n have no header of their
 //! own, so only the run's CRC ties them to it. All zeros means dirty (a run being written), as for
@@ -19,7 +25,7 @@
 //! the old run (as `n` single pages).
 //!
 //! **Reading** ([`checked_run`]) checks the reference against the run's header (page number,
-//! kind, flags, reserved bytes, txn identity, length, page count), the range against the
+//! kind, flags, reserved bytes, txn identity, length, tree tag), the range against the
 //! snapshot, and, unless the run is private to the writer, the non-zero trailer and, for a run of
 //! more than one page, the full CRC: without it a reused or redirected middle page would return
 //! wrong data. A 1-page run has no page without a header, so its header checks catch a reused
@@ -66,7 +72,7 @@ const FLAGS_OFF: usize = 5;
 const RESERVED_OFF: usize = 6;
 const TXN_OFF: usize = 8;
 const LEN_OFF: usize = 16;
-const NPAGES_OFF: usize = 20;
+const TAG_OFF: usize = 20;
 
 /// An overflow cell's reference to its run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,18 +84,21 @@ pub(crate) struct Ovf {
     pub(crate) txn: u32,
     /// The value's length.
     pub(crate) len: u32,
+    /// The tag of the tree whose leaf holds the cell ([`crate::page::tag`] of that leaf), which
+    /// the run's header must carry too. Not part of the cell's bytes.
+    pub(crate) tag: u32,
 }
 
 impl Ovf {
-    /// Decode an overflow cell's 12 value bytes.
-    pub(crate) fn decode(bytes: &[u8; OVF_CELL]) -> Self {
+    /// Decode an overflow cell's 12 value bytes, found in a leaf of the tree tagged `tag`.
+    pub(crate) fn decode(bytes: &[u8; OVF_CELL], tag: u32) -> Self {
         let u32_at = |off: usize| {
             u32::from_le_bytes(bytes[off..off + 4].try_into().expect("a 4-byte field"))
         };
-        Self { pgno: u32_at(0), txn: u32_at(4), len: u32_at(8) }
+        Self { pgno: u32_at(0), txn: u32_at(4), len: u32_at(8), tag }
     }
 
-    /// The 12 value bytes of an overflow cell.
+    /// The 12 value bytes of an overflow cell (the tag is the leaf's, not the cell's).
     pub(crate) fn encode(&self) -> [u8; OVF_CELL] {
         let mut out = [0; OVF_CELL];
         out[0..4].copy_from_slice(&self.pgno.to_le_bytes());
@@ -105,9 +114,16 @@ pub(crate) fn run_pages(len: usize, page_size: usize) -> usize {
 }
 
 /// Write the run of `value` into `run` (exactly [`run_pages`] pages of `page_size` bytes): the
-/// header for page `pgno` and txn `txn`, the value, a zero pad and a zero (dirty) trailer. Every
-/// byte is written, so the pages need not be zero.
-pub(crate) fn encode_run(run: &mut [u8], page_size: usize, pgno: u32, txn: u64, value: &[u8]) {
+/// header for page `pgno`, txn `txn` and the tree tagged `tag`, the value, a zero pad and a zero
+/// (dirty) trailer. Every byte is written, so the pages need not be zero.
+pub(crate) fn encode_run(
+    run: &mut [u8],
+    page_size: usize,
+    pgno: u32,
+    txn: u64,
+    tag: u32,
+    value: &[u8],
+) {
     let n = run_pages(value.len(), page_size);
     debug_assert_eq!(run.len(), n * page_size, "a run of {n} pages");
     run[PGNO_OFF..PGNO_OFF + 4].copy_from_slice(&pgno.to_le_bytes());
@@ -116,7 +132,7 @@ pub(crate) fn encode_run(run: &mut [u8], page_size: usize, pgno: u32, txn: u64, 
     run[RESERVED_OFF..RESERVED_OFF + 2].fill(0);
     run[TXN_OFF..TXN_OFF + 8].copy_from_slice(&txn.to_le_bytes());
     run[LEN_OFF..LEN_OFF + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    run[NPAGES_OFF..NPAGES_OFF + 4].copy_from_slice(&(n as u32).to_le_bytes());
+    run[TAG_OFF..TAG_OFF + 4].copy_from_slice(&tag.to_le_bytes());
     let end = RUN_HEADER + value.len();
     run[RUN_HEADER..end].copy_from_slice(value);
     run[end..].fill(0);
@@ -142,10 +158,10 @@ pub(crate) fn run_txn(run: &[u8]) -> u64 {
 /// [`crate::tree::PageRead`] store: `slice(pgno, len)` maps the run's bytes, exactly `len` of
 /// them (`None` if not mapped). The run must lie in `2..page_count` (a checked add), hold
 /// `ovf.pgno`, kind 3, flags 0 and zero reserved bytes in its header, a txn no later than
-/// `snapshot_txn` whose low 32 bits are `ovf.txn`, and the length and page count `ovf` implies
-/// (`len <=` [`MAX_VALUE`]). A run that is not `private` to the writer must also carry a non-zero
-/// trailer and a valid CRC over the whole run when `verify` asks for it. Any failure is
-/// [`Error::Corrupt`].
+/// `snapshot_txn` whose low 32 bits are `ovf.txn`, the length `ovf` names (`len <=`
+/// [`MAX_VALUE`]) and the tag of the tree whose leaf names it (`ovf.tag`). A run that is not
+/// `private` to the writer must also carry a non-zero trailer and a valid CRC over the whole run
+/// when `verify` asks for it. Any failure is [`Error::Corrupt`].
 ///
 /// Every read of a value verifies the CRC of a run of more than one page ([`RunCrc::MultiPage`]):
 /// pages 2..n of a run carry no header, so a reused or redirected middle page is caught by the CRC
@@ -199,8 +215,15 @@ pub(crate) fn checked_run<'a>(
             format_args!("txn {txn} is not the run its cell names: a redirected or stale pointer"),
         ));
     }
-    if u32_at(LEN_OFF) as usize != len || u32_at(NPAGES_OFF) as usize != n {
-        return Err(run_error(ovf, "its length or page count is not its cell's"));
+    if u32_at(LEN_OFF) as usize != len {
+        return Err(run_error(ovf, "its length is not its cell's"));
+    }
+    let found = u32_at(TAG_OFF);
+    if found != ovf.tag {
+        return Err(run_error(
+            ovf,
+            format_args!("belongs to the tree tagged {found:#x}, not to {:#x}", ovf.tag),
+        ));
     }
     if !private {
         if crc::crc_is_zero(run) {
@@ -234,6 +257,9 @@ mod tests {
     /// A txn whose high bits are set, so a 32-bit identity differs from the full id.
     const TXN: u64 = 0x1_0000_0007;
 
+    /// The tag of the tree the test runs belong to.
+    const TAG: u32 = 0x5a5a_0003;
+
     /// A value spanning `pages` pages, every byte non-zero.
     fn value_of_pages(pages: usize) -> Vec<u8> {
         (0..pages * P - RUN_HEADER - TRAILER - 100).map(|i| (i % 251) as u8 + 1).collect()
@@ -245,9 +271,9 @@ mod tests {
         let n = run_pages(value.len(), P);
         let mut file = vec![0; (2 + n) * P];
         let run = &mut file[2 * P..];
-        encode_run(run, P, 2, TXN, value);
+        encode_run(run, P, 2, TXN, TAG, value);
         crc::add_crc32_nonzero(run);
-        let ovf = Ovf { pgno: 2, txn: TXN as u32, len: value.len() as u32 };
+        let ovf = Ovf { pgno: 2, txn: TXN as u32, len: value.len() as u32, tag: TAG };
         (file, ovf, (2 + n) as u32)
     }
 
@@ -269,7 +295,7 @@ mod tests {
         let bytes = value_of_pages(3);
         let (mut file, ovf, count) = image(&bytes);
         assert_eq!(count, 5, "three pages");
-        assert_eq!(Ovf::decode(&ovf.encode()), ovf);
+        assert_eq!(Ovf::decode(&ovf.encode(), TAG), ovf);
         for verify in [RunCrc::Always, RunCrc::MultiPage, RunCrc::Skip] {
             let run = read(&file, (ovf, count, TXN, false, verify)).expect("a stamped run");
             assert_eq!((value(run, ovf), run.len()), (bytes.as_slice(), 3 * P));
@@ -312,8 +338,8 @@ mod tests {
         let n = run_pages(bytes.len(), P) as u32;
         let r = store.alloc_run(n).expect("run");
         let txn = store.txn();
-        encode_run(store.run_mut(r, n).expect("a private run"), P, r, txn, &bytes);
-        let ovf = Ovf { pgno: r, txn: txn as u32, len: bytes.len() as u32 };
+        encode_run(store.run_mut(r, n).expect("a private run"), P, r, txn, TAG, &bytes);
+        let ovf = Ovf { pgno: r, txn: txn as u32, len: bytes.len() as u32, tag: TAG };
         assert_eq!(store.overflow(ovf).expect("the writer's own run"), bytes.as_slice());
         let got = store.reader().overflow(ovf).map(<[u8]>::len);
         assert!(matches!(got, Err(Error::Corrupt(_))), "written after the snapshot: {got:?}");
@@ -331,7 +357,7 @@ mod tests {
     /// Every kind of damage to a run, or a cell that does not name it, is `Corrupt`: each header
     /// field (re-stamped, so only the header check can see it), a zero trailer, a CRC flip in a
     /// middle page, a range past the file's end or past the last page number, a run written after
-    /// the snapshot, and a cell whose txn, length or limit is not the run's.
+    /// the snapshot, and a cell whose txn, length, limit or tree is not the run's.
     #[test]
     fn each_damaged_run_is_corrupt() {
         let (file, ovf, count) = image(&value_of_pages(3));
@@ -348,7 +374,7 @@ mod tests {
             ("txn, low 32 bits", TXN_OFF, 1),
             ("txn, past the snapshot", TXN_OFF + 4, 2),
             ("len", LEN_OFF, 1),
-            ("npages", NPAGES_OFF, 1),
+            ("tag", TAG_OFF, 1),
         ];
         for (name, off, xor) in fields {
             let mut bad = file.clone();
@@ -397,6 +423,10 @@ mod tests {
             (
                 "len over the limit",
                 (Ovf { len: MAX_VALUE as u32 + 1, ..ovf }, count, TXN, false, RunCrc::MultiPage),
+            ),
+            (
+                "another tree's leaf",
+                (Ovf { tag: TAG ^ 1, ..ovf }, count, TXN, false, RunCrc::MultiPage),
             ),
         ];
         let short = &file[..file.len() - 1];

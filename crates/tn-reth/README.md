@@ -504,7 +504,8 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
   `check_consistency` would then prune the static files back to the empty database's tip. The
-  checks use `try_exists`, so a stat error fails the open. The MDBX build's error names the
+  checks stat each name with `symlink_metadata` (a symbolic link counts as present, dangling or
+  not), so a stat error fails the open. The MDBX build's error names the
   directory and both engines; the operator runs the default build or starts from a fresh datadir
   (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
   missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a build
@@ -515,7 +516,10 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   `db/` holding `mdbx.dat` moves it onto tn-lmdb ("Migrating from MDBX" below).
 - **`--db.*` flags on tn-lmdb** (`tn_lmdb_args`): `--db.max-size` is the mapping's address-space
   reservation (unset: the engine's default, 1 GiB); past it the engine remaps at double the size,
-  so it is not a cap. `--db.page-size` sets a new file's page size (the engine accepts a power of
+  so it is not a cap, and the node does not stop at it as reth's help for the flag says (that
+  describes MDBX): the node logs a warning when the flag is set (`warn_max_size_is_a_reservation`,
+  where the command line is read, so a temp chain's own reservation draws none).
+  `--db.page-size` sets a new file's page size (the engine accepts a power of
   two in 4 KiB..=64 KiB). `--db.growth-step` is the largest growth step (unset, the engine's 1
   GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
   gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
@@ -543,7 +547,7 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   Neither corrupts the file, and the pages commits free wait at most about one of those intervals
   and a commit, so the file stays bounded (an engine `NoSync` with no syncs would grow until one: see
   "Persist benchmark"). Refused at startup, naming the flag: `--db.exclusive`,
-  `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`, and reth's
+  `--db.max-readers`, `--db.log-level`, and reth's
   `UtterlyNoSync` and `NoMetaSync` sync modes (neither has a CLI value). The `UtterlyNoSync`
   refusal says why and points at `safe-no-sync` and `durable`: the engine has no mode that never
   syncs.
@@ -606,11 +610,17 @@ one of reth's: its rows are not copied (reth does not read them either).
   row is decoded) into a new tn-lmdb file built in `db/tn-lmdb-migrating/`, with the node's `--db.*`
   settings (`--db.page-size`, `--db.max-size` and `--db.growth-step`). Before anything of MDBX's is
   touched it checks each table's rows against MDBX's count, a read-back hash of each table against
-  the copy, and the synced file against the engine's full check. Then it renames the file to
-  `db/tn-lmdb.dat` (the commit point), records the tn-lmdb version in `db/database.version` (the
-  rollback tripwire, above), removes `mdbx.lck` and then `mdbx.dat`, writes the marker
-  `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
-  reth's static files are not touched. The copy needs no case of its own for the dup-sort tables'
+  the copy, and the synced file against the engine's full check. Then it records `mdbx.dat`'s
+  length and modification time, with MDBX's last transaction id, in
+  `db/tn-lmdb-migrating/mdbx-source`, renames the file to `db/tn-lmdb.dat` (the commit point),
+  records the tn-lmdb version in `db/database.version` (the rollback tripwire, above), checks
+  `mdbx.dat` against the record (see "A stop part way"), removes `mdbx.lck` and then `mdbx.dat`,
+  writes the marker `db/mdbx-migrated` (its text lists the rows copied per table) and removes the
+  temp directory. reth's static files are not touched. While `mdbx.dat` or the temp directory is
+  there, the open holds an exclusive `flock` on `db/` itself (two datadirs can name one `db/`, and
+  the datadir lock is one datadir's), so a second process migrating or finishing the same
+  directory is refused with "another process is migrating this database". The copy needs no case
+  of its own for the dup-sort tables'
   forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
   table, also when they span the copy's commits
@@ -623,7 +633,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   in large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees. `db stats`
   on the MDBX build (the build being replaced) prints the same figures beside a running node, each
   table's "Total Size" and their sum in the "Tables" row, so the space can be checked before
-  upgrading. The check is an early refusal: a disk that fills during the copy fails the migration
+  upgrading. The quarter is a margin, not a measurement: the copy's tn-lmdb tree need not take
+  the pages MDBX's did (each engine fills and splits its leaves by its own rules, and keeps a
+  value in the leaf up to its own limit, tn-lmdb's about half a page, the rest in overflow runs
+  of whole pages), the file also holds its catalog and free tree, and the filesystem needs room
+  to work. The on-demand test below prints the copy's table pages against the live bytes, with
+  their ratio, and `the_migrated_tables_fit_the_headroom` holds the test database within the
+  margin. The check is an early refusal: a disk that fills during the copy fails the migration
   the same way, leaving MDBX as it was.
 - **Time:** in proportion to the database's size: one read of MDBX, one write and one read-back of
   the copy, and one sync. The on-demand test `migrates_a_copy_of_a_real_database` (in
@@ -637,7 +653,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   as it was, and the next start removes the temp directory and migrates again from the beginning.
   After it, the next start finishes the remaining steps: it removes what is left of MDBX's files
   and writes the marker. It knows a stopped migration by the temp directory, emptied by the rename
-  and removed only after the marker. A failure after the commit point (the database directory's
+  and removed only after the marker. Before it removes `mdbx.dat` it compares the file's length and
+  modification time (a stat; `mdbx.lck` may already be gone) with the record the migration took
+  of it before the commit point: a stop between the rename and the version file leaves a window in
+  which a build running reth on MDBX alone opens and advances `mdbx.dat`, and removing it then
+  would silently roll those writes back, so a differing file is refused and both files are kept
+  (resolve by hand, as for an `mdbx.dat` beside the marker). A temp directory without the record
+  (an older build's migration) is finished as before. A failure after the commit point (the database directory's
   fsync, or a finishing step) keeps the temp directory too, and its error says the next start
   finishes the migration. An MDBX build started after a stop before the commit point opens MDBX as
   it was and warns of the temp directory, naming it and its size, but never removes it: remove it
@@ -647,10 +669,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   | the node finds | why | what to do |
   |---|---|---|
   | less free space than the migration needs | the copy is built beside MDBX | free space, then start again |
+  | `db/` locked by another process's migration ("another process is migrating this database") | two datadirs name one `db/`, and one node is migrating or finishing it | wait for it to finish, then start again |
+  | an MDBX database MDBX refuses to open read-only with `MDBX_WANNA_RECOVERY` (stopped uncleanly under `--db.sync-mode safe-no-sync`) | a read-only open does not recover it; the error says what to do | MDBX is unchanged: start the previous binary (the one that ran reth on MDBX) once and stop it cleanly, then start this build |
   | a row tn-lmdb cannot store: a second value for a dup-sort subkey (`MDBX_KEYEXIST`), or a value over 16 MiB (`MDBX_BAD_VALSIZE`) | tn-lmdb stores one value per subkey and values up to 16 MiB; reth writes neither | MDBX is unchanged: run the MDBX build, and report the error |
   | a copy that fails its checks (a short read, a read-back mismatch, the engine's check) | the copy would lose or change rows | as above |
   | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
+  | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or modification time from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | as above; both files are kept |
   | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
   | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
@@ -664,10 +689,20 @@ one of reth's: its rows are not copied (reth does not read them either).
   `tn-lmdb.dat`, prune the static files down to it, and fail at genesis. Back up `db/` and
   `static_files/` before the first tn-lmdb start of a datadir. Problems are fixed forward, as for
   the consensus DB.
-- **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start has run
-  the migration.
+- **`db migrate-execution`** (`migrate_reth_db`) runs the migration offline, with the node stopped,
+  so the first start of the new binary does not wait on it: it takes the datadir lock and the
+  node's `--db.*` flags (pass what the node runs with, so the file gets the same page size,
+  reservation and growth step), runs the version check, the migration (or finishes one stopped
+  after its commit point, or refuses what the node's start refuses) and the version file, as the
+  node's open does before it opens, and prints the marker's text (the rows migrated per table)
+  without opening the database. With no MDBX database it has nothing to do and creates nothing.
+  The MDBX build refuses it.
+- **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start (or
+  `db migrate-execution`) has run the migration.
 - **`db load-state`** never migrates either: it refuses a `db/` holding `mdbx.dat`, whatever MDBX
-  holds, before anything opens it (`refuse_pending_migration`); it restores into a fresh datadir.
+  holds, or an unfinished migration (the emptied `db/tn-lmdb-migrating/` beside `tn-lmdb.dat`,
+  which the node's next start finishes), before anything opens it (`refuse_pending_migration`);
+  it restores into a fresh datadir.
 
 ### Storage layouts
 
@@ -788,8 +823,9 @@ Both run in the normal lanes in well under a second. When one fails:
   example `v2` to `v2-layout1`) with a test of what the new binary does with it (opens, converts or
   refuses it), and then regenerates. A format no release has written has no datadirs to keep
   reading, so its fixtures are regenerated in place: tn-lmdb's format 7 (tree tags) replaced
-  format 6 before tn-lmdb shipped, and the engine's own tests pin the refusal of every earlier
-  version (`a_version_6_record_is_refused` and its siblings in `crates/tn-lmdb/src/meta.rs`;
+  format 6, and format 8 (overflow-run tags) replaced 7, before tn-lmdb shipped, and the
+  engine's own tests pin the refusal of every earlier version (`a_version_7_record_is_refused`
+  and its siblings in `crates/tn-lmdb/src/meta.rs`;
   `a_version_4_file_is_refused_at_open` in `crates/tn-lmdb/src/env/tests.rs` opens a whole file);
 - a block-hash difference is an execution change, not a format change (check `TN_*_FORK_EPOCH` in
   the environment first).
@@ -814,7 +850,9 @@ start of this release's binary (the default build, tn-lmdb):
 1. migrates the consensus database from MDBX to tndb and removes the MDBX environments (one-way,
    #1558);
 2. migrates the reth database from MDBX to tn-lmdb ([Migrating from MDBX](#migrating-from-mdbx)):
-   the engine changes, the layout stays v1, and the node records the layout marker;
+   the engine changes, the layout stays v1, and the node records the layout marker. To run this
+   step before the start, with the node stopped, run `telcoin-network db migrate-execution` with
+   the node's `--db.*` flags; the start then finds a tn-lmdb database;
 3. runs on. Nothing else is needed: a v1 datadir keeps working on this binary.
 
 **Upgrade every node together.** Since #1788 a node record carries a network-key co-signature, and

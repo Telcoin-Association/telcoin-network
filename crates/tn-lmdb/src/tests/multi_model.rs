@@ -144,6 +144,12 @@ struct Coverage {
     /// head's pages since the last sync failed).
     volume_losses: u32,
     volume_falls_back: u32,
+    /// Reopens after a volume loss that kept every page the head names since the last sync
+    /// ([`pages_since`]), where the independent oracle requires the head
+    /// ([`Run::after_volume_loss`]).
+    volume_keeps_head: u32,
+    /// Commits stopped right after their weak meta copy (`CrashAt::AfterWeakMetaCopy`).
+    stopped_after_weak_copy: u32,
     /// Deletes whose merges absorbed a sibling (`Writer::merging_deletes`).
     merging_deletes: u64,
     /// Each dup table's, in the dup variant ([`DUPS`]).
@@ -170,6 +176,9 @@ struct DupSeen {
     run_puts: u32,
     clears: u32,
     drops: u32,
+    /// Its deletes and `delete_prefix` calls whose merges absorbed a sibling, in its outer or a
+    /// nested tree (`Writer::merging_deletes` across each [`Run::dup_op`]).
+    merging_deletes: u64,
     /// Its packed forms, by its [`Forms`].
     forms: dup::FormSeen,
 }
@@ -346,6 +355,7 @@ impl Run {
         }
         let t = txn.create_dup_table(name, options).expect("dup table");
         let rows = work.entry(name.to_string()).or_default();
+        let merges = txn.writer_mut().merging_deletes;
         match roll {
             0..12 if self.grown[j] => {
                 txn.clear_table(&t).expect("clear");
@@ -458,6 +468,7 @@ impl Run {
                 assert_eq!(txn.get(&t, &key).expect("get"), want, "{name}: get");
             }
         }
+        self.seen.dups[j].merging_deletes += txn.writer_mut().merging_deletes - merges;
         let stat = txn.table_stat(&t).expect("stat");
         let counts = (rows.len() as u64, self.forms[j].nested.len());
         assert_eq!((stat.entries, stat.nested_trees as usize), counts, "{name}: entries, trees");
@@ -625,16 +636,39 @@ impl Run {
         }
     }
 
+    /// Before `go_down(3)`, with a weak head to lose: the file's bytes and the pages the head names
+    /// since the durable state ([`pages_since`]), for [`Run::after_volume_loss`]'s oracle.
+    fn head_pages(&self) -> Option<(Vec<u8>, Vec<u32>)> {
+        if self.latest.0 == self.durable.0 {
+            return None;
+        }
+        let before = fs::read(&self.path).expect("read");
+        Some((before, pages_since(self.env(), self.durable.0)))
+    }
+
     /// The state a reopen after `go_down(3)` must find: the newest commit if open's check of the
     /// trusted weak head passes (every page it names since the durable state survived), else the
-    /// durable state. A read-only open, which writes nothing, runs the same check first.
-    fn after_volume_loss(&mut self) -> (u64, State) {
-        if self.latest.0 == self.durable.0 {
+    /// durable state. A read-only open, which writes nothing, runs the same check first. The
+    /// check's answer is taken as it stands, but held to an oracle of its own: when every page
+    /// the head names since the durable state kept its bytes through the loss
+    /// ([`head_survived`] over `head`, [`Run::head_pages`] before it), the check must have passed.
+    fn after_volume_loss(&mut self, head: Option<(Vec<u8>, Vec<u32>)>) -> (u64, State) {
+        let Some((before, pages)) = head else {
             return self.durable.clone();
-        }
+        };
         let ro = Env::open_read_only(&self.path, options(SyncMode::Durable)).expect("read-only");
         let checked = env::take_weak_head_check().expect("a trusted head is checked");
         drop(ro);
+        let after = fs::read(&self.path).expect("read");
+        if head_survived(&before, &after, self.page_size, self.latest.0, &pages) {
+            assert!(
+                checked.is_ok(),
+                "txn {}: every page the head names since the last sync survived the volume loss, \
+                 yet open fell back",
+                self.latest.0
+            );
+            self.seen.volume_keeps_head += 1;
+        }
         if checked.is_ok() {
             self.latest.clone()
         } else {
@@ -686,23 +720,28 @@ impl Run {
     /// which is durable) stopped at a random point of the commit protocol, a random way down, and
     /// a reopen to the state the protocol allows.
     fn stopped_commit(&mut self, step: u32) {
-        let points = [
+        // The open's first commit that changes something is durable in `SyncMode::NoSync` too.
+        let durable_commit = self.sync == SyncMode::Durable || self.first.is_some();
+        // A durable commit copies no weak meta: its points leave that one out.
+        let points: Vec<CrashAt> = [
             CrashAt::BeforeSave,
             CrashAt::AfterSave,
             CrashAt::AfterStamp,
+            CrashAt::AfterWeakMetaCopy,
             CrashAt::AfterDataSync,
             CrashAt::AfterSizeSync,
             CrashAt::AfterMetaCopy,
             CrashAt::AfterMetaMsync,
-        ];
+        ]
+        .into_iter()
+        .filter(|&at| !(durable_commit && at == CrashAt::AfterWeakMetaCopy))
+        .collect();
         let at = points[self.rng.below(points.len() as u64) as usize];
         let env = self.env.take().expect("open");
         let slot = env.with_writer(|w| slot_to_write(&w.slots()));
         let mut txn = env.begin_rw().expect("begin");
         let planned = txn.writer_mut().alloc.txn();
         assert_eq!(planned, self.first.unwrap_or(self.latest.0 + 1), "the stopped commit's txn");
-        // The open's first commit that changes something is durable in `SyncMode::NoSync` too.
-        let durable_commit = self.sync == SyncMode::Durable || self.first.is_some();
         let mut work = self.latest.1.clone();
         self.restart_forms();
         self.random_ops(&mut txn, &mut work, step);
@@ -713,7 +752,13 @@ impl Run {
         txn.put(&t, &key(0), &v).expect("put");
         work.entry("t0".to_string()).or_default().insert(key(0), v);
         let in_commit = durable_commit
-            || matches!(at, CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp);
+            || matches!(
+                at,
+                CrashAt::BeforeSave
+                    | CrashAt::AfterSave
+                    | CrashAt::AfterStamp
+                    | CrashAt::AfterWeakMetaCopy
+            );
         let stopped = if in_commit {
             txn.writer_mut().crash_at = Some(at);
             txn.commit().map(|_| ())
@@ -734,15 +779,18 @@ impl Run {
         let record = slot_record(&self.path, self.page_size, slot);
         let trusted = record.filter(|&(txn, weak)| txn == new.0 && (loss == 0 || !weak));
         let reaches_new = match at {
-            _ if !durable_commit && in_commit => false,
             CrashAt::AfterMetaMsync => true,
             CrashAt::AfterMetaCopy => trusted.is_some(),
-            // The commit's weak meta, before the sync that stopped wrote its steady one.
-            _ if !durable_commit => loss == 0,
-            _ => false,
+            // A durable commit stopped before its meta copy, a deferred one before its weak one.
+            _ if durable_commit => false,
+            CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp => false,
+            // The deferred commit's weak meta, in its slot from its copy on and through the sync
+            // that stopped before writing its steady one: trusted in the same boot only.
+            _ => loss == 0,
         };
         assert_eq!(reaches_new, trusted.is_some(), "{at:?}, loss {loss}: {record:?}");
         self.seen.stopped_commits += 1;
+        self.seen.stopped_after_weak_copy += u32::from(at == CrashAt::AfterWeakMetaCopy);
         let want = if reaches_new {
             self.seen.stopped_to_new += 1;
             if trusted.is_some_and(|(_, weak)| !weak) {
@@ -851,10 +899,11 @@ fn random_run_with(
                     2 if (run.seen.random_losses + run.seen.volume_losses) % 2 == 1 => 3,
                     loss => loss,
                 };
+                let head = (loss == 3).then(|| run.head_pages()).flatten();
                 run.go_down(loss);
                 let want = match loss {
                     0 => run.latest.clone(),
-                    3 => run.after_volume_loss(),
+                    3 => run.after_volume_loss(head),
                     _ => run.durable.clone(),
                 };
                 run.reopen(want);
@@ -892,6 +941,7 @@ fn a_random_multi_table_workload_with_crashes_matches_the_model() {
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
         seen.volume_falls_back >= 1,
+        seen.stopped_after_weak_copy >= 1,
         seen.merging_deletes >= 3,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -944,6 +994,7 @@ fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model(
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
         seen.volume_falls_back >= 1,
+        seen.stopped_after_weak_copy >= 1,
         seen.merging_deletes >= 10,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
@@ -1001,6 +1052,8 @@ fn a_draining_multi_table_workload_with_crashes_matches_the_model() {
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
         seen.volume_falls_back >= 1,
+        seen.volume_keeps_head >= 1,
+        seen.stopped_after_weak_copy >= 5,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }
@@ -1042,7 +1095,8 @@ fn packing_gate(seen: &Coverage) -> [bool; 3] {
 /// are the model's, after every commit their figures in `Env::check` are their `table_stat`'s and
 /// their cells their forms'. Each dup table grows nested and outer trees of two levels, empties
 /// outer keys by deletes and by `delete_prefix`, and is cleared and dropped; the tables that pack
-/// create packed keys and promote them, the other never packs.
+/// create packed keys and promote them, the other never packs. Deletes merge pages in the plain
+/// tables and, rarely (the nested trees stay small), in the dup tables.
 #[test]
 fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
     let seen = random_run_with(0xD0B1_3A14, 1500, 4096, false, false, true);
@@ -1059,6 +1113,9 @@ fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
         seen.weak_reopens >= 3,
         seen.skipped_txns >= 3,
         seen.volume_falls_back >= 1,
+        seen.stopped_after_weak_copy >= 5,
+        seen.merging_deletes >= 40,
+        seen.dups.iter().map(|d| d.merging_deletes).sum::<u64>() >= 1,
     ];
     for d in &seen.dups {
         gate.extend([

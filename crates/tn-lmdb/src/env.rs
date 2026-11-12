@@ -352,7 +352,10 @@ pub struct EnvOptions {
     /// commits since that sync: their weak meta stays in its slot until this environment's
     /// first commit that changes something writes its steady meta over it (an [`Env::sync`] or
     /// the close with nothing committed leaves it), so a later open with `true` in the same
-    /// boot can open at them again, once they pass its check (README, Open and recovery).
+    /// boot can open at them again, once they pass its check (README, Open and recovery). But
+    /// this open builds on the last sync's free list and page count, which those commits'
+    /// pages are: any write transaction, committed, aborted or crashed, may reuse them, after
+    /// which that check fails and the later open falls back to the last sync with a warning.
     /// Applies to [`Env::open_read_only`] too, which never writes that slot.
     pub trust_unsynced: bool,
     /// Gap fill (default [`GapFill::OFF`]): the most clean pages between two runs of a durable
@@ -896,8 +899,11 @@ pub(crate) enum CrashAt {
     /// After the free list's save.
     AfterSave,
     /// After step 3 (the pages' CRCs stamped): the last point of a `SyncMode::NoSync` commit that
-    /// defers its sync.
+    /// defers its sync before its weak meta copy.
     AfterStamp,
+    /// After a `SyncMode::NoSync` commit's copy of its weak meta into its slot
+    /// ([`Writer::defer_sync`]): the commit's last point. A durable commit never reaches it.
+    AfterWeakMetaCopy,
     /// After step 4 (the data sync: the one `msync`, the one `fdatasync`, or nothing).
     AfterDataSync,
     /// After step 5 (the size sync, whether or not the file grew or step 4 already synced it).
@@ -1005,6 +1011,8 @@ impl Writer {
         self.stats.nosync_commits += 1;
         self.add_unsynced(pages);
         let slot = self.copy_meta(meta, Tag::weak(self.boot_id))?;
+        #[cfg(test)]
+        self.crash_point(CrashAt::AfterWeakMetaCopy)?;
         self.slots[slot] = Some(Slot { txn: meta.txn, weak: true });
         Ok(())
     }
@@ -1284,7 +1292,7 @@ impl Writer {
     /// against the newest *steady* slot: a weak slot may hold the newest state's txn, and its
     /// pages may be only in the page cache. A failure latches. The caller checks the latch
     /// first.
-    fn sync(&mut self, latch: &Latch) -> Result<()> {
+    pub(crate) fn sync(&mut self, latch: &Latch) -> Result<()> {
         if self.steady_txn().is_some_and(|txn| txn >= self.last.txn) {
             return Ok(());
         }

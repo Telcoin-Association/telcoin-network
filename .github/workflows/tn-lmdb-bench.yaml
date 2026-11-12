@@ -99,6 +99,7 @@ jobs:
               echo "$1"
             fi
           }
+          sync_args=()
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             base="$(commit_ref "$INPUT_BASE")"
             head="$(commit_ref "${INPUT_HEAD:-HEAD}")"
@@ -110,8 +111,13 @@ jobs:
             head="$MERGE_SHA"
             base="$(git rev-parse --verify "$MERGE_SHA^1")"
             tier=quick
+            # The quick tier runs nosync only; the durable rows hold the one exact durable
+            # guard, `reth.block.pages_synced` (gated), and the durable time rows the report
+            # shows but does not gate. About 6 s more per run, 8 runs.
+            sync_args=(--sync nosync,durable)
           fi
-          ./etc/tn-lmdb-bench-compare.sh --tier "$tier" --bench-dir "$BENCH_DIR" -- "$base" "$head"
+          ./etc/tn-lmdb-bench-compare.sh --tier "$tier" ${sync_args[@]+"${sync_args[@]}"} \
+            --bench-dir "$BENCH_DIR" -- "$base" "$head"
 
       - name: Report to the job summary
         if: always()

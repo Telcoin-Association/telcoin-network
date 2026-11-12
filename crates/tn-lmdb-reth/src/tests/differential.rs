@@ -28,13 +28,13 @@
 //! `last`, a write or a walk) places it again. The read transaction's cursor reads a snapshot no
 //! writer changes (its model is the snapshot's tables), so only classes 1, 7 and 8 reach it. Each
 //! skip is counted against its class:
-//! 1. **past either end:** `next` or `next_no_dup` finding nothing (except right after `last`,
-//!    which MDBX matches), `prev` finding nothing, a `seek`, `first` or `last` finding nothing, a
-//!    delete of the table's last key (and, by another writer, of the cursor's row with no row after
-//!    it), a walk that runs out, a missed `seek_exact` or `seek_by_key_subkey` on an empty table
-//!    (or past the last row, when another writer then deletes any row, or once another writer has
-//!    deleted the row it landed on and every row after it), and a `clear` under the cursor taint
-//!    it;
+//! 1. **past either end** (MDBX's cursor stays on an end row, this one goes past it; the crate docs
+//!    give each case): `next` or `next_no_dup` finding nothing (except right after `last`, which
+//!    MDBX matches), `prev` finding nothing, a `seek`, `first` or `last` finding nothing, a delete
+//!    of the table's last key (and, by another writer, of the cursor's row with no row after it), a
+//!    walk that runs out, a missed `seek_exact` or `seek_by_key_subkey` on an empty table (or past
+//!    the last row, when another writer then deletes any row, or once another writer has deleted
+//!    the row it landed on and every row after it), and a `clear` under the cursor taint it;
 //! 2. **reseek after another writer's delete and put:** another writer's delete of the cursor's row
 //!    marks it; a put by another writer between that row and the cursor's next row, before the
 //!    cursor's next call, taints it (on the dup table, class 3 takes these first);
@@ -85,7 +85,12 @@
 //! each run (`PROPTEST_RNG_SEED` picks one), printed with the totals and in a failure's message,
 //! which `PROPTEST_RNG_SEED` then reruns. `random_scripts_skip_counts_are_pinned_at_seed_1` and its
 //! `_heavy` variant run the same strategies from the fixed [`RNG_SEED`] and pin the totals by
-//! class, so a class whose share moved fails there.
+//! class, so a class whose share moved fails there. A test's scripts have a shape ([`Scripts`]):
+//! the narrow one above, or the multi-leaf one of `random_scripts_match_mdbx_multi_leaf` (and
+//! `_heavy`), seeded with [`MULTI_LEAF_ROWS`] rows under one dup key and as many header keys, the
+//! drawn keys and slots spread over them and the dup values in the wide encoding ([`WIDE`]), so
+//! the cursor calls run inside multi-leaf nested and composite trees. Every run also counts the
+//! dup table's cursor calls run and skipped apart, and fails if the skipped reach a fifth.
 
 use super::{
     adapter::create_mdbx_db, dup::second_value_refused, mdbx_port::create_test_db_with, Form,
@@ -142,18 +147,22 @@ impl Tb {
         matches!(self, Self::S)
     }
 
-    /// The row a drawn key names.
-    fn row(self, k: K) -> Row {
-        match self {
-            Self::H => (u64::from(k.0 % 16), 0),
-            Self::S => (u64::from(k.0 % 4), k.1 % 6),
-            Self::B => (u64::from(k.0 % 6), 0),
+    /// The row a drawn key names: from small sets, so rows collide (16 header keys, 4 dup keys of
+    /// 6 slots); with `spread` ([`Scripts::MultiLeaf`]) over the seeded leaves (256 header keys,
+    /// 4 dup keys of 256 slots).
+    fn row(self, k: K, spread: bool) -> Row {
+        match (self, spread) {
+            (Self::H, false) => (u64::from(k.0 % 16), 0),
+            (Self::H, true) => (u64::from(k.0 % 16) * 16 + u64::from(k.1 % 16), 0),
+            (Self::S, false) => (u64::from(k.0 % 4), k.1 % 6),
+            (Self::S, true) => (u64::from(k.0 % 4), k.1),
+            (Self::B, _) => (u64::from(k.0 % 6), 0),
         }
     }
 
     /// The row a drawn key names, without its slot: what a key-only call takes.
-    fn key_row(self, k: K) -> Row {
-        (self.row(k).0, 0)
+    fn key_row(self, k: K, spread: bool) -> Row {
+        (self.row(k, spread).0, 0)
     }
 }
 
@@ -341,11 +350,25 @@ impl TestTable for CanonicalHeaders {
     }
 }
 
+/// The bit every version of a multi-leaf run carries ([`Scripts::MultiLeaf`]): a dup value of
+/// such a version takes the wide encoding ([`subkey`], [`PlainStorageState::value`]).
+const WIDE: u32 = 1 << 30;
+
+/// The subkey of slot `slot`: `B256` with the slot last; `wide`, the slot first, the other bytes
+/// a seek's zeros (the first subkey of the slot, which the stored subkeys of the slot sort at or
+/// after) or a stored row's noise ([`PlainStorageState::value`]).
+fn subkey(slot: u8, wide: bool) -> B256 {
+    let mut key = B256::ZERO;
+    key.0[if wide { 0 } else { 31 }] = slot;
+    key
+}
+
 /// A `PlainStorageState` value read without its key: the value holds its row.
 fn parse_entry(value: &StorageEntry) -> Item {
     let n = value.value.as_limbs()[0];
-    let row = ((n >> 40) & 0xff, value.key.0[31]);
     let ver = (n & 0xffff_ffff) as u32;
+    let slot = if ver & WIDE != 0 { value.key.0[0] } else { value.key.0[31] };
+    let row = ((n >> 40) & 0xff, slot);
     (row, (*value == PlainStorageState::value(row, ver)).then_some(ver))
 }
 
@@ -353,9 +376,27 @@ impl TestTable for PlainStorageState {
     fn key(row: Row) -> Address {
         Address::with_last_byte(byte(row.0))
     }
+    /// A version with [`WIDE`] takes the wide encoding: the subkey's bytes past the slot are
+    /// noise of the row's (so subkeys differ past their first byte, and sort by slot), and the
+    /// value's high limbs, set by the version, make its rest from a few bytes to 32.
     fn value(row: Row, ver: u32) -> StorageEntry {
         let n = (row.0 << 40) | (u64::from(row.1) << 32) | u64::from(ver);
-        StorageEntry { key: B256::with_last_byte(row.1), value: U256::from(n) }
+        if ver & WIDE == 0 {
+            return StorageEntry { key: B256::with_last_byte(row.1), value: U256::from(n) };
+        }
+        let mut key = subkey(row.1, true);
+        for (i, b) in key.0[1..].iter_mut().enumerate() {
+            *b = byte(row.0).wrapping_mul(37).wrapping_add(row.1).wrapping_add(i as u8);
+        }
+        let mut limbs = [n, 0, 0, 0];
+        for (i, limb) in limbs[1..].iter_mut().enumerate() {
+            if i < (ver % 4) as usize {
+                *limb =
+                    u64::from(ver).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(i as u32 * 7)
+                        | 1;
+            }
+        }
+        StorageEntry { key, value: U256::from_limbs(limbs) }
     }
     fn parse(key: &Address, value: &StorageEntry) -> Item {
         let (row, ver) = parse_entry(value);
@@ -468,18 +509,17 @@ fn entry_res(result: Result<Option<StorageEntry>, DatabaseError>) -> Res {
     Res::Item(result.map(|v| v.as_ref().map(parse_entry)))
 }
 
-fn exec_dup<Cur: DbCursorRO<S> + DbDupCursorRO<S>>(c: &mut Cur, call: &Call) -> Res {
+/// `wide`: the subkeys sought take the wide encoding ([`subkey`]).
+fn exec_dup<Cur: DbCursorRO<S> + DbDupCursorRO<S>>(c: &mut Cur, call: &Call, wide: bool) -> Res {
     match *call {
         Call::NextDup => Res::Item(item::<S>(c.next_dup())),
         Call::PrevDup => Res::Item(item::<S>(c.prev_dup())),
         Call::NextNoDup => Res::Item(item::<S>(c.next_no_dup())),
         Call::LastDup => entry_res(c.last_dup()),
         Call::NextDupVal => entry_res(c.next_dup_val()),
-        Call::SeekByKeySubkey(r) => {
-            entry_res(c.seek_by_key_subkey(S::key(r), B256::with_last_byte(r.1)))
-        }
+        Call::SeekByKeySubkey(r) => entry_res(c.seek_by_key_subkey(S::key(r), subkey(r.1, wide))),
         Call::WalkDup(key, slot, n) => {
-            walk_res(c.walk_dup(key.map(|k| S::key((k, 0))), slot.map(B256::with_last_byte)), |w| {
+            walk_res(c.walk_dup(key.map(|k| S::key((k, 0))), slot.map(|s| subkey(s, wide))), |w| {
                 walked::<S>(w, n)
             })
         }
@@ -487,7 +527,7 @@ fn exec_dup<Cur: DbCursorRO<S> + DbDupCursorRO<S>>(c: &mut Cur, call: &Call) -> 
     }
 }
 
-fn exec_dup_rw<Cur>(c: &mut Cur, call: &Call) -> Res
+fn exec_dup_rw<Cur>(c: &mut Cur, call: &Call, wide: bool) -> Res
 where
     Cur: DbCursorRO<S> + DbCursorRW<S> + DbDupCursorRO<S> + DbDupCursorRW<S>,
 {
@@ -497,7 +537,7 @@ where
         Call::Upsert(..) | Call::Insert(..) | Call::Append(..) | Call::DeleteCurrent => {
             exec_rw::<S, Cur>(c, call)
         }
-        _ => exec_dup::<Cur>(c, call),
+        _ => exec_dup::<Cur>(c, call, wide),
     }
 }
 
@@ -526,10 +566,10 @@ impl<TX: DbTx> AnyReadCursor<TX> {
         })
     }
 
-    fn exec(&mut self, call: &Call) -> Res {
+    fn exec(&mut self, call: &Call, wide: bool) -> Res {
         match self {
             Self::H(c) => exec_ro::<CanonicalHeaders, _>(c, call),
-            Self::S(c) => exec_dup(c, call),
+            Self::S(c) => exec_dup(c, call, wide),
             Self::B(c) => exec_ro::<Bytecodes, _>(c, call),
         }
     }
@@ -618,7 +658,13 @@ struct Run {
     skips: [u64; 9],
     /// Ops run.
     ran: u64,
-    /// Where the model disagreed with the database: a test bug when MDBX is the database.
+    /// The dup table's cursor calls run, and skipped (by a class, or a second value): the
+    /// cursor calls the dup layouts get, kept apart so a run whose dup cursors mostly sit in a
+    /// skip class shows ([`differential_cases`]).
+    dup_cursor_ran: u64,
+    dup_cursor_skipped: u64,
+    /// Where the model disagreed with the database: a test bug when MDBX is the database, a
+    /// behaviour difference the outcomes did not show when tn-lmdb is.
     model_misses: Vec<String>,
 }
 
@@ -630,6 +676,9 @@ struct Runner<'d, DB: Database> {
     /// Run the writes of a second value for a dup row's subkey, which must be refused (tn-lmdb);
     /// else skip them (MDBX, which would store the second value).
     second_values: bool,
+    /// The scripts' shape: whether drawn keys spread over the seeded leaves ([`Tb::row`]) and dup
+    /// values take the wide encoding ([`WIDE`]).
+    scripts: Scripts,
     tx: Option<DB::TXMut>,
     cursors: [Option<AnyCursor<DB::TXMut>>; 3],
     /// The cursors' models, by slot ([`SNAP`] last).
@@ -684,12 +733,53 @@ const SEED: [Op; 10] = [
     Op::Commit,
 ];
 
-/// Runs `ops` (after [`SEED`]) on `db`, then commits and reads every table back; with
+/// The rows under one dup key, and the header keys, [`multi_leaf_seed`] puts: enough rows for
+/// the key's nested tree (52-byte stored keys, rests up to 32 bytes) and the headers' tree
+/// (8-byte keys, 32-byte values) to take several leaves at 4 KiB pages.
+const MULTI_LEAF_ROWS: u8 = 250;
+
+/// Puts [`MULTI_LEAF_ROWS`] rows under dup key 1 (slots 0 up), as many header keys (spread,
+/// [`Tb::row`]) and two bytecodes, and commits: the scripts of [`Scripts::MultiLeaf`] then run
+/// their cursor writes and moves inside multi-leaf nested trees and composite trees.
+fn multi_leaf_seed() -> Vec<Op> {
+    let slots = (0..MULTI_LEAF_ROWS).map(|s| Op::Put(Tb::S, K(1, s)));
+    let headers = (0..MULTI_LEAF_ROWS).map(|n| Op::Put(Tb::H, K(n / 16, n % 16)));
+    let codes = [Op::Put(Tb::B, K(1, 0)), Op::Put(Tb::B, K(3, 0)), Op::Commit];
+    slots.chain(headers).chain(codes).collect()
+}
+
+/// The scripts a test draws: [`SEED`]'s few rows, with keys and slots from small sets so rows
+/// collide; or the multi-leaf scripts, seeded by [`multi_leaf_seed`], their drawn keys and slots
+/// spread over the seeded leaves ([`Tb::row`]) and their dup values in the wide encoding
+/// ([`WIDE`]: subkeys that differ past their first byte, rests of several lengths).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scripts {
+    Narrow,
+    MultiLeaf,
+}
+
+impl Scripts {
+    /// Whether drawn keys spread over the seeded leaves, and dup values take the wide encoding.
+    const fn spread(self) -> bool {
+        matches!(self, Self::MultiLeaf)
+    }
+
+    /// The ops that seed the tables before a script.
+    fn seed(self) -> Vec<Op> {
+        match self {
+            Self::Narrow => SEED.to_vec(),
+            Self::MultiLeaf => multi_leaf_seed(),
+        }
+    }
+}
+
+/// Runs `ops` (after `scripts`'s seed) on `db`, then commits and reads every table back; with
 /// `second_values`, the writes of a second value for a dup row's subkey too ([`Runner`]).
-fn run<DB: Database>(db: &DB, ops: &[Op], second_values: bool) -> Run {
+fn run<DB: Database>(db: &DB, scripts: Scripts, ops: &[Op], second_values: bool) -> Run {
     let mut r = Runner {
         db,
         second_values,
+        scripts,
         tx: Some(db.tx_mut().expect("begin")),
         cursors: [None, None, None],
         models: [None, None, None, None],
@@ -698,10 +788,10 @@ fn run<DB: Database>(db: &DB, ops: &[Op], second_values: bool) -> Run {
         model: Default::default(),
         snap_model: Default::default(),
         committed: Default::default(),
-        ver: 0,
+        ver: if scripts.spread() { WIDE } else { 0 },
         run: Run::default(),
     };
-    for op in SEED.iter().chain(ops) {
+    for op in scripts.seed().iter().chain(ops) {
         r.op(*op);
     }
     r.op(Op::Commit);
@@ -797,7 +887,8 @@ impl<DB: Database> Runner<'_, DB> {
     /// The row after the table's last (on the dup table, mostly a slot after it), for appends in
     /// order.
     fn next_row(&self, tb: Tb, k: K) -> Row {
-        let Some((&(lk, ls), _)) = self.rows(tb).last_key_value() else { return tb.row(k) };
+        let spread = self.scripts.spread();
+        let Some((&(lk, ls), _)) = self.rows(tb).last_key_value() else { return tb.row(k, spread) };
         let step = u64::from(k.0 % 2) + 1;
         match tb {
             Tb::S if !k.1.is_multiple_of(3) && ls < u8::MAX => (lk, ls + 1),
@@ -808,16 +899,17 @@ impl<DB: Database> Runner<'_, DB> {
     }
 
     fn op(&mut self, op: Op) {
+        let spread = self.scripts.spread();
         match op {
             Op::Get(tb, k) => {
-                let row = tb.key_row(k);
+                let row = tb.key_row(k, spread);
                 let got = by_table!(tb, T => self.tx().get::<T>(T::key(row))
                     .map(|v| v.map(|v| T::parse(&T::key(row), &v))));
                 self.run.ran += 1;
                 self.push(format!("get {tb:?} {row:?}"), show_res(&Res::Item(got)));
             }
             Op::Put(tb, k) => {
-                let row = tb.row(k);
+                let row = tb.row(k, spread);
                 let ver = self.write_ver(tb, row, k.other_value());
                 let label = format!("put {tb:?} {row:?} v{ver}");
                 if self.second_value(tb, row, ver, false) {
@@ -837,7 +929,7 @@ impl<DB: Database> Runner<'_, DB> {
                 self.push(label, show_done(&res));
             }
             Op::Append(tb, k, in_order) => {
-                let row = if in_order { self.next_row(tb, k) } else { tb.row(k) };
+                let row = if in_order { self.next_row(tb, k) } else { tb.row(k, spread) };
                 let ver = self.write_ver(tb, row, k.other_value());
                 let label = format!("append {tb:?} {row:?} v{ver}");
                 if self.second_value(tb, row, ver, true) {
@@ -902,7 +994,7 @@ impl<DB: Database> Runner<'_, DB> {
             }
             Op::SnapOpen => self.snap_open(),
             Op::SnapGet(tb, k) => {
-                let row = tb.key_row(k);
+                let row = tb.key_row(k, spread);
                 let snap = self.snap();
                 let got = by_table!(tb, T => snap.get::<T>(T::key(row))
                     .map(|v| v.map(|v| T::parse(&T::key(row), &v))));
@@ -910,7 +1002,7 @@ impl<DB: Database> Runner<'_, DB> {
                 self.push(format!("snap get {tb:?} {row:?}"), show_res(&Res::Item(got)));
             }
             Op::SnapWalk(tb, start, n) => {
-                let start = start.map(|k| tb.key_row(k));
+                let start = start.map(|k| tb.key_row(k, spread));
                 let snap = self.snap();
                 let rows = by_table!(tb, T => walk_res(snap.cursor_read::<T>().and_then(|mut c| {
                     c.walk(start.map(T::key)).map(|w| walked::<T>(w, n))
@@ -983,7 +1075,8 @@ impl<DB: Database> Runner<'_, DB> {
     }
 
     fn delete(&mut self, tb: Tb, k: K, del: Del) {
-        let row = if matches!(del, Del::All) { tb.key_row(k) } else { tb.row(k) };
+        let spread = self.scripts.spread();
+        let row = if matches!(del, Del::All) { tb.key_row(k, spread) } else { tb.row(k, spread) };
         let other = 0x8000_0000 | self.ver;
         let ver = match del {
             Del::All => None,
@@ -1114,7 +1207,8 @@ impl<DB: Database> Runner<'_, DB> {
 
     /// Resolves a drawn call on a cursor of `tb`.
     fn resolve(&mut self, tb: Tb, c: C) -> Call {
-        let key = |k: K| tb.key_row(k);
+        let spread = self.scripts.spread();
+        let key = |k: K| tb.key_row(k, spread);
         if !tb.dup() {
             // A dup method on a plain table is its plain counterpart.
             let plain = match c {
@@ -1140,15 +1234,15 @@ impl<DB: Database> Runner<'_, DB> {
             C::Seek(k) => Call::Seek(key(k)),
             C::SeekExact(k) => Call::SeekExact(key(k)),
             C::Upsert(k) => {
-                let row = tb.row(k);
+                let row = tb.row(k, spread);
                 Call::Upsert(row, self.write_ver(tb, row, k.other_value()))
             }
             C::Insert(k) => {
-                let row = tb.row(k);
+                let row = tb.row(k, spread);
                 Call::Insert(row, self.write_ver(tb, row, false))
             }
             C::Append(k, in_order) => {
-                let row = if in_order { self.next_row(tb, k) } else { tb.row(k) };
+                let row = if in_order { self.next_row(tb, k) } else { tb.row(k, spread) };
                 Call::Append(row, self.write_ver(tb, row, k.other_value()))
             }
             C::DeleteCurrent => Call::DeleteCurrent,
@@ -1157,9 +1251,9 @@ impl<DB: Database> Runner<'_, DB> {
             C::NextNoDup => Call::NextNoDup,
             C::LastDup => Call::LastDup,
             C::NextDupVal => Call::NextDupVal,
-            C::SeekByKeySubkey(k) => Call::SeekByKeySubkey(tb.row(k)),
+            C::SeekByKeySubkey(k) => Call::SeekByKeySubkey(tb.row(k, spread)),
             C::AppendDup(k, in_order) => {
-                let mut row = tb.row(k);
+                let mut row = tb.row(k, spread);
                 if in_order {
                     if let Some(last) = self.key_rows(tb, row.0).next_back() {
                         row.1 = last.1.saturating_add(1);
@@ -1178,7 +1272,9 @@ impl<DB: Database> Runner<'_, DB> {
                 Call::WalkRange(s.map(key), end, n)
             }
             C::WalkBack(s, n) => Call::WalkBack(s.map(key), n),
-            C::WalkDup(k, s, n) => Call::WalkDup(k.map(|k| tb.row(k).0), s.map(|s| tb.row(s).1), n),
+            C::WalkDup(k, s, n) => {
+                Call::WalkDup(k.map(|k| tb.row(k, spread).0), s.map(|s| tb.row(s, spread).1), n)
+            }
         }
     }
 
@@ -1218,17 +1314,20 @@ impl<DB: Database> Runner<'_, DB> {
 
     /// Runs drawn call `c` on open cursor `slot`.
     fn cursor_call(&mut self, slot: usize, c: C) {
+        let wide = self.scripts.spread();
         let tb = self.models[slot].as_ref().expect("open").tb;
         let call = self.resolve(tb, c);
         let label = format!("c{slot} {tb:?} {call:?}");
         if let Some(class) = self.excluded(slot, &call) {
             self.run.skips[class] += 1;
+            self.run.dup_cursor_skipped += u64::from(tb.dup());
             self.push(label, format!("skipped: {}", CLASSES[class]));
             return;
         }
         if let Call::Upsert(row, ver) | Call::Append(row, ver) = call {
             let append = matches!(call, Call::Append(..));
             if self.second_value(tb, row, ver, append) {
+                self.run.dup_cursor_skipped += 1;
                 let operation = if append {
                     DatabaseWriteOperation::CursorAppend
                 } else {
@@ -1236,7 +1335,7 @@ impl<DB: Database> Runner<'_, DB> {
                 };
                 self.second_value_write(label, S::key(row), operation, |r| {
                     match r.cursors[slot].as_mut().map(|c| match c {
-                        AnyCursor::S(c) => exec_dup_rw(c, &call),
+                        AnyCursor::S(c) => exec_dup_rw(c, &call, wide),
                         _ => unreachable!("a dup row write on a write cursor of the dup table"),
                     }) {
                         Some(Res::Done(res)) => res,
@@ -1247,14 +1346,15 @@ impl<DB: Database> Runner<'_, DB> {
             }
         }
         self.run.ran += 1;
+        self.run.dup_cursor_ran += u64::from(tb.dup());
         let res = if slot == SNAP {
-            self.snap_cursor.as_mut().expect("open").exec(&call)
+            self.snap_cursor.as_mut().expect("open").exec(&call, wide)
         } else {
             match self.cursors[slot].as_mut().expect("open") {
                 AnyCursor::H(c) => exec_rw::<CanonicalHeaders, _>(c, &call),
-                AnyCursor::S(c) => exec_dup_rw(c, &call),
+                AnyCursor::S(c) => exec_dup_rw(c, &call, wide),
                 AnyCursor::B(c) => exec_rw::<Bytecodes, _>(c, &call),
-                AnyCursor::Ro(c) => c.exec(&call),
+                AnyCursor::Ro(c) => c.exec(&call, wide),
             }
         };
         let shown = show_res(&res);
@@ -1560,8 +1660,10 @@ impl<DB: Database> Runner<'_, DB> {
     }
 }
 
-fn key() -> impl Strategy<Value = K> {
-    (0u8..16, 0u8..6).prop_map(|(k, s)| K(k, s))
+/// A drawn key: a key index under 16 and a slot index under 6, or under 255 with `spread`
+/// ([`Tb::row`]).
+fn key(spread: bool) -> impl Strategy<Value = K> {
+    (0u8..16, 0u8..if spread { u8::MAX } else { 6 }).prop_map(|(k, s)| K(k, s))
 }
 
 fn table() -> impl Strategy<Value = Tb> {
@@ -1573,15 +1675,15 @@ fn walk_len() -> impl Strategy<Value = u8> {
 }
 
 /// Calls a read cursor takes.
-fn read_call() -> impl Strategy<Value = C> {
+fn read_call(spread: bool) -> impl Strategy<Value = C> {
     let moves = prop_oneof![
         2 => Just(C::First),
         2 => Just(C::Last),
         6 => Just(C::Next),
         4 => Just(C::Prev),
         3 => Just(C::Current),
-        3 => key().prop_map(C::Seek),
-        3 => key().prop_map(C::SeekExact),
+        3 => key(spread).prop_map(C::Seek),
+        3 => key(spread).prop_map(C::SeekExact),
     ];
     let dup_moves = prop_oneof![
         3 => Just(C::NextDup),
@@ -1589,45 +1691,49 @@ fn read_call() -> impl Strategy<Value = C> {
         3 => Just(C::NextNoDup),
         2 => Just(C::LastDup),
         2 => Just(C::NextDupVal),
-        3 => key().prop_map(C::SeekByKeySubkey),
+        3 => key(spread).prop_map(C::SeekByKeySubkey),
     ];
     let walks = prop_oneof![
-        (proptest::option::of(key()), walk_len()).prop_map(|(s, n)| C::Walk(s, n)),
-        (proptest::option::of(key()), proptest::option::of((key(), any::<bool>())), walk_len())
+        (proptest::option::of(key(spread)), walk_len()).prop_map(|(s, n)| C::Walk(s, n)),
+        (
+            proptest::option::of(key(spread)),
+            proptest::option::of((key(spread), any::<bool>())),
+            walk_len()
+        )
             .prop_map(|(s, e, n)| C::WalkRange(s, e, n)),
-        (proptest::option::of(key()), walk_len()).prop_map(|(s, n)| C::WalkBack(s, n)),
-        (proptest::option::of(key()), proptest::option::of(key()), walk_len())
+        (proptest::option::of(key(spread)), walk_len()).prop_map(|(s, n)| C::WalkBack(s, n)),
+        (proptest::option::of(key(spread)), proptest::option::of(key(spread)), walk_len())
             .prop_map(|(k, s, n)| C::WalkDup(k, s, n)),
     ];
     prop_oneof![23 => moves, 15 => dup_moves, 5 => walks]
 }
 
 /// Calls only a write cursor takes.
-fn write_call() -> impl Strategy<Value = C> {
+fn write_call(spread: bool) -> impl Strategy<Value = C> {
     prop_oneof![
-        4 => key().prop_map(C::Upsert),
-        2 => key().prop_map(C::Insert),
-        3 => (key(), prop::bool::weighted(0.75)).prop_map(|(k, o)| C::Append(k, o)),
+        4 => key(spread).prop_map(C::Upsert),
+        2 => key(spread).prop_map(C::Insert),
+        3 => (key(spread), prop::bool::weighted(0.75)).prop_map(|(k, o)| C::Append(k, o)),
         3 => Just(C::DeleteCurrent),
-        2 => (key(), prop::bool::weighted(0.6)).prop_map(|(k, o)| C::AppendDup(k, o)),
+        2 => (key(spread), prop::bool::weighted(0.6)).prop_map(|(k, o)| C::AppendDup(k, o)),
         2 => Just(C::DeleteCurrentDuplicates),
     ]
 }
 
-fn op() -> impl Strategy<Value = Op> {
+fn op(spread: bool) -> impl Strategy<Value = Op> {
     let tx_ops = prop_oneof![
-        3 => (table(), key()).prop_map(|(t, k)| Op::Get(t, k)),
-        6 => (table(), key()).prop_map(|(t, k)| Op::Put(t, k)),
-        2 => (table(), key(), prop::bool::weighted(0.75)).prop_map(|(t, k, o)| Op::Append(t, k, o)),
-        4 => (table(), key(), prop_oneof![Just(Del::All), Just(Del::Match), Just(Del::Other)])
+        3 => (table(), key(spread)).prop_map(|(t, k)| Op::Get(t, k)),
+        6 => (table(), key(spread)).prop_map(|(t, k)| Op::Put(t, k)),
+        2 => (table(), key(spread), prop::bool::weighted(0.75)).prop_map(|(t, k, o)| Op::Append(t, k, o)),
+        4 => (table(), key(spread), prop_oneof![Just(Del::All), Just(Del::Match), Just(Del::Other)])
             .prop_map(|(t, k, d)| Op::Delete(t, k, d)),
         1 => table().prop_map(Op::Entries),
     ];
     let cursor_ops = prop_oneof![
-        5 => (0usize..2, table(), prop_oneof![3 => read_call(), 2 => write_call()])
+        5 => (0usize..2, table(), prop_oneof![3 => read_call(spread), 2 => write_call(spread)])
             .prop_map(|(s, t, c)| Op::Cursor(s, t, c)),
-        2 => (table(), read_call()).prop_map(|(t, c)| Op::Cursor(2, t, c)),
-        2 => (table(), read_call()).prop_map(|(t, c)| Op::Cursor(SNAP, t, c)),
+        2 => (table(), read_call(spread)).prop_map(|(t, c)| Op::Cursor(2, t, c)),
+        2 => (table(), read_call(spread)).prop_map(|(t, c)| Op::Cursor(SNAP, t, c)),
         1 => (0..=SNAP, table()).prop_map(|(s, t)| Op::Open(s, t)),
     ];
     let txns = prop_oneof![
@@ -1635,8 +1741,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => Just(Op::Abort),
         1 => table().prop_map(Op::Clear),
         2 => Just(Op::SnapOpen),
-        3 => (table(), key()).prop_map(|(t, k)| Op::SnapGet(t, k)),
-        2 => (table(), proptest::option::of(key()), walk_len())
+        3 => (table(), key(spread)).prop_map(|(t, k)| Op::SnapGet(t, k)),
+        2 => (table(), proptest::option::of(key(spread)), walk_len())
             .prop_map(|(t, s, n)| Op::SnapWalk(t, s, n)),
         1 => table().prop_map(Op::SnapEntries),
     ];
@@ -1677,14 +1783,14 @@ fn assert_form(db: &TnLmdbEnv, form: Form) {
 /// Runs `ops` on MDBX and on tn-lmdb in each form of its nested layouts' tables ([`Form::ALL`]),
 /// each in a new environment, and compares each form's outcomes and skips with MDBX's. Returns
 /// MDBX's run, which every form's equals.
-fn differential(ops: &[Op]) -> Result<Run, TestCaseError> {
+fn differential(scripts: Scripts, ops: &[Op]) -> Result<Run, TestCaseError> {
     let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let want = run(&mdbx, ops, false);
+    let want = run(&mdbx, scripts, ops, false);
     for form in Form::ALL {
         let (_dir, db) = create_test_db_with(TnLmdbEnvKind::RW, form);
         assert_form(&db, form);
         let form = form.name();
-        let have = run(&db, ops, true);
+        let have = run(&db, scripts, ops, true);
         if !want.model_misses.is_empty() {
             let misses = want.model_misses.join("\n");
             return Err(TestCaseError::fail(format!(
@@ -1698,11 +1804,27 @@ fn differential(ops: &[Op]) -> Result<Run, TestCaseError> {
                 render(&want.outcomes, &have.outcomes)
             )));
         }
-        if (have.ran, have.skips) != (want.ran, want.skips) {
+        // The outcomes matched MDBX's, so a miss here is one the outcomes did not show: a
+        // committed table (`check_model`) or a cursor place that differs from the model's.
+        if !have.model_misses.is_empty() {
+            let misses = have.model_misses.join("\n");
+            return Err(TestCaseError::fail(format!(
+                "the test's model disagrees with tn-lmdb ({form}):\n{misses}\nscript: {ops:?}\n{}",
+                render(&want.outcomes, &have.outcomes)
+            )));
+        }
+        let counts = |r: &Run| (r.ran, r.skips, r.dup_cursor_ran, r.dup_cursor_skipped);
+        if counts(&have) != counts(&want) {
             return Err(TestCaseError::fail(format!(
                 "tn-lmdb's run ({form}) skipped other ops than MDBX's: ran {} against {}, skips \
-                 {:?} against {:?}\nscript: {ops:?}",
-                have.ran, want.ran, have.skips, want.skips
+                 {:?} against {:?}, dup cursor calls run and skipped {:?} against {:?}\nscript: \
+                 {ops:?}",
+                have.ran,
+                want.ran,
+                have.skips,
+                want.skips,
+                (have.dup_cursor_ran, have.dup_cursor_skipped),
+                (want.dup_cursor_ran, want.dup_cursor_skipped),
             )));
         }
     }
@@ -1724,10 +1846,14 @@ fn random_seed() -> u64 {
 /// Ops run and skipped by class ([`CLASSES`]) over a test's scripts.
 type Totals = (u64, [u64; 9]);
 
-/// Runs `cases` scripts of up to `len` ops from `seed`, each on MDBX and on every form of tn-lmdb
-/// ([`differential`]), prints the ops run and skipped (by class) with the seed, and returns them.
-/// A failure's message names the seed, which `PROPTEST_RNG_SEED` reruns.
-fn differential_cases(cases: u32, len: usize, seed: u64) -> Totals {
+/// Runs `cases` scripts of up to `len` ops from `seed`, of the shape `scripts`, each on MDBX and
+/// on every form of tn-lmdb ([`differential`]), prints the ops run and skipped (by class, and
+/// the dup table's cursor calls apart) with the seed, and returns the ops run and skipped by
+/// class. A failure's message names the seed, which `PROPTEST_RNG_SEED` reruns. The skips must
+/// stay under a tenth of the ops run, and the dup table's skipped cursor calls under a fifth of
+/// its cursor calls: the dup layouts' cursor code is what the skip classes mostly cover, so a
+/// rate low over every op could still leave it mostly skipped.
+fn differential_cases(cases: u32, len: usize, seed: u64, scripts: Scripts) -> Totals {
     let config = ProptestConfig {
         cases,
         rng_seed: RngSeed::Fixed(seed),
@@ -1735,10 +1861,13 @@ fn differential_cases(cases: u32, len: usize, seed: u64) -> Totals {
         ..ProptestConfig::default()
     };
     let totals = RefCell::new(Run::default());
-    let result = TestRunner::new(config).run(&prop::collection::vec(op(), 1..=len), |ops| {
-        let run = differential(&ops)?;
+    let ops = prop::collection::vec(op(scripts.spread()), 1..=len);
+    let result = TestRunner::new(config).run(&ops, |ops| {
+        let run = differential(scripts, &ops)?;
         let mut totals = totals.borrow_mut();
         totals.ran += run.ran;
+        totals.dup_cursor_ran += run.dup_cursor_ran;
+        totals.dup_cursor_skipped += run.dup_cursor_skipped;
         for (sum, n) in totals.skips.iter_mut().zip(run.skips) {
             *sum += n;
         }
@@ -1750,8 +1879,9 @@ fn differential_cases(cases: u32, len: usize, seed: u64) -> Totals {
     let totals = totals.into_inner();
     let skipped: u64 = totals.skips.iter().sum();
     println!(
-        "differential (seed {seed}, every form): {cases} scripts, {} ops run, {skipped} skipped",
-        totals.ran
+        "differential (seed {seed}, {scripts:?}, every form): {cases} scripts, {} ops run, \
+         {skipped} skipped; dup cursor calls: {} run, {} skipped",
+        totals.ran, totals.dup_cursor_ran, totals.dup_cursor_skipped
     );
     for (class, n) in CLASSES.iter().zip(totals.skips) {
         println!("  {n:7}  {class}");
@@ -1759,6 +1889,13 @@ fn differential_cases(cases: u32, len: usize, seed: u64) -> Totals {
     assert!(
         skipped * 10 < totals.ran,
         "skipped ops reached a tenth of the ops run at seed {seed}: the scripts test little"
+    );
+    assert!(
+        totals.dup_cursor_skipped * 5 < totals.dup_cursor_ran,
+        "skipped dup cursor calls reached a fifth of those run at seed {seed} ({} of {}): the \
+         scripts test the dup cursors little",
+        totals.dup_cursor_skipped,
+        totals.dup_cursor_ran
     );
     (totals.ran, totals.skips)
 }
@@ -1778,20 +1915,37 @@ const HEAVY_TOTALS: Totals = (294_529, [8988, 4, 2304, 23, 62, 1022, 52, 1048, 0
 /// overflow values) give the same outcomes on tn-lmdb, in every form, as on MDBX.
 #[test]
 fn random_scripts_match_mdbx() {
-    differential_cases(32, 64, random_seed());
+    differential_cases(32, 64, random_seed(), Scripts::Narrow);
 }
 
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_match_mdbx_heavy() {
-    differential_cases(2000, 256, random_seed());
+    differential_cases(2000, 256, random_seed(), Scripts::Narrow);
+}
+
+/// [`random_scripts_match_mdbx`] on tables seeded with one dup key of [`MULTI_LEAF_ROWS`] rows
+/// and as many header keys ([`Scripts::MultiLeaf`]), the drawn keys and slots spread over them,
+/// so the cursor writes and moves run inside multi-leaf nested trees (packed and packed-small
+/// forms) and multi-leaf composite trees, with dup subkeys that differ past their first byte and
+/// rests of several lengths ([`WIDE`]).
+#[test]
+fn random_scripts_match_mdbx_multi_leaf() {
+    differential_cases(32, 64, random_seed(), Scripts::MultiLeaf);
+}
+
+#[test]
+#[ignore = "heavy: run with --release"]
+fn random_scripts_match_mdbx_multi_leaf_heavy() {
+    differential_cases(2000, 256, random_seed(), Scripts::MultiLeaf);
 }
 
 /// [`random_scripts_match_mdbx`]'s scripts from [`RNG_SEED`] run and skip the pinned ops by
 /// class, on every form.
 #[test]
 fn random_scripts_skip_counts_are_pinned_at_seed_1() {
-    assert_eq!(differential_cases(32, 64, RNG_SEED), DEFAULT_TOTALS, "{PINNED_MOVED}");
+    let totals = differential_cases(32, 64, RNG_SEED, Scripts::Narrow);
+    assert_eq!(totals, DEFAULT_TOTALS, "{PINNED_MOVED}");
 }
 
 /// [`random_scripts_match_mdbx_heavy`]'s scripts from [`RNG_SEED`] run and skip the pinned ops
@@ -1799,5 +1953,6 @@ fn random_scripts_skip_counts_are_pinned_at_seed_1() {
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_skip_counts_are_pinned_at_seed_1_heavy() {
-    assert_eq!(differential_cases(2000, 256, RNG_SEED), HEAVY_TOTALS, "{PINNED_MOVED}");
+    let totals = differential_cases(2000, 256, RNG_SEED, Scripts::Narrow);
+    assert_eq!(totals, HEAVY_TOTALS, "{PINNED_MOVED}");
 }

@@ -185,6 +185,26 @@ pub(crate) fn form_mismatch(
     DatabaseError::Open(Mdbx::INCOMPATIBLE.with_message(message))
 }
 
+/// The error for a dup-sort table whose layout record in the file (`crate::env::LAYOUT_TABLE`:
+/// key width, subkey width, form) differs from this build's: `MDBX_INCOMPATIBLE`, as
+/// [`DatabaseError::Open`], with a message naming the table and both layouts.
+pub(crate) fn layout_mismatch(table: &str, found: &[u8], expected: [u8; 3]) -> DatabaseError {
+    let layout = |record: &[u8]| match record {
+        [key, subkey, form] => format!(
+            "key {key}, subkey {subkey}, {}",
+            if *form == 1 { "an engine dup table" } else { "composite keys" }
+        ),
+        other => format!("the unreadable record {other:?}"),
+    };
+    let message = format!(
+        "table {table} was written with a layout of {}, this build's is {}; the file was written \
+         by another tn-lmdb-reth layout",
+        layout(found),
+        layout(&expected)
+    );
+    DatabaseError::Open(Mdbx::INCOMPATIBLE.with_message(message))
+}
+
 /// The error for a dup-sort table this crate does not store, and for a dup cursor call on a
 /// table without duplicates.
 pub(crate) fn dup_sort_unsupported(table: &'static str) -> DatabaseError {

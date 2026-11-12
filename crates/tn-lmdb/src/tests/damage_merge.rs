@@ -237,7 +237,7 @@ fn a_merge_refuses_a_damaged_leaf_sibling() {
             restamped(p, r, |page| page::branch_set_child(page, si, away, away_txn).expect("set"))
         });
         refused(&fx, &case("run allocated later"), "l", &key, "of a file of", &|p| {
-            let ovf = Ovf { pgno: past_end, txn: txn32, len: 3 * P as u32 };
+            let ovf = Ovf { pgno: past_end, txn: txn32, len: 3 * P as u32, tag: 0 };
             restamped(p, sib, |page| {
                 let fit = page::LeafMut::new(page)
                     .expect("leaf")

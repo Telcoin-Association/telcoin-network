@@ -101,7 +101,10 @@ sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of
 
 The form is part of the file's format: the open refuses a table held in the other form, or a dup
 table with another key width or `packed_max` (`MDBX_INCOMPATIBLE`, naming the table and both
-forms). A read returns the value (subkey, then the rest) as one slice of the page, with no copy,
+forms), and a dup-sort table whose layout record in the file (`TnLmdbRethLayout`, written by
+`create_tables`: key width, subkey width, form, which the engine's catalog does not hold in full)
+differs from this build's; a file without the record, written before it, opens. A read returns
+the value (subkey, then the rest) as one slice of the page, with no copy,
 read by the move itself on a nested table (the engine's tail moves, `next_with_key_tail` and the
 others) and by `current_with_key_tail` after the move on a composite one; only a value in an
 overflow run is joined in a buffer of the cursor's.

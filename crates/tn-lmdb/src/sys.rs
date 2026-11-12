@@ -23,7 +23,10 @@ use std::{
     io,
     os::fd::{AsRawFd, BorrowedFd},
     path::Path,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
 };
 
 /// A boot id: 16 bytes that differ from one boot of the host to the next ([`boot_id`]). All zeros
@@ -232,7 +235,7 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
 ///
 /// `from` must be the file's current length (macOS reserves from the physical end of file). Where
 /// the filesystem cannot preallocate, this falls back to a plain (sparse) resize so the file
-/// still works.
+/// still works, with a warning once per process ([`sparse_fallback`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> {
     let len = to.saturating_sub(from);
@@ -254,9 +257,24 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
         // fallocate; fall back to a plain resize (sparse) rather than failing an
         // otherwise-serviceable growth.
         Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) => {
+            sparse_fallback(&err);
             file.set_len(to)
         }
         Err(err) => Err(err), // ENOSPC / EDQUOT / EFBIG / EIO propagate as the growth's io::Error
+    }
+}
+
+/// Warn, once per process, that [`allocate_range`] fell back to a sparse resize (`err` is the
+/// preallocation's refusal): the file then lacks the guarantee the preallocation exists for, and
+/// a full disk can be a `SIGBUS` on a mapped write instead of an error (README, Platform notes).
+fn sparse_fallback(err: &io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            target: "tn_lmdb",
+            "the file system cannot preallocate the data file's growth ({err}); it grows sparse, \
+             so a full disk can be a SIGBUS on a write instead of an error"
+        );
     }
 }
 
@@ -295,6 +313,7 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
     }
     if let Err(err) = reserved {
         if err.raw_os_error() == Some(libc::ENOTSUP) {
+            sparse_fallback(&err);
             return file.set_len(to);
         }
         return Err(err);
