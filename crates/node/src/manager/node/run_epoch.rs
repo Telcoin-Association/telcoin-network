@@ -720,6 +720,8 @@ where
             output.set_epoch_close();
         }
         evict_committed_batches(&self.consensus_db, output.batch_digests());
+        // free the quota of the committed batches and move the age-out horizon (issue #1794)
+        self.reported_batches.forget(output.batch_digests(), output.leader_round());
         // stamped before the send so the engine's forward wait includes a send blocked on a full
         // channel; node-local, never serialized or hashed
         output.set_forwarded_at(Instant::now());
@@ -1228,9 +1230,11 @@ fn epoch_tasks_ended(
 ///
 /// A latch is this node's own storage failing (a failed write or sync, a stopped writer, or damage
 /// a read found on disk): a peer's bad record is refused before it is written and latches nothing.
-/// One known exception predates tndb and is tracked separately: a committee member can flood
-/// distinct valid batches into [`NodeBatchesCache`], which keeps them until they are committed or
-/// the epoch closes, so the flood can fill the disk and latch the cache store. Without this, a
+/// A committee member that floods distinct valid batches into [`NodeBatchesCache`] through the
+/// worker report path or the gossip prefetch is bounded before the write
+/// (`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER` uncommitted stored batches per committee key
+/// for the whole node, issue #1794). The vote path, which stores the batches of an uncertified
+/// header, is not bounded yet (follow-up issue). Without this, a
 /// latched peer-record or batch-cache store would go unnoticed until the epoch ends (an observer's
 /// following stalls meanwhile).
 fn store_failure<DB: TNDatabase>(

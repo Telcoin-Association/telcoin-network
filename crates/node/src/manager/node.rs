@@ -51,7 +51,7 @@ use tn_types::{
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
 pub(crate) use tn_types::gas_accumulator::worker_id_from_header;
-use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tn_worker::{ReportedBatchLedger, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -302,6 +302,12 @@ pub(crate) struct EpochManager<P, DB> {
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
+
+    /// The uncommitted batches that each committee key stored on this node through the worker
+    /// report path and the gossip prefetch (issue #1794). One ledger for all workers of the node.
+    /// A new epoch empties it, a mode-change re-entry into the same epoch keeps it, and
+    /// [`Self::process_output`] frees the committed batches. A process restart starts it empty.
+    reported_batches: ReportedBatchLedger,
 
     /// Inbound sync ledgers of the primary network (opening admission and serve budgets),
     /// built once per node process and shared by the network of every epoch, so an epoch
@@ -827,6 +833,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            reported_batches: ReportedBatchLedger::new(),
             primary_sync_ledgers: PrimarySyncLedgers::new(),
             bootstrap_servers,
             trusted_peer_keys: HashSet::new(),

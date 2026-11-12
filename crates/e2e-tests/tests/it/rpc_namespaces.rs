@@ -181,6 +181,9 @@ fn test_rpc_namespaces_on_running_validators() -> eyre::Result<()> {
     )?;
     assert_method_not_found(default_node, "trace_transaction", rpc_params!(&tx_hash))?;
 
+    // Success-path teardown: SIGKILL and reap after the last assert. An early `?` return still
+    // drops the guard into the graceful `kill_all`, so a failure keeps complete node logs.
+    guard.finish();
     Ok(())
 }
 

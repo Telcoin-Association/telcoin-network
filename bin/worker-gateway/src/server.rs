@@ -4696,14 +4696,24 @@ mod tests {
         assert_eq!(ready_status(gateway).await, StatusCode::OK, "a timeout must not mark");
     }
 
+    /// A loopback socket bound to `addr` that does not listen: a connect to it
+    /// is refused, and while it is held no other socket can take the port (a
+    /// freed port can go to the next `bind(0)`, the gateway's own included).
+    fn hold_port(addr: SocketAddr) -> tokio::net::TcpSocket {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        // a port that just served a connection can be in TIME_WAIT
+        socket.set_reuseaddr(true).expect("reuseaddr");
+        socket.bind(addr).unwrap_or_else(|err| {
+            panic!("holding the port {addr} failed, another process took it: {err}")
+        });
+        socket
+    }
+
     #[tokio::test]
     async fn a_forward_that_gets_a_response_restarts_the_failure_run() {
-        // reserve a loopback port, then free it so forwards to it are refused
-        let addr = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind")
-            .local_addr()
-            .expect("local addr");
+        // hold a loopback port without listening on it, so forwards to it are refused
+        let held = hold_port(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let addr = held.local_addr().expect("local addr");
         // no idle connections, so every forward opens a new one and the third
         // is refused rather than sent on the second's connection
         let client = test_client_builder()
@@ -4721,16 +4731,10 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_GATEWAY,
-            "nothing should listen on the freed port {addr}; another process may have taken it"
-        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "the held port {addr} refuses the forward");
 
         // the worker answers once on the same port, then goes away again
-        let listener = TcpListener::bind(addr).await.unwrap_or_else(|err| {
-            panic!("rebinding the freed port {addr} failed, another process took it: {err}")
-        });
+        let listener = held.listen(1024).expect("listen");
         let worker = tokio::spawn(async move {
             axum::serve(listener, Router::new().route("/", post(|| async { "ok" }))).await
         });
@@ -4738,16 +4742,12 @@ mod tests {
         assert_eq!((status, text.as_str()), (StatusCode::OK, "ok"));
         worker.abort();
         let _ = worker.await;
+        let _held = hold_port(addr);
 
         // one refused forward after the response: the run restarted, so the
         // count is 1, below the threshold of 2
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_GATEWAY,
-            "nothing should listen on the freed port {addr} again; another process may have \
-             taken it"
-        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "the held port {addr} refuses the forward");
         assert_eq!(ready_status(gateway).await, StatusCode::OK, "the response reset the count");
     }
 
