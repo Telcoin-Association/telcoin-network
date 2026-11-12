@@ -1336,9 +1336,16 @@ where
                 .collect()
         };
 
-        // try to accept
+        // try to accept; a parent parked as pending (verified, its own parents not stored yet) is
+        // accepted here: `notify_read_parent_certificates` in `vote_inner` waits for it, bounded
+        // by `vote_timeout`, whose expiry is a recoverable, uncached error. returning `Pending`
+        // instead would end the vote in an error the proposer treats as final for this voter
+        // until it re-sends the header, although parking the parent already started its fetch
         for parent in parents.iter_mut() {
-            self.state_sync.process_peer_certificate(parent).await?;
+            match self.state_sync.process_peer_certificate(parent).await {
+                Ok(()) | Err(CertManagerError::Pending(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())
