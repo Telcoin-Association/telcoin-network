@@ -1832,12 +1832,12 @@ where
                 .collect()
         };
 
-        // skip the parents this node already stores or holds as pending: each was verified when
-        // it arrived (a certificate's digest is its header's, so the copy held is a verified one
-        // for the same header), and the parent wait in `vote_inner` covers a pending one. every
-        // author whose header cites a missing parent may attach it, so without this each copy
-        // would be verified again until the parent is stored. a copy still being verified is not
-        // skipped: if that copy were bad, skipping on it would drop the honest copies
+        // skip the parents this node already stores or holds as pending: the copy held has the
+        // same header (a certificate's digest is its header's), which is all the vote reads, and
+        // the parent wait in `vote_inner` covers a pending one. every author whose header cites a
+        // missing parent may attach it, so without this each copy would be verified again until
+        // the parent is stored. a copy still being verified is not skipped: if that copy were
+        // bad, skipping on it would drop the honest copies
         let digests: Vec<HeaderDigest> = parents.iter().map(|cert| cert.digest()).collect();
         let unknown = self.state_sync.identify_unknown_certificates(digests.iter()).await?;
         parents.retain(|cert| unknown.contains(&cert.digest()));
@@ -2025,7 +2025,8 @@ where
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening `Req(MissingCertificates { .. })` frame read by the caller. A streaming
     /// [`CertificateCollector`] (no aggregate response-size cap, only its DB-read time
-    /// limit) drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
+    /// limit), which serves only certificates whose signature this node has checked,
+    /// drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
     /// then the matching certificates as batched `Data` frames terminated by
     /// [`SyncFrame::End`]. This is the streamed replacement for the legacy
     /// request-response `RequestedCertificates` reply, without its `max_response_size`
@@ -2082,7 +2083,7 @@ where
             SEND_SYNC_CERTS_TIMEOUT,
             crate::network::sync_codec::send_sync_certificates_over_stream(
                 &mut stream,
-                collector,
+                collector.into_verified_stream(),
                 SEND_STREAM_BUFFER_TIMEOUT,
             ),
         )

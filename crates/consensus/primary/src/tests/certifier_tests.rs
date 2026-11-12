@@ -6,6 +6,7 @@ use crate::{
     network::{PrimaryRequest, PrimaryResponse},
     ConsensusBus,
 };
+use assert_matches::assert_matches;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
 use std::{
@@ -20,8 +21,8 @@ use tn_network_libp2p::types::{
 use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    encode, error::DagError, BlsKeypair, BlsSigner, DBIter, HeaderBuilder, Table, TnSender,
-    VotingPower,
+    encode, error::DagError, BlsKeypair, BlsSignature, BlsSigner, DBIter, HeaderBuilder,
+    SignatureVerificationState, Table, TnSender, VotingPower,
 };
 use tokio::{
     sync::{mpsc, watch},
@@ -1382,6 +1383,162 @@ fn row_failure(name: &str, error: tokio::task::JoinError) -> String {
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|message| message.to_string()))
         .unwrap_or_else(|| format!("{name}: row panicked with a non-string payload"))
+}
+
+/// A round-2 header of the last authority, a vote on it from the first authority, and one of its
+/// round-1 parents stored `VerifiedIndirectly` with `signature`, as a fetch that received it under
+/// another certificate stores it.
+struct IndirectParent {
+    committee: Committee,
+    peer: AuthorityIdentifier,
+    peer_key: BlsPublicKey,
+    header: Header,
+    vote: Vote,
+    parent: Certificate,
+    store: MemDatabase,
+}
+
+impl IndirectParent {
+    /// `signature` replaces the parent's aggregate signature; `None` keeps the valid one.
+    fn new(signature: Option<BlsSignature>) -> Self {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+        let committee = fixture.committee();
+        let round1: Vec<Certificate> = fixture
+            .authorities()
+            .map(|authority| {
+                fixture.certificate(&authority.header_builder_at_round(&committee, 1).build())
+            })
+            .collect();
+        let proposer = fixture.authorities().last().expect("committee has authorities");
+        let header = proposer
+            .header_builder_at_round(&committee, 2)
+            .parents(round1.iter().map(|certificate| certificate.header().digest()).collect())
+            .build();
+        let peer = fixture.authorities().next().expect("committee has authorities");
+        let vote = Vote::new(&header, peer.id(), peer.consensus_config().key_config());
+
+        let mut parent = round1[0].clone();
+        let signature = signature
+            .or_else(|| parent.aggregated_signature())
+            .expect("fixture certificates are signed");
+        parent.set_signature_verification_state(SignatureVerificationState::VerifiedIndirectly(
+            signature,
+        ));
+        let store = MemDatabase::default();
+        store.write(parent.clone()).expect("write the indirect parent");
+
+        Self {
+            committee,
+            peer: peer.id(),
+            peer_key: *peer.authority().protocol_key(),
+            header,
+            vote,
+            parent,
+            store,
+        }
+    }
+
+    /// Ask the peer for its vote. Its first answer names the stored parent as missing and every
+    /// later one is its vote. Returns the result and the parents each request carried.
+    async fn request_vote(&self) -> (DagResult<Vote>, Vec<Vec<Certificate>>) {
+        let (mut network, handle) = MockNetwork::new();
+        let cancel_proposal = Notifier::new();
+        let call = Certifier::request_vote(
+            self.peer.clone(),
+            self.header.clone(),
+            self.peer_key,
+            self.store.clone(),
+            handle,
+            self.committee.clone(),
+            cancel_proposal.subscribe(),
+        );
+        let missing = self.parent.header().digest();
+        let respond = async {
+            let mut attached = Vec::new();
+            // `request_vote` drops the only network handle when it returns, which ends this loop
+            while let Some(command) = network.rx.recv().await {
+                let (peer, parents, reply) = match command {
+                    NetworkCommand::SendRequest {
+                        peer,
+                        request: PrimaryRequest::Vote { parents, .. },
+                        reply,
+                    } => (peer, parents, reply),
+                    other => panic!("expected a vote request, got {other:?}"),
+                };
+                let result = if attached.is_empty() {
+                    PrimaryResponse::MissingParents(vec![missing])
+                } else {
+                    PrimaryResponse::Vote(self.vote.clone())
+                };
+                attached.push(parents);
+                let _ = reply.send(Ok(NetworkResponseMessage { peer, result }));
+            }
+            attached
+        };
+        tokio::join!(call, respond)
+    }
+
+    /// The parent as the store holds it now.
+    fn stored(&self) -> Certificate {
+        self.store
+            .read(self.parent.header().digest())
+            .expect("store readable")
+            .expect("the parent stays stored")
+    }
+}
+
+/// A stored parent whose aggregate signature was taken on trust from a fetch, and does not verify,
+/// is never attached to a vote request.
+///
+/// The request for that voter ends as for a parent this node does not hold, so the voter neither
+/// receives the bad bytes nor caches a refusal of the header. The failure is stored, so a second
+/// request, as after a restart, withholds the parent again without verifying it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn request_vote_withholds_indirect_parent_with_bad_signature() {
+    let cx = IndirectParent::new(Some(BlsSignature::default()));
+
+    for attempt in ["first request", "second request"] {
+        let (result, attached) = cx.request_vote().await;
+        assert_eq!(
+            attached,
+            vec![Vec::<Certificate>::new()],
+            "{attempt}: only the first request, without parents, may reach the voter"
+        );
+        assert!(
+            same_outcome(&result, &Err(DagError::ProposedHeaderMissingCertificates)),
+            "{attempt}: expected the request to end as for a parent not held, got {result:?}"
+        );
+        assert_matches!(
+            cx.stored().signature_verification_state(),
+            SignatureVerificationState::Unsigned(signature)
+                if *signature == BlsSignature::default(),
+            "{attempt}: the failed check is stored with the certificate"
+        );
+    }
+}
+
+/// A stored parent whose aggregate signature was taken on trust from a fetch, and verifies, is
+/// attached once checked, and the check is stored so the next use does not repeat it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn request_vote_attaches_indirect_parent_once_verified() {
+    let cx = IndirectParent::new(None);
+    let signature = cx.parent.aggregated_signature().expect("fixture certificates are signed");
+
+    let (result, attached) = cx.request_vote().await;
+    assert!(same_outcome(&result, &Ok(cx.vote.clone())), "expected the vote, got {result:?}");
+    assert_eq!(attached.len(), 2, "the parent is attached to the second request");
+    assert_eq!(attached[0], Vec::<Certificate>::new(), "the first request carries no parents");
+    assert_eq!(attached[1], vec![cx.parent.clone()], "the second request carries the parent");
+    assert_matches!(
+        attached[1][0].signature_verification_state(),
+        SignatureVerificationState::VerifiedDirectly(sent) if *sent == signature,
+        "the attached copy is the one this node verified"
+    );
+    assert_matches!(
+        cx.stored().signature_verification_state(),
+        SignatureVerificationState::VerifiedDirectly(stored) if *stored == signature,
+        "the check is stored with the certificate"
+    );
 }
 
 /// `VotesAggregator::append` returns exactly the result each vote calls for.

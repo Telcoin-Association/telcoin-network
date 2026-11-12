@@ -3,7 +3,7 @@
 use crate::{
     aggregators::VotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
-    state_sync::StateSynchronizer,
+    state_sync::{verify_stored_certificate, StateSynchronizer},
     ConsensusBus,
 };
 use std::{
@@ -164,32 +164,44 @@ impl<DB: Database> Certifier<DB> {
             attempt += 1;
 
             // peers may respond to a vote requesting missing parents
-            let parents = missing_parents.map(|missing_parents| {
-                // collect missing parents requested by peer in order to vote for this header
-                let expected_count = missing_parents.len();
-                let parents: Vec<_> = certificate_store
-                    .read_all(
+            let parents = match missing_parents {
+                Some(missing_parents) => {
+                    // collect missing parents requested by peer in order to vote for this header
+                    let expected_count = missing_parents.len();
+                    let stored = certificate_store.read_all(
                         missing_parents
                             .into_iter()
                             // only provide certs that are parents for the requested vote
                             .filter(|parent| header.parents().contains(parent)),
-                    )?
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                    )?;
 
-                // sanity check for missing parents
-                if parents.len() != expected_count {
-                    error!(
-                        target: "primary::certifier",
-                        "tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}",
-                        parents.len()
-                    );
-                    return Err(DagError::ProposedHeaderMissingCertificates);
+                    // a parent fetched under another certificate holds signature bytes this node
+                    // never checked: the voter verifies what it is sent and caches a refusal of
+                    // this header on a bad copy, so a copy that fails here counts as not held
+                    let mut parents = Vec::with_capacity(expected_count);
+                    for parent in stored.into_iter().flatten() {
+                        if let Some(parent) =
+                            verify_stored_certificate(&certificate_store, &committee, parent)
+                                .await?
+                        {
+                            parents.push(parent);
+                        }
+                    }
+
+                    // sanity check for missing parents
+                    if parents.len() != expected_count {
+                        error!(
+                            target: "primary::certifier",
+                            "tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {} with a valid signature",
+                            parents.len()
+                        );
+                        return Err(DagError::ProposedHeaderMissingCertificates);
+                    }
+
+                    parents
                 }
-
-                Ok(parents)
-            }).unwrap_or(Ok(vec![]))?;
+                None => vec![],
+            };
 
             // the round trip of this attempt alone: earlier attempts and the retry delays between
             // them are on their own lines
