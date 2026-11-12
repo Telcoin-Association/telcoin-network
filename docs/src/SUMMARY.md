@@ -40,6 +40,7 @@
     * [Development Tools](getting-started/dapp-development/development-tools.md)
   * [Faucet](getting-started/faucet.md)
   * [Hardware Requirements](getting-started/hardware-requirements.md)
+    * [Execution Database Disk and Memory](getting-started/execution-database-hardware.md)
 * [Networks and RPC Endpoints](networks-and-rpc-endpoints.md)
 * [Namespaces](rpc-methods/README.md)
   * [Enabling Namespaces](rpc-methods/enabling-namespaces.md)
