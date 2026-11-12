@@ -53,6 +53,13 @@
 #                                  and storage at past blocks, transactions by hash, beside the
 #                                  writer)
 #   EXEC_ALLOW_CARGO=1  time the runs even while rustc/cargo processes run (the report says so)
+#   EXEC_SHARED_BASE=1  commit mode only: the after side runs on the before side's cached bases
+#                    (cache-before-<commit>/) instead of aging its own (the report says so).
+#                    Aging is not page-deterministic: two bases aged by the same code differ in
+#                    page layout, which moves the write rows (write_state's cold reads, the
+#                    commit) by more than many changes do. Share them to compare a change that
+#                    writes the same data; the sides' final tips must then match. Leave it unset
+#                    for a change to what is written, or to the on-disk format
 #   EXEC_SYS_SAMPLE=1  Linux only (refused elsewhere): a sampler beside each run, started just
 #                    before the binary and killed right after it (and on any exit), which never
 #                    changes a run's status. Every second it writes reports/<run>.sys.tsv: the
@@ -1107,7 +1114,15 @@ else
     target_b="$bench_dir/target-$backend"
     cache_a="$bench_dir/cache-before-$before_key"
     cache_b="$bench_dir/cache-after"
+    if [ "${EXEC_SHARED_BASE:-}" = 1 ]; then
+        cache_b="$cache_a"
+    fi
 fi
+case "${EXEC_SHARED_BASE:-}" in
+    "") ;;
+    1) [ "$mode" = commit ] || die "EXEC_SHARED_BASE=1 is for commit mode; $mode mode already shares one base" ;;
+    *) die "EXEC_SHARED_BASE must be 1 or unset, not '$EXEC_SHARED_BASE'" ;;
+esac
 
 # A run refused or failed before its first timed run leaves no report.
 runs_started=0
@@ -1294,6 +1309,9 @@ if [ -n "$busy" ]; then
         || die "refusing to time runs while rustc/cargo run ($busy); wait, or set EXEC_ALLOW_CARGO=1"
     echo "warning: timing runs while rustc/cargo run ($busy): EXEC_ALLOW_CARGO=1" >&2
     kv "WARNING" "runs timed while rustc/cargo ran ($busy): EXEC_ALLOW_CARGO=1"
+fi
+if [ "${EXEC_SHARED_BASE:-}" = 1 ]; then
+    kv "shared base" "the after side ran on the before side's cached bases (EXEC_SHARED_BASE=1)"
 fi
 
 runs_started=1
