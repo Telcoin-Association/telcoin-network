@@ -124,7 +124,7 @@ use alloy::{
         eip4788::BEACON_ROOTS_ADDRESS,
         eip7685::{Requests, EMPTY_REQUESTS_HASH},
     },
-    primitives::{aliases::U184, Log},
+    primitives::{aliases::U184, Bloom, Log},
     sol_types::{SolCall as _, SolEventInterface as _},
 };
 use alloy_evm::{Database, Evm};
@@ -140,7 +140,7 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
     FromRecoveredTx, FromTxWithEncoded, OnStateHook, RecoveredTx,
 };
-use reth_primitives_traits::{logs_bloom, proofs::calculate_withdrawals_root};
+use reth_primitives_traits::proofs::calculate_withdrawals_root;
 use reth_revm::{
     context::{
         result::{ExecutionResult, ResultAndState},
@@ -2049,6 +2049,18 @@ where
     }
 }
 
+/// The header's `receipts_root` and `logs_bloom` from one bloom per receipt.
+///
+/// The block bloom is the OR of the receipt blooms, so the blooms computed for the receipts root
+/// are reused instead of hashing every log's address and topics a second time. Both values are
+/// the same as `Receipt::calculate_receipt_root_no_memo` and `logs_bloom` over all logs.
+fn receipts_root_and_logs_bloom(receipts: &[Receipt]) -> (B256, Bloom) {
+    let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+    let receipts_root = proofs::calculate_receipt_root(&receipts_with_bloom);
+    let logs_bloom = receipts_with_bloom.iter().fold(Bloom::ZERO, |acc, r| acc | r.bloom_ref());
+    (receipts_root, logs_bloom)
+}
+
 /// Block builder for TN.
 #[derive(Debug, Clone)]
 pub struct TNBlockAssembler<ChainSpec = reth_chainspec::ChainSpec> {
@@ -2090,8 +2102,7 @@ where
 
         let timestamp = evm_env.block_env.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
-        let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
+        let (receipts_root, logs_bloom) = receipts_root_and_logs_bloom(receipts);
 
         // set excess blob gas 0
         let excess_blob_gas = Some(0);
@@ -3067,5 +3078,57 @@ mod tests {
         assert_eq!(burns[0].0, victim, "the burned consensus NFT was the slashed validator's");
 
         Ok(())
+    }
+
+    /// The assembler's receipts root and logs bloom are the values of the two computations they
+    /// replaced (the receipts root with a bloom computed per receipt, then the bloom of every log
+    /// again), so the header's bytes are unchanged: every transaction type, receipts with no logs,
+    /// with several and with shared topics, and no receipts at all.
+    #[test]
+    fn receipts_root_and_logs_bloom_equal_the_separate_computations() {
+        use alloy::consensus::TxType;
+        use reth_primitives_traits::logs_bloom;
+
+        let mut rng = StdRng::seed_from_u64(0x7c);
+        let shared_topic = B256::from(rng.random::<[u8; 32]>());
+        let tx_types = [TxType::Legacy, TxType::Eip2930, TxType::Eip1559, TxType::Eip7702];
+        for count in [0, 1, 2, 5, 33, 200] {
+            let mut cumulative_gas_used = 0;
+            let receipts: Vec<Receipt> = (0..count)
+                .map(|i| {
+                    cumulative_gas_used += rng.random_range(21_000..200_000);
+                    let logs = (0..rng.random_range(0..6))
+                        .map(|_| {
+                            let mut topics: Vec<B256> = (0..rng.random_range(0..4))
+                                .map(|_| B256::from(rng.random::<[u8; 32]>()))
+                                .collect();
+                            if rng.random_bool(0.3) {
+                                topics.push(shared_topic);
+                            }
+                            let data: Vec<u8> =
+                                (0..rng.random_range(0..70)).map(|_| rng.random()).collect();
+                            Log::new_unchecked(
+                                Address::from(rng.random::<[u8; 20]>()),
+                                topics,
+                                data.into(),
+                            )
+                        })
+                        .collect();
+                    Receipt {
+                        tx_type: tx_types[i % tx_types.len()],
+                        success: rng.random_bool(0.8),
+                        cumulative_gas_used,
+                        logs,
+                    }
+                })
+                .collect();
+
+            let (receipts_root, bloom) = receipts_root_and_logs_bloom(&receipts);
+            assert_eq!(receipts_root, Receipt::calculate_receipt_root_no_memo(&receipts));
+            assert_eq!(bloom, logs_bloom(receipts.iter().flat_map(|r| r.logs())));
+            if receipts.iter().any(|r| !r.logs.is_empty()) {
+                assert_ne!(bloom, Bloom::ZERO, "{count} receipts with logs");
+            }
+        }
     }
 }

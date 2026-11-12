@@ -577,6 +577,58 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   state root's mean fell from 100.5 to 84.7 ms on that loaded machine (a quiet run decides).
   *Upstream*: n/a (upstream commit).
 
+- **TN-0140** — Backport 8572c88fe: the trie node iterator skips its hashed seek only when the
+  walker stands exactly at the seek prefix. *Kind*: backport (consensus fix).
+  *Files*: `crates/trie/trie/src/node_iter.rs` (the skip condition in `TrieNodeIter::try_next`,
+  `key == &seek_prefix` instead of `key.starts_with(&seek_prefix)`; upstream's test). One
+  import-only conflict in the test module; the test calls `HashedStorage::from_iter(false, ..)`,
+  the pin's signature.
+  *Why*: after skipping an unchanged branch, the iterator skipped the seek into the hashed
+  entries when the walker's next stored key started with the seek prefix. When that key sits
+  deeper than the prefix (the node at the prefix is an extension, which is not stored), hashed
+  entries between the prefix and the stored branch, such as a leaf the block inserted there, were
+  never visited, and the incremental root differed from a full rebuild of the same state. The
+  iterator now seeks unless the walker is exactly at the prefix. Execution path (state root):
+  **this changes the computed state root**, in the rare case the old code was wrong: there the old
+  root was not the root of the state, and the new one is. Every TN release up to now ran the old
+  code (upstream added it in 40015a821, 2025-04, spelled this way since 34fe4c7c5, 2025-06). A
+  node with this fix and one without compute different roots, and so different block hashes, on
+  any block where the case occurs, and an epoch record commits to the block hash. Mainnet takes it
+  at genesis; a chain already built by an older binary (adiri) is replayed with the fix and its
+  block hashes compared before the fix is deployed there, and a block that differs needs an
+  activation epoch. It is rare on hashed keys: a random-trie probe (base tries of 1k to 49k
+  accounts, about 155k inserted keys, the incremental root with the old condition against the
+  fixed one) found no wrong root, while it flags upstream's crafted shape. The cost is a few extra
+  hashed seeks when the walker lands deeper than the prefix.
+  *Tests*: upstream's `inserted_leaf_before_deeper_stored_branch_is_included` (seven storage slots
+  and one inserted under an extension: the incremental root against a rebuild); it fails without
+  the fix (incremental 0x52fe.. against rebuilt 0x6b94..). reth-trie and reth-trie-db suites,
+  tn-reth's `trie_overlay` tests and the format-freeze fixtures (their block hashes are unchanged,
+  so the case does not occur on that chain). *Upstream*: n/a (upstream commit).
+
+- **TN-0141** — Backport 8d97ab63c, 1b09bf5a2 and 3fba6ad70: `StoredNibblesSubKey` encodes to a
+  `[u8; 65]` instead of a `Vec`, and the storage-root span is trace-level and records its root
+  without formatting it first. *Kind*: backport.
+  *Files*: `crates/storage/db-api/src/models/mod.rs` (`Encode for StoredNibblesSubKey`),
+  `crates/trie/common/src/nibbles.rs` (`StoredNibblesSubKey::to_compact_array`; upstream's five
+  tests), `crates/trie/trie/src/trie.rs` (`StorageRoot::calculate`'s `instrument`: level `trace`,
+  name `storage_trie`, field `addr`; the two `storage_root` records in `calculate_with_cursors` pass
+  `tracing::field::debug`). Two conflicts in `trie.rs`: the attribute line, which the pin spells
+  differently (TN-0105), takes upstream's line (with it upstream's plain space for a non-breaking
+  one in the doc line above); the empty-storage short circuit, whose condition upstream changed in
+  a commit TN does not carry, keeps the pin's condition and takes only the record.
+  *Why*: every storage-trie seek and write encodes a subkey, one heap allocation each with the
+  `Vec`. TN's state root computes a storage root per changed account (TN-0105, TN-0139); the span
+  on `calculate` was at INFO, so it was built, with the address formatted, whenever INFO was on for
+  `trie::storage_root`, and each root was formatted into a `String` even with the span disabled.
+  Execution and storage path: the encoded bytes are the same (64 bytes of nibbles, zero padded,
+  then the count; upstream's test compares `to_compact_array` with `to_compact` at every length),
+  so the `StoragesTrie` keys are unchanged. The span change reaches logs only; a filter on the old
+  span name (`Storage trie`) or field (`hashed_address`) needs the new ones.
+  *Tests*: upstream's `test_stored_nibbles_subkey_compact_array_*`; reth-trie-common, reth-db-api,
+  reth-trie and reth-trie-db suites; the format-freeze writer test (the `StoragesTrie` rows of its
+  fixtures are unchanged). *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
