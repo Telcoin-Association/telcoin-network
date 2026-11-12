@@ -25,8 +25,9 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, now_ms, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
-    ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager, TnReceiver, B256,
+    error::HeaderError, now, now_ms, BlockNumHash, BlsPublicKey, Certificate, Committee,
+    ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, Header, HeaderDigest,
+    SealedHeader, SignatureVerificationState, TaskManager, TnReceiver, B256,
 };
 use tokio::time::timeout;
 
@@ -601,7 +602,8 @@ fn test_requested_parents_records_every_citing_author() {
 }
 
 /// A parent cited first by an author that never supplies it is still requested from, and
-/// accepted from, every later author whose header cites it (issue #1797).
+/// accepted from, every later author whose header cites it (issue #1797), and never accepted from
+/// an author this node did not ask for it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
     const NUM_PARENTS: usize = 10;
@@ -725,7 +727,35 @@ async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
     let received_missing: HashSet<_> = missing.into_iter().collect();
     assert_eq!(expected_missing, received_missing);
 
-    // TEST PHASE 3: the parents the honest author attaches are accepted and the vote is cast.
+    // TEST PHASE 3: an author this node never asked attaches the missing parents, and a round 3
+    // certificate no header cites, to its first request. Nothing it attaches is processed, so its
+    // vote waits for parents that never arrive and times out, and none of them is stored.
+    let outsider = fixture.authorities().nth(3).unwrap();
+    let outsider_header = outsider
+        .header_builder_at_round(&fixture.committee(), 3)
+        .author(outsider.id())
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .latest_execution_block(BlockNumHash::new(0, dummy_hash))
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+    outsider_header.payload().iter().for_each(|(digest, worker_id)| {
+        payload_store.write_payload(digest, worker_id).unwrap();
+    });
+    let uncited = all_certificates[NUM_PARENTS * 2].clone();
+    assert_eq!(uncited.round(), 3);
+    let attached: Vec<_> = round_2_missing.iter().cloned().chain([uncited.clone()]).collect();
+    let response = timeout(
+        Duration::from_secs(10),
+        handler.vote(*outsider.authority().protocol_key(), outsider_header, attached),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Err(PrimaryNetworkError::Timeout(_))), "{response:?}");
+    for digest in expected_missing.iter().chain([uncited.digest()].iter()) {
+        assert!(!certificate_store.contains(digest).unwrap(), "{digest:?} was processed");
+    }
+
+    // TEST PHASE 4: the parents the honest author attaches are accepted and the vote is cast.
     // Before the fix they were dropped because another author was recorded as their only owner.
     let response =
         timeout(Duration::from_secs(5), handler.vote(author_peer, author_header, round_2_missing))
@@ -733,6 +763,324 @@ async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
             .unwrap()
             .unwrap();
     assert!(matches!(response, PrimaryResponse::Vote(_)), "{response:?}");
+}
+
+/// A voter whose store holds half of the round 2 certificates and no round 1 certificate.
+///
+/// Every round 3 header from [`Self::header`] cites all round 2 certificates, so the voter asks
+/// its author for the other half. Those parents verify, but their own round 1 parents are
+/// missing, so the certificate manager parks them as pending until the round 1 certificates
+/// arrive. The certificate fetcher has no subscriber here, so parking a parent fetches nothing.
+struct PendingParentVoter {
+    fixture: CommitteeFixture<MemDatabase>,
+    handler: RequestHandler<MemDatabase>,
+    synchronizer: StateSynchronizer<MemDatabase>,
+    certificate_store: MemDatabase,
+    /// Every round 1 certificate; none is stored.
+    round_1_certs: Vec<Certificate>,
+    /// Every round 2 certificate.
+    round_2_certs: Vec<Certificate>,
+    /// The round 2 certificates the voter does not hold.
+    round_2_missing: Vec<Certificate>,
+    dummy_hash: B256,
+    _task_manager: TaskManager,
+    _temp_dir: TempDir,
+}
+
+impl PendingParentVoter {
+    const NUM_PARENTS: usize = 10;
+
+    async fn new() -> Self {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(Self::NUM_PARENTS).unwrap())
+            .build();
+        let target = fixture.authorities().next().unwrap();
+        let certificate_store = target.consensus_config().node_storage().clone();
+
+        let cb = ConsensusBus::new();
+        let temp_dir = TempDir::new().unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        // Need a dummy parent so we can request a vote.
+        let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+        let dummy_hash = dummy_parent.hash();
+        cb.app().recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                0,
+                ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+                Some(dummy_parent),
+            )
+        });
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            target.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        synchronizer.spawn(&task_manager);
+        let handler = RequestHandler::new(
+            target.consensus_config(),
+            cb.app().clone(),
+            synchronizer.clone(),
+            consensus_chain,
+        );
+
+        let committee: Committee = fixture.committee();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+        let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+        let (certificates, _next_parents) =
+            make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+        let all_certificates = certificates.into_iter().collect::<Vec<_>>();
+        let round_1_certs = all_certificates[..Self::NUM_PARENTS].to_vec();
+        let round_2_certs = all_certificates[Self::NUM_PARENTS..(Self::NUM_PARENTS * 2)].to_vec();
+        let round_2_missing = round_2_certs[(Self::NUM_PARENTS / 2)..].to_vec();
+
+        // store the first half of round 2 without its round 1 parents: only the round 3 header's
+        // own parents are read back
+        for cert in &round_2_certs[..(Self::NUM_PARENTS / 2)] {
+            certificate_store.write(cert.clone()).unwrap();
+        }
+        cb.app().committed_round_updates().send_replace(2);
+
+        Self {
+            fixture,
+            handler,
+            synchronizer,
+            certificate_store,
+            round_1_certs,
+            round_2_certs,
+            round_2_missing,
+            dummy_hash,
+            _task_manager: task_manager,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// A round 3 header by the authority at `index` that cites every round 2 certificate, with
+    /// its payload stored at the voter, and the peer key of its author. Each call builds a header
+    /// with a new payload, so a second call for one author gives a different header for the same
+    /// round.
+    fn header(&self, index: usize) -> (BlsPublicKey, Header) {
+        let author = self.fixture.authorities().nth(index).unwrap();
+        let header = author
+            .header_builder_at_round(&self.fixture.committee(), 3)
+            .author(author.id())
+            .parents(self.round_2_certs.iter().map(|c| c.digest()).collect())
+            .latest_execution_block(BlockNumHash::new(0, self.dummy_hash))
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+            .build();
+        for (digest, worker_id) in header.payload() {
+            self.certificate_store.write_payload(digest, worker_id).unwrap();
+        }
+        (*author.authority().protocol_key(), header)
+    }
+
+    /// The digests of the round 2 parents the voter does not hold.
+    fn missing_digests(&self) -> HashSet<HeaderDigest> {
+        self.round_2_missing.iter().map(|c| c.digest()).collect()
+    }
+
+    /// Whether the voter stores none of the missing round 2 parents but counts every one of them
+    /// as known, which means the certificate manager holds them all as pending.
+    async fn missing_parents_pending(&self, header: &Header) -> bool {
+        let unknown = self.synchronizer.identify_unkown_parents(header).await.unwrap();
+        let stored = self.missing_parents_stored();
+        unknown.is_empty() && stored.iter().all(|stored| !stored)
+    }
+
+    /// Whether the voter stores each missing round 2 parent, in order.
+    fn missing_parents_stored(&self) -> Vec<bool> {
+        self.round_2_missing
+            .iter()
+            .map(|c| self.certificate_store.contains(&c.digest()).unwrap())
+            .collect()
+    }
+
+    /// Deliver every round 1 certificate, as the fetch that parking a parent starts would. This
+    /// unlocks the pending round 2 parents, which are then stored.
+    async fn supply_round_1(&self) {
+        self.synchronizer
+            .process_fetched_certificates_in_parallel(self.round_1_certs.clone())
+            .await
+            .unwrap();
+    }
+}
+
+/// An author that attaches a missing parent whose own parents the voter lacks gets a vote once
+/// they arrive: the attached parent is parked as pending and the vote waits for it, instead of
+/// ending in an error the proposer treats as final for this voter (#1822 follow-up, issue #1797).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_waits_for_pending_attached_parent() {
+    let voter = PendingParentVoter::new().await;
+    let (author_peer, header) = voter.header(2);
+
+    // TEST PHASE 1: the author is told which parents are missing.
+    let response = voter.handler.vote(author_peer, header.clone(), Vec::new()).await.unwrap();
+    let PrimaryResponse::MissingParents(missing) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(voter.missing_digests(), missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 2: the author attaches them. They verify and are parked as pending, because the
+    // voter holds no round 1 certificate, and the vote waits for them. Paused time moves on only
+    // once the vote is idle, so the round 1 certificates arrive while it waits.
+    let vote = voter.handler.vote(author_peer, header.clone(), voter.round_2_missing.clone());
+    let supply = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let pending = voter.missing_parents_pending(&header).await;
+        voter.supply_round_1().await;
+        pending
+    };
+    let (response, pending_before_supply) = tokio::join!(vote, supply);
+    assert!(matches!(response, Ok(PrimaryResponse::Vote(_))), "{response:?}");
+    assert!(pending_before_supply, "the attached parents were not parked as pending");
+    assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
+}
+
+/// A vote that waits for a pending attached parent that never gets its own parents ends in the
+/// recoverable vote timeout, keeps the author's `MissingParents` entry, and votes on a retry once
+/// the parent is stored (#1822 follow-up, issue #1797).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_pending_attached_parent_times_out_recoverably() {
+    let voter = PendingParentVoter::new().await;
+    let (author_peer, header) = voter.header(2);
+    let expected_missing = voter.missing_digests();
+
+    // TEST PHASE 1: the author is told which parents are missing.
+    let response = voter.handler.vote(author_peer, header.clone(), Vec::new()).await.unwrap();
+    let PrimaryResponse::MissingParents(missing) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 2: the attached parents are parked as pending and never unlocked, so the vote
+    // ends in the vote timeout, which the proposer retries.
+    let response =
+        voter.handler.vote(author_peer, header.clone(), voter.round_2_missing.clone()).await;
+    assert!(matches!(response, Err(PrimaryNetworkError::Timeout(_))), "{response:?}");
+    assert!(voter.missing_parents_pending(&header).await);
+
+    // TEST PHASE 3: the timeout kept the author's entry, so a fresh request is told the same
+    // missing parents again rather than waiting for them.
+    let response = voter.handler.vote(author_peer, header.clone(), Vec::new()).await.unwrap();
+    let PrimaryResponse::MissingParents(missing) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 4: once the round 1 certificates arrive the parents are stored, and the retry
+    // with the same parents is voted.
+    voter.supply_round_1().await;
+    assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
+    let response = voter.handler.vote(author_peer, header, voter.round_2_missing.clone()).await;
+    assert!(matches!(response, Ok(PrimaryResponse::Vote(_))), "{response:?}");
+}
+
+/// A parent already held as pending is not verified again when a second citing author attaches
+/// it: the copy is skipped, and the vote waits for the pending parent and is cast once it is
+/// stored (#1822 follow-up).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_skips_attached_parent_already_pending() {
+    let voter = PendingParentVoter::new().await;
+    let (first_peer, first_header) = voter.header(2);
+    let (second_peer, second_header) = voter.header(3);
+    let expected_missing = voter.missing_digests();
+
+    // TEST PHASE 1: both authors cite the missing parents and are told about them.
+    for (peer, header) in [(first_peer, &first_header), (second_peer, &second_header)] {
+        let response = voter.handler.vote(peer, header.clone(), Vec::new()).await.unwrap();
+        let PrimaryResponse::MissingParents(missing) = response else {
+            panic!("Expected MissingParents, got: {response:?}");
+        };
+        assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+    }
+
+    // TEST PHASE 2: the first author attaches them. They are parked as pending, and its vote
+    // times out waiting for them.
+    let response =
+        voter.handler.vote(first_peer, first_header, voter.round_2_missing.clone()).await;
+    assert!(matches!(response, Err(PrimaryNetworkError::Timeout(_))), "{response:?}");
+    assert!(voter.missing_parents_pending(&second_header).await);
+
+    // TEST PHASE 3: the second author attaches copies whose aggregate signature does not verify.
+    // A certificate's digest is its header's, so each copy has the digest of a pending parent and
+    // is skipped unverified; verifying it would end the vote in an invalid signature error. The
+    // vote waits for the pending parents and is cast once the round 1 certificates arrive.
+    let wrong_signature = voter.round_1_certs[0].aggregated_signature().unwrap();
+    let copies = voter
+        .round_2_missing
+        .iter()
+        .cloned()
+        .map(|mut cert| {
+            cert.set_signature_verification_state(SignatureVerificationState::Unverified(
+                wrong_signature,
+            ));
+            cert
+        })
+        .collect::<Vec<_>>();
+    let vote = voter.handler.vote(second_peer, second_header, copies);
+    let supply = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        voter.supply_round_1().await;
+    };
+    let (response, ()) = tokio::join!(vote, supply);
+    assert!(matches!(response, Ok(PrimaryResponse::Vote(_))), "{response:?}");
+    assert!(voter.missing_parents_stored().into_iter().all(|stored| stored));
+}
+
+/// A vote request dropped while it waits, as the network layer drops one its requester cancels,
+/// leaves the author's entry in the vote guard as it found it, so a second header from that
+/// author at the same round is still refused before it can record missing parents (#1822
+/// follow-up).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_dropped_request_keeps_author_entry() {
+    let voter = PendingParentVoter::new().await;
+    let (author_peer, header) = voter.header(2);
+    let (_, second_header) = voter.header(2);
+    assert_ne!(header.digest(), second_header.digest());
+    let expected_missing = voter.missing_digests();
+
+    // TEST PHASE 1: the author is told which parents are missing, which the guard records.
+    let response = voter.handler.vote(author_peer, header.clone(), Vec::new()).await.unwrap();
+    let PrimaryResponse::MissingParents(missing) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 2: the author attaches them. They are parked as pending and the vote waits for
+    // them, and the request is dropped during that wait, before the vote timeout.
+    let dropped = timeout(
+        Duration::from_secs(1),
+        voter.handler.vote(author_peer, header.clone(), voter.round_2_missing.clone()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the request ended before it was dropped: {dropped:?}");
+    assert!(voter.missing_parents_pending(&header).await);
+
+    // TEST PHASE 3: the guard still holds the author's `MissingParents` for this header, so a
+    // fresh request for it is told the same missing parents at once.
+    let response = voter.handler.vote(author_peer, header, Vec::new()).await;
+    let Ok(PrimaryResponse::MissingParents(missing)) = response else {
+        panic!("Expected MissingParents, got: {response:?}");
+    };
+    assert_eq!(expected_missing, missing.into_iter().collect::<HashSet<_>>());
+
+    // TEST PHASE 4: a second header from the author at the same round is refused by the guard.
+    let response = voter.handler.vote(author_peer, second_header, Vec::new()).await;
+    assert!(
+        matches!(
+            response,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+                theirs: 3,
+                ours: 3
+            }))
+        ),
+        "{response:?}"
+    );
 }
 
 #[tokio::test]

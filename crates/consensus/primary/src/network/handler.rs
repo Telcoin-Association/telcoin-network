@@ -934,6 +934,11 @@ where
                     .into());
                 }
             }
+            // put the entry back while the request is evaluated: the network layer drops this
+            // future when the requester cancels the request, and a dropped request must leave the
+            // guard as it found it. an empty entry would let another header from this author at
+            // the same round past the check above and into `check_for_missing_parents`
+            *auth_last_vote = previous_vote.clone();
             let epoch = header.epoch();
             let round = header.round();
             // Bound the whole evaluation, including a wait for a future-dated header's lead, by the
@@ -1520,9 +1525,26 @@ where
                 .collect()
         };
 
-        // try to accept
+        // skip the parents this node already stores or holds as pending: each was verified when
+        // it arrived (a certificate's digest is its header's, so the copy held is a verified one
+        // for the same header), and the parent wait in `vote_inner` covers a pending one. every
+        // author whose header cites a missing parent may attach it, so without this each copy
+        // would be verified again until the parent is stored. a copy still being verified is not
+        // skipped: if that copy were bad, skipping on it would drop the honest copies
+        let digests: Vec<HeaderDigest> = parents.iter().map(|cert| cert.digest()).collect();
+        let unknown = self.state_sync.identify_unknown_certificates(digests.iter()).await?;
+        parents.retain(|cert| unknown.contains(&cert.digest()));
+
+        // try to accept; a parent parked as pending (verified, its own parents not stored yet) is
+        // accepted here: `notify_read_parent_certificates` in `vote_inner` waits for it, bounded
+        // by `vote_timeout`, whose expiry is a recoverable, uncached error. returning `Pending`
+        // instead would end the vote in an error the proposer treats as final for this voter
+        // until it re-sends the header, although parking the parent already started its fetch
         for parent in parents.iter_mut() {
-            self.state_sync.process_peer_certificate(parent).await?;
+            match self.state_sync.process_peer_certificate(parent).await {
+                Ok(()) | Err(CertManagerError::Pending(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())
