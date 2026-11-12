@@ -89,6 +89,52 @@ struct ConsensusCertTally {
 /// Note we only accept votes for the epoch record digest we expect so do not store it here.
 type EpochVoteKey = (BlsPublicKey, Epoch);
 
+/// The parent certificates this node has asked authors for, keyed by `(parent round, digest)`,
+/// with every author it asked for each one.
+///
+/// A vote request whose header cites a parent this node does not hold gets that digest back as
+/// `MissingParents`, and the author is recorded under the parent's key. A parent that arrives
+/// with a later vote request is processed only when it was asked of that request's author, which
+/// is the protection against unsolicited certificates: a certificate nobody asked for is never
+/// processed from a vote request.
+///
+/// Every author whose header cites a parent is recorded, not only the first one (issue #1797).
+/// With one owner per parent, an author that withheld its own certificate after citing it kept
+/// every other author that cited the same certificate from supplying it: the voter answered
+/// those authors with no missing parents, dropped the certificate when they attached it, and
+/// waited out the vote timeout on each retry. With f to 2f honest proposers trapped that way no
+/// round quorum formed, and one committee member was enough to cause it. The set per parent is
+/// bounded by the committee size, since only committee authors reach the vote path.
+#[derive(Debug, Default)]
+pub(crate) struct RequestedParents(BTreeMap<(Round, HeaderDigest), BTreeSet<AuthorityIdentifier>>);
+
+impl RequestedParents {
+    /// Record `author` as an author this node asked for the parent `digest` at `round`.
+    pub(crate) fn record(
+        &mut self,
+        round: Round,
+        digest: HeaderDigest,
+        author: &AuthorityIdentifier,
+    ) {
+        self.0.entry((round, digest)).or_default().insert(author.clone());
+    }
+
+    /// Whether this node asked `author` for the parent `digest` at `round`.
+    pub(crate) fn asked(
+        &self,
+        round: Round,
+        digest: HeaderDigest,
+        author: &AuthorityIdentifier,
+    ) -> bool {
+        self.0.get(&(round, digest)).is_some_and(|authors| authors.contains(author))
+    }
+
+    /// Drop every parent whose round is below `round`.
+    pub(crate) fn drop_below(&mut self, round: Round) {
+        self.0.retain(|(parent_round, _), _| *parent_round >= round);
+    }
+}
+
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -98,13 +144,13 @@ pub(crate) struct RequestHandler<DB> {
     consensus_bus: ConsensusBusApp,
     /// Synchronize state between peers.
     state_sync: StateSynchronizer<DB>,
-    /// The digests of parents that are currently being requested from peers.
+    /// The parents this node has asked authors for, with every author it asked.
     ///
-    /// Missing parents are requested from peers. This is a local map to track in-flight requests
-    /// for missing parents. The values are associated with the first authority that proposed a
-    /// header with these parents. The node keeps track of requested Certificates to prevent
-    /// unsolicited certificate attacks.
-    requested_parents: Arc<Mutex<BTreeMap<(Round, HeaderDigest), AuthorityIdentifier>>>,
+    /// Missing parents are requested from the authors whose headers cite them. This local map
+    /// tracks those in-flight requests so that a parent attached to a vote request is processed
+    /// only when it was asked of that author, which prevents unsolicited certificate attacks. See
+    /// [`RequestedParents`] and issue #1797 for why every citing author is recorded.
+    requested_parents: Arc<Mutex<RequestedParents>>,
     /// Map of the last epoch and round each authority requested a vote for.
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
@@ -1225,11 +1271,14 @@ where
 
     /// Helper method to retrieve parents for header.
     ///
-    /// Certificates are considered "known" if they are in local storage, pending, or already
-    /// requested from a peer.
+    /// Certificates are considered "known" if they are in local storage or pending. Every unknown
+    /// parent is returned, and the header's author is recorded as one this node asked for it, so
+    /// that the author may attach it to its next vote request. The reply does not depend on which
+    /// author cited the parent first: with one owner per parent, an author that withheld its own
+    /// certificate kept every other author that cited it from supplying it (issue #1797).
     async fn check_for_missing_parents(&self, header: &Header) -> HeaderResult<Vec<HeaderDigest>> {
         // identify parents that are neither in storage nor pending
-        let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
+        let unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
         let limit = self.consensus_bus.primary_round().saturating_sub(
@@ -1250,26 +1299,17 @@ where
         // remove entries that are past the limit
         //
         // NOTE: the minimum parent round is the limit - 1
-        while let Some(((round, _), _)) = current_requests.first_key_value() {
-            if round < &limit.saturating_sub(1) {
-                current_requests.pop_first();
-            } else {
-                break;
-            }
-        }
+        current_requests.drop_below(limit.saturating_sub(1));
 
-        // filter out parents that were already requested and new ones
-        unknown_certs.retain(|digest| {
-            // `saturating_sub` matches the style used for `limit` above and keeps this helper
-            // underflow-safe on its own; `vote_inner` already rejects round 0 (see #789).
-            let key = (header.round().saturating_sub(1), *digest);
-            if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
-                e.insert(header.author().clone());
-                true
-            } else {
-                false
-            }
-        });
+        // record this author as one this node asked for every unknown parent; a parent another
+        // author cited first stays in the reply, so this author can supply it too (issue #1797)
+        //
+        // `saturating_sub` matches the style used for `limit` above and keeps this helper
+        // underflow-safe on its own; `vote_inner` already rejects round 0 (see #789).
+        let parent_round = header.round().saturating_sub(1);
+        unknown_certs
+            .iter()
+            .for_each(|digest| current_requests.record(parent_round, *digest, header.author()));
 
         Ok(unknown_certs)
     }
@@ -1277,24 +1317,24 @@ where
     /// Try to accept parents included with peer's request for vote.
     ///
     /// Parents are expected with a vote request after this node rejects a proposed header due to
-    /// missing parents. The certificates are only processed if this node has requested them.
+    /// missing parents. A certificate is only processed if this node has asked the header's
+    /// author for it, which every author whose header cited it has been (issue #1797). The
+    /// certificate then passes the usual verification before it is stored.
     async fn try_accept_unknown_certs(
         &self,
         header: &Header,
-        mut parents: Vec<Certificate>,
+        parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<()> {
-        // sanitize request
-        {
+        // sanitize request: keep only the parents this node asked this author for
+        let mut parents: Vec<Certificate> = {
             let requested_parents = self.requested_parents.lock();
-            parents.retain(|cert| {
-                let req = (cert.round(), cert.digest());
-                if let Some(authority) = requested_parents.get(&req) {
-                    authority == header.author()
-                } else {
-                    false
-                }
-            });
-        }
+            parents
+                .into_iter()
+                .filter(|cert| {
+                    requested_parents.asked(cert.round(), cert.digest(), header.author())
+                })
+                .collect()
+        };
 
         // try to accept
         for parent in parents.iter_mut() {
