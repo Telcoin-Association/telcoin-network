@@ -1040,9 +1040,10 @@ fn leaf_val(page: &[u8], off: usize, klen: usize, vlen: usize) -> Val<'_> {
     let v = off + LEAF_CELL_HEADER + klen;
     match read_u16(page, off + 6) {
         0 => Val::Inline(&page[v..v + vlen]),
-        CELL_OVERFLOW => {
-            Val::Overflow(Ovf::decode(page[v..v + OVF_CELL].try_into().expect("12 bytes")))
-        }
+        CELL_OVERFLOW => Val::Overflow(Ovf::decode(
+            page[v..v + OVF_CELL].try_into().expect("12 bytes"),
+            tag(page),
+        )),
         _ => nested_val(page, v),
     }
 }
@@ -3059,7 +3060,7 @@ mod tests {
                 // A run's cell is canonical for `mv + 1` bytes, not for `mv`.
                 let key = vec![7; klen];
                 for (len, ok) in [(mv + 1, true), (mv, false)] {
-                    let ovf = Ovf { pgno: 9, txn: 3, len: len as u32 };
+                    let ovf = Ovf { pgno: 9, txn: 3, len: len as u32, tag: 0 };
                     let mut page = fresh(&g, Kind::Leaf);
                     let fit = LeafMut::new(&mut page).unwrap().insert(0, &key, Val::Overflow(ovf));
                     assert_eq!(fit.unwrap(), Fit::Done);
@@ -3723,7 +3724,7 @@ mod tests {
             let key = ranked_key(i, (r % 40) as usize);
             let fit = if leaf && (r >> 56) & 3 == 0 {
                 // An overflow cell: a 12-byte reference with flags 1.
-                let ovf = Ovf { pgno: i, txn: (r >> 16) as u32, len: (r >> 32) as u32 };
+                let ovf = Ovf { pgno: i, txn: (r >> 16) as u32, len: (r >> 32) as u32, tag: 0 };
                 LeafMut::new(&mut page)
                     .and_then(|m| m.insert(i as usize - 1, &key, Val::Overflow(ovf)))
             } else if leaf && (r >> 56) & 3 == 1 {
@@ -4032,7 +4033,7 @@ mod tests {
             let (k, v) = self.cell(i)?;
             let off = self.u16_at(24 + 2 * i);
             Some(match self.u16_at(off + 6) {
-                1 => (k, Val::Overflow(Ovf::decode(v.try_into().unwrap()))),
+                1 => (k, Val::Overflow(Ovf::decode(v.try_into().unwrap(), tag(self.page)))),
                 2 => (k, Val::Nested(v.try_into().unwrap())),
                 _ => (k, Val::Inline(v)),
             })
@@ -4550,7 +4551,8 @@ mod tests {
         for size in SIZES {
             let g = geometry(size);
             let key = b"key".as_slice();
-            let ovf = Ovf { pgno: 9, txn: 0xDEAD_BEEF, len: (g.max_value(key.len()) + 1) as u32 };
+            let ovf =
+                Ovf { pgno: 9, txn: 0xDEAD_BEEF, len: (g.max_value(key.len()) + 1) as u32, tag: 0 };
             let mut page = fresh(&g, Kind::Leaf);
             assert_eq!(leaf_insert(&mut page, 0, b"a", b"inline").unwrap(), Fit::Done);
             let fit = LeafMut::new(&mut page).unwrap().insert(1, key, Val::Overflow(ovf)).unwrap();
@@ -4827,6 +4829,7 @@ mod tests {
                     pgno: n as u32 + 9,
                     txn: 0xC0FF_EE00 | n as u32,
                     len: (g.max_value(key.len()) + 1) as u32,
+                    tag: 0,
                 });
                 let nested = ovf_sel % 4 == 1 && g.max_value(key.len()) >= NESTED_CELL;
                 let root = TreeRoot {
@@ -4951,7 +4954,7 @@ mod tests {
                 let value = s.value(&g, key.len());
                 let root = TreeRoot { root: 9, root_txn: 3, height: 1, entries: 1, leaf_pages: 1,
                     ..TreeRoot::EMPTY }.encode();
-                let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32 };
+                let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32, tag: 0 };
                 let val = match sel % 4 {
                     0 if g.overflow_fits(key.len()) => Val::Overflow(ovf),
                     1 if g.max_value(key.len()) >= NESTED_CELL => Val::Nested(&root),
@@ -5041,7 +5044,7 @@ mod tests {
         for (n, (s, sel)) in specs.iter().enumerate() {
             let key = ranked_key(2 * n as u32 + 1, s.klen(g));
             let value = s.value(g, key.len());
-            let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32 };
+            let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32, tag: 0 };
             let val = match sel % 4 {
                 0 if g.overflow_fits(key.len()) => Val::Overflow(ovf),
                 1 if g.max_value(key.len()) >= NESTED_CELL => Val::Nested(&root),
@@ -5138,7 +5141,7 @@ mod tests {
         /// Form `form` of the new value: `bytes`, inline or as [`Val::Inline`], else an overflow
         /// reference or a nested root.
         fn pick(form: u8, bytes: &'a [u8], root: &'a [u8; NESTED_CELL]) -> Self {
-            let ovf = Ovf { pgno: 11, txn: 2, len: 70_000 };
+            let ovf = Ovf { pgno: 11, txn: 2, len: 70_000, tag: 0 };
             match form % 6 {
                 0..=2 => EditVal::Bytes(bytes),
                 3 => EditVal::Val(Val::Inline(bytes)),

@@ -11,7 +11,7 @@ use std::{
 };
 
 use super::{
-    damage::{fixture, places, restamped, set_child, tree, write_page, Stage, P},
+    damage::{fixture, places, restamped, same_rows, set_child, tree, write_page, Reads, Stage, P},
     *,
 };
 use crate::{
@@ -398,15 +398,22 @@ fn a_read_only_open_falls_back_past_a_damaged_newest_meta() {
 /// Use a damaged read-only environment as a reader would (get every key, scan every table) and
 /// then check it: the first error must be `Corrupt` and come from `stage` (never
 /// `Stage::Write`: there is no writer), the operation that returned it must have latched the
-/// environment, and write transactions are still refused as `ReadOnly`.
-fn sweep_read_only(env: &Env, state: &State, what: &str, stage: Stage) {
+/// environment, and write transactions are still refused as `ReadOnly`. The gets and scans that
+/// succeed are the model's unless `reads` says the damage may show in them ([`Reads`]).
+fn sweep_read_only(env: &Env, state: &State, what: &str, stage: Stage, reads: Reads) {
     let mut first = None;
     let ro = env.begin_ro().expect("ro");
     for (name, rows) in state {
         let get = (|| {
-            let Some(table) = ro.open_table(name)? else { return Ok(()) };
-            for k in rows.keys() {
-                ro.get(&table, k)?;
+            let Some(table) = ro.open_table(name)? else {
+                assert!(reads == Reads::Changed, "{what}: table {name} does not open");
+                return Ok(());
+            };
+            for (k, v) in rows {
+                let got = ro.get(&table, k)?;
+                if reads == Reads::Exact {
+                    assert!(got == Some(&v[..]), "{what}: table {name} key {k:?}: the get differs");
+                }
             }
             Ok(())
         })();
@@ -414,11 +421,17 @@ fn sweep_read_only(env: &Env, state: &State, what: &str, stage: Stage) {
             first.get_or_insert((Stage::Get, e, env.failure().is_some()));
         }
     }
-    for name in state.keys() {
+    for (name, rows) in state {
         let scan = (|| {
             let Some(table) = ro.open_table(name)? else { return Ok(()) };
             let mut cursor = ro.cursor(&table)?;
-            while cursor.next()?.is_some() {}
+            let mut scanned = Vec::new();
+            while let Some((k, v)) = cursor.next()? {
+                scanned.push((k.to_vec(), v.to_vec()));
+            }
+            if reads == Reads::Exact {
+                assert!(same_rows(&scanned, rows), "{what}: table {name}: the scan differs");
+            }
             Ok(())
         })();
         if let Err(e) = scan {
@@ -452,33 +465,49 @@ fn damage_at_rest_is_met_by_read_only_reads_and_check() {
         assert_ne!(root, tree(&env, "t").root);
         root
     };
-    type Damage<'a> = (&'a str, Stage, Box<dyn Fn(&Path) + 'a>);
+    type Damage<'a> = (&'a str, Stage, Reads, Box<dyn Fn(&Path) + 'a>);
     let (redirect, target) = at.same_txn;
+    use Reads::{Changed, Exact};
     let cases: Vec<Damage<'_>> = vec![
-        // A cell byte under a stale CRC: reads do not recompute CRCs, the check does.
-        ("leaf", Stage::Check, Box::new(|p| flip(p, u64::from(at.t_leaf) * P + P - 16))),
-        ("root", Stage::Scan, Box::new(|p| flip(p, u64::from(at.t_root) * P + P - 16))),
-        ("branch", Stage::Get, Box::new(|p| flip(p, u64::from(at.t_branch) * P + 26))),
-        ("zeroed leaf", Stage::Get, Box::new(|p| write_page(p, at.t_leaf, &vec![0; P as usize]))),
+        // A cell byte under a stale CRC: reads do not recompute CRCs, the check does; a get of
+        // the leaf's row returns it as stored, and a get routed by the root's separator misses.
+        ("leaf", Stage::Check, Changed, Box::new(|p| flip(p, u64::from(at.t_leaf) * P + P - 16))),
+        ("root", Stage::Scan, Changed, Box::new(|p| flip(p, u64::from(at.t_root) * P + P - 16))),
+        ("branch", Stage::Get, Exact, Box::new(|p| flip(p, u64::from(at.t_branch) * P + 26))),
+        (
+            "zeroed leaf",
+            Stage::Get,
+            Exact,
+            Box::new(|p| write_page(p, at.t_leaf, &vec![0; P as usize])),
+        ),
         (
             "redirected",
             Stage::Get,
+            Exact,
             Box::new(|p| restamped(p, at.t_branch, |b| set_child(b, redirect, target))),
         ),
         (
             "stale copy",
             Stage::Get,
+            Exact,
             Box::new(|p| restamped(p, at.t_branch, |b| set_child(b, 0, fx.stale))),
         ),
-        ("free leaf", Stage::Check, Box::new(|p| flip(p, u64::from(at.free_leaf) * P + P - 16))),
+        (
+            "free leaf",
+            Stage::Check,
+            Exact,
+            Box::new(|p| flip(p, u64::from(at.free_leaf) * P + P - 16)),
+        ),
         (
             "catalog leaf",
             Stage::Check,
+            Exact,
             Box::new(|p| flip(p, u64::from(at.catalog_leaf) * P + P - 16)),
         ),
         (
             "free record",
             Stage::Check,
+            Exact,
             Box::new(|p| {
                 restamped(p, at.free_leaf, |b| {
                     let offset = (at.free_value - u64::from(at.free_leaf) * P) as usize + 4;
@@ -487,13 +516,13 @@ fn damage_at_rest_is_met_by_read_only_reads_and_check() {
             }),
         ),
     ];
-    for (what, stage, damage) in &cases {
+    for (what, stage, reads, damage) in &cases {
         let path = fx.dir.path().join("case");
         fs::copy(&fx.path, &path).expect("copy");
         damage(&path);
         let before = fs::read(&path).expect("read");
         let env = open_ro(&path);
-        sweep_read_only(&env, &fx.state, what, *stage);
+        sweep_read_only(&env, &fx.state, what, *stage, *reads);
         drop(env);
         assert!(fs::read(&path).expect("read") == before, "{what}: the file changed");
         fs::remove_file(&path).expect("remove");

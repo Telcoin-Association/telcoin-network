@@ -1685,7 +1685,7 @@ fn a_dup_record_of_another_width_is_corrupt_at_first_use() {
 /// holds a run).
 #[test]
 fn check_refuses_an_outer_cell_that_is_not_nested() {
-    let ovf = overflow::Ovf { pgno: 3, txn: 1, len: 10_000 };
+    let ovf = overflow::Ovf { pgno: 3, txn: 1, len: 10_000, tag: 0 };
     for (case, message) in [
         ("inline", "a cell that is not nested in a dup table's outer tree"),
         ("overflow", "holds an overflow cell in a dup table's outer tree (a reference to run 3)"),
@@ -2161,7 +2161,7 @@ fn delete_prefix_refuses_a_nested_root_miscounting_its_pages() {
 /// the outer leaf.
 #[test]
 fn a_free_walk_refuses_a_damaged_outer_tree() {
-    let ovf = overflow::Ovf { pgno: 3, txn: 1, len: 10_000 };
+    let ovf = overflow::Ovf { pgno: 3, txn: 1, len: 10_000, tag: 0 };
     for (case, message) in [
         ("width", "an outer key of 4 bytes in a dup table of width 3"),
         ("inline", "a cell that is not nested in a dup table's outer tree"),

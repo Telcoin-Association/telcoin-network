@@ -2,14 +2,18 @@
 //! and each kind of damage to a run, to a cell naming one, to the table's overflow counter or to a
 //! free record listing a run's page is met as `Error::Corrupt` by the first use that reaches it
 //! ([`sweep`]), which latches the environment. A read checks a run's header against the cell that
-//! names it (page number, kind, txn identity, length and page count) and verifies the CRC of a run
-//! of more than one page; `Env::check` verifies every run's CRC, a 1-page run's included, and
-//! compares the counter with the runs the leaves name, as `drop_table` and `clear_table` do.
+//! names it (page number, kind, txn identity, length and the tree tag of the leaf holding the
+//! cell) and verifies the CRC of a run of more than one page; `Env::check` verifies every run's
+//! CRC, a 1-page run's included, and compares the counter with the runs the leaves name, as
+//! `drop_table` and `clear_table` do.
 
 use std::{collections::BTreeMap, fs, os::unix::fs::FileExt as _};
 
 use super::{
-    damage::{list_in_free_record, read_page, restamped, sweep, tree, write_page, Stage, P},
+    damage::{
+        self, children, list_in_free_record, read_page, restamped, set_child, sweep, tree,
+        write_page, Stage, P,
+    },
     *,
 };
 use crate::{
@@ -38,14 +42,20 @@ const RUNS: [(u32, usize); 7] = [
 /// The key the last commit rewrites, so its first run is a stale copy.
 const REWRITTEN: u32 = 8;
 
+/// The keys of `o` whose runs table `p` has a twin of (the same commit, the same length): a 1-page
+/// run and a 3-page one.
+const TWINS: [u32; 2] = [1, 2];
+
 fn key(i: u32) -> [u8; 4] {
     i.to_be_bytes()
 }
 
 /// A cleanly closed file to damage: table `o` (one leaf; every run written by the first commit
-/// but [`REWRITTEN`]'s), a dropped table's pages in a free record that passes the reuse gate once
-/// reopened, and `stale`: the first page of [`REWRITTEN`]'s old run, intact and of the same
-/// length as its new one. No run key is one [`sweep`]'s writes rewrite (every fifth key from 0).
+/// but [`REWRITTEN`]'s), table `p` (the first commit too: a run of each of [`TWINS`]' lengths,
+/// so `o` has a run of another table of the same txn and length), a dropped table's pages in a
+/// free record that passes the reuse gate once reopened, and `stale`: the first page of
+/// [`REWRITTEN`]'s old run, intact and of the same length as its new one. No run key is one
+/// [`sweep`]'s writes rewrite (every fifth key from 0).
 struct Fixture {
     dir: TempDir,
     path: PathBuf,
@@ -61,6 +71,10 @@ fn fixture() -> Fixture {
     for i in 0..ENTRIES {
         let len = RUNS.iter().find(|r| r.0 == i).map_or(100, |r| r.1);
         put(&mut txn, &mut state, "o", &key(i), &value(1, i, len));
+    }
+    for k in TWINS {
+        let len = RUNS.iter().find(|r| r.0 == k).expect("a run key").1;
+        put(&mut txn, &mut state, "p", &key(k), &value(4, k, len));
     }
     for i in 0..400 {
         put(&mut txn, &mut state, "big", &key(i), &value(3, i, 900));
@@ -83,7 +97,12 @@ fn fixture() -> Fixture {
 /// The overflow cells of `o`'s one leaf in the newest state of `env`, by key: each cell's
 /// reference and the offset of its 12 value bytes in the leaf.
 fn cells(env: &Env) -> BTreeMap<u32, (Ovf, usize)> {
-    let o = tree(env, "o");
+    cells_of(env, "o")
+}
+
+/// [`cells`] of table `name`'s one leaf.
+fn cells_of(env: &Env, name: &str) -> BTreeMap<u32, (Ovf, usize)> {
+    let o = tree(env, name);
     assert_eq!(o.height, 1, "{o:?}");
     let snapshot = env.inner().current();
     let leaf = snapshot.page_any(o.root).expect("leaf");
@@ -95,7 +114,7 @@ fn cells(env: &Env) -> BTreeMap<u32, (Ovf, usize)> {
             let cell = usize::from(u16::from_le_bytes([leaf[slot], leaf[slot + 1]]));
             let klen = usize::from(u16::from_le_bytes([leaf[cell + 4], leaf[cell + 5]]));
             let at = cell + page::LEAF_CELL_HEADER + klen;
-            assert_eq!(Ovf::decode(leaf[at..at + 12].try_into().expect("12 bytes")), ovf);
+            assert_eq!(Ovf::decode(leaf[at..at + 12].try_into().expect("12 bytes"), ovf.tag), ovf);
             cells.insert(u32::from_be_bytes(k.try_into().expect("a 4-byte key")), (ovf, at));
         }
     }
@@ -179,13 +198,19 @@ fn set_cell(path: &Path, at: &Places, k: u32, ovf: Ovf) {
 /// Add one to `o`'s overflow counter in its catalog record, the catalog leaf's CRC stamped again
 /// (a counter [`crate::tree::TreeRoot::decode`] accepts).
 fn bump_counter(path: &Path, at: &Places) {
+    set_counter(path, at, |counter| counter + 1);
+}
+
+/// Set `o`'s overflow counter in its catalog record to `to` of its value, the catalog leaf's CRC
+/// stamped again.
+fn set_counter(path: &Path, at: &Places, to: impl FnOnce(u32) -> u32) {
     let file = fs::File::open(path).expect("open");
     let mut b = [0; 4];
     file.read_exact_at(&mut b, at.counter).expect("read");
     let counter = u32::from_le_bytes(b);
     assert_eq!(counter, RUNS.iter().map(|r| run_pages(r.1, P as usize) as u32).sum());
     let (pgno, off) = ((at.counter / P) as u32, (at.counter % P) as usize);
-    restamped(path, pgno, |page| page[off..off + 4].copy_from_slice(&(counter + 1).to_le_bytes()));
+    restamped(path, pgno, |page| page[off..off + 4].copy_from_slice(&to(counter).to_le_bytes()));
 }
 
 /// A copy of the fixture's file, damaged by `damage`, opened (the open changing nothing).
@@ -291,6 +316,70 @@ fn damaged_runs_are_corrupt_at_the_first_use_that_meets_them() {
     }
 }
 
+/// A cell of `o` redirected to a run of table `p` that the same commit wrote, of the same length:
+/// the run passes its range, header, identity, length and CRC checks, so only the tree tag in its
+/// header tells it is another tree's. A get through the cell and a scan reaching it are
+/// `Corrupt`, naming both tags, and latch; a delete of the key (the walk that frees the run,
+/// which skips the CRC) is `Corrupt` too; `Env::check` refuses the file. For a 1-page run and a
+/// 3-page one.
+#[test]
+fn a_cell_redirected_to_another_tables_run_of_its_commit_is_corrupt_at_the_read() {
+    let fx = fixture();
+    let at = places(&fx.path);
+    let (twins, tags) = {
+        let env = open(&fx.path, SyncMode::Durable);
+        (cells_of(&env, "p"), (tree(&env, "p").tag, tree(&env, "o").tag))
+    };
+    assert_ne!(tags.0, tags.1, "two tables, two tags");
+    for k in TWINS {
+        let (mine, twin) = (at.ovf(k), twins[&k].0);
+        assert_eq!((mine.txn, mine.len), (twin.txn, twin.len), "key {k}: one commit, one length");
+        assert_ne!(mine.pgno, twin.pgno);
+        let forged = Ovf { pgno: twin.pgno, ..mine };
+        let what = format!("key {k} redirected to p's run");
+        let damage = |p: &Path| set_cell(p, &at, k, forged);
+        let want = format!(
+            "overflow run {} (len {}, txn {}): belongs to the tree tagged {:#x}, not to {:#x}",
+            twin.pgno, twin.len, twin.txn, tags.0, tags.1
+        );
+
+        let (path, env) = damaged(&fx, &what, &damage);
+        let ro = env.begin_ro().expect("ro");
+        let o = ro.open_table("o").expect("open").expect("o");
+        let got = ro.get(&o, &key(k)).map(|v| v.map(<[u8]>::len));
+        assert!(matches!(&got, Err(Error::Corrupt(m)) if m == &want), "{what}: get: {got:?}");
+        let mut cursor = ro.cursor(&o).expect("cursor");
+        let mut seen = 0;
+        let scan = loop {
+            match cursor.next() {
+                Ok(Some(_)) => seen += 1,
+                Ok(None) => panic!("{what}: the scan ended after {seen} entries"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(&scan, Error::Corrupt(m) if m == &want), "{what}: scan: {scan}");
+        assert_eq!(seen, k as usize, "{what}: the scan met the redirect at key {k}");
+        drop(ro);
+        assert!(env.failure().is_some(), "{what}: latched");
+        assert!(
+            matches!(env.check(), Err(Error::Corrupt(m)) if m.contains(&want)),
+            "{what}: check"
+        );
+        drop(env);
+        fs::remove_file(&path).expect("remove");
+
+        let (path, env) = damaged(&fx, &format!("{what}, deleted"), &damage);
+        let mut txn = env.begin_rw().expect("begin");
+        let o = txn.open_table("o").expect("open").expect("o");
+        let got = txn.delete(&o, &key(k));
+        assert!(matches!(&got, Err(Error::Corrupt(m)) if m == &want), "{what}: delete: {got:?}");
+        drop(txn);
+        assert!(env.failure().is_some(), "{what}: the delete latched");
+        drop(env);
+        fs::remove_file(&path).expect("remove");
+    }
+}
+
 /// `o`'s overflow counter one too high refuses `drop_table` and `clear_table` as `Corrupt`, which
 /// latches: the walk that collects the table's pages to free (`tree_pages`) adds up the runs its
 /// leaves name and compares the sum with the counter before anything is freed. This is the first
@@ -318,6 +407,70 @@ fn a_damaged_overflow_counter_refuses_drop_and_clear() {
         drop(env);
         fs::remove_file(&path).expect("remove");
     }
+}
+
+/// `o`'s overflow counter zero, its runs still named by its leaf, refuses `drop_table` and
+/// `clear_table` as `Corrupt`, naming the first run, which latches: the free walk of a tree
+/// whose handle counts no overflow page reads every leaf's cells all the same, so a miscounted
+/// handle cannot leak the runs it does not count.
+#[test]
+fn a_zero_overflow_counter_over_runs_refuses_drop_and_clear() {
+    let fx = fixture();
+    let at = places(&fx.path);
+    let first = at.cells.values().map(|c| c.0.pgno).min().expect("a run");
+    let want = format!("names overflow run {first} in a tree whose handle counts no overflow page");
+    for dropping in [false, true] {
+        let what = if dropping { "drop, zero counter" } else { "clear, zero counter" };
+        let (path, env) = damaged(&fx, what, &|p| set_counter(p, &at, |_| 0));
+        let mut txn = env.begin_rw().expect("begin");
+        let o = txn.open_table("o").expect("open").expect("o");
+        let got = if dropping { txn.drop_table(o) } else { txn.clear_table(&o) };
+        match got {
+            Err(Error::Corrupt(e)) => assert!(e.contains(&want), "{what}: {e}"),
+            other => panic!("{what}: {other:?}"),
+        }
+        drop(txn);
+        assert!(env.failure().is_some(), "{what}: the damage latched");
+        drop(env);
+        fs::remove_file(&path).expect("remove");
+    }
+}
+
+/// A branch cell of table `t` redirected to a leaf of table `u` that the same commit wrote (the
+/// damage of `damage::a_child_redirected_to_another_tables_page_of_its_commit_is_corrupt_at_the_fetch`)
+/// refuses `drop_table` as `Corrupt`, naming both tags, and latches, so no page of `u`'s is
+/// freed: the free walk reads every leaf with a descent's checks, a tree without runs included,
+/// and `u` reads whole after the refusal.
+#[test]
+fn a_drop_through_a_leaf_redirected_to_another_table_frees_nothing() {
+    let fx = damage::fixture();
+    let at = damage::places(&fx.path);
+    let (cell, _) = at.same_txn;
+    let (target, tags) = {
+        let env = open(&fx.path, SyncMode::Durable);
+        let (t, u) = (tree(&env, "t"), tree(&env, "u"));
+        let (target, txn) = *children(&env, u.root).last().expect("u's last leaf");
+        assert_eq!(txn, children(&env, at.t_branch)[cell].1, "one commit");
+        (target, (u.tag, t.tag))
+    };
+    restamped(&fx.path, at.t_branch, |b| set_child(b, cell, target));
+    let want =
+        format!("page {target} belongs to the tree tagged {:#x}, not to {:#x}", tags.0, tags.1);
+    let env = open(&fx.path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.open_table("t").expect("open").expect("t");
+    let got = txn.drop_table(t);
+    assert!(matches!(&got, Err(Error::Corrupt(m)) if m == &want), "drop: {got:?}");
+    drop(txn);
+    assert!(env.failure().is_some(), "latched");
+    let ro = env.begin_ro().expect("ro");
+    let u = ro.open_table("u").expect("open").expect("u");
+    let mut cursor = ro.cursor(&u).expect("cursor");
+    let mut rows = Rows::new();
+    while let Some((k, v)) = cursor.next().expect("u reads whole") {
+        rows.insert(k.to_vec(), v.to_vec());
+    }
+    assert_eq!(rows, fx.state["u"], "u is untouched");
 }
 
 /// `RwCursor::delete_current` reads the key of the entry it deletes, not its value, as
