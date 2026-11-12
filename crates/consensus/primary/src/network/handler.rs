@@ -64,17 +64,25 @@ const RECENTLY_VERIFIED_CERTIFICATES: NonZeroUsize = NonZeroUsize::MIN.saturatin
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
-type AuthEquivocationMap = HashMap<AuthorityIdentifier, TokioMutex<AuthLastVote>>;
+type AuthEquivocationMap = HashMap<AuthorityIdentifier, TokioMutex<AuthVoteState>>;
 
 /// The last header this node decided on for one author: its epoch, round and digest, with the
 /// response this node gave for it.
 type AuthLastVote = Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>;
 
-/// Whether `last_vote` holds this node's vote for the header with `digest`.
-fn holds_vote_for(last_vote: &AuthLastVote, digest: HeaderDigest) -> bool {
-    last_vote.as_ref().is_some_and(|(_, _, last_digest, last_response)| {
-        *last_digest == digest && matches!(last_response, Some(PrimaryResponse::Vote(_)))
-    })
+/// What this node holds in memory about one author's vote requests, under that author's lock.
+#[derive(Debug, Default)]
+pub(crate) struct AuthVoteState {
+    /// The last decision, for the early equivocation check and the cached one-shot responses.
+    last: AuthLastVote,
+    /// This node's latest vote for a header of the author.
+    ///
+    /// Kept apart from `last` because any other decision about the author replaces that entry or
+    /// drops the response cached in it, and a repeat of the voted header would then sign again
+    /// (issue #1836). Only this node's vote for a newer header of the author replaces it, and the
+    /// handler is rebuilt at each epoch start, so this is at most one vote per committee member
+    /// per epoch.
+    cast: Option<Vote>,
 }
 
 /// The committee that may sign a `ConsensusResult` for one epoch, with the bound a certified
@@ -218,7 +226,7 @@ where
         // Preload with each committee auth id.
         // This is so we can lock each authority individually when processing votes.
         for auth in consensus_config.committee().authorities() {
-            auth_last_vote.insert(auth.id(), TokioMutex::new(None));
+            auth_last_vote.insert(auth.id(), TokioMutex::default());
         }
         Self {
             consensus_config,
@@ -831,33 +839,46 @@ where
         // voted on in parallel but only one vote for an authority can proceed at a time.
         if let Some(auth_lock) = self.auth_last_vote.get(header.author()) {
             // Check for validator equivocation early and reject if so
-            let mut auth_last_vote = auth_lock.lock().await;
+            let mut auth_vote_state = auth_lock.lock().await;
+            let AuthVoteState { last: auth_last_vote, cast } = &mut *auth_vote_state;
             let digest = header.digest();
+            // a repeat of the header this node voted for gets the same vote back from memory: the
+            // vote passed the durability barrier when it was cast, so the repeat needs no new
+            // signature and no new barrier (issue #1836)
+            if let Some(vote) = cast.as_ref().filter(|vote| vote.header_digest() == digest) {
+                return Ok(PrimaryResponse::Vote(vote.clone()));
+            }
             // A vote this node already cast for this header but holds only on disk (after a
-            // restart, or after a request that timed out once its vote was written) is recast
-            // here, under the author lock and inside the vote timeout like any other vote
-            // request. The recast vote then stays in the guard and the cache check below returns
-            // it, so repeats of one header sign at most once and queue on this lock instead of
-            // each signing in parallel (issue #1836).
-            if !holds_vote_for(&auth_last_vote, digest)
-                && self
-                    .consensus_config
-                    .node_storage()
-                    .read_vote_info(&auth_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|vote_info| vote_info.vote_digest == digest.into())
+            // restart, or after a request that ended once its vote was written) is recast here,
+            // under the author lock and inside the vote timeout like any other vote request. The
+            // recast vote then fills `cast`, so repeats of one header sign at most once and queue
+            // on this lock instead of each signing in parallel (issue #1836).
+            if self
+                .consensus_config
+                .node_storage()
+                .read_vote_info(&auth_id)
+                .ok()
+                .flatten()
+                .is_some_and(|vote_info| vote_info.vote_digest == digest.into())
             {
                 let (epoch, round) = (header.epoch(), header.round());
-                return tokio::time::timeout(
+                let vote = tokio::time::timeout(
                     self.consensus_config.config().parameters.vote_timeout,
                     self.recast_stored_vote(&header),
                 )
                 .await
-                .unwrap_or_else(|elapsed| Err(elapsed.into()))
-                .inspect(|response| {
-                    *auth_last_vote = Some((epoch, round, digest, Some(response.clone())));
-                });
+                .unwrap_or_else(|elapsed| Err(elapsed.into()))?;
+                *cast = Some(vote.clone());
+                // keep a decision on a newer header of this author: moving the entry back would
+                // let other headers for that newer slot past the early refusal below and drop a
+                // cached parents request for it
+                if auth_last_vote.as_ref().is_none_or(|(last_epoch, last_round, ..)| {
+                    (*last_epoch, *last_round) <= (epoch, round)
+                }) {
+                    *auth_last_vote =
+                        Some((epoch, round, digest, Some(PrimaryResponse::Vote(vote.clone()))));
+                }
+                return Ok(PrimaryResponse::Vote(vote));
             }
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
@@ -912,16 +933,7 @@ where
                                 .into());
                             }
                         }
-                        Some(res) => {
-                            // a vote is final for this header: keep it so a later repeat is
-                            // served from here again, with no new signature (issue #1836).
-                            // other cached responses stay one-shot
-                            if matches!(res, PrimaryResponse::Vote(_)) {
-                                *auth_last_vote =
-                                    Some((last_epoch, last_round, last_digest, Some(res.clone())));
-                            }
-                            return Ok(res);
-                        }
+                        Some(res) => return Ok(res),
                     }
                 } else if header.epoch() < last_epoch
                     || (last_epoch == header.epoch() && last_round >= header.round())
@@ -967,6 +979,9 @@ where
             } else {
                 *auth_last_vote = Some((epoch, round, digest, Some(cached_res)));
             }
+            if let Ok(PrimaryResponse::Vote(vote)) = &res {
+                *cast = Some(vote.clone());
+            }
             res
         } else {
             Err(HeaderError::UnknownAuthority(header.author().to_string()).into())
@@ -977,12 +992,8 @@ where
     ///
     /// The caller holds the author's vote lock and has checked that the stored vote digest is the
     /// header's digest. BLS signatures are deterministic, so the new signature is the same vote.
-    async fn recast_stored_vote(&self, header: &Header) -> PrimaryNetworkResult<PrimaryResponse> {
-        let vote = Vote::new(
-            header,
-            self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
-            self.consensus_config.key_config(),
-        );
+    async fn recast_stored_vote(&self, header: &Header) -> PrimaryNetworkResult<Vote> {
+        let author = self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?;
 
         // A recast must be gated on the same durability barrier as a first vote. If any epoch-DB
         // write or sync has failed, the `Votes` guard for this author/round may be readable
@@ -991,6 +1002,9 @@ where
         // The store's failure latch fails this barrier after any failed write or sync; end the
         // epoch rather than recast a non-durable vote (issue #975), after which `run_epoch`
         // finds the store unable to make writes durable and stops the node.
+        //
+        // The barrier comes before the signature, so a recast that times out or is dropped ends
+        // before it signs: the next repeat pays a barrier again but no wasted signature.
         self.consensus_config
             .node_storage()
             .persist::<Votes>()
@@ -999,8 +1013,9 @@ where
                 error!(target: "primary", "epoch DB durable barrier failed on stored vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                 self.consensus_config.shutdown().notify();
             })?;
+        let vote = Vote::new(header, author, self.consensus_config.key_config());
         info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
-        Ok(PrimaryResponse::Vote(vote))
+        Ok(vote)
     }
 
     /// Whether the in-memory vote guard for `author` holds this node's vote for `digest`.
@@ -1012,7 +1027,9 @@ where
     ) -> bool {
         futures::future::OptionFuture::from(self.auth_last_vote.get(author).map(|lock| lock.lock()))
             .await
-            .is_some_and(|last_vote| holds_vote_for(&last_vote, digest))
+            .is_some_and(|state| {
+                state.cast.as_ref().is_some_and(|vote| vote.header_digest() == digest)
+            })
     }
 
     /// Hold the vote lock for `author`, as an in-flight vote request from that author does.
@@ -1020,7 +1037,7 @@ where
     pub(crate) async fn lock_author_vote(
         &self,
         author: &AuthorityIdentifier,
-    ) -> Option<tokio::sync::MutexGuard<'_, AuthLastVote>> {
+    ) -> Option<tokio::sync::MutexGuard<'_, AuthVoteState>> {
         futures::future::OptionFuture::from(self.auth_last_vote.get(author).map(|lock| lock.lock()))
             .await
     }
