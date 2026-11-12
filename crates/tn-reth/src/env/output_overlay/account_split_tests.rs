@@ -5,7 +5,8 @@
 //! children (thousands of accounts), so the database holds a real account trie, then drives
 //! multi-block outputs through the output overlay, comparing each block's root with the serial
 //! one over the same transaction and counting the blocks the split composed. Every test chooses
-//! the walk explicitly ([`AccountWalk`]), so they pass whatever `TN_PARALLEL_ACCOUNT_WALK` says.
+//! the walks explicitly ([`Walks`]), so they pass whatever `TN_PARALLEL_ACCOUNT_WALK` and
+//! `TN_PARALLEL_STORAGE_WALK` say.
 
 use super::{
     compose, worth_splitting, AccountWalk, Subtries, CORRUPT_NEXT_COMPOSED_ROOT, SPLITS_COMPOSED,
@@ -14,7 +15,8 @@ use super::{
 use crate::{
     env::output_overlay::{
         layered_factories,
-        parallel::{ParallelRoots, CHECK_NEXT_SAMPLED_BLOCK},
+        parallel::{ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK},
+        storage_split::StorageWalk,
     },
     OutputTrieOverlay, RethChainSpec, RethEnv,
 };
@@ -42,16 +44,19 @@ use std::{
 use tempfile::TempDir;
 use tn_types::{test_genesis, TaskManager, B256, U256};
 
+/// The account walk on one thread, the storage split on.
+const ONE_THREAD: Walks = Walks::new(AccountWalk::OneThread, StorageWalk::Split);
+
 /// EOAs in the large base state: about 23 per second-level node, so no first nibble's node has a
 /// leaf child.
-const EOAS: u64 = 6_000;
+pub(in crate::env::output_overlay) const EOAS: u64 = 6_000;
 /// Slots of the hot contract.
 const HOT_SLOTS: u64 = 1_000;
 /// Small contracts, one or two slots each.
 const SMALL_CONTRACTS: u64 = 200;
 
 /// A deterministic key from a domain tag and an index.
-fn key(domain: u8, index: u64) -> B256 {
+pub(in crate::env::output_overlay) fn key(domain: u8, index: u64) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&index.to_be_bytes());
     bytes[8] = domain;
@@ -69,12 +74,12 @@ fn small(i: u64) -> B256 {
 }
 
 /// EOA `i`'s hashed address.
-fn eoa(i: u64) -> B256 {
+pub(in crate::env::output_overlay) fn eoa(i: u64) -> B256 {
     key(3, i)
 }
 
 /// Slot `i`'s hashed key.
-fn slot(i: u64) -> B256 {
+pub(in crate::env::output_overlay) fn slot(i: u64) -> B256 {
     key(4, i)
 }
 
@@ -84,12 +89,12 @@ fn nibble_of(address: &B256) -> u8 {
 }
 
 /// A contract account with nonce `nonce`.
-fn contract(nonce: u64) -> Option<Account> {
+pub(in crate::env::output_overlay) fn contract(nonce: u64) -> Option<Account> {
     Some(Account { nonce, balance: U256::from(nonce), bytecode_hash: Some(key(5, 0)) })
 }
 
 /// An EOA with nonce `nonce`.
-fn account(nonce: u64) -> Option<Account> {
+pub(in crate::env::output_overlay) fn account(nonce: u64) -> Option<Account> {
     Some(Account { nonce, balance: U256::from(nonce * 7 + 1), bytecode_hash: None })
 }
 
@@ -114,8 +119,8 @@ fn large_base() -> HashedPostState {
 }
 
 /// A temp chain with a base state persisted (finalized block 1).
-struct Fixture {
-    env: RethEnv,
+pub(in crate::env::output_overlay) struct Fixture {
+    pub(in crate::env::output_overlay) env: RethEnv,
     _tmp: TempDir,
     _tasks: TaskManager,
     /// The finalized block number the next persist writes.
@@ -123,7 +128,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(base: HashedPostState) -> eyre::Result<Self> {
+    pub(in crate::env::output_overlay) fn new(base: HashedPostState) -> eyre::Result<Self> {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let tmp = TempDir::new()?;
         let tasks = TaskManager::new("account split");
@@ -135,7 +140,10 @@ impl Fixture {
 
     /// Persist `blocks` as one output with their serial roots' trie updates, then advance the
     /// finalized block number, as a persist does.
-    fn persist(&mut self, blocks: &[HashedPostState]) -> eyre::Result<()> {
+    pub(in crate::env::output_overlay) fn persist(
+        &mut self,
+        blocks: &[HashedPostState],
+    ) -> eyre::Result<()> {
         let factory = self.env.blockchain_provider();
         let provider = factory.database_provider_ro()?;
         let mut overlay = OutputTrieOverlay::new();
@@ -178,7 +186,7 @@ impl Fixture {
                 factory,
                 tx,
                 block.clone(),
-                AccountWalk::Split,
+                Walks::SPLIT,
             )?;
             assert_eq!(parallel.0, serial.0, "state root differs at block {i}");
             assert_eq!(parallel.1, serial.1, "trie updates differ at block {i}");
@@ -186,7 +194,7 @@ impl Fixture {
                 factory,
                 tx,
                 block.clone(),
-                ParallelRoots::Shadow(AccountWalk::Split),
+                ParallelRoots::Shadow(Walks::SPLIT),
             )?;
             assert_eq!(shadow, serial, "shadow result differs at block {i}");
             overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -438,17 +446,12 @@ async fn one_thread_walk_does_not_split() -> eyre::Result<()> {
     let composed_before = SPLITS_COMPOSED.with(|n| n.get());
     let (results, fallbacks) = counting_fallbacks(|| -> eyre::Result<_> {
         Ok([
-            overlay.layered_root_with_updates_parallel(
-                factory,
-                tx,
-                block.clone(),
-                AccountWalk::OneThread,
-            )?,
+            overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), ONE_THREAD)?,
             overlay.block_root_with_updates(
                 factory,
                 tx,
                 block.clone(),
-                ParallelRoots::Shadow(AccountWalk::OneThread),
+                ParallelRoots::Shadow(ONE_THREAD),
             )?,
         ])
     });
@@ -559,7 +562,7 @@ async fn moved_tip_leaves_the_subtries_to_the_walk() -> eyre::Result<()> {
 
     let composed_before = SPLITS_COMPOSED.with(|n| n.get());
     let parallel =
-        overlay.layered_root_with_updates_parallel(factory, walk_tx, block, AccountWalk::Split)?;
+        overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(SPLITS_COMPOSED.with(|n| n.get()), composed_before + 1, "the split composed");
     Ok(())
@@ -579,12 +582,8 @@ async fn sampled_check_replaces_a_wrong_split_root() -> eyre::Result<()> {
     let serial = overlay.layered_root_with_updates(tx, block.clone())?;
 
     CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.set(true));
-    let wrong = overlay.layered_root_with_updates_parallel(
-        factory,
-        tx,
-        block.clone(),
-        AccountWalk::Split,
-    )?;
+    let wrong =
+        overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), Walks::SPLIT)?;
     assert_ne!(wrong.0, serial.0, "the corrupted split root must reach the result unchecked");
 
     CORRUPT_NEXT_COMPOSED_ROOT.with(|c| c.set(true));
@@ -594,7 +593,7 @@ async fn sampled_check_replaces_a_wrong_split_root() -> eyre::Result<()> {
             factory,
             tx,
             block.clone(),
-            ParallelRoots::Sampled(AccountWalk::Split),
+            ParallelRoots::Sampled(Walks::SPLIT),
         )
     });
     assert_eq!(checked?, serial, "a sampled block must use the serial result");
@@ -617,6 +616,6 @@ async fn shadow_panics_on_a_wrong_split_root() {
         factory,
         provider.tx_ref(),
         block,
-        ParallelRoots::Shadow(AccountWalk::Split),
+        ParallelRoots::Shadow(Walks::SPLIT),
     );
 }

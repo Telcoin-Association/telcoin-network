@@ -29,7 +29,8 @@
 //! running, so the wait never depends on a job the pool has not started. A nibble whose task
 //! failed (a database error, a panic) is recomputed on the calling thread's transaction; the split
 //! still composes. The subtrie walks take the storage roots from the storage-root tasks like the
-//! one-thread walk does.
+//! one-thread walk does; the same threads first work the pieces of the hot contracts' split storage
+//! tries (`storage_split.rs`), whose roots the subtrie walks consume.
 //!
 //! # When the walk runs on one thread
 //!
@@ -269,7 +270,7 @@ impl Subtries {
 }
 
 /// The index of `address`'s first nibble.
-fn first_nibble(address: &B256) -> usize {
+pub(super) fn first_nibble(address: &B256) -> usize {
     (address[0] >> 4) as usize
 }
 
@@ -301,7 +302,8 @@ pub(crate) fn compose(subtries: Vec<(B256, TrieUpdates)>) -> Option<(B256, TrieU
     for (nibble, (root, subtrie)) in subtries.into_iter().enumerate() {
         let nibble = nibble as u8;
         if root != EMPTY_ROOT_HASH {
-            let Some(child) = child_node(nibble, root, &subtrie) else {
+            let path = Nibbles::from_nibbles_unchecked([nibble]);
+            let Some(child) = child_node(&path, root, subtrie.account_nodes.get(&path)) else {
                 debug!(target: "tn_reth::account_split", nibble, "subtrie node is not a branch with hashed children; the walk runs on one thread");
                 return None;
             };
@@ -317,20 +319,28 @@ pub(crate) fn compose(subtries: Vec<(B256, TrieUpdates)>) -> Option<(B256, TrieU
         debug!(target: "tn_reth::account_split", children = children.len(), "root is not a branch; the walk runs on one thread");
         return None;
     }
-    let mut buf = Vec::new();
-    let node = BranchNodeRef::new(&children, state_mask).rlp(&mut buf);
-    let root = node.as_hash().unwrap_or_else(|| keccak256(node.as_slice()));
+    let root = branch_root(&children, state_mask);
     debug!(target: "tn_reth::account_split", children = children.len(), "root composed from subtries");
     Some((root, updates))
 }
 
-/// The node at path `[nibble]` of the block's trie, rebuilt from the subtrie's update for that
-/// path when all its children are hashed, and checked against the subtrie's root (the hash of an
-/// extension `[nibble]` over it).
-fn child_node(nibble: u8, subtrie_root: B256, subtrie: &TrieUpdates) -> Option<RlpNode> {
-    let path = Nibbles::from_nibbles_unchecked([nibble]);
-    let BranchNodeCompact { state_mask, hash_mask, hashes, .. } =
-        subtrie.account_nodes.get(&path)?;
+/// The hash of the root branch over the first-nibble nodes `children` (in nibble order, at the
+/// bits of `state_mask`), as reth's hash builder computes a root.
+pub(super) fn branch_root(children: &[RlpNode], state_mask: TrieMask) -> B256 {
+    let mut buf = Vec::new();
+    let node = BranchNodeRef::new(children, state_mask).rlp(&mut buf);
+    node.as_hash().unwrap_or_else(|| keccak256(node.as_slice()))
+}
+
+/// The node at the first-nibble path `path` of a trie, rebuilt from `update`, the subtrie's update
+/// for that path, when all its children are hashed, and checked against the subtrie's root (the
+/// hash of an extension `path` over it). Shared by the account split and the storage split.
+pub(super) fn child_node(
+    path: &Nibbles,
+    subtrie_root: B256,
+    update: Option<&BranchNodeCompact>,
+) -> Option<RlpNode> {
+    let BranchNodeCompact { state_mask, hash_mask, hashes, .. } = update?;
     if hash_mask != state_mask {
         return None;
     }
@@ -338,7 +348,7 @@ fn child_node(nibble: u8, subtrie_root: B256, subtrie: &TrieUpdates) -> Option<R
     let mut buf = Vec::new();
     let node = BranchNodeRef::new(&stack, *state_mask).rlp(&mut buf);
     buf.clear();
-    let extension = ExtensionNodeRef::new(&path, &node).rlp(&mut buf);
+    let extension = ExtensionNodeRef::new(path, &node).rlp(&mut buf);
     let root = extension.as_hash().unwrap_or_else(|| keccak256(extension.as_slice()));
     (root == subtrie_root).then_some(node)
 }
@@ -371,7 +381,7 @@ impl<F: TrieCursorFactory> TrieCursorFactory for Subtrie<F> {
         Self: 'a;
 
     fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor<'_>, DatabaseError> {
-        Ok(SubtrieCursor { inner: self.inner.account_trie_cursor()?, nibble: self.nibble })
+        Ok(SubtrieCursor::new(self.inner.account_trie_cursor()?, self.nibble))
     }
 
     fn storage_trie_cursor(
@@ -393,7 +403,7 @@ impl<F: HashedCursorFactory> HashedCursorFactory for Subtrie<F> {
         Self: 'a;
 
     fn hashed_account_cursor(&self) -> Result<Self::AccountCursor<'_>, DatabaseError> {
-        Ok(SubtrieCursor { inner: self.inner.hashed_account_cursor()?, nibble: self.nibble })
+        Ok(SubtrieCursor::new(self.inner.hashed_account_cursor()?, self.nibble))
     }
 
     fn hashed_storage_cursor(
@@ -412,6 +422,18 @@ pub(crate) struct SubtrieCursor<C> {
     inner: C,
     /// The first nibble shown.
     nibble: u8,
+}
+
+impl<C> SubtrieCursor<C> {
+    /// `inner` restricted to keys starting with `nibble`.
+    pub(super) const fn new(inner: C, nibble: u8) -> Self {
+        Self { inner, nibble }
+    }
+
+    /// The full cursor.
+    pub(super) fn inner_mut(&mut self) -> &mut C {
+        &mut self.inner
+    }
 }
 
 impl<C: TrieCursor> SubtrieCursor<C> {
@@ -497,4 +519,4 @@ fn test_observed((root, updates): (B256, TrieUpdates)) -> (B256, TrieUpdates) {
 
 #[cfg(test)]
 #[path = "account_split_tests.rs"]
-mod tests;
+pub(super) mod tests;

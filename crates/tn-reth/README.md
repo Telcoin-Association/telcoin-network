@@ -61,7 +61,7 @@ None of them covers the persist, which runs once per output after every block is
 `save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
 start at 5 ms, so a stage shorter than that reads only as "under 5 ms" on a dashboard.
 
-### Parallel storage roots and account walk
+### Parallel storage roots, account walk and storage walk
 
 A block's state root computes the storage roots of the accounts with changed storage on rayon's
 pool while the account walk runs (`src/env/output_overlay/parallel.rs`). A block with at least 64
@@ -72,19 +72,33 @@ thread composes the root branch and the union of their trie updates. No vendored
 storage-root hook (TN-0139). A trie the split cannot compose (a small one: a few thousand accounts
 or fewer) runs the walk on one thread as before.
 
+A hot contract's storage root is split the same way (`src/env/output_overlay/storage_split.rs`): a
+contract with at least 64 changed slots whose stored trie has all sixteen first-nibble nodes over
+hashed children gets sixteen pieces, each reth's own `StorageRoot` over storage cursors restricted
+to one nibble, worked by the same threads before the account subtries; the walk that reaches the
+contract's leaf composes its storage root and the union of the pieces' trie updates. Wiped
+storage, smaller tries and a split that composes nothing (an emptied storage, a single non-empty
+nibble) leave the storage root to one task or the walk. On the exec bench, against the account
+split alone, the state root fell to 0.53x at peak and 0.54x on the busy profile on the Mac, and to
+0.41x and 0.44x on a 22-thread Linux VM (the whole output by 8% and 5% on the Mac, 12% and 6% on the
+VM).
+
 One block in 256 with parallel work (storage-root tasks or a split walk) is also computed serially
 and compared; a difference is logged with both roots, counted in
 `tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the block uses the
 serial result. `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
 ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
 split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
-split wrong) are alerts.
+split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
+the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
+expected, `stored_root_node` and `mismatch` are alerts.
 
 Off switches, read once at the first block from the node's environment:
 `TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
-storage-root tasks and runs the account walk on one thread. Tests and benches select the walk
-explicitly; `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds: the exec bench, tests) compares every
-block, split ones included, and panics on a difference.
+storage-root tasks and runs the account walk on one thread; `TN_PARALLEL_STORAGE_WALK=0` keeps every
+storage root on one task. Tests and benches select the walks explicitly;
+`TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds: the exec bench, tests) compares every block, split
+ones included, and panics on a difference.
 
 ## Header field mapping
 
