@@ -159,8 +159,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
 }
 
 /// Refuse a temp dir the run cannot use, before any work: one on tmpfs or ramfs (syncs there cost
-/// nothing), or one a temp dir cannot be made in (missing, not a directory, not writable), which
-/// the first rep would otherwise find by a panic.
+/// nothing), or one that [`check_creatable`] refuses.
 fn check_temp_dir(tmp: &Path) -> Result<(), String> {
     if let Some(fs) = memory_fs(tmp) {
         return Err(format!(
@@ -169,6 +168,13 @@ fn check_temp_dir(tmp: &Path) -> Result<(), String> {
             tmp.display()
         ));
     }
+    check_creatable(tmp)
+}
+
+/// Refuse a dir that a temp dir cannot be made in (missing, not a directory, not writable), which
+/// the first rep would otherwise find by a panic. This check is separate from the file system
+/// check, so that a test can run it on a host whose temp dir is on tmpfs.
+fn check_creatable(tmp: &Path) -> Result<(), String> {
     tempfile::Builder::new()
         .prefix("tn-lmdb-bench-")
         .tempdir_in(tmp)
@@ -295,8 +301,10 @@ mod tests {
 
     #[test]
     fn a_temp_dir_the_run_cannot_use_is_refused() {
+        // `check_creatable`, not `check_temp_dir`: `root` is under $TMPDIR, which can be on tmpfs
+        // (on Linux, /tmp often is), and `check_temp_dir` refuses tmpfs first.
         let root = tempfile::tempdir().expect("a temp dir");
-        check_temp_dir(root.path()).expect("a writable dir is used");
+        check_creatable(root.path()).expect("a writable dir is used");
         assert_eq!(
             std::fs::read_dir(root.path()).expect("list").count(),
             0,
@@ -306,7 +314,7 @@ mod tests {
         let file = root.path().join("file");
         std::fs::write(&file, b"").expect("write");
         for dir in [missing, file] {
-            let err = check_temp_dir(&dir).expect_err("refused");
+            let err = check_creatable(&dir).expect_err("refused");
             assert!(err.contains("cannot make a temp dir"), "{err}");
         }
     }
