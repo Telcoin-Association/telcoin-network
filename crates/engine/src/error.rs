@@ -32,6 +32,10 @@ pub enum TnEngineError {
     /// This should not happen outside of a bug in ConsensusOutput production...
     #[error("Uneven number of sealed blocks from batches and batch digests, batches {0}, batch digests {1}")]
     ConsensusOutputUnevenBatches(usize, usize),
+    /// The recovered signers of a ConsensusOutput do not have one entry per flattened batch.
+    /// Both sides walk the same batches, so this indicates a bug in the engine.
+    #[error("Recovered signers do not match the output's batches, batches {0}, recovered {1}")]
+    RecoveredSignersMismatch(usize, usize),
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

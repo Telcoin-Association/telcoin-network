@@ -25,6 +25,10 @@ mod certificate_tests;
 #[path = "tests/consensus_bus_tests.rs"]
 mod consensus_bus_tests;
 
+#[cfg(test)]
+#[path = "tests/log_capture.rs"]
+pub(crate) mod log_capture;
+
 pub use crate::primary::Primary;
 
 mod consensus_bus;

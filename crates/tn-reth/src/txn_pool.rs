@@ -816,8 +816,9 @@ impl WorkerTxPool {
     /// Subscribe to admissions in every subpool, including transactions that cannot propagate.
     ///
     /// Retired workers subscribe before draining so in-flight admissions also reach an active
-    /// worker. Include private and parked transactions regardless of their propagation policy.
-    pub(crate) fn admitted_transactions(&self) -> impl Stream<Item = ()> + Send + 'static {
+    /// worker, and the batch builder wakes on them. Include private and parked transactions
+    /// regardless of their propagation policy.
+    pub fn admitted_transactions(&self) -> impl Stream<Item = ()> + Send + 'static {
         tokio_stream::wrappers::ReceiverStream::new(
             self.0
                 .new_transactions_listener_for(reth_transaction_pool::TransactionListenerKind::All),

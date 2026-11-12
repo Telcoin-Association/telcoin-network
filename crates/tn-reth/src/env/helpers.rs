@@ -665,6 +665,10 @@ impl CanonicalExecutionReader for RethEnv {
             |_floor| None,
         )
     }
+
+    fn restored_state_floor(&self) -> Option<BlockNumber> {
+        self.inner.restored_state_floor
+    }
 }
 
 #[cfg(test)]

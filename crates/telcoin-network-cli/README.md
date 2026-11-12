@@ -817,8 +817,11 @@ See [Private observability listeners](../../docs/src/getting-started/observabili
 Use `RUST_LOG` for fine-grained control:
 
 ```bash
-RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
+RUST_LOG=info,consensus=debug,engine::evm=trace telcoin-network node ...
 ```
+
+`engine=debug` logs execution as hashes, numbers and counts.
+The `ConsensusOutput` and `ExecutedBlock` struct dumps are at trace under the target `engine::dump`, and the per-transaction EVM lines at trace under `engine::evm`, so name the target you need, as the example does.
 
 ## Multi-instance setup
 

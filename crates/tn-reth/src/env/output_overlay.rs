@@ -18,7 +18,11 @@
 //! merge+clone+re-sort; prefix sets come from the current block's own hashed state
 //! only, exactly as in reth's path (ancestors contribute empty prefix sets there).
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    cell::Cell,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use reth_chain_state::ComputedTrieData;
 use reth_db::transaction::DbTx;
@@ -158,6 +162,10 @@ pub(crate) struct OverlayRootStateProvider<'a, P> {
     /// computation; the database tip equals the overlay anchor for the whole output
     /// because TN persists strictly after the output's builds and has no reorg path.
     blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
+    /// Wall time spent in `state_root_with_updates`, read by the block build after `finish`
+    /// returns (observability only). A `Cell` is enough: one builder borrows the wrapper on
+    /// one thread, and `StateProvider` has no `Send`/`Sync` supertrait.
+    root_elapsed: Cell<Duration>,
 }
 
 impl<'a, P> OverlayRootStateProvider<'a, P> {
@@ -168,7 +176,13 @@ impl<'a, P> OverlayRootStateProvider<'a, P> {
         overlay: &'a OutputTrieOverlay,
         blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
     ) -> Self {
-        Self { inner, overlay, blockchain_provider }
+        Self { inner, overlay, blockchain_provider, root_elapsed: Cell::new(Duration::ZERO) }
+    }
+
+    /// Total wall time of the state-root computations routed through this wrapper (exactly
+    /// one per block build).
+    pub(crate) fn root_elapsed(&self) -> Duration {
+        self.root_elapsed.get()
     }
 }
 
@@ -229,8 +243,9 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
 
     /// The #1301 layered root: current-block deltas over the accumulated output
     /// overlay over the database, with prefix sets from the current block only.
-    /// Timed into `RethEnvMetrics::block_state_root_seconds`, from opening the
-    /// read-only transaction to closing it.
+    /// Timed into `RethEnvMetrics::block_state_root_seconds` and the wrapper's
+    /// `root_elapsed` lap, from opening the read-only transaction to closing it; a
+    /// failed root records neither, since the build that called it fails too.
     fn state_root_with_updates(
         &self,
         hashed_state: HashedPostState,
@@ -240,7 +255,9 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
             let provider = self.blockchain_provider.database_provider_ro()?;
             self.overlay.layered_root_with_updates(provider.tx_ref(), hashed_state)?
         };
-        RETH_METRICS.block_state_root_seconds.record(started.elapsed());
+        let elapsed = started.elapsed();
+        self.root_elapsed.set(self.root_elapsed.get().saturating_add(elapsed));
+        RETH_METRICS.block_state_root_seconds.record(elapsed);
         Ok(root)
     }
 

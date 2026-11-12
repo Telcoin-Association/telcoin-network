@@ -57,6 +57,7 @@ mod output_overlay;
 mod persist_bench;
 mod rpc;
 
+pub use execution::{BlockBuildTimings, OutputBuildScope};
 pub use output_overlay::OutputTrieOverlay;
 
 /// This is a wrapped abstraction around Reth.
