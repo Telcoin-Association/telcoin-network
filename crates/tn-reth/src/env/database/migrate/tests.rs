@@ -684,14 +684,30 @@ fn a_migration_stopped_after_its_commit_point_is_finished() {
     assert!(marker.contains("finished by a later open"), "{marker}");
 }
 
-/// How a test writes `mdbx.dat` after a migration's commit point, as a build running reth on MDBX
-/// alone would in the window before the version file: a byte appended (its length and
-/// modification time change), or the modification time alone moved (as a write that keeps the
-/// length would).
+/// How a test writes `mdbx.dat` behind a migration's back, as a build running reth on MDBX would:
+/// a byte appended (its length and modification time change), or the modification time alone
+/// moved (as a write that keeps the length would).
 #[derive(Clone, Copy, Debug)]
 enum Change {
     Append,
     Touch,
+}
+
+/// Make `change` to `mdbx`, an `mdbx.dat`.
+fn change_mdbx(mdbx: &Path, change: Change) {
+    use std::io::Write as _;
+    match change {
+        Change::Append => {
+            let mut file =
+                std::fs::OpenOptions::new().append(true).open(mdbx).expect("open to append");
+            file.write_all(b"x").expect("append");
+        }
+        Change::Touch => {
+            let file = std::fs::OpenOptions::new().write(true).open(mdbx).expect("open");
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            file.set_modified(later).expect("touch");
+        }
+    }
 }
 
 /// Between a migration's commit point and its version file, a build running reth on MDBX alone can
@@ -702,7 +718,6 @@ enum Change {
 /// Once resolved by hand (here `mdbx.dat` removed), the next open finishes the migration.
 #[test]
 fn mdbx_written_after_the_commit_point_is_refused() {
-    use std::io::Write as _;
     for change in [Change::Append, Change::Touch] {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("db");
@@ -715,18 +730,7 @@ fn mdbx_written_after_the_commit_point_is_refused() {
         assert!(recorded.starts_with("len ") && recorded.contains("\nlast_txnid "), "{recorded}");
 
         let mdbx = path.join(MDBX_DATA_FILE);
-        match change {
-            Change::Append => {
-                let mut file =
-                    std::fs::OpenOptions::new().append(true).open(&mdbx).expect("open to append");
-                file.write_all(b"x").expect("append");
-            }
-            Change::Touch => {
-                let file = std::fs::OpenOptions::new().write(true).open(&mdbx).expect("open");
-                let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-                file.set_modified(later).expect("touch");
-            }
-        }
+        change_mdbx(&mdbx, change);
         let written = std::fs::read(&mdbx).expect("mdbx.dat");
         let tn_lmdb = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
 
@@ -755,6 +759,153 @@ fn mdbx_written_after_the_commit_point_is_refused() {
         assert!(marker.contains("finished by a later open"), "{change:?}: {marker}");
         assert!(!exists(&path.join(MIGRATING_DIR)), "{change:?}: the temp directory is gone");
     }
+}
+
+/// Arm `run` to run at the first pass of [`Step::MidCopy`] of the next migration on this thread:
+/// after the copy's first commit, inside its read transaction of MDBX.
+fn run_mid_copy(run: impl FnOnce() + 'static) {
+    RUN_AT.set(Some((Step::MidCopy, Box::new(run))));
+}
+
+/// Assert that a migration of `path` failed with `err` because MDBX was written during its copy,
+/// before its commit point: the error says so and names `mdbx.dat`, and the migration left the
+/// directory as it found it, `mdbx.dat` holding `mdbx` and `mdbx.lck` still there.
+fn assert_written_during_the_copy(path: &Path, err: &eyre::Report, mdbx: &[u8], case: &str) {
+    assert!(RUN_AT.with_borrow(Option::is_none), "{case}: the write was made");
+    let msg = format!("{err:#}");
+    for says in [
+        "another process wrote the MDBX database during the migration",
+        "Stop that process, then start the node again",
+        "MDBX database is unchanged",
+    ] {
+        assert!(msg.contains(says), "{case}: says {says:?}: {msg}");
+    }
+    let named = msg.contains(&path.join(MDBX_DATA_FILE).display().to_string());
+    assert!(named, "{case}: names mdbx.dat: {msg}");
+    assert_untouched(path, mdbx, case);
+    assert!(exists(&path.join(MDBX_LOCK_FILE)), "{case}: mdbx.lck kept");
+}
+
+/// A process writing `mdbx.dat` while the migration copies it (a build running reth on MDBX on a
+/// second datadir naming the same `db/`) writes past the copy's snapshot: the migration takes the
+/// file's length and modification time when it opens MDBX and again at its commit point, and fails
+/// before the commit point on a difference, naming the file, with MDBX's files as that process
+/// left them and no `tn-lmdb.dat`. Once the writer has stopped, the next open migrates (after the
+/// touch: the appended byte leaves no MDBX file).
+#[test]
+fn mdbx_written_during_the_copy_fails_the_migration() {
+    for change in [Change::Append, Change::Touch] {
+        let case = format!("{change:?}");
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        let mdbx = path.join(MDBX_DATA_FILE);
+        let mut written = std::fs::read(&mdbx).expect("mdbx.dat");
+        if let Change::Append = change {
+            written.push(b'x');
+        }
+
+        let file = mdbx.clone();
+        run_mid_copy(move || change_mdbx(&file, change));
+        let err = open(&path).expect_err("mdbx.dat written during the copy");
+        assert_written_during_the_copy(&path, &err, &written, &case);
+
+        // An appended byte leaves no MDBX file to migrate.
+        if let Change::Touch = change {
+            let db =
+                open(&path).unwrap_or_else(|e| panic!("{case}: the next open migrates: {e:#}"));
+            let mut rows = raw_rows(&*db);
+            rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+            assert!(rows == expected, "{case}: every row, as MDBX held it");
+            assert!(!exists(&mdbx), "{case}: the migration finished");
+        }
+    }
+}
+
+/// The environment variable that makes [`mdbx_writer_process`] write: the database directory.
+const WRITER_DIR: &str = "TN_MIGRATE_TEST_MDBX_WRITER_DIR";
+
+/// The row [`mdbx_writer_process`] commits to `CanonicalHeaders`: a block number past the test
+/// database's.
+const WRITTEN_BLOCK: u64 = u64::MAX;
+
+/// Not a test of its own: the second process of
+/// [`an_mdbx_commit_during_the_copy_fails_the_migration`], which runs this test binary on it alone,
+/// since MDBX refuses a second environment on the same files in one process (`EAGAIN`). With
+/// [`WRITER_DIR`] set it opens the MDBX database there read-write, commits [`WRITTEN_BLOCK`], and
+/// prints MDBX's last transaction ids before and after; without it, it does nothing.
+#[test]
+#[ignore = "the writer process of an_mdbx_commit_during_the_copy_fails_the_migration"]
+fn mdbx_writer_process() {
+    use reth_db::mdbx::DatabaseEnvKind;
+    let Some(dir) = std::env::var_os(WRITER_DIR) else { return };
+    let args = DatabaseArgs { page_size: Some(MDBX_PAGE_SIZE), ..temp_chain_db_args() };
+    let db = DatabaseEnv::open(Path::new(&dir), DatabaseEnvKind::RW, args.database_args())
+        .expect("open MDBX read-write");
+    let id = || mdbx_last_txnid(&db).expect("last txnid");
+    let first = id();
+    let tx = db.tx_mut().expect("tx_mut");
+    tx.put::<tables::CanonicalHeaders>(WRITTEN_BLOCK, Default::default()).expect("put");
+    tx.commit().expect("commit");
+    println!("mdbx-writer: {first} {}", id());
+}
+
+/// A commit to MDBX during the copy, by another process on the same files (a build running reth on
+/// MDBX on a second datadir naming the same `db/`), advances MDBX's last transaction id; here the
+/// test then puts `mdbx.dat`'s modification time back, so the file's stat is as the migration found
+/// it (as on a filesystem with coarse timestamps). The migration reads the last transaction id
+/// again at its commit point, while the source is still open, and fails on the difference, naming
+/// both ids, with MDBX's files as the write left them. The next open migrates the written row too.
+#[test]
+fn an_mdbx_commit_during_the_copy_fails_the_migration() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    build_mdbx(&path);
+    let mdbx = path.join(MDBX_DATA_FILE);
+    let before = std::fs::metadata(&mdbx).expect("stat");
+    let (len, modified) = (before.len(), before.modified().expect("mtime"));
+    // The writer's transaction ids before and after its commit, and `mdbx.dat` as it left it.
+    let wrote = std::rc::Rc::new(std::cell::Cell::new(None));
+
+    let (dir, file, seen) = (path.clone(), mdbx.clone(), wrote.clone());
+    run_mid_copy(move || {
+        let (_, tests) = module_path!().split_once("::").expect("a crate path");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([&format!("{tests}::mdbx_writer_process"), "--exact", "--ignored"])
+            .args(["--nocapture", "--test-threads", "1"])
+            .env(WRITER_DIR, &dir)
+            .output()
+            .expect("run the writer process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the writer: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // the output follows libtest's `test <name> ...` on its line
+        let line = stdout.lines().find_map(|line| Some(line.split_once("mdbx-writer: ")?.1));
+        let ids = line.and_then(|ids| ids.split_once(' '));
+        let (first, last) = ids.unwrap_or_else(|| panic!("the writer's ids: {stdout}"));
+        let (first, last) = (first.parse::<u64>().expect("id"), last.parse::<u64>().expect("id"));
+        let handle = std::fs::OpenOptions::new().write(true).open(&file).expect("open");
+        handle.set_modified(modified).expect("put the modification time back");
+        seen.set(Some((first, last, std::fs::read(&file).expect("mdbx.dat"))));
+    });
+    let err = open(&path).expect_err("MDBX committed to during the copy");
+    let (first, last, written) = wrote.take().expect("the writer ran");
+    assert!(last > first, "the write committed: transaction {first} to {last}");
+    let now = std::fs::metadata(&mdbx).expect("stat");
+    assert_eq!(now.len(), len, "the commit kept mdbx.dat's length");
+    assert_eq!(now.modified().expect("mtime"), modified, "and its modification time");
+    assert_written_during_the_copy(&path, &err, &written, "a commit");
+    let msg = format!("{err:#}");
+    for id in [first, last] {
+        assert!(msg.contains(&format!("MDBX transaction {id}")), "names transaction {id}: {msg}");
+    }
+
+    let db = open(&path).unwrap_or_else(|e| panic!("the next open migrates: {e:#}"));
+    let row = db.tx().expect("tx").get::<tables::CanonicalHeaders>(WRITTEN_BLOCK).expect("get");
+    assert_eq!(row, Some(Default::default()), "the row committed during the copy is migrated");
 }
 
 /// While `mdbx.dat` or the temp directory is in the database directory, the open holds an
