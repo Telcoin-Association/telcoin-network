@@ -4,7 +4,7 @@
 //! reth has two layouts (`StorageSettings`). v1 keeps change sets, transaction senders and the
 //! history indices in database tables, and plain state beside hashed state. v2 moves change sets
 //! and senders into static files and keeps only hashed state; its storage change sets and history
-//! are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0044). A datadir's layout is
+//! are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0112). A datadir's layout is
 //! chosen when it is created and recorded in reth's `Metadata` table (`storage_settings`; a missing
 //! row reads as v1). Nothing converts a datadir from one layout to the other, and flipping the row
 //! alone would make every historical read wrong.
@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use crate::traits::TelcoinNode;
 
 /// The layout the tn-lmdb build gives a new datadir: v2, with the history indices and the
-/// transaction-hash index in the database (vendor/reth CHANGES.md TN-0042..0044). The MDBX build
+/// transaction-hash index in the database (vendor/reth CHANGES.md TN-0110..0112). The MDBX build
 /// always gives v1 ([`StorageLayout::for_new_datadirs`]); an existing datadir keeps its own.
 const NEW_DATADIR_LAYOUT_TN_LMDB: StorageLayout = StorageLayout::V2;
 

@@ -796,7 +796,7 @@ mod tests {
         }
     }
 
-    /// TN(TN-0044): a genesis-allocated slot reads its genesis value at a block after genesis
+    /// TN(TN-0112): a genesis-allocated slot reads its genesis value at a block after genesis
     /// under storage v2, as under v1. Genesis writes `StoragesHistory` with the plain slot; while
     /// the vendored v2 read history by `keccak256(slot)`, such a slot read as never written (zero).
     #[test]

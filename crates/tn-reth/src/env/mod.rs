@@ -455,7 +455,7 @@ impl RethEnv {
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
         // multi-backend commit: static files are made durable, RocksDB commits, then MDBX commits
         // last. The static files' segment threads in `save_blocks` sync each segment and write
-        // its configuration (vendored TN-0051), so from the end of `save_blocks` a crash, or a
+        // its configuration (vendored TN-0118), so from the end of `save_blocks` a crash, or a
         // failure before the MDBX commit, durably leaves static files and/or RocksDB one output
         // ahead of the MDBX tip. `check_consistency` heals exactly that direction in place: it
         // prunes the leading backends down to the MDBX stage checkpoints, which
@@ -641,7 +641,7 @@ mod tests {
     ///
     /// The test persists block 1 through the production path, then reproduces the crash window
     /// for block 2 by hand: `save_blocks` appends block 2 to both backends and makes the static
-    /// files durable (each segment's configuration included, vendored TN-0051), the headers
+    /// files durable (each segment's configuration included, vendored TN-0118), the headers
     /// writer's commit publishes its index, and the MDBX transaction is dropped uncommitted. On
     /// disk the static files are durably at 2 while MDBX is at 1, exactly the post-crash state.
     /// A "restart" (a second `RethEnv` over the same datadir) must then (a) construct Ok,

@@ -75,7 +75,7 @@ own change if that stops being true.
   (`populate_bundle_state_hashed`; v1 reads the plain state, which is still unreverted). So the
   returned `Chain` holds the pre-unwind values as its present state. The tables it leaves are
   right; only the returned `Chain` is wrong. TN never calls it: its unwinds go through
-  `remove_block_and_execution_above`, which returns nothing (TN-0045's round trip covers that).
+  `remove_block_and_execution_above`, which returns nothing (TN-0113's round trip covers that).
   A fix reads the present state before the hashed tables are unwound, or unwinds them after.
 - **A file rotation publishes rows before the database commit.** When a save fills a static
   file, `increment_block` commits it (`StaticFileProviderRW::commit`) and the reader index names
@@ -83,7 +83,7 @@ own change if that stops being true.
   headers tip (TN's `last_block_number`) reads ahead of the database until the node halts; the
   restart prunes the rows back (`check_consistency`), and re-execution writes the same ones.
   `test_save_blocks_without_db_commit_heals_across_files_v2` (TN-0115) pins this state.
-- **A cache miss after a failed save can cache uncommitted rows.** Since TN-0051 every segment
+- **A cache miss after a failed save can cache uncommitted rows.** Since TN-0118 every segment
   writes its `.conf` in its own thread, so after a database-arm failure in `save_blocks` the
   `.conf` files on disk name rows the database never committed. A jar loaded on a cache miss
   then holds them until restart. Reads by number or transaction route by the index, and

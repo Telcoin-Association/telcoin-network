@@ -1,4 +1,4 @@
-//! TN(TN-0045): storage v2 without `RocksDB`, checked against v1 on the same generated chain.
+//! TN(TN-0113): storage v2 without `RocksDB`, checked against v1 on the same generated chain.
 //!
 //! Each test generates one chain of executed blocks with transactions, account changes, slots
 //! that change in several blocks, and an account a block destroys and re-creates. It saves the
@@ -224,7 +224,7 @@ impl Chain {
             }
             let mut bundle = builder.build();
             if number == RECREATED_AT {
-                // TN(TN-0043): what revm leaves for an account destroyed and re-created in the
+                // TN(TN-0111): what revm leaves for an account destroyed and re-created in the
                 // block, which the builder cannot express.
                 bundle.state.get_mut(&recreated).unwrap().status = AccountStatus::DestroyedChanged;
                 let revert = bundle.reverts[0]
@@ -456,7 +456,7 @@ fn assert_v2_matches_v1(chain: &Chain) -> Factory {
         "v2 TransactionHashNumbers is empty"
     );
     assert_eq!(index_tables(&v2), index_tables(&v1), "index tables differ between v1 and v2");
-    // TN(TN-0041): v2's bytecode-only `write_state` writes the rows v1's conversion writes.
+    // TN(TN-0109): v2's bytecode-only `write_state` writes the rows v1's conversion writes.
     let bytecodes = rows::<tables::Bytecodes>(&v2);
     assert_eq!(bytecodes.len(), 1, "v2 Bytecodes: {bytecodes:?}");
     assert_eq!(bytecodes, rows::<tables::Bytecodes>(&v1), "Bytecodes differ between v1 and v2");
@@ -465,7 +465,7 @@ fn assert_v2_matches_v1(chain: &Chain) -> Factory {
     assert_tx_lookups(&v1, chain, TIP);
     assert_tx_lookups(&v2, chain, TIP);
 
-    // TN(TN-0043): the wipe block is the re-created slot's only history entry, so a read after
+    // TN(TN-0111): the wipe block is the re-created slot's only history entry, so a read after
     // it finds the value only if the wiped account's slot revert made it into the history.
     for factory in [&v1, &v2] {
         let provider = factory.provider().unwrap();
@@ -534,7 +534,7 @@ fn assert_unwind_round_trip(chain: &Chain) {
     }
 }
 
-/// TN(TN-0043): in both layouts every key of the tip state has history: after a full save, after
+/// TN(TN-0111): in both layouts every key of the tip state has history: after a full save, after
 /// an unwind to just before the wipe block, and after a re-save of the rest in one batch.
 #[test]
 fn v2_history_covers_the_tip_state() {
@@ -587,7 +587,7 @@ fn save_wipe(
     Ok(())
 }
 
-/// TN(TN-0043): under v2 a block that wipes an account with storage fails instead of leaving
+/// TN(TN-0111): under v2 a block that wipes an account with storage fails instead of leaving
 /// the removed slots out of the changesets and the history. A wipe of an account without
 /// storage still saves.
 #[test]
@@ -605,7 +605,7 @@ fn v2_wipe_of_existing_storage_fails_closed() {
     save_wipe(&chain.save(StorageSettings::v2(), 3), 4, parent, without_storage).unwrap();
 }
 
-/// TN(TN-0043): a wipe of storage written by an earlier block of the same batch fails too: the
+/// TN(TN-0111): a wipe of storage written by an earlier block of the same batch fails too: the
 /// database does not hold that storage yet.
 #[test]
 fn v2_wipe_of_storage_written_earlier_in_the_batch_fails_closed() {
@@ -640,7 +640,7 @@ fn v2_wipe_of_storage_written_earlier_in_the_batch_fails_closed() {
     assert!(err.contains("wiped the storage"), "{err}");
 }
 
-/// TN(TN-0043): under v2 `update_history_indices` refuses blocks whose changesets the static
+/// TN(TN-0111): under v2 `update_history_indices` refuses blocks whose changesets the static
 /// files have not committed, the trap `save_blocks` avoids by indexing from the reverts.
 #[test]
 fn v2_update_history_indices_refuses_uncommitted_changesets() {

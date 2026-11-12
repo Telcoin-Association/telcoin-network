@@ -159,7 +159,7 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        // TN(TN-0044): `StoragesHistory` is keyed by the plain slot in both storage layouts
+        // TN(TN-0112): `StoragesHistory` is keyed by the plain slot in both storage layouts
         // (upstream 815037e27). A hashed slot cannot be looked up: v2 stores no preimages.
         let StorageSlotKey::Plain(lookup_key) = storage_key else {
             return Err(ProviderError::UnsupportedProvider)
@@ -182,7 +182,7 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
     /// Accepts a [`StorageSlotKey`]; the correct lookup key is derived internally
     /// based on the storage mode.
     ///
-    /// TN(TN-0044): history and changesets are keyed by the plain slot in both storage layouts,
+    /// TN(TN-0112): history and changesets are keyed by the plain slot in both storage layouts,
     /// so only a [`StorageSlotKey::Plain`] resolves. v2's current state, `HashedStorages`, is
     /// keyed by its keccak256 hash.
     fn storage_by_lookup_key(
@@ -508,7 +508,7 @@ impl<
         self.storage_by_lookup_key(address, StorageSlotKey::plain(storage_key))
     }
 
-    /// TN(TN-0044): unsupported in both storage layouts. History is keyed by the plain slot and
+    /// TN(TN-0112): unsupported in both storage layouts. History is keyed by the plain slot and
     /// v2 stores no preimages, so a hashed slot cannot be found in it.
     fn storage_by_hashed_key(
         &self,

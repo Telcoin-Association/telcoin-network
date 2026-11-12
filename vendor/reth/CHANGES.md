@@ -459,54 +459,6 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   taken); the other pins the no-permit path, which would hang with an awaited acquire.
   *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.
 
-- **TN-0038** — Backport a774920b7: size the `block_range` buffer for the inclusive span.
-  *Kind*: backport.
-  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`block_range`).
-  *Why*: the `Vec` for an inclusive block range was allocated one short, so every multi-block read
-  reallocated once. Capacity only: the blocks returned are unchanged, so it cannot reach
-  execution or storage. *Upstream*: n/a (upstream commit).
-
-- **TN-0039** — Backport 70e776bfe: find a block's static-file range with a B-tree range lookup.
-  *Kind*: backport.
-  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs`
-  (`StaticFileProviderInner::find_fixed_range_with_block_index`).
-  *Why*: the lookup walked every file range of the segment for each block; `range(block..)` takes
-  the first range whose `max_block` is at or above the block, the same answer in O(log n). It
-  picks which file a block is read from or appended to, so it is on the storage path, but the
-  result is identical by construction (the index is a `BTreeMap` keyed by `max_block`).
-  *Upstream*: n/a (upstream commit).
-
-- **TN-0040** — Backport 7839f3d87: keep one `.csoff` reader per loaded changeset jar.
-  *Kind*: backport.
-  *Files*: `crates/static-file/types/src/{changeset_offsets.rs, lib.rs}` (the reader reads with
-  `read_exact_at` through `&self`; the module is `unix`-only), `crates/storage/provider/src/
-  providers/static_file/{mod.rs, jar.rs, writer.rs, writer_tests.rs}` (`LoadedJar` opens the
-  sidecar once, the jar provider uses it), `.../static_file/manager.rs` (two `let mut reader`
-  that the `&self` reader no longer needs; upstream had already moved that code).
-  *Why*: every changeset lookup (each storage v2 historical read that resolves through a
-  changeset, and each changeset walk) did a `stat` and an `open` of the sidecar. The reader is
-  now opened when the jar is loaded, which `update_index` redoes after each commit, so its length
-  is the committed one, as before. A changeset jar whose header counts offsets but has no sidecar
-  now fails at load instead of reading as "no offsets". Read path only: the bytes read are the
-  same, so it cannot change execution or what is written. TN builds for Linux and macOS only,
-  both `unix`. *Upstream*: n/a (upstream commit).
-
-- **TN-0041** — Backport a195b777e: storage v2's `write_state` skips the plain-state conversion
-  when nothing it produces goes to the database. *Kind*: backport, adapted.
-  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`write_state`, new
-  `write_bytecodes`, used by `write_state_changes` too).
-  *Why*: under v2, `save_blocks` sends receipts and both changesets to static files and v2 keeps
-  no plain state, so the per-block `to_plain_state_and_reverts` (a walk and copy of every changed
-  account and slot) fed only the bytecode writes. The early return writes the bytecodes
-  directly. Adapted: upstream writes every entry of the bundle's `contracts`, while
-  `to_plain_state` drops the empty bytecode (`KECCAK_EMPTY`); TN keeps that filter, so the
-  `Bytecodes` table is the same on both paths. Storage path, v2 only: the condition needs
-  `use_hashed_state()`, which is false for every v1 datadir, so v1 writes are unchanged; genesis
-  and other `StateWriteConfig::default()` callers still convert. *Tests*:
-  `v2_matches_v1_on_a_generated_chain` (TN-0045) puts the empty bytecode in a bundle and requires
-  `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
-  filter.
-
 - **TN-0102** — Backport 345fbbbfd: the in-memory trie cursor skips the database seek on an
   exact overlay hit. *Kind*: backport.
   *Files*: `crates/trie/trie/src/trie_cursor/in_memory.rs` (`InMemoryTrieCursor`: a
@@ -576,6 +528,54 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   109.3k, `HashedStorages` cursors opened 1.89M to 640; hashed seeks and nexts unchanged. The
   state root's mean fell from 100.5 to 84.7 ms on that loaded machine (a quiet run decides).
   *Upstream*: n/a (upstream commit).
+
+- **TN-0106** — Backport a774920b7: size the `block_range` buffer for the inclusive span.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`block_range`).
+  *Why*: the `Vec` for an inclusive block range was allocated one short, so every multi-block read
+  reallocated once. Capacity only: the blocks returned are unchanged, so it cannot reach
+  execution or storage. *Upstream*: n/a (upstream commit).
+
+- **TN-0107** — Backport 70e776bfe: find a block's static-file range with a B-tree range lookup.
+  *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs`
+  (`StaticFileProviderInner::find_fixed_range_with_block_index`).
+  *Why*: the lookup walked every file range of the segment for each block; `range(block..)` takes
+  the first range whose `max_block` is at or above the block, the same answer in O(log n). It
+  picks which file a block is read from or appended to, so it is on the storage path, but the
+  result is identical by construction (the index is a `BTreeMap` keyed by `max_block`).
+  *Upstream*: n/a (upstream commit).
+
+- **TN-0108** — Backport 7839f3d87: keep one `.csoff` reader per loaded changeset jar.
+  *Kind*: backport.
+  *Files*: `crates/static-file/types/src/{changeset_offsets.rs, lib.rs}` (the reader reads with
+  `read_exact_at` through `&self`; the module is `unix`-only), `crates/storage/provider/src/
+  providers/static_file/{mod.rs, jar.rs, writer.rs, writer_tests.rs}` (`LoadedJar` opens the
+  sidecar once, the jar provider uses it), `.../static_file/manager.rs` (two `let mut reader`
+  that the `&self` reader no longer needs; upstream had already moved that code).
+  *Why*: every changeset lookup (each storage v2 historical read that resolves through a
+  changeset, and each changeset walk) did a `stat` and an `open` of the sidecar. The reader is
+  now opened when the jar is loaded, which `update_index` redoes after each commit, so its length
+  is the committed one, as before. A changeset jar whose header counts offsets but has no sidecar
+  now fails at load instead of reading as "no offsets". Read path only: the bytes read are the
+  same, so it cannot change execution or what is written. TN builds for Linux and macOS only,
+  both `unix`. *Upstream*: n/a (upstream commit).
+
+- **TN-0109** — Backport a195b777e: storage v2's `write_state` skips the plain-state conversion
+  when nothing it produces goes to the database. *Kind*: backport, adapted.
+  *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`write_state`, new
+  `write_bytecodes`, used by `write_state_changes` too).
+  *Why*: under v2, `save_blocks` sends receipts and both changesets to static files and v2 keeps
+  no plain state, so the per-block `to_plain_state_and_reverts` (a walk and copy of every changed
+  account and slot) fed only the bytecode writes. The early return writes the bytecodes
+  directly. Adapted: upstream writes every entry of the bundle's `contracts`, while
+  `to_plain_state` drops the empty bytecode (`KECCAK_EMPTY`); TN keeps that filter, so the
+  `Bytecodes` table is the same on both paths. Storage path, v2 only: the condition needs
+  `use_hashed_state()`, which is false for every v1 datadir, so v1 writes are unchanged; genesis
+  and other `StateWriteConfig::default()` callers still convert. *Tests*:
+  `v2_matches_v1_on_a_generated_chain` (TN-0113) puts the empty bytecode in a bundle and requires
+  `Bytecodes` to equal v1's; it fails without the filter. *Upstream*: yes, the `KECCAK_EMPTY`
+  filter.
 
 - **TN-0140** — Backport 8572c88fe: the trie node iterator skips its hashed seek only when the
   walker stands exactly at the seek prefix. *Kind*: backport (consensus fix).
@@ -677,7 +677,50 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
 
-- **TN-0042** — Storage v2 writes `TransactionHashNumbers` to the database table. *Kind*: fix.
+- **TN-0100** — A timing harness for historical reads, storage v1 against v2. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/database/tn_v2_read_bench.rs` (new: the heavy
+  test `v2_history_read_timing_heavy`), `.../database/mod.rs` (the module),
+  `.../database/tn_v2_tests.rs` (`executed` is `pub(super)`).
+  *Why*: storage v2 answers a historical account or storage read that the history resolves to a
+  changeset from static files, not from a database table, and the exec bench showed those reads
+  slower than v1's with a longer tail. The harness saves one generated chain (2400 blocks of 150
+  account and 300 slot changes) into a v1 and a v2 factory in batches of 8 blocks, then times the
+  same 20k reads in each: right after the last persist, again warm, with the changeset jars
+  reloaded every 32 reads as a persist does, while a writer persists, and while a writer persists
+  and another thread holds a static-file jar the way a range walk does. Under v2 it also times
+  the steps of the changeset lookup (jar, `.csoff` read, cursor, binary search). Every answer is
+  compared between the passes and between the layouts. `#[ignore]`d (heavy, run with
+  `--release`); test code only. *Upstream*: no.
+
+- **TN-0101** — `StaticFileProvider::update_index` loads the jar before it takes the index lock.
+  *Kind*: performance (static-file read path).
+  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (`update_index`, new
+  `prepare_index_update` and `PreparedIndexUpdate`; test
+  `growing_commit_waits_for_jar_readers_outside_the_index_lock`).
+  *Why*: `update_index`, which every static-file commit runs once per segment, held the write lock
+  of the segment index while it read the jar's configuration, mapped its data and offsets files,
+  opened its `.csoff`, inserted the jar into the cache (waiting for every reader of that cache
+  shard) and cleaned the cache with `DashMap::retain` (waiting for every reader of every shard).
+  Every static-file lookup of every segment takes that lock, so one reader holding a jar, such as
+  a range walk over receipts or headers, stalled all of them for as long as it held it; storage v2
+  routes each historical read that resolves to a changeset through it. Now the jar is loaded
+  before the lock; when the segment grows past the indexed tip it is published to the cache before
+  the lock too, and the stale jars above the new range are found under shared shard locks and
+  removed one by one. Publishing before the index is the state a jar loaded on a cache miss already
+  creates (TN-0118): lookups route by the index, which still ends at the old tip, and the new jar
+  holds every row the old one did. A shrinking or unchanged segment (unwind, prune) is still
+  published under the lock with the index, and if the index was re-initialized or the segment's
+  ranges moved since the load, the jar is reloaded under the lock as before. The index, the cached
+  jars and every byte read are the same once `update_index` returns, so this cannot reach
+  execution or what is written. *Tests*: `growing_commit_waits_for_jar_readers_outside_the_index_lock`
+  (a reader holds the headers jar, then another segment's, while a commit grows the headers: a
+  lookup from a third thread must not wait for it, and the new header must be readable after the
+  commit; it fails when the grown jar is published under the lock, and when the clean-up goes back
+  to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
+  effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
+  yes.
+
+- **TN-0110** — Storage v2 writes `TransactionHashNumbers` to the database table. *Kind*: fix.
   *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`).
   *Why*: TN-0014 removed `RocksDB`, which wrote this table under v2, but `save_blocks` still
   skipped the database write under v2, so a v2 node could not find a transaction by hash. The
@@ -685,11 +728,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   reader (`transaction_id`) and the unwind (`remove_blocks_above`) already used the table in both
   layouts (`EitherReader`/`EitherWriter` route it to the database only). Storage path, v2 only:
   the v1 write is unchanged. *Tests*: `v2_matches_v1_on_a_generated_chain` and
-  `v2_history_unwind_round_trip` (TN-0045) look every transaction up by hash, and the unwound ones
+  `v2_history_unwind_round_trip` (TN-0113) look every transaction up by hash, and the unwound ones
   must be gone; the first fails with the v2 gate restored. *Upstream*: n/a (upstream writes it to
   `RocksDB`).
 
-- **TN-0043** — Storage v2 writes and unwinds `AccountsHistory` and `StoragesHistory` in the
+- **TN-0111** — Storage v2 writes and unwinds `AccountsHistory` and `StoragesHistory` in the
   database tables. *Kind*: fix.
   *Files*: `crates/storage/provider/src/providers/database/provider.rs` (`save_blocks`, new
   `HistoryTransitions`, `ensure_wiped_accounts_had_no_storage` and `insert_history_transitions`,
@@ -717,7 +760,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - `update_history_indices` indexes v2 from the static-file changesets again, but fails if the
     committed static-file tip is below the range end, instead of indexing nothing.
   Storage path: v1's `save_blocks` still calls `update_history_indices` and its unwinds are the
-  same code, so v1 datadirs are written as before. *Tests* (TN-0045):
+  same code, so v1 datadirs are written as before. *Tests* (TN-0113):
   `v2_matches_v1_on_a_generated_chain` (the tables equal v1's; fails without the v2 insert or
   with the `DoNothing` filter dropped), `v2_history_unwind_round_trip` (fails with either empty
   unwind arm restored), `v2_wipe_of_existing_storage_fails_closed`,
@@ -725,7 +768,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `v2_update_history_indices_refuses_uncommitted_changesets` (each fails with its check
   removed). *Upstream*: n/a (upstream writes these to `RocksDB`; its v2 has the same wipe gap).
 
-- **TN-0044** — Storage v2 keys storage changesets and `StoragesHistory` by the plain slot, as v1
+- **TN-0112** — Storage v2 keys storage changesets and `StoragesHistory` by the plain slot, as v1
   does (the key form of upstream 815037e27). *Kind*: fix (format).
   *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (the static-file
   storage-changeset writer and readers), `.../providers/state/historical.rs` (storage history
@@ -750,18 +793,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - History cannot be looked up by a hashed slot (v2 keeps no preimages), so a historical
     `storage_by_hashed_key` returns `UnsupportedProvider` in both layouts. Nothing in TN called it.
   - `write_state_reverts` cannot record a wiped account's slots from `HashedStorages` (it holds
-    only hashes), so under v2 such a wipe is an error (see TN-0043; impossible since Cancun).
+    only hashes), so under v2 such a wipe is an error (see TN-0111; impossible since Cancun).
   Storage path, v2 format: any v2 datadir written before this reads wrongly. None is deployed;
   testnet is v1, whose keys were already plain. v1 reads and writes are unchanged.
   *Tests*: `v2_genesis_storage_reads_after_genesis` (db-common; fails with the hashed lookup),
   `test_populate_bundle_state_hashed_with_plain_keys`, `test_write_and_remove_state_roundtrip_v2`
-  and the TN-0045 differential. *Upstream*: n/a (upstream commit).
+  and the TN-0113 differential. *Upstream*: n/a (upstream commit).
 
-- **TN-0045** — Tests: storage v2 without `RocksDB` against v1 on the same generated chain.
+- **TN-0113** — Tests: storage v2 without `RocksDB` against v1 on the same generated chain.
   *Kind*: test.
   *Files*: new `crates/storage/provider/src/providers/database/tn_v2_tests.rs` (TN-owned),
   `.../providers/database/mod.rs` (the `#[cfg(test)]` module line).
-  *Why*: the oracle for TN-0041 to TN-0044. A seeded generator builds blocks 1 to 12 with
+  *Why*: the oracle for TN-0109 to TN-0112. A seeded generator builds blocks 1 to 12 with
   transactions, account creations and updates, accounts whose only change is storage (an info
   revert of `DoNothing`), slots changed in several blocks, slots cleared, the empty bytecode
   in a bundle's contracts, and an account without storage that block 7 destroys and re-creates
@@ -778,14 +821,64 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `HashedAccounts` and `HashedStorages`, in both layouts, after a full save, an unwind to before
   the wipe block and a re-save, and requires a history shard for every key: a key without one
   reads as never written at every block, which no read reports as an error. Three tests cover
-  the fail-closed paths of TN-0043: a v2 wipe of an account with committed storage, and of
+  the fail-closed paths of TN-0111: a v2 wipe of an account with committed storage, and of
   storage written earlier in the same batch, fail (a wipe of an account without storage saves),
   and `update_history_indices` refuses blocks whose static-file changesets are not committed yet
   while re-indexing committed ones to what `save_blocks` wrote. Each test fails with the change
   it guards undone; dropping a wiped account's slots in `HistoryTransitions::from_reverts`
   fails the differential, the unwind round trip, the re-index check and the history check.
   *Upstream*: n/a.
-- **TN-0050** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
+
+- **TN-0115** — Tests: storage v2 across static-file boundaries. *Kind*: test.
+  *Files*: `crates/storage/provider/src/test_utils/mod.rs` (new
+  `create_test_provider_factory_with_blocks_per_file`),
+  `.../providers/database/tn_v2_tests.rs` (`Chain::across_static_files`,
+  `v2_matches_v1_across_static_files`, `v2_history_unwind_round_trip_across_static_files`),
+  `.../providers/database/provider.rs` (`run_save_blocks_without_db_commit_heals` takes a
+  blocks-per-file setting; `test_save_blocks_without_db_commit_heals_across_files_v2`).
+  *Why*: every v2 test held its chain in one static file per segment (500k blocks per file
+  against a 12-block chain), so nothing exercised a v2 changeset lookup in a later file, an
+  unwind or heal that deletes files, or a save that rotates files in the segment threads
+  (TN-0118). The TN-0113 differential and unwind round trip now also run with 4 blocks per file
+  (four files; the `5..=9` and `10..=12` batches each cross into a new one); the unwind must
+  delete the later files, leave two, and read the shorter chain, and the re-save must rebuild the
+  full chain's tables. The aborted save of TN-0118 runs with 2 blocks per file under v2: blocks
+  1 to 3 rotate every segment into a new file with a new `.csoff`; the heal on reopen must delete
+  the new files with every satellite file and shorten the old ones to genesis, and the blocks
+  must save again. A rotation commits the filled file during the save (`increment_block`), so
+  the reader index reaches block 1 before the database commit; the test pins that (it is the
+  index's state, not the new file's). *Tests*: the across-files differential and unwind fail when
+  `SegmentHeader::changeset_offset_index` ignores the file's first block (the single-file ones
+  pass), the unwind when `truncate_changesets` stops deleting files, and the aborted save when
+  `NippyJar::delete` leaves a file's configuration behind. *Upstream*: n/a.
+
+- **TN-0116** — A storage v2 genesis refuses an account with storage but no code; the wipe
+  check's rationale is corrected. *Kind*: fix (genesis init, v2 only) and docs.
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`, new
+  `InitStorageError::GenesisStorageWithoutCode`; test `v2_genesis_refuses_storage_without_code`;
+  `v2_genesis_storage_reads_after_genesis` gives its account code),
+  `crates/storage/provider/src/providers/database/provider.rs` (the doc of
+  `ensure_wiped_accounts_had_no_storage`).
+  *Why*: TN-0111's check documented that a wipe of an account with storage cannot happen since
+  Cancun because EIP-7610 refuses a create at an address with storage. revm does not apply that
+  rule: its create collision check looks at the code hash and the nonce only. The argument that
+  holds: revm wipes storage when it self-destructs an account (since EIP-6780 only one created in
+  the same transaction, which revm allows only at an address with no code and a zero nonce) or
+  deletes a touched empty account (EIP-161: no code, zero nonce, zero balance). Execution never
+  leaves storage at an address with no code and a zero nonce: only code running at an address
+  writes its storage, a created contract gets nonce 1 even with empty runtime code, and an
+  EIP-7702 authorization bumps the delegating account's nonce. (A native precompile writing its
+  own storage needs code in genesis; TN's TEL precompile has `0xfe`.) The one source left is a
+  genesis alloc, so under v2 `init_genesis_with_settings` now refuses an account with storage
+  and no code (absent or empty) before it writes anything, rather than letting a later block
+  halt the chain. TN's testnet and mainnet genesis files and the precompile configuration have no
+  such account (checked 2026-11-09); v1 genesis is unchanged. It cannot change execution: it only
+  refuses a genesis v2 could not store faithfully. *Tests*:
+  `v2_genesis_refuses_storage_without_code` (absent and empty code: v2 refuses with nothing
+  written, v1 writes it; fails with the check removed). *Upstream*: maybe (upstream's v2 has the
+  same wipe gap, TN-0111).
+
+- **TN-0117** — Static-file syncs are a plain `fsync` on macOS. *Kind*: fix (performance, macOS
   only).
   *Files*: `crates/fs-util/{Cargo.toml, src/lib.rs}` (new `fsync_file`, used by
   `atomic_write_file`; tests), `crates/storage/nippy-jar/src/writer.rs` (data and offsets syncs,
@@ -806,7 +899,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   nippy-jar, static-file-types and provider suites. *Upstream*: no; upstream calls
   `File::sync_all`, which std makes `F_FULLFSYNC` on macOS.
 
-- **TN-0051** — `save_blocks` writes each static-file segment's configuration in the segment's
+- **TN-0118** — `save_blocks` writes each static-file segment's configuration in the segment's
   thread. *Kind*: performance (storage commit path).
   *Files*: `crates/storage/provider/src/providers/static_file/writer.rs` (new
   `StaticFileProviderRW::sync_and_freeze`, the `index_pending` flag that `finalize` and `commit`
@@ -849,13 +942,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the rows) fails
   without `commit`'s `index_pending` branch, and
   `finalize_syncs_rows_appended_after_sync_and_freeze` (a row appended after the freeze gets its
-  own data and offsets syncs, counted by TN-0052's stats) fails if `sync_and_freeze` leaves the
+  own data and offsets syncs, counted by TN-0119's stats) fails if `sync_and_freeze` leaves the
   writer marked synced. TN's
   `test_startup_heals_static_files_ahead_of_database` (tn-reth) and the engine's late-persist
   tests cover the same states through `RethEnv`. *Upstream*: maybe; it keeps upstream's crash
   semantics.
 
-- **TN-0052** — Per-segment timings of the static-file syncs, for benches. *Kind*: TN feature
+- **TN-0119** — Per-segment timings of the static-file syncs, for benches. *Kind*: TN feature
   (instrumentation).
   *Files*: `crates/storage/provider/src/providers/static_file/sync_stats.rs` (new:
   `StaticFileSyncStats`, `SegmentSyncStats`, `SyncPhaseStats`), `.../static_file/{mod.rs,
@@ -868,105 +961,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the commit as wholes, so nothing showed which sync of which segment a persist waits on.
   `StaticFileProvider::take_sync_stats` returns, per segment, the calls, total and longest time
   of five phases since the last take: the data file's write-out and `fsync`, the offsets'
-  append and `fsync`, the `.csoff` `fsync`, the `.conf` freeze (TN-0051) and the index update.
+  append and `fsync`, the `.csoff` `fsync`, the `.conf` freeze (TN-0118) and the index update.
   Each provider keeps its own under a mutex (about ten uncontended locks a persist), so tests
   never share them. TN reads them through `RethEnv::take_static_file_sync_stats` (test-utils).
   Nothing written or synced changes, so this cannot reach execution or storage. *Tests*:
   `sync_stats_record_each_phase_per_segment` (each phase once per segment, `.csoff` only for a
   changeset segment, a take drains them; fails when a phase is not recorded) and tn-reth's
   `test_persist_reports_static_file_sync_stats`. *Upstream*: no.
-
-- **TN-0100** — A timing harness for historical reads, storage v1 against v2. *Kind*: test.
-  *Files*: `crates/storage/provider/src/providers/database/tn_v2_read_bench.rs` (new: the heavy
-  test `v2_history_read_timing_heavy`), `.../database/mod.rs` (the module),
-  `.../database/tn_v2_tests.rs` (`executed` is `pub(super)`).
-  *Why*: storage v2 answers a historical account or storage read that the history resolves to a
-  changeset from static files, not from a database table, and the exec bench showed those reads
-  slower than v1's with a longer tail. The harness saves one generated chain (2400 blocks of 150
-  account and 300 slot changes) into a v1 and a v2 factory in batches of 8 blocks, then times the
-  same 20k reads in each: right after the last persist, again warm, with the changeset jars
-  reloaded every 32 reads as a persist does, while a writer persists, and while a writer persists
-  and another thread holds a static-file jar the way a range walk does. Under v2 it also times
-  the steps of the changeset lookup (jar, `.csoff` read, cursor, binary search). Every answer is
-  compared between the passes and between the layouts. `#[ignore]`d (heavy, run with
-  `--release`); test code only. *Upstream*: no.
-
-- **TN-0101** — `StaticFileProvider::update_index` loads the jar before it takes the index lock.
-  *Kind*: performance (static-file read path).
-  *Files*: `crates/storage/provider/src/providers/static_file/manager.rs` (`update_index`, new
-  `prepare_index_update` and `PreparedIndexUpdate`; test
-  `growing_commit_waits_for_jar_readers_outside_the_index_lock`).
-  *Why*: `update_index`, which every static-file commit runs once per segment, held the write lock
-  of the segment index while it read the jar's configuration, mapped its data and offsets files,
-  opened its `.csoff`, inserted the jar into the cache (waiting for every reader of that cache
-  shard) and cleaned the cache with `DashMap::retain` (waiting for every reader of every shard).
-  Every static-file lookup of every segment takes that lock, so one reader holding a jar, such as
-  a range walk over receipts or headers, stalled all of them for as long as it held it; storage v2
-  routes each historical read that resolves to a changeset through it. Now the jar is loaded
-  before the lock; when the segment grows past the indexed tip it is published to the cache before
-  the lock too, and the stale jars above the new range are found under shared shard locks and
-  removed one by one. Publishing before the index is the state a jar loaded on a cache miss already
-  creates (TN-0051): lookups route by the index, which still ends at the old tip, and the new jar
-  holds every row the old one did. A shrinking or unchanged segment (unwind, prune) is still
-  published under the lock with the index, and if the index was re-initialized or the segment's
-  ranges moved since the load, the jar is reloaded under the lock as before. The index, the cached
-  jars and every byte read are the same once `update_index` returns, so this cannot reach
-  execution or what is written. *Tests*: `growing_commit_waits_for_jar_readers_outside_the_index_lock`
-  (a reader holds the headers jar, then another segment's, while a commit grows the headers: a
-  lookup from a third thread must not wait for it, and the new header must be readable after the
-  commit; it fails when the grown jar is published under the lock, and when the clean-up goes back
-  to `retain`). In `v2_history_read_timing_heavy` (TN-0100, Mac at load ~60-80, so only the largest
-  effect is clear) the longest v2 read with a jar holder fell from 82-94 ms to 4-5 ms. *Upstream*:
-  yes.
-
-- **TN-0115** — Tests: storage v2 across static-file boundaries. *Kind*: test.
-  *Files*: `crates/storage/provider/src/test_utils/mod.rs` (new
-  `create_test_provider_factory_with_blocks_per_file`),
-  `.../providers/database/tn_v2_tests.rs` (`Chain::across_static_files`,
-  `v2_matches_v1_across_static_files`, `v2_history_unwind_round_trip_across_static_files`),
-  `.../providers/database/provider.rs` (`run_save_blocks_without_db_commit_heals` takes a
-  blocks-per-file setting; `test_save_blocks_without_db_commit_heals_across_files_v2`).
-  *Why*: every v2 test held its chain in one static file per segment (500k blocks per file
-  against a 12-block chain), so nothing exercised a v2 changeset lookup in a later file, an
-  unwind or heal that deletes files, or a save that rotates files in the segment threads
-  (TN-0051). The TN-0045 differential and unwind round trip now also run with 4 blocks per file
-  (four files; the `5..=9` and `10..=12` batches each cross into a new one); the unwind must
-  delete the later files, leave two, and read the shorter chain, and the re-save must rebuild the
-  full chain's tables. The aborted save of TN-0051 runs with 2 blocks per file under v2: blocks
-  1 to 3 rotate every segment into a new file with a new `.csoff`; the heal on reopen must delete
-  the new files with every satellite file and shorten the old ones to genesis, and the blocks
-  must save again. A rotation commits the filled file during the save (`increment_block`), so
-  the reader index reaches block 1 before the database commit; the test pins that (it is the
-  index's state, not the new file's). *Tests*: the across-files differential and unwind fail when
-  `SegmentHeader::changeset_offset_index` ignores the file's first block (the single-file ones
-  pass), the unwind when `truncate_changesets` stops deleting files, and the aborted save when
-  `NippyJar::delete` leaves a file's configuration behind. *Upstream*: n/a.
-
-- **TN-0116** — A storage v2 genesis refuses an account with storage but no code; the wipe
-  check's rationale is corrected. *Kind*: fix (genesis init, v2 only) and docs.
-  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`, new
-  `InitStorageError::GenesisStorageWithoutCode`; test `v2_genesis_refuses_storage_without_code`;
-  `v2_genesis_storage_reads_after_genesis` gives its account code),
-  `crates/storage/provider/src/providers/database/provider.rs` (the doc of
-  `ensure_wiped_accounts_had_no_storage`).
-  *Why*: TN-0043's check documented that a wipe of an account with storage cannot happen since
-  Cancun because EIP-7610 refuses a create at an address with storage. revm does not apply that
-  rule: its create collision check looks at the code hash and the nonce only. The argument that
-  holds: revm wipes storage when it self-destructs an account (since EIP-6780 only one created in
-  the same transaction, which revm allows only at an address with no code and a zero nonce) or
-  deletes a touched empty account (EIP-161: no code, zero nonce, zero balance). Execution never
-  leaves storage at an address with no code and a zero nonce: only code running at an address
-  writes its storage, a created contract gets nonce 1 even with empty runtime code, and an
-  EIP-7702 authorization bumps the delegating account's nonce. (A native precompile writing its
-  own storage needs code in genesis; TN's TEL precompile has `0xfe`.) The one source left is a
-  genesis alloc, so under v2 `init_genesis_with_settings` now refuses an account with storage
-  and no code (absent or empty) before it writes anything, rather than letting a later block
-  halt the chain. TN's testnet and mainnet genesis files and the precompile configuration have no
-  such account (checked 2026-11-09); v1 genesis is unchanged. It cannot change execution: it only
-  refuses a genesis v2 could not store faithfully. *Tests*:
-  `v2_genesis_refuses_storage_without_code` (absent and empty code: v2 refuses with nothing
-  written, v1 writes it; fails with the check removed). *Upstream*: maybe (upstream's v2 has the
-  same wipe gap, TN-0043).
 
 - **TN-0120** — NippyJar format version 2: a CRC32 on every value and on the configuration.
   *Kind*: feature (storage integrity; static files of storage-v2 datadirs only).
@@ -1048,7 +1049,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   file's first block; every record read verifies it, and a mismatch is an `InvalidData` I/O
   error wrapping `ChangesetOffsetChecksumMismatch` (file, index). Plain sidecars keep upstream's
   16-byte records. Every reader and writer is given the jar's format, from `NippyJar::
-  has_checksums` (the cached reader of TN-0040, the count functions, the heal, truncation,
+  has_checksums` (the cached reader of TN-0108, the count functions, the heal, truncation,
   rotation and `delete_current_and_open_previous`). The read paths around it: `StaticFileJarProvider
   ::read_changeset_offset` checks that the block's rows lie inside the jar before any caller sizes
   a buffer with `num_changes` or iterates `changeset_range` (a damaged count asked for an
@@ -1139,7 +1140,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   It cannot reach execution: historical reads only, same results. *Tests*:
   `damaged_probe_key_is_an_error_not_another_row` (a probe's key damaged so the search lands on an
   intact row of another key: the checksum error, never that row; real misses stay `None`; fails
-  without the rerun), and every changeset lookup test of the crate (TN-0045, TN-0115, TN-0123).
+  without the rerun), and every changeset lookup test of the crate (TN-0113, TN-0115, TN-0123).
   *Upstream*: maybe (the raw probe; the rerun needs TN-0120).
 
 - **TN-0130** — A prune commits its configuration before it shrinks a file, and a checksummed

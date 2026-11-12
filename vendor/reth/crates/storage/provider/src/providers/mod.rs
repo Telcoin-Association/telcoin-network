@@ -12,7 +12,7 @@ pub use static_file::{
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
 };
-// TN(TN-0052): per-segment sync timings for benches.
+// TN(TN-0119): per-segment sync timings for benches.
 pub use static_file::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 // TN(TN-0122): which segments' new jars carry checksums under storage v2.
 pub use static_file::checksummed_segment;

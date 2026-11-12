@@ -28,7 +28,7 @@ pub enum StorageSlotKey {
     Plain(B256),
     /// A keccak256-hashed storage slot, as stored in `HashedStorages`.
     ///
-    /// TN(TN-0044): storage changesets and `StoragesHistory` hold plain slots in both storage
+    /// TN(TN-0112): storage changesets and `StoragesHistory` hold plain slots in both storage
     /// layouts (upstream 815037e27), so no changeset reader produces this variant.
     Hashed(B256),
 }
@@ -83,7 +83,7 @@ impl StorageSlotKey {
         }
     }
 
-    // TN(TN-0044): `from_raw`, `to_changeset_key` and `to_changeset` are removed. They encoded
+    // TN(TN-0112): `from_raw`, `to_changeset_key` and `to_changeset` are removed. They encoded
     // "v2 changesets hold hashed slots", which no longer holds (upstream 815037e27).
 }
 
@@ -113,7 +113,7 @@ impl StorageEntry {
         Self { key, value }
     }
 
-    // TN(TN-0044): `slot_key` (tag by storage mode) is removed with `StorageSlotKey::from_raw`.
+    // TN(TN-0112): `slot_key` (tag by storage mode) is removed with `StorageSlotKey::from_raw`.
 }
 
 impl ValueWithSubKey for StorageEntry {

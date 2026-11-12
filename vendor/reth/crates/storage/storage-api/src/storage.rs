@@ -66,7 +66,7 @@ pub trait StorageChangeSetReader: Send {
     /// Iterate over storage changesets and return the storage state from before this block.
     ///
     /// Returned entries have their keys tagged as [`StorageSlotKey::Plain`] or
-    /// [`StorageSlotKey::Hashed`] by the reader. TN(TN-0044): changesets hold plain slots in both
+    /// [`StorageSlotKey::Hashed`] by the reader. TN(TN-0112): changesets hold plain slots in both
     /// storage layouts.
     fn storage_changeset(
         &self,
@@ -75,7 +75,7 @@ pub trait StorageChangeSetReader: Send {
 
     /// Search the block's changesets for the given address and storage key, and return the result.
     ///
-    /// TN(TN-0044): the `storage_key` is the plain slot in both storage layouts (upstream
+    /// TN(TN-0112): the `storage_key` is the plain slot in both storage layouts (upstream
     /// 815037e27; the vendored v2 used to key changesets by its keccak256 hash).
     ///
     /// Returns `None` if the storage slot was not changed in this block.
@@ -89,7 +89,7 @@ pub trait StorageChangeSetReader: Send {
     /// Get all storage changesets in a range of blocks.
     ///
     /// Returned entries have their keys tagged as [`StorageSlotKey::Plain`] or
-    /// [`StorageSlotKey::Hashed`] by the reader. TN(TN-0044): changesets hold plain slots in both
+    /// [`StorageSlotKey::Hashed`] by the reader. TN(TN-0112): changesets hold plain slots in both
     /// storage layouts.
     fn storage_changesets_range(
         &self,

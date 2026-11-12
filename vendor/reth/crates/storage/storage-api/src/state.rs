@@ -57,7 +57,7 @@ pub trait StateProvider:
     /// This is used when changeset keys are pre-hashed (e.g., `use_hashed_state` mode)
     /// to avoid double-hashing.
     ///
-    /// TN(TN-0044): changeset and history keys are plain slots in both storage layouts, so a
+    /// TN(TN-0112): changeset and history keys are plain slots in both storage layouts, so a
     /// historical provider cannot serve a hashed slot and returns
     /// `ProviderError::UnsupportedProvider`.
     fn storage_by_hashed_key(

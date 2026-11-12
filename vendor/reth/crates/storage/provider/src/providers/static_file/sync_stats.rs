@@ -1,6 +1,6 @@
 //! Per-segment timings of the static-file syncs.
 //!
-//! TN(TN-0052): TN-only, for benches. Each [`StaticFileProvider`](super::StaticFileProvider)
+//! TN(TN-0119): TN-only, for benches. Each [`StaticFileProvider`](super::StaticFileProvider)
 //! accumulates its own, and [`StaticFileProvider::take_sync_stats`] drains them, so a bench reads
 //! one persist's split after its commit. Two providers never share them.
 //!

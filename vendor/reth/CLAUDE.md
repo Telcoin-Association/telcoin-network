@@ -56,7 +56,7 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | RPC limits TN adds beyond upstream | TN-0036, TN-0037 |
 | transaction pool backports | TN-0018, TN-0022, TN-0024 |
 | static files and nippy-jar backports | TN-0023 |
-| static-file sync path (plain `fsync` on macOS, `.conf` in the segment threads, sync timers) | TN-0050 to TN-0052 |
+| static-file sync path (plain `fsync` on macOS, `.conf` in the segment threads, sync timers) | TN-0117 to TN-0119 |
 
 CHANGES.md is ordered by section, then by id, newest last within a section.
 
