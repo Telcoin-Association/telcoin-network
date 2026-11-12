@@ -90,13 +90,14 @@ const SYNC_TARGET_RATE_MULTIPLE: u64 = 8;
 /// exactly the target is therefore displaced by the first exploration walk, at most
 /// `SYNC_PREFERENCE_EXPLORE_EVERY` walks away, that any other peer serves at the target (#1787).
 ///
-/// A requester whose own link is below the target pays for it once per node epoch (#1787, Gap
-/// 4): the first walk that cuts two distinct peers at the target (about one window each, ~31 s
-/// at 190 KiB/s) stops its target pass there, reads the rest of that walk at the floor, and sets
-/// the handle's floor-only flag (`floor_only_this_epoch` in `network/mod.rs`), so every later walk
-/// of that node epoch reads every peer at the floor with no target probe; `clear_sync_capability`
-/// resets the flag at rotation. The worst case is two cut probes per node epoch on top of the
-/// parent's always-floor behaviour.
+/// A requester whose own link is below the target pays for it once per `FLOOR_ONLY_TTL` (#1787,
+/// Gap 4): a walk that cuts two distinct staked peers (current or next committee) at the target
+/// (about one window each, ~31 s at 190 KiB/s) stops its target pass there, reads the rest of
+/// that walk at the floor, and sets the handle's floor-only verdict (`LinkSpeed` in
+/// `network/mod.rs`) for `FLOOR_ONLY_TTL`, so the walks in that time read every peer at the floor
+/// with no target probe. A cut of a peer that is not staked never counts, and a serve at the
+/// target inside `FLOOR_ONLY_EVIDENCE_WINDOW` blocks the verdict (GHSA-h352-9822-hjqg). A serve at
+/// the target and `clear_sync_capability` end it.
 pub(crate) const SYNC_TARGET_MIN_BYTES: u64 = SYNC_RATE_MIN_BYTES * SYNC_TARGET_RATE_MULTIPLE;
 
 /// Wall-clock allowance for the latency part of one exchange (stream open, request write, `Ack`

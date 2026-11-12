@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -568,21 +568,44 @@ const MAX_SYNC_REQUEST_FRAME_SIZE: usize = 4 * 1024 * 1024;
 /// each slow peer costs that at most once per epoch.
 pub(crate) const SYNC_PREFERENCE_EXPLORE_EVERY: u64 = 16;
 
-/// How many distinct peers one probe walk must see cut at the target rate before the requester
-/// concludes that its own link, not the peers, is below the target (Gap 4 of #1787). The walk
-/// stops its target pass at that cut, reads the rest of the walk at the floor, and sets
-/// `PrimaryNetworkHandle::floor_only_this_epoch`, so every later walk of the node epoch reads
-/// every peer at the floor. One cut is one slow peer; two in one walk are the requester's own
-/// link.
+/// How many distinct staked peers one probe walk must see cut at the target rate before the
+/// requester concludes that its own link, not the peers, is below the target (Gap 4 of #1787).
+/// The walk stops its target pass at that cut, reads the rest of the walk at the floor, and sets
+/// the floor-only verdict (`LinkSpeed::floor_only_until`) for `FLOOR_ONLY_TTL`, so the later
+/// walks in that time read every peer at the floor. One cut is one slow peer; two in one walk
+/// are the requester's own link.
 ///
-/// A committee-tier requester reads the cut peers at the floor first and then the peers not yet
-/// probed. The cost is about two target-cut probes, around one `SYNC_RATE_WINDOW` each on a
-/// slow link, once per node epoch, after which the requester syncs at the floor as the parent
-/// always did. A public-tier requester reads only the peers not yet probed at the floor. It does
-/// not probe again a peer that this walk cut, because the responder's hold budget refuses that
-/// probe with `Deny(Busy)` for about five times the cut's hold. It reads that peer at the floor
-/// in a later walk (`PrimaryNetworkHandle::walk_with_floor_fallback`).
+/// Only a cut of a staked peer counts (`PrimaryNetworkHandle::staked_peers`, the current and
+/// the next committee), so identities that cost nothing cannot make the verdict
+/// (GHSA-h352-9822-hjqg). A cut of any other peer still marks that peer slow for the epoch and
+/// still gets the floor re-probe of `walk_with_floor_fallback`.
+///
+/// After the stop, a committee-tier requester reads the peers not yet probed at the floor first
+/// and then the cut peers. The cost is about two target-cut probes, around one
+/// `SYNC_RATE_WINDOW` each on a slow link, once per `FLOOR_ONLY_TTL`. A public-tier requester
+/// reads only the peers not yet probed at the floor. It does not probe again a peer that this
+/// walk cut, because the responder's hold budget refuses that probe with `Deny(Busy)` for about
+/// five times the cut's hold. It reads that peer at the floor in a later walk
+/// (`PrimaryNetworkHandle::walk_with_floor_fallback`).
 const LINK_BELOW_TARGET_CUTS: usize = 2;
+
+/// How long a floor-only verdict lasts (`LinkSpeed::floor_only_until`, GHSA-h352-9822-hjqg).
+///
+/// The verdict does not last for the node epoch. When it ends, the next walk reads fresh peers
+/// at the target again, and two staked cuts in one walk set it again. Ten minutes is twenty
+/// `SYNC_RATE_WINDOW`s, so a node whose link is really below the target pays about two
+/// target-cut windows in twenty (10%) to check it again, and a wrong verdict lasts at most ten
+/// minutes. A serve at the target ends the verdict at once (`LinkSpeed::note_target_serve`).
+const FLOOR_ONLY_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How recent a serve at the target must be to block a floor-only verdict
+/// (`LinkSpeed::conclude_below_target`, GHSA-h352-9822-hjqg).
+///
+/// A peer that served this node at the target rate shows that the link can carry the target, so
+/// cuts in a later walk inside this window are slow peers, not a slow link. The window has the
+/// length of `FLOOR_ONLY_TTL`: a serve that ends a verdict also blocks a new one for the same
+/// time.
+const FLOOR_ONLY_EVIDENCE_WINDOW: Duration = FLOOR_ONLY_TTL;
 
 /// The outcome of an epoch-pack fetch attempt over the typed sync protocol.
 enum EpochPackAttempt {
@@ -683,11 +706,12 @@ enum WalkOutcome<T> {
         /// order; `walk_with_floor_fallback` probes them again at the floor.
         cut_at_target: Vec<BlsPublicKey>,
     },
-    /// The pass stopped at the second distinct peer the reader cut at the target
-    /// (`LINK_BELOW_TARGET_CUTS`): two peers below the target in one walk mean the requester's
-    /// own link is below it, so no further peer was read at the target (Gap 4 of #1787).
+    /// The pass stopped at the second distinct staked peer the reader cut at the target
+    /// (`LINK_BELOW_TARGET_CUTS`): two staked peers below the target in one walk mean the
+    /// requester's own link is below it, so no further peer was read at the target (Gap 4 of
+    /// #1787, GHSA-h352-9822-hjqg).
     LinkBelowTarget {
-        /// The peers cut at the target, in probe order.
+        /// The peers cut at the target, staked or not, in probe order.
         cut_at_target: Vec<BlsPublicKey>,
         /// The peers of the plan past the second cut, not probed in this pass, in plan order.
         unprobed: Vec<BlsPublicKey>,
@@ -698,10 +722,10 @@ enum WalkOutcome<T> {
 enum WalkStop<T> {
     /// A peer served.
     Served(T),
-    /// A second distinct peer was cut at the target; `next` indexes the first plan entry not
-    /// probed.
+    /// A second distinct staked peer was cut at the target; `next` indexes the first plan entry
+    /// not probed.
     LinkBelowTarget {
-        /// The peers cut at the target, in probe order.
+        /// The peers cut at the target, staked or not, in probe order.
         cut_at_target: Vec<BlsPublicKey>,
         /// Index into the plan of the first entry not probed.
         next: usize,
@@ -1567,6 +1591,46 @@ impl SyncPreference {
     }
 }
 
+/// What this node knows about the speed of its own sync link (GHSA-h352-9822-hjqg): when a peer
+/// last served it at the target rate, and until when the walks read every peer at the floor.
+#[derive(Debug, Default)]
+struct LinkSpeed {
+    /// When a peer last served a full pack, a partial pack or a verified consensus output at the
+    /// target rate ([`SyncServeSpeed::Target`]). It shows that the link can carry the target.
+    last_target_serve: Option<tokio::time::Instant>,
+    /// The floor-only verdict: until this instant the walks plan every peer at the floor and
+    /// read nothing at the target. `None` when no verdict holds.
+    floor_only_until: Option<tokio::time::Instant>,
+}
+
+impl LinkSpeed {
+    /// Whether the floor-only verdict holds at `now`.
+    fn floor_only(&self, now: tokio::time::Instant) -> bool {
+        self.floor_only_until.is_some_and(|until| now < until)
+    }
+
+    /// Record a serve at the target rate at `now`. The serve shows that the link can carry the
+    /// target, so a floor-only verdict ends at once.
+    fn note_target_serve(&mut self, now: tokio::time::Instant) {
+        self.last_target_serve = Some(now);
+        self.floor_only_until = None;
+    }
+
+    /// Conclude from the staked target cuts of one walk that the link is below the target, and
+    /// set the floor-only verdict until `FLOOR_ONLY_TTL` after `now`. A serve at the target
+    /// inside `FLOOR_ONLY_EVIDENCE_WINDOW` before `now` contradicts the cuts, so no verdict is
+    /// set. Returns whether the verdict was set.
+    fn conclude_below_target(&mut self, now: tokio::time::Instant) -> bool {
+        let contradicted = self.last_target_serve.is_some_and(|served| {
+            now.saturating_duration_since(served) < FLOOR_ONLY_EVIDENCE_WINDOW
+        });
+        if !contradicted {
+            self.floor_only_until = now.checked_add(FLOOR_ONLY_TTL);
+        }
+        self.floor_only(now)
+    }
+}
+
 /// What a probe walk read from the preference slot when it started (#1787), threaded through
 /// the `probe_*` functions to [`PrimaryNetworkHandle::record_sync_served`].
 #[derive(Clone, Copy, Debug)]
@@ -1632,11 +1696,23 @@ pub struct PrimaryNetworkHandle {
     /// Count of the probe walks started on this handle and its clones: the counter behind
     /// `exploration_walk` (#1787).
     probe_walks: Arc<AtomicU64>,
-    /// Whether this node's own link was found below the target rate in this node epoch (Gap 4
-    /// of #1787): one probe walk saw `LINK_BELOW_TARGET_CUTS` distinct peers cut at the target.
-    /// While set, `walk_with_floor_fallback` plans every peer at the floor and reads nothing at
-    /// the target. Reset at rotation by [`Self::clear_sync_capability`].
-    floor_only_this_epoch: Arc<AtomicBool>,
+    /// The speed of this node's own link ([`LinkSpeed`], Gap 4 of #1787): the last serve at the
+    /// target rate and the floor-only verdict.
+    ///
+    /// One probe walk that sees `LINK_BELOW_TARGET_CUTS` distinct staked peers cut at the target
+    /// sets the verdict for `FLOOR_ONLY_TTL`, unless a peer served at the target inside
+    /// `FLOOR_ONLY_EVIDENCE_WINDOW` (GHSA-h352-9822-hjqg). While it holds,
+    /// `walk_with_floor_fallback` plans every peer at the floor and reads nothing at the target.
+    /// A serve at the target ends it ([`Self::record_sync_served`]), and so does rotation
+    /// ([`Self::clear_sync_capability`]).
+    link_speed: Arc<Mutex<LinkSpeed>>,
+    /// The staked identities: the keys of the current and the next committee.
+    ///
+    /// `PrimaryNetwork::new` sets it at each epoch, from the same keys that give a requester the
+    /// committee tier (`ReservedPeers`). Only a target cut of a peer in this set counts toward
+    /// `LINK_BELOW_TARGET_CUTS`, so identities that are not staked cannot set the floor-only
+    /// verdict (GHSA-h352-9822-hjqg). It is empty until the first set, so no cut counts.
+    staked_peers: Arc<Mutex<HashSet<BlsPublicKey>>>,
     /// The tier that a responder's admission gives this node as a requester ([`PeerTier`]).
     ///
     /// `PrimaryNetwork::new` sets it at each epoch from this node's own BLS key and the current
@@ -1662,7 +1738,8 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1678,7 +1755,8 @@ impl PrimaryNetworkHandle {
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1692,7 +1770,8 @@ impl PrimaryNetworkHandle {
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1708,8 +1787,26 @@ impl PrimaryNetworkHandle {
         *self.requester_tier.lock()
     }
 
+    /// Set the staked identities, the keys of the current and the next committee
+    /// (`staked_peers`). `PrimaryNetwork::new` calls it at each epoch.
+    pub(crate) fn set_staked_peers(&self, peers: HashSet<BlsPublicKey>) {
+        *self.staked_peers.lock() = peers;
+    }
+
+    /// Whether `peer` is a staked identity (`staked_peers`), so its target cut counts toward
+    /// `LINK_BELOW_TARGET_CUTS`.
+    fn is_staked(&self, peer: &BlsPublicKey) -> bool {
+        self.staked_peers.lock().contains(peer)
+    }
+
+    /// Whether the floor-only verdict holds now (`link_speed`), so the walks read every peer at
+    /// the floor.
+    fn floor_only(&self) -> bool {
+        self.link_speed.lock().floor_only(tokio::time::Instant::now())
+    }
+
     /// Clear the per-peer epoch-pack sync-capability cache, the per-(peer, epoch) failure
-    /// marks, the probe-first preference and the floor-only flag.
+    /// marks, the probe-first preference and the floor-only verdict.
     ///
     /// Called at each epoch boundary: committees rotate and binaries are upgraded there, so a
     /// peer that did not answer the sync protocol last epoch is re-probed for it this epoch.
@@ -1717,14 +1814,15 @@ impl PrimaryNetworkHandle {
     /// (`SyncPreference::displace`), so a serve in flight at the clear, whose walk read the old
     /// generation when it started, does not re-install its peer in the new epoch (#1787).
     /// Within the epoch the holder-last exploration order (`exploration_walk`) displaces a
-    /// holder that serves at exactly the target rate. The floor-only flag
-    /// (`floor_only_this_epoch`) is reset, so the new epoch's walks read fresh peers at the
-    /// target again until two distinct peers are cut at the target in one walk.
+    /// holder that serves at exactly the target rate. The floor-only verdict (`link_speed`) ends,
+    /// so the new epoch's walks read fresh peers at the target again until two distinct staked
+    /// peers are cut at the target in one walk. The last serve at the target is kept: it is
+    /// evidence about this node's link, not about the epoch.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
         self.last_sync_server.lock().displace(None);
-        self.floor_only_this_epoch.store(false, Ordering::Relaxed);
+        self.link_speed.lock().floor_only_until = None;
     }
 
     /// Record that `peer` served a full pack, a partial pack or a verified consensus output for
@@ -1740,9 +1838,13 @@ impl PrimaryNetworkHandle {
     /// back. The preference lasts until another peer takes it, until `peer` fails a probe
     /// (`forget_sync_server`), or until rotation (`clear_sync_capability`), so a peer that
     /// served once and then stalls does not stay at the front of every later walk.
+    ///
+    /// The serve shows that this node's link carries the target, so it ends a floor-only verdict
+    /// and blocks a new one for `FLOOR_ONLY_EVIDENCE_WINDOW` ([`LinkSpeed`], GHSA-h352-9822-hjqg).
     pub(crate) fn record_sync_served(&self, peer: BlsPublicKey, epoch: Epoch, walk: ProbeWalk) {
         self.sync_capability.lock().insert(peer, true);
         self.epoch_sync_failed.lock().remove(&(peer, epoch));
+        self.link_speed.lock().note_target_serve(tokio::time::Instant::now());
         let mut preference = self.last_sync_server.lock();
         if walk.explore {
             preference.displace(Some(peer));
@@ -2160,14 +2262,16 @@ impl PrimaryNetworkHandle {
     }
 
     /// Walk `plan` one peer at a time, reading each peer at its planned bound, and stop at the
-    /// first peer that serves, so no peer past it is probed, or at the second distinct peer the
-    /// reader cuts at the target (`LINK_BELOW_TARGET_CUTS`), so no further peer is read at a
-    /// bound this node's own link cannot meet (#1787).
+    /// first peer that serves, so no peer past it is probed, or at the second distinct staked
+    /// peer (`is_staked`) the reader cuts at the target (`LINK_BELOW_TARGET_CUTS`), so no further
+    /// peer is read at a bound this node's own link cannot meet (#1787). A cut of a peer that is
+    /// not staked never counts (GHSA-h352-9822-hjqg).
     ///
     /// A peer cached unsyncable (`is_known_unsyncable`) is skipped. The check runs as the walk
     /// reaches the peer, so a peer that an earlier probe in the same walk cached unsyncable is
     /// skipped too. Returns the served value, the peers the reader cut at the target in probe
-    /// order, or, after the second cut, those peers plus the peers of the plan not yet probed.
+    /// order, or, after the second staked cut, those peers plus the peers of the plan not yet
+    /// probed.
     async fn walk_probes<T, F, Fut>(
         &self,
         plan: Vec<(BlsPublicKey, SyncRateBound)>,
@@ -2187,7 +2291,7 @@ impl PrimaryNetworkHandle {
                 })
             })
             // `Err` short-circuits the fold: a serve, so no peer past it is probed, or the
-            // second distinct peer cut at the target, so the rest of the plan is left for a
+            // second distinct staked peer cut at the target, so the rest of the plan is left for a
             // floor pass. `Ok` carries the peers cut at the target so far, in probe order.
             .try_fold(Vec::new(), |cut: Vec<BlsPublicKey>, (index, cut_peer)| {
                 let cut_at_target: Vec<BlsPublicKey> = cut
@@ -2195,7 +2299,10 @@ impl PrimaryNetworkHandle {
                     .filter(|earlier| Some(*earlier) != cut_peer)
                     .chain(cut_peer)
                     .collect();
-                futures::future::ready(if cut_at_target.len() < LINK_BELOW_TARGET_CUTS {
+                // only the cut of a staked peer counts toward the link verdict, so identities
+                // that cost nothing cannot stop the target pass (GHSA-h352-9822-hjqg)
+                let staked_cuts = cut_at_target.iter().filter(|peer| self.is_staked(peer)).count();
+                futures::future::ready(if staked_cuts < LINK_BELOW_TARGET_CUTS {
                     Ok(cut_at_target)
                 } else {
                     Err(WalkStop::LinkBelowTarget { cut_at_target, next: index + 1 })
@@ -2229,18 +2336,21 @@ impl PrimaryNetworkHandle {
     /// times the cut's hold. The cut peer keeps its (peer, `epoch`) mark, so a later walk reads it
     /// at the floor. One cut with no serve therefore ends the walk with `None`.
     ///
-    /// Two distinct peers cut at the target in one pass mean this node's own link, not the
-    /// peers, is below the target (Gap 4 of #1787): pass 1 stops at the second cut
-    /// (`LINK_BELOW_TARGET_CUTS`), the rest of this walk is read at the floor, and
-    /// `floor_only_this_epoch` is set, so every later walk of this node epoch plans every peer at
-    /// the floor and reads nothing at the target. A `Committee` requester reads the cut peers and
-    /// then the peers not yet probed; a `Public` requester reads only the peers not yet probed.
-    /// The flag is reset at rotation (`clear_sync_capability`). A slow requester therefore pays
-    /// about two target-cut probes, around one `SYNC_RATE_WINDOW` each, once per node epoch, and
-    /// then syncs at the floor as the parent always did. A floor read that completes at the
-    /// target speed takes the preference and one that does not is marked slow, as for any serve
-    /// (`probe_consensus_output`, `probe_epoch_pack`). Returns the first served value, or `None`
-    /// when no pass serves.
+    /// Two distinct staked peers cut at the target in one pass mean this node's own link, not
+    /// the peers, is below the target (Gap 4 of #1787): pass 1 stops at the second staked cut
+    /// (`LINK_BELOW_TARGET_CUTS`) and the rest of this walk is read at the floor. A cut of a peer
+    /// that is not staked never counts, so identities that cost nothing cannot stop the pass
+    /// (GHSA-h352-9822-hjqg). The stop sets the floor-only verdict for `FLOOR_ONLY_TTL`, unless
+    /// a peer served at the target inside `FLOOR_ONLY_EVIDENCE_WINDOW` (`LinkSpeed`). While the
+    /// verdict holds, every walk plans every peer at the floor and reads nothing at the target.
+    /// A `Committee` requester reads the peers not yet probed and then the cut peers, so the
+    /// peers that just cut it are read last; a `Public` requester reads only the peers not yet
+    /// probed. A serve at the target and rotation (`clear_sync_capability`) end the verdict. A
+    /// slow requester therefore pays about two target-cut probes, around one `SYNC_RATE_WINDOW`
+    /// each, once per `FLOOR_ONLY_TTL`, and syncs at the floor in between. A floor read that
+    /// completes at the target speed takes the preference and one that does not is marked slow,
+    /// as for any serve (`probe_consensus_output`, `probe_epoch_pack`). Returns the first served
+    /// value, or `None` when no pass serves.
     async fn walk_with_floor_fallback<T, F, Fut>(
         &self,
         peers: Vec<BlsPublicKey>,
@@ -2251,7 +2361,7 @@ impl PrimaryNetworkHandle {
         F: Fn(BlsPublicKey, SyncRateBound) -> Fut,
         Fut: Future<Output = ProbeVerdict<T>>,
     {
-        let floor_only = self.floor_only_this_epoch.load(Ordering::Relaxed);
+        let floor_only = self.floor_only();
         let requester_tier = self.requester_tier();
         let plan = peers
             .into_iter()
@@ -2287,17 +2397,23 @@ impl PrimaryNetworkHandle {
                 }
             },
             WalkOutcome::LinkBelowTarget { cut_at_target, unprobed } => {
-                self.floor_only_this_epoch.store(true, Ordering::Relaxed);
+                let verdict =
+                    self.link_speed.lock().conclude_below_target(tokio::time::Instant::now());
                 info!(
                     target: "primary::network",
                     epoch,
                     cut = cut_at_target.len(),
                     unprobed = unprobed.len(),
-                    "two peers cut at the target rate in one walk, so this node's link is below \
-                     the target; reading every peer at the floor for the rest of the epoch"
+                    floor_only = verdict,
+                    "two staked peers cut at the target rate in one walk, so this node's link is \
+                     below the target; reading the rest of the walk at the floor"
                 );
+                // the peers not yet probed come first, so the peers that just cut this walk
+                // cannot hold the front of its floor pass (GHSA-h352-9822-hjqg)
+                let fresh: Vec<BlsPublicKey> =
+                    unprobed.into_iter().filter(|peer| !cut_at_target.contains(peer)).collect();
                 let rest: Vec<BlsPublicKey> = match requester_tier {
-                    PeerTier::Committee => cut_at_target.into_iter().chain(unprobed).collect(),
+                    PeerTier::Committee => fresh.into_iter().chain(cut_at_target).collect(),
                     PeerTier::Public => {
                         debug!(
                             target: "primary::network",
@@ -2306,7 +2422,7 @@ impl PrimaryNetworkHandle {
                             "public requester skips the same-walk floor re-probe of the peers \
                              this walk cut; they keep their slow marks"
                         );
-                        unprobed.into_iter().filter(|peer| !cut_at_target.contains(peer)).collect()
+                        fresh
                     }
                 };
                 self.walk_floor_pass(rest, &probe).await
@@ -3325,11 +3441,15 @@ where
         // the current and the next committee may take the reserve of every sync budget
         let committee_keys = consensus_config.committee().bls_keys();
         let next_keys = consensus_config.next_committee_keys().iter().copied();
-        let reserved_peers = ReservedPeers::new(committee_keys.into_iter().chain(next_keys));
+        let staked: HashSet<BlsPublicKey> = committee_keys.into_iter().chain(next_keys).collect();
+        let reserved_peers = ReservedPeers::new(staked.iter().copied());
         // this node's tier at a responder follows the same rule, so the probe walks know
         // whether a same-walk floor re-probe of a peer cut at the target can be admitted
         let own_key = consensus_config.key_config().primary_public_key();
         network_handle.set_requester_tier(reserved_peers.tier(&own_key));
+        // only a target cut of a staked peer counts toward the floor-only verdict
+        // (GHSA-h352-9822-hjqg)
+        network_handle.set_staked_peers(staked);
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
@@ -5349,10 +5469,11 @@ mod sync_busy_deny_tests {
 mod sync_server_preference_tests {
     use super::{
         order_probe_peers, PeerTier, PrimaryNetworkHandle, ProbeVerdict, ProbeWalk, SyncRateBound,
+        FLOOR_ONLY_TTL,
     };
     use parking_lot::Mutex;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::{collections::HashSet, sync::atomic::Ordering};
+    use std::collections::HashSet;
     use tn_types::{BlsKeypair, BlsPublicKey, Epoch};
     use tokio::sync::mpsc;
 
@@ -5383,9 +5504,21 @@ mod sync_server_preference_tests {
         handle.last_sync_server.lock().peer
     }
 
-    /// Whether `handle` reads every peer at the floor for the rest of the epoch.
+    /// Whether the floor-only verdict holds on `handle` now, so its walks read every peer at the
+    /// floor.
     fn floor_only(handle: &PrimaryNetworkHandle) -> bool {
-        handle.floor_only_this_epoch.load(Ordering::Relaxed)
+        handle.floor_only()
+    }
+
+    /// Set the floor-only verdict on `handle` for `FLOOR_ONLY_TTL` from now.
+    fn set_floor_only(handle: &PrimaryNetworkHandle) {
+        handle.link_speed.lock().floor_only_until =
+            tokio::time::Instant::now().checked_add(FLOOR_ONLY_TTL);
+    }
+
+    /// Mark `peers` as staked on `handle`.
+    fn stake(handle: &PrimaryNetworkHandle, peers: &[BlsPublicKey]) {
+        handle.set_staked_peers(peers.iter().copied().collect());
     }
 
     /// The scripted verdict of one probe for the `walk_with_floor_fallback` tests: a probe
@@ -5570,14 +5703,14 @@ mod sync_server_preference_tests {
     }
 
     /// Rotation drops the probe-first preference with the capability cache and the marks, bumps
-    /// the slot's generation and resets the floor-only flag (#1787).
+    /// the slot's generation and ends the floor-only verdict (#1787).
     #[test]
     fn clear_sync_capability_drops_the_preference() {
         let handle = handle();
         let (served, slow) = (key(1), key(2));
         handle.record_sync_served(served, 3, walk(&handle));
         handle.record_sync_served_slowly(slow, 3);
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        set_floor_only(&handle);
         let before = handle.last_sync_server.lock().generation;
         handle.clear_sync_capability();
         assert_eq!(preferred(&handle), None);
@@ -5624,12 +5757,12 @@ mod sync_server_preference_tests {
         assert_eq!(preferred(&handle), Some(peer));
     }
 
-    /// Rotation resets the floor-only flag, so the new epoch reads fresh peers at the target
+    /// Rotation ends the floor-only verdict, so the new epoch reads fresh peers at the target
     /// again (#1787, Gap 4).
     #[test]
-    fn clear_sync_capability_resets_the_floor_only_flag() {
+    fn clear_sync_capability_ends_the_floor_only_verdict() {
         let handle = handle();
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        set_floor_only(&handle);
         assert!(floor_only(&handle));
         handle.clear_sync_capability();
         assert!(!floor_only(&handle));
@@ -5712,7 +5845,7 @@ mod sync_server_preference_tests {
             calls,
             vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (a, SyncRateBound::Floor),]
         );
-        assert!(!floor_only(&handle), "one cut must not set the floor-only flag");
+        assert!(!floor_only(&handle), "one cut must not set the floor-only verdict");
     }
 
     /// A public-tier requester does not probe again at the floor, in the same walk, a peer that
@@ -5728,16 +5861,17 @@ mod sync_server_preference_tests {
         assert_eq!(served, None);
         assert!(!calls.contains(&(a, SyncRateBound::Floor)), "a cut peer must not be re-probed");
         assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
-        assert!(!floor_only(&handle), "one cut must not set the floor-only flag");
+        assert!(!floor_only(&handle), "one cut must not set the floor-only verdict");
     }
 
-    /// After two cuts in one walk, a public-tier requester still reads the peers not yet probed
-    /// at the floor, but not the two peers that the walk cut (#1787, GHSA-jr9x).
+    /// After two staked cuts in one walk, a public-tier requester still reads the peers not yet
+    /// probed at the floor, but not the two peers that the walk cut (#1787, GHSA-jr9x).
     #[tokio::test]
     async fn public_requester_still_reads_unprobed_peers_at_the_floor() {
         let handle = handle();
         handle.set_requester_tier(PeerTier::Public);
         let (a, b, c) = (key(1), key(2), key(3));
+        stake(&handle, &[a, b]);
         let serves =
             [(a, SyncRateBound::Floor), (b, SyncRateBound::Floor), (c, SyncRateBound::Floor)];
         let (served, calls) = scripted_walk(&handle, vec![a, b, c], 0, &serves, &[a, b]).await;
@@ -5748,7 +5882,7 @@ mod sync_server_preference_tests {
         );
         assert!(!calls.contains(&(a, SyncRateBound::Floor)), "a cut peer must not be re-probed");
         assert!(!calls.contains(&(b, SyncRateBound::Floor)), "a cut peer must not be re-probed");
-        assert!(floor_only(&handle), "two cuts in one walk must set the floor-only flag");
+        assert!(floor_only(&handle), "two staked cuts in one walk must set the floor-only verdict");
     }
 
     /// The first serve ends the walk: no peer past it is probed and no floor pass runs, even
@@ -5787,15 +5921,112 @@ mod sync_server_preference_tests {
         assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
     }
 
-    /// Two distinct peers cut at the target in one walk stop the target pass there: the rest of
-    /// the walk (the cut peers, then the peers not yet probed) is read at the floor, and the
-    /// handle reads every peer at the floor for the rest of the epoch (#1787, Gap 4).
+    /// Two distinct staked peers cut at the target in one walk stop the target pass there: the
+    /// rest of the walk (the peers not yet probed, then the cut peers) is read at the floor, and
+    /// the handle reads every peer at the floor for `FLOOR_ONLY_TTL` (#1787, Gap 4,
+    /// GHSA-h352-9822-hjqg).
     #[tokio::test]
     async fn walk_with_floor_fallback_stops_the_target_pass_at_the_second_cut() {
         let handle = handle();
         let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
         let (served, calls) =
             scripted_walk(&handle, vec![a, b, c, d], 0, &[(c, SyncRateBound::Floor)], &[a, b])
+                .await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (c, SyncRateBound::Floor)]
+        );
+        assert!(floor_only(&handle), "two staked cuts in one walk must set the floor-only verdict");
+    }
+
+    /// While the floor-only verdict holds, the next walk plans every peer at the floor and reads
+    /// nothing at the target, a fresh peer included (#1787, Gap 4).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_plans_every_peer_at_the_floor_once_the_link_is_slow() {
+        let handle = handle();
+        set_floor_only(&handle);
+        let (a, b) = (key(1), key(2));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b], 0, &[(b, SyncRateBound::Floor)], &[a]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(a, SyncRateBound::Floor), (b, SyncRateBound::Floor)]);
+    }
+
+    /// A target cut of a peer that is not staked never counts toward the link verdict, so two
+    /// such cuts do not stop the target pass and set no verdict (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_ignores_cuts_of_peers_that_are_not_staked() {
+        let handle = handle();
+        let (a, b, c) = (key(1), key(2), key(3));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c], 0, &[(c, SyncRateBound::Target)], &[a, b]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![
+                (a, SyncRateBound::Target),
+                (b, SyncRateBound::Target),
+                (c, SyncRateBound::Target)
+            ]
+        );
+        assert!(!floor_only(&handle), "cuts of peers that are not staked must not set the verdict");
+    }
+
+    /// A serve at the target inside `FLOOR_ONLY_EVIDENCE_WINDOW` contradicts two staked cuts:
+    /// the walk still reads its rest at the floor, but no verdict is set (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn a_recent_target_serve_blocks_the_floor_only_verdict() {
+        let handle = handle();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
+        handle.record_sync_served(d, 0, walk(&handle));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c], 0, &[(c, SyncRateBound::Floor)], &[a, b]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (c, SyncRateBound::Floor)]
+        );
+        assert!(!floor_only(&handle), "a recent serve at the target must block the verdict");
+    }
+
+    /// The floor-only verdict ends `FLOOR_ONLY_TTL` after it is set, so a later walk reads at
+    /// the target again, and a serve at the target ends a verdict at once
+    /// (GHSA-h352-9822-hjqg).
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_only_verdict_expires_and_a_target_serve_ends_it() {
+        let handle = handle();
+        let (a, b, c) = (key(1), key(2), key(3));
+        stake(&handle, &[a, b]);
+        let (served, _) = scripted_walk(&handle, vec![a, b], 0, &[], &[a, b]).await;
+        assert_eq!(served, None);
+        assert!(floor_only(&handle), "two staked cuts must set the verdict");
+
+        tokio::time::advance(FLOOR_ONLY_TTL).await;
+        assert!(!floor_only(&handle), "the verdict must end after FLOOR_ONLY_TTL");
+        let (served, calls) =
+            scripted_walk(&handle, vec![c], 0, &[(c, SyncRateBound::Target)], &[]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(c, SyncRateBound::Target)]);
+
+        scripted_walk(&handle, vec![a, b], 0, &[], &[a, b]).await;
+        assert!(floor_only(&handle), "two staked cuts must set the verdict again");
+        handle.record_sync_served(c, 0, walk(&handle));
+        assert!(!floor_only(&handle), "a serve at the target must end the verdict");
+    }
+
+    /// After a stop at the second staked cut, a `Committee` requester reads the peers not yet
+    /// probed before the cut peers, so the peers that just cut the walk are read last
+    /// (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_reads_the_cut_peers_last_after_a_link_stop() {
+        let handle = handle();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c, d], 0, &[(b, SyncRateBound::Floor)], &[a, b])
                 .await;
         assert_eq!(served, Some(()));
         assert_eq!(
@@ -5803,24 +6034,11 @@ mod sync_server_preference_tests {
             vec![
                 (a, SyncRateBound::Target),
                 (b, SyncRateBound::Target),
+                (c, SyncRateBound::Floor),
+                (d, SyncRateBound::Floor),
                 (a, SyncRateBound::Floor),
                 (b, SyncRateBound::Floor),
-                (c, SyncRateBound::Floor),
             ]
         );
-        assert!(floor_only(&handle), "two cuts in one walk must set the floor-only flag");
-    }
-
-    /// Once the floor-only flag is set, the next walk plans every peer at the floor and reads
-    /// nothing at the target, a fresh peer included (#1787, Gap 4).
-    #[tokio::test]
-    async fn walk_with_floor_fallback_plans_every_peer_at_the_floor_once_the_link_is_slow() {
-        let handle = handle();
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
-        let (a, b) = (key(1), key(2));
-        let (served, calls) =
-            scripted_walk(&handle, vec![a, b], 0, &[(b, SyncRateBound::Floor)], &[a]).await;
-        assert_eq!(served, Some(()));
-        assert_eq!(calls, vec![(a, SyncRateBound::Floor), (b, SyncRateBound::Floor)]);
     }
 }
