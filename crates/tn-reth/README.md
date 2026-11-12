@@ -54,20 +54,37 @@ nothing, and neither do the stages after it.
 | `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer, in parallel on rayon. Part of execute. |
 | `tn_reth_block_finish_seconds` | The block builder's `finish`: the post-execution changes (on an epoch-closing block, the closing system calls), merging the state transitions, hashing the post-state, the state root, and assembling the block. |
 | `tn_reth_block_hashed_state_seconds` | Hashing the block's post-execution state (`hashed_post_state`). Part of finish. |
-| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay` in `src/env/output_overlay.rs`, with the changed storage roots on parallel tasks: `parallel.rs` there), from opening its read-only database transaction to closing it, the tasks' own transactions included. Part of finish. |
+| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay` in `src/env/output_overlay.rs`, with the changed storage roots on parallel tasks and the account walk split by first nibble: `parallel.rs` and `account_split.rs` there), from opening its read-only database transaction to closing it, the tasks' own transactions included. Part of finish. |
 | `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
 
 None of them covers the persist, which runs once per output after every block is built; reth's
 `save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
 start at 5 ms, so a stage shorter than that reads only as "under 5 ms" on a dashboard.
 
-### Parallel storage roots
+### Parallel storage roots and account walk
 
 A block's state root computes the storage roots of the accounts with changed storage on rayon's
-pool while the account walk runs (`src/env/output_overlay/parallel.rs`). One block in 256 is also
-computed serially and compared; a difference is logged with both roots, counted in
+pool while the account walk runs (`src/env/output_overlay/parallel.rs`). A block with at least 64
+changed accounts also splits the account walk by the first nibble of the hashed address
+(`src/env/output_overlay/account_split.rs`): sixteen subtrie walks, each reth's own `StateRoot`
+over cursors restricted to one nibble, run on the calling thread and pool jobs, and the calling
+thread composes the root branch and the union of their trie updates. No vendored change beyond the
+storage-root hook (TN-0139). A trie the split cannot compose (a small one: a few thousand accounts
+or fewer) runs the walk on one thread as before.
+
+One block in 256 with parallel work (storage-root tasks or a split walk) is also computed serially
+and compared; a difference is logged with both roots, counted in
 `tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the block uses the
-serial result. `TN_PARALLEL_STATE_ROOT=0` in the node's environment computes every root serially.
+serial result. `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
+ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
+split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
+split wrong) are alerts.
+
+Off switches, read once at the first block from the node's environment:
+`TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
+storage-root tasks and runs the account walk on one thread. Tests and benches select the walk
+explicitly; `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds: the exec bench, tests) compares every
+block, split ones included, and panics on a difference.
 
 ## Header field mapping
 

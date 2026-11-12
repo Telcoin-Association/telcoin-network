@@ -6,10 +6,10 @@
 //! overlay, comparing each block's parallel root with the serial one over the same transaction.
 
 use super::{
-    checked, storage_root_targets, ParallelRoots, StorageRootSource as _, StorageRootTasks,
-    TaskError, TASK_ROOTS_TAKEN,
+    checked, storage_root_targets, ParallelRoot, ParallelRoots, StorageRootSource as _,
+    StorageRootTasks, TaskError, TASK_ROOTS_TAKEN,
 };
-use crate::{OutputTrieOverlay, RethChainSpec, RethEnv};
+use crate::{env::output_overlay::AccountWalk, OutputTrieOverlay, RethChainSpec, RethEnv};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use reth_chain_state::ComputedTrieData;
@@ -141,9 +141,9 @@ impl Fixture {
         Ok(())
     }
 
-    /// Run `blocks` as one output: each block's root serially, with the tasks unchecked and in
-    /// shadow mode, over one transaction; all three must agree. Returns the task results the walks
-    /// took.
+    /// Run `blocks` as one output: each block's root serially, with the tasks unchecked (the
+    /// account walk on one thread, then split) and in shadow mode, over one transaction; all must
+    /// agree. Returns the task results the walks took.
     fn check_output(&self, blocks: &[HashedPostState]) -> eyre::Result<usize> {
         let factory = self.env.blockchain_provider();
         let provider = factory.database_provider_ro()?;
@@ -152,15 +152,17 @@ impl Fixture {
         let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
         for (i, block) in blocks.iter().enumerate() {
             let serial = overlay.layered_root_with_updates(tx, block.clone())?;
-            let parallel =
-                overlay.layered_root_with_updates_parallel(factory, tx, block.clone())?;
-            assert_eq!(parallel.0, serial.0, "state root differs at block {i}");
-            assert_eq!(parallel.1, serial.1, "trie updates differ at block {i}");
+            for walk in [AccountWalk::OneThread, AccountWalk::Split] {
+                let parallel =
+                    overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), walk)?;
+                assert_eq!(parallel.0, serial.0, "state root differs at block {i} ({walk:?})");
+                assert_eq!(parallel.1, serial.1, "trie updates differ at block {i} ({walk:?})");
+            }
             let shadow = overlay.block_root_with_updates(
                 factory,
                 tx,
                 block.clone(),
-                ParallelRoots::Shadow,
+                ParallelRoots::Shadow(AccountWalk::Split),
             )?;
             assert_eq!(shadow, serial, "shadow result differs at block {i}");
             overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -326,7 +328,8 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     drop(after);
 
     let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
-    let parallel = overlay.layered_root_with_updates_parallel(factory, walk_tx, block)?;
+    let parallel =
+        overlay.layered_root_with_updates_parallel(factory, walk_tx, block, AccountWalk::Split)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
     Ok(())
@@ -357,8 +360,14 @@ fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
     assert_eq!(tasks.failures.lock().0, 1, "the panic is counted as a failure");
 }
 
+/// A parallel result, from the walk on one thread (`composed: false`) or the split.
+fn parallel(result: (B256, TrieUpdates), composed: bool) -> ParallelRoot {
+    ParallelRoot { result, composed }
+}
+
 /// A sampled comparison that finds a difference (in the root, or only in the trie updates)
-/// returns the serial result and counts it in `tn_reth.parallel_state_root_mismatches_total`.
+/// returns the serial result and counts it in `tn_reth.parallel_state_root_mismatches_total`; a
+/// difference in a root the split composed also counts as the `mismatch` account-walk fallback.
 /// The counter binds to the recorder current when `RETH_METRICS` is first forced, so run it under
 /// nextest (one process per test).
 #[test]
@@ -368,20 +377,38 @@ fn sampled_difference_uses_the_serial_result_and_counts_it() {
     let serial = (key(7, 1), TrieUpdates::default());
     let mut other_updates = TrieUpdates::default();
     other_updates.removed_nodes.insert(reth_trie::Nibbles::from_nibbles([1, 2]));
+    let other_root = (key(7, 2), TrieUpdates::default());
     metrics::with_local_recorder(&recorder, || {
-        assert_eq!(checked(serial.clone(), serial.clone(), false), serial);
-        assert_eq!(checked(serial.clone(), (key(7, 2), TrieUpdates::default()), false), serial);
-        assert_eq!(checked(serial.clone(), (key(7, 1), other_updates), false), serial);
+        assert_eq!(checked(serial.clone(), parallel(serial.clone(), false), false), serial);
+        assert_eq!(checked(serial.clone(), parallel(serial.clone(), true), false), serial);
+        assert_eq!(checked(serial.clone(), parallel(other_root.clone(), false), false), serial);
+        assert_eq!(
+            checked(serial.clone(), parallel((key(7, 1), other_updates), false), false),
+            serial
+        );
+        assert_eq!(checked(serial.clone(), parallel(other_root, true), false), serial);
     });
-    let counted = snapshotter.snapshot().into_vec().into_iter().find_map(|(k, _, _, value)| {
-        (k.key().name() == "tn_reth.parallel_state_root_mismatches_total").then_some(value)
-    });
-    assert!(matches!(counted, Some(DebugValue::Counter(2))), "counted: {counted:?}");
+    let snapshot = snapshotter.snapshot().into_vec();
+    let counted = |name: &str, reason: Option<&str>| {
+        snapshot.iter().find_map(|(k, _, _, value)| {
+            let labels_match = k.key().labels().any(|l| Some(l.value()) == reason)
+                || (reason.is_none() && k.key().labels().next().is_none());
+            (k.key().name() == name && labels_match).then_some(value)
+        })
+    };
+    let mismatches = counted("tn_reth.parallel_state_root_mismatches_total", None);
+    assert!(matches!(mismatches, Some(DebugValue::Counter(3))), "counted: {mismatches:?}");
+    let split = counted("tn_reth.account_walk_fallbacks_total", Some("mismatch"));
+    assert!(matches!(split, Some(DebugValue::Counter(1))), "split mismatches: {split:?}");
 }
 
 /// In shadow mode a difference panics.
 #[test]
 #[should_panic(expected = "differs from the serial root")]
 fn shadow_difference_panics() {
-    checked((key(7, 1), TrieUpdates::default()), (key(7, 2), TrieUpdates::default()), true);
+    checked(
+        (key(7, 1), TrieUpdates::default()),
+        parallel((key(7, 2), TrieUpdates::default()), false),
+        true,
+    );
 }

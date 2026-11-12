@@ -30,6 +30,20 @@
 //! moved tip, below) or panics leaves its account to the walk, which computes it serially: the
 //! failures are logged once a block and change no result.
 //!
+//! # The account walk
+//!
+//! A block with at least `SPLIT_MIN_ACCOUNTS` changed accounts also splits the account walk by
+//! the first nibble of the hashed address (`account_split.rs`): sixteen subtrie walks, claimed in
+//! order by the calling thread and up to [`SUBTRIE_HELPERS`] pool jobs (each on its own read-only
+//! transaction, with the tip check below), take the storage roots from the tasks above, and the
+//! calling thread composes the root branch and the union of their trie updates. A shape the split
+//! does not compose (a small trie, a root that is not a branch) runs the walk on the calling thread
+//! as before, counted in `tn_reth.account_walk_fallbacks_total`. A block with no storage-root
+//! targets but a split walk takes this path too. Measured on the exec bench (storage v2, against
+//! the walk on one thread with the storage-root tasks): the root fell from 311 to 198 ms an output
+//! at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to 322 and from 113 to
+//! 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the split off on its own.
+//!
 //! # Why the tasks' transactions see the walk's state
 //!
 //! The walk and the tasks read separate transactions, so they see the same database only if
@@ -52,32 +66,42 @@
 //! # Checks
 //!
 //! A wrong root forks the chain, and TN builds its own blocks: no payload's root checks this one.
-//! In production one block in [`CHECK_ONE_BLOCK_IN`] (of those with storage-root tasks) also
-//! computes the root serially and compares the roots and the trie updates; on a difference it
-//! logs both roots, counts it (`tn_reth.parallel_state_root_mismatches_total`) and uses the serial
-//! result. With `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit
-//! tests) every such block is compared and a difference panics.
+//! In production one block in [`CHECK_ONE_BLOCK_IN`] (of those with parallel work: storage-root
+//! tasks or a split account walk) also computes the root serially and compares the roots and the
+//! trie updates; on a difference it logs both roots and whether the split composed the block's,
+//! counts it (`tn_reth.parallel_state_root_mismatches_total`, and a split's also in
+//! `tn_reth.account_walk_fallbacks_total` as `mismatch`) and uses the serial result. With
+//! `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every such
+//! block is compared and a difference panics: the shadow runs of the exec bench compare every
+//! block, split ones included.
 //!
 //! # Off switch
 //!
 //! `TN_PARALLEL_STATE_ROOT=0` computes every root serially, as before; unset or `1` uses the tasks.
 //! Any other value is logged as an error and also turns them off (the serial root is the
-//! reference). It is read once, at the first block. An environment variable rather than a
-//! constant, so an operator can turn the tasks off without a new release, and rather than a
-//! config field or CLI flag, which would carry a setting with no use once the code has proven
-//! itself; TN reads deployment overrides from the environment elsewhere too (the swarm listener
-//! addresses).
+//! reference). It is read once, at the first block. `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
+//! storage-root tasks and runs the account walk on one thread (`account_split.rs`). An environment
+//! variable rather than a constant, so an operator can turn the tasks off without a new release,
+//! and rather than a config field or CLI flag, which would carry a setting with no use once the
+//! code has proven itself; TN reads deployment overrides from the environment elsewhere too (the
+//! swarm listener addresses).
 
-use super::{layered_factories, sorted_runs::SortedTrieRuns, OutputTrieOverlay};
-use crate::metrics::RETH_METRICS;
+use super::{
+    account_split::{AccountWalk, Subtries},
+    layered_factories,
+    sorted_runs::SortedTrieRuns,
+    OutputTrieOverlay,
+};
+use crate::metrics::{record_account_walk_fallback, AccountWalkFallback, RETH_METRICS};
 use parking_lot::{Condvar, Mutex};
 use reth_db::{tables, transaction::DbTx, DatabaseError};
 use reth_errors::ProviderError;
 use reth_provider::{DBProvider as _, DatabaseProviderFactory, ProviderResult};
 use reth_trie::{
     prefix_set::{PrefixSet, TriePrefixSets},
+    trie_cursor::{TrieCursor as _, TrieCursorFactory},
     updates::{StorageTrieUpdates, TrieUpdates},
-    HashedPostState, HashedPostStateSorted, StateRoot, StorageRoot, StorageRootSource,
+    HashedPostState, HashedPostStateSorted, Nibbles, StateRoot, StorageRoot, StorageRootSource,
 };
 use reth_trie_db::DatabaseStorageRoot as _;
 use std::{
@@ -102,22 +126,22 @@ pub(crate) const CHECK_ONE_BLOCK_IN: u64 = 256;
 /// The off switch (module docs).
 const PARALLEL_ENV: &str = "TN_PARALLEL_STATE_ROOT";
 
-/// How a block's root uses parallel storage roots.
+/// How a block's root uses parallel storage roots and how its account walk runs with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParallelRoots {
     /// Every root serial (the off switch).
     Off,
     /// Tasks, with a serial comparison on one block in [`CHECK_ONE_BLOCK_IN`] (production).
-    Sampled,
+    Sampled(AccountWalk),
     /// Tasks and a serial comparison on every block; a difference panics (test builds: tests and
     /// benches).
     #[cfg(any(test, feature = "test-utils"))]
-    Shadow,
+    Shadow(AccountWalk),
 }
 
 impl ParallelRoots {
-    /// The mode `TN_PARALLEL_STATE_ROOT` (and, in test builds, `TN_PARALLEL_STATE_ROOT_SHADOW`)
-    /// select, read once.
+    /// The mode `TN_PARALLEL_STATE_ROOT` and `TN_PARALLEL_ACCOUNT_WALK` (and, in test builds,
+    /// `TN_PARALLEL_STATE_ROOT_SHADOW`) select, read once.
     pub(crate) fn from_env() -> Self {
         static MODE: OnceLock<ParallelRoots> = OnceLock::new();
         *MODE.get_or_init(|| {
@@ -132,11 +156,12 @@ impl ParallelRoots {
                     return Self::Off;
                 }
             }
+            let walk = AccountWalk::from_env();
             #[cfg(any(test, feature = "test-utils"))]
             if shadow_from_env() {
-                return Self::Shadow;
+                return Self::Shadow(walk);
             }
-            Self::Sampled
+            Self::Sampled(walk)
         })
     }
 }
@@ -155,6 +180,10 @@ fn shadow_from_env() -> bool {
 
 /// Whether the next sampled block is compared: one in [`CHECK_ONE_BLOCK_IN`], the first included.
 fn next_block_is_checked() -> bool {
+    #[cfg(test)]
+    if CHECK_NEXT_SAMPLED_BLOCK.with(|c| c.replace(false)) {
+        return true;
+    }
     static BLOCKS: AtomicU64 = AtomicU64::new(0);
     BLOCKS.fetch_add(1, Ordering::Relaxed).is_multiple_of(CHECK_ONE_BLOCK_IN)
 }
@@ -176,29 +205,37 @@ impl OutputTrieOverlay {
     {
         let prefix_sets = current.construct_prefix_sets().freeze();
         let current = current.into_sorted();
-        let targets = storage_root_targets(&prefix_sets);
-        let shadow = match mode {
-            _ if targets.is_empty() => return self.serial_root(tx, &current, prefix_sets),
+        let (walk, shadow) = match mode {
             ParallelRoots::Off => return self.serial_root(tx, &current, prefix_sets),
-            ParallelRoots::Sampled if !next_block_is_checked() => {
-                return self.parallel_root(factory, tx, &current, prefix_sets, targets)
-            }
-            ParallelRoots::Sampled => false,
+            ParallelRoots::Sampled(walk) => (walk, false),
             #[cfg(any(test, feature = "test-utils"))]
-            ParallelRoots::Shadow => true,
+            ParallelRoots::Shadow(walk) => (walk, true),
         };
-        let parallel = self.parallel_root(factory, tx, &current, prefix_sets.clone(), targets)?;
+        let targets = storage_root_targets(&prefix_sets);
+        let split = walk.splits(&prefix_sets);
+        if targets.is_empty() && !split {
+            return self.serial_root(tx, &current, prefix_sets);
+        }
+        if !shadow && !next_block_is_checked() {
+            return Ok(self
+                .parallel_root(factory, tx, &current, prefix_sets, targets, split)?
+                .result);
+        }
+        let parallel =
+            self.parallel_root(factory, tx, &current, prefix_sets.clone(), targets, split)?;
         let serial = self.serial_root(tx, &current, prefix_sets)?;
         Ok(checked(serial, parallel, shadow))
     }
 
-    /// [`Self::block_root_with_updates`] with the tasks and no comparison.
+    /// [`Self::block_root_with_updates`] with the tasks, the account walk as `walk` says, and no
+    /// comparison.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn layered_root_with_updates_parallel<F, TX>(
         &self,
         factory: &F,
         tx: &TX,
         current: HashedPostState,
+        walk: AccountWalk,
     ) -> ProviderResult<(B256, TrieUpdates)>
     where
         F: DatabaseProviderFactory,
@@ -207,13 +244,15 @@ impl OutputTrieOverlay {
         let prefix_sets = current.construct_prefix_sets().freeze();
         let current = current.into_sorted();
         let targets = storage_root_targets(&prefix_sets);
-        if targets.is_empty() {
+        let split = walk.splits(&prefix_sets);
+        if targets.is_empty() && !split {
             return self.serial_root(tx, &current, prefix_sets);
         }
-        self.parallel_root(factory, tx, &current, prefix_sets, targets)
+        Ok(self.parallel_root(factory, tx, &current, prefix_sets, targets, split)?.result)
     }
 
-    /// The account walk on this thread over `tx`, with one storage-root task per target on rayon's
+    /// The account walk over `tx`, split by first nibble when `split` says so (on this thread and
+    /// pool jobs) and otherwise on this thread, with one storage-root task per target on rayon's
     /// global pool.
     fn parallel_root<F, TX>(
         &self,
@@ -222,31 +261,111 @@ impl OutputTrieOverlay {
         current: &HashedPostStateSorted,
         prefix_sets: TriePrefixSets,
         targets: Vec<(B256, PrefixSet)>,
-    ) -> ProviderResult<(B256, TrieUpdates)>
+        split: bool,
+    ) -> ProviderResult<ParallelRoot>
     where
         F: DatabaseProviderFactory,
         TX: DbTx,
     {
         let walk_tip = snapshot_tip(tx)?;
         let tasks = Arc::new(StorageRootTasks::new(targets));
+        let source = Arc::clone(&tasks) as Arc<dyn StorageRootSource>;
         let runs = &self.runs;
-        let root = rayon::in_place_scope(|scope| {
+        let (trie, hashed) = layered_factories(tx, runs, current);
+        let stored_root_node = split && has_stored_root_node(&trie)?;
+        if stored_root_node {
+            record_account_walk_fallback(AccountWalkFallback::StoredRootNode);
+        }
+        let subtries = (split && !stored_root_node).then(|| Subtries::new(&prefix_sets));
+        let root = rayon::in_place_scope(|scope| -> ProviderResult<ParallelRoot> {
             let shared = &*tasks;
             for slot in &shared.slots {
                 scope.spawn(move |_| {
                     shared.run(slot, || storage_root_task(factory, walk_tip, runs, current, slot))
                 });
             }
-            let (trie, hashed) = layered_factories(tx, runs, current);
-            let root = StateRoot::new(trie, hashed)
-                .with_prefix_sets(prefix_sets)
-                .with_storage_roots(Arc::clone(&tasks) as Arc<dyn StorageRootSource>)
-                .root_with_updates();
+            let mut composed = None;
+            if let Some(subtries) = &subtries {
+                let source = &source;
+                for _ in 0..rayon::current_num_threads().min(SUBTRIE_HELPERS) {
+                    scope.spawn(move |_| {
+                        subtrie_helper(factory, walk_tip, runs, current, subtries, source, shared)
+                    });
+                }
+                subtries.work(&trie, &hashed, source, &|error| shared.record_failure(error));
+                composed =
+                    subtries.finish(&trie, &hashed, source).map_err(TaskError::into_provider)?;
+            }
+            let root = match composed {
+                Some(result) => ParallelRoot { result, composed: true },
+                None => {
+                    if subtries.is_some() {
+                        record_account_walk_fallback(AccountWalkFallback::Shape);
+                    }
+                    let result = StateRoot::new(&trie, &hashed)
+                        .with_prefix_sets(prefix_sets)
+                        .with_storage_roots(Arc::clone(&source))
+                        .root_with_updates()?;
+                    ParallelRoot { result, composed: false }
+                }
+            };
             shared.claim_unstarted();
-            root
+            Ok(root)
         });
         tasks.log_failures();
-        Ok(root?)
+        root
+    }
+}
+
+/// A block's root and trie updates from [`OutputTrieOverlay::parallel_root`].
+#[derive(Debug)]
+struct ParallelRoot {
+    /// The root and trie updates.
+    result: (B256, TrieUpdates),
+    /// Whether the split account walk composed them (otherwise the walk ran on one thread).
+    composed: bool,
+}
+
+/// Pool jobs offered to the account walk's subtries besides the calling thread: one per nibble but
+/// the one the calling thread takes first.
+const SUBTRIE_HELPERS: usize = 15;
+
+/// Whether the account trie holds a node at the empty path. Reth never writes one (its trie
+/// updates drop the root path); a walk that found one would skip unchanged nibbles by its hashes,
+/// which the split does not reproduce.
+fn has_stored_root_node<T: TrieCursorFactory>(trie: &T) -> Result<bool, DatabaseError> {
+    Ok(trie.account_trie_cursor()?.seek_exact(Nibbles::default())?.is_some())
+}
+
+/// A pool job working the account walk's subtries on its own read-only transaction, unless the
+/// calling thread has already claimed them all. A failure leaves its subtries to the calling
+/// thread.
+fn subtrie_helper<F: DatabaseProviderFactory>(
+    factory: &F,
+    walk_tip: Option<BlockNumber>,
+    runs: &SortedTrieRuns,
+    current: &HashedPostStateSorted,
+    subtries: &Subtries,
+    source: &Arc<dyn StorageRootSource>,
+    tasks: &StorageRootTasks,
+) {
+    if subtries.all_claimed() {
+        return;
+    }
+    let helper = || -> Result<(), TaskError> {
+        let provider = factory.database_provider_ro()?;
+        let tx = provider.tx_ref();
+        let task_tip = snapshot_tip(tx)?;
+        if task_tip != walk_tip {
+            return Err(TaskError::TipMoved { walk: walk_tip, task: task_tip });
+        }
+        let (trie, hashed) = layered_factories(tx, runs, current);
+        subtries.work(&trie, &hashed, source, &|error| tasks.record_failure(error));
+        Ok(())
+    };
+    let result = catch_unwind(AssertUnwindSafe(helper)).unwrap_or(Err(TaskError::Panicked));
+    if let Err(error) = result {
+        tasks.record_failure(error);
     }
 }
 
@@ -296,9 +415,9 @@ fn storage_root_task<F: DatabaseProviderFactory>(
         .map_err(DatabaseError::from)?)
 }
 
-/// Why a storage-root task left its account to the walk.
+/// Why a storage-root or subtrie task left its work to the walk.
 #[derive(Debug, thiserror::Error)]
-enum TaskError {
+pub(super) enum TaskError {
     /// Opening the task's transaction failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -316,6 +435,18 @@ enum TaskError {
     /// The task panicked.
     #[error("the task panicked")]
     Panicked,
+}
+
+impl TaskError {
+    /// The error of a computation on the walk's own transaction (a database read: the walk's
+    /// threads never see the other variants).
+    fn into_provider(self) -> ProviderError {
+        match self {
+            Self::Provider(error) => error,
+            Self::Database(error) => error.into(),
+            other => ProviderError::Database(DatabaseError::Other(other.to_string())),
+        }
+    }
 }
 
 /// Where one storage-root task stands.
@@ -383,15 +514,16 @@ impl StorageRootTasks {
             *state = TaskState::Running;
         }
         let result = catch_unwind(AssertUnwindSafe(task)).unwrap_or(Err(TaskError::Panicked));
-        let root = result
-            .map_err(|error| {
-                let mut failures = self.failures.lock();
-                failures.0 += 1;
-                failures.1.get_or_insert(error);
-            })
-            .ok();
+        let root = result.map_err(|error| self.record_failure(error)).ok();
         *slot.state.lock() = TaskState::Done(root);
         slot.finished.notify_all();
+    }
+
+    /// Count a failed task, keeping the first failure for the log.
+    fn record_failure(&self, error: TaskError) {
+        let mut failures = self.failures.lock();
+        failures.0 += 1;
+        failures.1.get_or_insert(error);
     }
 
     /// Mark the tasks that have not started as claimed, so they return at once (the walk is done).
@@ -410,9 +542,9 @@ impl StorageRootTasks {
         if let Some(error) = first {
             let tasks = self.slots.len();
             if matches!(error, TaskError::TipMoved { .. }) {
-                error!(target: "engine", %error, count, tasks, "storage-root tasks saw another database tip than the block's root; computed serially");
+                error!(target: "engine", %error, count, tasks, "root tasks saw another database tip than the block's root; computed serially");
             } else {
-                warn!(target: "engine", %error, count, tasks, "storage-root tasks failed; computed serially");
+                warn!(target: "engine", %error, count, tasks, "root tasks failed; computed serially");
             }
         }
     }
@@ -443,12 +575,13 @@ impl StorageRootSource for StorageRootTasks {
 }
 
 /// A compared block's result: the serial one. On a difference, panic in shadow mode; otherwise
-/// log both roots and count it.
+/// log both roots and count it, a split walk's also as an account-walk fallback.
 fn checked(
     serial: (B256, TrieUpdates),
-    parallel: (B256, TrieUpdates),
+    parallel: ParallelRoot,
     shadow: bool,
 ) -> (B256, TrieUpdates) {
+    let ParallelRoot { result: parallel, composed: split } = parallel;
     if serial == parallel {
         return serial;
     }
@@ -457,11 +590,14 @@ fn checked(
     if shadow {
         panic!(
             "parallel state root {parallel_root} differs from the serial root {serial_root} \
-             (trie updates equal: {updates_equal})"
+             (trie updates equal: {updates_equal}, split walk: {split})"
         );
     }
-    error!(target: "engine", %serial_root, %parallel_root, updates_equal, "parallel state root differs from the serial one; the block uses the serial result");
+    error!(target: "engine", %serial_root, %parallel_root, updates_equal, split, "parallel state root differs from the serial one; the block uses the serial result");
     RETH_METRICS.parallel_state_root_mismatches_total.increment(1);
+    if split {
+        record_account_walk_fallback(AccountWalkFallback::Mismatch);
+    }
     serial
 }
 
@@ -469,6 +605,9 @@ fn checked(
 thread_local! {
     /// Task results the walks on this thread took (tests check the tasks ran).
     static TASK_ROOTS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Set by a test to make this thread's next sampled block a compared one.
+    pub(super) static CHECK_NEXT_SAMPLED_BLOCK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
