@@ -6,6 +6,7 @@ use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
+pub use ledger::ReportedBatchLedger;
 pub use message::{WorkerRequest, WorkerResponse};
 use std::{collections::BTreeSet, future::Future, io::ErrorKind, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
@@ -30,6 +31,7 @@ use tracing::{debug, warn};
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
+pub(crate) mod ledger;
 pub(crate) mod message;
 pub(crate) mod primary;
 pub(crate) mod stream_codec;
@@ -278,7 +280,8 @@ impl SyncServeOutcome {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::BatchEpochMismatch(..) => Self::Failed,
+            | WorkerNetworkError::BatchEpochMismatch(..)
+            | WorkerNetworkError::ReporterOverQuota { .. } => Self::Failed,
         }
     }
 }
@@ -1109,6 +1112,9 @@ where
     Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
 {
     /// Create a new instance of Self.
+    ///
+    /// `reported_batches` is the ledger of uncommitted stored batches per committee key (issue
+    /// #1794). The node shares one ledger with all of its workers.
     pub fn new(
         network_events: Events,
         network_handle: WorkerNetworkHandle,
@@ -1116,13 +1122,19 @@ where
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
         consensus_chain: ConsensusChain,
+        reported_batches: ReportedBatchLedger,
     ) -> Self {
         // committee peers (this epoch's and the next) admit through the reserves
         let committee = consensus_config.committee().bls_keys();
         let next_committee = consensus_config.next_committee_keys().iter().copied();
         let reserved_peers = ReservedPeers::new(committee.into_iter().chain(next_committee));
-        let request_handler =
-            RequestHandler::new(id, validator, consensus_config, network_handle.clone());
+        let request_handler = RequestHandler::new(
+            id,
+            validator,
+            consensus_config,
+            network_handle.clone(),
+            reported_batches,
+        );
         Self {
             network_events,
             network_handle,
@@ -1308,7 +1320,7 @@ where
             // The batch fetch can take longer than the about 12 s gossipsub validation window,
             // so the worker accepts at delivery (#1772). Batch gossip forwards as before.
             validation.accept().await;
-            if let Err(e) = request_handler.process_gossip(&msg).await {
+            if let Err(e) = request_handler.process_gossip(&msg, author.as_ref()).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
                 // Charge the accountable peer, and only once its BLS identity has resolved: the
                 // author for a content-determined fault (#819, guaranteed resolved on the
