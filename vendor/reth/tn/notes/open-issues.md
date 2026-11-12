@@ -3,9 +3,41 @@
 The PR that brought `vendor/reth` onto `main` fixed what its reviews found that was small and
 safe to change before the testnet upgrade. The items below are known and deliberately left for
 their own changes, because each is too large for that PR or needs other owners. None of them lets
-two validators execute a block differently.
+two validators on the same release execute a block differently. The first one is fixed now
+(TN-0140); the fix changes the state root of any block where the old code was wrong, so it ships
+with a coordinated upgrade.
 
 Upstream fixes that are simply not applied yet are tracked in `upstream-backports.md`, not here.
+
+## The incremental state root can skip a changed subtree (upstream 8572c88fe) [fixed: TN-0140]
+
+Applied as TN-0140 with the storage-v2 work. Mainnet takes it at genesis; a chain an older binary
+built (adiri) is replayed with the fix and its block hashes compared before the fix is deployed
+there (CHANGES.md TN-0140). The analysis below is from before the fix.
+
+`TrieNodeIter` (`vendor/reth/crates/trie/trie/src/node_iter.rs`, the `can_skip_node` seek check)
+skips re-hashing a stored branch when the walker's key merely *starts with* the seek prefix. When
+the stored key is deeper than the prefix, hashed entries between the two are never visited: a leaf
+inserted there (upstream's test inserts storage slot `0x1000..` beside stored branches under
+`0x10a0..`) is left out of the root. Upstream fixed it on 2026-11-03 by skipping only at the exact
+prefix. The line is the same in reth v1.11.3, which `main` builds, and in this copy.
+
+TN computes every block's root this way: `OutputTrieOverlay::layered_root_with_updates`
+(`crates/tn-reth/src/env/output_overlay.rs`) runs `StateRoot` over stored trie nodes with prefix
+sets from the block's own changes. Upstream's test fails on this copy (incremental root `0x52fe…`,
+rebuilt root `0x6b94…`) and passes with the one-line fix.
+
+- Fork risk today: none between nodes on the same release. The skip is deterministic, so every
+  node that built its trie by executing the same blocks computes the same root, right or wrong. A
+  node whose trie was rebuilt from scratch (snapshot import, `crates/tn-reth/src/snapshot.rs`)
+  hard-fails at import if the chain's root ever went wrong, instead of forking.
+- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary.
+  So the fix is a coordinated upgrade, never a rolling one, and it is not applied here.
+- Has the testnet hit it? Unknown. A snapshot export from a testnet node and an import elsewhere
+  answers it: the import rebuilds the trie from scratch and compares with the header's root. A
+  replay of the testnet from genesis on a fixed binary answers it too, and names the first block.
+- Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
+  history already contains such a block), after `graph.py` and `make test-upgrade`.
 
 ## The pool re-admits a nonce from a batch that reached quorum (review finding T2-1)
 
@@ -33,36 +65,22 @@ unpaid tip. Skipped copies add nothing to `gas_used`, so the base fee does not r
   `retry_forwarded` (`txn_pool.rs`), and a quorum batch whose header never commits. A canonical
   update for an earlier block that touches the sender also lowers the tracked nonce again
   (`txpool.rs`), so a complete fix makes that update monotonic. Needs the batch-builder owners.
-
-## RPC work shares the blocking pool with execution and consensus
-
-reth's RPC and TN's execution engine and certificate validation all run on tokio's one blocking
-pool (512 threads by default). Semaphores bound most RPC work: upstream's for `eth_call`,
-`eth_callMany`, `eth_simulateV1`, `eth_getLogs` and `eth_getProof` (TN-0019, TN-0035), and TN's for
-`eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`, `eth_callBundle` (TN-0037,
-`crates/tn-reth/src/rpc_call.rs`) and `debug_trace*` (TN-0036). Two gaps remain:
-
-- `trace_*` and `debug_executionWitness*` release their permit when the client disconnects while
-  the blocking work runs on, as upstream does. Both namespaces are opt-in, and the work is bounded
-  by block gas. The fix is TN-0036's pattern: take the permit in the public method and move it
-  into the blocking closure.
-- Long synchronous jobs (a large `eth_call`) run to completion after the client leaves. Upstream
-  13a59de4b and 621f663ed stop them; they need `CancelOnDrop` moved into reth-tasks first
-  (`upstream-backports.md`, Medium).
-
-The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_manager.rs`) its own
-runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method
-does.
-
-## CORS on shifted workers' HTTP servers
-
-With HTTP and WebSocket on one port, reth's worker-0 server applies `ws_cors.or(http_cors)` to both
-transports (`vendor/reth/crates/rpc/rpc-builder/src/lib.rs`, the shared-port arm). Workers above 0
-get separate servers on shifted ports, and `worker_rpc_server_args`
-(`crates/tn-reth/src/env/rpc.rs`) carries `--http.corsdomain` to their WebSocket server, but not
-`--ws.origins` to their HTTP server. So with only `--ws.origins` set, worker 0's HTTP server sends
-CORS headers and the other workers' do not. That fails closed (browsers are refused), so it is
-not a security issue; the fix is to mirror the carry into `http_corsdomain`.
+- Design notes from the 2026-11-08 review, for the TN half (`tasks/t2-1-plan.md`):
+  - R11, the RPC-visible symptom: with two of a sender's batches in flight (nonces k and k+1
+    certified, tracked nonce k+2), the canonical update for the first batch overwrites the
+    tracked nonce to k+1; `get_highest_consecutive_transaction_by_sender` then stops at the gap
+    and `eth_getTransactionCount(pending)` falls back to the on-chain k+1 until the second batch
+    executes. A wallet that signs k+1 again in that round produces a duplicate the pool admits
+    and execution skips for free, the T2-1 mechanism. The floor/clamp design (tracked nonce
+    monotonic while a quorum batch is unexecuted) covers it; a narrower stop-gap in TN's wrapper
+    iterates from the pool's lowest nonce for the sender when it is above the tracked one.
+  - With `enforce_tracked_nonce` on, a sender whose only transactions were orphaned keeps an
+    advanced tracked nonce that `unique_senders()` cannot surface, so the epoch-start reload
+    misses it and the orphan repool is refused with `NonceNotConsistent` and the batch deleted
+    from the cache; the pool needs a `sender_info` accessor or reset entry point (the observer
+    requeue has the same gap).
+  - `keep_sender_info` makes `sender_info` insert-only, one entry per sender ever admitted (the
+    growth class of `SenderIdentifiers`); prune on floor release.
 
 ## Storage v2 corner cases with no TN caller, or a halt behind them
 
@@ -112,21 +130,13 @@ Phase 3; tn-lmdb is the default backend since 2026-11-09, DECISIONS.md D22).
 
 ## The revm-inspectors patch
 
-`patches/revm-inspectors` lowers Boa's recursion limit in the revm-inspectors version TN's revm
-needs (0.34.3). It retires when TN's reth moves to a revm-inspectors release that has upstream's
-fix (0.44.2 or later). `patches/revm-inspectors/PATCH.md` has the
+`patches/revm-inspectors` carries two changes to the revm-inspectors version TN's revm needs
+(0.34.3): Boa's recursion limit, which retires when TN's reth moves to a release with upstream's
+fix (0.44.2 or later), and the cap on recorded trace steps (TN-0079), which upstream lacks as of
+0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
+resolves the registry crate instead of the patch (TN-0085, review R30), and the nested test lane
+now really builds against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
 details.
-
-## reth's test-only dependencies are not pinned
-
-`tn/cargo.sh` seeds the nested lockfile from TN's on each run, and cargo resolves the packages only
-reth's tests need (about 75) against crates.io at that moment. TN's shipped code is unaffected,
-but the `test-vendor-reth` lane is not reproducible from a commit, and a bad release of one of
-those packages can fail it for every queued PR. `cargo.sh` limits them to versions that support
-the workspace's `rust-version`, which removes the commonest break (a release that needs a newer
-rustc). The complete fix is a committed overlay lockfile for the nested workspace, run with
-`--locked`, plus a check that its shared packages match TN's lockfile. That reverses DECISIONS.md
-D7, so it is its own change.
 
 ## CI build time with the vendored crates
 
@@ -136,16 +146,10 @@ four ways. None of this has been timed on a GitHub runner. Before queueing the P
 `main-compiles.yaml` on the branch times the builds; caching the vendored crates would need
 sccache or a different cache layout.
 
-## Ledger coverage is checked by hand
+## The upstream survey is from 2026-11-06
 
-`vendor.py status` lists the files that differ from upstream, and CHANGES.md must account for
-each one, but no tool or CI job compares the two. A `vendor.py ledger` check (every changed file
-named by an entry, every `TN(TN-NNNN)` id defined) would make that mechanical.
-
-## The upstream survey is from 2026-10-30
-
-`upstream-backports.md` surveyed upstream `main` up to `84caec584`. Upstream has moved since; the
-next survey starts there (CLAUDE.md, "Tracking upstream reth").
+`upstream-backports.md` surveyed upstream `main` up to `44a74f9ea`. The next survey starts there
+(CLAUDE.md, "Tracking upstream reth").
 
 ## Branches that carry tndb-b [closed 2026-11-09]
 
@@ -153,5 +157,6 @@ The tndb-b work (renamed tn-lmdb on 2026-11-04) was written against an earlier c
 vendoring on another branch. `main`'s vendoring (#1768) was merged into it (f88cb29d6), not
 rebased, and `sls_storage_v2` builds on that merge. The merge re-added its workspace
 dependencies (`reth-db-api`, `reth-storage-errors`, `reth-trie-common`) to the root `Cargo.toml`,
-kept `patches/revm-inspectors` and the `--config` patch line in `tn/cargo.sh`, and took the union
-of both sides' CI lanes. tn-lmdb is the default reth backend there (DECISIONS.md D22).
+kept `patches/revm-inspectors` and the nested workspace's patch for it (since TN-0080 the
+`[patch.crates-io]` entry in `vendor/reth/.cargo/config.toml`), and took the union of both sides'
+CI lanes. tn-lmdb is the default reth backend there (DECISIONS.md D22).

@@ -5,6 +5,8 @@
 
 Decodes an RLP-encoded block, re-executes every transaction in it, and returns one trace per transaction. The block itself does not need to be in the node's database, but its parent does: the node starts from the parent's state, applies the block's pre-transaction system calls, and then traces the transactions in order. A block whose parent the node does not have fails with error `-32001` `block not found: hash <parent hash>`.
 
+The raw block is bounded like a [debug\_traceCallMany](debug_tracecallmany.md) request, since its header and transactions come from the caller: it may hold at most `--rpc.gascap` divided by 21,000 transactions (2,380 at the default cap of 50,000,000), and together they may use at most `--rpc.gascap` gas. A block with more transactions, or a transaction whose gas limit exceeds what is left of that budget, fails with error `-32602`. Blocks the node already has are traced without these bounds through [debug\_traceBlockByHash](debug_traceblockbyhash.md) or [debug\_traceBlockByNumber](debug_traceblockbynumber.md).
+
 Tracing the genesis block (`0x0`) fails with error `-32001` `block not found: hash 0x0000000000000000000000000000000000000000000000000000000000000000`: the tracer looks up the genesis block's parent, whose hash is zero. `trace_block` returns `[]` for genesis instead.
 
 Traces cover the block's transactions only. The system calls a block runs before its transactions (EIP-4788 beacon root, EIP-2935 block hashes) and the epoch-closing system calls (`applyIncentives` and `concludeEpoch`) are not transactions, so no tracer shows them.

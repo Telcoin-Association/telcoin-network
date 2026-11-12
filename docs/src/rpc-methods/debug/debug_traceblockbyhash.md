@@ -5,13 +5,13 @@
 
 Re-executes every transaction of a block the node holds, identified by hash, and returns one trace per transaction. It behaves as [debug\_traceBlockByNumber](debug_traceblockbynumber.md) does.
 
-Tracing the genesis block (`0x0`) fails with error `-32001` `block not found: hash 0x0000000000000000000000000000000000000000000000000000000000000000`: the tracer looks up the genesis block's parent, whose hash is zero. `trace_block` returns `[]` for genesis instead.
+Tracing the genesis block (`0x0`) fails with error `-32000` `genesis is not traceable`: tracing replays a block on its parent's state, and genesis has no parent. `trace_block` returns `[]` for genesis instead.
 
 Traces cover the block's transactions only. The system calls a block runs before its transactions (EIP-4788 beacon root, EIP-2935 block hashes) and the epoch-closing system calls (`applyIncentives` and `concludeEpoch`) are not transactions, so no tracer shows them.
 
 #### Parameters
 
-`DATA`, 32 Bytes - The block hash. A block the node does not have fails with error `-32001` and the message `block not found: hash 0x…`.
+`DATA`, 32 Bytes - The block hash. A block the node does not have fails with error `-32000` and the message `block 0x… not found`.
 
 `Object` - (optional) The tracing options, as for [debug\_traceTransaction](debug_tracetransaction.md#parameters): `tracer`, `tracerConfig`, and the struct logger fields `enableMemory`, `disableStack`, `disableStorage` and `enableReturnData`. When omitted, the struct logger runs with its defaults.
 

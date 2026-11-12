@@ -11,34 +11,27 @@
 # dependencies. This is for reth's unit and integration tests, whose dev-dependencies only
 # resolve inside the nested workspace.
 #
-# The nested lockfile is seeded from TN's Cargo.lock on every run (it is git-ignored), so the
-# dependencies the two workspaces share resolve to the versions TN ships; cargo adds what only
-# reth's tests need. Output goes to target/vendor-reth so the two workspaces' feature sets do
-# not evict each other's artifacts.
+# The nested lockfile is seeded on every run (it is git-ignored): TN's Cargo.lock, so the
+# dependencies the two workspaces share resolve to the versions TN ships, plus tn/test-only.lock,
+# which pins the packages only reth's tests need (tn/lockfile.py). Output goes to
+# target/vendor-reth so the two workspaces' feature sets do not evict each other's artifacts.
 #
-# TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested manifest does
-# not, so the same patch is passed with --config, and reth's tests run against the code TN ships.
+# TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested workspace
+# carries the same patch in .cargo/config.toml (TN-0080), which also reaches the cargo that
+# cargo-nextest runs, so reth's tests run against the code TN ships.
 #
-# The packages cargo adds are resolved against crates.io when this runs, so a new release of one
-# of reth's test-only dependencies reaches CI unreviewed. `incompatible-rust-versions = fallback`
-# keeps those additions to versions that support the nested workspace's `rust-version`, so a
-# release that needs a newer rustc than TN's pin cannot break the lane. The resolution is still
-# not pinned (vendor/reth/tn/notes/open-issues.md).
+# A package neither file pins is resolved against crates.io when this runs;
+# `tn/lockfile.py check`, which the test-vendor-reth lane runs, fails on one.
+# `incompatible-rust-versions = fallback` keeps such additions (and `lockfile.py update`) to
+# versions that support the nested workspace's `rust-version`.
 
 set -euo pipefail
 
 VENDOR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$VENDOR/../.." && pwd)"
 
-cp "$ROOT/Cargo.lock" "$VENDOR/Cargo.lock"
+# tn/lockfile.py sets TN_LOCKFILE_SEEDED when it has written the lockfile itself.
+[[ "${TN_LOCKFILE_SEEDED:-}" == 1 ]] || python3 -I -B "$VENDOR/tn/lockfile.py" seed
 cd "$VENDOR"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/vendor-reth"
-config=(--config "patch.crates-io.revm-inspectors.path=\"$ROOT/patches/revm-inspectors\""
-    --config 'resolver.incompatible-rust-versions="fallback"')
-# a +toolchain argument has to stay first
-if [[ "${1:-}" == +* ]]; then
-    toolchain=$1
-    shift
-    exec cargo "$toolchain" "${config[@]}" "$@"
-fi
-exec cargo "${config[@]}" "$@"
+exec cargo "$@"

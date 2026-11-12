@@ -33,6 +33,9 @@ use tokio::{
 };
 use tracing::debug;
 
+// TN(TN-0049): upstream 621f663ed moves `CancelOnDrop` here from reth-revm, and 13a59de4b adds
+// `is_cancelled`. TN adds the module and leaves reth-revm's copy in place.
+pub mod cancel;
 pub mod metrics;
 pub mod runtime;
 pub mod shutdown;
@@ -40,6 +43,7 @@ pub mod shutdown;
 #[cfg(feature = "rayon")]
 pub mod pool;
 
+pub use cancel::{CancelOnDrop, ManualCancel};
 #[cfg(feature = "rayon")]
 pub use runtime::RayonConfig;
 pub use runtime::{Runtime, RuntimeBuildError, RuntimeBuilder, RuntimeConfig, TokioConfig};

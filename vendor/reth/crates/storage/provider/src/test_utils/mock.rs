@@ -701,9 +701,14 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Send + Sync + 'static> BlockRe
 
     fn recovered_block_range(
         &self,
-        _range: RangeInclusive<BlockNumber>,
+        range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
-        Ok(vec![])
+        // TN(TN-0038): the stored blocks, recovered as `recovered_block` does, so a `trace_filter`
+        // test has blocks to trace.
+        self.block_range(range)?
+            .into_iter()
+            .map(|block| block.try_into_recovered().map_err(ProviderError::other))
+            .collect()
     }
 
     fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {

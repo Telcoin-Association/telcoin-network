@@ -151,28 +151,38 @@ where
                 // database. Since `factory.block_hash` will only query the static files, we need to
                 // make sure that our database has been written to, and throw error if it's empty.
                 if factory.get_stage_checkpoint(StageId::Headers)?.is_none() {
-                    error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
-                    return Err(InitStorageError::UninitializedDatabase)
-                }
+                    // TN(TN-0083): the commit below finalizes the static files before the MDBX
+                    // transaction, so a first launch that crashed between the two leaves the
+                    // genesis header in static files and nothing in the database, and every
+                    // restart failed here until the operator deleted the datadir (review R17).
+                    // With no stage checkpoint at all the database is empty, so the launch
+                    // resumes: `insert_genesis_header` keeps the header already there.
+                    if database_is_empty(factory)? {
+                        warn!(target: "reth::storage", "Genesis header found on static files with an empty database; resuming an interrupted first launch.");
+                    } else {
+                        error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
+                        return Err(InitStorageError::UninitializedDatabase)
+                    }
+                } else {
+                    let stored = factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
+                    if stored != genesis_storage_settings {
+                        warn!(
+                            target: "reth::storage",
+                            ?stored,
+                            requested = ?genesis_storage_settings,
+                            "Storage settings mismatch detected"
+                        );
+                    }
 
-                let stored = factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
-                if stored != genesis_storage_settings {
-                    warn!(
-                        target: "reth::storage",
-                        ?stored,
-                        requested = ?genesis_storage_settings,
-                        "Storage settings mismatch detected"
-                    );
+                    debug!("Genesis already written, skipping.");
+                    return Ok(hash)
                 }
-
-                debug!("Genesis already written, skipping.");
-                return Ok(hash)
+            } else {
+                return Err(InitStorageError::GenesisHashMismatch {
+                    chainspec_hash: hash,
+                    storage_hash: block_hash,
+                })
             }
-
-            return Err(InitStorageError::GenesisHashMismatch {
-                chainspec_hash: hash,
-                storage_hash: block_hash,
-            })
         }
         Err(e) => {
             debug!(?e);
@@ -270,6 +280,17 @@ where
     provider_rw.commit()?;
 
     Ok(hash)
+}
+
+/// TN(TN-0083): whether no stage has a checkpoint, i.e. no genesis write ever committed to the
+/// database.
+fn database_is_empty<PF: StageCheckpointReader>(factory: &PF) -> Result<bool, InitStorageError> {
+    for stage in StageId::ALL {
+        if factory.get_stage_checkpoint(stage)?.is_some() {
+            return Ok(false)
+        }
+    }
+    Ok(true)
 }
 
 /// Inserts the genesis state into the database.
@@ -709,6 +730,43 @@ mod tests {
 
         // actual, expected
         assert_eq!(genesis_hash, HOLESKY_GENESIS_HASH);
+    }
+
+    /// TN(TN-0083): a first launch that committed the genesis header to static files but not
+    /// to the database resumes instead of failing on every restart.
+    #[test]
+    fn init_genesis_resumes_after_a_torn_first_launch() {
+        let factory = create_test_provider_factory_with_chain_spec(SEPOLIA.clone());
+        {
+            let provider_rw = factory.database_provider_rw().unwrap();
+            insert_genesis_header(&provider_rw, &factory.chain_spec()).unwrap();
+            provider_rw.static_file_provider().commit().unwrap();
+            // the MDBX transaction is dropped uncommitted: the crash between the two commits
+        }
+        assert_eq!(factory.block_hash(0).unwrap(), Some(SEPOLIA_GENESIS_HASH));
+        assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_none());
+
+        assert_eq!(init_genesis(&factory).unwrap(), SEPOLIA_GENESIS_HASH);
+        assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_some());
+        assert_eq!(factory.block_hash(0).unwrap(), Some(SEPOLIA_GENESIS_HASH));
+        // the next start is the ordinary "already written" path
+        assert_eq!(init_genesis(&factory).unwrap(), SEPOLIA_GENESIS_HASH);
+    }
+
+    /// TN(TN-0083): a database that holds any checkpoint without the Headers one is still
+    /// refused; only an empty database is a torn first launch.
+    #[test]
+    fn init_genesis_refuses_a_partly_written_database() {
+        let factory = create_test_provider_factory_with_chain_spec(SEPOLIA.clone());
+        let provider_rw = factory.database_provider_rw().unwrap();
+        insert_genesis_header(&provider_rw, &factory.chain_spec()).unwrap();
+        provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0)).unwrap();
+        provider_rw.commit().unwrap();
+
+        assert!(matches!(
+            init_genesis(&factory).unwrap_err(),
+            InitStorageError::UninitializedDatabase
+        ));
     }
 
     #[test]

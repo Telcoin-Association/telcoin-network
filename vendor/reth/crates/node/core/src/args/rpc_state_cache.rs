@@ -1,8 +1,13 @@
-use clap::Args;
+use clap::{builder::RangedU64ValueParser, Args};
 use reth_rpc_server_types::constants::cache::{
     DEFAULT_BLOCK_CACHE_MAX_LEN, DEFAULT_CONCURRENT_DB_REQUESTS, DEFAULT_HEADER_CACHE_MAX_LEN,
     DEFAULT_MAX_CACHED_TX_HASHES, DEFAULT_RECEIPT_CACHE_MAX_LEN,
 };
+
+/// TN(TN-0061): the most permits a tokio semaphore holds (`Semaphore::MAX_PERMITS`, spelled
+/// out because this crate's tokio has no `sync` feature); a larger count panics while the RPC
+/// server is built.
+const MAX_PERMITS: u64 = (usize::MAX >> 3) as u64;
 
 /// Parameters to configure RPC state cache.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -31,8 +36,12 @@ pub struct RpcStateCacheArgs {
     pub max_headers: u32,
 
     /// Max number of concurrent database requests.
+    ///
+    /// TN(TN-0061): at least 1 (with none, every cache miss waits forever) and at most what a
+    /// tokio semaphore holds (more panics while the RPC server is built).
     #[arg(
         long = "rpc-cache.max-concurrent-db-requests",
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS),
         default_value_t = DEFAULT_CONCURRENT_DB_REQUESTS,
     )]
     pub max_concurrent_db_requests: usize,

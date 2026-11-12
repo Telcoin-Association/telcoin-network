@@ -135,6 +135,15 @@ pub enum EthApiError {
     /// Thrown when a requested transaction is not found
     #[error("transaction not found")]
     TransactionNotFound,
+    /// Thrown when a transaction requested by a tracing method is not found
+    #[error("transaction not found")]
+    TracingTransactionNotFound,
+    /// Thrown when a block requested by a tracing method is not found
+    #[error("block not found")]
+    TracingBlockNotFound(BlockId),
+    /// Thrown when a tracing method is called for the genesis block
+    #[error("genesis is not traceable")]
+    GenesisNotTraceable,
     /// Some feature is unsupported
     #[error("unsupported")]
     Unsupported(&'static str),
@@ -298,6 +307,22 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             EthApiError::EvmCustom(_) => internal_rpc_err(error.to_string()),
             EthApiError::UnknownBlockOrTxIndex | EthApiError::TransactionNotFound => {
                 rpc_error_with_code(EthRpcErrorCode::ResourceNotFound.code(), error.to_string())
+            }
+            EthApiError::TracingTransactionNotFound | EthApiError::GenesisNotTraceable => {
+                rpc_error_with_code(
+                    jsonrpsee_types::error::CALL_EXECUTION_FAILED_CODE,
+                    error.to_string(),
+                )
+            }
+            EthApiError::TracingBlockNotFound(id) => {
+                let id = match id {
+                    BlockId::Hash(hash) => hash.block_hash.to_string(),
+                    BlockId::Number(number) => number.to_string(),
+                };
+                rpc_error_with_code(
+                    jsonrpsee_types::error::CALL_EXECUTION_FAILED_CODE,
+                    format!("block {id} not found"),
+                )
             }
             EthApiError::HeaderNotFound(id) | EthApiError::ReceiptsNotFound(id) => {
                 rpc_error_with_code(
@@ -789,12 +814,7 @@ impl From<RpcInvalidTransactionError> for jsonrpsee_types::error::ErrorObject<'s
     fn from(err: RpcInvalidTransactionError) -> Self {
         match err {
             RpcInvalidTransactionError::Revert(revert) => {
-                // include out data if some
-                rpc_err(
-                    revert.error_code(),
-                    revert.to_string(),
-                    revert.output.as_ref().map(|out| out.as_ref()),
-                )
+                rpc_err(revert.error_code(), revert.to_string(), Some(revert.output.as_ref()))
             }
             RpcInvalidTransactionError::Other(err) => err.to_rpc_error(),
             err => rpc_err(err.error_code(), err.to_string(), None),
@@ -902,9 +922,7 @@ impl From<InvalidTransactionError> for RpcInvalidTransactionError {
 #[derive(Debug, Clone, thiserror::Error)]
 pub struct RevertError {
     /// The transaction output data
-    ///
-    /// Note: this is `None` if output was empty
-    output: Option<Bytes>,
+    output: Bytes,
 }
 
 // === impl RevertError ==
@@ -913,12 +931,8 @@ impl RevertError {
     /// Wraps the output bytes
     ///
     /// Note: this is intended to wrap a revm output
-    pub fn new(output: Bytes) -> Self {
-        if output.is_empty() {
-            Self { output: None }
-        } else {
-            Self { output: Some(output) }
-        }
+    pub const fn new(output: Bytes) -> Self {
+        Self { output }
     }
 
     /// Returns error code to return for this error.
@@ -930,7 +944,9 @@ impl RevertError {
 impl std::fmt::Display for RevertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("execution reverted")?;
-        if let Some(reason) = self.output.as_ref().and_then(|out| RevertReason::decode(out)) {
+        if !self.output.is_empty() &&
+            let Some(reason) = RevertReason::decode(&self.output)
+        {
             let error = reason.to_string();
             let mut error = error.as_str();
             if matches!(reason, RevertReason::ContractError(ContractError::Revert(_))) {
@@ -1133,6 +1149,26 @@ mod tests {
     }
 
     #[test]
+    fn tracing_lookup_errors_use_call_execution_failed_code() {
+        let cases = [
+            (EthApiError::TracingTransactionNotFound, "transaction not found"),
+            (
+                EthApiError::TracingBlockNotFound(BlockId::hash(b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                ))),
+                "block 0x0000000000000000000000000000000000000000000000000000000000000001 not found",
+            ),
+            (EthApiError::GenesisNotTraceable, "genesis is not traceable"),
+        ];
+
+        for (error, message) in cases {
+            let error: jsonrpsee_types::error::ErrorObject<'static> = error.into();
+            assert_eq!(error.code(), -32000);
+            assert_eq!(error.message(), message);
+        }
+    }
+
+    #[test]
     fn header_not_found_message() {
         let err: jsonrpsee_types::error::ErrorObject<'static> =
             EthApiError::HeaderNotFound(BlockId::hash(b256!(
@@ -1213,5 +1249,14 @@ mod tests {
         let err = RevertError::new(revert.abi_encode().into());
         let msg = err.to_string();
         assert_eq!(msg, "execution reverted: test_revert_reason");
+    }
+
+    #[test]
+    fn empty_revert_err_has_empty_data() {
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            RpcInvalidTransactionError::Revert(RevertError::new(Bytes::new())).into();
+        assert_eq!(err.code(), 3);
+        assert_eq!(err.message(), "execution reverted");
+        assert_eq!(err.data().unwrap().get(), "\"0x\"");
     }
 }

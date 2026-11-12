@@ -8,10 +8,12 @@ markers: **[done]**, **[next]**, **[later]**.
 
 - The vendoring moved from `sls_tndb_b_vendor`, where it sat on top of the tndb-b storage work, to
   its own branch off `main` (D8). Nothing from tndb-b is included.
-- The ledger runs TN-0001 to TN-0037. A review on 2026-11-01 found nothing Critical and nothing
+- The ledger runs TN-0001 to TN-0085. A review on 2026-11-01 found nothing Critical and nothing
   that can split validators. Its fixes: TN-0034 to TN-0037, `patches/revm-inspectors` (Boa's
   recursion limit), a test that pins storage v1, WebSocket origin checks on every worker's server,
-  and tooling fixes. What it left open is in `tn/notes/open-issues.md`.
+  and tooling fixes. A second review on 2026-11-08 (`tasks/review-vendor-reth-2026-11-08.md`)
+  found nothing that can split validators either; its fixes are TN-0054 to TN-0085 and the TN-side
+  commits beside them. What both left open is in `tn/notes/open-issues.md`.
 - CI now runs reth's own tests for the vendored crates and the `js-tracer` build (lane
   `test-vendor-reth`, job `vendor-reth-test`) and the patched crate's tests (job
   `revm-inspectors-patch`).

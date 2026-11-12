@@ -300,6 +300,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             tracing_url: _,
         } = self;
 
+        check_instance_ports(instance, &reth, with_unused_ports)?;
         // set up reth node config for engine components
         let node_config = RethConfig::new(
             reth,
@@ -378,6 +379,37 @@ pub(crate) fn validate_faucet_build(faucet_enabled: bool, genesis: &Genesis) -> 
 /// chain-spec construction the node itself boots with.
 fn genesis_block_hash(genesis: Genesis) -> B256 {
     RethChainSpec::from(genesis).sealed_genesis_header().hash()
+}
+
+/// Refuse an `--instance` whose port shift leaves the port range.
+///
+/// reth's `adjust_instance_ports` moves the HTTP port down by `instance - 1` and the WebSocket
+/// port up by `2 * (instance - 1)` with plain `u16` arithmetic: a release build wraps (an HTTP
+/// port of 100 with instance 150 binds 65,387) and a build with overflow checks panics.
+/// `--with-unused-ports` zeroes both ports before the shift, so there only instance 1 fits.
+fn check_instance_ports(
+    instance: Option<u16>,
+    reth: &RethCommand,
+    with_unused_ports: bool,
+) -> eyre::Result<()> {
+    let Some(instance) = instance else { return Ok(()) };
+    let (http, ws) =
+        if with_unused_ports { (0, 0) } else { (reth.rpc.http_port, reth.rpc.ws_port) };
+    let shift = instance - 1;
+    if http.checked_sub(shift).is_none() {
+        eyre::bail!(
+            "--instance {instance} moves the HTTP RPC port {http} down by {shift}, below port 0; \
+             raise --http.port or lower --instance"
+        );
+    }
+    if ws.checked_add(shift * 2).is_none() {
+        eyre::bail!(
+            "--instance {instance} moves the WebSocket RPC port {ws} up by {}, above port 65535; \
+             lower --ws.port or --instance",
+            shift * 2
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,6 +672,28 @@ mod tests {
         assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
         let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
         assert!(matches!(absent, Ok(None)));
+    }
+
+    /// An instance whose shift would wrap a port is refused before the config is built; the
+    /// shifts that stay in range pass, and so does `--with-unused-ports` with instance 1.
+    #[test]
+    fn instance_port_shift_is_checked() -> eyre::Result<()> {
+        let parse = |args: &[&str]| NodeCommand::<NoArgs>::try_parse_from(args);
+        let low_http = parse(&["node", "--instance", "150", "--http.port", "100"])?;
+        let err = check_instance_ports(low_http.instance, &low_http.reth, false).unwrap_err();
+        assert!(err.to_string().contains("below port 0"), "{err}");
+
+        let high_ws = parse(&["node", "--instance", "200", "--ws.port", "65300"])?;
+        let err = check_instance_ports(high_ws.instance, &high_ws.reth, false).unwrap_err();
+        assert!(err.to_string().contains("above port 65535"), "{err}");
+
+        let fits = parse(&["node", "--instance", "101", "--http.port", "100"])?;
+        check_instance_ports(fits.instance, &fits.reth, false)?;
+        let defaults = parse(&["node", "--instance", "200"])?;
+        check_instance_ports(defaults.instance, &defaults.reth, false)?;
+        check_instance_ports(Some(1), &defaults.reth, true)?;
+        assert!(check_instance_ports(Some(2), &defaults.reth, true).is_err());
+        check_instance_ports(None, &defaults.reth, true)
     }
 
     /// Retention defaults to unlimited, accepts positive counts, and rejects zero.

@@ -20,7 +20,10 @@
 //!   `last_block_number`, `last_finalized_block_number`. These see the in-flight blocks only once
 //!   the output commits. `lookup_head` also belongs here: reth's `NodeConfig::lookup_head` resolves
 //!   the head *number* from the `Finish` stage checkpoint via `database_provider_ro()`, so it
-//!   tracks the committed database even though the follow-up header fetch is in-memory-aware.
+//!   tracks the committed database even though the follow-up header fetch is in-memory-aware. The
+//!   tip readers here use that checkpoint too, not the provider's `last_block_number`: a commit
+//!   finalizes the static files before the MDBX transaction, so the Headers static file can be one
+//!   block ahead of MDBX for a moment (review R16).
 //!
 //! Concretely: `sealed_header_by_hash` can return a header whose number exceeds
 //! `last_block_number()`, and `header_by_number(canonical_tip().number)` can return `None`,
@@ -341,8 +344,13 @@ impl RethEnv {
     /// Committed-DB read (see the module docs): blocks of an in-flight consensus output are not
     /// counted until the output commits, so this can lag [`Self::canonical_tip`]. Provider
     /// errors propagate — there is no fallback value.
+    ///
+    /// The number is the `Finish` stage checkpoint, which `save_blocks` writes in the same MDBX
+    /// transaction as the blocks. The provider's `last_block_number` reads the Headers static
+    /// file instead, which a commit finalizes before the MDBX transaction commits, so inside that
+    /// window it reports a block MDBX does not hold yet (vendored reth review R16).
     pub fn last_block_number(&self) -> TnRethResult<u64> {
-        Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number()?)
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.best_block_number()?)
     }
 
     /// Return the block number and hash for the current canonical tip.

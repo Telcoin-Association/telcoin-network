@@ -202,7 +202,7 @@ impl<C: TrieCursor, K: AsRef<AddedRemovedKeys>> TrieWalker<C, K> {
     }
 
     /// Constructs a new [`TrieWalker`] for the state trie.
-    pub fn state_trie(cursor: C, changes: PrefixSet) -> Self {
+    pub fn state_trie(cursor: C, changes: PrefixSet) -> Result<Self, DatabaseError> {
         Self::new(
             cursor,
             changes,
@@ -212,7 +212,7 @@ impl<C: TrieCursor, K: AsRef<AddedRemovedKeys>> TrieWalker<C, K> {
     }
 
     /// Constructs a new [`TrieWalker`] for the storage trie.
-    pub fn storage_trie(cursor: C, changes: PrefixSet) -> Self {
+    pub fn storage_trie(cursor: C, changes: PrefixSet) -> Result<Self, DatabaseError> {
         Self::new(
             cursor,
             changes,
@@ -226,7 +226,7 @@ impl<C: TrieCursor, K: AsRef<AddedRemovedKeys>> TrieWalker<C, K> {
         cursor: C,
         changes: PrefixSet,
         #[cfg(feature = "metrics")] trie_type: crate::TrieType,
-    ) -> Self {
+    ) -> Result<Self, DatabaseError> {
         // Initialize the walker with a single empty stack element.
         let mut this = Self {
             cursor,
@@ -240,13 +240,13 @@ impl<C: TrieCursor, K: AsRef<AddedRemovedKeys>> TrieWalker<C, K> {
         };
 
         // Set up the root node of the trie in the stack, if it exists.
-        if let Some((key, value)) = this.node(true).unwrap() {
+        if let Some((key, value)) = this.node(true)? {
             this.stack[0] = CursorSubNode::new(key, Some(value));
         }
 
         // Update the skip state for the root node.
         this.update_skip_node();
-        this
+        Ok(this)
     }
 
     /// Advances the walker to the next trie node and updates the skip node flag.
@@ -385,5 +385,63 @@ impl<C: TrieCursor, K: AsRef<AddedRemovedKeys>> TrieWalker<C, K> {
         self.move_to_next_sibling(false)?;
 
         Ok(())
+    }
+}
+
+/// TN: upstream's `walker.rs` test module postdates v1.11.4; this holds only the two tests
+/// 8f5efd2b3 added (TN-0081).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_storage_errors::db::DatabaseErrorInfo;
+
+    #[test]
+    fn state_trie_initial_read_timeout_returns_error() {
+        let error =
+            TrieWalker::<_>::state_trie(TimedOutTrieCursor, PrefixSet::default()).unwrap_err();
+        assert_matches::assert_matches!(error, DatabaseError::Read(info) if info == timeout_error());
+    }
+
+    #[test]
+    fn storage_trie_initial_read_timeout_returns_error() {
+        let error =
+            TrieWalker::<_>::storage_trie(TimedOutTrieCursor, PrefixSet::default()).unwrap_err();
+        assert_matches::assert_matches!(error, DatabaseError::Read(info) if info == timeout_error());
+    }
+
+    fn timeout_error() -> DatabaseErrorInfo {
+        DatabaseErrorInfo { message: "read transaction has been timed out".into(), code: -96000 }
+    }
+
+    #[derive(Debug)]
+    struct TimedOutTrieCursor;
+
+    impl TrieCursor for TimedOutTrieCursor {
+        fn seek_exact(
+            &mut self,
+            key: Nibbles,
+        ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+            assert_eq!(key, Nibbles::default());
+            Err(DatabaseError::Read(timeout_error()))
+        }
+
+        fn seek(
+            &mut self,
+            _key: Nibbles,
+        ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+            unreachable!("initialization only seeks the root exactly")
+        }
+
+        fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+            unreachable!("initialization only seeks the root exactly")
+        }
+
+        fn current(&mut self) -> Result<Option<Nibbles>, DatabaseError> {
+            unreachable!("initialization only seeks the root exactly")
+        }
+
+        fn reset(&mut self) {
+            unreachable!("initialization only seeks the root exactly")
+        }
     }
 }

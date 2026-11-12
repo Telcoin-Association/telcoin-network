@@ -22,6 +22,7 @@ use reth_primitives_traits::{BlockBody as _, BlockTy, NodePrimitives, Recovered,
 use reth_rpc_convert::{RpcBlock, RpcConvert, RpcTxReq};
 use reth_rpc_server_types::result::rpc_err;
 use reth_storage_api::noop::NoopProvider;
+use reth_tasks::cancel::is_cancelled;
 use revm::{
     context::Block,
     context_interface::result::ExecutionResult,
@@ -232,6 +233,9 @@ where
 
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
+        if is_cancelled() {
+            return Err(EthApiError::InternalEthError)
+        }
         // Resolve transaction, populate missing fields and enforce calls
         // correctness.
         let tx = resolve_transaction(

@@ -605,7 +605,7 @@ mod tests {
     use crate::{eth::helpers::types::EthRpcConverter, EthApi, EthApiBuilder};
     use alloy_consensus::{Block, BlockBody, Header};
     use alloy_eips::BlockNumberOrTag;
-    use alloy_primitives::{Signature, B256, U64};
+    use alloy_primitives::{Address, Signature, B256, U256, U64};
     use alloy_rpc_types::FeeHistory;
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
@@ -615,7 +615,7 @@ mod tests {
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::{
-        test_utils::{MockEthProvider, NoopProvider},
+        test_utils::{ExtendedAccount, MockEthProvider, NoopProvider},
         StageCheckpointReader,
     };
     use reth_rpc_eth_api::{node::RpcNodeCoreAdapter, EthApiServer};
@@ -651,6 +651,21 @@ mod tests {
             NoopNetwork::default(),
             EthEvmConfig::new(provider.chain_spec()),
         )
+        .build()
+    }
+
+    /// TN(TN-0062): [`build_test_eth_api`] under an RPC gas cap (0 means no cap).
+    fn build_test_eth_api_with_gas_cap(
+        provider: MockEthProvider,
+        gas_cap: u64,
+    ) -> FakeEthApi<MockEthProvider> {
+        EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(reth_rpc_eth_types::GasCap(gas_cap))
         .build()
     }
 
@@ -898,5 +913,236 @@ mod tests {
             fee_history.reward.is_none(),
             "all: no percentiles were requested, so there should be no rewards result"
         );
+    }
+    /// Upstream 13a59de4b's test (TN-0049): a blocking task sees its dropped request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_task_observes_dropped_request() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use reth_tasks::cancel::is_cancelled;
+        use std::time::{Duration, Instant};
+
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io(move |_| {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        // drop the request while its blocking task is running
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
+    }
+
+    /// TN(TN-0049): the same for `spawn_blocking_io_fut`, which `spawn_with_state_at_block` (and
+    /// so every replay and trace) runs on: the future's blocking work sees the dropped request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_future_observes_dropped_request() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use reth_tasks::cancel::is_cancelled;
+        use std::time::{Duration, Instant};
+
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io_fut(move |_| async move {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
+    }
+
+    /// TN(TN-0062): upstream 5b6863039's test. The caller allowance for a call with a gas price
+    /// and no `gas` field must not lift the call above `--rpc.gascap`.
+    #[tokio::test]
+    async fn call_allowance_respects_rpc_gas_cap() {
+        use alloy_eips::BlockId;
+        use alloy_primitives::{Address, Bytes, U256};
+        use alloy_rpc_types_eth::{
+            state::{AccountOverride, EvmOverrides, StateOverride},
+            TransactionRequest,
+        };
+        use alloy_rpc_types_trace::{parity::TraceType, tracerequest::TraceCallRequest};
+        use reth_chainspec::ChainSpecBuilder;
+        use reth_rpc_eth_api::helpers::EthCall;
+        use reth_rpc_eth_types::EthConfig;
+        use reth_tasks::pool::BlockingTaskGuard;
+
+        let sender = Address::repeat_byte(0x11);
+        let contract = Address::repeat_byte(0xaa);
+        // Return the gas remaining after intrinsic gas and the GAS opcode.
+        let code = Bytes::from_static(&[0x5a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+
+        // RPC cap, supplied gas, price, balance after value, block limit, expected budget.
+        for (gas_cap, gas, price, balance, block_limit, budget) in [
+            (50_000, None, 1, 100_000, 100_000, 50_000),
+            (50_000, None, 0, 100_000, 100_000, 50_000),
+            (50_000, None, 1, 40_000, 100_000, 40_000),
+            (50_000, None, 1, 100_000, 40_000, 40_000),
+            (50_000, Some(70_000), 1, 100_000, 100_000, 50_000),
+            (50_000, Some(30_000), 1, 100_000, 100_000, 30_000),
+            (50_000, Some(70_000), 1, 100_000, 40_000, 50_000),
+            (0, None, 1, 100_000, 100_000, 100_000),
+            (0, Some(70_000), 1, 100_000, 40_000, 70_000),
+        ] {
+            let provider = MockEthProvider::default()
+                .with_chain_spec(ChainSpecBuilder::mainnet().cancun_activated().build());
+            provider.add_block(
+                B256::repeat_byte(0x42),
+                Block {
+                    header: Header {
+                        number: 1,
+                        gas_limit: block_limit,
+                        excess_blob_gas: Some(0),
+                        ..Default::default()
+                    },
+                    body: BlockBody::default(),
+                },
+            );
+            let api = build_test_eth_api_with_gas_cap(provider, gas_cap);
+            let trace_api =
+                crate::TraceApi::new(api.clone(), BlockingTaskGuard::new(1), EthConfig::default());
+            let state_override = StateOverride::from_iter([
+                (
+                    sender,
+                    AccountOverride {
+                        balance: Some(U256::from(balance + 1_000)),
+                        ..Default::default()
+                    },
+                ),
+                (contract, AccountOverride { code: Some(code.clone()), ..Default::default() }),
+            ]);
+
+            for dynamic_fee in [false, true] {
+                let request = TransactionRequest {
+                    gas,
+                    gas_price: (!dynamic_fee).then_some(price),
+                    max_fee_per_gas: dynamic_fee.then_some(price),
+                    max_priority_fee_per_gas: dynamic_fee.then_some(price),
+                    value: Some(U256::from(1_000)),
+                    from: Some(sender),
+                    to: Some(contract.into()),
+                    ..Default::default()
+                };
+                let output = EthCall::call(
+                    &api,
+                    request.clone(),
+                    Some(BlockId::latest()),
+                    EvmOverrides::state(Some(state_override.clone())),
+                )
+                .await
+                .unwrap();
+                let traces = trace_api
+                    .trace_call(TraceCallRequest {
+                        call: request,
+                        trace_types: std::iter::once(TraceType::Trace).collect(),
+                        block_id: Some(BlockId::latest()),
+                        state_overrides: Some(state_override.clone()),
+                        block_overrides: None,
+                    })
+                    .await
+                    .unwrap();
+
+                assert_eq!(U256::from_be_slice(&output), U256::from(budget - 21_002));
+                assert_eq!(traces.output, output);
+            }
+        }
+    }
+
+    /// TN(TN-0063): upstream dfcb10454's tests for `eth_getTransactionBySenderAndNonce`.
+    #[tokio::test]
+    async fn test_transaction_by_sender_and_nonce_without_sender_transaction_returns_none() {
+        use reth_rpc_eth_api::helpers::EthTransactions;
+
+        let provider = MockEthProvider::default();
+        let sender = Address::random();
+        provider.add_account(sender, ExtendedAccount::new(1, U256::ZERO));
+
+        let block_hash = B256::random();
+        provider.add_block(
+            block_hash,
+            Block {
+                header: Header { number: 1, ..Default::default() },
+                body: BlockBody::default(),
+            },
+        );
+
+        let api = build_test_eth_api(provider);
+        let transaction =
+            EthTransactions::get_transaction_by_sender_and_nonce(&api, sender, 0, false)
+                .await
+                .expect("existing block without a sender transaction should not be a header error");
+
+        assert!(transaction.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_transaction_by_sender_and_nonce_missing_block_returns_error() {
+        use reth_rpc_eth_api::helpers::EthTransactions;
+        use reth_rpc_eth_types::EthApiError;
+
+        let provider = MockEthProvider::default();
+        let sender = Address::random();
+        provider.add_account(sender, ExtendedAccount::new(1, U256::ZERO));
+        provider.add_header(B256::random(), Header { number: 1, ..Default::default() });
+
+        let api = build_test_eth_api(provider);
+        let error = EthTransactions::get_transaction_by_sender_and_nonce(&api, sender, 0, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EthApiError::HeaderNotFound(id) if id == 1.into()));
+    }
+
+    #[tokio::test]
+    async fn test_transaction_by_sender_and_nonce_returns_matching_transaction() {
+        use reth_primitives_traits::SignerRecoverable;
+        use reth_rpc_eth_api::helpers::EthTransactions;
+
+        let provider = MockEthProvider::default();
+        let tx = TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(Default::default()),
+            Signature::test_signature(),
+        );
+        let sender = tx.recover_signer().unwrap();
+        provider.add_account(sender, ExtendedAccount::new(1, U256::ZERO));
+        let block = Block {
+            header: Header { number: 1, ..Default::default() },
+            body: BlockBody { transactions: vec![tx], ..Default::default() },
+        };
+        let block_hash = block.header.hash_slow();
+        provider.add_block(block_hash, block);
+
+        let api = build_test_eth_api(provider);
+        let transaction =
+            EthTransactions::get_transaction_by_sender_and_nonce(&api, sender, 0, false)
+                .await
+                .unwrap()
+                .expect("matching transaction should be returned");
+
+        assert_eq!(transaction.block_hash, Some(block_hash));
+        assert_eq!(transaction.block_number, Some(1));
+        assert_eq!(transaction.transaction_index, Some(0));
+        assert_eq!(transaction.inner.signer(), sender);
     }
 }

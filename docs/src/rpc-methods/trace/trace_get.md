@@ -3,7 +3,7 @@
 > [!NOTE]
 > Served only when `trace` is named in `--http.api` or `--ws.api`; see [Enabling Namespaces](../enabling-namespaces.md).
 
-Returns one Parity-style trace of a mined transaction, selected by its index in the list [trace\_transaction](trace_transaction.md) returns: index `0` is the top-level call. The node traces the whole transaction to answer, so the cost is the same as `trace_transaction`.
+Returns one Parity-style trace of a mined transaction, selected by its `traceAddress` path in the call tree: `[]` is the top-level call, `[0]` its first child, `[0, 1]` that child's second child. This is the path [trace\_transaction](trace_transaction.md) reports for each frame, so a frame found there can be fetched here by its path. The node traces the whole transaction to answer, so the cost is the same as `trace_transaction`.
 
 Traces cover the block's transactions only. The system calls a block runs before its transactions (EIP-4788 beacon root, EIP-2935 block hashes) and the epoch-closing system calls (`applyIncentives` and `concludeEpoch`) are not transactions, so no tracer shows them.
 
@@ -11,11 +11,11 @@ Traces cover the block's transactions only. The system calls a block runs before
 
 `DATA`, 32 Bytes - The transaction hash.
 
-`Array` - The trace index, as a one-element list. Each index may be a hex string (`"0x0"`), a decimal string or a JSON number. Only one index is supported: a list with no index or with more than one returns `null`.
+`Array` - The `traceAddress` path of the frame. Each element may be a hex string (`"0x0"`), a decimal string or a JSON number. An empty list selects the top-level frame.
 
 #### Returns
 
-`Object` - The trace at that index, or `null` when the node does not know the transaction, when the index is past the transaction's last trace, or when the list does not hold exactly one index:
+`Object` - The frame at that path, or `null` when the node does not know the transaction or no frame has that path:
 
 * `action`: `Object` - What the frame did. For a `call`: `from` (`DATA`, 20 bytes, the caller), `callType` (`call`, `callcode`, `delegatecall` or `staticcall`), `gas` (`QUANTITY`, the gas available to the frame), `input` (`DATA`), `to` (`DATA`, 20 bytes) and `value` (`QUANTITY`, in wei). For a `create`: `from`, `gas`, `init` (`DATA`, the init code), `value` and `creationMethod` (`create` or `create2`). For a `suicide` (a `SELFDESTRUCT`): `address`, `balance` and `refundAddress`. The top-level frame's `gas` is the transaction's gas limit minus its intrinsic gas, so it is `0x0` for a plain transfer sent with a 21,000 gas limit.
 * `blockHash`: `DATA`, 32 Bytes - Hash of the block that holds the transaction.
@@ -36,7 +36,7 @@ Traces cover the block's transactions only. The system calls a block runs before
 curl http://localhost:8545 \
  -X POST \
  -H "Content-Type: application/json" \
- --data '{"jsonrpc":"2.0","method":"trace_get","params":["0xa794c7eb915c26fdb77242159053c1a36241bcd016b671fb07abe3fa9050805e",["0x0"]],"id":1}'
+ --data '{"jsonrpc":"2.0","method":"trace_get","params":["0xa794c7eb915c26fdb77242159053c1a36241bcd016b671fb07abe3fa9050805e",[]],"id":1}'
 ```
 
 #### Result

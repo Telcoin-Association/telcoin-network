@@ -104,7 +104,8 @@ alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-tokio = { workspace = true, features = ["macros", "time", "sync"] }
+# `rt-multi-thread`: RPC's own blocking pool (`rpc_blocking.rs`).
+tokio = { workspace = true, features = ["macros", "time", "sync", "rt-multi-thread"] }
 # `Service` impl for the size-capped forwarder transport (issue #1275). Only the trait; the
 # HTTP client underneath comes through alloy's re-export so the TLS backend stays alloy's.
 tower = { workspace = true }

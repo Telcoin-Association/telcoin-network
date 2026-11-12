@@ -392,15 +392,14 @@ where
         trace!("{:?}", request);
 
         let cfg = RpcServiceCfg {
-            bounded_subscriptions: BoundedSubscriptions::new(
-                self.inner.server_cfg.max_subscriptions_per_connection,
-            ),
+            bounded_subscriptions: self.inner.bounded_subscriptions.clone(),
             id_provider: self.inner.id_provider.clone(),
             sink: self.inner.method_sink.clone(),
         };
 
         let max_response_body_size = self.inner.server_cfg.max_response_body_size as usize;
         let max_request_body_size = self.inner.server_cfg.max_request_body_size as usize;
+        let max_batch_requests = self.inner.server_cfg.max_batch_requests as usize;
         let conn = self.inner.conn_permit.clone();
         let rpc_service = self.rpc_middleware.service(RpcService::new(
             self.inner.methods.clone(),
@@ -420,6 +419,7 @@ where
                 rpc_service,
                 max_response_body_size,
                 max_request_body_size,
+                max_batch_requests,
                 conn,
             )
             .await
@@ -532,9 +532,8 @@ async fn to_ipc_service<S, T>(
                break
             }
             item = rx_item.next() => {
-                if let Some(item) = item {
-                    conn.push_back(item.to_string());
-                }
+                let Some(item) = item else { break };
+                conn.push_back(item.to_string());
             }
             _ = &mut stopped => {
                 // shutdown
@@ -559,6 +558,8 @@ pub struct Settings {
     max_connections: u32,
     /// Maximum number of subscriptions per connection.
     max_subscriptions_per_connection: u32,
+    /// TN(TN-0055): maximum number of calls in one batch request.
+    max_batch_requests: u32,
     /// Number of messages that server is allowed `buffer` until backpressure kicks in.
     message_buffer_capacity: u32,
     /// Custom tokio runtime to run the server on.
@@ -575,6 +576,7 @@ impl Default for Settings {
             max_log_length: 4096,
             max_connections: 100,
             max_subscriptions_per_connection: 1024,
+            max_batch_requests: 100,
             message_buffer_capacity: 1024,
             tokio_runtime: None,
             ipc_socket_permissions: None,
@@ -631,6 +633,12 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
     /// Set the maximum number of subscriptions per connection. Default is 1024.
     pub const fn max_subscriptions_per_connection(mut self, max: u32) -> Self {
         self.settings.max_subscriptions_per_connection = max;
+        self
+    }
+
+    /// TN(TN-0055): set the maximum number of calls in one batch request.
+    pub const fn max_batch_requests(mut self, max: u32) -> Self {
+        self.settings.max_batch_requests = max;
         self
     }
 
@@ -773,12 +781,18 @@ mod tests {
     use futures::future::select;
     use jsonrpsee::{
         core::{
-            client::{self, ClientT, Error, Subscription, SubscriptionClientT},
+            client::{
+                self, ClientT, Error, ReceivedMessage, Subscription, SubscriptionClientT,
+                TransportReceiverT, TransportSenderT,
+            },
             middleware::{Batch, BatchEntry, Notification},
             params::BatchRequestBuilder,
         },
         rpc_params,
-        types::Request,
+        types::{
+            error::{TOO_BIG_BATCH_REQUEST_CODE, TOO_MANY_SUBSCRIPTIONS_CODE},
+            Request,
+        },
         PendingSubscriptionSink, RpcModule, SubscriptionMessage,
     };
     use reth_tracing::init_test_tracing;
@@ -888,6 +902,46 @@ mod tests {
         let response: Result<client::BatchResponse<'_, String>, Error> =
             client.batch_request(batch_request_builder).await;
         assert!(response.is_err());
+    }
+
+    /// TN(TN-0055): a batch above the limit is refused whole.
+    #[tokio::test]
+    async fn can_set_max_batch_requests() {
+        init_test_tracing();
+        let endpoint = &dummy_name();
+        let server = Builder::default().max_batch_requests(2).build(endpoint.clone());
+        let mut module = RpcModule::new(());
+        module.register_method("anything", |_, _, _| "succeed").unwrap();
+        let handle = server.start(module).await.unwrap();
+        tokio::spawn(handle.stopped());
+
+        // the whole-batch error carries `id: null`, which the async client cannot match to a
+        // pending batch, so read the server's response off the raw transport
+        let (mut tx, mut rx) =
+            crate::client::IpcTransportClientBuilder::default().build(endpoint).await.unwrap();
+        let batch_of = |count: usize| {
+            let calls: Vec<String> = (0..count)
+                .map(|id| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"anything"}}"#))
+                .collect();
+            format!("[{}]", calls.join(","))
+        };
+        async fn receive(rx: &mut crate::client::Receiver) -> String {
+            match rx.receive().await.unwrap() {
+                ReceivedMessage::Text(text) => text,
+                other => panic!("unexpected message {other:?}"),
+            }
+        }
+
+        tx.send(batch_of(2)).await.unwrap();
+        let response = receive(&mut rx).await;
+        assert_eq!(response.matches("succeed").count(), 2, "{response}");
+
+        tx.send(batch_of(3)).await.unwrap();
+        let response = receive(&mut rx).await;
+        let error: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(error["id"], serde_json::Value::Null, "{response}");
+        assert_eq!(error["error"]["code"], TOO_BIG_BATCH_REQUEST_CODE, "{response}");
+        assert_eq!(error["error"]["data"], "Exceeded max limit of 2", "{response}");
     }
 
     #[tokio::test]
@@ -1012,6 +1066,38 @@ mod tests {
 
         let items = sub.take(16).collect::<Vec<_>>().await;
         assert_eq!(items.len(), 16);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_max_subscriptions_per_connection() {
+        let endpoint = &dummy_name();
+        let server = Builder::default().max_subscriptions_per_connection(1).build(endpoint.clone());
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription(
+                "subscribe_hello",
+                "s_hello",
+                "unsubscribe_hello",
+                |_, pending, _, _| async move {
+                    let Ok(sink) = pending.accept().await else { return };
+                    sink.closed().await;
+                },
+            )
+            .unwrap();
+        let handle = server.start(module).await.unwrap();
+        tokio::spawn(handle.stopped());
+
+        let client = IpcClientBuilder::default().build(endpoint).await.unwrap();
+        let _sub: Subscription<usize> =
+            client.subscribe("subscribe_hello", rpc_params![], "unsubscribe_hello").await.unwrap();
+        let err = client
+            .subscribe::<usize, _>("subscribe_hello", rpc_params![], "unsubscribe_hello")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Call(err) if err.code() == TOO_MANY_SUBSCRIPTIONS_CODE),
+            "{err}"
+        );
     }
 
     #[tokio::test]

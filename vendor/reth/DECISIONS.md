@@ -95,6 +95,14 @@ crates from git revisions that TN ships from crates.io. `sync` and `pick` list u
 to them, and TN mirrors one in both manifests only on purpose. Dropping was chosen over a warning
 alone: it is barely more code, and the safe state is the default.
 
+2026-11-06: the packages only reth's tests need are now pinned, in `tn/test-only.lock`, which
+`cargo.sh` adds to the seed. The nested lockfile stays generated, so TN's versions still win for
+every package TN ships, and a dependency bump in TN's lockfile needs no second lockfile edit unless
+it breaks a pin. Before, a crates.io release of a test-only package reached the lane the day it
+was published, and a test-only package that needed a newer shared crate moved that crate for the
+vendored code too: reth's tests ran TN's code on libc 0.2.191 while TN shipped 0.2.183.
+`tn/lockfile.py check` fails on either.
+
 ## D8. Git workflow
 
 Decided with the maintainer, 2026-10-30: commits and tags on `sls_tndb_b_vendor`, pushed only

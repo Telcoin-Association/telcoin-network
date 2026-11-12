@@ -285,7 +285,7 @@ pub use crate::{
         LocalTransactionConfig, PoolConfig, PriceBumpConfig, SubPoolLimit,
         DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS, DEFAULT_PRICE_BUMP,
         DEFAULT_TXPOOL_ADDITIONAL_VALIDATION_TASKS, MAX_NEW_PENDING_TXS_NOTIFICATIONS,
-        REPLACE_BLOB_PRICE_BUMP, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+        MAX_RPC_TX_LISTENERS, REPLACE_BLOB_PRICE_BUMP, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
         TXPOOL_SUBPOOL_MAX_SIZE_MB_DEFAULT, TXPOOL_SUBPOOL_MAX_TXS_DEFAULT,
     },
     error::PoolResult,
@@ -523,6 +523,20 @@ where
 
     fn pending_transactions_listener_for(&self, kind: TransactionListenerKind) -> Receiver<TxHash> {
         self.pool.add_pending_listener(kind)
+    }
+
+    fn try_pending_transactions_listener_for(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<Receiver<TxHash>> {
+        self.pool.try_add_pending_listener(kind)
+    }
+
+    fn try_new_transactions_listener_for(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<Receiver<NewTransactionEvent<Self::Transaction>>> {
+        self.pool.try_add_new_transaction_listener(kind)
     }
 
     fn blob_transaction_sidecars_listener(&self) -> Receiver<NewBlobSidecar> {

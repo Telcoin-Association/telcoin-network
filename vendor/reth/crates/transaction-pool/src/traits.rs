@@ -250,6 +250,24 @@ pub trait TransactionPool: Clone + Debug + Send + Sync {
     /// inserted into the pending pool depending on the given [`TransactionListenerKind`] argument.
     fn pending_transactions_listener_for(&self, kind: TransactionListenerKind) -> Receiver<TxHash>;
 
+    /// TN(TN-0056): [`Self::pending_transactions_listener_for`] for an RPC client; `None` when
+    /// the pool's bound on such listeners is reached.
+    fn try_pending_transactions_listener_for(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<Receiver<TxHash>> {
+        Some(self.pending_transactions_listener_for(kind))
+    }
+
+    /// TN(TN-0056): [`Self::new_transactions_listener_for`] for an RPC client; `None` when the
+    /// pool's bound on such listeners is reached.
+    fn try_new_transactions_listener_for(
+        &self,
+        kind: TransactionListenerKind,
+    ) -> Option<Receiver<NewTransactionEvent<Self::Transaction>>> {
+        Some(self.new_transactions_listener_for(kind))
+    }
+
     /// Returns a new stream that yields new valid transactions added to the pool.
     fn new_transactions_listener(&self) -> Receiver<NewTransactionEvent<Self::Transaction>> {
         self.new_transactions_listener_for(TransactionListenerKind::PropagateOnly)
