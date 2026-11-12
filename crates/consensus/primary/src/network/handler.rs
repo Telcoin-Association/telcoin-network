@@ -2025,7 +2025,8 @@ where
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening `Req(MissingCertificates { .. })` frame read by the caller. A streaming
     /// [`CertificateCollector`] (no aggregate response-size cap, only its DB-read time
-    /// limit) drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
+    /// limit), which serves only certificates whose signature this node has checked,
+    /// drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
     /// then the matching certificates as batched `Data` frames terminated by
     /// [`SyncFrame::End`]. This is the streamed replacement for the legacy
     /// request-response `RequestedCertificates` reply, without its `max_response_size`
@@ -2082,7 +2083,7 @@ where
             SEND_SYNC_CERTS_TIMEOUT,
             crate::network::sync_codec::send_sync_certificates_over_stream(
                 &mut stream,
-                collector,
+                collector.into_verified_stream(),
                 SEND_STREAM_BUFFER_TIMEOUT,
             ),
         )
