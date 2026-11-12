@@ -56,7 +56,7 @@
 //! a split that composes nothing leaves the storage root to the walk, counted in
 //! `tn_reth.storage_walk_fallbacks_total`. Measured on the exec bench (storage v2, against the
 //! account split alone): the root fell from 199 to 106 ms an output at peak and from 41 to 22 ms on
-//! the busy profile on the Mac.
+//! the busy profile on the Mac, and from 329 to 135 and from 68 to 30 ms on a 22-thread Linux VM.
 //! `TN_PARALLEL_STORAGE_WALK=0` turns this split off on its own.
 //!
 //! # Why the tasks' transactions see the walk's state

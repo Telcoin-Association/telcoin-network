@@ -79,8 +79,9 @@ to one nibble, worked by the same threads before the account subtries; the walk 
 contract's leaf composes its storage root and the union of the pieces' trie updates. Wiped
 storage, smaller tries and a split that composes nothing (an emptied storage, a single non-empty
 nibble) leave the storage root to one task or the walk. On the exec bench, against the account
-split alone, the state root fell to 0.53x at peak and 0.54x on the busy profile on the Mac (the whole
-output by 8% and 5%).
+split alone, the state root fell to 0.53x at peak and 0.54x on the busy profile on the Mac, and to
+0.41x and 0.44x on a 22-thread Linux VM (the whole output by 8% and 5% on the Mac, 12% and 6% on the
+VM).
 
 One block in 256 with parallel work (storage-root tasks or a split walk) is also computed serially
 and compared; a difference is logged with both roots, counted in
