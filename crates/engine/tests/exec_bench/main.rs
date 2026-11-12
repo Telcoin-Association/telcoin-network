@@ -218,18 +218,20 @@
 //! - `total`: the wall time of one `execute_consensus_output` call.
 //! - `execute`, `finish` and `overlay extend`: the output's blocks' `tn_reth.block_*_seconds`,
 //!   summed. `finish` includes `hashed state` and `state root`.
-//! - `signer recovery`: the output's per-batch `tn_reth.block_signer_recovery_seconds`, summed.
-//!   `execute_consensus_output` recovers every batch's signers concurrently before the first block,
-//!   so the samples overlap: their sum is not part of `execute`, and the recovery's wall time falls
-//!   in `other`.
+//! - `signer recovery`: the wall time of the signer-recovery jobs that finished during the output's
+//!   call (`tn_engine.recover_seconds`, one sample per output). As the engine does when it queues
+//!   an output, [`run_outputs`] starts each output's recovery on a blocking job and the call waits
+//!   for it before the first block. Back to back, output `i + 1`'s job starts with output `i`'s
+//!   call, so a row holds the next output's job and the run's mean is the job's mean; the part the
+//!   call waited for falls in `other`. Paced, each output's job starts at its own slot.
 //! - `save_blocks`: reth's `save_blocks_total`. `mdbx` is its database writes, which include
 //!   `insert_block` through `update_history_indices`; `sf` is the static-file writes, which run
 //!   beside them on another thread.
 //! - `commit sf` and `commit mdbx`: the static files' commit and the database commit after
 //!   `save_blocks`, outside `save_blocks_total`.
 //! - `other`: `total` minus `execute`, `finish`, `overlay extend`, `save_blocks`, `commit sf` and
-//!   `commit mdbx`: the engine's own work (signer recovery included), announcing the output and
-//!   finalizing.
+//!   `commit mdbx`: the engine's own work (the wait for the output's signer recovery included),
+//!   announcing the output and finalizing.
 //!
 //! reth names the database stages `mdbx` (its metrics `save_blocks_mdbx` and
 //! `save_blocks_commit_mdbx`) whatever the engine, and the labels and JSON keys keep its names: on
@@ -318,7 +320,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
-use tn_engine::execute_consensus_output;
+use tn_engine::{
+    execute_consensus_output,
+    test_utils::{execute_queued_output, QueuedRecovery},
+};
 use tn_reth::{
     db_table_stats, default_page_size,
     payload::BuildArguments,
@@ -486,12 +491,13 @@ impl BenchNode {
         Ok((tip, updates))
     }
 
-    /// Run `output` through `execute_consensus_output` on a blocking task on the canonical tip,
-    /// sending its engine update on `engine_update_tx`, and return the new tip and the call's
-    /// wall time.
+    /// Run `output` through the engine's queued-output path on a blocking task on the canonical
+    /// tip, with its signers from `recovery` (the job started when it was queued) and its engine
+    /// update sent on `engine_update_tx`, and return the new tip and the call's wall time.
     async fn execute_timed(
         &self,
         output: ConsensusOutput,
+        recovery: QueuedRecovery,
         engine_update_tx: &mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<(SealedHeader, Duration)> {
         let args = BuildArguments::new(self.env.clone(), output, self.env.canonical_tip());
@@ -499,8 +505,9 @@ impl BenchNode {
         let engine_update_tx = engine_update_tx.clone();
         let (tip, wall) = tokio::task::spawn_blocking(move || {
             let start = Instant::now();
-            let tip = execute_consensus_output(
+            let tip = execute_queued_output(
                 args,
+                recovery,
                 gas_accumulator,
                 RepackMonitor::default(),
                 engine_update_tx,
@@ -1361,13 +1368,17 @@ enum Per {
     Block,
     /// One per output: `persist_executed_output`'s `save_blocks` and commit.
     Output,
+    /// One per output, recorded by the output's signer-recovery job, which runs beside the call
+    /// before it (see [`run_outputs`]): drained once per run, not before each output, and not
+    /// counted, since a row takes the samples recorded since the row before.
+    Overlapped,
 }
 
 /// The captured histograms, by raw name (before tn-metrics' prefix), and their samples per
 /// output. Every value is in seconds.
 const CAPTURED: [(&str, Per); 16] = [
     (EXECUTE, Per::Block),
-    ("tn_reth.block_signer_recovery_seconds", Per::Block),
+    (RECOVER, Per::Overlapped),
     (FINISH, Per::Block),
     ("tn_reth.block_hashed_state_seconds", Per::Block),
     ("tn_reth.block_state_root_seconds", Per::Block),
@@ -1384,8 +1395,10 @@ const CAPTURED: [(&str, Per); 16] = [
     (COMMIT_MDBX, Per::Output),
 ];
 
-/// A block's EVM execution (signer recovery runs before it, once per batch).
+/// A block's EVM execution (its signers were recovered before the output's first block).
 const EXECUTE: &str = "tn_reth.block_execute_seconds";
+/// One output's signer-recovery job, its wall time.
+const RECOVER: &str = "tn_engine.recover_seconds";
 /// A block's `builder.finish`, hashed state and state root included.
 const FINISH: &str = "tn_reth.block_finish_seconds";
 /// Extending the output's trie overlay with a block.
@@ -1463,7 +1476,7 @@ impl OutputRow {
 
 /// Each [`CAPTURED`] histogram's samples for one output of `blocks` blocks, summed, taking them
 /// with `drain`. Refuses a histogram whose sample count is not one per block or one per output
-/// ([`Per`]).
+/// ([`Per`]); an overlapped one is summed whatever its count.
 fn stage_sums(
     mut drain: impl FnMut(&str) -> Vec<f64>,
     blocks: usize,
@@ -1474,6 +1487,10 @@ fn stage_sums(
         let expected = match per {
             Per::Block => blocks,
             Per::Output => 1,
+            Per::Overlapped => {
+                *sum = samples.iter().sum();
+                continue;
+            }
         };
         let hint = if samples.is_empty() {
             " (a metric handle that registered before the capture recorder records nothing: run \
@@ -2037,8 +2054,20 @@ async fn run_outputs(
     let mut rows = Vec::with_capacity(outputs.len());
     let mut expected = Vec::with_capacity(outputs.len());
     let mut parent = node.env.canonical_tip().number;
+    // the recovery jobs' own task manager, so their handles do not fill the env's
+    let mut recovery_tasks = TaskManager::default();
+    let recovery_spawner = recovery_tasks.get_spawner();
+    // the overlapped histograms keep their samples across the outputs of this run
+    for (name, per) in CAPTURED {
+        if per == Per::Overlapped {
+            recorder.drain(name);
+        }
+    }
+    // the next output's recovery job, started with the call before it when back to back
+    let mut queued: Option<QueuedRecovery> = None;
+    let mut outputs = outputs.into_iter().peekable();
     timed.resume();
-    for load in outputs {
+    while let Some(load) = outputs.next() {
         let index = timed.next;
         timed.next += 1;
         let t0 = *timed.t0.get_or_insert_with(Instant::now);
@@ -2062,8 +2091,10 @@ async fn run_outputs(
         let hashes = timed.side.is_some().then(|| tx_hashes(&load));
         // the commit histograms also record the env's other commits (opening it, say): start each
         // output with no samples
-        for (name, _) in CAPTURED {
-            recorder.drain(name);
+        for (name, per) in CAPTURED {
+            if per != Per::Overlapped {
+                recorder.drain(name);
+            }
         }
         // the database's and the process's write counters around the call, outside its wall
         // time: the commit completes inside the call, so the difference is this output's
@@ -2072,8 +2103,18 @@ async fn run_outputs(
         node.env.take_sf_sync_stats();
         let disk_before = timed.disk_bytes();
         let faults_before = page_faults();
+        // As the engine queues outputs: this output's job started with the call before it (back
+        // to back) or starts now (its slot, or the run's first output), and back to back the next
+        // output is queued, its job started, as this call starts.
+        let recovery =
+            queued.take().unwrap_or_else(|| QueuedRecovery::spawn(&load.output, &recovery_spawner));
+        if timed.pace.is_none() {
+            queued =
+                outputs.peek().map(|next| QueuedRecovery::spawn(&next.output, &recovery_spawner));
+        }
+        recovery_tasks.update_tasks();
         let started = Instant::now();
-        let (tip, wall) = node.execute_timed(load.output, &updates.tx).await?;
+        let (tip, wall) = node.execute_timed(load.output, recovery, &updates.tx).await?;
         let export_active = timed
             .export
             .as_ref()
@@ -2185,11 +2226,7 @@ enum Stage {
 const STAGES: [(&str, &str, Stage); 18] = [
     ("total", "total", Stage::Total),
     ("  execute", "execute", Stage::Captured(EXECUTE)),
-    (
-        "  signer recovery",
-        "signer_recovery",
-        Stage::Captured("tn_reth.block_signer_recovery_seconds"),
-    ),
+    ("  signer recovery", "signer_recovery", Stage::Captured(RECOVER)),
     ("  finish", "finish", Stage::Captured(FINISH)),
     ("    hashed state", "hashed_state", Stage::Captured("tn_reth.block_hashed_state_seconds")),
     ("    state root", "state_root", Stage::Captured("tn_reth.block_state_root_seconds")),
@@ -4778,7 +4815,7 @@ mod tests {
         let index = CAPTURED.iter().position(|(captured, _)| *captured == name).unwrap() + 1;
         match CAPTURED[index - 1].1 {
             Per::Block => vec![index as f64 * 1e-3; blocks],
-            Per::Output => vec![index as f64 * 1e-2],
+            Per::Output | Per::Overlapped => vec![index as f64 * 1e-2],
         }
     }
 
