@@ -80,8 +80,11 @@ contract's leaf composes its storage root and the union of the pieces' trie upda
 storage, smaller tries and a split that composes nothing (an emptied storage, a single non-empty
 nibble) leave the storage root to one task or the walk. On the exec bench, against the account
 split alone, the state root fell to 0.53x at peak and 0.54x on the busy profile on the Mac, and to
-0.41x and 0.44x on a 22-thread Linux VM (the whole output by 8% and 5% on the Mac, 12% and 6% on the
-VM).
+0.41x and 0.44x on a 22-thread Linux VM. The whole output fell by 8% and 5% on the Mac (local NVMe).
+On the VM's 20,000-IOPS cloud disk it fell by 9% at peak (transactions per second +10%) and not at
+all on the busy profile: the busy commit is bound by the disk's IOPS, and its data sync grew by the
+time the state root saved for the same pages written (both sides on one aged base, gap fill fixed at
+4 pages).
 
 One block in 256 with parallel work (storage-root tasks or a split walk) is also computed serially
 and compared; a difference is logged with both roots, counted in
