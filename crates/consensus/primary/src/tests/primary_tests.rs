@@ -602,7 +602,8 @@ fn test_requested_parents_records_every_citing_author() {
 }
 
 /// A parent cited first by an author that never supplies it is still requested from, and
-/// accepted from, every later author whose header cites it (issue #1797).
+/// accepted from, every later author whose header cites it (issue #1797), and never accepted from
+/// an author this node did not ask for it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
     const NUM_PARENTS: usize = 10;
@@ -726,7 +727,35 @@ async fn test_request_vote_missing_parent_supplied_by_any_citing_author() {
     let received_missing: HashSet<_> = missing.into_iter().collect();
     assert_eq!(expected_missing, received_missing);
 
-    // TEST PHASE 3: the parents the honest author attaches are accepted and the vote is cast.
+    // TEST PHASE 3: an author this node never asked attaches the missing parents, and a round 3
+    // certificate no header cites, to its first request. Nothing it attaches is processed, so its
+    // vote waits for parents that never arrive and times out, and none of them is stored.
+    let outsider = fixture.authorities().nth(3).unwrap();
+    let outsider_header = outsider
+        .header_builder_at_round(&fixture.committee(), 3)
+        .author(outsider.id())
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .latest_execution_block(BlockNumHash::new(0, dummy_hash))
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+    outsider_header.payload().iter().for_each(|(digest, worker_id)| {
+        payload_store.write_payload(digest, worker_id).unwrap();
+    });
+    let uncited = all_certificates[NUM_PARENTS * 2].clone();
+    assert_eq!(uncited.round(), 3);
+    let attached: Vec<_> = round_2_missing.iter().cloned().chain([uncited.clone()]).collect();
+    let response = timeout(
+        Duration::from_secs(10),
+        handler.vote(*outsider.authority().protocol_key(), outsider_header, attached),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Err(PrimaryNetworkError::Timeout(_))), "{response:?}");
+    for digest in expected_missing.iter().chain([uncited.digest()].iter()) {
+        assert!(!certificate_store.contains(digest).unwrap(), "{digest:?} was processed");
+    }
+
+    // TEST PHASE 4: the parents the honest author attaches are accepted and the vote is cast.
     // Before the fix they were dropped because another author was recorded as their only owner.
     let response =
         timeout(Duration::from_secs(5), handler.vote(author_peer, author_header, round_2_missing))
