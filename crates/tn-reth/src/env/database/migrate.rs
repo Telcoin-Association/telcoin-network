@@ -33,10 +33,11 @@
 //!
 //! **Steps.**
 //! 1. Remove a stopped migration's temp directory.
-//! 2. Open MDBX read-only, and sum the live bytes of reth's tables in it: their branch, leaf and
-//!    overflow pages times the page size, as `db stats` reports them on the MDBX build
-//!    ([`mdbx_live_bytes`]). Warn of any named database in it that is not one of reth's tables: its
-//!    rows are not copied (reth does not read them either).
+//! 2. Open MDBX read-only, with the node's read transaction timeout as tn-lmdb takes it
+//!    (`--db.read-transaction-timeout`), and sum the live bytes of reth's tables in it: their
+//!    branch, leaf and overflow pages times the page size, as `db stats` reports them on the MDBX
+//!    build ([`mdbx_live_bytes`]). Warn of any named database in it that is not one of reth's
+//!    tables: its rows are not copied (reth does not read them either).
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
@@ -52,9 +53,9 @@
 //!    takes the engine's append. Any refused row (out of order, a second value for a dup row's
 //!    subkey, a size the adapter cannot store) fails the migration.
 //! 6. Verify: each table's rows copied equal MDBX's count of them (`db_stat`), so a short read
-//!    fails; a read-back pass over each tn-lmdb table hashes equal to its copy; then
-//!    `TnLmdbEnv::sync`, the engine's full check of the file (`TnLmdbEnv::check`), and its entry
-//!    count of each table equal to the rows copied.
+//!    fails; a read-back pass over each tn-lmdb table, in one transaction with the long-read safety
+//!    off, hashes equal to its copy; then `TnLmdbEnv::sync`, the engine's full check of the file
+//!    (`TnLmdbEnv::check`), and its entry count of each table equal to the rows copied.
 //! 7. Close the tn-lmdb file, fsync the temp directory, and rename its `tn-lmdb.dat` into the
 //!    database directory: the commit point. Then fsync the database directory, and record tn-lmdb's
 //!    version in reth's `database.version` (`TN_LMDB_DB_VERSION`, the rollback tripwire), so a
@@ -97,7 +98,7 @@ use std::{
 use eyre::WrapErr as _;
 use reth_db::{
     cursor::{DbCursorRO as _, DbCursorRW as _},
-    mdbx::{tx::Tx, DatabaseArguments, Error as MdbxError, RO},
+    mdbx::{tx::Tx, DatabaseArguments, Error as MdbxError, MaxReadTransactionDuration, RO},
     table::Table,
     tables::{RawTable, TableViewer, Tables},
     transaction::{DbTx, DbTxMut as _},
@@ -130,11 +131,14 @@ const PROGRESS_ROWS: u64 = 10_000_000;
 const HEADROOM_FLOOR: u64 = 1 << 30;
 
 /// The named steps of a migration, at which a test can stop it as a kill would (the test-only
-/// `STOP_AT`), or fail it as an I/O error would (`FAIL_AT`).
+/// `STOP_AT`), fail it as an I/O error would (`FAIL_AT`), or hold it as a slow read would
+/// (`PAUSE_AT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     /// After a commit of the copy: rows are in the temp directory's file.
     MidCopy,
+    /// After the read-back checked a table, inside its read transaction of the copy.
+    MidVerify,
     /// Verified, synced and closed, before the rename (the commit point).
     BeforeRename,
     /// After the rename, before the database directory's fsync and the removal of MDBX's files.
@@ -179,6 +183,10 @@ thread_local! {
     /// Test-only: the step at which the next migration on this thread fails with an ordinary error,
     /// as a failed I/O call would fail it: unlike a [`Killed`] stop, the failure's cleanup runs.
     pub(super) static FAIL_AT: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
+    /// Test-only: the step at which the next migration on this thread waits, and for how long, as
+    /// a slow disk or a large table would hold it inside a read transaction.
+    pub(super) static PAUSE_AT: std::cell::Cell<Option<(Step, std::time::Duration)>> =
+        const { std::cell::Cell::new(None) };
     /// Test-only: the free bytes the migrations on this thread read in place of the filesystem's.
     pub(super) static FREE_BYTES: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
@@ -188,8 +196,13 @@ thread_local! {
 }
 
 /// Pass step `at`; a test stops the migration there through `STOP_AT` (after `STOP_PASSES`
-/// passes of it), or fails it there through `FAIL_AT`.
+/// passes of it), fails it there through `FAIL_AT`, or holds it there once through `PAUSE_AT`.
 fn step(at: Step) -> eyre::Result<()> {
+    #[cfg(test)]
+    if let Some((_, held)) = PAUSE_AT.get().filter(|(pause, _)| *pause == at) {
+        PAUSE_AT.set(None);
+        std::thread::sleep(held);
+    }
     #[cfg(test)]
     if FAIL_AT.get() == Some(at) {
         FAIL_AT.set(None);
@@ -412,7 +425,14 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
             path.display()
         )
     };
-    let src = reth_db::mdbx::open_db_read_only(path, DatabaseArguments::default())
+    // The node's read transaction timeout, as tn-lmdb's reads take it: the copy's read, which
+    // lives as long as the copy, opts out of it.
+    let limit = match args.read_transaction_timeout {
+        Some(limit) => MaxReadTransactionDuration::Set(limit),
+        None => MaxReadTransactionDuration::Unbounded,
+    };
+    let src_args = DatabaseArguments::default().with_max_read_transaction_duration(Some(limit));
+    let src = reth_db::mdbx::open_db_read_only(path, src_args)
         .wrap_err("failed to open the MDBX database read-only")
         .wrap_err_with(unchanged)?;
     refuse_non_v1_source(&src).wrap_err_with(unchanged)?;
@@ -660,6 +680,7 @@ fn verify_tables<D: Database>(db: &D, copies: &[TableCopy]) -> eyre::Result<()> 
     tx.disable_long_read_transaction_safety();
     for (table, copy) in Tables::ALL.iter().zip(copies) {
         table.view(&VerifyTable { tx: &tx, copy })?;
+        step(Step::MidVerify)?;
     }
     Ok(())
 }

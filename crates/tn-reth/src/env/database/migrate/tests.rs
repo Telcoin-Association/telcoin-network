@@ -15,7 +15,7 @@ use reth_db::{
     ClientVersion,
 };
 use reth_node_core::args::DatabaseArgs;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
 
 /// One table's raw rows: encoded keys and compressed values, in order.
@@ -608,11 +608,59 @@ fn a_migration_stopped_between_tables_migrates_again_at_the_next_open() {
     });
 }
 
-/// A migration stopped once its copy is verified and durable, before the rename (its commit
-/// point), migrates afresh at the next open.
+/// A migration stopped while it reads its copy back, or once the copy is verified and durable,
+/// before the rename (its commit point), migrates afresh at the next open.
 #[test]
 fn a_migration_stopped_before_its_commit_point_migrates_again_at_the_next_open() {
+    stop_then_reopen(Step::MidVerify, 0, assert_stopped_before_the_commit_point);
     stop_then_reopen(Step::BeforeRename, 0, assert_stopped_before_the_commit_point);
+}
+
+/// The read transaction timeout the long-read tests open with (`--db.read-transaction-timeout`
+/// in seconds, its least).
+const READ_TIMEOUT_SECS: u64 = 1;
+
+/// How long a long-read test holds the migration inside a read transaction: past
+/// [`READ_TIMEOUT_SECS`], with room for MDBX's timeout thread, which aborts a reader on its next
+/// wake after the deadline.
+const LONG_READ: Duration = Duration::from_secs(2);
+
+/// Migrate [`build_mdbx`]'s database at an open with `--db.read-transaction-timeout`
+/// [`READ_TIMEOUT_SECS`], held at the first pass of `hold`, inside one of the migration's long read
+/// transactions, for [`LONG_READ`], as a large table would hold it: the migration reads on past
+/// the timeout, and every table holds MDBX's rows.
+fn migrate_holding_a_long_read(hold: Step) {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let db_args =
+        DatabaseArgs { read_transaction_timeout: Some(READ_TIMEOUT_SECS), ..tn_lmdb_db_args() };
+
+    PAUSE_AT.set(Some((hold, LONG_READ)));
+    let db = open_tn_lmdb(&path, &db_args, version("2.0.0"))
+        .unwrap_or_else(|e| panic!("{hold:?}: the migration reads on past the timeout: {e:#}"));
+    assert_eq!(PAUSE_AT.get(), None, "{hold:?}: the migration was held");
+    assert_eq!(db.read_transaction_timeout(), Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "{hold:?}: every row, as MDBX held it");
+    assert!(exists(&path.join(MIGRATED_MARKER)), "{hold:?}: the migration finished");
+}
+
+/// The copy reads MDBX through one read transaction across every table, which on a large
+/// database lives past the read transaction timeout: it opts out of the timeout, so a copy held
+/// past it inside a table (after a bounded commit) reads the rest of its rows.
+#[test]
+fn the_copy_reads_mdbx_past_the_read_transaction_timeout() {
+    migrate_holding_a_long_read(Step::MidCopy);
+}
+
+/// The read-back of the copy reads tn-lmdb through one read transaction across every table,
+/// which lives as long as the copy: it opts out of the timeout, so a read-back held past it
+/// between two tables reads the rest.
+#[test]
+fn the_read_back_reads_tn_lmdb_past_the_read_transaction_timeout() {
+    migrate_holding_a_long_read(Step::MidVerify);
 }
 
 /// A migration stopped after its commit point (`tn-lmdb.dat` in place beside MDBX's files, no
