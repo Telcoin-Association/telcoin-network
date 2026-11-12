@@ -315,3 +315,28 @@ async fn replay_rejects_block2_not_built_on_block1_when_nothing_executed() -> ey
     manager.consensus_chain.clone().close().await;
     Ok(())
 }
+
+/// The block-1 anchor exemption carries a fresh node's replay through its first epoch close: the
+/// replay stops at the boundary output and hands its header to the close, where
+/// `write_epoch_record` compares a stored record with the closing block this node executed.
+#[tokio::test]
+async fn replay_anchored_on_block1_stops_at_the_epoch_close() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, outputs) = fresh_manager_with_saved_outputs(&temp, false).await?;
+    // output 3 commits at the boundary, so epoch 0 closes there
+    manager.epoch_boundary = 3;
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let mut replay = manager.replay_missed_consensus(fixture.committee(), &to_engine).await?;
+    assert_eq!(replay.take_epoch_close_hash(), Some(outputs[2].consensus_header_hash()));
+    for expected in &outputs {
+        assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), expected.consensus_header_hash());
+    }
+    assert!(engine_rx.try_recv().is_err());
+    assert_eq!(
+        manager.last_consensus_header.as_ref().map(|header| header.digest()),
+        Some(outputs[2].consensus_header_hash()),
+        "the close reads the boundary header the replay stashed"
+    );
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
