@@ -345,15 +345,19 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let genesis: Genesis = Config::load_from_path(&genesis_file, ConfigFmt::YAML)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
-    info!(target: "faucet-test", "nodes started - waiting for the network to produce a block...");
+    info!(target: "faucet-test", "nodes started - waiting for consensus output...");
 
     let rpc_url = endpoints[0].http_url.clone();
     let client = HttpClientBuilder::default().build(&rpc_url)?;
 
-    // wait for network convergence by polling until the network produces a block
-    wait_until(Duration::from_secs(30), "network produced a block", || async {
-        let block_number: String = client.request("eth_blockNumber", rpc_params![]).await?;
-        Ok(U256::from_str(&block_number)? > U256::ZERO)
+    // wait for network convergence by polling the consensus chain, not the execution chain: an
+    // idle committee commits empty outputs that execute no block (the engine skips an empty
+    // output unless it closes the epoch), so `eth_blockNumber` stays at genesis until the first
+    // drip below. An RPC that is not serving yet counts as not converged.
+    wait_until(Duration::from_secs(30), "network committed consensus output", || async {
+        let header: Result<serde_json::Value, _> =
+            client.request("tn_latestConsensusHeader", rpc_params![]).await;
+        Ok(header.is_ok_and(|header| header["number"].as_u64().is_some_and(|number| number > 0)))
     })
     .await?;
 
