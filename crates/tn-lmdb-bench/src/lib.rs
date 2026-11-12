@@ -217,8 +217,10 @@ pub struct RowSpec {
     /// tier's 100k is one commit of 100k entries, a fraction of a millisecond spent mostly
     /// writing fresh file pages, whose cost moves by 10% and more from run to run with the
     /// machine's memory state however many passes it takes: such a row is reported in a small
-    /// run, and gated from 1M entries (the default and full tiers) on. The run's size decides,
-    /// not its tier's name, since `--n` overrides the tier's.
+    /// run, and gated from 1M entries (the default and full tiers) on. `ro.txn.mt`, 4 threads
+    /// started together, is the same: it wants four idle cores, which the quick tier's host, a
+    /// shared CI runner, does not have. The run's size decides, not its tier's name, since
+    /// `--n` overrides the tier's.
     pub small_gate: bool,
     /// The job that measures it.
     pub(crate) job: Job,
@@ -262,7 +264,7 @@ pub const ROWS: &[RowSpec] = &[
     row("seek.range", Generic, NsPerOp, NoSyncOnly, Job::Rand),
     row("seek.range.sorted", Generic, NsPerOp, NoSyncOnly, Job::Rand),
     row("ro.txn", Generic, NsPerOp, NoSyncOnly, Job::Txn),
-    row("ro.txn.mt", Generic, NsPerOp, NoSyncOnly, Job::Txn),
+    row("ro.txn.mt", Generic, NsPerOp, NoSyncOnly, Job::Txn).not_gated_when_small(),
     row("commit.small", Generic, NsPerOp, Every, Job::Small),
     row("mixed", Generic, NsPerOp, Every, Job::Mixed),
     row("delete.rand90", Generic, NsPerOp, NoSyncOnly, Job::Delete),
@@ -898,7 +900,7 @@ mod tests {
     #[test]
     fn every_row_is_gated_from_the_size_on() {
         let small: Vec<&str> = ROWS.iter().filter(|r| !r.gate(100_000)).map(|r| r.name).collect();
-        assert_eq!(small, ["put.seq.commit", "put.rand.commit"]);
+        assert_eq!(small, ["put.seq.commit", "put.rand.commit", "ro.txn.mt"]);
         assert!(ROWS.iter().all(|r| r.gate(GATE_EVERY_ROW_FROM_N)));
         assert!(ROWS.iter().any(|r| !r.gate(GATE_EVERY_ROW_FROM_N - 1)));
     }

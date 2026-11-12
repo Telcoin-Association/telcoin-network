@@ -54,7 +54,7 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | `seek.range` | seek | n | a seek to a random absent key, then 9 `next` (100k seeks) |
 | `seek.range.sorted` | seek | n | the same targets sorted ascending, as a walker seeks |
 | `ro.txn` | transaction | n | short read transactions on one thread, each `begin_ro`, 2 point gets of random hits and its drop (20k), over a table of random entries small enough to stay in the caches (10k), so the gets do not bury the transaction's own cost under memory misses |
-| `ro.txn.mt` | transaction a thread | n | the same on 4 threads at once over one environment, each its own gets, started together: the span from the first thread's start to the last one's end over a thread's transactions. Equal to `ro.txn` when the threads share nothing they write, but for the threads' start skew (the last thread to reach the barrier starts at once, the others once woken) and any wait for a core: it wants 4 idle cores, and on a shared runner it is noisy; the ratio is what readers on several threads (an RPC node) pay for the state they share. The thread count is fixed so runs compare across machines; 4 stay on performance cores (an M1 Max has 8) |
+| `ro.txn.mt` | transaction a thread | n | the same on 4 threads at once over one environment, each its own gets, started together: the span from the first thread's start to the last one's end over a thread's transactions. Equal to `ro.txn` when the threads share nothing they write, but for the threads' start skew (the last thread to reach the barrier starts at once, the others once woken) and any wait for a core: it wants 4 idle cores, and on a shared runner it is noisy, so it is not gated in a run under 1M entries (see below); the ratio is what readers on several threads (an RPC node) pay for the state they share. The thread count is fixed so runs compare across machines; 4 stay on performance cores (an M1 Max has 8) |
 | `commit.small` | transaction | * | transactions of 3 puts committed one by one into a fresh environment (2000) |
 | `mixed` | operation | * | 50/50 deletes and re-inserts over a full random table, 1000 a transaction (100k) |
 | `delete.rand90` | delete | n | 90% of a random table deleted in random order, one transaction |
@@ -79,7 +79,7 @@ of writing pages again after a sync), which is why it is the one to gate on.
 
 | tier | `n` | reps | sync | wall time (M1 Max) |
 |---|---|---|---|---|
-| `quick` | 100k | 3 | nosync | about 15 s (durable rows: 6 s more); a comparison of 4 rounds, 2 min |
+| `quick` | 100k | 3 | nosync | about 15 s (durable rows: 6 s more, which the pull-request bench adds with `--sync nosync,durable`); a comparison of 4 rounds, 2 min |
 | `default` | 1M | 3 | nosync | about 2 min |
 | `full` | 1M | 7 | nosync, durable | several minutes; durable time depends on the drive |
 
@@ -122,11 +122,13 @@ cargo build --release -p tn-lmdb-bench
 `metric` is `ns_per_op` (unit `ns`), `bytes` (`B`) or `pages_per_op` (`pages`); the last two are
 exact. A row is keyed by `name` and `sync`. `median` of an even count is the mean of the middle
 two. `gate` is false for a row the comparison reports but does not gate at the run's size: the two
-single-commit rows (`put.seq.commit`, `put.rand.commit`) in a run of fewer than 1M entries a bulk
-table (`n`; the quick tier's 100k), where a commit of 100k entries takes a fraction of a
-millisecond, mostly writing fresh file pages, and its cost moves by 10% and more from one run to
-the next with the machine's memory state, however many passes it takes. From 1M entries on (the
-default and full tiers, or any `--n` of 1M or more; a commit of milliseconds) they are gated.
+single-commit rows (`put.seq.commit`, `put.rand.commit`) and the 4-thread `ro.txn.mt` in a run of
+fewer than 1M entries a bulk table (`n`; the quick tier's 100k). A commit of 100k entries takes a
+fraction of a millisecond, mostly writing fresh file pages, and its cost moves by 10% and more from
+one run to the next with the machine's memory state, however many passes it takes; the thread row
+wants four idle cores, which the quick tier's usual host, a shared CI runner, does not have. From
+1M entries on (the default and full tiers, or any `--n` of 1M or more; a commit of milliseconds)
+they are gated.
 
 ## Comparing two revisions
 
