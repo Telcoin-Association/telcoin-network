@@ -104,9 +104,9 @@ This page covers the node's own listeners only.
 ## Metric label policy
 
 - No per-address labels: no IP, socket, multiaddr or hostname is ever a label value.
-- Per-peer labels only for committee or trusted peers, with a bounded lifecycle and cleanup when the peer leaves the set.
+- Per-peer labels only for committee or trusted peers, with every other peer under one shared value, so the series count stays bounded by the peers that were in the set since the node started.
 - Raw errors, URLs and attacker-supplied identities are never label values.
-- Every label vocabulary is bounded: a static string, a Rust enum with fixed arms, or a small worker id.
+- Every label vocabulary is bounded: a static string, a Rust enum with fixed arms, a small worker id, or the BLS key of a peer the previous rule allows.
 
 ### Audit of the tree at this change
 
@@ -119,15 +119,20 @@ Every labelled series in the twelve metrics modules was classified at the base o
 | `tn_info` (`version`) | `&'static str` build version | static |
 | `tn_node_mode` (`mode`) | literal array, 3 values | static |
 | `tn_batch_builder_*` (`worker`, `reason`) | `WorkerId`; `BlockSealError`, 8 arms | worker id, enum |
-| `tn_worker_*` (`worker`, `reason`, `source`) | `WorkerId`; `QuorumWaiterError` 6 arms (`Rpc` payload dropped), `ForwardDropReason`, `SyncShedReason`; `local` / `remote` | worker id, enum, static |
+| `tn_worker_*` (`worker`, `reason`, `source`, `tier`, `peer`) | `WorkerId`; `QuorumWaiterError` 6 arms (`Rpc` payload dropped), `ForwardDropReason`, `SyncShedReason`; `local` / `remote`; `PeerTier`, 2 arms; `peer` on the two batch request counters only: a current committee member's BLS key, else `other` | worker id, enum, static, committee key |
 | `tn_reth_*` (`reason`, `call`) | `InvalidTxSkipReason` 5 arms, `HandoffDropReason` 7 arms, `ForwardDropReason` 5 arms; `&'static str` literals | enum, static |
 | `tn_network_*` (`network`, `kind`, `class`, `outcome`, `reason`, `direction`, `severity`) | `primary` or `worker-{id}`; `ServiceClass` 6 arms, `InboundFailureOutcome` 5 arms, `ConnectionLimitReason` 7 arms, `InboundDenial` 4 arms, `ShedReason` 3 arms; literals | worker id, enum, static |
 | `tn_storage_write_failures_total` (`env`, `op`) | `&'static str` env constants; `WriteOp`, 6 arms | static, enum |
 | reth passthrough (`reth_*`) | reth's own labels, copied unchanged | reth |
 
 Result: 0 violations.
-No label carries a peer id, BLS key, hostname, IP, socket, multiaddr, URL, raw error string or remote-supplied topic.
-No per-peer labels exist, so no cleanup on committee rotation is needed.
+No label carries a libp2p peer id, hostname, IP, socket, multiaddr, URL, raw error string or remote-supplied topic.
+One label carries a BLS key: `peer` on `tn_worker_batch_requests_denied_total` and `tn_worker_batch_requests_failed_total`.
+Its value is the key of a current committee member, and every other peer records under the single value `other`.
+The worker's committee set is replaced when each epoch starts and is empty until the first one starts, so a request denied or failed before then records as `other`.
+The worker caches counters for at most the committee plus `other`, because it drops the members that left the committee before it adds a new entry.
+The exported series are not cleaned up: the recorder sets no idle timeout, so a departed member's series stays at its last value until the node restarts.
+Each of the two counters therefore has, per worker, at most one series for each committee member seen since startup, plus `other`.
 The only error `Display` text that reaches label code (`tn_network_connection_limit_rejections_total`) is matched against fixed strings, and only the bounded enum becomes the label.
 
 To add a metric: derive the label value from an enum `as_str` that returns `&'static str`, register the series at zero where the owning crate registers its handles, and never format a remote-supplied value into a label.

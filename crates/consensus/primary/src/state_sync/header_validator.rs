@@ -3,7 +3,7 @@
 use super::CertificateManagerCommand;
 use crate::ConsensusBus;
 use futures::{stream::FuturesOrdered, StreamExt as _};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 use tn_config::{ConsensusConfig, RetryConfig};
 use tn_network_types::{PrimaryToWorkerClient as _, WorkerSynchronizeMessage};
 use tn_storage::{CertificateStore, PayloadStore};
@@ -67,6 +67,10 @@ where
     }
 
     /// Synchronize batches.
+    ///
+    /// A sync that fetched batches logs `header batches synced`; one that gave up after asking
+    /// the workers for batches (the fetch failed, or the header fell behind the committed round)
+    /// logs `header batch sync abandoned`. Headers with every batch already stored log neither.
     pub(super) async fn sync_header_batches(
         &self,
         header: &Header,
@@ -81,6 +85,7 @@ where
             }
         }
 
+        let started = Instant::now();
         // Clone the round updates channel so we can get update notifications specific to
         // this RPC handler.
         let mut rx_committed_round_updates =
@@ -122,6 +127,10 @@ where
             }
         }
 
+        // counts for the sync log lines, taken before the requests consume the map
+        let missing_batches: usize = missing.values().map(Vec::len).sum();
+        let workers = missing.len();
+
         // Build Synchronize requests to workers.
         let mut synchronize_handles = Vec::new();
         for (worker_id, digests) in missing {
@@ -162,9 +171,39 @@ where
         loop {
             tokio::select! {
                 results = &mut wait_synchronize => {
-                    break results
-                        .map(|_| ())
-                        .map_err(|e| HeaderError::SyncBatches(format!("error synchronizing batches: {e:?}")))
+                    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    break match results {
+                        Ok(_) => {
+                            if workers > 0 {
+                                debug!(
+                                    target: "primary::header_validator",
+                                    author = %header.author(),
+                                    round = header.round(),
+                                    missing = missing_batches,
+                                    workers,
+                                    elapsed_ms,
+                                    "header batches synced"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            // debug, not warn: this runs once per header or certificate whose
+                            // sync fails, unthrottled, so a degraded worker would flood an info log
+                            debug!(
+                                target: "primary::header_validator",
+                                author = %header.author(),
+                                round = header.round(),
+                                missing = missing_batches,
+                                workers,
+                                elapsed_ms,
+                                reason = "sync_failed",
+                                err = ?e,
+                                "header batch sync abandoned"
+                            );
+                            Err(HeaderError::SyncBatches(format!("error synchronizing batches: {e:?}")))
+                        }
+                    };
                 },
 
                 // The synchronization abort condition checks against the committed round from consensus.
@@ -185,6 +224,21 @@ where
                     debug!(target: "primary::header_validator", ?committed_round, "committed round update");
 
                     if header.round() < committed_round.saturating_sub(max_age) {
+                        if workers > 0 {
+                            // debug for the same reason as `sync_failed`: on the vote path
+                            // (max_age 0) every header whose sync a commit overtakes lands here
+                            debug!(
+                                target: "primary::header_validator",
+                                author = %header.author(),
+                                round = header.round(),
+                                missing = missing_batches,
+                                workers,
+                                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                reason = "too_old",
+                                committed_round,
+                                "header batch sync abandoned"
+                            );
+                        }
                         return Err(HeaderError::TooOld{
                             digest: header.digest(),
                             header_round: header.round(),

@@ -14,6 +14,7 @@ use std::{
     collections::VecDeque,
     fmt::{self, Display, Formatter},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -79,6 +80,13 @@ pub struct ConsensusOutput {
     close_epoch: bool,
     /// Cached digest of the consensus header for this output.
     consensus_header_hash_cache: ConsensusHeaderDigest,
+    /// When this node handed the output to its engine (see [`Self::forwarded_at`]).
+    ///
+    /// Transient and node-local like `close_epoch`: never serialized, never part of the
+    /// consensus header digest and never an execution input. A plain `Option<Instant>` needs no
+    /// wrapper because this type derives only `Clone` and `Debug`; equality and hashing go
+    /// through the digest.
+    forwarded_at: Option<Instant>,
 }
 
 // NOTE: only [Self::inner] is serialized. `close_epoch` is intentionally NOT part of the
@@ -86,6 +94,7 @@ pub struct ConsensusOutput {
 // digest) and is always recomputed from `committed_at() >= epoch_boundary`. Any consumer that
 // deserializes a [ConsensusOutput] MUST recompute it via `EpochManager::process_output` before
 // trusting [ConsensusOutput::close_epoch] — a deserialized output always reports `false`.
+// `forwarded_at` is likewise local observability state: a deserialized output reports `None`.
 impl Serialize for ConsensusOutput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -104,7 +113,12 @@ impl<'de> Deserialize<'de> for ConsensusOutput {
         let inner = ConsensusOutputInner::deserialize(deserializer)?;
         let consensus_header_hash_cache =
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
-        Ok(Self { inner: Arc::new(inner), close_epoch: false, consensus_header_hash_cache })
+        Ok(Self {
+            inner: Arc::new(inner),
+            close_epoch: false,
+            consensus_header_hash_cache,
+            forwarded_at: None,
+        })
     }
 }
 
@@ -128,7 +142,7 @@ impl ConsensusOutput {
         });
         let consensus_header_hash_cache =
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
-        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
+        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache, forwarded_at: None }
     }
     pub fn new_with_subdag(
         sub_dag: CommittedSubDag,
@@ -277,6 +291,24 @@ impl ConsensusOutput {
     /// The engine should make a system call to consensus registry contract to close the epoch.
     pub fn close_epoch(&self) -> bool {
         self.close_epoch
+    }
+
+    /// Stamp the instant this node hands the output to its engine.
+    ///
+    /// `EpochManager::process_output` stamps it just before the send on the engine channel, so
+    /// the engine can time the hop, a send blocked on a full channel included. Observability
+    /// only; see [`Self::forwarded_at`].
+    pub fn set_forwarded_at(&mut self, at: Instant) {
+        self.forwarded_at = Some(at);
+    }
+
+    /// The instant this node handed the output to its engine, or `None` when nothing stamped it
+    /// (a deserialized output, or one built outside the forwarding path such as in tests).
+    ///
+    /// Node-local and transient: it is not serialized, not part of [`Self::digest`] and never
+    /// an execution input. The engine reads it into `tn_engine_forward_wait_seconds`.
+    pub fn forwarded_at(&self) -> Option<Instant> {
+        self.forwarded_at
     }
 
     /// The source of randomness used to shuffle future committees at the epoch boundary: the

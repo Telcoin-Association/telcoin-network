@@ -97,7 +97,11 @@ impl Config {
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
-    /// Load a config from it's component parts.
+    /// Load the bundled adiri (testnet) config: node info from the datadir, parameters and
+    /// genesis compiled in.
+    ///
+    /// Writes nothing to the datadir. Call [`Config::write_adiri_committee`] once the caller has
+    /// decided to use this config, so a start refused after the load leaves the datadir as it was.
     pub fn load_adiri<P: TelcoinDirs>(tn_datadir: &P, version: &'static str) -> eyre::Result<Self> {
         let validator_info: NodeInfo =
             Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
@@ -105,17 +109,16 @@ impl Config {
             serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(TESTNET_GENESIS).expect("bad adiri genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = tn_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(tn_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
-    /// Load a config from it's component parts.
+    /// Load the bundled mainnet config: node info from the datadir, parameters and genesis
+    /// compiled in.
+    ///
+    /// Writes nothing to the datadir. Call [`Config::write_mainnet_committee`] once the caller
+    /// has decided to use this config, so a start refused after the load leaves the datadir as it
+    /// was.
     pub fn load_mainnet<P: TelcoinDirs>(
         tn_datadir: &P,
         version: &'static str,
@@ -126,14 +129,20 @@ impl Config {
             serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(MAINNET_GENESIS).expect("bad adiri genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = tn_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(tn_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
+    }
+
+    /// Write the bundled adiri (testnet) genesis committee to `genesis/committee.yaml` unless
+    /// that file already exists.
+    pub fn write_adiri_committee<P: TelcoinDirs>(tn_datadir: &P) -> eyre::Result<()> {
+        write_committee_if_missing(tn_datadir, TESTNET_COMMITTEE)
+    }
+
+    /// Write the bundled mainnet genesis committee to `genesis/committee.yaml` unless that file
+    /// already exists.
+    pub fn write_mainnet_committee<P: TelcoinDirs>(tn_datadir: &P) -> eyre::Result<()> {
+        write_committee_if_missing(tn_datadir, MAINNET_COMMITTEE)
     }
 
     /// Update the authority protocol key.
@@ -244,8 +253,9 @@ pub struct Parameters {
     ///
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`; while the sub-second gate is dormant for the epoch
-    /// it is rounded up to whole seconds, matching the voter) and below the 10 s libp2p request
-    /// timeout. `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
+    /// it is rounded up to whole seconds, matching the voter), above the voter's 1 s execution
+    /// wait (`VOTE_EXECUTION_WAIT`) and below the 10 s libp2p request timeout.
+    /// `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
     /// it on entering any epoch it can still vote in, so it refuses to start such an epoch with
     /// one. An epoch its committee has already closed is replayed without the check. Defaults to
     /// 5 s.
@@ -460,6 +470,14 @@ impl Parameters {
     ///   the buffer collapses that window to zero and wedges the node inactive during normal
     ///   operation. Coupling the floor to the same constant the handler subtracts keeps the two
     ///   from drifting apart.
+    /// - `gc_depth + gc_activity_window(gc_depth) + RETENTION_SLACK` must not exceed
+    ///   [`tn_types::ROUNDS_TO_KEEP`]. Peers prune certificates below their newest written round
+    ///   minus `ROUNDS_TO_KEEP`, and a validator that restarts consensus up to the activity window
+    ///   behind (a rejoin, a restart) rebuilds its DAG from the `gc_depth` rounds below that point,
+    ///   which it can fetch only while some peer still holds them. With `ROUNDS_TO_KEEP` 128 any
+    ///   `gc_depth` above 64 is refused here (100 <= 128 at `gc_depth` 50); the protocol ceiling
+    ///   [`tn_types::MAX_GC_DEPTH`] (50) refuses those first today, so this check binds once that
+    ///   ceiling is raised.
     /// - `max_header_num_of_batches` must be at least one, otherwise the proposer caps every header
     ///   at zero batch digests: it drains no transactions while its digest queue grows without
     ///   bound.
@@ -481,6 +499,23 @@ impl Parameters {
             "gc_depth {} must exceed the activity buffer {} or the node cannot stay active",
             self.gc_depth,
             tn_types::GC_ACTIVITY_BUFFER,
+        );
+        // the window is `gc_depth - GC_ACTIVITY_BUFFER` here (the check above), so the largest
+        // gc_depth that fits is `(ROUNDS_TO_KEEP + GC_ACTIVITY_BUFFER - RETENTION_SLACK) / 2`
+        let window = tn_types::gc_activity_window(self.gc_depth);
+        let retention =
+            self.gc_depth.saturating_add(window).saturating_add(tn_types::RETENTION_SLACK);
+        eyre::ensure!(
+            retention <= tn_types::ROUNDS_TO_KEEP,
+            "gc_depth {} + activity window {} + retention slack {} = {} exceeds ROUNDS_TO_KEEP {}: \
+             peers prune the certificate rounds a rejoining validator rebuilds its DAG from, so a \
+             gc_depth above {} refuses to start",
+            self.gc_depth,
+            window,
+            tn_types::RETENTION_SLACK,
+            retention,
+            tn_types::ROUNDS_TO_KEEP,
+            (tn_types::ROUNDS_TO_KEEP + tn_types::GC_ACTIVITY_BUFFER - tn_types::RETENTION_SLACK) / 2,
         );
         eyre::ensure!(
             self.max_header_num_of_batches >= 1,
@@ -529,6 +564,19 @@ impl Parameters {
     }
 }
 
+/// Write `committee_yaml` to the datadir's `genesis/committee.yaml` unless that file exists.
+fn write_committee_if_missing<P: TelcoinDirs>(
+    tn_datadir: &P,
+    committee_yaml: &str,
+) -> eyre::Result<()> {
+    let committee_path = tn_datadir.committee_path();
+    if !committee_path.exists() {
+        std::fs::create_dir_all(tn_datadir.genesis_path())?;
+        File::create_new(committee_path)?.write_all(committee_yaml.as_bytes())?
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::Parameters;
@@ -559,7 +607,7 @@ mod test {
     /// paths `--chain mainnet` uses.
     ///
     /// `Config::load_mainnet` parses `MAINNET_GENESIS`/`MAINNET_PARAMETERS` with
-    /// `serde_yaml::from_str` and materializes `MAINNET_COMMITTEE` to
+    /// `serde_yaml::from_str` and `Config::write_mainnet_committee` writes `MAINNET_COMMITTEE` to
     /// `<datadir>/genesis/committee.yaml`, which the epoch manager later reads back via
     /// `Config::load_from_path::<Committee>` (crates/node/src/manager/node.rs). This gate
     /// drives all three files through exactly those paths, so a schema-stale committed file
@@ -589,6 +637,29 @@ mod test {
             4,
             "mainnet placeholder committee must seat the 4 placeholder validators"
         );
+    }
+
+    /// The named-chain loaders write nothing to the datadir; the committee writers add
+    /// `genesis/committee.yaml` once and leave an existing file alone.
+    #[test]
+    fn named_chain_load_writes_nothing_and_committee_write_keeps_existing_file() {
+        use crate::{NodeInfo, TelcoinDirs as _};
+
+        let dir = tempfile::tempdir().expect("datadir");
+        let datadir = dir.path().to_path_buf();
+        Config::write_to_path(datadir.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        Config::load_mainnet(&datadir, "test").expect("load mainnet");
+        Config::load_adiri(&datadir, "test").expect("load adiri");
+        assert!(!datadir.genesis_path().exists(), "a load must not create genesis/");
+
+        Config::write_mainnet_committee(&datadir).expect("write mainnet committee");
+        let written = std::fs::read_to_string(datadir.committee_path()).expect("committee");
+        assert_eq!(written, MAINNET_COMMITTEE);
+        // an existing committee file is kept as it is
+        Config::write_adiri_committee(&datadir).expect("existing committee kept");
+        let kept = std::fs::read_to_string(datadir.committee_path()).expect("committee");
+        assert_eq!(kept, MAINNET_COMMITTEE);
     }
 
     /// The mainnet genesis `ConsensusRegistry` account must carry the CURRENT tn-contracts
@@ -890,5 +961,39 @@ mod test {
         adiri
             .validate_operational_floors()
             .expect("the adiri preset must satisfy the operational floors");
+    }
+
+    /// The certificate-retention floor accepts the devnet `gc_depth` (50 + 40 + 10 = 100 <= 128)
+    /// and the largest that fits (64 + 54 + 10 = 128).
+    #[test]
+    fn parameters_accept_gc_depth_within_certificate_retention() {
+        for gc_depth in [50, 64] {
+            let params = Parameters { gc_depth, ..Default::default() };
+            assert!(
+                params.validate_operational_floors().is_ok(),
+                "gc_depth {gc_depth} fits ROUNDS_TO_KEEP and must be accepted"
+            );
+        }
+    }
+
+    /// The certificate-retention floor refuses a `gc_depth` whose rebuild window peers may have
+    /// pruned, with a message naming the numbers and the rule.
+    #[test]
+    fn parameters_reject_gc_depth_beyond_certificate_retention() {
+        let params = Parameters { gc_depth: 65, ..Default::default() };
+        assert!(
+            params.validate_operational_floors().is_err(),
+            "gc_depth 65 needs 130 rounds of retention and must be rejected"
+        );
+        let params = Parameters { gc_depth: 79, ..Default::default() };
+        let err = params
+            .validate_operational_floors()
+            .expect_err("gc_depth 79 needs 158 rounds of retention and must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "gc_depth 79 + activity window 69 + retention slack 10 = 158 exceeds ROUNDS_TO_KEEP \
+             128: peers prune the certificate rounds a rejoining validator rebuilds its DAG from, \
+             so a gc_depth above 64 refuses to start"
+        );
     }
 }

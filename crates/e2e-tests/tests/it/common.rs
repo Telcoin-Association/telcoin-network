@@ -11,7 +11,7 @@ use alloy::{
 use clap::Parser as _;
 use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
-use eyre::Report;
+use eyre::{Report, WrapErr as _};
 use jsonrpsee::{
     core::{client::ClientT as _, DeserializeOwned},
     http_client::HttpClientBuilder,
@@ -170,9 +170,9 @@ impl ProcessGuard {
     ///
     /// The exit wait polls EVERY child against one shared 6s deadline (the same shape as
     /// [`Self::wait_for_natural_exits`]) instead of giving each child its own [`wait_or_kill`]
-    /// window: a 10ms poll reaps the common case (all children already dying from the parallel
-    /// SIGTERM) as soon as the last one exits, instead of rounding each child up to its next
-    /// 1.2s poll slot in sequence.
+    /// window in sequence: a 10ms poll reaps the common case (all children already dying from the
+    /// parallel SIGTERM) as soon as the last one exits, and one deadline bounds the whole wait
+    /// instead of one per child.
     pub(crate) fn kill_all(&mut self) {
         // Phase 1: SIGTERM all in parallel for fast graceful shutdown
         self.send_term_all();
@@ -296,30 +296,38 @@ pub(crate) fn kill_child(child: &mut Child) -> bool {
     wait_or_kill(child)
 }
 
-/// Poll for exit up to 5 times (1.2s each), then SIGKILL + wait.
+/// Poll for exit at 10ms against a 6s deadline, then SIGKILL + wait.
 /// Assumes SIGTERM has already been sent. Returns whether the child exited before the SIGKILL.
+///
+/// The poll has the shape of [`ProcessGuard::kill_all`]'s. A node's graceful shutdown takes about
+/// 2.3s, and the 1.2s poll slots this used to sleep in rounded that up to 3.6s, so every mid-test
+/// restart paid up to 1.3s of pure wait here. The SIGKILL escalation grace is unchanged.
 fn wait_or_kill(child: &mut Child) -> bool {
-    for _ in 0..5 {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                info!(target: "e2e-test", "child exited");
-                return true;
-            }
-            Ok(None) => {}
-            Err(e) => error!(target: "e2e-test", "error waiting on child to exit: {e}"),
-        }
-        std::thread::sleep(Duration::from_millis(1200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let exited =
+        std::iter::repeat(()).take_while(|()| std::time::Instant::now() < deadline).any(|()| {
+            std::thread::sleep(Duration::from_millis(10));
+            child
+                .try_wait()
+                .inspect_err(|e| error!(target: "e2e-test", "error waiting on child to exit: {e}"))
+                .ok()
+                .flatten()
+                .is_some()
+        });
+    if exited {
+        info!(target: "e2e-test", "child exited");
+    } else {
+        force_kill_and_reap(child);
     }
-    force_kill_and_reap(child);
-    false
+    exited
 }
 
 /// SIGKILL a child that did not exit within its SIGTERM grace, then reap it.
 ///
-/// The shared tail of every kill path ([`wait_or_kill`], [`ProcessGuard::kill_all`], and
-/// `basefee.rs`'s boundary-kill helper). Failures are logged, not propagated: teardown has no
-/// recovery path, and signaling a child that already exited is harmless (`kill` on a reaped
-/// child returns `InvalidInput` without touching any pid).
+/// The shared tail of every kill path ([`wait_or_kill`], [`ProcessGuard::kill_all`] and
+/// [`ProcessGuard::finish`]). Failures are logged, not propagated: teardown has no recovery path,
+/// and signaling a child that already exited is harmless (`kill` on a reaped child returns
+/// `InvalidInput` without touching any pid).
 pub(crate) fn force_kill_and_reap(child: &mut Child) {
     child.kill().unwrap_or_else(|e| error!(target: "e2e-test", ?e, "error sending SIGKILL"));
     child.wait().map(drop).unwrap_or_else(
@@ -428,9 +436,58 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     // exist or an epoch closes, so we cannot rely on block_number advancing
     // during idle periods. Actual block production is verified later by
     // send_and_confirm().
+    // Each poll logs nothing. The latest miss is kept and attached to a timeout, so the error
+    // still names the node that did not answer and the reason.
+    let last_miss: RefCell<Option<String>> = RefCell::new(None);
     wait_until_blocking(Duration::from_secs(45), "all nodes advancing", || {
-        Ok(client_urls.iter().all(|url| get_block_number(url).is_ok()))
+        let miss = client_urls.iter().find_map(|url| latest_block_miss(url));
+        let all_served = miss.is_none();
+        miss.into_iter().for_each(|text| *last_miss.borrow_mut() = Some(text));
+        Ok(all_served)
     })
+    .wrap_err_with(|| {
+        format!(
+            "last node not serving RPC: {}",
+            last_miss.borrow().as_deref().unwrap_or("none recorded")
+        )
+    })
+}
+
+/// Why `node` does not serve the latest block right now: its URL with the probe error or the null
+/// block. `None` when it serves one.
+fn latest_block_miss(node: &str) -> Option<String> {
+    probe_latest_block(node).map_or_else(
+        |e| Some(format!("{node}: {e:#}")),
+        |served| (!served).then(|| format!("{node}: latest block is null")),
+    )
+}
+
+/// Whether `node` answers one `eth_getBlockByNumber("latest")` request with a block right now:
+/// `Ok(false)` for a null block, `Err` for a transport or RPC error.
+///
+/// The readiness probe of [`network_advancing`]: the same request [`get_block_number`] makes, in
+/// ONE attempt that logs nothing. `call_rpc` retries 10 times with a 250ms backoff and logs an
+/// error after the last one, so a probe built on it rounds every node's start-up up to the next
+/// 250ms step and fills the test log on every miss. Here the caller's own poll sets the cadence.
+fn probe_latest_block(node: &str) -> eyre::Result<bool> {
+    let probe = || async move {
+        let client =
+            HttpClientBuilder::default().request_timeout(Duration::from_secs(10)).build(node)?;
+        let block: Option<HashMap<String, Value>> =
+            client.request("eth_getBlockByNumber", rpc_params!("latest", true)).await?;
+        Ok::<_, eyre::Report>(block.is_some())
+    };
+    tokio::runtime::Handle::try_current().map_or_else(
+        |_| {
+            Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(eyre::Report::from)
+                .and_then(|runtime| runtime.block_on(probe()))
+        },
+        |handle| tokio::task::block_in_place(|| handle.block_on(probe())),
+    )
 }
 
 /// Start a process running a validator node.

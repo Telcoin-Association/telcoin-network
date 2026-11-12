@@ -168,8 +168,9 @@ pub trait TNMessage:
 
     /// The service class of this message as an inbound request.
     ///
-    /// The class labels the inbound occupancy, service time, and shed metrics. It does not change
-    /// how the swarm forwards the request. The default is [`crate::ServiceClass::Other`].
+    /// The class labels the inbound occupancy, service time, and shed metrics, and the sender's
+    /// outbound round-trip histogram. It does not change how the swarm sends or forwards the
+    /// request. The default is [`crate::ServiceClass::Other`].
     fn service_class(&self) -> crate::ServiceClass {
         crate::ServiceClass::Other
     }

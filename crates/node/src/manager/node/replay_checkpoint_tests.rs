@@ -40,6 +40,26 @@ fn output_at(
     ConsensusOutput::new(sub_dag, parent, number, false, VecDeque::new(), vec![])
 }
 
+/// An observer manager over a fresh datadir, with the epoch boundary at commit timestamp 6 and no
+/// execution tip.
+async fn observer_manager(
+    temp: &TempDir,
+) -> eyre::Result<(EpochManager<PathBuf, DatabaseType>, CommitteeFixture<MemDatabase>)> {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let datadir = temp.path().join("observer");
+    std::fs::create_dir_all(&datadir)?;
+    let config = Config::default_for_test();
+    let (node_config, reth_db) = reth_config_and_db(&config, &fixture.committee(), &datadir)?;
+    let keys =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(601)));
+    std::fs::create_dir_all(datadir.join("db"))?;
+    let db = open_db(datadir.join("db"));
+    let builder = TnBuilder::new(node_config, config, reth_db);
+    let mut manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
+    manager.epoch_boundary = 6;
+    Ok((manager, fixture))
+}
+
 /// Import six outputs, save only a prefix, and point execution at an independently chosen
 /// output. This recreates the split between pack tip, saved slot and execution tip on disk.
 async fn imported_manager(
@@ -52,19 +72,8 @@ async fn imported_manager(
     Vec<ConsensusOutput>,
     EpochRecord,
 )> {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let (manager, fixture) = observer_manager(temp).await?;
     let committee = fixture.committee();
-    let datadir = temp.path().join("observer");
-    std::fs::create_dir_all(&datadir)?;
-    let config = Config::default_for_test();
-    let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
-    let keys =
-        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(601)));
-    std::fs::create_dir_all(datadir.join("db"))?;
-    let db = open_db(datadir.join("db"));
-    let builder = TnBuilder::new(node_config, config, reth_db);
-    let mut manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
-    manager.epoch_boundary = 6;
 
     let source_dir = temp.path().join("source");
     std::fs::create_dir_all(&source_dir)?;
@@ -213,6 +222,78 @@ async fn replay_checkpoint_does_not_promote_to_an_unreplayed_pack_tip() -> eyre:
         4,
         "the downloaded pack tip is not proof that its whole suffix was replayed"
     );
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
+/// A fresh observer that saved outputs 1 to 3 and executed none of them. Output 1 is built on
+/// `B256::ZERO`, which is not the default header's digest in either build flavor, like the anchor
+/// adiri's block 1 was built on. Output 2 is built on output 1, or on `B256::ZERO` as well when
+/// `misparent_block2` is set; output 3 is built on output 2.
+async fn fresh_manager_with_saved_outputs(
+    temp: &TempDir,
+    misparent_block2: bool,
+) -> eyre::Result<(
+    EpochManager<PathBuf, DatabaseType>,
+    CommitteeFixture<MemDatabase>,
+    Vec<ConsensusOutput>,
+)> {
+    let (manager, fixture) = observer_manager(temp).await?;
+    let anchor: ConsensusHeaderDigest = B256::ZERO.into();
+    assert_ne!(anchor, ConsensusHeader::default().digest());
+    let one = output_at(&fixture, 0, 1, anchor);
+    let block2_parent = if misparent_block2 { anchor } else { one.consensus_header_hash() };
+    let two = output_at(&fixture, 0, 2, block2_parent);
+    let three = output_at(&fixture, 0, 3, two.consensus_header_hash());
+    let outputs = vec![one, two, three];
+    for output in &outputs {
+        manager.consensus_chain.save_consensus_output(output.clone()).await?;
+    }
+    manager.consensus_chain.persist_current().await?;
+    assert!(
+        state_sync::last_executed_consensus_block(&manager.consensus_bus, &manager.consensus_chain)
+            .await?
+            .is_none(),
+        "the fixture must leave execution at genesis"
+    );
+    Ok((manager, fixture, outputs))
+}
+
+/// Issue #1790: a node that saved outputs before executing any must replay them on restart even
+/// though block 1 is not built on the default header's digest.
+#[tokio::test]
+async fn replay_anchors_block1_on_its_own_parent_when_nothing_executed() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, outputs) = fresh_manager_with_saved_outputs(&temp, false).await?;
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let mut replay = manager.replay_missed_consensus(fixture.committee(), &to_engine).await?;
+    assert_eq!(replay.take_epoch_close_hash(), None);
+    assert_eq!(replay.take_last_replayed_hash(), Some(outputs[2].consensus_header_hash()));
+    for expected in &outputs {
+        assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), expected.consensus_header_hash());
+    }
+    assert!(engine_rx.try_recv().is_err());
+    assert_eq!(manager.consensus_chain.latest_consensus_number(), 3);
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
+/// The block-1 anchor exemption ends at block 1: a block 2 that does not build on block 1 still
+/// halts the replay, after block 1 alone reached the engine.
+#[tokio::test]
+async fn replay_rejects_block2_not_built_on_block1_when_nothing_executed() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, outputs) = fresh_manager_with_saved_outputs(&temp, true).await?;
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let Err(err) = manager.replay_missed_consensus(fixture.committee(), &to_engine).await else {
+        panic!("block 2 does not build on block 1, so replay must fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        "restart replay is not contiguous: expected consensus 2 following 1, got 2"
+    );
+    assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), outputs[0].consensus_header_hash());
+    assert!(engine_rx.try_recv().is_err(), "nothing past the gap may reach the engine");
     manager.consensus_chain.clone().close().await;
     Ok(())
 }

@@ -57,7 +57,7 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(20);
 struct ForwardingNetwork {
     /// The node processes; declared before the tempdir so the nodes stop before their data
     /// directories are removed.
-    _guard: ProcessGuard,
+    guard: ProcessGuard,
     /// The data directories of every node.
     _tmp_dir: TempDir,
     /// RPC urls of the four validators, validator 1 first.
@@ -77,6 +77,15 @@ struct ForwardingNetwork {
 }
 
 impl ForwardingNetwork {
+    /// Success-path teardown: SIGKILL and reap the nodes after the last check.
+    ///
+    /// Without it the guard drops into the graceful `kill_all`, which waits out the task manager
+    /// join timeout (about 2.3s). An early `?` return still takes that path, so a failure keeps
+    /// complete node logs.
+    fn finish(mut self) {
+        self.guard.finish();
+    }
+
     /// Configure and start the network, then wait until every node serves RPC, the validators
     /// are active committee members and the observer follows them.
     fn start(test: &'static str, extra_observer_args: &[&str]) -> eyre::Result<Self> {
@@ -140,7 +149,7 @@ impl ForwardingNetwork {
         wait_for_node_mode(&obs_url, NodeMode::Observer)?;
 
         Ok(Self {
-            _guard: guard,
+            guard,
             _tmp_dir: tmp_dir,
             client_urls,
             obs_url,
@@ -286,7 +295,9 @@ fn test_restarts_observer_forward_txs() -> eyre::Result<()> {
     eyre::ensure!(upstream_error >= 1, "the refused resubmission was not counted upstream");
     eyre::ensure!(dead_target_failures >= 1, "the dead first target was never tried");
 
-    net.assert_targets_not_exposed()
+    net.assert_targets_not_exposed()?;
+    net.finish();
+    Ok(())
 }
 
 /// With `--sanitize-txs` the observer refuses a malleable signature and a foreign chain id itself,
@@ -351,7 +362,9 @@ fn test_restarts_observer_forward_txs_sanitized() -> eyre::Result<()> {
         "the valid transfer was not counted as accepted"
     );
 
-    net.assert_targets_not_exposed()
+    net.assert_targets_not_exposed()?;
+    net.finish();
+    Ok(())
 }
 
 /// Allocate a localhost TCP port no other port this test process allocates will collide with.

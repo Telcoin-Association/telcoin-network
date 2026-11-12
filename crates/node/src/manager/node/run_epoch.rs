@@ -26,7 +26,7 @@ use std::{
     collections::{HashSet, VecDeque},
     future::{ready, Future},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
@@ -373,7 +373,12 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // `create_consensus` publishes this epoch's mode, so read it once here: the proposer and
-        // the batch builders below must decide from the same value
+        // the batch builders below must decide from the same value. `Consensus::spawn` (inside
+        // `primary.start`) may still demote the node after this read (a restored dag with a gap
+        // above the committed round): the proposer and batch builders then start as active while
+        // the subscriber starts the inactive path, every task exits on the latched shutdown and
+        // the epoch re-runs as a mode change. No node-level test covers that path yet; the e2e
+        // slow-execution test (bench F1-3) is meant to cover it.
         let node_mode = self.consensus_bus.current_node_mode();
         let proposer_started = starts_proposer(node_mode);
         // Shared with the consensus task, which saves into it; `finish_epoch` seals it once that
@@ -699,9 +704,11 @@ where
     /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
     /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
-    /// [`evict_committed_batches`]), then the output is sent. `last_forwarded_consensus_number` is
-    /// updated only after the send succeeds, so the restart-replay and leftover-drain paths can
-    /// rely on it marking what actually reached the engine rather than what was merely dequeued.
+    /// [`evict_committed_batches`]), then the output is stamped with the hand-off instant
+    /// (`ConsensusOutput::set_forwarded_at`, observability only) and sent.
+    /// `last_forwarded_consensus_number` is updated only after the send succeeds, so the
+    /// restart-replay and leftover-drain paths can rely on it marking what actually reached the
+    /// engine rather than what was merely dequeued.
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -713,6 +720,11 @@ where
             output.set_epoch_close();
         }
         evict_committed_batches(&self.consensus_db, output.batch_digests());
+        // free the quota of the committed batches and move the age-out horizon (issue #1794)
+        self.reported_batches.forget(output.batch_digests(), output.leader_round());
+        // stamped before the send so the engine's forward wait includes a send blocked on a full
+        // channel; node-local, never serialized or hashed
+        output.set_forwarded_at(Instant::now());
         // only forward the output to the engine
         to_engine.send(output).await?;
         // store number after successful send
@@ -1218,9 +1230,11 @@ fn epoch_tasks_ended(
 ///
 /// A latch is this node's own storage failing (a failed write or sync, a stopped writer, or damage
 /// a read found on disk): a peer's bad record is refused before it is written and latches nothing.
-/// One known exception predates tndb and is tracked separately: a committee member can flood
-/// distinct valid batches into [`NodeBatchesCache`], which keeps them until they are committed or
-/// the epoch closes, so the flood can fill the disk and latch the cache store. Without this, a
+/// A committee member that floods distinct valid batches into [`NodeBatchesCache`] through the
+/// worker report path or the gossip prefetch is bounded before the write
+/// (`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER` uncommitted stored batches per committee key
+/// for the whole node, issue #1794). The vote path, which stores the batches of an uncertified
+/// header, is not bounded yet (follow-up issue). Without this, a
 /// latched peer-record or batch-cache store would go unnoticed until the epoch ends (an observer's
 /// following stalls meanwhile).
 fn store_failure<DB: TNDatabase>(

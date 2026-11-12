@@ -43,19 +43,21 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
 
 ### Block-building timings
 
-`RethEnv::build_block_from_batch_payload` times the stages of each block it builds into six
-histograms (`RethEnvMetrics` in `src/metrics.rs`), one sample per block each. Execute, finish and
-overlay extend run back to back, and the other three are parts of them. A stage that fails records
-nothing, and neither do the stages after it.
+Block building (`RethEnv::build_block_from_batch_payload`, or the engine's
+`RethEnv::recover_output_signers` followed by `RethEnv::build_block_from_recovered_payload`) times
+the stages of each block it builds into six histograms (`RethEnvMetrics` in `src/metrics.rs`), one
+sample per block each. Signer recovery runs per batch ahead of the build; execute, finish and
+overlay extend run back to back, and hashed state and state root are parts of finish. A stage that
+fails records nothing, and neither do the stages after it.
 
 | Metric | Spans |
 |---|---|
-| `tn_reth_block_execute_seconds` | Creating the block builder, the pre-execution changes, signer recovery and the transaction loop (`src/env/execution.rs`). |
-| `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer, in parallel on rayon. Part of execute. |
+| `tn_reth_block_execute_seconds` | Creating the block builder, the pre-execution changes and the transaction loop (`src/env/execution.rs`). |
+| `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer of one batch, in parallel on rayon. Not part of execute: the engine recovers an output's batches concurrently on a background job when the output is queued. |
 | `tn_reth_block_finish_seconds` | The block builder's `finish`: the post-execution changes (on an epoch-closing block, the closing system calls), merging the state transitions, hashing the post-state, the state root, and assembling the block. |
 | `tn_reth_block_hashed_state_seconds` | Hashing the block's post-execution state (`hashed_post_state`). Part of finish. |
 | `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay::layered_root_with_updates` in `src/env/output_overlay.rs`), from opening its read-only database transaction to closing it. Part of finish. |
-| `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
+| `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: taking the bundle and advancing the output's read cache with it, sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
 
 None of them covers the persist, which runs once per output after every block is built; reth's
 `save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
@@ -314,7 +316,9 @@ replay, and read-only/RPC EVMs alike:
 **Feature-flag hazard:** the `faucet` feature replaces the timelocked mint with an instant,
 role-gated `mint(address,uint256)` and **must never ship in mainnet builds**. Note
 `adiri = ["faucet", "tn-types/adiri"]` in `crates/tn-reth/Cargo.toml` — building for adiri
-transitively enables faucet minting.
+transitively enables faucet minting. At startup a faucet build refuses mainnet (chain id 731) and
+the embedded mainnet genesis, and starts on any other chain but adiri only with
+`--allow-faucet-on-chain` (`validate_faucet_build` in `telcoin-network-cli`).
 
 ## Trust boundaries
 

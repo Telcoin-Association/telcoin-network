@@ -51,7 +51,7 @@ use tn_types::{
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
 pub(crate) use tn_types::gas_accumulator::worker_id_from_header;
-use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tn_worker::{ReportedBatchLedger, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -302,6 +302,12 @@ pub(crate) struct EpochManager<P, DB> {
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
+
+    /// The uncommitted batches that each committee key stored on this node through the worker
+    /// report path and the gossip prefetch (issue #1794). One ledger for all workers of the node.
+    /// A new epoch empties it, a mode-change re-entry into the same epoch keeps it, and
+    /// [`Self::process_output`] frees the committed batches. A process restart starts it empty.
+    reported_batches: ReportedBatchLedger,
 
     /// Inbound sync ledgers of the primary network (opening admission and serve budgets),
     /// built once per node process and shared by the network of every epoch, so an epoch
@@ -827,6 +833,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            reported_batches: ReportedBatchLedger::new(),
             primary_sync_ledgers: PrimarySyncLedgers::new(),
             bootstrap_servers,
             trusted_peer_keys: HashSet::new(),
@@ -1831,16 +1838,17 @@ where
     ///
     /// On restart the in-memory `recent_blocks` history is empty; this backfills it (up to the
     /// watch's capacity) so consensus components can resolve recent consensus number/hash lookups.
-    /// Each block's consensus hash is recovered from `parent_beacon_block_root`; round is set to 0
-    /// because it is not persisted, which is sufficient for hash resolution during catch-up.
+    /// Each block's consensus hash is recovered from `parent_beacon_block_root` and its leader
+    /// round from the block nonce, so the last consensus round reads the executed tip's leader
+    /// round.
     async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
         let block_capacity = self.consensus_bus.recent_blocks_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-            // On restore, use the block's consensus hash from parent_beacon_block_root.
-            // Round is set to 0 since we don't persist it; consensus number/hash still allows
-            // wait_for_consensus_execution to resolve hash lookups.
+            // On restore, use the block's consensus hash from parent_beacon_block_root and the
+            // leader round from the nonce; consensus number/hash lets
+            // wait_for_consensus_execution resolve hash lookups.
             let consensus_hash: ConsensusHeaderDigest =
                 recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());

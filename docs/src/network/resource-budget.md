@@ -109,8 +109,9 @@ starts.
 The queue sheds all other events in a gap as `unsubscribed`. Thus certificate gossip and
 consensus-output gossip cannot take the space of the epoch votes. A shed gossip event drops its
 validation ticket, and the ticket reports Ignore to gossipsub. Thus this node does not relay
-certificate or consensus-output gossip that arrives in a gap (#1772). The certificate fetcher and
-state sync recover the content. The certificate fetcher of the new epoch gets a shed certificate
+certificate gossip that arrives in a gap, or a consensus result that a newer result of its author
+replaces there (#1772). The certificate fetcher and state sync recover the content. The
+certificate fetcher of the new epoch gets a shed certificate
 again when a later certificate names it as a parent. State sync gets shed consensus output again.
 A shed request drops its response channel, and the peer sends the request again. The certifier
 sends a vote request again until a new proposal replaces it. Peers send epoch-record and stream

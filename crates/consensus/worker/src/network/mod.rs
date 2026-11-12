@@ -1,11 +1,12 @@
 //! Worker network implementation.
 
-use crate::metrics::{SyncShedReason, WorkerMetrics};
+use crate::metrics::{tier_label, SyncShedReason, WorkerMetrics};
 use error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
+pub use ledger::ReportedBatchLedger;
 pub use message::{WorkerRequest, WorkerResponse};
 use std::{collections::BTreeSet, future::Future, io::ErrorKind, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
@@ -30,6 +31,7 @@ use tracing::{debug, warn};
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
+pub(crate) mod ledger;
 pub(crate) mod message;
 pub(crate) mod primary;
 pub(crate) mod stream_codec;
@@ -278,7 +280,8 @@ impl SyncServeOutcome {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::BatchEpochMismatch(..) => Self::Failed,
+            | WorkerNetworkError::BatchEpochMismatch(..)
+            | WorkerNetworkError::ReporterOverQuota { .. } => Self::Failed,
         }
     }
 }
@@ -734,10 +737,12 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
             }
         }
         OpeningRead::AtCapacity(refusal) => {
+            network_handle.metrics().record_sync_serve_denied(tier);
             debug!(
                 target: "worker::network",
                 %peer,
-                ?tier,
+                tier = tier_label(&tier),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 ?refusal,
                 "batch-serve admission refused, denying inbound sync stream"
             );
@@ -1109,6 +1114,9 @@ where
     Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
 {
     /// Create a new instance of Self.
+    ///
+    /// `reported_batches` is the ledger of uncommitted stored batches per committee key (issue
+    /// #1794). The node shares one ledger with all of its workers.
     pub fn new(
         network_events: Events,
         network_handle: WorkerNetworkHandle,
@@ -1116,13 +1124,19 @@ where
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
         consensus_chain: ConsensusChain,
+        reported_batches: ReportedBatchLedger,
     ) -> Self {
         // committee peers (this epoch's and the next) admit through the reserves
         let committee = consensus_config.committee().bls_keys();
         let next_committee = consensus_config.next_committee_keys().iter().copied();
         let reserved_peers = ReservedPeers::new(committee.into_iter().chain(next_committee));
-        let request_handler =
-            RequestHandler::new(id, validator, consensus_config, network_handle.clone());
+        let request_handler = RequestHandler::new(
+            id,
+            validator,
+            consensus_config,
+            network_handle.clone(),
+            reported_batches,
+        );
         Self {
             network_events,
             network_handle,
@@ -1308,7 +1322,7 @@ where
             // The batch fetch can take longer than the about 12 s gossipsub validation window,
             // so the worker accepts at delivery (#1772). Batch gossip forwards as before.
             validation.accept().await;
-            if let Err(e) = request_handler.process_gossip(&msg).await {
+            if let Err(e) = request_handler.process_gossip(&msg, author.as_ref()).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
                 // Charge the accountable peer, and only once its BLS identity has resolved: the
                 // author for a content-determined fault (#819, guaranteed resolved on the
@@ -2424,6 +2438,46 @@ mod tests {
         // the held permits keep the public share full for the whole exchange
         drop(held);
         assert_eq!(batch_serve.pool.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+    }
+
+    /// A request refused because the public share of the batch-serve pool is full counts one
+    /// denied serve under the `public` tier, and none under `committee`.
+    #[tokio::test(start_paused = true)]
+    async fn at_capacity_openings_count_a_denied_serve_by_tier() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the current-thread test runtime keeps every task on this thread, so the local
+        // recorder covers the handle built inside `stuck_opening`
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let (_opening, batch_serve) = admission_budgets();
+        let _held: Vec<_> = (0..MAX_CONCURRENT_BATCH_STREAMS)
+            .map(|_| {
+                batch_serve
+                    .pool
+                    .try_acquire(&key(1), PeerTier::Public)
+                    .expect("public batch-serve permit")
+            })
+            .collect();
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        stuck_opening(request, batch_serve).await;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let denied = |tier: PeerTier| {
+            snapshot.iter().find_map(|(key, _, _, value)| {
+                let labelled =
+                    key.key().labels().any(|l| l.key() == "tier" && l.value() == tier_label(&tier));
+                match value {
+                    DebugValue::Counter(n)
+                        if key.key().name() == "tn_worker.sync_serves_denied_total" && labelled =>
+                    {
+                        Some(*n)
+                    }
+                    _ => None,
+                }
+            })
+        };
+        assert_eq!(denied(PeerTier::Public), Some(1), "the refused public request is counted");
+        assert_eq!(denied(PeerTier::Committee), Some(0), "no committee request was refused");
     }
 
     /// A valid request that arrives in the second half of the public window is

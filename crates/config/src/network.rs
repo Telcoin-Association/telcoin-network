@@ -564,6 +564,9 @@ pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 12_000;
 /// The prefix of the epoch-vote gossip topic. The topic is this prefix and the chain id.
 pub const EPOCH_VOTE_TOPIC_PREFIX: &str = "tn-epoch-vote-";
 
+/// The prefix of the consensus-output gossip topic. The topic is this prefix and the chain id.
+pub const CONSENSUS_OUTPUT_TOPIC_PREFIX: &str = "tn-consensus-output-";
+
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
@@ -668,7 +671,7 @@ impl LibP2pConfig {
 
     /// Return the consensus-output gossip topic for `chain_id`.
     pub fn consensus_output_topic(chain_id: u64) -> String {
-        format!("tn-consensus-output-{chain_id}")
+        format!("{CONSENSUS_OUTPUT_TOPIC_PREFIX}{chain_id}")
     }
 
     /// Return the epoch-vote gossip topic for `chain_id`.

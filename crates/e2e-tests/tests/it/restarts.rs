@@ -344,12 +344,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
 fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
     // Nodes 0/1/3 stay live (index 2 is the killed one).
-    let peer_height = || {
-        [&client_urls[0], &client_urls[1], &client_urls[3]]
-            .into_iter()
-            .filter_map(|url| get_latest_consensus_header_number(url).ok())
-            .max()
-    };
+    let peer_height = || peer_consensus_height(client_urls);
 
     let start_height = peer_height();
     let start = Instant::now();
@@ -387,6 +382,15 @@ fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<(
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// The highest consensus header number that the peers 0/1/3 report, or `None` if none answers.
+/// Index 2 is the node the restart tests stop.
+fn peer_consensus_height(client_urls: &[String; 4]) -> Option<u64> {
+    [&client_urls[0], &client_urls[1], &client_urls[3]]
+        .into_iter()
+        .filter_map(|url| get_latest_consensus_header_number(url).ok())
+        .max()
 }
 
 /// Garbage-collection depth (DAG rounds) used for the delayed restart tests. Lowering it from the
@@ -471,13 +475,25 @@ fn test_restart_catch_up_requires_active_cvv() {
     });
 }
 
+/// How [`do_restarts`] stops the committee between phase 1 and the cold restart of phase 2.
+#[derive(Clone, Copy, Debug)]
+enum Phase1Stop {
+    /// One `kill_all` stops all four nodes in parallel. Phase 2 restarts four nodes that stopped
+    /// together.
+    Together,
+    /// Node 2 stops first, and 0/1/3 commit at least one more consensus header before they stop.
+    /// Phase 2 then cold-restarts a committee with one member behind (inside the GC window) and
+    /// asserts that node 2 reaches the consensus height its peers had at the stop.
+    Node2First,
+}
+
 /// Run the restart scenario. Phase 1 stops node 2, waits out `delay` seconds and restarts it
-/// (`lagged`: node 2 misses a transfer while it is down). Then all four nodes stop, and phase 2
-/// restarts all four from their datadirs.
+/// (`lagged`: node 2 misses a transfer while it is down). Then all four nodes stop, as `stop`
+/// says, and phase 2 restarts all four from their datadirs.
 ///
 /// All four validators stay in one [`ProcessGuard`] for both phases, so no exit from phase 1 (an
 /// `Err` or a panic) leaves a validator process running.
-fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
+fn do_restarts(delay: u64, lagged: bool, stop: Phase1Stop, test: &str) -> eyre::Result<()> {
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
@@ -527,9 +543,15 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         run_restart_tests1(&client_urls, &mut guard, bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
-    // On success, stop the restarted node 2 before nodes 0/1/3, as before. `stop_node2` takes it
-    // out of its slot first, so `kill_all` below does not signal its reaped pid.
-    let res1 = res1.and_then(|()| stop_node2(&mut guard));
+    let res1 = match stop {
+        // The restarted node 2 stays in slot 2: `kill_all` below stops all four nodes in parallel
+        // under one wait.
+        Phase1Stop::Together => res1,
+        // On success, stop the restarted node 2 alone first, so 0/1/3 commit past it before
+        // `kill_all` stops them. `stop_node2` takes it out of its slot first, so `kill_all` below
+        // does not signal its reaped pid.
+        Phase1Stop::Node2First => res1.and_then(|()| stop_node2(&mut guard)),
+    };
     let is_ok = res1.is_ok();
     let assert_str = res1.map_or_else(
         |err| {
@@ -539,9 +561,24 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         |()| String::new(),
     );
 
-    // Kill all remaining children. On success slot 2 is already empty. After a phase 1 error it
-    // holds node 2 (the original or the restarted process) unless phase 1 failed while node 2
-    // was down.
+    // `Node2First`: wait until the peers commit at least one more consensus header while node 2
+    // is down (`min_round_gap = 1`), then keep their height. Phase 2 asserts node 2 reaches it.
+    let node2_catch_up_height = match stop {
+        Phase1Stop::Together => None,
+        Phase1Stop::Node2First => is_ok
+            .then(|| {
+                wait_for_downtime(&client_urls, 2)?;
+                peer_consensus_height(&client_urls)
+                    .ok_or_else(|| Report::msg("no peer reported a consensus height"))
+            })
+            .transpose()?,
+    };
+
+    // Stop every node gracefully, so phase 2 restarts from a clean shutdown. With `Together` this
+    // stops all four, and phase 2 restarts four nodes that stopped together. With `Node2First` it
+    // stops 0/1/3 after node 2, and phase 2 starts with node 2 behind. After a phase 1 error slot 2
+    // still holds node 2 (the original or the restarted process), so this stops it too, unless
+    // phase 1 failed while node 2 was down and its slot was empty.
     guard.kill_all();
 
     // Make sure we shutdown nodes even if an error in first testing.
@@ -561,11 +598,16 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     }
 
     info!(target: "restart-test", "Running restart tests 2");
-    let res2 = run_restart_tests2(&client_urls);
+    let res2 = run_restart_tests2(&client_urls).and_then(|()| {
+        // `Node2First`: node 2 restarted behind its peers and must reach their height at the stop.
+        node2_catch_up_height
+            .map_or(Ok(()), |height| wait_for_consensus_height(&client_urls[2], height))
+    });
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
-    // guard.drop() handles final cleanup
-    res2
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    res2.inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
@@ -573,7 +615,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(2, false, "restarts")
+    do_restarts(2, false, Phase1Stop::Together, "restarts")
 }
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
@@ -584,6 +626,15 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
         || Ok(get_block_number(node).map(|n| n >= target_block).unwrap_or(false)),
     )?;
     Ok(())
+}
+
+/// Wait for `node` to reach at least consensus height `height`, polling for up to 60 seconds.
+fn wait_for_consensus_height(node: &str, height: u64) -> eyre::Result<()> {
+    wait_until_blocking(
+        Duration::from_secs(60),
+        &format!("node {node} to reach consensus height {height}"),
+        || Ok(get_latest_consensus_header_number(node).is_ok_and(|n| n >= height)),
+    )
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -661,17 +712,19 @@ fn test_restarts_observer() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
-    // Guard cleanup handles all process shutdown on drop
-    run_observer_tests(&client_urls, &obs_url)
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    run_observer_tests(&client_urls, &obs_url).inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
-/// the consensus chain.
+/// the consensus chain. Phase 1 ends with node 2 stopped first, so phase 2 cold-restarts the
+/// committee with node 2 behind and checks that it catches up.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, "restarts_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, Phase1Stop::Node2First, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -680,7 +733,7 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, Phase1Stop::Together, "restarts_lagged_delayed")
 }
 
 /// The epoch whose close every validator stops inside in
@@ -1818,11 +1871,18 @@ fn spawn_load(
 }
 
 /// A validator restarted far behind while transactions keep flowing must catch up and rejoin
-/// consensus before the load stops (issue #1513).
+/// consensus before the load stops (issue #1513), once and for good (issue #1518).
 ///
 /// Before the fix a catching-up node rejoined only when the output it had just handled was the
 /// newest known header. A node that must execute every output does not reach that point while the
 /// committee keeps committing, so it stayed inactive until the load dropped.
+///
+/// After the rejoin the node must hold it under the same load ([`check_rejoin_held`]): one rejoin,
+/// still `CvvActive` past the rejoin grace, no demotion after the promotion, its own headers
+/// certified, no certificate fetch failing on missing parents and no stale header re-proposed. On
+/// the bench a promoted node whose peers had pruned the rounds it rebuilt from kept failing those
+/// fetches, never committed and was demoted again 41 rounds later; at this test's `gc_depth` the
+/// peers keep more rounds than the node needs, so that failure needs a deeper `gc_depth` to show.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_under_load() -> eyre::Result<()> {
@@ -1861,7 +1921,7 @@ fn test_restarts_lagged_under_load() -> eyre::Result<()> {
     let sent = Arc::new(AtomicU64::new(0));
     let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
 
-    let mut rejoin = || -> eyre::Result<()> {
+    let mut rejoin = || -> eyre::Result<String> {
         network_advancing(&client_urls)?;
         wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
             Ok(sent.load(Ordering::Relaxed) > 0)
@@ -1899,13 +1959,852 @@ fn test_restarts_lagged_under_load() -> eyre::Result<()> {
             !load.is_finished() && sent.load(Ordering::Relaxed) > sent_at_restart,
             "the load stopped before the lagged validator rejoined"
         );
-        Ok(())
+        check_rejoin_held(&client_urls[2], &metrics_addr, test, 1)
     };
     let rejoined = rejoin();
     stop.store(true, Ordering::Relaxed);
     let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
     guard.kill_all();
-    rejoined
-        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))
-        .and(joined)
+    let evidence = rejoined
+        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))?;
+    eprintln!("{test}: {evidence}");
+    joined
+}
+
+/// How long [`check_rejoin_held`] waits after the rejoin before it checks that the rejoin held:
+/// past the rejoin grace (`REJOIN_DEMOTION_GRACE`), inside which a promoted node is not demoted
+/// for trailing the activity window.
+const REJOIN_HOLD: Duration =
+    tn_types::REJOIN_DEMOTION_GRACE.saturating_add(Duration::from_secs(5));
+
+/// The line the executor's subscriber logs when it promotes a catching-up node.
+const REJOIN_LOG: &str = "attempting to rejoin consensus";
+
+/// The line a vote aggregator logs when one of this node's own headers gathers a quorum of votes.
+const OWN_CERTIFICATE_LOG: &str = "quorum reached";
+
+/// The line the certificate fetcher logs when a fetched certificate cannot be accepted.
+const FETCH_FAILED_LOG: &str = "Fetch task failed";
+
+/// The line the proposer logs when it sends a stored header again.
+const REPROPOSE_LOG: &str = "reproposing header";
+
+/// The line state sync logs when it seeds the consensus rounds of a promoted node.
+const PRIMED_LOG: &str = "primed consensus rounds";
+
+/// Check that the lagged validator at `node` (metrics at `metrics_addr`, run `run` of `test`'s
+/// node 2) holds its rejoin, [`REJOIN_HOLD`] after it is first seen back in `CvvActive`.
+///
+/// The node must still be `CvvActive`, its process must have counted exactly one rejoin
+/// (`tn_node_mode_transitions_total{to="cvv_active",reason="rejoin"}`) and no demotion since the
+/// rejoin was seen. The demotion that sent the restarted node to catch-up is counted before the
+/// rejoin and is expected. After the last [`REJOIN_LOG`] line its log must show at least one own
+/// header certified ([`OWN_CERTIFICATE_LOG`]), no [`FETCH_FAILED_LOG`] for missing parents and no
+/// [`REPROPOSE_LOG`] of a header more than [`RESTART_TEST_GC_DEPTH`] rounds below the newest
+/// consensus header. The size of the restored DAG, the rejoin-grace holds and the seeded rounds are
+/// recorded without an expectation: the DAG of a promoted node refills from its peers.
+fn check_rejoin_held(node: &str, metrics_addr: &str, test: &str, run: u32) -> eyre::Result<String> {
+    let at_rejoin = scrape_metrics(metrics_addr)?;
+    let demotions_at_rejoin =
+        labeled_sample(&at_rejoin, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    std::thread::sleep(REJOIN_HOLD);
+
+    let mode = get_node_mode(node)?;
+    let body = scrape_metrics(metrics_addr)?;
+    let rejoins =
+        labeled_sample(&body, MODE_TRANSITIONS, &[r#"to="cvv_active""#, r#"reason="rejoin""#])?
+            .unwrap_or(0.0);
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    let transitions = samples_of(&body, MODE_TRANSITIONS);
+    eyre::ensure!(
+        mode == NodeMode::CvvActive && rejoins == 1.0 && demotions == demotions_at_rejoin,
+        "the rejoin did not hold {REJOIN_HOLD:?} later: mode {mode:?}, {rejoins} rejoins, \
+         demotions {demotions_at_rejoin} at the rejoin and {demotions} now ({transitions})"
+    );
+    let grace_holds =
+        labeled_sample(&body, "tn_primary_rejoin_grace_holds_total", &[])?.unwrap_or(0.0);
+
+    let lines = node_log_lines(test, 2, run)?;
+    let promoted = lines
+        .iter()
+        .rposition(|line| line.contains(REJOIN_LOG))
+        .ok_or_else(|| eyre::eyre!("node 2 run {run} never logged `{REJOIN_LOG}`"))?;
+    let after = &lines[promoted + 1..];
+    let restored_certs = after.iter().find_map(|line| {
+        line.split(DAG_RESTORED_LOG).nth(1)?.split_whitespace().next()?.parse::<u64>().ok()
+    });
+    let restored_certs =
+        restored_certs.ok_or_else(|| eyre::eyre!("no `{DAG_RESTORED_LOG}` after the promotion"))?;
+    let own_certificates = after.iter().filter(|line| line.contains(OWN_CERTIFICATE_LOG)).count();
+    let fetch_failures = after
+        .iter()
+        .filter(|line| line.contains(FETCH_FAILED_LOG) && line.contains("missing parents"))
+        .collect::<Vec<_>>();
+    let stale_reproposals = after
+        .iter()
+        .filter(|line| line.contains(REPROPOSE_LOG))
+        .filter(|line| {
+            log_field(line, "header_round")
+                .zip(log_field(line, "newest_round"))
+                .is_some_and(|(header, newest)| header + u64::from(RESTART_TEST_GC_DEPTH) < newest)
+        })
+        .collect::<Vec<_>>();
+    eyre::ensure!(
+        own_certificates > 0 && fetch_failures.is_empty() && stale_reproposals.is_empty(),
+        "after the promotion node 2 certified {own_certificates} own headers, logged {} fetch \
+         failures for missing parents (first {:?}) and {} re-proposals more than \
+         {RESTART_TEST_GC_DEPTH} rounds below the newest header (first {:?})",
+        fetch_failures.len(),
+        fetch_failures.first(),
+        stale_reproposals.len(),
+        stale_reproposals.first()
+    );
+    let primed = after
+        .iter()
+        .find(|line| line.contains(PRIMED_LOG))
+        .map(|line| (log_field(line, "primary_round"), log_field(line, "newest_round")));
+    Ok(format!(
+        "one rejoin held {REJOIN_HOLD:?} ({transitions}), dag restored with {restored_certs} \
+         certs, {own_certificates} own certificates after the promotion, {grace_holds} rejoin \
+         grace holds, primed (primary_round, newest_round) {primed:?}"
+    ))
+}
+
+/// The number in the `name=value` field of a plain node log line.
+fn log_field(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
+/// A field is read only as a whole `name=` token, so `round` does not read `header_round`.
+#[test]
+fn test_log_field_reads_whole_fields() {
+    let line = "WARN primary::proposer: reproposing header current_round=752 header_round=5 \
+                newest_round=750 header=Header { round: 5 }";
+    assert_eq!(log_field(line, "header_round"), Some(5));
+    assert_eq!(log_field(line, "newest_round"), Some(750));
+    assert_eq!(log_field(line, "round"), None);
+    assert_eq!(log_field(line, "committed_round"), None);
+}
+
+/// Node whose execution [`test_slow_execution_stays_active`] slows.
+const SLOW_NODE: usize = 2;
+
+/// Environment variable of the engine's execution-delay test hook
+/// (`tn_types::test_hooks::execution_delay`), set on [`SLOW_NODE`] only.
+const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
+
+/// Milliseconds [`SLOW_NODE`] sleeps before it executes each output that carries batches.
+///
+/// The delay `d` keeps the slowed node's lag well below the commit run-ahead bound
+/// (`tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS`, 1000 rounds), past which its commits are held and the
+/// activity window demotes it by design. Under load the e2e committee advances `r` = 5.9 to 6.3
+/// rounds a second with a leader every two rounds, every output carries batches, and the slowed
+/// node executes one output every `d` plus about 25 ms, two rounds each. Its lag grows by
+/// `r - 2/d`, about 2.3 rounds a second at `d` = 0.5 s: it passes the 15-round activity window of
+/// [`RESTART_TEST_GC_DEPTH`] about 7 s into the load and reached 130 to 152 rounds by the end of
+/// the 60-s [`SLOW_EXECUTION_WINDOW`] `W` in the measured runs.
+///
+/// The backlog at the stop, `B = (r/2 - 1/d) * W` (about 70 outputs), plus the `E` outputs that
+/// still carry batches after the stop (batches the load left waiting for a header, 3 to 109
+/// measured), drains in `D = (B + E) * d` while consensus keeps committing, so the lag peaks below
+/// `r * D`: about 220 rounds at `E` = 0 and 560 at `E` = 109, the latter only if execution made no
+/// progress during the drain. The measured peaks were 172 to 300 rounds. At the earlier 1.5 s, `B`
+/// alone was about 150 outputs and `D` about 220 s, and the lag reached the bound.
+const SLOW_EXECUTION_DELAY_MS: &str = "500";
+
+/// How long [`test_slow_execution_stays_active`] watches the slowed validator under load.
+const SLOW_EXECUTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// Interval between the slowed validator's mode and metrics polls.
+const SLOW_EXECUTION_POLL: Duration = Duration::from_secs(2);
+
+/// Time limit for the slowed validator's execution to return inside the activity window once the
+/// load stops.
+///
+/// The drain `D` of [`SLOW_EXECUTION_DELAY_MS`] took 37 to 98 s in the measured runs (35 to 90 s
+/// by its arithmetic). The limit leaves more than twice the slowest, for a busier host.
+const SLOW_EXECUTION_CATCH_UP: Duration = Duration::from_secs(240);
+
+/// Prometheus series of node mode changes, labelled `to` and `reason`.
+const MODE_TRANSITIONS: &str = "tn_node_mode_transitions_total";
+
+/// The `to` label of a demotion in [`MODE_TRANSITIONS`].
+const TO_INACTIVE: &str = r#"to="cvv_inactive""#;
+
+/// Prometheus gauge of how many rounds a node's committed round leads its executed round.
+const EXEC_LAG_ROUNDS: &str = "tn_primary_consensus_exec_lag_rounds";
+
+/// Prometheus gauge of a node's committed round.
+const COMMITTED_ROUND: &str = "tn_primary_committed_round";
+
+/// Prometheus counter of the commits a node held because its execution fell more than
+/// `tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS` behind them.
+const RUN_AHEAD_BLOCKED: &str = "tn_primary_commit_run_ahead_blocked_total";
+
+/// The warning a node logs when it demotes itself for falling behind consensus.
+const BEHIND_LOG: &str = "we are behind";
+
+/// A validator whose execution trails its commits by more than the activity window stays an active
+/// voter while the committee runs under load (issues #1781 and #1782).
+///
+/// [`SLOW_NODE`]'s engine sleeps [`SLOW_EXECUTION_DELAY_MS`] before it executes each output with
+/// batches, so under load its execution falls more than `gc_activity_window(gc_depth)` (15 rounds
+/// at [`RESTART_TEST_GC_DEPTH`]) behind its commits. Commits do not wait for execution, so the
+/// slowed node's committed round keeps pace with the committee and the activity window, which
+/// measures how far commits trail an incoming certificate, is never crossed: for
+/// [`SLOW_EXECUTION_WINDOW`] the node is `CvvActive` at every poll, counts no demotion and logs no
+/// [`BEHIND_LOG`], while its execution lag exceeds the window at least once and every node's
+/// committed round advances by more than the window. Once the load stops, its execution returns
+/// inside the window while the node stays `CvvActive` at every poll and its commit run-ahead gate
+/// never holds a commit ([`RUN_AHEAD_BLOCKED`] stays 0). A held commit freezes the committed round
+/// and demotes the node `outside_gc_window` by design, so the test sizes the backlog to peak well
+/// below `MAX_COMMIT_RUN_AHEAD_ROUNDS` (see [`SLOW_EXECUTION_DELAY_MS`]); a zero count tells a
+/// caught-up node from one the gate demoted.
+///
+/// This fails on the base, where Bullshark waited for local execution before each commit: the
+/// slowed node's committed round froze with its execution, and the first certificate more than 15
+/// rounds ahead demoted it (`we are behind`, `tn_node_mode_transitions_total{to="cvv_inactive",
+/// reason="outside_gc_window"}`) within about 15 s of load. The bench-4 slow-fsync validators were
+/// demoted the same way, 41 rounds behind at the devnet `gc_depth` of 50.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_slow_execution_stays_active() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "slow_execution_stays_active";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let funded = vec![(
+        address_from_word(LOAD_SOURCE),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        Some(funded),
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no port available"));
+    let nodes = (0..4)
+        .map(|_| Ok((port()?, format!("127.0.0.1:{}", port()?))))
+        .collect::<eyre::Result<Vec<(u16, String)>>>()?;
+    let client_urls = <[String; 4]>::try_from(
+        nodes
+            .iter()
+            .map(|(rpc_port, _)| format!("http://127.0.0.1:{rpc_port}"))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let metrics_addrs = nodes.iter().map(|(_, addr)| addr.as_str()).collect::<Vec<_>>();
+    let mut guard = ProcessGuard::empty();
+    nodes.iter().enumerate().for_each(|(i, (rpc_port, metrics_addr))| {
+        let env: &[(&str, &str)] =
+            if i == SLOW_NODE { &[(EXECUTION_DELAY_ENV, SLOW_EXECUTION_DELAY_MS)] } else { &[] };
+        let args = ["--metrics", metrics_addr.as_str()];
+        guard.push(start_validator_with_env(i, bin, &temp_path, *rpc_port, test, 0, &args, env));
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
+    let checked =
+        check_slow_execution_stays_active(&client_urls, &metrics_addrs, test, &stop, &sent);
+    stop.store(true, Ordering::Relaxed);
+    let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
+    guard.kill_all();
+    let summary = checked.wrap_err(format!(
+        "slowed validator did not stay active under load, check logs in test_logs/{test}/"
+    ))?;
+    eprintln!("{test}: {summary}");
+    joined
+}
+
+/// The checks of [`test_slow_execution_stays_active`]: [`SLOW_NODE`] stays active under load for
+/// [`SLOW_EXECUTION_WINDOW`] while its execution lags, then `stop` ends the load and its execution
+/// catches up. Returns the observed values for the test's summary line.
+fn check_slow_execution_stays_active(
+    client_urls: &[String; 4],
+    metrics_addrs: &[&str],
+    test: &str,
+    stop: &AtomicBool,
+    sent: &AtomicU64,
+) -> eyre::Result<String> {
+    network_advancing(client_urls)?;
+    wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
+        Ok(sent.load(Ordering::Relaxed) > 0)
+    })?;
+    let window = f64::from(tn_types::gc_activity_window(RESTART_TEST_GC_DEPTH));
+    let slow_url = &client_urls[SLOW_NODE];
+    let slow_metrics = metrics_addrs[SLOW_NODE];
+    let committed_rounds = || {
+        metrics_addrs
+            .iter()
+            .map(|addr| scrape_metric_value(addr, COMMITTED_ROUND))
+            .collect::<eyre::Result<Vec<f64>>>()
+    };
+    let start_rounds = committed_rounds()?;
+
+    let start = Instant::now();
+    let mut max_lag = 0.0_f64;
+    let mut polls = 0_u32;
+    while start.elapsed() < SLOW_EXECUTION_WINDOW {
+        std::thread::sleep(SLOW_EXECUTION_POLL);
+        polls += 1;
+        let at = format!("{}s into the load (poll {polls})", start.elapsed().as_secs());
+        max_lag = max_lag.max(poll_slow_node(slow_url, slow_metrics, &at)?);
+    }
+
+    let end_rounds = committed_rounds()?;
+    let loaded = start.elapsed();
+    let advanced = start_rounds.iter().zip(&end_rounds).map(|(s, e)| e - s).collect::<Vec<_>>();
+    eyre::ensure!(
+        advanced.iter().all(|rounds| *rounds > window),
+        "a node's committed round advanced no more than the {window}-round activity window in \
+         {SLOW_EXECUTION_WINDOW:?} of load: committed rounds {start_rounds:?} -> {end_rounds:?}"
+    );
+    eyre::ensure!(
+        max_lag > window,
+        "node {SLOW_NODE}'s execution never trailed its commits by more than the {window}-round \
+         activity window (max {max_lag} over {polls} polls), so the run did not test the window"
+    );
+    let behind = node_log_lines(test, SLOW_NODE, 0)?
+        .into_iter()
+        .filter(|line| line.contains(BEHIND_LOG))
+        .collect::<Vec<_>>();
+    eyre::ensure!(
+        behind.is_empty(),
+        "node {SLOW_NODE} logged {} `{BEHIND_LOG}` lines, the first: {:?}",
+        behind.len(),
+        behind.first()
+    );
+
+    // the backlog drains while consensus keeps committing, so the lag still grows until the last
+    // output with batches executes: every poll of the drain must also find the node active and
+    // its run-ahead gate idle
+    stop.store(true, Ordering::Relaxed);
+    let stopped = Instant::now();
+    let mut peak_lag = 0.0_f64;
+    loop {
+        let at = format!("{}s after the load stopped", stopped.elapsed().as_secs());
+        let lag = poll_slow_node(slow_url, slow_metrics, &at)?;
+        peak_lag = peak_lag.max(lag);
+        if lag < window {
+            break;
+        }
+        eyre::ensure!(
+            stopped.elapsed() < SLOW_EXECUTION_CATCH_UP,
+            "node {SLOW_NODE}'s execution did not return inside the {window}-round activity \
+             window within {SLOW_EXECUTION_CATCH_UP:?} of the load stopping: exec lag {lag} \
+             rounds (peak {peak_lag})"
+        );
+        std::thread::sleep(SLOW_EXECUTION_POLL);
+    }
+    let catch_up = stopped.elapsed();
+    let rate = advanced[SLOW_NODE] / loaded.as_secs_f64();
+    Ok(format!(
+        "{rate:.1} rounds/s under load, max exec lag {max_lag} rounds (window {window}) over \
+         {polls} polls, committed rounds advanced {advanced:?}, peak exec lag {peak_lag} rounds \
+         and no run-ahead hold while the backlog drained, caught up {catch_up:?} after the load \
+         stopped, {} transfers sent",
+        sent.load(Ordering::Relaxed)
+    ))
+}
+
+/// One poll of [`SLOW_NODE`] for [`check_slow_execution_stays_active`], `at` naming when for an
+/// error: its execution lag in rounds, once its mode, its mode gauge and its demotion count show
+/// it `CvvActive` and [`RUN_AHEAD_BLOCKED`] shows that its commits were never held.
+///
+/// The counter is required to be served, so a renamed series cannot pass for zero holds.
+fn poll_slow_node(url: &str, metrics_addr: &str, at: &str) -> eyre::Result<f64> {
+    let mode = get_node_mode(url).wrap_err_with(|| format!("node {SLOW_NODE} mode {at}"))?;
+    let body = scrape_metrics(metrics_addr)?;
+    let lag = labeled_sample(&body, EXEC_LAG_ROUNDS, &[])?
+        .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {EXEC_LAG_ROUNDS}"))?;
+    let held = labeled_sample(&body, RUN_AHEAD_BLOCKED, &[])?
+        .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {RUN_AHEAD_BLOCKED}"))?;
+    let active = labeled_sample(&body, "tn_node_mode", &[r#"mode="cvv_active""#])?;
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    eyre::ensure!(
+        mode == NodeMode::CvvActive && active == Some(1.0) && demotions == 0.0 && held == 0.0,
+        "node {SLOW_NODE} left CvvActive or held a commit {at}: mode {mode:?}, \
+         tn_node_mode{{mode=\"cvv_active\"}} {active:?}, {demotions} demotions ({}), {held} \
+         commits held by the run-ahead gate, exec lag {lag} rounds",
+        samples_of(&body, MODE_TRANSITIONS)
+    );
+    Ok(lag)
+}
+
+/// The sum of every sample of the prometheus series `name` in the scrape `body` whose label set
+/// holds each of `labels` (each a `key="value"` pair), or `None` when no sample matches.
+///
+/// A labelled counter has no sample until it first counts, so `None` reads as "never" for
+/// [`MODE_TRANSITIONS`]. Without `labels` every sample of `name` matches. A sample whose value
+/// does not parse is an error, so a format change cannot pass for an absent series.
+fn labeled_sample(body: &str, name: &str, labels: &[&str]) -> eyre::Result<Option<f64>> {
+    let mut total = None;
+    for line in body.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        let (set, value) = match rest.strip_prefix('{') {
+            Some(labelled) => match labelled.rsplit_once('}') {
+                Some(split) => split,
+                None => continue,
+            },
+            None if rest.starts_with(char::is_whitespace) => ("", rest),
+            // a longer series name that merely starts with `name`
+            None => continue,
+        };
+        if !labels.iter().all(|label| set.split(',').any(|pair| pair == *label)) {
+            continue;
+        }
+        let raw = value.split_whitespace().next().unwrap_or_default();
+        let value: f64 =
+            raw.parse().map_err(|e| eyre::eyre!("sample of `{name}` has value {raw:?}: {e}"))?;
+        total = Some(total.unwrap_or(0.0) + value);
+    }
+    Ok(total)
+}
+
+/// Every sample line of the prometheus series `name` in the scrape `body`, joined for an error
+/// message.
+fn samples_of(body: &str, name: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with(&format!("{name}{{")) || line.starts_with(&format!("{name} "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Labelled samples are summed over the label sets that hold every requested pair; a longer
+/// series name and an unlabelled twin are told apart.
+#[test]
+fn test_labeled_sample_matches_label_subsets() -> eyre::Result<()> {
+    let body = "# TYPE tn_node_mode_transitions_total counter\n\
+                tn_node_mode_transitions_total{to=\"cvv_inactive\",reason=\"outside_gc_window\"} 1\n\
+                tn_node_mode_transitions_total{reason=\"epoch_behind\",to=\"cvv_inactive\"} 2\n\
+                tn_node_mode_transitions_total{to=\"cvv_active\",reason=\"rejoin\"} 1\n\
+                tn_node_mode{mode=\"cvv_active\"} 1\n\
+                tn_primary_consensus_exec_lag_rounds 17\n\
+                tn_primary_consensus_exec_lag_rounds_max 99\n";
+    assert_eq!(labeled_sample(body, MODE_TRANSITIONS, &[TO_INACTIVE])?, Some(3.0));
+    assert_eq!(
+        labeled_sample(body, MODE_TRANSITIONS, &[TO_INACTIVE, r#"reason="outside_gc_window""#])?,
+        Some(1.0)
+    );
+    assert_eq!(labeled_sample(body, MODE_TRANSITIONS, &[r#"reason="restart_gap""#])?, None);
+    assert_eq!(labeled_sample(body, "tn_node_mode", &[r#"mode="cvv_active""#])?, Some(1.0));
+    assert_eq!(labeled_sample(body, EXEC_LAG_ROUNDS, &[])?, Some(17.0));
+    assert!(labeled_sample("tn_primary_consensus_exec_lag_rounds NaNx\n", EXEC_LAG_ROUNDS, &[])
+        .is_err());
+    Ok(())
+}
+
+// ---- bench5 f3-rejoin ----
+
+/// The validator [`test_restarts_halt_recovers_on_stalled_head`] restarts, demotes and freezes
+/// (node 3). It is index 2, the node [`wait_for_downtime`] leaves out of its progress reads.
+const HALTED_INACTIVE_NODE: usize = 2;
+
+/// The run index of [`HALTED_INACTIVE_NODE`]'s restarted process, whose log the test reads.
+const HALTED_RESTART_RUN: u32 = 1;
+
+/// The validator [`test_restarts_halt_recovers_on_stalled_head`] kills (node 4), which leaves two
+/// active members of four, one short of the quorum of three.
+const HALTED_KILLED_NODE: usize = 3;
+
+/// Time limit for the restarted [`HALTED_INACTIVE_NODE`] to start and demote itself on the first
+/// certificate past its activity window.
+const HALT_DEMOTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the consensus head must stay unchanged before the committee counts as halted.
+///
+/// It exceeds `tn_types::REJOIN_STALLED_HEAD_AFTER` (20 s), so the head the inactive member resumes
+/// on is old enough for the stalled-head rule, and four times the five-second freshness limit of
+/// the usual rejoin rule, which therefore cannot promote it.
+const HALT_MIN: Duration = Duration::from_secs(21);
+
+/// Time limit for the halt to set in after the kill: commits of certificates already formed with
+/// the killed node's votes can still land.
+const HALT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Interval between consensus head reads while the test watches the halt.
+const HALT_POLL: Duration = Duration::from_millis(500);
+
+/// Time limit, from the inactive member's resume, for the committee to commit again.
+///
+/// The budget, about 60 s: up to 10 s to fetch the outputs behind the gossiped frontier (fetches
+/// from the killed node fail after about 5 s, and a lost fetch is asked for again within two 5 s
+/// stalled-head checks), up to one check before the stall clock starts on the replayed head, the
+/// 20 s stall plus one check when timer jitter misses the threshold, and about 18 s from the
+/// promotion to the first commit, which the restarted primary spends fetching the certificates it
+/// needs before it votes. Measured runs took 42 to 53 s.
+const STALLED_HEAD_RECOVERY: Duration = Duration::from_secs(90);
+
+/// The line a catching-up CVV logs when the stalled-head rule promotes it.
+const STALLED_HEAD_REJOIN_LOG: &str = "rejoining on a stalled consensus head";
+
+/// Prometheus counter of promotions on a stalled consensus head.
+const STALLED_HEAD_REJOINS: &str = "tn_executor_stalled_head_rejoins_total";
+
+/// Prometheus counter of the usual rejoin rule's refusals, labelled `reason`.
+const REJOIN_BLOCKED: &str = "tn_executor_rejoin_blocked_total";
+
+/// The `reason` label of a refusal because the newest known header is too old.
+const STALE_HEAD: &str = r#"reason="stale_head""#;
+
+/// The labels of a promotion in [`MODE_TRANSITIONS`], from either rejoin rule.
+const TO_ACTIVE_REJOIN: [&str; 2] = [r#"to="cvv_active""#, r#"reason="rejoin""#];
+
+/// A committee halted below quorum resumes when its inactive member rejoins on the stalled head,
+/// with no process restart (SEC-2, issue #1518).
+///
+/// Four validators, quorum three, `gc_depth` [`RESTART_TEST_GC_DEPTH`]. [`HALTED_INACTIVE_NODE`] is
+/// stopped while the other three commit past its activity window and then started again. The new
+/// process has no gossip backlog: the first certificate it sees is at the committee's frontier,
+/// past its window, and demotes it to `CvvInactive`. It is frozen with SIGSTOP at once, so it
+/// cannot catch up while the head is fresh, and the other three commit once more, so that a
+/// consensus output reaches it after its demotion. [`HALTED_KILLED_NODE`] is then killed: two
+/// active members remain, and the consensus head of nodes 1 and 2 stays unchanged for
+/// [`HALT_MIN`]. The inactive member is resumed with SIGCONT, the same process: it replays to the
+/// stalled head, the usual rule refuses the head as stale, and after watching it stall it promotes
+/// itself; the committee commits again within [`STALLED_HEAD_RECOVERY`] and a transfer sent to
+/// node 1 executes on node 3.
+///
+/// The first stop is a restart, not a freeze: a node frozen while the others commit handles the
+/// gossip buffered meanwhile once resumed, oldest first and each certificate inside its window,
+/// and a certificate fetch can lift its committed round to the frontier before the first frontier
+/// certificate arrives, so it never demotes (one run in three). The commit after the freeze is
+/// needed because an inactive member learns the consensus head only from gossip, and the restarted
+/// node can demote before any consensus output reached it (two runs in five without it).
+///
+/// The test checks the restarted process's counters and log: one stalled-head promotion, one
+/// rejoin transition (so the usual rule never promoted), at least one `stale_head` refusal,
+/// exactly one demotion, and one `rejoining on a stalled consensus head` line, logged after it
+/// replayed the halted head; nodes 1 and 2 count no demotion.
+///
+/// This fails without the stalled-head rule: an inactive CVV checked readiness only after an
+/// output, and only on a head under five seconds old, so the resumed node replays to the halted
+/// head, refuses it as stale and stays inactive, and the committee never commits again.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_halt_recovers_on_stalled_head() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "restarts_halt_recovers_on_stalled_head";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        None,
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no port available"));
+    let nodes = (0..4)
+        .map(|_| Ok((port()?, format!("127.0.0.1:{}", port()?))))
+        .collect::<eyre::Result<Vec<(u16, String)>>>()?;
+    let client_urls = <[String; 4]>::try_from(
+        nodes
+            .iter()
+            .map(|(rpc_port, _)| format!("http://127.0.0.1:{rpc_port}"))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let mut guard = ProcessGuard::empty();
+    nodes.iter().enumerate().for_each(|(i, (rpc_port, metrics_addr))| {
+        let args = ["--metrics", metrics_addr.as_str()];
+        guard.push(start_validator_with_args(i, bin, &temp_path, *rpc_port, test, 0, &args));
+    });
+
+    let checked = check_halt_recovers_on_stalled_head(
+        &mut guard,
+        bin,
+        &temp_path,
+        &nodes,
+        &client_urls,
+        test,
+    );
+    // a frozen node handles the teardown's sigterm only once it runs again; the guard holds the
+    // restarted process once the test restarted it
+    let resumed = guard
+        .get_mut(HALTED_INACTIVE_NODE)
+        .map(|child| pid_of(child).and_then(|pid| Ok(signal::kill(pid, Signal::SIGCONT)?)));
+    if let Some(Err(e)) = resumed {
+        error!(target: "restart-test", ?e, "failed to resume the frozen validator before teardown");
+    }
+    match checked {
+        Ok(summary) => {
+            guard.finish();
+            eprintln!("{test}: {summary}");
+            Ok(())
+        }
+        Err(e) => {
+            guard.kill_all();
+            Err(e.wrap_err(format!(
+                "halted committee did not resume on a stalled head, check logs in test_logs/{test}/"
+            )))
+        }
+    }
+}
+
+/// The steps and checks of [`test_restarts_halt_recovers_on_stalled_head`]. `nodes` holds each
+/// validator's RPC port and metrics address. [`HALTED_INACTIVE_NODE`] is killed and its restarted
+/// process replaces it in `guard` (RPC port kept, a fresh metrics address); [`HALTED_KILLED_NODE`]
+/// is taken out of `guard` and killed. Returns the measured times and counter values for the
+/// test's summary line.
+fn check_halt_recovers_on_stalled_head(
+    guard: &mut ProcessGuard,
+    bin: &'static TestBinary,
+    temp_path: &Path,
+    nodes: &[(u16, String)],
+    client_urls: &[String; 4],
+    test: &str,
+) -> eyre::Result<String> {
+    let node = |index: usize| index + 1;
+    let inactive_url = &client_urls[HALTED_INACTIVE_NODE];
+    let inactive_rpc_port = nodes
+        .get(HALTED_INACTIVE_NODE)
+        .map(|(rpc_port, _)| *rpc_port)
+        .ok_or_else(|| eyre::eyre!("missing node {}", node(HALTED_INACTIVE_NODE)))?;
+    network_advancing(client_urls)?;
+    wait_until_blocking(Duration::from_secs(45), "all four validators commit", || {
+        Ok(client_urls
+            .iter()
+            .all(|url| get_latest_consensus_header_number(url).is_ok_and(|number| number > 0)))
+    })?;
+
+    // the other three commit past the stopped node's activity window
+    kill_validator(guard, client_urls, HALTED_INACTIVE_NODE)?;
+    wait_for_downtime(client_urls, RESTART_TEST_DOWNTIME_SECS)?;
+
+    // restarted, the node has no gossip backlog: the first certificate it sees is far past its
+    // window and demotes it; it is frozen as soon as it is inactive, before it can catch up to a
+    // head the usual rule calls fresh
+    let metrics_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no metrics port available for the restarted validator"))?;
+    let inactive_metrics = format!("127.0.0.1:{metrics_port}");
+    guard.replace(
+        HALTED_INACTIVE_NODE,
+        start_validator_with_args(
+            HALTED_INACTIVE_NODE,
+            bin,
+            temp_path,
+            inactive_rpc_port,
+            test,
+            HALTED_RESTART_RUN,
+            &["--metrics", &inactive_metrics],
+        ),
+    );
+    let restarted_at = Instant::now();
+    let inactive_pid = guard
+        .get_mut(HALTED_INACTIVE_NODE)
+        .map(|child| pid_of(child))
+        .ok_or_else(|| eyre::eyre!("missing restarted node {}", node(HALTED_INACTIVE_NODE)))??;
+    wait_until_blocking(
+        HALT_DEMOTION_TIMEOUT,
+        &format!("node {} to demote itself after its restart", node(HALTED_INACTIVE_NODE)),
+        || Ok(get_node_mode(inactive_url).is_ok_and(|mode| mode == NodeMode::CvvInactive)),
+    )?;
+    signal::kill(inactive_pid, Signal::SIGSTOP)?;
+    let demoted_after = restarted_at.elapsed();
+
+    // an inactive member learns the consensus head only from gossip, and the restarted node can
+    // demote before any consensus output reached it: one more commit of the three active members
+    // is gossiped to it while it is frozen, and it reads that output when it resumes
+    let frozen_head = get_latest_consensus_header_number(&client_urls[0])?;
+    wait_until_blocking(
+        Duration::from_secs(30),
+        &format!(
+            "nodes 1, 2 and 4 to commit past consensus head {frozen_head} while node {} is frozen",
+            node(HALTED_INACTIVE_NODE)
+        ),
+        || {
+            Ok(get_latest_consensus_header_number(&client_urls[0])
+                .is_ok_and(|number| number > frozen_head))
+        },
+    )?;
+
+    kill_validator(guard, client_urls, HALTED_KILLED_NODE)?;
+
+    // nodes 1 and 2 cannot certify alone: the head must stay put
+    let block_before = get_block_number(&client_urls[0])?;
+    let (halt_head, halt_started) = wait_for_halt(&client_urls[..2])?;
+    let halted_for = halt_started.elapsed();
+    let block_halted = get_block_number(&client_urls[0])?;
+    eyre::ensure!(
+        block_halted == block_before,
+        "node 1's block number moved from {block_before} to {block_halted} during the halt at \
+         consensus head {halt_head}"
+    );
+
+    // the inactive member resumes on a head older than the usual rule accepts; nothing restarts
+    signal::kill(inactive_pid, Signal::SIGCONT)?;
+    let resumed = Instant::now();
+    wait_until_blocking(
+        STALLED_HEAD_RECOVERY,
+        &format!("node 1 to commit past the halted consensus head {halt_head}"),
+        || {
+            Ok(get_latest_consensus_header_number(&client_urls[0])
+                .is_ok_and(|number| number > halt_head))
+        },
+    )?;
+    let halt_to_commit = halt_started.elapsed();
+    let resume_to_commit = resumed.elapsed();
+    wait_until_blocking(
+        Duration::from_secs(30),
+        &format!("nodes 1-3 to commit past the halted consensus head {halt_head}"),
+        || {
+            Ok(client_urls[..3].iter().all(|url| {
+                get_latest_consensus_header_number(url).is_ok_and(|number| number > halt_head)
+            }))
+        },
+    )?;
+    wait_for_node_mode(inactive_url, NodeMode::CvvActive)?;
+
+    // blocks execute again on nodes 1-3
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+    send_and_confirm(&client_urls[0], inactive_url, &key, to_account, 0)?;
+    let balance = get_balance(inactive_url, &to_account.to_string(), 1)?;
+    for (index, url) in client_urls[..2].iter().enumerate() {
+        let peer_balance = get_balance_above_with_retry(url, &to_account.to_string(), balance - 1)?;
+        eyre::ensure!(
+            peer_balance == balance,
+            "node {} reads a balance of {peer_balance}, node {} {balance}",
+            node(index),
+            node(HALTED_INACTIVE_NODE)
+        );
+    }
+    let blocks = client_urls[..3]
+        .iter()
+        .map(|url| get_block_number(url))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    eyre::ensure!(
+        blocks.iter().all(|block| *block > block_halted),
+        "nodes 1-3 are at blocks {blocks:?}, not past the halted block {block_halted}"
+    );
+
+    // node 3 rejoined once, on the stalled-head rule, after the usual rule refused the old head
+    let body = scrape_metrics(&inactive_metrics)?;
+    let stalled_rejoins = labeled_sample(&body, STALLED_HEAD_REJOINS, &[])?;
+    let rejoins = labeled_sample(&body, MODE_TRANSITIONS, &TO_ACTIVE_REJOIN)?;
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?;
+    let stale_head = labeled_sample(&body, REJOIN_BLOCKED, &[STALE_HEAD])?;
+    eyre::ensure!(
+        stalled_rejoins == Some(1.0)
+            && rejoins == Some(1.0)
+            && demotions == Some(1.0)
+            && stale_head.is_some_and(|refusals| refusals >= 1.0),
+        "node {}: {STALLED_HEAD_REJOINS} {stalled_rejoins:?}, rejoin transitions {rejoins:?}, \
+         demotions {demotions:?} ({}), stale-head refusals {stale_head:?} ({})",
+        node(HALTED_INACTIVE_NODE),
+        samples_of(&body, MODE_TRANSITIONS),
+        samples_of(&body, REJOIN_BLOCKED)
+    );
+    let lines = node_log_lines(test, HALTED_INACTIVE_NODE, HALTED_RESTART_RUN)?;
+    let stalled_lines =
+        lines.iter().filter(|line| line.contains(STALLED_HEAD_REJOIN_LOG)).collect::<Vec<_>>();
+    let usual_lines = lines.iter().filter(|line| line.contains(REJOIN_LOG)).count();
+    let head_age_ms = stalled_lines.first().and_then(|line| log_field(line, "head_age_ms"));
+    let replayed = stalled_lines.first().and_then(|line| log_field(line, "replayed_number"));
+    eyre::ensure!(
+        stalled_lines.len() == 1 && usual_lines == 0,
+        "node {} logged {} `{STALLED_HEAD_REJOIN_LOG}` lines and {usual_lines} `{REJOIN_LOG}` \
+         lines, the first stalled-head line: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.len(),
+        stalled_lines.first()
+    );
+    eyre::ensure!(
+        head_age_ms
+            .is_some_and(|age| u128::from(age) >= tn_types::REJOIN_STALLED_HEAD_AFTER.as_millis()),
+        "node {} promoted on a head {head_age_ms:?} ms old: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.first()
+    );
+    eyre::ensure!(
+        replayed == Some(halt_head),
+        "node {} promoted after replaying to {replayed:?}, not to the halted consensus head \
+         {halt_head}: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.first()
+    );
+
+    // nodes 1 and 2 were never behind
+    for (index, (_, addr)) in nodes[..2].iter().enumerate() {
+        let body = scrape_metrics(addr)?;
+        let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+        let stalled_rejoins = labeled_sample(&body, STALLED_HEAD_REJOINS, &[])?.unwrap_or(0.0);
+        eyre::ensure!(
+            demotions == 0.0 && stalled_rejoins == 0.0,
+            "node {} counted {demotions} demotions ({}) and {stalled_rejoins} stalled-head rejoins",
+            node(index),
+            samples_of(&body, MODE_TRANSITIONS)
+        );
+    }
+
+    Ok(format!(
+        "node {} demoted {demoted_after:?} after its restart; consensus head {halt_head} halted \
+         {halted_for:?} before node {} resumed; first commit {halt_to_commit:?} after the halt \
+         began, {resume_to_commit:?} after the resume; promoted on a head {head_age_ms:?} ms old; \
+         node {} counters: {STALLED_HEAD_REJOINS} {stalled_rejoins:?}, rejoin transitions \
+         {rejoins:?}, demotions {demotions:?}, stale-head refusals {stale_head:?}; blocks {blocks:?}",
+        node(HALTED_INACTIVE_NODE),
+        node(HALTED_INACTIVE_NODE),
+        node(HALTED_INACTIVE_NODE)
+    ))
+}
+
+/// Take validator `index` out of `guard`, stop it, and check that its RPC no longer answers.
+fn kill_validator(
+    guard: &mut ProcessGuard,
+    client_urls: &[String; 4],
+    index: usize,
+) -> eyre::Result<()> {
+    let mut child = guard.take(index).ok_or_else(|| eyre::eyre!("missing node {}", index + 1))?;
+    kill_child(&mut child);
+    let rpc: eyre::Result<String> =
+        call_rpc(&client_urls[index], "eth_blockNumber", rpc_params![], 0, "killed validator");
+    eyre::ensure!(rpc.is_err(), "node {} serves RPC after the kill", index + 1);
+    Ok(())
+}
+
+/// The process id of `child`, for signals.
+fn pid_of(child: &Child) -> eyre::Result<Pid> {
+    Ok(Pid::from_raw(i32::try_from(child.id())?))
+}
+
+/// Wait until the newest consensus header any of `client_urls` reports has stayed unchanged for
+/// [`HALT_MIN`], within [`HALT_TIMEOUT`]. Returns that header's number and when the test first
+/// read it, which is when the halt began to within [`HALT_POLL`].
+fn wait_for_halt(client_urls: &[String]) -> eyre::Result<(u64, Instant)> {
+    let head = || {
+        client_urls
+            .iter()
+            .map(|url| get_latest_consensus_header_number(url))
+            .collect::<eyre::Result<Vec<_>>>()
+            .map(|numbers| numbers.into_iter().max().unwrap_or_default())
+    };
+    let start = Instant::now();
+    let mut halted = (head()?, Instant::now());
+    loop {
+        if halted.1.elapsed() >= HALT_MIN {
+            return Ok(halted);
+        }
+        eyre::ensure!(
+            start.elapsed() < HALT_TIMEOUT,
+            "the consensus head of {client_urls:?} kept moving for {HALT_TIMEOUT:?} with two \
+             active members, last at {}",
+            halted.0
+        );
+        std::thread::sleep(HALT_POLL);
+        let now = head()?;
+        if now != halted.0 {
+            halted = (now, Instant::now());
+        }
+    }
 }
