@@ -75,7 +75,7 @@ What this means for a validator:
 - **On cloud block storage, the minimum is 20,000 sustained write IOPS.** With the defaults, at 800 MiB/s, a busy output took 629 ms (1.59 outputs a second) and a peak one 1,964 ms (0.51 a second).
 - **10,000 IOPS is not enough.** A busy output took 964 ms, about the second between the benchmark's outputs, so the node kept up with busy load with no margin, and at peak its commits wrote about 700 MiB/s of the disk's 800.
 - **For cloud block storage, 40,000 IOPS is recommended.** Its commit took 157 ms of a 486 ms busy output (2.06 outputs a second) and 408 ms of a 1,670 ms peak one (0.60 a second), so more IOPS can save at most that commit time.
-- **Provision throughput with the IOPS.** At 20,000 IOPS, 300 MiB/s gave a busy output of 807 ms and a peak one of 2,598 ms, against 629 and 1,964 ms at 800 MiB/s.
+- **Provision at least 800 MiB/s with the IOPS.** At 20,000 IOPS, 300 MiB/s gave a busy output of 807 ms and a peak one of 2,598 ms, against 629 and 1,964 ms at 800 MiB/s: 28% and 32% slower. Nothing above 800 MiB/s was measured on cloud block storage.
 - **No disk measured keeps up with peak load at one output a second.** Even at 40,000 IOPS a peak output took 1.7 s, 1.3 s of it outside the commit (execution, the state root and writing the blocks). Peak-sized outputs arriving that fast queue on any of these disks.
 - **4,500 IOPS is too slow for a busy validator.** The commit of one peak output took 12 s or more.
 - Quote provisioned, sustained figures, not burst figures.
