@@ -7,9 +7,12 @@
 
 use super::{
     checked, storage_root_targets, ParallelRoot, ParallelRoots, StorageRootSource as _,
-    StorageRootTasks, TaskError, TASK_ROOTS_TAKEN,
+    StorageRootTasks, StorageSplits, TaskError, TASK_ROOTS_TAKEN,
 };
-use crate::{env::output_overlay::AccountWalk, OutputTrieOverlay, RethChainSpec, RethEnv};
+use crate::{
+    env::output_overlay::{AccountWalk, StorageWalk, Walks},
+    OutputTrieOverlay, RethChainSpec, RethEnv,
+};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use reth_chain_state::ComputedTrieData;
@@ -141,8 +144,8 @@ impl Fixture {
         Ok(())
     }
 
-    /// Run `blocks` as one output: each block's root serially, with the tasks unchecked (the
-    /// account walk on one thread, then split) and in shadow mode, over one transaction; all must
+    /// Run `blocks` as one output: each block's root serially, with the tasks unchecked (each walk
+    /// on one thread or task, then split) and in shadow mode, over one transaction; all must
     /// agree. Returns the task results the walks took.
     fn check_output(&self, blocks: &[HashedPostState]) -> eyre::Result<usize> {
         let factory = self.env.blockchain_provider();
@@ -152,17 +155,24 @@ impl Fixture {
         let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
         for (i, block) in blocks.iter().enumerate() {
             let serial = overlay.layered_root_with_updates(tx, block.clone())?;
-            for walk in [AccountWalk::OneThread, AccountWalk::Split] {
-                let parallel =
-                    overlay.layered_root_with_updates_parallel(factory, tx, block.clone(), walk)?;
-                assert_eq!(parallel.0, serial.0, "state root differs at block {i} ({walk:?})");
-                assert_eq!(parallel.1, serial.1, "trie updates differ at block {i} ({walk:?})");
+            for account in [AccountWalk::OneThread, AccountWalk::Split] {
+                for storage in [StorageWalk::OneTask, StorageWalk::Split] {
+                    let walk = Walks::new(account, storage);
+                    let parallel = overlay.layered_root_with_updates_parallel(
+                        factory,
+                        tx,
+                        block.clone(),
+                        walk,
+                    )?;
+                    assert_eq!(parallel.0, serial.0, "state root differs at block {i} ({walk:?})");
+                    assert_eq!(parallel.1, serial.1, "trie updates differ at block {i} ({walk:?})");
+                }
             }
             let shadow = overlay.block_root_with_updates(
                 factory,
                 tx,
                 block.clone(),
-                ParallelRoots::Shadow(AccountWalk::Split),
+                ParallelRoots::Shadow(Walks::SPLIT),
             )?;
             assert_eq!(shadow, serial, "shadow result differs at block {i}");
             overlay.extend_from_block(&ComputedTrieData::without_trie_input(
@@ -329,7 +339,7 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
 
     let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
     let parallel =
-        overlay.layered_root_with_updates_parallel(factory, walk_tx, block, AccountWalk::Split)?;
+        overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
     Ok(())
@@ -341,7 +351,7 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
 fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
     let mut targets = vec![(key(9, 1), Default::default()), (key(9, 2), Default::default())];
     targets.sort_unstable_by_key(|(address, _)| *address);
-    let tasks = StorageRootTasks::new(targets);
+    let tasks = StorageRootTasks::new(targets, StorageSplits::default());
     let [first, second] = [&tasks.slots[0], &tasks.slots[1]];
 
     tasks.run(first, || panic!("a task panics"));
@@ -350,10 +360,12 @@ fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
     assert!(tasks.storage_root(second.hashed_address).is_none(), "the walk claims a pending task");
     tasks.run(second, || unreachable!("a claimed task must not run"));
 
-    let failed = StorageRootTasks::new(vec![(key(9, 3), Default::default())]);
+    let failed =
+        StorageRootTasks::new(vec![(key(9, 3), Default::default())], StorageSplits::default());
     failed.run(&failed.slots[0], || Err(TaskError::TipMoved { walk: Some(1), task: Some(2) }));
     assert!(failed.storage_root(key(9, 3)).is_none(), "a failed task's root");
-    let done = StorageRootTasks::new(vec![(key(9, 4), Default::default())]);
+    let done =
+        StorageRootTasks::new(vec![(key(9, 4), Default::default())], StorageSplits::default());
     done.run(&done.slots[0], || Ok((key(9, 5), 3, Default::default())));
     assert_eq!(done.storage_root(key(9, 4)).map(|r| r.0), Some(key(9, 5)), "a finished task");
     assert!(done.storage_root(key(9, 6)).is_none(), "an account without a task");
@@ -362,7 +374,7 @@ fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
 
 /// A parallel result, from the walk on one thread (`composed: false`) or the split.
 fn parallel(result: (B256, TrieUpdates), composed: bool) -> ParallelRoot {
-    ParallelRoot { result, composed }
+    ParallelRoot { result, composed, storage_composed: 0 }
 }
 
 /// A sampled comparison that finds a difference (in the root, or only in the trie updates)

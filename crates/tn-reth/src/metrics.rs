@@ -13,7 +13,9 @@
 //! `tn_reth.parallel_state_root_mismatches_total` (alertable), sampled block roots whose parallel
 //! storage roots differed from the serial computation. A fifth,
 //! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
-//! counts blocks whose split account walk ran on one thread instead.
+//! counts blocks whose split account walk ran on one thread instead, and a sixth,
+//! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
+//! storage tries whose split storage root was not used.
 //!
 //! Six histograms in the same group time the stages of each block that function builds, one
 //! sample per block each: `tn_reth.block_execute_seconds` (with
@@ -134,6 +136,7 @@ pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
     register_invalid_tx_skip_series();
     register_account_walk_fallback_series();
+    register_storage_walk_fallback_series();
     register_retired_pool_handoff_series();
 }
 
@@ -473,6 +476,70 @@ fn register_account_walk_fallback_series() {
 /// test.
 pub(crate) fn record_account_walk_fallback(reason: AccountWalkFallback) {
     metrics::counter!(ACCOUNT_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for hot storage tries whose storage root would be split by first nibble but was
+/// computed on one task or by the walk (`env/output_overlay/storage_split.rs`), kept next to its
+/// only emission helper so the registration in [`register_storage_walk_fallback_series`] and the
+/// increment in [`record_storage_walk_fallback`] cannot drift apart. One series per
+/// [`StorageWalkFallback`].
+const STORAGE_WALK_FALLBACKS: &str = "tn_reth.storage_walk_fallbacks_total";
+
+/// Why a hot storage trie (a storage-root target with at least `SPLIT_MIN_SLOTS` changed slots)
+/// was not split, or its split result not used. Labels [`STORAGE_WALK_FALLBACKS`]; counted once
+/// per such trie and block.
+///
+/// Only tries the split would take count: a node with `TN_PARALLEL_STORAGE_WALK=0` or
+/// `TN_PARALLEL_STATE_ROOT=0` counts nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageWalkFallback {
+    /// The stored trie failed the pre-check (a first-nibble node missing or with a leaf or
+    /// extension child): a trie of a few thousand slots or fewer. Not tried, so free: its storage
+    /// root ran on one task.
+    SmallTrie,
+    /// The pieces composed nothing (the block's changes left a first-nibble node that is not a
+    /// branch over hashed children, fewer than two non-empty first nibbles, or an empty storage):
+    /// the block paid for the pieces and then the walk computed the storage root serially.
+    Shape,
+    /// The database holds a storage-trie node at the empty path, which reth never writes. Alert
+    /// on any nonzero value: the stored trie is not one reth wrote.
+    StoredRootNode,
+    /// A sampled serial check found a block with a composed storage root wrong; the block used
+    /// the serial result. Alert on any nonzero value: also counted in
+    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off
+    /// (`TN_PARALLEL_STORAGE_WALK=0`).
+    Mismatch,
+}
+
+impl StorageWalkFallback {
+    /// Every variant, for zero-registration in [`register_storage_walk_fallback_series`]. Extend
+    /// it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SmallTrie => "small_trie",
+            Self::Shape => "shape",
+            Self::StoredRootNode => "stored_root_node",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Register one storage-walk fallback series per [`StorageWalkFallback`] at zero. Called from
+/// [`init`], for the reasons given there.
+fn register_storage_walk_fallback_series() {
+    StorageWalkFallback::ALL.iter().for_each(|reason| {
+        metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one hot storage trie whose split fell back, labeled by [`StorageWalkFallback`]. The
+/// macro path re-resolves the recorder on every call, keeping the series observable from a unit
+/// test.
+pub(crate) fn record_storage_walk_fallback(reason: StorageWalkFallback) {
+    metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
 }
 
 /// Counter names for the retired-worker pool handoff, kept next to their only emission sites so
@@ -1330,6 +1397,43 @@ mod tests {
                     reason.label()
                 );
             });
+    }
+
+    /// [`register_storage_walk_fallback_series`] registers one series per
+    /// [`StorageWalkFallback`] at zero, and a recorded fallback moves only its own reason's.
+    #[test]
+    fn test_storage_walk_fallbacks_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_storage_walk_fallback_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == StorageWalkFallback::SmallTrie { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
     }
 
     /// [`register_account_walk_fallback_series`] registers one series per

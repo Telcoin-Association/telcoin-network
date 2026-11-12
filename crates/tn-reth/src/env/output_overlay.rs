@@ -48,16 +48,21 @@ mod cursors;
 mod parallel;
 mod sorted_runs;
 mod storage_cursor;
+mod storage_split;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 pub(crate) use account_split::AccountWalk;
 use cursors::RunCursorFactory;
 use parallel::ParallelRoots;
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use parallel::Walks;
 use sorted_runs::SortedTrieRuns;
 use storage_cursor::OverlayCursorFactory;
+#[cfg(test)]
+pub(crate) use storage_split::StorageWalk;
 
 /// Geometrically compacted trie deltas for the blocks built within one consensus output.
 ///
