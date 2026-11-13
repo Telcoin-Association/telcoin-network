@@ -364,7 +364,7 @@ impl<H: NippyJarHeader> NippyJar<H> {
     /// configuration, which every commit rewrites. Only upstream's format (version 1) carries
     /// them (TN-0146 makes that path write and reopen correctly). Checked at load and, TN(TN-0149),
     /// when a writer opens the jar, so no row is written that a load would then refuse.
-    pub(crate) fn check_compression(&self) -> Result<(), NippyJarError> {
+    pub(crate) const fn check_compression(&self) -> Result<(), NippyJarError> {
         if self.has_checksums() &&
             matches!(&self.compressor, Some(Compressors::Zstd(zstd)) if zstd.use_dict)
         {
