@@ -116,8 +116,8 @@ RocksDB work:
 - `EitherWriter`/`EitherReader` (`either_writer.rs`) still have the `RocksBatchArg`/`RocksTxRefArg`
   parameters, typed `()`, and `storage_v2` routing in `StorageSettings` (reth-db-api
   `models/metadata.rs`).
-- `check_consistency()` returns a RocksDB unwind target (always `None`), which TN logs in
-  `env/mod.rs`. `DatadirArgs::rocksdb_path` and `ChainPath`'s RocksDB directory live in
+- `check_consistency()` returns a RocksDB unwind target (always `None`); TN's startup refuses
+  any unwind target it returns (`env/mod.rs`). `DatadirArgs::rocksdb_path` and `ChainPath`'s RocksDB directory live in
   reth-node-core (`args/datadir_args.rs`, `dirs.rs`), and TN sets `rocksdb_path: None` in
   `dirs.rs`, `genesis.rs` and `snapshot.rs`.
 
@@ -138,7 +138,8 @@ CHANGES.md and DECISIONS.md should remain).
   traits.
 - `reth-evm-ethereum` contributes three items. TN pins all forks at genesis, so a TN-owned
   `revm_spec` and receipt builder are small.
-- `reth-metrics` in six TN crates becomes `metrics` plus `metrics-derive` (mechanical).
+- `reth-metrics` in nine TN crates (tn-reth included) becomes `metrics` plus `metrics-derive`
+  (mechanical).
 - [done, TN-0012] `reth-primitives` became `reth-primitives-traits` plus `reth-ethereum-primitives`;
   `tn-types` now owns the `Block`/`BlockBody`/`SealedBlock` aliases. Going further (TN-owned
   `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.

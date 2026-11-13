@@ -4,11 +4,11 @@ Research behind ROADMAP.md. Regenerate it before relying on it after large chang
 `file:line` references drift. Paths are relative to the TN repository root; a bare path such as
 `env/mod.rs:188` is under `crates/tn-reth/src/`.
 
-Taken on `sls_tndb_b_vendor`, which also carries the tndb-b storage work. Rows naming
-`tndb-b-reth`, `TndbEnv`, `env/database.rs`'s tndb-b build or `migrate.rs` do not apply to
-`main`. On `main`, six manifests name `reth-metrics` (batch-builder, engine, network-libp2p, node,
-state-sync, tn-reth), all for its derive and `metrics` re-export; the counts below are the
-snapshot's.
+Taken on the branch that carried the tndb-b storage work. tndb-b is tn-lmdb since 2026-11-04
+(`tn-lmdb-reth`, `TnLmdbEnv`; the rows below use those names) and TN's default reth backend since
+2026-11-09 (DECISIONS.md D22). Nine manifests name `reth-metrics` (batch-builder, the consensus
+executor, primary and worker, engine, network-libp2p, node, state-sync, tn-reth), all for its
+derive and `metrics` re-export; the other counts below are the snapshot's.
 
 Vendored: 57 reth crates plus the dev-only `reth-testing-utils` (`vendor/reth/tn/crates.txt`),
 down from 101 (TN-0005, TN-0009, TN-0011, TN-0012, and TN-0028 to TN-0032 in the second pass).
@@ -21,7 +21,8 @@ still prints v1.11.3: upstream did not bump the workspace version for v1.11.4 ei
   and reth's `TaskSpawner` trait, implemented for TN's spawner (`task_manager.rs:626`).
 - `tn-config`: `ChainSpec` (`crates/config/src/node.rs:4`).
 - `tn-exex`: two items, `Chain` and `CanonStateNotification`.
-- `tndb-b-reth`: the reth DB API (`reth-db-api`, `reth-storage-errors`), which it implements.
+- `tn-lmdb-reth`: the reth DB API (`reth-db-api`, `reth-storage-errors`), which it implements
+  over tn-lmdb, the default execution database.
 - `tn-storage`: `reth-libmdbx`, behind its default `reth-libmdbx` feature, for TN's old MDBX
   consensus-DB backend (migration source, tests, benches).
 - Eight crates use `reth-metrics` only for its derive macro and its `metrics` re-export.
@@ -38,8 +39,8 @@ reth-payload-*). TN assembles the components itself:
 | Piece | Where | Notes |
 |---|---|---|
 | `NodeConfig` | wrapped by `RethConfig` (`cli.rs:63`), filled in `RethConfig::new` (`cli.rs:277-439`) | Every arg group is pinned or disabled; the network group no longer exists (TN-0008). Only the RPC, txpool and DB args come from the CLI. RPC uses TN's subset `RpcServerArgs`, converted to reth's at `rpc_server_args.rs:277`. `init_reth_defaults` (`cli.rs:169`) seeds reth's process-wide pool and IPC defaults. |
-| `NodeTypes` | `TelcoinNode`, `traits.rs:36-47` | `TNPrimitives` (`= EthPrimitives`, `types.rs:35`), `ChainSpec`, `EthStorage`, `EthEngineTypes`, `DB = RethDb`. `RethDb` wraps MDBX's `DatabaseEnv`, or tndb-b's `TndbEnv` under the `tndb-b` feature (`env/database.rs:27-33`). `TNExecution` (`traits.rs:77-149`) is a fail-loud consensus stub that satisfies the RPC builder's bounds (`env/rpc.rs:280`). |
-| Provider stack | `env/mod.rs:333-390`, `BlockchainProvider::new` at `env/mod.rs:188` | DB opened by `open_rw` (`env/database.rs:113`, reth's `init_db`; the tndb-b build at `:128`). `ProviderFactory::new` over the DB, the chain, `StaticFileProvider::read_write`, the `RocksDBProvider` stub and a `Runtime`, then `check_consistency()` (`:369`), then `init_genesis` (`:386`). The stub is zero-size since TN-0014; TN also sets `rocksdb_path: None` in `dirs.rs` and `env/genesis.rs` (ROADMAP, RocksDB step B). |
+| `NodeTypes` | `TelcoinNode`, `traits.rs:36-47` | `TNPrimitives` (`= EthPrimitives`, `types.rs:35`), `ChainSpec`, `EthStorage`, `EthEngineTypes`, `DB = RethDb`. `RethDb` wraps tn-lmdb's `TnLmdbEnv`, or MDBX's `DatabaseEnv` under the opt-in `mdbx` feature (`env/database.rs:31-38`). `TNExecution` (`traits.rs:77-149`) is a fail-loud consensus stub that satisfies the RPC builder's bounds (`env/rpc.rs:280`). |
+| Provider stack | `env/mod.rs:333-390`, `BlockchainProvider::new` at `env/mod.rs:188` | DB opened by `open_rw` (`env/database.rs:138`, tn-lmdb, which first migrates an MDBX database; the `mdbx` build's at `:120`, reth's `init_db`). `ProviderFactory::new` over the DB, the chain, `StaticFileProvider::read_write`, the `RocksDBProvider` stub and a `Runtime`, then `check_consistency()`, then `init_genesis_with_settings` in the layout `env/layout.rs` settles. The stub is zero-size since TN-0014; TN also sets `rocksdb_path: None` in `dirs.rs` and `env/genesis.rs` (ROADMAP, RocksDB step B). |
 | EVM | `evm/config.rs:109`, `evm/{factory,block,mod,handler}.rs` | TN-owned `ConfigureEvm`, `EvmFactory` (`factory.rs:44`), `BlockExecutorFactory` (`factory.rs:141`) and `BlockExecutor` (`block.rs:1842`; system calls, epoch close, EIP-2935/4788; `block.rs` is about 2.2k lines before its tests), plus a `BlockAssembler` (`block.rs:2067`), the `Evm` (`mod.rs:179`) and a revm `Handler` (`handler.rs:63`). |
 | Execution | `env/execution.rs:134-434` | `State::builder` over `StateProviderDatabase`, then `builder_for_next_block`, then `finish` against TN's `OverlayRootStateProvider` (`env/output_overlay.rs:149`, built at `execution.rs:242`), giving an `ExecutedBlock`. Saved with `save_blocks(SaveBlocksMode::Full)` and `commit` (`:342`, `:355`); the new tip goes out through `NewCanonicalChain::Commit` and `notify_canon_state` (`:385`, `:413`). `finish_executing_output` (`:427`) runs both halves. |
 | Txpool | `txn_pool.rs:318-350` | `EthTransactionPool` over a `DiskFileBlobStore`, from `eth_builder().no_eip4844().no_eip7702()` and `Pool::eth_pool`. TN runs its own maintenance loop (`maintain_pool`, `txn_pool.rs:476`), not reth's. |
@@ -57,7 +58,7 @@ names another crate.
 | reth-evm | reth-owned: `ConfigureEvm`, `EvmEnvFor`, `ExecutionCtxFor`, `BlockBuilder(Outcome)`, `BlockAssembler(Input)`, `Executor`. The rest is alloy-evm re-exports (`BlockExecutor(Factory)`, `EvmFactory`, `PrecompilesMap`, ...). `evm/*`, `env/*`. | heavy |
 | reth-evm-ethereum | `RethReceiptBuilder`, `revm_spec`, `revm_spec_by_timestamp_and_block_number` (`evm/config.rs`) | 3 items |
 | reth-provider | `ProviderFactory`, `BlockchainProvider`, `StaticFileProvider`, the `RocksDBProvider` stub, about 36 reader/writer traits, `SaveBlocksMode`, `CanonStateNotification(Stream)`, `ChangedAccount`, `Chain`, `ExecutionOutcome`, `EthStorage`. Also tn-exex (`CanonStateNotification`). | heavy |
-| reth-db / reth-db-api | `init_db`, `DatabaseEnv`, `mdbx::{DatabaseArguments, open_db_read_only, SyncMode}`, `tables::*`, the cursor/tx traits, `version`, `ClientVersion`, `DatabaseMetrics`, `iter_static_files` (`env/database.rs` and its MDBX-to-tndb-b `migrate.rs`, `snapshot.rs`, `env/output_overlay/*`, `metrics.rs`). tn-reth names reth-db only; tndb-b-reth implements reth-db-api (`Database`, `DbTx(Mut)`, the cursor and dup-cursor traits, `TableImporter`). | heavy |
+| reth-db / reth-db-api | `init_db`, `DatabaseEnv`, `mdbx::{DatabaseArguments, open_db_read_only, SyncMode}`, `tables::*`, the cursor/tx traits, `version`, `ClientVersion`, `DatabaseMetrics`, `iter_static_files` (`env/database.rs` and its MDBX-to-tn-lmdb `migrate.rs`, `snapshot.rs`, `env/output_overlay/*`, `metrics.rs`). tn-reth names reth-db only; tn-lmdb-reth implements reth-db-api (`Database`, `DbTx(Mut)`, the cursor and dup-cursor traits, `TableImporter`). | heavy |
 | reth-trie / reth-trie-db | `StateRoot`, `HashedPostState(Sorted)`, `HashedStorage`, `TrieUpdates(Sorted)`, `TrieInput(Sorted)`, the hashed/trie cursor traits and in-memory cursor factories, `MultiProof`; `DatabaseStateRoot`, `Database{Hashed,Trie}CursorFactory`. TN's output overlay (`env/output_overlay.rs` and `output_overlay/*`) layers its cursors on them; `snapshot.rs` recomputes roots. | moderate-heavy |
 | reth-chain-state | `ExecutedBlock`, `NewCanonicalChain`, `CanonicalInMemoryState`, `ComputedTrieData` | load-bearing |
 | reth-transaction-pool | `Pool`, `EthTransactionPool`, `TransactionValidationTaskExecutor`, `DiskFileBlobStore`, `CanonicalStateUpdate`, `BestTransactions`, `EthPooledTransaction`, `ValidPoolTransaction`, identifiers, error types (`txn_pool.rs`, `metrics.rs`, `types.rs`) | heavy |
@@ -71,13 +72,13 @@ names another crate.
 | reth-errors | `ProviderError`, `RethError`, `BlockExecutionError`, `BlockValidationError` | moderate |
 | reth-stages-types / reth-prune-types | Checkpoint types written by snapshot restore | light |
 | reth-network-api / -network-peers / reth-eth-wire-types | **Type-only.** `WorkerNetwork` stub impls of `NetworkInfo` and `PeersInfo` (`worker.rs:269-332`) for the `EthApi`, `web3_` and `net_` bounds (the only two network traits left, TN-0031); `Enr`, `NodeRecord`, `PeerId`; `BlockHashNumber` (`env/epoch.rs:80`); `NoopNetwork` in tests | light |
-| reth-tasks, -db-common, -cli-util, -tokio-util, -tracing | `TaskSpawner` (implemented in tn-types), `Runtime`; `init_genesis`; 3 parsers; `EventSender`; `Layers` | light |
+| reth-tasks, -db-common, -cli-util, -tokio-util, -tracing | `TaskSpawner` (implemented in tn-types), `Runtime`; `init_genesis_with_settings`; 3 parsers; `EventSender`; `Layers` | light |
 | reth-trie-sparse | No items: a dependency only to set its `std` and `metrics` features (`lib.rs:77`) | features only |
 | reth-metrics | `Metrics` derive in 9 TN crates: tn-reth, tn-node, tn-engine, tn-network-libp2p, tn-batch-builder, state-sync, tn-executor, tn-worker, tn-primary | light |
 | reth-execution-types | `Chain` re-export in tn-exex (`crates/exex/src/notification.rs:36`) | 1 item |
-| reth-storage-errors | tndb-b-reth's error mapping: `DatabaseErrorInfo`, `DatabaseWriteError`, `DatabaseWriteOperation` | light |
-| reth-libmdbx | tn-storage's MDBX consensus-DB backend (`crates/storage/src/mdbx/`, migration source and tests); tndb-b-reth differential tests (dev-dependency) | moderate |
-| reth-trie-common | Only tndb-b-reth's dup-sort tests (dev-dependency). tn-reth gets its types through reth-trie. | test only |
+| reth-storage-errors | tn-lmdb-reth's error mapping: `DatabaseErrorInfo`, `DatabaseWriteError`, `DatabaseWriteOperation` | light |
+| reth-libmdbx | tn-storage's MDBX consensus-DB backend (`crates/storage/src/mdbx/`, migration source and tests); tn-lmdb-reth differential tests (dev-dependency) | moderate |
+| reth-trie-common | Only tn-lmdb-reth's dup-sort tests (dev-dependency). tn-reth gets its types through reth-trie. | test only |
 
 ## Removed since the 2026-10-30 snapshot
 

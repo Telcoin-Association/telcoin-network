@@ -25,13 +25,18 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 - non-critical task panics are ignored by TN's `TaskManager`, and `panic` is the default
   `unwind`;
 - TN's base fee never goes below `MIN_PROTOCOL_BASE_FEE` (7 wei);
-- TN runs storage v1 (`StorageSettings::base()`) and never prunes: headers, transactions and
-  receipts are in static files; senders, change sets and history indices are in MDBX
-  (`provider/src/either_writer.rs`). Until 2026-11-04 this line said receipts were in MDBX; the
-  verdicts below that rest on it (1b20c9bfc, 6bd6bf28a) were rechecked by the 2026-11-01 review
-  and still hold;
-- the tndb-b work replaces MDBX and RocksDB, so fixes to those paths are tracked for its owners.
-  Static-file fixes are in scope here.
+- TN never prunes (`RethConfig::ensure_archive_mode`). The only prune checkpoints it writes are
+  a snapshot restore's availability markers (`AccountHistory`, `StorageHistory` at the restored
+  block, `crates/tn-reth/src/snapshot.rs`);
+- reth's database is tn-lmdb by default, MDBX only in the opt-in `mdbx` build (DECISIONS.md
+  D22). A new datadir on tn-lmdb is storage v2: headers, transactions, receipts, senders and
+  change sets in static files (checksummed, TN-0120 to TN-0122), history indices and the
+  transaction-hash index in the database (TN-0110, TN-0111). A datadir created before, or on the
+  `mdbx` build, stays v1: senders, change sets and history indices in the database
+  (`provider/src/either_writer.rs`; `crates/tn-reth/src/env/layout.rs`);
+- RocksDB is gone (TN-0014). An MDBX-only fix matters to the `mdbx` build until MDBX retires
+  (ROADMAP.md, Phase 3); a provider fix generic over the database reaches both. Static-file
+  fixes are in scope here.
 
 ## Applied
 
@@ -111,14 +116,14 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 | sha | subject | crate | why it matters to TN | pick |
 |---|---|---|---|---|
-| 7bf9241fe | disable read-tx timeout during check_consistency | provider | TN runs `check_consistency` at startup; a long heal on an archive DB can hit the MDBX reader timeout and crash-loop. **MDBX: for the tndb-b owners.** | 1 import-only conflict; likely clean after 294e21507 |
+| 7bf9241fe | disable read-tx timeout during check_consistency | provider | TN runs `check_consistency` at startup; a long heal on an archive DB can hit the read-transaction timeout and crash-loop. Both backends: tn-lmdb marks a read transaction past the same five-minute default (`TnLmdbArgs::read_transaction_timeout`), and its later calls fail as MDBX's do. | 1 import-only conflict; likely clean after 294e21507 |
 
 ### Medium
 
 | sha | subject | crate | why | pick |
 |---|---|---|---|---|
-| 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
-| 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
+| 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. In `ProviderFactory`, generic over the database, so both backends. | clean |
+| 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. reth-db's MDBX code only: the `mdbx` build. tn-lmdb bounds `safe-no-sync` with its own period (`SAFE_NO_SYNC_PERIOD`, `crates/tn-reth/src/env/database.rs`). | test-only |
 
 ### Low
 
@@ -129,10 +134,15 @@ None left.
 fd1c9982c (implicit simulate gas cap; Amsterdam/EIP-8037 only), 7b3432d95 (`eth_simulateV1`
 timestamp overflow in `sanitize_chain`, which TN's v1.11 simulate code predates), 0eeb8c5ef
 (eth/68 packing; devp2p, not vendored), a9b6969e7 (init-state OOM; TN does not use reth's
-state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check; senders
-and changesets are in MDBX under storage v1, and receipts are in static files but TN never prunes,
-so the checkpoints it reads are unset),
-6bd6bf28a (receipts static-file sizing; node-builder and receipts-in-static-files only),
+state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check: a
+segment's coverage becomes the higher of its static-file tip and its prune checkpoint. Rechecked
+for storage v2 on 2026-11-13: TN never prunes, so the Receipts and SenderRecovery checkpoints are
+unset; the restore's `AccountHistory`/`StorageHistory` markers are at the restored block, and on
+v2 the restore advances both changeset segments to that block (`snapshot.rs`, "advancing
+changeset segments"), so the higher of the two is the static-file tip in both layouts and the
+check does what it did),
+6bd6bf28a (receipts static-file sizing from the prune distance; node-builder, which TN does not
+carry, and pruned receipts only, in either layout),
 00f9bd2a9 (`tx_hash()` instead of `trie_hash()`; equal for Ethereum transaction types, so it only
 saves a re-hash),
 db17c899c (`reth db migrate-v2`; TN has no reth CLI), adfcad70c (edits a pruned-anchor check

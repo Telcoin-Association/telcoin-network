@@ -136,6 +136,10 @@ but MDBX is still the default and the migration source. The vendored `reth-libmd
 `reth-mdbx-sys` stay in place. Gating them out is listed in ROADMAP.md, for whoever lands the
 tndb-b switch.
 
+Since 2026-11-09 (D22) tn-lmdb, as tndb-b is now called, is the default, and MDBX is the opt-in
+`mdbx` build. MDBX stays compiled in every build for D22's reasons: the default build migrates an
+MDBX datadir, and the `mdbx` build runs on it.
+
 ## D10. Reduction keeps behavior identical: restore the features a removed crate enabled
 
 Removing a crate can switch off features it enabled on crates that stay, through feature
@@ -210,6 +214,14 @@ it.) Upstream main returns v2 from `base()`, so a sync conflicts on that line; r
 upstream would make new nodes write no history indices and disagree with v1 nodes on historical
 reads. `tn-reth`'s `test_new_datadir_uses_storage_v1` fails if that happens.
 
+Since 2026-11-09 (D22) TN creates v2 datadirs itself, without RocksDB: `settle`
+(`crates/tn-reth/src/env/layout.rs`) picks a new datadir's layout (v2 on tn-lmdb, v1 on the
+`mdbx` build) and genesis is written with it (`init_genesis_with_settings`), so `base()`, still
+v1, no longer decides it. History and the transaction-hash index stay in database tables, keyed
+as in v1 (TN-0110 to TN-0112). `the_default_build_gives_new_datadirs_v2` replaced
+`test_new_datadir_uses_storage_v1`. Step B itself is still deferred: the stub and the plumbing
+remain.
+
 ## D16. The JS-tracer interrupt is ported, not upgraded or removed
 
 Upstream fixed the JS-tracer DoS (57825d41d) with `JsInspectorInterrupt` from revm-inspectors
@@ -249,7 +261,8 @@ from the first survey. One item was raised and two lowered:
 Non-security High items (txpool nonce order, storage fixes) were first tracked with a
 recommendation, not applied, because they were outside the direction given. They were applied
 later, the pool nonce order as TN-0022 and the static-file fixes as TN-0023, along with
-d3d7fb31d (lowered to Medium above) as TN-0024. The MDBX fixes still wait for the tndb-b work.
+d3d7fb31d (lowered to Medium above) as TN-0024. The MDBX fixes still wait for the tndb-b work
+(two of them are provider fixes that reach tn-lmdb too: `tn/notes/upstream-backports.md`).
 
 2026-11-04: the review of 2026-11-01 found four upstream fixes the survey missed. Three are
 applied: d85d9deae (TN-0034), the permit part of 055fafc72 (TN-0035) and revm-inspectors
@@ -290,7 +303,8 @@ were left for a deliberate decision instead:
   engine, the largest cut left, but `debug_trace*` would then refuse JS tracers (D21 later made
   it opt-in at build time). Path expansion
   in flags (shellexpand) and reth's logging stack also stay for this reason.
-- **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work owns these (D15, Phase 3):
+- **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work (tn-lmdb, the default since
+  D22) owns these (D15, Phase 3):
   the static-file watcher's switch in the MDBX provider builder, reth-db's storage lock,
   parity-scale-codec and modular-bitfield.
 - **Consensus-sensitive code.** reth-trie, the EVM and execution crates (Phase 4).
