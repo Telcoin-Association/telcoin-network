@@ -2261,3 +2261,37 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   answer; a header length past the file answers the file's records and fails past them).
   Mutation-checked: the record's place in its chunk shifted by one (fails); the length bound
   dropped (panics). *Upstream*: no (upstream reads each record with a `pread`).
+
+- **TN-0148** — The static-file jar cache hands readers an `Arc` of the jar, so a persist that
+  grows a segment never waits for the readers of its current jar. *Kind*: performance (storage
+  commit path under RPC load).
+  *Files*: `crates/storage/provider/src/providers/static_file/mod.rs` (`LoadedJarRef` is a struct
+  holding an `Arc<LoadedJar>`, no longer the `DashMap` shard's read guard; `LoadedJar::lease`,
+  `extending`, `release`), `.../static_file/manager.rs` (the cache holds `Arc<LoadedJar>`;
+  `get_or_create_jar_provider`, `prepare_index_update`, `update_index`, `initialize_index`,
+  `remove_cached_provider`, `delete_jar`; tests).
+  *Why*: a provider held the cache's shard read guard for its whole life, and `update_index`'s
+  insert of the new jar waited for every holder of that shard (TN-0101 took this wait out of the
+  index lock, not out of the commit). Any reader of a segment's current jar (a range walk, a
+  changeset walk, a logs query) so stalled the persist's `commit_sf` for its hold time: on quaker
+  with 4 history readers `commit_sf` 0.89 ms (v1) -> 2.41 ms (v2). Readers now clone the jar's
+  `Arc` and drop the shard lock at once; a growing persist replaces the cached jar under a brief
+  entry lock and returns, and readers of the old jar keep their snapshot, whose files only grew.
+  A jar taken out of the cache without its segment growing (a prune or unwind replacing it, a
+  stale jar above the new range, `remove_cached_provider`, `delete_jar`, `initialize_index`)
+  still waits for its readers, as the shard lock made it wait: a prune cuts rows in place and
+  the next append writes new rows there, under a reader's mapping. Every snapshot of a file loaded
+  while its segment only grew shares one lease (`Arc<()>`), so that wait covers readers of
+  snapshots a growing persist already replaced; it polls the lease's count every 50 us, after the
+  index lock is dropped (those readers may need it), and only these rare paths take it.
+  `delete_jar` now loads the deleted jar's configuration from its file. *Can reach execution or
+  storage*: it changes which jar snapshot a reader holds and when a commit waits for readers,
+  not what is written or read for a block: a reader still sees the rows its index lookup named.
+  *Tests*: `growing_commit_does_not_wait_for_a_reader_of_the_jar` (a growing commit returns while
+  a reader holds the current jar, which keeps its rows),
+  `pruning_commit_waits_for_readers_of_every_earlier_snapshot` (a prune after a growing commit
+  waits for a reader of the jar before it, then the pruned block appends again), the TN-0101
+  cache tests unchanged (`growing_commit_waits_for_jar_readers_outside_the_index_lock`'s doc
+  updated). Mutation-checked: the growing replace waiting for its readers (the first fails); the
+  grown jar given a fresh lease (the second fails). *Upstream*: maybe; upstream's cache is the
+  same.

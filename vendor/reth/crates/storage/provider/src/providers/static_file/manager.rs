@@ -1,5 +1,5 @@
 use super::{
-    metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
+    metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar, LoadedJarRef,
     StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileSyncStats,
     SyncPhase,
 };
@@ -34,8 +34,9 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_nippy_jar::{NippyJar, NippyJarChecker, NippyJarError, CONFIG_FILE_EXTENSION};
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{
-    dashmap::DashMap, AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader,
-    SignedTransaction, StorageSlotKey,
+    dashmap::{mapref::entry::Entry, DashMap},
+    AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader, SignedTransaction,
+    StorageSlotKey,
 };
 use reth_prune_types::PruneSegment;
 use reth_stages_types::PipelineTarget;
@@ -421,7 +422,9 @@ struct PreparedIndexUpdate {
 pub struct StaticFileProviderInner<N> {
     /// Maintains a map which allows for concurrent access to different `NippyJars`, over different
     /// segments and ranges.
-    map: DashMap<(BlockNumber, StaticFileSegment), LoadedJar>,
+    ///
+    /// TN(TN-0148): readers clone a jar's `Arc` and drop the shard lock at once (`LoadedJarRef`).
+    map: DashMap<(BlockNumber, StaticFileSegment), Arc<LoadedJar>>,
     /// Incremented before clearing the jar cache so in-flight loads cannot repopulate it with a
     /// snapshot from before the invalidation.
     cache_generation: AtomicU64,
@@ -1139,7 +1142,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         segment: StaticFileSegment,
         fixed_block_range_end: BlockNumber,
     ) {
-        self.map.remove(&(fixed_block_range_end, segment));
+        // TN(TN-0148): waits for the jar's readers, as the shard lock did.
+        if let Some((_, jar)) = self.map.remove(&(fixed_block_range_end, segment)) {
+            LoadedJar::release(jar);
+        }
     }
 
     /// This handles history expiry by deleting all static files for the given segment below the
@@ -1213,9 +1219,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let fixed_block_range = self.find_fixed_range(segment, block);
         let key = (fixed_block_range.end(), segment);
         let file = self.path.join(segment.filename(&fixed_block_range));
-        let jar = if let Some((_, jar)) = self.map.remove(&key) {
-            jar.jar
-        } else {
+        // TN(TN-0148): the cached jar is shared with its readers; wait for them, as the shard
+        // lock did, then load the configuration from the file as for an uncached jar.
+        if let Some((_, jar)) = self.map.remove(&key) {
+            LoadedJar::release(jar);
+        }
+        let jar = {
             debug!(
                 target: "providers::static_file",
                 ?file,
@@ -1278,9 +1287,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         // Avoid using `entry` directly to avoid a write lock in the common case.
         trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Getting provider");
+        // TN(TN-0148): clone the jar's `Arc`; the shard lock is held only for the lookup.
         let mut provider: StaticFileJarProvider<'_, N> = if let Some(jar) = self.map.get(&key) {
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Jar found in cache");
-            jar.into()
+            LoadedJarRef::new(Arc::clone(jar.value())).into()
         } else {
             let generation = self.cache_generation.load(Ordering::Acquire);
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Creating jar from scratch");
@@ -1309,9 +1319,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     };
                     #[cfg(test)]
                     self.after_cache_validation.fire(segment);
-                    Ok(loaded)
-                })?
-                .downgrade()
+                    Ok(Arc::new(loaded))
+                })
+                .map(|jar| LoadedJarRef::new(Arc::clone(jar.value())))?
                 .into()
         };
 
@@ -1402,7 +1412,18 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let loaded = LoadedJar::new(jar)?;
         let jar = if grows {
             debug!(target: "providers::static_file", ?segment, "Inserting grown jar into cache");
-            self.map.insert((fixed_range.end(), segment), loaded);
+            // TN(TN-0148): the grown jar extends the cached one's file, under the entry's shard
+            // lock, so a later shrink waits for the readers of both. The replaced jar's readers
+            // keep it: no wait.
+            match self.map.entry((fixed_range.end(), segment)) {
+                Entry::Occupied(mut entry) => {
+                    let loaded = loaded.extending(entry.get());
+                    entry.insert(Arc::new(loaded));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(loaded));
+                }
+            }
             None
         } else {
             Some(loaded)
@@ -1435,6 +1456,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             Some(segment_max_block) => Some(self.prepare_index_update(segment, segment_max_block)?),
             None => None,
         };
+        // TN(TN-0148): the jars replaced or removed below without the segment growing, released
+        // (their readers waited for) after the index lock, which those readers may need.
+        let mut released = Vec::new();
         let mut indexes = self.indexes.write();
 
         match segment_max_block {
@@ -1554,7 +1578,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 // Update the cached provider, unless it was published before the lock.
                 if let Some(loaded) = unpublished {
                     debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
-                    self.map.insert((fixed_range.end(), segment), loaded);
+                    released
+                        .extend(self.map.insert((fixed_range.end(), segment), Arc::new(loaded)));
                 }
 
                 // Delete any cached provider that no longer has an associated jar.
@@ -1568,7 +1593,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     .filter(|(end, seg)| *seg == segment && *end > fixed_range.end())
                     .collect();
                 for key in stale {
-                    self.map.remove(&key);
+                    released.extend(self.map.remove(&key).map(|(_, jar)| jar));
                 }
             }
             None => {
@@ -1576,6 +1601,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 indexes.remove(segment);
             }
         };
+
+        drop(indexes);
+        for jar in released {
+            LoadedJar::release(jar);
+        }
 
         debug!(target: "providers::static_file", ?segment, "Updated provider index");
         Ok(())
@@ -1627,7 +1657,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         // cache. A fill that started before this point either reloads under its shard lock or
         // publishes before the clear reaches that shard and is removed by it.
         self.cache_generation.fetch_add(1, Ordering::AcqRel);
-        self.map.clear();
+        // TN(TN-0148): take the jars out and release them after the index lock, as `update_index`
+        // does (upstream's `clear` waited for every shard's readers here).
+        let keys: Vec<_> = self.map.iter().map(|entry| *entry.key()).collect();
+        let released: Vec<_> =
+            keys.iter().filter_map(|key| self.map.remove(key).map(|(_, jar)| jar)).collect();
 
         // initialize the expired history height to the lowest static file block
         if let Some(lowest_range) =
@@ -1638,6 +1672,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
         }
 
+        drop(indexes);
+        for jar in released {
+            LoadedJar::release(jar);
+        }
         Ok(())
     }
 
@@ -3971,9 +4009,100 @@ mod tests {
         Ok(())
     }
 
+    /// TN(TN-0148): a commit that grows the headers returns while a reader still holds the
+    /// headers' current jar, and the reader keeps its snapshot.
+    #[test]
+    fn growing_commit_does_not_wait_for_a_reader_of_the_jar() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x40, 0x41].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+        }
+        let held =
+            static_files.get_segment_provider_for_block(StaticFileSegment::Headers, 0, None)?;
+        thread::scope(|scope| -> eyre::Result<()> {
+            let (tx, rx) = mpsc::channel();
+            let files = &static_files;
+            scope.spawn(move || {
+                let commit = (|| -> eyre::Result<()> {
+                    let mut headers = files.latest_writer(StaticFileSegment::Headers)?;
+                    headers
+                        .append_header(&Header { number: 1, ..Default::default() }, &hashes[1])?;
+                    Ok(headers.commit()?)
+                })();
+                let _ = tx.send(commit);
+            });
+            let commit = rx.recv_timeout(Duration::from_secs(5));
+            // Drop the reader before asserting, so a commit that waits for it can end.
+            let rows = held.rows();
+            drop(held);
+            assert!(matches!(commit, Ok(Ok(()))), "the commit waited for the reader: {commit:?}");
+            assert_eq!(rows, 1);
+            Ok(())
+        })?;
+        assert_eq!(static_files.block_hash(1)?, Some(hashes[1]));
+        Ok(())
+    }
+
+    /// TN(TN-0148): a commit that prunes the headers waits until no reader holds a jar of the file
+    /// from before the prune: the cached jar's or, after a growing commit replaced it without
+    /// waiting, the one before it. The rows a prune cuts are written again by the next append.
+    #[test]
+    fn pruning_commit_waits_for_readers_of_every_earlier_snapshot() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x50, 0x51, 0x52].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+        }
+        // A reader of the snapshot before a growing commit.
+        let held =
+            static_files.get_segment_provider_for_block(StaticFileSegment::Headers, 0, None)?;
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header { number: 1, ..Default::default() }, &hashes[1])?;
+            headers.commit()?;
+        }
+        thread::scope(|scope| -> eyre::Result<()> {
+            let (tx, rx) = mpsc::channel();
+            let files = &static_files;
+            scope.spawn(move || {
+                let commit = (|| -> eyre::Result<()> {
+                    let mut headers = files.latest_writer(StaticFileSegment::Headers)?;
+                    headers.prune_headers(1)?;
+                    Ok(headers.commit()?)
+                })();
+                let _ = tx.send(commit);
+            });
+            let early = rx.recv_timeout(Duration::from_millis(300));
+            assert!(early.is_err(), "the prune did not wait for the reader: {early:?}");
+            assert_eq!(held.rows(), 1);
+            drop(held);
+            let commit = rx.recv_timeout(Duration::from_secs(5));
+            assert!(matches!(commit, Ok(Ok(()))), "the prune did not finish: {commit:?}");
+            Ok(())
+        })?;
+        assert_eq!(static_files.get_highest_static_file_block(StaticFileSegment::Headers), Some(0));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header { number: 1, ..Default::default() }, &hashes[2])?;
+            headers.commit()?;
+        }
+        assert_eq!(static_files.block_hash(1)?, Some(hashes[2]));
+        Ok(())
+    }
+
     /// TN(TN-0101): a commit that grows the headers while a reader holds a jar, the headers'
-    /// own or another segment's, waits for the reader without the index lock, so lookups go on,
-    /// and the new header is readable once the commit returns.
+    /// own or another segment's, never makes lookups wait (TN-0148: nor the commit itself, see
+    /// `growing_commit_does_not_wait_for_a_reader_of_the_jar`), and the new header is readable
+    /// once the commit returns.
     #[test]
     fn growing_commit_waits_for_jar_readers_outside_the_index_lock() -> eyre::Result<()> {
         let (static_dir, _) = create_test_static_files_dir();
