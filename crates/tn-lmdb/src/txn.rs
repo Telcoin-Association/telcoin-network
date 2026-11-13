@@ -3075,9 +3075,10 @@ impl RwTxn {
     /// to the last sync: `SyncMode::NoSync`) and return its txn id. A transaction that changed
     /// nothing returns the id of the state it began from, with no I/O but, in
     /// `SyncMode::Durable`, the sync that makes that state durable when it is not yet: a weak
-    /// head the open trusted ([`Env::sync`]), so a `Durable` commit's return means the state it
-    /// names is durable whether the commit changed anything or not. An error latches the
-    /// environment, and whether the commit survives is unknown until the file is reopened.
+    /// head the open trusted ([`Env::sync`](crate::Env::sync)), so a `Durable` commit's return
+    /// means the state it names is durable whether the commit changed anything or not. An error
+    /// latches the environment, and whether the commit survives is unknown until the file is
+    /// reopened.
     pub fn commit(mut self) -> Result<u64> {
         let inner = &*self.inner;
         inner.latch.check()?;
