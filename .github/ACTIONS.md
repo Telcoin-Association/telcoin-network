@@ -520,6 +520,7 @@ It triggers on `pull_request`, never `pull_request_target`: it compiles and runs
 
 `.github/workflows/arm64-crc.yaml` (*arm64 CRC kernel*) runs `cargo nextest run --locked -p tn-lmdb -E 'test(/^crc::tests::/)'` on `ubuntu-24.04-arm`.
 `crates/tn-lmdb/src/crc.rs` (a copy of `crates/storage/src/archive/crc.rs`) has a PMULL carry-less-multiply CRC-32 kernel that is compiled on little-endian aarch64 only, and its tests compare that kernel with `crc32fast`.
+Before the tests, a step diffs the two files with every comment line and the `allow(dead_code)` and `#[inline]` attribute lines dropped (the differences tn-lmdb's copy documents), and fails on any other difference, the unit tests included: the one arm64 run then covers both copies without building tn-storage.
 Every test lane in `pr.yaml` runs on `ubuntu-latest`, which is x86_64, so without this workflow the kernel never ran in CI; the maintainers' attested runs on Apple silicon were its only coverage.
 
 It runs on a `pull_request` or a push to `main` that touches `crates/tn-lmdb/**`, `crates/storage/src/archive/crc.rs`, `rust-toolchain.toml`, `Cargo.lock` or the workflow itself, and on every `merge_group` (that event takes no path filter).

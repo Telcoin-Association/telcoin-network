@@ -34,7 +34,12 @@ rebuilt root `0x6b94…`) and passes with the one-line fix.
   So the fix is a coordinated upgrade, never a rolling one, and it is not applied here.
 - Has the testnet hit it? Unknown. A snapshot export from a testnet node and an import elsewhere
   answers it: the import rebuilds the trie from scratch and compares with the header's root. A
-  replay of the testnet from genesis on a fixed binary answers it too, and names the first block.
+  replay of the testnet from genesis on a fixed binary answers it too, but does not name the
+  block: no check compares a replayed block's hash, so the node runs to the close of the epoch
+  that contains it and stops at the stored epoch record's check (`check_stored_record`,
+  `crates/node/src/manager/node/close_epoch.rs`), naming that epoch's recorded and local closing
+  blocks. The first block that differs is found by comparing the replayed block hashes with the
+  chain's (CHANGES.md TN-0140).
 - Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
   history already contains such a block), after `graph.py` and `make test-upgrade`.
 

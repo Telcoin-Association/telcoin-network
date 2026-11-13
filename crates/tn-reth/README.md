@@ -40,6 +40,14 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
   twice the TTL, so a flood of peer batches can switch a deferral off but never re-arm one.
   Duplicates across workers stay tolerated at execution; this only stops this node from packing a
   copy of what a peer is already proposing.
+- Execution cache (`src/env/exec_cache.rs`): block execution reads accounts, slots and code
+  through a cross-block cache of the values at the last built block. One hit of each kind in 256
+  is re-read from the parent state; a stale one is logged, counted in
+  `tn_reth_exec_cache_stale_hits_total` (alert on any nonzero value), and the block is built again
+  without the cache, so that block is right and the node goes on. Unchecked stale hits of earlier
+  blocks may already have put the node on another state than its peers': compare its recent block
+  hashes with a peer's before trusting it, and report it. The sample follows each node's own cache,
+  so nodes check different hits, and a zero on one node says nothing about another.
 
 ### Block-building timings
 
@@ -99,13 +107,25 @@ the parallel code computed a wrong root, and the unchecked blocks the same bug h
 node running this code: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`, or
 only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
 `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning them off
-on one node only parts it from its peers on the next block the bug hits.
+on one node only parts it from its peers on the next block the bug hits. Turning them off stops the
+bug; it repairs no trie node an unchecked block already persisted (the check compares the trie
+updates too, so a bug can be in them). Every later root, serial ones included, is computed over
+those nodes, so the nodes keep agreeing while a block's root may not be the root of its state. A
+snapshot restore (`src/snapshot.rs`) finds it: it rebuilds the trie from the hashed state and fails
+when that root differs from the snapshot block's header.
 `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
 ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
 split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
 split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
 the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
 expected, `stored_root_node` and `mismatch` are alerts.
+`tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
+storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
+part to the serial computation, on this node only; the block also logs the first error. It is the
+one per-node difference the parallel paths have, so read it first when one node parts from its
+peers. `provider`, `database` and `panicked` cost the block time; `tip_moved` (a task's transaction
+saw another finalized block than the walk's: something wrote the state or trie tables while an
+output's blocks were built) is an alert, as the node has no such writer.
 
 Off switches, read once at the first block from the node's environment:
 `TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
@@ -1103,8 +1123,9 @@ each as the run's mean, first third and last third, ending with the commit's ms 
 (tn-lmdb: per `tn_lmdb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
 grows at the same ms per page writes more pages, one that grows per page writes the same pages
 slower. Each profile also prints each side's chain, the genesis, aged-tip and final-tip hashes in
-its runs' JSON headers: execution is deterministic, so in backend and layout modes a difference
-is marked `CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
+its runs' JSON headers: execution is deterministic, so in backend and layout modes, and in commit
+mode with `EXEC_SHARED_BASE=1` (both sides on the before side's aged bases), a difference is marked
+`CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
 dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
 runs. The script reads JSON report versions 6 (the bench's `JSON_REPORT_VERSION`) and 5 (6 only
 added fields, which a version 5 run renders as `-`): it refuses a directory without `runs.tsv` or

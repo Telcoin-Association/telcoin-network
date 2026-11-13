@@ -58,8 +58,10 @@
 #                    Aging is not page-deterministic: two bases aged by the same code differ in
 #                    page layout, which moves the write rows (write_state's cold reads, the
 #                    commit) by more than many changes do. Share them to compare a change that
-#                    writes the same data; the sides' final tips must then match. Leave it unset
-#                    for a change to what is written, or to the on-disk format
+#                    writes the same data; the sides' chains must then match, and a profile whose
+#                    runs differ is marked CHAINS DIFFER and fails the script, as in backend and
+#                    layout modes (reports/shared-base marks the run for --report-only). Leave it
+#                    unset for a change to what is written, or to the on-disk format
 #   EXEC_SYS_SAMPLE=1  Linux only (refused elsewhere): a sampler beside each run, started just
 #                    before the binary and killed right after it (and on any exit), which never
 #                    changes a run's status. Every second it writes reports/<run>.sys.tsv: the
@@ -104,8 +106,9 @@
 # line, never exported. A profile whose run fails is named in the report and its remaining runs
 # skipped; the other profiles still run, and the script then exits 1. Each profile prints each
 # side's chain (the genesis, aged tip and final tip hashes of its runs' JSON headers): execution is
-# deterministic, so in backend and layout modes the two sides must match, and a profile whose runs
-# differ is marked CHAINS DIFFER and makes the script exit 1 after the report.
+# deterministic, so in backend and layout modes, and in commit mode with EXEC_SHARED_BASE=1, the two
+# sides must match, and a profile whose runs differ is marked CHAINS DIFFER and makes the script
+# exit 1 after the report.
 #
 # The report has the host, the knobs each run's JSON header records, the binaries, one line per run,
 # and per profile: each side's page size and storage layout (as requested and as its database has
@@ -164,6 +167,8 @@
 #   reports/runs.tsv, reports/head.txt     the runs (emptied when they start, a line added as
 #                                          each ends) and the report's head (written when they
 #                                          are done), for --report-only
+#   reports/shared-base                    an empty file when the runs share one base
+#                                          (EXEC_SHARED_BASE=1), removed when they do not
 #   logs/<profile>-<side>-<round>.log      each run's output, replaced by a rerun
 #   src-before/ and tmp/                   the before export and the runs' TMPDIR, each marked as
 #                                          the script's own and removed on exit; tmp/ is also
@@ -181,7 +186,8 @@ report_versions="5 6"
 # The report's per-profile sections. Std-lib Python, read from stdin and run isolated (-I), so
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
 # of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
-# after rendering everything, when backend or layout mode's two sides ran different chains.
+# after rendering everything, when backend or layout mode's two sides, or a shared-base commit
+# run's (reports/shared-base beside the manifest), ran different chains.
 render_report() {
     EXEC_REPORT_VERSIONS="$report_versions" python3 -I - "$@" <<'PY'
 import json
@@ -205,6 +211,9 @@ SIDE_PAIRS = (("mdbx", "tn-lmdb"), ("v1", "v2"), ("before", "after"))
 # The modes whose two sides run one load, by side A, and what differs between their sides: their
 # runs must run one chain.
 SAME_LOAD = {"mdbx": "backends", "v1": "layouts"}
+# Commit mode's sides on one base (EXEC_SHARED_BASE=1, marked by reports/shared-base beside the
+# manifest) compare a change that writes the same data: they must run one chain too.
+SHARED_BASE_LOAD = "before and after sides on one shared base"
 
 
 def read_manifest(path, bench=None):
@@ -240,6 +249,8 @@ else:
             break
     else:
         sys.exit(f"reports of both modes in {bench}/reports ({', '.join(sorted(seen))})")
+shared_base = os.path.exists(os.path.join(os.path.dirname(manifest), "shared-base"))
+same_load = SAME_LOAD.get(side_a) or (SHARED_BASE_LOAD if shared_base else None)
 
 
 def load(path):
@@ -756,7 +767,7 @@ def section(name, fn, *args):
 
 
 profiles = []
-chains_differ = []  # backend and layout modes' profiles whose runs ran different chains
+chains_differ = []  # the profiles whose runs ran different chains on one load (same_load)
 for run in runs:
     if run["profile"] not in profiles:
         profiles.append(run["profile"])
@@ -812,8 +823,8 @@ for profile in profiles:
             print(f"{side} chain: genesis {chain[0][:18]} aged tip {chain[1][:18]} "
                   f"final tip {chain[2][:18]} (rounds {rnds})")
     if len(set(chains.values())) > 1:
-        if side_a in SAME_LOAD:
-            print(f"FAILED: CHAINS DIFFER between runs of {profile}: the {SAME_LOAD[side_a]} ran "
+        if same_load:
+            print(f"FAILED: CHAINS DIFFER between runs of {profile}: the {same_load} ran "
                   "different chains, so the ratios compare different loads")
             chains_differ.append(profile)
         else:
@@ -866,7 +877,7 @@ for run in runs:
     json_path = run["json"] if run["status"] == "0" else "-"
     print(f"{run['profile']} {run['side']} round {run['round']}: {json_path}  log {run['log']}{state}")
 if chains_differ:  # rendered in full, then status 3: the caller fails on it
-    print(f"the {SAME_LOAD[side_a]} ran different chains in: {' '.join(chains_differ)}",
+    print(f"the {same_load} ran different chains in: {' '.join(chains_differ)}",
           file=sys.stderr)
     sys.exit(3)
 PY
@@ -1322,6 +1333,12 @@ runs_started=1
 manifest="$bench_dir/reports/runs.tsv" # kept for --report-only
 : >"$manifest"
 rm -f "$bench_dir/reports/head.txt" # rewritten just before the report renders
+# The renderer holds a shared base's two sides to one chain, in --report-only too.
+if [ "${EXEC_SHARED_BASE:-}" = 1 ]; then
+    : >"$bench_dir/reports/shared-base"
+else
+    rm -f "$bench_dir/reports/shared-base"
+fi
 # EXEC_SYS_SAMPLE=1, in the background beside one run until killed: every second the time, the
 # run log's size (the report places the timed loop by it), /proc/meminfo's Dirty and Writeback,
 # the drive's temperature, the disk's (and the file system's) /proc/diskstats line, then
