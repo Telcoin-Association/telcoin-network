@@ -10,16 +10,16 @@ before Initial-key derivation. Label vocabularies are fixed and independent of r
 
 | Field | Recorded value |
 | --- | --- |
-| Package | Published `quinn-proto` 0.11.18 |
+| Package | Published `quinn-proto` 0.11.19 |
 | Upstream | https://github.com/quinn-rs/quinn, `quinn-proto` |
-| Release identity | Immutable crates.io 0.11.18 archive and its VCS base; no mutable tag is used |
-| Upstream base | `eaec0db4bcb698f76df736d89938743c88a2ad5f` |
-| Archive SHA-256 | `a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc` |
+| Release identity | Immutable crates.io 0.11.19 archive and its VCS base; no mutable tag is used |
+| Upstream base | `8192ed399a26a6e8f0aba43d10ec8badaa5b905e` |
+| Archive SHA-256 | `0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe` |
 | Maintained mirror | [Tracked source tree](../../../patches/quinn-proto) |
 | Exact observation revision | [`372fa302bbb85758c9341b2c6b2247db3e9601ca`](https://github.com/Telcoin-Association/telcoin-network/commit/372fa302bbb85758c9341b2c6b2247db3e9601ca) |
 | Cargo source | Root `[patch.crates-io]`, `quinn-proto = { path = "patches/quinn-proto" }`, excluded from workspace membership |
-| Complete diff | [upstream.diff](../../../patches/quinn-proto/upstream.diff), SHA-256 `b3bddf015b9991132fa7a73506bcbed227ed03eea30442f851dc90651a47c163` |
-| Source tree fingerprint | `a64afd46d7b4d7da8d240f6a30b978a68cb6772fc33099bf5f34012c83849904` |
+| Complete diff | [upstream.diff](../../../patches/quinn-proto/upstream.diff), SHA-256 `a6d617eb08f578553035913df17830bbe1386f6b55fe4d9cf4bbfbfb2f14f9a5` |
+| Source tree fingerprint | `f3e292806c44d803931cbb71ca3bd40ec13955e49d51ee4500230cdf4bacac23` |
 | Resolution evidence | [source.json](evidence/source.json), default and Adiri Linux graphs, package IDs, dependency edges, enabled features and per-file source hashes |
 
 The normalized registry manifest, dependencies, features, crypto providers and both licenses
@@ -41,7 +41,7 @@ advisory responsibility, including weekly review and review at every transport d
 update, and identifies @MavenRain as the approving core maintainer for the process. Release
 approval remains subject to the repository's PR and attestation gates.
 
-Evaluate the next quinn-proto release after 0.11.18, or an earlier revision exposing equivalent
+Evaluate the next quinn-proto release after 0.11.19, or an earlier revision exposing equivalent
 incoming observations. The 2026-10-15 submission plan is to prepare an observation-only upstream
 proposal from this reviewed delta after Telcoin review and record the upstream link here.
 Remove the companion when the upstream API can provide these observations with the same stages,
@@ -56,17 +56,32 @@ advisory applicability and compatibility evidence together.
 
 The companion adds observation statements to the pinned protocol decisions. Both pinned
 scanners skip a lockfile package that has no registry source. The path override alone
-would therefore hide an advisory published against the carried `quinn-proto` 0.11.18
+would therefore hide an advisory published against the carried `quinn-proto` 0.11.19
 itself; the path control in the active transport record measures that gap. The required
 transport gate closes it for the carried versions: `etc/transport-patches/advisories.py`
 writes a registry-form copy of the node lockfile under the evidence directory, with the
-recorded path packages (`quinn-proto` 0.11.18, `libp2p-quic` 0.14.0) re-sourced to the
+recorded path packages (`quinn-proto` 0.11.19, `libp2p-quic` 0.14.0) re-sourced to the
 registry, and audits that copy with the same transport-closure filter as the node scan.
 The rewrite is proven on the affected control first: the path `quinn-proto` 0.11.6 copy
 must report RUSTSEC-2024-0373, or the gate fails. The copy is audit input only; the node
 lockfile is unchanged. The scanners match the published version, not the carried diff, so
 the weekly upstream advisory review in the active transport record still applies to the
 diff. A clean scanner report shows only that no advisory names the carried version.
+
+On 2026-11-13 the registry-form scan matched RUSTSEC-2026-0523 (a MAX_STREAM_DATA frame naming
+an unopened bidirectional stream opened every stream up to that index, past the stream limit)
+and RUSTSEC-2026-0524 (a client kept an unbounded Retry or address-validation token and could
+panic or exhaust memory building Initial packets) against the carried 0.11.18. Both are fixed
+in the published 0.11.19, so the companion moved to that release instead of carrying
+backports. The 0.11.18 to 0.11.19 release changes only those fixes, their tests, Initial
+padding and loss-probe clamping to the configured `min_mtu` (1200 bytes by default, which the
+node does not change, so the datagrams are the same) and the removal of a client connection ID
+left behind when `connect` fails. Telcoin's diff applies to 0.11.19 unchanged apart from line
+offsets, and the carried tree differs from the previous one by exactly the upstream release
+delta. Neither change touches token validation, the incoming-slab removal sites, saturation
+ordering, the accept-error returns, server-config replacement or endpoint destruction.
+With the pinned toolchain and CI's `-D warnings`, all 318 library tests of the carried 0.11.19
+pass, and `sources.py` reproduces the archive checksum and the regenerated diff.
 
 Local pinned-toolchain verification on 2026-10-15:
 

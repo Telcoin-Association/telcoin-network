@@ -53,7 +53,7 @@ def run(argv, cwd, output, name):
     return result.stdout
 
 
-RECORDED_PATHS = {"libp2p-quic": "0.14.0", "quinn-proto": "0.11.18"}
+RECORDED_PATHS = {"libp2p-quic": "0.14.0", "quinn-proto": "0.11.19"}
 
 
 def validate_sources(packages, root, carried):
@@ -177,7 +177,7 @@ def main():
             result["source_override_comparison"] = "only recorded libp2p-quic and quinn-proto source identities differ"
         result["provenance"] = provenance(args.root.resolve(), output)
         result["quinn_provenance"] = provenance(args.root.resolve(), output / "quinn-proto",
-            "quinn-proto", "0.11.18", "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc")
+            "quinn-proto", "0.11.19", "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe")
         result["status"] = "passed"
     finally:
         (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")

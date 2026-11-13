@@ -56,7 +56,7 @@ index 0a299d03a71d31a28cc8b9899a76a8cbfc46ff4d..609dff633662a2378116c1a4335ea1b8
  
      pub(crate) preferred_address_v4: Option<SocketAddrV4>,
 diff --git upstream/src/endpoint.rs patched/src/endpoint.rs
-index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64888db773 100644
+index 63ccbd8e3a551803f792fb4873e3ee24a0ed479f..a144c36b7c05a038c16a50782989372e09646f9f 100644
 --- upstream/src/endpoint.rs
 +++ patched/src/endpoint.rs
 @@ -58,6 +58,18 @@ pub struct Endpoint {
@@ -114,7 +114,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
                      }
  
                      None
-@@ -453,6 +480,12 @@ impl Endpoint {
+@@ -457,6 +484,12 @@ impl Endpoint {
          // Saturation only happens under heavy load, where deriving initial keys per Initial just to
          // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
          if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
@@ -127,7 +127,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
              debug!(
                  "ignoring initial for connection {} due to saturation",
                  dst_cid
-@@ -503,9 +536,15 @@ impl Endpoint {
+@@ -507,9 +540,15 @@ impl Endpoint {
  
          let server_config = self.server_config.as_ref().unwrap().clone();
  
@@ -144,7 +144,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
                  debug!("rejecting invalid retry token");
                  return Some(DatagramEvent::Response(self.initial_close(
                      header.version,
-@@ -518,6 +557,11 @@ impl Endpoint {
+@@ -522,6 +561,11 @@ impl Endpoint {
              }
          };
  
@@ -156,7 +156,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
          let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
              server_config,
              datagrams: Vec::new(),
-@@ -525,6 +569,10 @@ impl Endpoint {
+@@ -529,6 +573,10 @@ impl Endpoint {
          });
          self.index
              .insert_initial_incoming(header.dst_cid, incoming_idx);
@@ -167,7 +167,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
  
          Some(DatagramEvent::NewConnection(Incoming {
              received_at: event.now,
-@@ -556,6 +604,10 @@ impl Endpoint {
+@@ -560,6 +608,10 @@ impl Endpoint {
          let remote_address_validated = incoming.remote_address_validated();
          incoming.improper_drop_warner.dismiss();
          let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
@@ -178,7 +178,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
          self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
  
          let packet_number = incoming.packet.header.number.expand(0);
-@@ -576,6 +628,7 @@ impl Endpoint {
+@@ -580,6 +632,7 @@ impl Endpoint {
          {
              debug!("abandoning accept of stale initial");
              self.index.remove_initial(dst_cid);
@@ -186,7 +186,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
              return Err(AcceptError {
                  cause: ConnectionError::TimedOut,
                  response: None,
-@@ -585,6 +638,7 @@ impl Endpoint {
+@@ -589,6 +642,7 @@ impl Endpoint {
          if self.cids_exhausted() {
              debug!("refusing connection");
              self.index.remove_initial(dst_cid);
@@ -194,7 +194,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
              return Err(AcceptError {
                  cause: ConnectionError::CidsExhausted,
                  response: Some(self.initial_close(
-@@ -611,6 +665,7 @@ impl Endpoint {
+@@ -615,6 +669,7 @@ impl Endpoint {
          {
              debug!(packet_number, "failed to authenticate initial packet");
              self.index.remove_initial(dst_cid);
@@ -202,7 +202,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
              return Err(AcceptError {
                  cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
                  response: None,
-@@ -681,6 +736,7 @@ impl Endpoint {
+@@ -685,6 +740,7 @@ impl Endpoint {
              }
              Err(e) => {
                  debug!("handshake failed: {}", e);
@@ -210,7 +210,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
                  self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
                  let response = match e {
                      ConnectionError::TransportError(ref e) => Some(self.initial_close(
-@@ -725,6 +781,7 @@ impl Endpoint {
+@@ -729,6 +785,7 @@ impl Endpoint {
  
      /// Reject this incoming connection attempt
      pub fn refuse(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
@@ -218,7 +218,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
          self.clean_up_incoming(&incoming);
          incoming.improper_drop_warner.dismiss();
  
-@@ -796,6 +853,7 @@ impl Endpoint {
+@@ -800,6 +857,7 @@ impl Endpoint {
      /// Doing this actively, rather than merely dropping the [`Incoming`], is necessary to prevent
      /// memory leaks due to state within [`Endpoint`] tracking the incoming connection.
      pub fn ignore(&mut self, incoming: Incoming) {
@@ -226,7 +226,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
          self.clean_up_incoming(&incoming);
          incoming.improper_drop_warner.dismiss();
      }
-@@ -804,9 +862,21 @@ impl Endpoint {
+@@ -808,9 +866,21 @@ impl Endpoint {
      fn clean_up_incoming(&mut self, incoming: &Incoming) {
          self.index.remove_initial(incoming.packet.header.dst_cid);
          let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
@@ -248,7 +248,7 @@ index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64
      fn add_connection(
          &mut self,
          ch: ConnectionHandle,
-@@ -1261,7 +1331,8 @@ impl Drop for IncomingImproperDropWarner {
+@@ -1265,7 +1335,8 @@ impl Drop for IncomingImproperDropWarner {
  pub enum ConnectError {
      /// The endpoint can no longer create new connections
      ///
@@ -651,7 +651,7 @@ index 0000000000000000000000000000000000000000..718c14b88f1a9cebd62ae380426f796f
 +    });
 +}
 diff --git upstream/src/tests/mod.rs patched/src/tests/mod.rs
-index 1c24d34a4e3ba8aef4002450577f2b6f8612aa0c..a28fd57f2cf7cc087055035d106040bdda49976a 100644
+index 0d39a9647792b3d3a648b8b0f6774cade09db2a6..85f86a4587b1c390d51298500339c2ca2c03ff29 100644
 --- upstream/src/tests/mod.rs
 +++ patched/src/tests/mod.rs
 @@ -35,14 +35,15 @@ use crate::{
@@ -746,7 +746,7 @@ index 1c24d34a4e3ba8aef4002450577f2b6f8612aa0c..a28fd57f2cf7cc087055035d106040bd
      assert_eq!(
          final_bytes - initial_bytes,
          ((29 + DATAGRAM_LEN) * DATAGRAMS) as u64
-@@ -3852,7 +3853,8 @@ fn pad_to_mtu() {
+@@ -4058,7 +4059,8 @@ fn pad_to_mtu() {
      pair.server.capture_inbound_packets = true;
  
      info!("sending");
@@ -756,7 +756,7 @@ index 1c24d34a4e3ba8aef4002450577f2b6f8612aa0c..a28fd57f2cf7cc087055035d106040bd
      const LEN_1: usize = 800;
      const LEN_2: usize = 600;
      pair.client_datagrams(client_ch)
-@@ -4140,7 +4142,8 @@ fn ack_bundled_with_datagrams() {
+@@ -4346,7 +4348,8 @@ fn ack_bundled_with_datagrams() {
  
      pair.drive();
  

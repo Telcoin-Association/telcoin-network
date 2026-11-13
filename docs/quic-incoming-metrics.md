@@ -59,7 +59,7 @@ API refusal. Retransmitted or separately processed Initials can contribute multi
 The buffer counter counts dropped datagrams, not bytes. Do not sum this table into a connection
 count or treat it as wire delivery acknowledgement.
 
-In pinned Quinn 0.11.18, an unvalidated incoming permits Retry, so the two policy fallback rows
+In pinned Quinn 0.11.19, an unvalidated incoming permits Retry, so the two policy fallback rows
 normally remain zero. Their observations are installed, but these branches are unreachable for
 ordinary input under that contract. Real endpoint refuse, ignore and accept-error observations
 are separately exercised. The legacy retried, accepted, refused, ignored and budget-yield counters
