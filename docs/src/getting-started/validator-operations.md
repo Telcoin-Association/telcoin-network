@@ -115,7 +115,7 @@ Fix any problem found after that forward, with a later release.
 
 The same release moves the execution (reth) database from MDBX to tn-lmdb, also one-way.
 On its first start the node copies `db/mdbx.dat` into `db/tn-lmdb.dat`, verifies the copy against it, makes it durable, and then deletes the MDBX files.
-It needs free disk for the database's live pages plus a quarter plus 1 GiB while it copies, and refuses to start, with nothing changed, when there is less.
+It needs free disk for the database's live pages plus a quarter plus 1 GiB (or the `--db.growth-step`, if larger) while it copies, and refuses to start, with nothing changed, when there is less.
 The migrated datadir keeps reth's storage layout v1; only a new datadir gets layout v2.
 
 There is no automatic rollback for either migration.
