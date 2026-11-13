@@ -24,10 +24,14 @@ default = []
 mdbx = []
 test-utils = []
 """
-# package directory -> (name, the tn-reth dependency line or None, the target file)
+TN_RETH_DEP = 'tn-reth = { path = "../../crates/tn-reth" }'
+# The node package's features, as bin/telcoin-network has them: three that leave tn-reth's
+# backend alone, and `mdbx`, the opt-in MDBX build the gate does not resolve.
+NODE_FEATURES = {"adiri": [], "faucet": [], "js-tracer": [], "mdbx": ['"tn-reth/mdbx"']}
+# package directory -> (name, the tn-reth dependency line or None, the target file); the node's
+# manifest is `node_manifest()`
 PACKAGES = {
-    "bin/telcoin-network": ("telcoin-network", 'tn-reth = { path = "../../crates/tn-reth" }',
-                            "src/main.rs"),
+    "bin/telcoin-network": ("telcoin-network", TN_RETH_DEP, "src/main.rs"),
     "bin/worker-gateway": ("tn-worker-gateway", None, "src/main.rs"),
     "bin/node-record-api": ("tn-node-record-api", None, "src/main.rs"),
 }
@@ -46,6 +50,13 @@ def manifest(name, dependency):
     return f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n{deps}'
 
 
+def node_manifest(dependency=TN_RETH_DEP, features=None):
+    """The node package's manifest: NODE_FEATURES with `features` overriding entries."""
+    table = {**NODE_FEATURES, **(features or {})}
+    lines = "".join(f'"{name}" = [{", ".join(values)}]\n' for name, values in table.items())
+    return manifest("telcoin-network", dependency) + "\n[features]\n" + lines
+
+
 class BackendGate(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -58,7 +69,8 @@ class BackendGate(unittest.TestCase):
         self.write("crates/e2e-tests/Cargo.toml", E2E.format(features='"test-utils"'))
         self.write("crates/e2e-tests/src/lib.rs", "")
         for directory, (name, dependency, target) in PACKAGES.items():
-            self.write(f"{directory}/Cargo.toml", manifest(name, dependency))
+            text = node_manifest() if name == "telcoin-network" else manifest(name, dependency)
+            self.write(f"{directory}/Cargo.toml", text)
             self.write(f"{directory}/{target}", "fn main() {}\n")
         self.relock()
 
@@ -86,8 +98,7 @@ class BackendGate(unittest.TestCase):
         self.assertIn("backend guard passed", out)
 
     def test_a_release_dependency_enabling_mdbx_fails(self):
-        self.write("bin/telcoin-network/Cargo.toml", manifest(
-            "telcoin-network",
+        self.write("bin/telcoin-network/Cargo.toml", node_manifest(
             'tn-reth = { path = "../../crates/tn-reth", features = ["mdbx"] }'))
         rc, out = self.gate()
         self.assertEqual(rc, 1, out)
@@ -101,6 +112,20 @@ class BackendGate(unittest.TestCase):
         self.assertIn("the release graph of telcoin-network enables", out)
         self.assertIn("the workspace graph (test-default) enables", out)
 
+    def test_a_node_feature_enabling_mdbx_fails(self):
+        # The images and releases build the node with one feature list; a list that forwards
+        # tn-reth's mdbx moves that build onto MDBX while the default graph stays clean.
+        for feature in ("adiri", "faucet", "js-tracer"):
+            with self.subTest(feature=feature):
+                self.write("bin/telcoin-network/Cargo.toml",
+                           node_manifest(features={feature: ['"tn-reth/mdbx"']}))
+                rc, out = self.gate()
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"the release graph of telcoin-network --features {feature} "
+                              "enables tn-reth's mdbx feature", out)
+                self.assertNotIn("the release graph of telcoin-network enables", out)
+                self.assertNotIn("the workspace graph", out)
+
     def test_a_workspace_dev_dependency_enabling_mdbx_fails(self):
         self.write("crates/e2e-tests/Cargo.toml", E2E.format(features='"test-utils", "mdbx"'))
         rc, out = self.gate()
@@ -109,7 +134,7 @@ class BackendGate(unittest.TestCase):
         self.assertNotIn("the release graph", out)
 
     def test_a_node_binary_that_no_longer_reaches_tn_reth_fails_closed(self):
-        self.write("bin/telcoin-network/Cargo.toml", manifest("telcoin-network", None))
+        self.write("bin/telcoin-network/Cargo.toml", node_manifest(None, {"mdbx": []}))
         self.relock()
         rc, out = self.gate()
         self.assertEqual(rc, 1, out)
