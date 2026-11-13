@@ -1078,8 +1078,9 @@ each as the run's mean, first third and last third, ending with the commit's ms 
 (tn-lmdb: per `tn_lmdb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
 grows at the same ms per page writes more pages, one that grows per page writes the same pages
 slower. Each profile also prints each side's chain, the genesis, aged-tip and final-tip hashes in
-its runs' JSON headers: execution is deterministic, so in backend and layout modes a difference
-is marked `CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
+its runs' JSON headers: execution is deterministic, so in backend and layout modes, and in commit
+mode with `EXEC_SHARED_BASE=1` (both sides on the before side's aged bases), a difference is marked
+`CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
 dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
 runs. The script reads JSON report versions 6 (the bench's `JSON_REPORT_VERSION`) and 5 (6 only
 added fields, which a version 5 run renders as `-`): it refuses a directory without `runs.tsv` or
