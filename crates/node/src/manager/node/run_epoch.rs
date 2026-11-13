@@ -232,9 +232,10 @@ where
         // record
         // - re-derive record N-1 locally from the executed closing block before opening the pack.
         // Re-derives nothing unless the previous epoch's record is actually missing. With the
-        // record present it clears the epoch tables only when they still hold rows of an older
-        // epoch (killed between the record write and the tables clear).
-        self.recover_previous_epoch_record(committee.epoch(), engine).await?;
+        // record present it checks the record against the closing block (`epoch_start_header`)
+        // and clears the epoch tables only when they still hold rows of an older epoch (killed
+        // between the record write and the tables clear).
+        self.recover_previous_epoch_record(committee.epoch(), &epoch_start_header, engine).await?;
 
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
         if epoch_mode.replay_consensus() {
@@ -250,7 +251,7 @@ where
                 // that left no durable record 0 would trip the epoch-0 guard above on every
                 // restart (peers cannot backfill epoch 0), bricking the node
                 self.write_epoch_record(committee.epoch(), engine).await?;
-                self.clear_consensus_db_for_next_epoch()?;
+                self.clear_consensus_db_for_next_epoch(committee.epoch())?;
                 return Ok(RunEpochMode::NewEpoch);
             }
             // Only wait for consensus that was actually forwarded to the engine.
@@ -650,7 +651,7 @@ where
 
         // clear tables
         if clear_tables_for_next_epoch {
-            self.clear_consensus_db_for_next_epoch()?;
+            self.clear_consensus_db_for_next_epoch(epoch)?;
         }
         // An epoch task that saw a store refuse a write (a failed durability barrier) ends the
         // epoch the way a mode change does. Running another epoch on a store the node can no
@@ -1364,7 +1365,7 @@ fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::manager::{
         read_base_fees_for_entered_epoch, sync_num_workers_from_chain, EpochBaseFees,
@@ -1434,19 +1435,52 @@ mod tests {
         TaskManager,
         Committee,
     )> {
+        manager_with_engine_and_floor(temp, None).await
+    }
+
+    /// [`manager_with_engine`] on a datadir that holds `floor` as its restored-state floor marker,
+    /// as a snapshot restore leaves it, when `floor` is given.
+    pub(in crate::manager::node) async fn manager_with_engine_and_floor(
+        temp: &TempDir,
+        floor: Option<u64>,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        ExecutionNode,
+        RethEnv,
+        TaskManager,
+        Committee,
+    )> {
+        manager_with_engine_on(temp, floor, tn_config::Config::default_for_test()).await
+    }
+
+    /// [`manager_with_engine_and_floor`] on `config`'s chain.
+    async fn manager_with_engine_on(
+        temp: &TempDir,
+        floor: Option<u64>,
+        config: tn_config::Config,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        ExecutionNode,
+        RethEnv,
+        TaskManager,
+        Committee,
+    )> {
         use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
-        use tn_config::{Config, KeyConfig};
+        use tn_config::KeyConfig;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::CommitteeFixture;
         use tn_types::BlsKeypair;
 
         let datadir = temp.path().to_path_buf();
         let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
-        let config = Config::default_for_test();
         let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        if let Some(floor) = floor {
+            std::fs::write(RethEnv::restored_state_floor_marker(&datadir), format!("{floor}\n"))?;
+        }
         let tasks = TaskManager::default();
         let reth_env =
             RethEnv::new(&node_config, &tasks, reth_db.clone(), None, GasAccumulator::new(1))?;
+        eyre::ensure!(reth_env.restored_state_floor() == floor, "the env reads the floor marker");
         let builder = TnBuilder::new(node_config, config, reth_db);
         let engine = ExecutionNode::new(&builder, reth_env.clone())?;
         let keys =
@@ -1576,6 +1610,127 @@ mod tests {
         let mode =
             finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, Some(pack)).await?;
         assert!(matches!(mode, RunEpochMode::ModeChange), "a healthy pack seals: {mode:?}");
+        Ok(())
+    }
+
+    /// [`manager_with_engine`] on a chain with a consensus registry, which has executed epoch 0's
+    /// closing block, so the epoch loop enters epoch 1 pinned to it. Returns the closing block's
+    /// header.
+    async fn manager_past_the_epoch0_close(
+        temp: &TempDir,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        ExecutionNode,
+        TaskManager,
+        SealedHeader,
+    )> {
+        let config = tn_config::Config::default_for_test_with_genesis(
+            test_genesis_with_consensus_registry(4),
+        );
+        let (manager, engine, reth_env, tasks, _committee) =
+            manager_with_engine_on(temp, None, config).await?;
+        let genesis = reth_env
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre::eyre!("the genesis header"))?;
+        let closing = execute_worker_block(
+            &reth_env,
+            &GasAccumulator::new(1),
+            genesis,
+            &consensus_output_for_tests(1, 0, 1, true),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        eyre::ensure!(reth_env.epoch_state_from_canonical_tip()?.epoch == 1, "epoch 0 closed");
+        Ok((manager, engine, tasks, closing))
+    }
+
+    /// Store a certified epoch 0 record committing `final_state`. The entry check reads only its
+    /// `final_state`, and storage checks only that the certificate names the record's digest.
+    async fn store_certified_record0(
+        manager: &EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        final_state: tn_types::BlockNumHash,
+    ) -> eyre::Result<()> {
+        let record = EpochRecord { epoch: 0, final_state, ..Default::default() };
+        let cert = tn_types::EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: tn_types::BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        manager.consensus_chain.epochs().save(record, cert).await?;
+        Ok(())
+    }
+
+    /// Run the epoch loop from a node start, as `EpochManager::run` does. Bounded: an entry that
+    /// ran on past the record check would go live, which these tests do not set up.
+    async fn run_epochs_from_start(
+        manager: &mut EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        let (to_engine, _engine_rx) = mpsc::channel(8);
+        let epochs =
+            manager.run_epochs(engine, NetworkConfig::default(), to_engine, GasAccumulator::new(1));
+        tokio::time::timeout(Duration::from_secs(60), epochs)
+            .await
+            .map_err(|_| eyre::eyre!("the epoch loop did not stop"))?
+    }
+
+    /// The epoch loop stops when the record of the epoch it enters from does not match that
+    /// epoch's closing block: `run_epoch` hands the entry check the closing block it read from the
+    /// registry (`epoch_start_header`), here the block this node executed, and the check's error
+    /// ends `run_epochs` (so `EpochManager::run` returns it and the node exits).
+    #[tokio::test]
+    async fn epoch_loop_stops_when_the_previous_record_does_not_match_its_closing_block(
+    ) -> eyre::Result<()> {
+        use super::super::close_epoch::FinalStateMismatch;
+
+        let temp = TempDir::with_prefix("epoch_loop_record_mismatch")?;
+        let (mut manager, engine, _tasks, closing) = manager_past_the_epoch0_close(&temp).await?;
+        let local = closing.num_hash();
+        let recorded = tn_types::BlockNumHash::new(local.number, B256::repeat_byte(0x5a));
+        assert_ne!(recorded, local, "fixture: the record commits another block");
+        store_certified_record0(&manager, recorded).await?;
+
+        let err = run_epochs_from_start(&mut manager, &engine).await.expect_err("the loop stops");
+        let mismatch = err
+            .downcast_ref::<FinalStateMismatch>()
+            .unwrap_or_else(|| panic!("not a final-state mismatch: {err:#}"));
+        assert_eq!(*mismatch, FinalStateMismatch { epoch: 0, certified: true, recorded, local });
+        Ok(())
+    }
+
+    /// The epoch loop stops when the record of the epoch it enters from is stored but does not read
+    /// back: the entry check fails closed instead of skipping the compare. The record matches the
+    /// closing block, so only the failed read can stop the loop.
+    #[tokio::test]
+    async fn epoch_loop_stops_when_the_previous_record_cannot_be_read() -> eyre::Result<()> {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let temp = TempDir::with_prefix("epoch_loop_record_unreadable")?;
+        let (mut manager, engine, _tasks, closing) = manager_past_the_epoch0_close(&temp).await?;
+        store_certified_record0(&manager, closing.num_hash()).await?;
+        manager.consensus_chain.epochs().persist().await?;
+
+        // Flip the first payload byte of the records log's only record: past the data header,
+        // its 4-byte size prefix. That breaks the record's crc32, and the store still counts the
+        // epoch as present. Nothing has read the record yet, so the open store reads the flip.
+        let records = temp.path().to_path_buf().epochs_db_path().join("epochs.pack");
+        let at = (tn_storage::archive::pack::DATA_HEADER_BYTES + 4) as u64;
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&records)?;
+        let mut byte = [0_u8; 1];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut byte)?;
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&[!byte[0]])?;
+        drop(file);
+        assert!(manager.consensus_chain.epochs().contains_epoch(0).await, "still present");
+
+        let err = run_epochs_from_start(&mut manager, &engine).await.expect_err("the loop stops");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to READ the stored epoch 0 record entering epoch 1"),
+            "{message}"
+        );
         Ok(())
     }
 

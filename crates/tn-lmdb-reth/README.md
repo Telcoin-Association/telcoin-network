@@ -7,16 +7,17 @@ five dup-sort tables, the state tables are the engine's dup tables (each key's f
 its outer cell, more in a nested tree of their own) and the changesets composite keys in plain
 engine tables.
 
-**Status: pre-production.** TN uses it behind the off-by-default `tn-lmdb` feature of `tn-reth`
-(forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`), which runs TN's reth
-execution database on `TnLmdbEnv` instead of MDBX; the default build is still MDBX. A `tn-lmdb`
-build migrates an MDBX reth database onto `TnLmdbEnv` at its first open (every table copied raw by
+**Status: TN's default reth backend** (since 2026-11-09; mainnet launches on it). Every TN build
+runs its reth execution database on `TnLmdbEnv`, unless the opt-in `mdbx` feature of `tn-reth`
+(forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`) selects MDBX, the legacy
+backend kept until testnet has resynced. The default build migrates an MDBX reth database onto
+`TnLmdbEnv` at its first open (every table copied raw by
 appends and verified, with `TnLmdbEnv::sync` and `TnLmdbEnv::check`, before MDBX's files are removed).
 `tn-reth`'s README ("Database backend") covers the open path, the backend guard, the migration
 and how reth's `--db.*` flags map onto `TnLmdbArgs`. The adapter's comparison against MDBX on
 reth's database benches (below) passed its Linux gate on 2026-10-26, on an earlier engine format
-with every dup-sort table composite; it has not been rerun on the current layout. On a reth upgrade
-(storage v2 included), follow the checklist in `CLAUDE.md` ("On a reth upgrade").
+with every dup-sort table composite; it has not been rerun on the current layout. On a reth upgrade,
+follow the checklist in `CLAUDE.md` ("On a reth upgrade").
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
 of every dup call, the error codes, every difference from MDBX, and the differential and crash
@@ -100,7 +101,10 @@ sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of
 
 The form is part of the file's format: the open refuses a table held in the other form, or a dup
 table with another key width or `packed_max` (`MDBX_INCOMPATIBLE`, naming the table and both
-forms). A read returns the value (subkey, then the rest) as one slice of the page, with no copy,
+forms), and a dup-sort table whose layout record in the file (`TnLmdbRethLayout`, written by
+`create_tables`: key width, subkey width, form, which the engine's catalog does not hold in full)
+differs from this build's; a file without the record, written before it, opens. A read returns
+the value (subkey, then the rest) as one slice of the page, with no copy,
 read by the move itself on a nested table (the engine's tail moves, `next_with_key_tail` and the
 others) and by `current_with_key_tail` after the move on a composite one; only a value in an
 overflow run is joined in a buffer of the cursor's.

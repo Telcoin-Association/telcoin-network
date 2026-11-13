@@ -519,7 +519,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
         let p = store.alloc()?;
         let val = match run_pages {
             None => value.inline(),
-            Some(n) => match write_run(store, n, value.bytes()) {
+            Some(n) => match write_run(store, n, root.tag, value.bytes()) {
                 Ok(ovf) => Val::Overflow(ovf),
                 Err(e) => {
                     store.free(p);
@@ -598,15 +598,17 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
             &mut empty
         }
     };
-    let val = match reserve_put(store, needed, &mut scratch.reserved, run_pages, value.bytes()) {
-        Ok(ovf) => ovf.map_or(value.inline(), Val::Overflow),
-        Err(e) => {
-            if let Some(taken) = taken {
-                store.put_scratch(taken);
+    let val =
+        match reserve_put(store, needed, &mut scratch.reserved, run_pages, root.tag, value.bytes())
+        {
+            Ok(ovf) => ovf.map_or(value.inline(), Val::Overflow),
+            Err(e) => {
+                if let Some(taken) = taken {
+                    store.put_scratch(taken);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     // The change runs right after copy-on-write's page copies, whose stores are still draining,
     // so its outcome never goes through memory: a value stored narrow and reloaded wider is one
     // store forwarding cannot serve, and the reload waits for every older store, the copies'
@@ -1823,13 +1825,14 @@ fn reserve_put<S: PageWrite + ?Sized>(
     n: usize,
     pages: &mut Vec<u32>,
     run_pages: Option<u32>,
+    tag: u32,
     value: &[u8],
 ) -> Result<Option<Ovf>> {
     reserve(store, n, pages)?;
     let Some(run_pages) = run_pages else {
         return Ok(None);
     };
-    match write_run(store, run_pages, value) {
+    match write_run(store, run_pages, tag, value) {
         Ok(ovf) => Ok(Some(ovf)),
         Err(e) => {
             while let Some(p) = pages.pop() {
@@ -1840,20 +1843,26 @@ fn reserve_put<S: PageWrite + ?Sized>(
     }
 }
 
-/// A new overflow run of `npages` pages holding `value` ([`overflow::encode_run`]), written in
-/// full now, before any leaf names it; its CRC is stamped at commit. A failure changes nothing.
-fn write_run<S: PageWrite + ?Sized>(store: &mut S, npages: u32, value: &[u8]) -> Result<Ovf> {
+/// A new overflow run of `npages` pages holding `value` for the tree tagged `tag`
+/// ([`overflow::encode_run`]), written in full now, before any leaf names it; its CRC is stamped
+/// at commit. A failure changes nothing.
+fn write_run<S: PageWrite + ?Sized>(
+    store: &mut S,
+    npages: u32,
+    tag: u32,
+    value: &[u8],
+) -> Result<Ovf> {
     let len = u32::try_from(value.len()).map_err(|_| bug("a value of over 4 GiB in a run"))?;
     let p = store.alloc_run(npages)?;
     let (txn, page_size) = (store.txn(), store.geometry().page_size());
     match store.run_mut(p, npages) {
-        Ok(run) => overflow::encode_run(run, page_size, p, txn, value),
+        Ok(run) => overflow::encode_run(run, page_size, p, txn, tag, value),
         Err(e) => {
             store.free_run(p, npages);
             return Err(e);
         }
     }
-    Ok(Ovf { pgno: p, txn: txn as u32, len })
+    Ok(Ovf { pgno: p, txn: txn as u32, len, tag })
 }
 
 /// The writable version of page `p`: `p` itself if private, else a copy in a reserved page
@@ -3164,13 +3173,17 @@ pub(crate) struct NestedSums {
 /// the published cells): no published page names a page past its state's count, so it is one
 /// this transaction allocated and freed, in the pool, which freeing would also list free.
 ///
-/// A plain tree ([`Leaves::Plain`]) counting no overflow page has its leaves taken from their
-/// parents' pointers: only the first is read (it must be a leaf: the tree is balanced, so that
-/// checks the height), and the private ones' headers (in memory) for the identity check. A tree
-/// with runs has every leaf read, with a descent's checks and verified unless private or stamped
-/// here, and each run its overflow cells name taken after its header and identity checks and its
-/// provenance ([`leaving_run`]); their pages, each reached once, must add up to the handle's
-/// counter ([`TreePages`]).
+/// Every leaf is read with a descent's checks (the header names the page, its tree and the txn
+/// its parent names). In a plain tree ([`Leaves::Plain`]) counting no overflow page that is all:
+/// its leaves' CRCs are not verified, and an overflow cell in one is [`Error::Corrupt`] (a
+/// handle that miscounts its runs would otherwise leak them). A tree with runs has every leaf
+/// verified unless private or stamped here, and each run its overflow cells name taken after
+/// its header and identity checks and its provenance ([`leaving_run`]); their pages, each
+/// reached once, must add up to the handle's counter ([`TreePages`]).
+///
+/// A tree of one page, walked on its own (the free of one nested tree), can repeat no page, so
+/// the walk keeps no set of the pages reached: the set is a bitset sized by the highest page
+/// number inserted, which a 1-page tree deep in a large file would pay in full.
 ///
 /// A dup table's outer tree ([`Leaves::Dup`]) counts no overflow page and has every leaf read so:
 /// each cell must be under an outer key of the table's width and a nested cell, whose tree (its
@@ -3254,7 +3267,14 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
         } else if root.root >= base_count {
             return Err(loose(root.root));
         }
-        self.seen.insert(root.root);
+        let dup = matches!(leaves, Leaves::Dup { .. });
+        let runs = root.overflow_pages != 0;
+        // A 1-page plain tree without runs, in a walk that reached nothing before it, repeats no
+        // page: `seen` stays empty, so `insert` never sizes it by this root's number.
+        let single = !dup && !runs && root.height == 1 && self.out.pages.is_empty();
+        if !single {
+            self.seen.insert(root.root);
+        }
         self.out.pages.push(root.root);
         let mut level = vec![(root.root, root.root_txn)];
         let mut branches = 0_u64;
@@ -3290,9 +3310,9 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
             self.out.pages.extend(next.iter().map(|&(p, _)| p));
             level = next;
         }
-        let Some(&(first, txn)) = level.first() else {
+        if level.is_empty() {
             return Err(corrupt(format!("a level of the tree of height {} is empty", root.height)));
-        };
+        }
         let leaf_pages = level.len() as u64;
         if branches != u64::from(root.branch_pages) || leaf_pages != u64::from(root.leaf_pages) {
             return Err(corrupt(format!(
@@ -3301,14 +3321,7 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
                 root.root, root.branch_pages, root.leaf_pages
             )));
         }
-        let dup = matches!(leaves, Leaves::Dup { .. });
-        if !dup && root.overflow_pages == 0 {
-            if page::kind(check_header(first, txn)?)? != Kind::Leaf {
-                return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
-            }
-            return Ok(());
-        }
-        if dup && root.overflow_pages != 0 {
+        if dup && runs {
             return Err(corrupt(format!(
                 "a dup table's outer tree counts {} overflow pages",
                 root.overflow_pages
@@ -3320,7 +3333,7 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
             let page::View::Leaf(view) = page::View::new(page)? else {
                 return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
             };
-            if !store.is_private(p) && !store.is_stamped(p) {
+            if (dup || runs) && !store.is_private(p) && !store.is_stamped(p) {
                 verify_published(store, page, &self.geometry)?;
             }
             for i in 0..view.nkeys() {
@@ -3328,6 +3341,13 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
                 let ovf =
                     match (&mut leaves, val) {
                         (Leaves::Plain, Val::Inline(_)) => continue,
+                        (Leaves::Plain, Val::Overflow(ovf)) if !runs => {
+                            return Err(corrupt(format!(
+                                "page {p} names overflow run {} in a tree whose handle counts \
+                                 no overflow page",
+                                ovf.pgno
+                            )))
+                        }
                         (Leaves::Plain, Val::Overflow(ovf)) => ovf,
                         (Leaves::Plain, Val::Nested(cell)) => return Err(page::nested_error(cell)),
                         (Leaves::Dup { key_len, nested, .. }, Val::Nested(cell)) => {
@@ -4530,7 +4550,7 @@ mod tests {
             // The other tree's first put takes a leaf, then its run; the copy takes one page.
             let count = store.alloc.page_count();
             let pgno = if x_first { count + 1 } else { count + 2 };
-            let x = Ovf { pgno, txn: store.txn() as u32, len: big.len() as u32 };
+            let x = Ovf { pgno, txn: store.txn() as u32, len: big.len() as u32, tag: 0 };
             forge_run_cell(&mut store, &mut root, x);
 
             let (mut trusted, mut other) = (false, TreeRoot::EMPTY);
@@ -7572,7 +7592,7 @@ mod tests {
         // An outer write meets an inline value or an overflow reference in its private leaf.
         let cases: [(&str, Val<'_>); 2] = [
             ("not a nested tree", Val::Inline(&[3; 32])),
-            ("an overflow cell", Val::Overflow(Ovf { pgno: 9, txn: 7, len: 5_000 })),
+            ("an overflow cell", Val::Overflow(Ovf { pgno: 9, txn: 7, len: 5_000, tag: 0 })),
         ];
         for (want, forged) in cases {
             for cached in [true, false] {
@@ -7939,7 +7959,7 @@ mod tests {
             (
                 Cells::Packing,
                 "an overflow cell",
-                Some(Val::Overflow(Ovf { pgno: 9, txn: 7, len: 5_000 })),
+                Some(Val::Overflow(Ovf { pgno: 9, txn: 7, len: 5_000, tag: 0 })),
             ),
         ];
         for (cells, want, forged) in cases {

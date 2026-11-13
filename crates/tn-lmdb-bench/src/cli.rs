@@ -173,7 +173,8 @@ fn check_temp_dir(tmp: &Path) -> Result<(), String> {
 
 /// Refuse a dir that a temp dir cannot be made in (missing, not a directory, not writable), which
 /// the first rep would otherwise find by a panic. This check is separate from the file system
-/// check, so that a test can run it on a host whose temp dir is on tmpfs.
+/// check, so that a test can run it on a host whose temp dir is on tmpfs. The probe dir is removed
+/// either way.
 fn check_creatable(tmp: &Path) -> Result<(), String> {
     tempfile::Builder::new()
         .prefix("tn-lmdb-bench-")
@@ -184,7 +185,8 @@ fn check_creatable(tmp: &Path) -> Result<(), String> {
                 "cannot make a temp dir under {}: {e}. Set TMPDIR to a writable directory.",
                 tmp.display()
             )
-        })
+        })?;
+    Ok(())
 }
 
 /// The command line: run `args` (without the program name) and return the exit code.
@@ -299,12 +301,22 @@ mod tests {
         }
     }
 
+    /// A writable temp dir is used, unless it is on tmpfs or ramfs (where `TMPDIR` often is):
+    /// there it is refused as such. One that cannot hold a temp dir is refused for that, on any
+    /// file system. The probe dir is removed either way.
     #[test]
     fn a_temp_dir_the_run_cannot_use_is_refused() {
         // `check_creatable`, not `check_temp_dir`: `root` is under $TMPDIR, which can be on tmpfs
         // (on Linux, /tmp often is), and `check_temp_dir` refuses tmpfs first.
         let root = tempfile::tempdir().expect("a temp dir");
         check_creatable(root.path()).expect("a writable dir is used");
+        match memory_fs(root.path()) {
+            None => check_temp_dir(root.path()).expect("a writable dir on a real disk is used"),
+            Some(fs) => {
+                let err = check_temp_dir(root.path()).expect_err("a memory file system");
+                assert!(err.contains(&format!("is on {fs}: syncs there cost nothing")), "{err}");
+            }
+        }
         assert_eq!(
             std::fs::read_dir(root.path()).expect("list").count(),
             0,

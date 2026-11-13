@@ -5,10 +5,6 @@
 //! signature recovery, block building, state persistence, and finalization.
 
 use alloy::sol_types::SolCall;
-use reth_provider::{
-    AccountReader as _, BlockHashReader as _, BytecodeReader as _, StateProvider as _,
-};
-use reth_revm::primitives::KECCAK_EMPTY;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::VecDeque,
@@ -425,66 +421,15 @@ impl PipelineTestEnv {
         )
     }
 
-    /// Every entry of `scope`'s read cache that differs from the state at `block`, the parent
-    /// state of the output's next block: one description per account, slot, bytecode or block
-    /// hash, sorted. Empty when the cache is a subset of that state (the scope's invariant).
-    ///
-    /// Values are compared the way the cache serves them: account info as `(balance, nonce,
-    /// code hash)` with neither code nor a storage-access hint (`account_id`), a missing slot as
-    /// zero and missing bytecode as empty, as reth's state provider database reads them.
-    pub(crate) fn cache_mismatches(
-        &self,
-        scope: &OutputBuildScope,
-        block: &ExecutedBlock,
-    ) -> eyre::Result<Vec<String>> {
-        let provider = self.reth_env.state_by_block_hash_for_test(block.recovered_block.hash())?;
-        let reads = scope.reads();
-        let mut mismatches = Vec::new();
-        for (address, cached) in &reads.accounts {
-            // a provider read carries no code (revm loads it by hash) and no `account_id`
-            let state = provider.basic_account(address)?.map(|account| {
-                let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
-                (account.balance, account.nonce, code_hash, true, true)
-            });
-            let info = cached.info.as_ref().map(|info| {
-                let (no_code, no_id) = (info.code.is_none(), info.account_id.is_none());
-                (info.balance, info.nonce, info.code_hash, no_code, no_id)
-            });
-            if info != state {
-                mismatches.push(format!("account {address}: cached {info:?}, state {state:?}"));
-            }
-            for (slot, value) in &cached.storage {
-                let state = provider.storage(*address, B256::from(*slot))?.unwrap_or_default();
-                if *value != state {
-                    mismatches
-                        .push(format!("{address} slot {slot}: cached {value}, state {state}"));
-                }
-            }
-        }
-        for (hash, code) in &reads.contracts {
-            let state = provider.bytecode_by_hash(hash)?.unwrap_or_default().0;
-            if *code != state {
-                mismatches.push(format!("bytecode {hash} differs"));
-            }
-        }
-        for (number, hash) in &reads.block_hashes {
-            let state = provider.block_hash(*number)?.unwrap_or_default();
-            if *hash != state {
-                mismatches.push(format!("block hash {number}: cached {hash}, state {state}"));
-            }
-        }
-        mismatches.sort();
-        Ok(mismatches)
-    }
-
     /// Build the next block of an UNPERSISTED output twice from one pinned payload, then chain it
     /// in memory only, as the engine does between the blocks of one consensus output.
     ///
-    /// The first build goes through `build_block_from_batch_payload` with `overlay`, which starts
-    /// from an empty read cache, so every state read reaches the parent state provider. The second
-    /// goes through `build_block_from_recovered_payload` with `scope`, the output's shared build
-    /// scope, whose read cache carries the earlier blocks' reads. Both carry the output's trie
-    /// overlay. Returns `(fresh, shared)`; the fresh block is the one chained.
+    /// The first build goes through `build_block_from_batch_payload` with `overlay`, the second
+    /// through `build_block_from_recovered_payload` with `scope`, the output's shared build scope.
+    /// Both carry the output's trie overlay and read through the env's cross-block execution cache:
+    /// the first finds it anchored at the parent whenever the previous block's builds agreed, and
+    /// checks it in at the built block, so the second, on the same parent, starts with an empty
+    /// one. Returns `(fresh, shared)`; the fresh block is the one chained.
     pub(crate) fn build_unpersisted_fresh_and_shared(
         &mut self,
         txs: &Vec<Vec<u8>>,

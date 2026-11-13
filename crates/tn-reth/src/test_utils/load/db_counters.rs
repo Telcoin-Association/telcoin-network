@@ -24,7 +24,7 @@
 use crate::RethDb;
 
 /// MDBX's counter names, in the order of [`DbCounters`]'s values: libmdbx's `PageOps` fields.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const MDBX_NAMES: [&str; 12] = [
     "mdbx_newly",
     "mdbx_cow",
@@ -46,37 +46,38 @@ const MDBX_NAMES: [&str; 12] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DbCounters {
     /// libmdbx's page-operation statistics, in [`MDBX_NAMES`]'s order.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     values: [u64; MDBX_NAMES.len()],
     /// tn-lmdb's I/O and allocation counters.
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     io: tn_lmdb_reth::IoStats,
 }
 
 impl DbCounters {
     /// What happened between `earlier` and `self`, two reads of one database (`earlier` first):
     /// each counter's difference, saturating, so a pair from two databases does not wrap.
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     pub fn since(&self, earlier: &Self) -> Self {
         Self { values: std::array::from_fn(|i| self.values[i].saturating_sub(earlier.values[i])) }
     }
 
     /// What happened between `earlier` and `self`, two reads of one database (`earlier` first):
-    /// tn-lmdb's `IoStats::since`, each counter's saturating difference except
-    /// `tn_lmdb_max_gate_lag`, a maximum since the open, which is `self`'s.
-    #[cfg(feature = "tn-lmdb")]
+    /// tn-lmdb's `IoStats::since`, each counter's saturating difference except those of
+    /// [`NOT_DIFFERENCES`] (`tn_lmdb_max_gate_lag`, a maximum since the open, and the automatic
+    /// gap fill's gauges), which are `self`'s.
+    #[cfg(not(feature = "mdbx"))]
     pub fn since(&self, earlier: &Self) -> Self {
         Self { io: self.io.since(&earlier.io) }
     }
 
     /// The counters as `(name, value)`, in this build's fixed order (see the module docs).
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     pub fn entries(&self) -> Vec<(&'static str, u64)> {
         MDBX_NAMES.into_iter().zip(self.values).collect()
     }
 
     /// The counters as `(name, value)`, in this build's fixed order (see the module docs).
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     pub fn entries(&self) -> Vec<(&'static str, u64)> {
         // Destructured whole, so a counter the engine adds fails to compile here until it is named.
         let tn_lmdb_reth::IoStats {
@@ -88,11 +89,26 @@ impl DbCounters {
             msync_syncs,
             fdatasync_syncs,
             msync_span_pages,
+            sync_runs,
+            gaps_filled,
+            gap_pages,
+            gap_misses,
+            gap_fill_refusals,
+            gap_auto_steps,
+            gap_auto_probes,
+            gap_auto_readapts,
+            gap_auto_width_sum,
+            gap_auto_width,
+            gap_auto_run_ns,
+            gap_auto_page_ns,
+            gap_auto_gap_ns,
+            gap_auto_capped,
             bytes_grown,
             free_list_save_rounds,
             save_ns,
             stamp_ns,
             data_sync_ns,
+            gap_fill_ns,
             size_sync_ns,
             meta_sync_ns,
             cow_copies,
@@ -116,11 +132,26 @@ impl DbCounters {
             ("tn_lmdb_msync_syncs", msync_syncs),
             ("tn_lmdb_fdatasync_syncs", fdatasync_syncs),
             ("tn_lmdb_msync_span_pages", msync_span_pages),
+            ("tn_lmdb_sync_runs", sync_runs),
+            ("tn_lmdb_gaps_filled", gaps_filled),
+            ("tn_lmdb_gap_pages", gap_pages),
+            ("tn_lmdb_gap_misses", gap_misses),
+            ("tn_lmdb_gap_fill_refusals", gap_fill_refusals),
+            ("tn_lmdb_gap_auto_steps", gap_auto_steps),
+            ("tn_lmdb_gap_auto_probes", gap_auto_probes),
+            ("tn_lmdb_gap_auto_readapts", gap_auto_readapts),
+            ("tn_lmdb_gap_auto_width_sum", gap_auto_width_sum),
+            ("tn_lmdb_gap_auto_width", gap_auto_width),
+            ("tn_lmdb_gap_auto_run_ns", gap_auto_run_ns),
+            ("tn_lmdb_gap_auto_page_ns", gap_auto_page_ns),
+            ("tn_lmdb_gap_auto_gap_ns", gap_auto_gap_ns),
+            ("tn_lmdb_gap_auto_capped", gap_auto_capped),
             ("tn_lmdb_bytes_grown", bytes_grown),
             ("tn_lmdb_free_list_save_rounds", free_list_save_rounds),
             ("tn_lmdb_save_ns", save_ns),
             ("tn_lmdb_stamp_ns", stamp_ns),
             ("tn_lmdb_data_sync_ns", data_sync_ns),
+            ("tn_lmdb_gap_fill_ns", gap_fill_ns),
             ("tn_lmdb_size_sync_ns", size_sync_ns),
             ("tn_lmdb_meta_sync_ns", meta_sync_ns),
             ("tn_lmdb_cow_copies", cow_copies),
@@ -147,9 +178,21 @@ impl DbCounters {
     }
 }
 
+/// The tn-lmdb counters whose [`DbCounters::since`] is the later read's value, not a difference:
+/// `tn_lmdb_max_gate_lag`, a maximum since the open, and the automatic gap fill's gauges (its last
+/// width and its fit).
+pub const NOT_DIFFERENCES: [&str; 6] = [
+    "tn_lmdb_max_gate_lag",
+    "tn_lmdb_gap_auto_width",
+    "tn_lmdb_gap_auto_run_ns",
+    "tn_lmdb_gap_auto_page_ns",
+    "tn_lmdb_gap_auto_gap_ns",
+    "tn_lmdb_gap_auto_capped",
+];
+
 /// The open database `db`'s cumulative counters (see the module docs for what they count and what
 /// a read costs).
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
     let ops = db.info()?.page_ops();
     Ok(DbCounters {
@@ -172,7 +215,7 @@ pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
 
 /// The open database `db`'s cumulative counters (see the module docs for what they count and what
 /// a read costs). Never fails on tn-lmdb.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
     Ok(DbCounters { io: db.io_stats() })
 }
@@ -180,14 +223,14 @@ pub fn db_counters(db: &RethDb) -> eyre::Result<DbCounters> {
 /// The page size, in bytes, of the open database `db`: the one its file was created with, which
 /// a later `--db.page-size` does not change. On MDBX one environment stat, a read transaction
 /// over the table catalog: read it once per open, not per output.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 pub fn db_page_size(db: &RethDb) -> eyre::Result<u32> {
     Ok(db.stat()?.page_size())
 }
 
 /// The page size, in bytes, of the open database `db`: the one its file was created with, which
 /// a later `--db.page-size` does not change.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 pub fn db_page_size(db: &RethDb) -> eyre::Result<u32> {
     Ok(db.page_size())
 }
@@ -237,12 +280,12 @@ mod tests {
         // pages were added and reached the disk: reth maps MDBX writable, so its durable commit
         // syncs the map (`msync`) or the file (`fsync`) rather than writing (`wops`)
         let count = |name: &str| delta.get(name).expect("a counter of this build");
-        #[cfg(not(feature = "tn-lmdb"))]
+        #[cfg(feature = "mdbx")]
         let moved = [
             ("pages added", count("mdbx_newly")),
             ("syncs", count("mdbx_msync") + count("mdbx_fsync")),
         ];
-        #[cfg(feature = "tn-lmdb")]
+        #[cfg(not(feature = "mdbx"))]
         let moved = [
             ("commits", count("tn_lmdb_commits")),
             ("pages synced", count("tn_lmdb_pages_synced")),
@@ -257,12 +300,12 @@ mod tests {
         for (((name, earlier), (_, later)), (delta_name, value)) in rows {
             assert_eq!(delta_name, name, "one order");
             // a maximum since the open, not a difference
-            let expected = if name == "tn_lmdb_max_gate_lag" { later } else { later - earlier };
+            let expected = if NOT_DIFFERENCES.contains(&name) { later } else { later - earlier };
             assert_eq!(value, expected, "{name}");
         }
         let unmoved = before.since(&after).entries();
         assert!(
-            unmoved.iter().all(|(name, value)| *value == 0 || *name == "tn_lmdb_max_gate_lag"),
+            unmoved.iter().all(|(name, value)| *value == 0 || NOT_DIFFERENCES.contains(name)),
             "a pair in the wrong order saturates at zero: {unmoved:?}"
         );
         Ok(())

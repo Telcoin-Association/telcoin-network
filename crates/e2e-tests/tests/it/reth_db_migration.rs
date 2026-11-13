@@ -1,27 +1,28 @@
 //! E2e test for a validator's reth database moving from MDBX to tn-lmdb across a restart.
 //!
-//! A node built with the `tn-lmdb` feature that finds an MDBX reth database migrates it when it
+//! A node of the default (tn-lmdb) build that finds an MDBX reth database migrates it when it
 //! first opens it (`tn_reth`'s `migrate_from_mdbx`). This test runs that on live validators: the
-//! committee starts on the default (MDBX) binary, then each validator in turn is stopped and
-//! restarted on the `tn-lmdb` binary, and must come back migrated and follow the chain.
+//! committee starts on the MDBX binary (the `mdbx` feature), then each validator in turn is stopped
+//! and restarted on the default binary, and must come back migrated and follow the chain.
 //!
 //! **Binaries.** The test uses the harness's two binaries in fixed roles:
-//! - `TN_BIN_PATH_PREV` ([`e2e_tests::get_previous_telcoin_network_binary`]) is the default e2e
-//!   binary from `make build-e2e-bin`, whose reth database is MDBX;
-//! - `TN_BIN_PATH` ([`e2e_tests::get_telcoin_network_binary`]) is the `tn-lmdb` e2e binary from
-//!   `make build-e2e-bin-tn-lmdb`.
+//! - `TN_BIN_PATH_PREV` ([`e2e_tests::get_previous_telcoin_network_binary`]) is the MDBX e2e binary
+//!   from `make build-e2e-bin-mdbx`, whose reth database is MDBX;
+//! - `TN_BIN_PATH` ([`e2e_tests::get_telcoin_network_binary`]) is the default (tn-lmdb) e2e binary
+//!   from `make build-e2e-bin`.
 //!
 //! `make test-e2e-reth-migration` passes both, and the marker `TN_E2E_TN_LMDB_BIN`, which says that
-//! `TN_BIN_PATH` is the `tn-lmdb` build. Without the marker the test skips with a warning: `make
-//! test-e2e` selects every ignored test with `TN_BIN_PATH` at the default binary, and a
-//! `TN_BIN_PATH_PREV` exported for the mixed-binary tests (`make build-e2e-bin-prev`) would
-//! otherwise run this test against two MDBX binaries. With the marker set, a missing binary or
-//! both variables naming one file fails the test.
+//! `TN_BIN_PATH` is the tn-lmdb build and `TN_BIN_PATH_PREV` this lane's MDBX one. Without the
+//! marker the test skips with a warning: `make test-e2e` selects every ignored test with
+//! `TN_BIN_PATH` at the default binary and no MDBX binary, and a `TN_BIN_PATH_PREV` exported for
+//! the mixed-binary tests (`make build-e2e-bin-prev`) would otherwise run this test against a
+//! release this lane does not choose. With the marker set, a missing binary or both variables
+//! naming one file fails the test.
 //!
 //! **No vacuous pass.** The files prove the roles: before each restart the stopped validator's
 //! `db/` must hold `mdbx.dat` and no `tn-lmdb.dat` (the previous binary is MDBX), and after it the
 //! migrated layout plus the migration's line in that run's own log (the current binary is
-//! `tn-lmdb` and migrated this database).
+//! tn-lmdb and migrated this database).
 
 use crate::{
     common::{
@@ -50,10 +51,10 @@ use tracing::{info, warn};
 const TEST: &str = "rethmig";
 
 /// The marker `make test-e2e-reth-migration` sets: `TN_BIN_PATH` is the `tn-lmdb` e2e binary.
-const TN_LMDB_BIN_MARKER: &str = "TN_E2E_TN_LMDB_BIN";
+pub(crate) const TN_LMDB_BIN_MARKER: &str = "TN_E2E_TN_LMDB_BIN";
 
 /// The line the `tn-lmdb` node logs once a migration has committed (`migrate_from_mdbx`).
-const MIGRATED_LOG: &str = "migrated the reth database from MDBX to tn-lmdb";
+pub(crate) const MIGRATED_LOG: &str = "migrated the reth database from MDBX to tn-lmdb";
 
 /// The validator restarted first; the others follow in a rolling upgrade.
 const FIRST: usize = 2;
@@ -84,12 +85,12 @@ fn lane_binaries() -> eyre::Result<Option<(&'static TestBinary, &'static TestBin
     }
     let previous = e2e_tests::get_previous_telcoin_network_binary().ok_or_else(|| {
         eyre::eyre!(
-            "{TN_LMDB_BIN_MARKER} is set but TN_BIN_PATH_PREV is unset: the test needs the default \
-             (MDBX) e2e binary there (`make test-e2e-reth-migration` passes it)"
+            "{TN_LMDB_BIN_MARKER} is set but TN_BIN_PATH_PREV is unset: the test needs the MDBX \
+             e2e binary there (`make test-e2e-reth-migration` passes it)"
         )
     })?;
-    // checked before resolving the binary: with TN_BIN_PATH unset the harness builds the
-    // default (MDBX) binary through cargo, which would only fail later, after minutes of build
+    // checked before resolving the binary: with TN_BIN_PATH unset the harness builds a binary
+    // through cargo, minutes of build under features this lane did not choose
     let current_path = std::env::var_os("TN_BIN_PATH")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -103,7 +104,7 @@ fn lane_binaries() -> eyre::Result<Option<(&'static TestBinary, &'static TestBin
         eyre::ensure!(
             std::fs::canonicalize(previous_path)? != std::fs::canonicalize(&current_path)?,
             "TN_BIN_PATH and TN_BIN_PATH_PREV name the same file ({}): the test needs the tn-lmdb \
-             binary in TN_BIN_PATH and the default (MDBX) binary in TN_BIN_PATH_PREV",
+             binary in TN_BIN_PATH and the MDBX binary in TN_BIN_PATH_PREV",
             current_path.display()
         );
     }
@@ -111,7 +112,7 @@ fn lane_binaries() -> eyre::Result<Option<(&'static TestBinary, &'static TestBin
 }
 
 /// `true` when `path` exists; a stat error fails rather than reading as absent.
-fn exists(path: &Path) -> eyre::Result<bool> {
+pub(crate) fn exists(path: &Path) -> eyre::Result<bool> {
     path.try_exists().map_err(|e| eyre::eyre!("failed to stat {}: {e}", path.display()))
 }
 
@@ -121,17 +122,17 @@ fn datadir(base: &Path, instance: usize) -> PathBuf {
 }
 
 /// Assert a stopped validator's reth database is MDBX: `db/mdbx.dat` and no `db/tn-lmdb.dat`.
-fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
+pub(crate) fn assert_mdbx_layout(datadir: &Path) -> eyre::Result<()> {
     let db = datadir.join("db");
     eyre::ensure!(
         exists(&db.join("mdbx.dat"))?,
-        "{} has no mdbx.dat: TN_BIN_PATH_PREV must be the default (MDBX) e2e binary",
+        "{} has no mdbx.dat: TN_BIN_PATH_PREV must be the MDBX e2e binary",
         db.display()
     );
     eyre::ensure!(
         !exists(&db.join("tn-lmdb.dat"))?,
         "{} holds a tn-lmdb.dat before the restart on TN_BIN_PATH: TN_BIN_PATH_PREV must be the \
-         default (MDBX) e2e binary",
+         MDBX e2e binary",
         db.display()
     );
     Ok(())
@@ -145,7 +146,7 @@ const TN_LMDB_DB_VERSION: &str = "1002";
 /// Assert a restarted validator's reth database finished its migration: `db/tn-lmdb.dat` and the
 /// `db/mdbx-migrated` marker, none of MDBX's files, no temp directory, the tn-lmdb version in
 /// `db/database.version`, and the static files kept.
-fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
+pub(crate) fn assert_migrated_layout(datadir: &Path) -> eyre::Result<()> {
     let db = datadir.join("db");
     eyre::ensure!(
         exists(&db.join("tn-lmdb.dat"))?,
@@ -204,7 +205,7 @@ fn tip(client_urls: &[String; 4], instances: impl IntoIterator<Item = usize>) ->
 /// Stop validator `instance` with SIGTERM and wait for it to exit on its own. A validator that
 /// does not stop within [`STOP_TIMEOUT`] fails the test (the guard still holds it), rather than
 /// being killed, so the database the next run opens is a cleanly closed one.
-fn stop_validator(guard: &mut ProcessGuard, instance: usize) -> eyre::Result<()> {
+pub(crate) fn stop_validator(guard: &mut ProcessGuard, instance: usize) -> eyre::Result<()> {
     let child =
         guard.get_mut(instance).ok_or_else(|| eyre::eyre!("no validator-{}", instance + 1))?;
     send_term(child);

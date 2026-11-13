@@ -78,8 +78,9 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   so the base does not move while the file grows within it (past it the mapping moves, and the
   old one is kept for its readers). The OS page cache is the cache.
 - **Fail-stop.** Any I/O or commit error, and any damage a read finds, latches the environment.
-  From then on writes and commits return `Failed` and reads continue. A reopen recovers from the
-  metas.
+  From then on writes and commits return `Failed` and reads continue (a latched write
+  transaction's own reads serve what its failed write left half-applied, which its refused
+  commit never publishes). A reopen recovers from the metas.
 - **Deletes merge.** A page a delete leaves under a quarter full absorbs same-parent siblings
   while they fit, up the tree. A merge allocates nothing and never splits. See
   [Deletes and merging](#deletes-and-merging).
@@ -108,7 +109,7 @@ Each meta page holds a 128-byte record at offset 0, and the rest of the page is 
 | off | size | field |
 |---|---|---|
 | 0 | 8 | magic `b"tn-lmdb\0"` |
-| 8 | 4 | format version = 6 |
+| 8 | 4 | format version = 8 |
 | 12 | 4 | page size P |
 | 16 | 8 | txn id |
 | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -141,7 +142,9 @@ Decoding (`Meta::decode`) runs its checks in this order:
    would fail `page::validate`'s canonical-length rule. Version 6 put the flags word and the boot
    id in bytes 96..116, which version 5 reserved, for the weak record. Version 7 put the tree tag
    in bytes 18..22 of every tree page's header, which version 6 reserved ([Tree
-   pages](#tree-pages-pagers)).
+   pages](#tree-pages-pagers)). Version 8 put the tree tag in bytes 20..24 of every overflow
+   run's header, where version 7 kept the run's page count, which its `len` already implies
+   ([Overflow runs](#overflow-runs-overflowrs)).
 3. The CRC must match, else `Corrupt`.
 4. The remaining fields must be possible, else `Corrupt`: a valid page size, no flag but bit 0,
    no non-zero reserved byte, well-formed tree roots, a `page_count` of at least 2, and a next
@@ -282,8 +285,14 @@ overflow cell:  vlen u32 = 12 | klen u16 | flags u16 = 1 | key | ovf_pgno u32 | 
 
 run (n·P bytes, n = ceil((28 + len) / P)):
   @0  pgno u32 | @4 kind u8 = 3 | @5 flags u8 = 0 | @6 reserved u16 = 0 | @8 txn u64
-  @16 len u32  | @20 npages u32 | @24 value (len bytes) | zero pad | CRC32 u32 at n·P − 4
+  @16 len u32  | @20 tag u32 | @24 value (len bytes) | zero pad | CRC32 u32 at n·P − 4
 ```
+
+- **The run names its tree.** `tag` is the tag of the tree whose leaf names the run (the same
+  tag the leaf's header carries, [Tree pages](#tree-pages-pagers)); the cell does not store it,
+  a read takes it from the leaf the cell is in (`Ovf::tag`). So a reference that damage
+  redirects to another tree's run of the same txn and length is `Corrupt`, as a child pointer
+  redirected to another tree's page is.
 
 - **The cell is canonical.** `ovf_pgno` is the run's first page, `ovf_txn` the low 32 bits of the
   txn that wrote it (the identity check, as a branch cell's `child_txn`), and `len` the value's
@@ -533,7 +542,7 @@ committed tree, only one this transaction freed, and only damage names it: the c
 | 1 | Flush each dup table's working map into its outer tree (`Work::flush_nested`: each changed nested root into its outer cell, which can allocate, copy and free pages), write each changed table's root into the catalog (in name order), then save the free list (see below). |
 | 2 | Build meta M in memory: txn L+1 (the first after an open, `meta::MAX_WEAK_RUN` + 1 past the newest steady slot's and past every slot's: [Open and recovery](#open-and-recovery), step 6), both roots, the page count. |
 | 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
-| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
+| 4 | With `EnvOptions::gap_fill` set, first rewrite the short gaps between the dirty runs with their own bytes ([Gap fill](#gap-fill); under `GapFill::Auto` at a width chosen per scattered step from the measured sync costs, [Automatic width](#automatic-width)). Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). On macOS the otherwise-case is an `msync(MS_ASYNC)` of each merged range, then an `msync(MS_SYNC)` of each (`DataSync::Ranges`; [Platform notes](#platform-notes), do-not-flag item 30). |
 | 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too (on macOS, step 4's msyncs of a scattered commit leave the size to this step). |
 | 6 | Copy meta M, steady, into the slot that does not hold the newest steady meta (`meta::slot_to_write`: with both slots steady, the lower txn, an invalid slot first, on a tie slot 1; beside a weak slot, the weak one), msync that one page, then record M's txn as the slot's. |
 | 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
@@ -617,6 +626,157 @@ and whether the commit survives is unknown until a reopen. Validation errors (`K
 `InvalidDupOptions`, `ReadOnly`, `WrongTxn`) happen in `put` and the other calls, before anything
 changes, and do not latch.
 
+### Gap fill
+
+`EnvOptions::gap_fill` (a `GapFill`: `Pages(g)`, default 0: off, at most `MAX_GAP_FILL`, 64,
+else `InvalidGapFill` at open; or `Auto`, [Automatic width](#automatic-width); parsed from
+`auto`, `off` or a page count) trades bytes written for writes. A durable commit's pages are
+scattered: in steady state nearly all of them (98-99% measured) are pages freed two commits
+earlier, which sit wherever their old copies were written, so most runs of adjacent dirty pages
+are one page long. Linux's writeback sends each run to the disk as its own write, so a commit
+costs about one write per run (`IoStats::sync_runs`): measured on the node's workloads, 636 runs
+for the persist benchmark's 796-page commit and 21,431 for the execution benchmark's 24,585-page
+busy commit, about 5 KiB per write. On a disk that caps writes per second (network block storage:
+a cloud disk at 4,500 to 20,000 IOPS) that is seconds of I/O per large commit, while its
+bandwidth sits idle.
+
+With `gap_fill` at `g`, step 4 first rewrites each gap of 1 to `g` clean pages between two runs
+with the bytes it holds (`Writer::fill_gaps`): it reads the gap through the file into a buffer
+(`PageFile::read_resident`) and writes the buffer back at the same offset (`PageFile::rewrite`,
+a `pwrite`), never through the mapping. The page cache then holds the two runs and the gap dirty,
+one run, and the sync (either of step 4's) writes it as one write. A replay of the measured
+commits' page sets predicted, against `g` = 0:
+
+| `g` | persist, writes | bytes | busy, writes | bytes | peak, writes | bytes |
+|---|---|---|---|---|---|---|
+| 4 | -53% | 1.94x | -34% | 1.68x | -49% | 1.89x |
+| 8 | -76% | 3.08x | -53% | 2.73x | -71% | 3.03x |
+| 16 | -90% | 4.62x | -73% | 4.90x | | |
+
+A commit's time on such a disk is about the larger of its writes over the IOPS cap and its bytes
+over the bandwidth cap, so gap fill wins while bandwidth is in hand, and a `g` past that point
+loses. It adds no file space. On a local NVMe drive, whose IOPS are plentiful, it only costs: the
+extra bytes, and two system calls per gap filled.
+
+- **No byte changes.** Only the writer changes pages, on its own thread, and nothing changes a
+  gap page between the fill's read and its write: a gap holds no page of the commit, and the
+  metas are never between two of its pages. So the write stores what the page cache holds, and
+  a clean cached page holds what the disk holds. A gap page may be a page of the last durable
+  state, of a reader's snapshot, a free page, one the transaction took and gave back, or one an
+  aborted transaction or a dead writer wrote: each keeps its bytes. Readers reading a gap page
+  meanwhile see each byte's own value: the kernel's copy stores nothing else.
+  `a_gap_fill_changes_no_byte_of_the_file` compares the files of the same commits at 0, 4 and
+  64 pages byte for byte, and the crash matrix runs with it on
+  (`every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill` and neighbours).
+- **A torn write.** A crash during the sync leaves each sector of a gap rewritten or not, and
+  both hold the same bytes, on a drive that writes each logical block atomically (NVMe's atomic
+  write unit is at least one logical block; cloud block storage writes whole blocks). Without gap
+  fill no commit writes a page the last durable state names, so a drive that can garble the
+  block it was writing at a power cut damages only free pages and a meta (see the page-size
+  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page,
+  which its CRC then reports as `Corrupt`. Leave gap fill off on such a drive.
+- **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous random
+  read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
+  `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap it
+  cannot read whole is skipped (`IoStats::gap_misses`). When the gap's first page is missing, the
+  kernel starts a read of the gap that nothing waits for, and `POSIX_FADV_RANDOM` on the file (given
+  at open when gap fill is on; the engine reads through the file only at open otherwise) keeps that
+  read to the gap's pages. A commit stops trying once its misses exceed its fills by 16, so the
+  reads a commit's fill starts exceed the writes it saved by at most 16. Right after an open that
+  dropped the file's cached pages (Linux, open step 4: after an unclean end, or with no usable boot
+  record) the cache holds none of the file, so the first commits' gaps miss until the tree's reads and the commits' writes bring pages back; that bound caps what it
+  costs, and no byte changes either way. A kernel or file system that refuses `RWF_NOWAIT`
+  (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off for the environment at the
+  first gap read, a fixed width and auto alike, with one warning and `IoStats::gap_fill_refusals` at
+  1: no later commit tries (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap
+  fill tests assert that fallback on such a file system (`file::refuses_nowait_reads`, a probe of
+  their own), so they fill gaps only where the temp dir is on a disk. No safe call reports residency
+  without reading (`mincore` would be a raw call: new `unsafe`).
+- **macOS** has no `RWF_NOWAIT`: a gap is read with a plain `pread`, and a page not in memory
+  costs a synchronous read. Gap fill there serves the tests and measurement, not production.
+  Step 4's `msync`s of `DataSync::Ranges` write the rewritten gaps with the mapped pages (each
+  gap lies inside a merged range: `MAX_GAP_FILL` is `MERGE_GAP`),
+  `a_gap_filled_scattered_commit_leaves_no_page_dirty`.
+- **Errors.** An I/O error reading or writing a gap fails the commit (it latches) and poisons the
+  file. A failed write leaves each byte as it was or rewritten, the same bytes.
+
+#### Automatic width
+
+A fixed width suits one kind of disk: measured on the Mac's SSD, filling costs about 4.7 µs of
+the writer's time per gap and the extra bytes cost more than the writes saved (the execution
+benchmark's busy output took 454 ms at 0 and 513 ms at 4), while on a 4,500-IOPS cloud disk the
+busy commit's 21,400 writes take about 4.8 s, and at 8 pages about 2.2 s. `GapFill::Auto`
+(`--db.gap-fill auto`) chooses the width per scattered durable step (one step 4 syncs by the
+`fdatasync`, or on macOS the `msync`s of `DataSync::Ranges`; a step synced by one `msync` fills
+nothing under auto) from what the disk's syncs were measured to cost (`env/gap_auto.rs`):
+
+- **Its counts.** From the step's sorted pages, one pass counts its runs, pages and the sizes of
+  its gaps (`Gaps::of`); one pass over the sizes gives, at each candidate width (0, 1, 2, 4, 8,
+  16, 32, 64), the gaps it would fill and their pages: the runs it would write are the runs less
+  those gaps, the pages the pages plus theirs. Measured: under 1 ns a page (24 µs for a
+  30,000-page step), the choice 0.4 µs (`the_chooser_costs_microseconds_per_step`, x86 Linux).
+- **Its cost model.** Each scattered step's runs written, pages written and data sync time are a
+  sample, kept with its width: the latest 16 steps of each width. Two forms are fitted to them,
+  robustly (non-negative least squares, reweighted by Huber's and then Tukey's weights of the
+  residuals, so a stalled sync or a latency spike moves the fit little): the sum
+  `c + a·runs + b·pages` (a drive that pays per write and per byte, such as local NVMe) and the
+  capped form `c + max(a·runs, b·pages)` (a disk capped on writes per second and on bytes per
+  second, whichever binds, such as network block storage, whose best width balances the two caps:
+  the sum, a plane, can only straddle it). The capped form is kept only when it fits markedly
+  better: its error, the root mean square over the widths of each width's median residual (so a
+  probed width's few steps count as much as the choice's many), under 0.7 of the sum's. Each width
+  then has its own correction: the median, over the steps the choice held at that width (its
+  probes if it held none), of their sync time over the model's prediction. The forms are two
+  shapes, and a disk can cost far more at one width than either predicts from the others: on a
+  20,000-IOPS Hyperdisk, a peak output's commit at 0 took 1.3 to 2.2 s, two to three times what a
+  capped fit to the widths from 2 up allows. The fill's own cost per gap tried and the share of
+  gaps it fills are running means of the fill's timer. A fit costs about 13 µs a step.
+- **Its choice.** Each width's predicted step 4 is the model's sync time for the runs and pages it
+  would write, times the width's correction, plus the fill's cost of its gaps. The first choice
+  after a warm-up is the warm-up width that predicts the least. After that the choice moves only
+  to a width beside it, half of it or twice it (at least 2), and only when that is predicted to
+  save 5% of its time; a width beside it that no kept step measured is probed once first. A new
+  choice holds for 4 steps before the next move, so the next decision rests on its own steps. So
+  the choice never jumps to a width no step is near. That jump was how the fit's blind spots
+  became width-0 streaks: once every kept width was bound by its bytes, nothing showed the cost
+  per write, the sum's fit put 0 there, and 0 (the fewest pages) predicted cheapest; the first
+  steps at 0 then read as outliers, and on a disk with a burst allowance of writes they were cheap
+  besides (the first step at 0 after wider ones spends what they saved), so 4 to 5 followed at
+  about three times the cost before the fit turned. On a drive whose writes are cheap beside its
+  bytes and the fill's cost the choice is 0; on one that caps its writes, a fill.
+- **Exploration.** At one width a step's runs and pages move together, so steps at one width
+  cannot tell `a` from `b`. An open starts with a warm-up of 12 scattered steps at 8, 0 and 4
+  pages in turn; after it, a step is now and then a probe at half the choice or twice it (at
+  least 2), alternately. Probes start 16 steps apart and the interval doubles after each, up to
+  128, while the choice holds; a new choice brings it back to 16. So a disk whose choice moves is
+  explored often and one that settles seldom: on the Mac's SSD, where the choice is 0, a probe's
+  fill costs about half its step's sync (a fill costs about 3.7 µs a gap there), a 128th of that
+  over all steps once settled. Since each width keeps its own steps, the choice's steps never
+  crowd out what the warm-up and the probes measured.
+- **Re-adaptation.** A width's samples give way to its newer steps, and its correction follows
+  them. A disk whose costs change at once (a cloud disk's limits raised, a drive that changed
+  speed) is seen sooner: 8 steps in a row whose sync took more than 1.5 times the corrected
+  prediction, or less than 1/1.5 of it, the same way, empty every width's samples and start the
+  warm-up again. The model is in memory only: each open starts cold.
+- **No byte changes, at any width.** The width only says which clean gaps step 4 rewrites with
+  their own bytes, so no choice changes a byte of the file (`a_gap_fill_changes_no_byte_of_the_file`
+  runs auto beside 0, 4 and 64; the crash matrices run under auto too,
+  `every_crash_point_recovers_the_state_the_protocol_allows_with_auto_gap_fill` and neighbours).
+  The fill's guards (a gap read only from memory on Linux, the miss slack) hold at every width,
+  and a file system that refuses `RWF_NOWAIT` turns auto off as it turns a fixed width off, once:
+  the step refused is not filed and no later step chooses.
+- **Reading its choice.** `IoStats::gap_auto_steps` (scattered steps it chose for),
+  `gap_auto_width_sum` (their widths summed: over an interval, the sum over the steps is the mean
+  width), `gap_auto_probes`, `gap_auto_readapts`; and gauges, which `IoStats::since` keeps as the
+  later read's: `gap_auto_width` (the last step's width), `gap_auto_run_ns` and `gap_auto_page_ns`
+  (the fitted `a` and `b`, per write and per page), `gap_auto_gap_ns` (the fill's cost per gap)
+  and `gap_auto_capped` (1 for the capped form). The model's chooser tests (`env/gap_auto/tests.rs`)
+  run it on modelled disks: per write only (64), per byte only (0), mixed costs (the predicted
+  crossover), noise and stalls, both caps, and costs that change mid-run.
+- **macOS** runs auto as Linux does, for tests and measurement like any gap fill there: its gap
+  reads are plain `pread`s, so a gap not in memory costs a synchronous read, which shows in the
+  fill's timed cost per gap and so in the choice.
+
 ---
 
 ## Free list and page reuse
@@ -658,10 +818,14 @@ changes, and do not latch.
   transaction named by a page it did not write, or by an untrusted root handle, is `Corrupt`, and
   a private child must be the page and txn its parent names. A freed private page goes back to
   the pool at once, so a forged pointer to a page this transaction allocated for another tree
-  must not free it. A tree whose `overflow_pages` is 0 reads its branches, its first leaf and its
-  private leaves (in memory) only. A tree with runs reads every leaf, checks each run's header,
-  identity and provenance (`leaving_run`, without the CRC: the value is not read), and requires
-  the run pages to add up to `overflow_pages`. Every tree a free walk meets (a plain table's, a
+  must not free it. Every leaf is read with a descent's checks (the page, its tree's tag and the
+  txn its parent names), so a leaf pointer redirected to another table's page frees nothing. A
+  tree whose `overflow_pages` is 0 verifies no leaf's CRC and refuses any overflow cell it finds
+  (a handle that miscounts its runs would otherwise leak them). A tree with runs verifies every
+  leaf unless private or stamped, checks each run's header, identity and provenance
+  (`leaving_run`, without the CRC: the value is not read), and requires the run pages to add up
+  to `overflow_pages`. A one-page tree walked on its own keeps no set of the pages reached (the
+  set is a bitset sized by the highest page number inserted). Every tree a free walk meets (a plain table's, a
   dup table's outer and nested trees, `delete_prefix`'s nested tree) must also hold exactly the
   branch and leaf pages its handle counts, counted from the levels the walk reads, so a root that
   miscounts its pages is refused too. Damage refuses the free with `Corrupt`, before any page is
@@ -977,7 +1141,7 @@ against its cell before returning a byte:
 - its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
 - its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
   `ovf_txn`, so a redirected or stale reference is `Corrupt`;
-- its `len` and `npages` are the ones the cell implies;
+- its `len` is the cell's, and its `tag` is the tag of the tree whose leaf holds the cell;
 - unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
   page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
   ties them to it: without it a reused or redirected middle page would return wrong data.
@@ -1058,7 +1222,7 @@ checks as `Cursor`'s.
    too. The locked file must be the one the path names, and non-empty. A creator may rename its
    new file over the path between this open and its lock, so the open is retried up to three
    times, then fails with `Locked`.
-4. **`fsync_file` once, then the directory, then the page cache dropped.** A crash may have left a meta in the page cache whose
+4. **`fsync_file` once, then the directory, then the page cache dropped when it can be stale.** A crash may have left a meta in the page cache whose
    msync never finished, a trusted weak head whose pages a dead writer left there, and a `create`
    that died or failed between its rename and its `fsync_directory` may have left the file's name
    not durable. What open reads, and the name it found it by, must be durable before anything is
@@ -1071,15 +1235,43 @@ checks as `Cursor`'s.
    the directory, or an `EINVAL`/`ENOTSUP` from its fsync, is skipped with a warning naming it
    (such a directory never could make a name durable; the file's own fsync still runs); any other
    error fails the open, naming the directory. Step 2's directory sync after the rename follows
-   the same rule. Then, on Linux, the file's cached pages are dropped (`sys::drop_cached_pages`,
+   the same rule. Then, on Linux, unless the boot record says the cache equals the device (below),
+   the file's cached pages are dropped (`sys::drop_cached_pages`,
    `posix_fadvise(POSIX_FADV_DONTNEED)`; an error fails the open), so everything this open reads,
    the metas (step 5) and the pages step 9 checks, is the device's: a page a failed writeback
    left clean in the cache, its bytes never on the device and its error reported to the writer
    that is gone, would otherwise pass from the cache
    (`a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync`). The `fsync` before it wrote
-   every page it could, so the drop removes clean pages only; the kernel keeps a dirty one. The
-   cost is a cold cache after every writer open: the pages the node reads come from the device
-   again.
+   every page it could, so the drop removes clean pages only; the kernel keeps a dirty one. A
+   dropped cache costs the reads after it: every page the node reads comes from the device again
+   (a steady open on a cloud disk at about 0.4 ms a cold 4 KiB read took about 100 ms instead of
+   1 ms).
+
+   **The boot record** (`boot_record.rs`) decides. It is a 64-byte file beside the data file,
+   `<path>.boot`: a magic, a version, the state ("open" or "clean"), the boot id of the writer
+   that wrote it (`sys::boot_id`), the data file's device and inode, the file's ctime at a clean
+   close, and a CRC. It is advisory: the data file's format and `FORMAT_VERSION` are unchanged, and
+   every way the record can go wrong costs a drop, never data. Only a writer leaves a stale page,
+   and only in its boot (a new boot's cache holds only what that boot read from the device), and
+   a clean close leaves none (its final sync would have failed). So at a writer open:
+
+   | the record | the cache |
+   |---|---|
+   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup) | dropped |
+   | this boot's id or the record's unknown (zeros) | dropped |
+   | "clean", but the file's ctime moved since (something wrote the file after the close) | dropped |
+   | another boot's | kept |
+   | this boot's, "open": its writer crashed, was killed, or closed latched | dropped |
+   | this boot's, "clean" | kept |
+
+   A copied file is another inode, so its first open drops the cache the copy filled (in large
+   folios, perhaps: [Platform notes](#platform-notes)) whatever record came with it
+   (`a_copied_datadir_drops_the_cache_its_copy_filled`). A device number that a volume manager
+   assigns anew at a reboot costs a drop in a boot whose cache is cold anyway. Step 10 writes
+   "open", and the close's last step "clean" ([Close](#close)). No clock is read; containers share
+   the host's boot id and its page cache, which is what the record means by a boot
+   (`a_writer_open_drops_the_cache_as_the_boot_record_says`, `boot_record::tests`). Only Linux
+   keeps the record (in tests every host, whose disk model mirrors the drop); macOS has no drop.
 5. **Choose a meta** (`choose_meta`):
    - Meta 0 is read at offset 0. If it is valid, meta 1 is read at its page size.
    - If meta 0 is invalid, meta 1 is the first record carrying the magic at an offset P for P in
@@ -1163,7 +1355,37 @@ checks as `Cursor`'s.
    and 115 ms for 463 MiB, about 4 GB/s of CRC, beside 0.4 and 12.5 ms for the steady open of
    the same files (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`).
 
-**Open never writes to an existing file.** Every failure above leaves the file unchanged.
+   On Linux an unclean end means step 4 dropped the cache, so the check reads from the device.
+   One fault at a time that is a device read per page in turn. So the walk starts its reads
+   ahead of itself (`check::Ahead`): before it descends from a branch it advises
+   `posix_fadvise(POSIX_FADV_WILLNEED)` (`sys::will_need`, through `rustix`) for every child it
+   will descend into, and before it reads a leaf's entries for each overflow run and nested root
+   it will read from them, each batch sorted and its adjacent pages merged into one range. The
+   advice queues the reads and returns; the walk's faults then find the pages read or in flight,
+   and the device reads a branch's children together
+   (`a_weak_head_check_reads_ahead_what_it_descends_into`). On a cloud VM's disk (GCP
+   Hyperdisk, ext4, Linux 7.0) the check after a crash took 1.3 to 3.1 s for 61 MiB of pages and
+   8.6 to 21.7 s for 463 MiB over two runs, 5,000 to 14,000 pages a second, bound by the disk's
+   reads, where one fault at a time took 86.8 s for the 61 MiB; the steady open of the same files
+   keeps its cache and took 3 ms
+   (`a_weak_head_check_costs_the_pages_written_since_the_last_sync`, `TMPDIR` on that disk). A
+   read-only open's check advises the same (it reads, writes nothing); `Env::check` advises
+   nothing.
+10. **Write the boot record's "open"** (`Writer::mark_open`): this boot's id and the file's
+   device and inode, synced (`fsync_file`), and the directory synced too when the record was
+   missing, before the writer can commit; an error fails the open, naming the record, but for a
+   missing record its directory refuses to create (`PermissionDenied`, `ReadOnlyFilesystem`),
+   which is logged: the record stays missing, and every open drops the cache
+   (`a_directory_that_refuses_the_boot_record_opens_without_one`). Were "open"
+   only in the page cache, a failed writeback of it could bring back the device's "clean" of an
+   earlier close in this boot, and a crash after it would keep a cache it must drop. A crash
+   between this step and the first commit leaves "open": the next open drops, which costs only
+   its reads. The record is written only under the data file's exclusive lock (a writer open and
+   its close), so no two processes race on it; a symbolic link or anything but a regular file at
+   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed.
+
+**Open never writes to an existing file.** Every failure above leaves the file unchanged (the
+boot record beside it is written at step 10 only, once everything else has passed).
 Recovery is choosing a meta: there is no repair, no reinitialisation of a non-empty file, and no
 fallback past a short file. A torn or invalid slot counts as the lowest and is the first one a
 later commit overwrites. A weak head stays weak: the next sync (`Env::sync`, the close, a durable
@@ -1201,7 +1423,12 @@ so no later transaction rewrote it in place. It was on the disk before S's meta 
   the steady state beside it, whose pages are durable, and stamps every page with a txn past the
   head's (step 6), so it names no page of the head's commits. A read-only open writes nothing.
 
-A volume loss keeps what reached the disk, so every skipped page is intact. The parents name
+A volume loss keeps what reached the disk, so every skipped page is intact. An open that passed
+over a weak head W with `trust_unsynced = false` builds on S's free list and page count, which
+are W's commits' pages: any write transaction after it, committed, aborted or crashed, may
+reuse them (W's meta stays in its slot until the first commit that changes something writes
+over it), after which a trusting open's check of W fails and it opens at S with a warning.
+ The parents name
 txns by their low 32 bits (a branch cell's `child_txn`, a `TreeRoot`'s `root_txn`, an overflow
 cell's txn), so the walk compares them by wrapping distance from S's (`check::named_after`): a
 txn is after S when it is 1 to 2^31 − 1 past it. That is exact for every txn after S while W is
@@ -1220,8 +1447,8 @@ msync, or a sync's data step, fails (say EIO), the environment latches. The page
 the new meta, or the weak head's pages, in pages now marked clean while the disk holds the old
 bytes, and the error is reported once, to the file already open, not to one opened later (the
 "fsyncgate" pattern, common to engines that rely on the page cache for writeback). On Linux a
-writer open in the same boot drops the file's cached pages after its `fsync` (step 4), so it reads
-the disk: a meta that never reached it is not seen, and a weak head whose record reached it but
+writer open in the same boot drops the file's cached pages after its `fsync` (step 4: the boot
+record still says "open", as a latched close never writes "clean"), so it reads the disk: a meta that never reached it is not seen, and a weak head whose record reached it but
 whose pages did not fails step 9's check; either way the open is at the last sync, whose pages and
 meta earlier syncs that succeeded wrote and no later write touched (the reuse gate and the slot
 rule), losing the commits since it
@@ -1251,11 +1478,15 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
    (`sys::flock_shared`), else `Locked`. Read-only opens coexist; a writer's `LOCK_EX` excludes
    them, and they exclude it (its open is `Locked`). The locked file must be the one the path
    names, retried up to three times as in step 3 above.
-4. **No fsync, no page cache dropped.** Nothing is built on what this open reads. A meta that a
-   crash left in the page cache unsynced (a trusted weak head among them) is the state it reads,
-   and a power loss afterwards can still lose that state; the next `Env::open` then makes
-   durable whichever meta it reads. What a failed writeback left clean in the cache is read as
-   it is (the writer open's drop is what finds it: the known limit above).
+4. **No fsync, no page cache dropped, no boot record.** Nothing is built on what this open reads.
+   A meta that a crash left in the page cache unsynced (a trusted weak head among them) is the
+   state it reads, and a power loss afterwards can still lose that state; the next `Env::open`
+   then makes durable whichever meta it reads. What a failed writeback left clean in the cache is
+   read as it is (the writer open's drop is what finds it: the known limit above). The boot
+   record is neither read nor written: this open drops nothing whatever it says, a stale cached
+   page can mislead only this open's own readers (the dead writer's readers saw the same state),
+   and the record keeps saying "open" for the next writer open, which drops. Reads change no
+   ctime, so a clean close's record stays valid across read-only opens.
 5. **Choose a meta**, 6. **txn check**, 7. **length check**: exactly as steps 5–7 above
    (`choose_state`):
    an invalid slot is skipped, a weak head is trusted only in the boot that wrote it (and with
@@ -1314,13 +1545,26 @@ in order:
    pages). A failure is logged (`tracing::warn!`, target `tn_lmdb`) and does not latch: the file
    only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
    own `page_count × P` bytes, all below the new length.
+6. **The boot record says "clean"** (`env::mark_clean`), once the sync and the trim both
+   succeeded (any earlier stop leaves "open", so the next writer open in this boot drops the
+   cache: `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
+   mappings are gone (an unmap can move the file's times: macOS's file systems update them for
+   pages written through a mapping), while a second descriptor of the file (`dup`) keeps the
+   lock; then the record takes the file's ctime and is written, with no sync. A power loss before
+   its writeback leaves "open" of a boot that is over, and the next boot keeps its cache either
+   way; a failed writeback of it leaves the device's "open", which drops. A failure is logged
+   (`tracing::warn!`) and changes nothing else.
 
 ---
 
 ## Failure latch
 
 `latch.rs` keeps the first cause and never clears it, and only the first cause is logged
-(`tracing::error!`, target `tn_lmdb`).
+(`tracing::error!`, target `tn_lmdb`). Reads of the published snapshots continue after a
+latch; the latched write transaction's own reads and cursor moves are not refused either and
+serve its working state as the failed write left it, half-applied (a dup write's nested root
+changed but its outer cell not, a dropped table's pages freed but its record kept), which its
+refused commit never publishes.
 
 | latches (later writes and commits return `Failed`) | does not latch |
 |---|---|
@@ -1595,7 +1839,9 @@ outer cell, and the tree's last leaf is freed. `delete_prefix(k)` frees `k`'s wh
 one walk, which collects every page and run before it frees any (damage, a root whose counters
 miss its pages included, is refused first), removes
 the cell and returns the rows removed (0, and no change, when `k` holds none). On a packed key the
-same calls work on its set, below.
+same calls work on its set, below: a row delete that keeps the set rewrites the outer cell as a
+replace does, which never merges; only the delete of a set's last row removes the cell and can
+merge (a shrinking replace of a plain table's value does not merge either).
 
 **Packed sets.** In a table whose `packed_max` is above 0, a new outer key whose first row encodes
 within the bound (`2 + 4 + |s| + |v|` bytes, [Packed sets](#packed-sets)) is created as a packed
@@ -1955,9 +2201,9 @@ benchmark takes two reads and `IoStats::since` for one commit's or one interval'
 | group | counters |
 |---|---|
 | commits | `commits` (each run of steps 4–6: a `Durable` commit, a `NoSync` commit that synced, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits` (`NoSync` commits that deferred their sync), `auto_syncs` (`NoSync` commits that synced their own pages and the deferred ones: past `sync_period` or `sync_bytes`, the first that changes something after an open, or one more than 2^20 txns past the last sync; each also counts in `commits`), `grown_commits` (the file grew since the last durable state) |
-| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took; on macOS the msyncs of each range count as `fdatasync_syncs`), `msync_span_pages` (the one range's pages, clean ones included), `sync_runs` (runs of adjacent pages among `pages_synced`, before any gap fill: about the writes Linux sends the disk), `gaps_filled`, `gap_pages`, `gap_misses` and `gap_fill_refusals` ([Gap fill](#gap-fill): runs written are `sync_runs - gaps_filled`; a refusal turned gap fill off, auto too); under `GapFill::Auto` `gap_auto_steps`, `gap_auto_probes`, `gap_auto_readapts`, `gap_auto_width_sum` and the gauges `gap_auto_width`, `gap_auto_run_ns`, `gap_auto_page_ns`, `gap_auto_gap_ns`, `gap_auto_capped` ([Automatic width](#automatic-width): `since` keeps the gauges' later value) |
 | growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
-| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
+| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `gap_fill_ns` (4's gap fill, before its sync, and under auto its choice), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
 | free list | `records_loaded`, `refill_ns`; `runs_by_step` (the run policy's four steps); `gate_lag_sum`, `gate_lag_samples` and `max_gate_lag` (at each load of records, the writing txn minus the reuse gate: 2 in `Durable` with no reader on an old snapshot, more under a held reader or `NoSync` commits not yet synced; the txn ids an open skips are not counted) |
 
@@ -2183,7 +2429,8 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
   growth, not a `SIGBUS` on a mapped write. That holds only where preallocation works. On a file
   system without it (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on NFS before version 4.2
   and FUSE file systems that do not implement it, or `F_PREALLOCATE` with `ENOTSUP`), growth is a
-  sparse `set_len`, and a full disk can then be a `SIGBUS` on a mapped write. Growth is geometric:
+  sparse `set_len` (warned once per process, target `tn_lmdb`), and a full disk can then be a
+  `SIGBUS` on a mapped write. Growth is geometric:
   at least `clamp(len, 1 MiB, max_growth)` more (`EnvOptions::max_growth`, default 1 GiB, at least
   `MIN_GROWTH`, 1 MiB), rounded to the OS page, so a running file holds a preallocated tail of up to
   one step past its pages. A clean close truncates the file to its pages, rounded up to the OS page
@@ -2235,8 +2482,11 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
     still cached (what a copy leaves), 115 after a cold full sequential read with the default
     readahead, 4.2 after cold random reads with it, 4.0 with `MADV_RANDOM`.
   - The advice cannot help a file already cached in large folios by buffered writes (a copy, a
-    restore written with `write(2)`). Evict such a file from the page cache before opening it
-    (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`): a commit on a copy left cached grew
+    restore written with `write(2)`). A writer open evicts such a file itself: a copy or a restore
+    is another inode, which no boot record names, so open step 4 drops its cache. Evict it by hand
+    (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`) only for a file rewritten in place, whose
+    record a clean close left (the ctime check then drops it too, but a coarse-timestamp file
+    system may not tell): a commit on a copy left cached grew
     from 82 to 583 ms over 300 commits in one measured workload, all in its one
     `fdatasync`, as the disk wrote 199 to 532 MiB per commit.
   - A failed `madvise` is not an error: the advice is a hint, so it is logged (`tracing::warn!`)
@@ -2365,13 +2615,23 @@ argument and the measurements. Code and other docs cite the items by number, so 
      the writer rewrites in place and no reader slices, aside), retired mappings outlive every view
      of them, and a read-only open's shared lock keeps every writer out. It also rests on a truthful
      free list: a crafted file whose free list names a live page can make a write overwrite bytes a
-     reader still holds ([Free list and page reuse](#free-list-and-page-reuse)). Copy-on-write adds
-     no `unsafe` ([Commit protocol](#commit-protocol)).
+     reader still holds ([Free list and page reuse](#free-list-and-page-reuse)); and on undamaged
+     published pointers: reads do not recompute CRCs, so a branch cell, overflow reference or
+     nested root damaged at rest can name a page the writer is reusing in its open transaction
+     (one freed below every reader's snapshot), and the reader slices it and reads its trailer
+     and header while the writer stores into it. The checks that follow the slice refuse the
+     page (its new txn is after the snapshot's, or its old bytes fail the tag or identity
+     check), so the outcome is `Corrupt` or torn bytes, never a page the reader keeps; but the
+     overlap is a data race by Rust's rules, the same class LMDB and MDBX accept. A read path that
+     verified every page's CRC before use (do-not-flag item 3) or copied pages out of the mapping
+     would close it. Copy-on-write adds no `unsafe` ([Commit protocol](#commit-protocol)).
    - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf`, `flock`
      and, on macOS, `sysctlbyname("kern.bootsessionuuid")` (the boot id, into a stack buffer),
      each on a live file descriptor (`sysconf` and `sysctlbyname` take none).
    - `crc.rs`: the aarch64 PMULL kernel (`pmull::update`, a copy of `tn-storage`'s), called only
-     after the CPU feature is detected at runtime.
+     after the CPU feature is detected at runtime. The pull-request test lanes run on x86_64,
+     where it is not compiled; `.github/workflows/arm64-crc.yaml` runs its `crc::tests` on an
+     arm64 runner.
    - `page::prefetch`: a one-instruction prefetch hint (`prfm` or `prefetcht0`) at a byte of the
      page, for a search's next probes and a level's first cells; a hint never faults or changes
      memory.
@@ -2517,6 +2777,12 @@ argument and the measurements. Code and other docs cite the items by number, so 
     `MS_ASYNC` pass as redundant with the `MS_SYNC` one (it starts every range's writes at once).
     Linux keeps the `fdatasync`, which writes them. See [Platform notes](#platform-notes) and
     [Step 4](#step-4-one-msync-or-one-fdatasync).
+31. **The boot record's "clean" is not synced, and the record is advisory** (`boot_record.rs`).
+    Only "open" must be durable: its loss could bring back an earlier "clean" of the same boot.
+    A lost or torn "clean" leaves "open" or no record, which drops the cache: a cost, never data.
+    Do not flag the missing sync, a record that a datadir copy carries along (a copy is another
+    inode, which the record does not name), or the drop it costs after a reboot that renumbered
+    the device. See [Open and recovery](#open-and-recovery), step 4.
 
 ---
 
@@ -2531,7 +2797,8 @@ relies on and every platform switch in the code, for a port to another OS.
 | `lib.rs` | crate docs, `compile_error!` off Linux and macOS, re-exports |
 | `error.rs` | `Error`, `Result` |
 | `stats.rs` | `IoStats`, the writer's I/O and allocation counters (`Env::io_stats`) |
-| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
+| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit (step 4's gap fill included), `sync` |
+| `env/gap_auto.rs` | `GapFill::Auto`'s chooser (`AutoGap`): the gap-fill width per scattered commit from the measured sync costs, probing less once its choice settles |
 | `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial), `DupRoCursor`, `DupTxnCursor` (the dup cursors, over `tree::dup_cursor::DupWalk`); dup tables' point ops, `delete_prefix` and the per-transaction map of their nested trees, flushed at commit; commit steps 1–3 and 7 |
 | `meta.rs` | the 128-byte meta record, `choose_meta`, `slot_to_write` |
 | `page.rs` | the slotted page codec (inline, overflow and nested leaf cells, `Val`), `Geometry` (limits, `place`: inline or overflow), `validate` |
@@ -2542,13 +2809,14 @@ relies on and every platform switch in the code, for a port to another OS.
 | `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
 | `freelist.rs` | free-record codec, gated loading, the fixed-point save |
 | `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
-| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting; `check_since`, open's check of a trusted weak head since the last sync (the same walk, pruned by `named_after`, no accounting) |
+| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting; `check_since`, open's check of a trusted weak head since the last sync (the same walk, pruned by `named_after`, no accounting, its reads started ahead of it: `Ahead`) |
+| `boot_record.rs` | The boot record beside the data file (`<path>.boot`): its codec, `decide` (whether a writer open drops the file's cached pages), `BootFile`'s read and write |
 | `latch.rs` | the failure latch |
 | `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, the cut of an inherited tail `distrust_tail`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
-| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
+| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `drop_cached_pages`, `will_need`, `flock_exclusive`, `flock_shared`, `boot_id` |
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`crc.rs` differs in its docs, two `dead_code` allows and `#[inline]` on `crc_is_zero`, which a sync keeps; `page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
-| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
+| `tests/`, `*/tests.rs`, `env/*_tests.rs` | crash, damage (nested cells, dup records, overflow runs and packed sets included), dup tables against a composite-key model (the dup cursors' and packed sets' suites with them), multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests (`env/gap_fill_tests.rs`, `env/io_stats_tests.rs`: step 4's gap fill and the I/O counters) |
 | `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch, and the on-demand probe of step 3's thread count (`stamp_probe`) |
 
 ---
@@ -2707,11 +2975,12 @@ commits are not yet measured under the new rule (see
   `insert` (`KeyExists`); prefix steps; a cursor that rests on the follower after a delete, so a
   walk that deletes as it goes skips nothing; `KeyTail`; and the reth adapter,
   [`tn-lmdb-reth`](../tn-lmdb-reth/README.md).
-- **M3, TN's reth database:** TN runs its reth database on tn-lmdb behind the `tn-lmdb` feature,
-  migrating an MDBX one at its first open (`crates/tn-reth`'s README); dup tables as nested
-  trees with packed small sets ([Dup tables](#dup-tables)); leaf values inline up to half a page;
-  a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
-  tail ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
+- **M3, TN's reth database:** TN runs its reth database on tn-lmdb (behind a `tn-lmdb` feature
+  until it became the default backend, 2026-11-09), migrating an MDBX one at its first open
+  (`crates/tn-reth`'s README); dup tables as nested trees with packed small sets
+  ([Dup tables](#dup-tables)); leaf values inline up to half a page; a growth cap
+  (`EnvOptions::max_growth`) and a clean close that gives back the preallocated tail
+  ([Close](#close)); automatic syncs for `NoSync` (`EnvOptions::sync_period`, `sync_bytes`),
   which bound its growth and what a reboot loses, and weak metas (format version 6), so that a
   crash of the process alone loses no `NoSync` commit, trusted at open once the pages they name
   since the last sync pass a check (a volume lost in the same boot falls back to the last sync): it serves as an opt-in fast mode. On 2026-11-04 TN's reth execution bench on Linux (six load profiles,

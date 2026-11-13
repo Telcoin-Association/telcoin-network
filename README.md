@@ -35,8 +35,21 @@ Generate a config and keys for your observer node:
 
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
-Start your observer node:
-`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+Find the two UDP ports keytool picked for the node's listeners, the primary's first and then worker 0's:
+`grep -o 'udp/[0-9]*' DATADIR/node-info.yaml`
+
+Start your observer node, binding those two ports on every interface:
+
+```bash
+PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/PRIMARY_PORT/quic-v1 \
+WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/WORKER_PORT/quic-v1 \
+target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR
+```
+
+keytool writes a 127.0.0.1 listener when no `--external-*-addr` flag is given, and a QUIC dial leaves from the listener's socket, which cannot send from 127.0.0.1 to a public address, so without the two variables every dial to the bootstrap peers times out and the node finds no peers.
+The variables change only what the node binds: the address it advertises stays the one in `node-info.yaml`.
+Binding 0.0.0.0 accepts inbound QUIC on those ports wherever a firewall allows it; an observer works outbound-only, so the firewall can drop inbound UDP.
+[Transport](docs/src/network/transport.md#listener-addresses) describes the override.
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 

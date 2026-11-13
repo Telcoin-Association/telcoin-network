@@ -40,6 +40,14 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
   twice the TTL, so a flood of peer batches can switch a deferral off but never re-arm one.
   Duplicates across workers stay tolerated at execution; this only stops this node from packing a
   copy of what a peer is already proposing.
+- Execution cache (`src/env/exec_cache.rs`): block execution reads accounts, slots and code
+  through a cross-block cache of the values at the last built block. One hit of each kind in 256
+  is re-read from the parent state; a stale one is logged, counted in
+  `tn_reth_exec_cache_stale_hits_total` (alert on any nonzero value), and the block is built again
+  without the cache, so that block is right and the node goes on. Unchecked stale hits of earlier
+  blocks may already have put the node on another state than its peers': compare its recent block
+  hashes with a peer's before trusting it, and report it. The sample follows each node's own cache,
+  so nodes check different hits, and a zero on one node says nothing about another.
 
 ### Block-building timings
 
@@ -56,12 +64,75 @@ fails records nothing, and neither do the stages after it.
 | `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer of one batch, in parallel on rayon. Not part of execute: the engine recovers an output's batches concurrently on a background job when the output is queued. |
 | `tn_reth_block_finish_seconds` | The block builder's `finish`: the post-execution changes (on an epoch-closing block, the closing system calls), merging the state transitions, hashing the post-state, the state root, and assembling the block. |
 | `tn_reth_block_hashed_state_seconds` | Hashing the block's post-execution state (`hashed_post_state`). Part of finish. |
-| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay::layered_root_with_updates` in `src/env/output_overlay.rs`), from opening its read-only database transaction to closing it. Part of finish. |
-| `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: taking the bundle and advancing the output's read cache with it, sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
+| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay` in `src/env/output_overlay.rs`, with the changed storage roots on parallel tasks and the account walk split by first nibble: `parallel.rs` and `account_split.rs` there), from opening its read-only database transaction to closing it, the tasks' own transactions included. Part of finish. |
+| `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: taking the bundle, sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
 
 None of them covers the persist, which runs once per output after every block is built; reth's
 `save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
 start at 5 ms, so a stage shorter than that reads only as "under 5 ms" on a dashboard.
+
+### Parallel storage roots, account walk and storage walk
+
+A block's state root computes the storage roots of the accounts with changed storage on rayon's
+pool while the account walk runs (`src/env/output_overlay/parallel.rs`). A block with at least 64
+changed accounts also splits the account walk by the first nibble of the hashed address
+(`src/env/output_overlay/account_split.rs`): sixteen subtrie walks, each reth's own `StateRoot`
+over cursors restricted to one nibble, run on the calling thread and pool jobs, and the calling
+thread composes the root branch and the union of their trie updates. No vendored change beyond the
+storage-root hook (TN-0139). A trie the split cannot compose (a small one: a few thousand accounts
+or fewer) runs the walk on one thread as before.
+
+A hot contract's storage root is split the same way (`src/env/output_overlay/storage_split.rs`): a
+contract with at least 64 changed slots whose stored trie has all sixteen first-nibble nodes over
+hashed children gets sixteen pieces, each reth's own `StorageRoot` over storage cursors restricted
+to one nibble, worked by the same threads before the account subtries; the walk that reaches the
+contract's leaf composes its storage root and the union of the pieces' trie updates. Wiped
+storage, smaller tries and a split that composes nothing (an emptied storage, a single non-empty
+nibble) leave the storage root to one task or the walk. On the exec bench, against the account
+split alone, the state root fell to 0.53x at peak and 0.54x on the busy profile on the Mac, and to
+0.41x and 0.44x on a 22-thread Linux VM. The whole output fell by 8% and 5% on the Mac (local NVMe).
+On the VM's 20,000-IOPS cloud disk it fell by 9% at peak (transactions per second +10%) and not at
+all on the busy profile: the busy commit is bound by the disk's IOPS, and its data sync grew by the
+time the state root saved for the same pages written (both sides on one aged base, gap fill fixed at
+4 pages).
+
+The blocks whose number is a multiple of 256, of those with parallel work (storage-root tasks or a
+split walk), are also computed serially and compared; a difference is logged with both roots,
+counted in `tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the
+block uses the serial result. The sample is the block number, not a count kept by each node, so
+every node checks the same blocks and nodes running the same code always publish the same root,
+right or wrong. A node whose rayon pool runs one thread runs the same parallel code and composes
+the same roots; only the off switches below compute serially. Any nonzero mismatch count means
+the parallel code computed a wrong root, and the unchecked blocks the same bug hit carry it on every
+node running this code: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`, or
+only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
+`TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning them off
+on one node only parts it from its peers on the next block the bug hits. Turning them off stops the
+bug; it repairs no trie node an unchecked block already persisted (the check compares the trie
+updates too, so a bug can be in them). Every later root, serial ones included, is computed over
+those nodes, so the nodes keep agreeing while a block's root may not be the root of its state. A
+snapshot restore (`src/snapshot.rs`) finds it: it rebuilds the trie from the hashed state and fails
+when that root differs from the snapshot block's header.
+`tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
+ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
+split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
+split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
+the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
+expected, `stored_root_node` and `mismatch` are alerts.
+`tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
+storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
+part to the serial computation, on this node only; the block also logs the first error. It is the
+one per-node difference the parallel paths have, so read it first when one node parts from its
+peers. `provider`, `database` and `panicked` cost the block time; `tip_moved` (a task's transaction
+saw another finalized block than the walk's: something wrote the state or trie tables while an
+output's blocks were built) is an alert, as the node has no such writer.
+
+Off switches, read once at the first block from the node's environment:
+`TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the
+storage-root tasks and runs the account walk on one thread; `TN_PARALLEL_STORAGE_WALK=0` keeps every
+storage root on one task. Tests and benches select the walks explicitly;
+`TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds: the exec bench, tests) compares every block, split
+ones included, and panics on a difference.
 
 ## Header field mapping
 
@@ -433,13 +504,22 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 What restore does *not* verify: the authenticity of the header window itself — that is the
 caller's trust decision (the window is validated upstream against consensus data).
 
+A restored node did not execute `B`, so its epoch-record check (see "Rebuilding in the new layout"
+below) skips the one record whose closing block is `B`: when the node enters the epoch after it,
+the restored epoch's record is not compared with `B`. `db load-state` already bound that record's
+`final_state` to the pack's final block. The restored-state floor marker (`restored-state-floor`)
+is what tells the node `B` was imported; every epoch it closes above `B` is compared.
+
 ## Database backend
 
-TN's reth execution database lives in `<datadir>/db`. The default build runs it on MDBX
-(`reth_db::DatabaseEnv`, `db/mdbx.dat`). The `tn-lmdb` feature (forwarded by `tn-node`,
-`telcoin-network-cli` and `telcoin-network`) runs it on the tn-lmdb engine instead
-(`tn_lmdb_reth::TnLmdbEnv`, `db/tn-lmdb.dat`). reth is not patched: it is generic over the database on
-every path TN uses, and MDBX stays compiled in both builds. Every backend difference lives in
+TN's reth execution database lives in `<datadir>/db`. The default build runs it on the tn-lmdb
+engine (`tn_lmdb_reth::TnLmdbEnv`, `db/tn-lmdb.dat`); every release, mainnet's included, is this
+build. The opt-in `mdbx` feature (forwarded by `tn-node`, `telcoin-network-cli` and
+`telcoin-network`) runs it on MDBX instead (`reth_db::DatabaseEnv`, `db/mdbx.dat`): the legacy
+backend, kept until testnet has resynced, for the tests of that path (`./etc/ci-lanes.sh test-mdbx`, run by hand: not in CI or the attestation)
+and as the previous binary of the migration e2e lanes. reth is not patched: it is generic over the
+database on every path TN uses, and MDBX stays compiled in both builds (reth's crates require it,
+and the default build reads an MDBX database to migrate it). Every backend difference lives in
 `src/env/database.rs`; other code names `RethDbEnv` and `RethDb` (`Arc<RethDbEnv>`).
 
 - **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
@@ -450,32 +530,50 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
 - **Version file** (`check_db_version_file`, `record_db_version_file`, tn-lmdb build):
   `db/database.version` holds `TN_LMDB_DB_VERSION` (1002: reth's version 2 plus 1000), never
   reth's own. It is a rollback tripwire: a binary that runs reth on MDBX alone (a release from
-  before the backend guard) checks the file before it opens anything and stops with "breaking
-  database change detected: your database version (v1002) is incompatible with the latest database
-  version (v2)", where it would otherwise create an empty `mdbx.dat` beside `tn-lmdb.dat` and prune
-  the static files down to it. The check runs before the backend guard, so a directory another
-  binary wrote (any other version) is refused before a migration touches it; a missing file, or
-  one holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or one the migration just
-  moved), is rewritten atomically after the guard. A new `db/` is made durable in its parent.
+  before the backend guard, `v0.16.0-adiri` among them) checks the file before it opens anything
+  and stops with "breaking database change detected: your database version (v1002) is
+  incompatible with the latest database version (v2)", where it would otherwise create an empty
+  `mdbx.dat` beside `tn-lmdb.dat` and prune the static files down to it. The check runs before the
+  backend guard, so a directory another binary wrote (any other version, or a file that does not
+  parse) is refused before a migration touches it. The migration records 1002 at its commit
+  point. A missing file, or one holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or a
+  migration stopped between its commit point and that write), is rewritten atomically after the
+  guard. A new `db/` is made durable in its parent.
 - **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
   `check_consistency` would then prune the static files back to the empty database's tip. The
-  checks use `try_exists`, so a stat error fails the open. The MDBX build's error names the
-  directory and both engines; the operator runs the matching build or starts from a fresh datadir
+  checks stat each name with `symlink_metadata` (a symbolic link counts as present, dangling or
+  not), so a stat error fails the open. The MDBX build's error names the
+  directory and both engines; the operator runs the default build or starts from a fresh datadir
   (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
-  missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a tn-lmdb
-  build, rather than create a new database in its place. It warns of a stopped migration's temp
+  missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a build
+  without `mdbx`, rather than create a new database in its place. It warns of a stopped migration's temp
   directory (`db/tn-lmdb-migrating/`, a partial copy beside an unchanged MDBX database), naming it
   and its size, and never removes it.
 - **MDBX to tn-lmdb migration** (`src/env/database/migrate.rs`, tn-lmdb build): the first open of a
   `db/` holding `mdbx.dat` moves it onto tn-lmdb ("Migrating from MDBX" below).
 - **`--db.*` flags on tn-lmdb** (`tn_lmdb_args`): `--db.max-size` is the mapping's address-space
   reservation (unset: the engine's default, 1 GiB); past it the engine remaps at double the size,
-  so it is not a cap. `--db.page-size` sets a new file's page size (the engine accepts a power of
+  so it is not a cap, and the node does not stop at it as reth's help for the flag says (that
+  describes MDBX): the node logs a warning when the flag is set (`warn_max_size_is_a_reservation`,
+  where the command line is read, so a temp chain's own reservation draws none).
+  `--db.page-size` sets a new file's page size (the engine accepts a power of
   two in 4 KiB..=64 KiB). `--db.growth-step` is the largest growth step (unset, the engine's 1
   GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
   gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
+  `--db.gap-fill <PAGES|auto>` (TN's own flag, `RethCommand::db_gap_fill`, carried as
+  `RethConfig::db_gap_fill`, a `GapFill`; unset: `auto` on Linux, off on macOS and on the MDBX
+  build (`DEFAULT_DB_GAP_FILL`); `off` or 0: off; a width of at most the engine's
+  `MAX_GAP_FILL`, 64, else refused naming the flag) is the engine's `EnvOptions::gap_fill`: a
+  durable commit first rewrites each gap of at most that many clean pages between two runs of its
+  dirty pages with the bytes they hold, so the disk takes fewer, larger writes for more bytes
+  (`crates/tn-lmdb/README.md`, "Gap fill"). A width suits disks that cap I/Os per second (cloud
+  block storage), not local NVMe. `auto` chooses each scattered commit's width from the disk's
+  measured sync costs (README, "Automatic width"): it settles at 0 where filling does not pay and
+  fills where writes are capped; its choice and fit are the `tn_lmdb_gap_auto_*` database
+  counters (`DbCounters`; the width, the fitted cost per write and per page, the fill's cost per
+  gap and the capped flag are gauges, `NOT_DIFFERENCES`). The MDBX build refuses any but off.
   `--db.sync-mode durable` (the default) is durable commits. `--db.sync-mode safe-no-sync` is the
   engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
   MiB): a commit returns before it is durable, and the first commit a second after the last durable
@@ -488,7 +586,7 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   Neither corrupts the file, and the pages commits free wait at most about one of those intervals
   and a commit, so the file stays bounded (an engine `NoSync` with no syncs would grow until one: see
   "Persist benchmark"). Refused at startup, naming the flag: `--db.exclusive`,
-  `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`, and reth's
+  `--db.max-readers`, `--db.log-level`, and reth's
   `UtterlyNoSync` and `NoMetaSync` sync modes (neither has a CLI value). The `UtterlyNoSync`
   refusal says why and points at `safe-no-sync` and `durable`: the engine has no mode that never
   syncs.
@@ -525,19 +623,22 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   (`AccountChangeSets`, `StorageChangeSets`), appended by block and read by range, are composite keys (`key ‖ subkey`) in plain engine tables. A
   table's form is part of the file's format: the open refuses a file holding one in the other
   form (`MDBX_INCOMPATIBLE`, naming the table and both forms). No tn-lmdb file in the other form
-  exists outside tests (the backend is pre-release and off by default), so there is no migration
-  between the forms.
+  existed outside tests before tn-lmdb became the default (it was pre-release and off by default
+  until then), so there is no migration between the forms.
 - **What differs on tn-lmdb:**
   - no per-operation latency metrics (MDBX's `with_metrics`). The sampled gauges keep MDBX's
     names (`db.table_size` and the rest), so dashboards and the e2e `reth_db_table_size` check
     hold;
-  - the snapshot export's long read (`RethEnv::pin_state_view`) has no timeout to disable, and
-    the adapter's long-reader warning can fire, at most once a minute, during a long export: the
-    export holds back page reuse while it runs, so the file grows until it ends.
+  - a read transaction past `--db.read-transaction-timeout` (MDBX's five minutes by default) is
+    marked, not aborted: its later calls fail with `ReadTransactionTimeout` as on MDBX, and its
+    pages return to reuse when reth drops it. The snapshot export (`RethEnv::pin_state_view`) and
+    the migration opt out (`disable_long_read_transaction_safety`), as on MDBX, and the adapter's
+    long-reader warning can fire, at most once a minute, during a long export: the export holds
+    back page reuse while it runs, so the file grows until it ends.
 
 ### Migrating from MDBX
 
-A build with the `tn-lmdb` feature that finds an MDBX reth database (`db/mdbx.dat`) migrates it at
+The default (tn-lmdb) build that finds an MDBX reth database (`db/mdbx.dat`) migrates it at
 the node's first start, when `RethEnv::new_database` opens the database and before reth reads
 anything. The module docs of `src/env/database/migrate.rs` have the states and steps. The node
 logs `mdbx.dat`'s size, the live bytes of reth's tables in it and the free space, each table's
@@ -548,12 +649,28 @@ one of reth's: its rows are not copied (reth does not read them either).
   row is decoded) into a new tn-lmdb file built in `db/tn-lmdb-migrating/`, with the node's `--db.*`
   settings (`--db.page-size`, `--db.max-size` and `--db.growth-step`). Before anything of MDBX's is
   touched it checks each table's rows against MDBX's count, a read-back hash of each table against
-  the copy, and the synced file against the engine's full check. Then it renames the file to
-  `db/tn-lmdb.dat` (the commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker
-  `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
-  reth's static files and `database.version` file are not touched (the open after it writes the
-  tn-lmdb version into the latter, above). The copy needs no case of its own
-  for the dup-sort tables' forms: MDBX walks a key's values in subkey order, so each row is an
+  the copy, and the synced file against the engine's full check. It opens MDBX read-only and
+  exclusively (`MDBX_EXCLUSIVE`): while another process has the MDBX database open (an MDBX build
+  on a second datadir naming the same `db/`, writing or idle), MDBX refuses the open with
+  `MDBX_BUSY` and the migration does not start, and while the migration copies, MDBX refuses any
+  other process's open. It takes a record of `mdbx.dat` when it opens MDBX (MDBX's last
+  transaction id, and the file's length and modification time), and takes it again once the copy
+  is checked, the id while MDBX is still open: a difference means something wrote MDBX during the
+  migration past the exclusive open (a write to the file itself, or a process MDBX's file locks do
+  not reach), and the copy misses those writes, so the migration fails, leaving MDBX as the write
+  left it. Then it writes the record to `db/tn-lmdb-migrating/mdbx-source`, renames the file to
+  `db/tn-lmdb.dat` (the commit point),
+  records the tn-lmdb version in `db/database.version` (the rollback tripwire, above), checks
+  `mdbx.dat` against the record (see "A stop part way"), removes `mdbx.lck` and then `mdbx.dat`,
+  writes the marker `db/mdbx-migrated` (its text lists the rows copied per table) and removes the
+  temp directory. reth's static files are not touched. While `mdbx.dat` or the temp directory is
+  there, the open holds an exclusive `flock` on `db/` itself (two datadirs can name one `db/`, and
+  the datadir lock is one datadir's), so a second process migrating or finishing the same
+  directory is refused with "another process is migrating this database"; the open looks at
+  `db/`'s files under that lock, so a migration another process finished just before is seen as
+  finished. The copy needs no case
+  of its own for the dup-sort tables'
+  forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
   table, also when they span the copy's commits
   (`a_dup_key_with_more_rows_than_a_commit_migrates_whole`).
@@ -565,7 +682,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   in large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees. `db stats`
   on the MDBX build (the build being replaced) prints the same figures beside a running node, each
   table's "Total Size" and their sum in the "Tables" row, so the space can be checked before
-  upgrading. The check is an early refusal: a disk that fills during the copy fails the migration
+  upgrading. The quarter is a margin, not a measurement: the copy's tn-lmdb tree need not take
+  the pages MDBX's did (each engine fills and splits its leaves by its own rules, and keeps a
+  value in the leaf up to its own limit, tn-lmdb's about half a page, the rest in overflow runs
+  of whole pages), the file also holds its catalog and free tree, and the filesystem needs room
+  to work. The on-demand test below prints the copy's table pages against the live bytes, with
+  their ratio, and `the_migrated_tables_fit_the_headroom` holds the test database within the
+  margin. The check is an early refusal: a disk that fills during the copy fails the migration
   the same way, leaving MDBX as it was.
 - **Time:** in proportion to the database's size: one read of MDBX, one write and one read-back of
   the copy, and one sync. The on-demand test `migrates_a_copy_of_a_real_database` (in
@@ -579,7 +702,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   as it was, and the next start removes the temp directory and migrates again from the beginning.
   After it, the next start finishes the remaining steps: it removes what is left of MDBX's files
   and writes the marker. It knows a stopped migration by the temp directory, emptied by the rename
-  and removed only after the marker. A failure after the commit point (the database directory's
+  and removed only after the marker. Before it removes `mdbx.dat` it compares the file's length and
+  modification time (a stat; `mdbx.lck` may already be gone) with the record the migration took
+  of it when it opened MDBX: a stop between the rename and the version file leaves a window in
+  which a build running reth on MDBX alone opens and advances `mdbx.dat`, and removing it then
+  would silently roll those writes back, so a differing file is refused and both files are kept
+  (resolve by hand, as for an `mdbx.dat` beside the marker). A temp directory without the record
+  (an older build's migration) is finished as before. A failure after the commit point (the database directory's
   fsync, or a finishing step) keeps the temp directory too, and its error says the next start
   finishes the migration. An MDBX build started after a stop before the commit point opens MDBX as
   it was and warns of the temp directory, naming it and its size, but never removes it: remove it
@@ -589,11 +718,17 @@ one of reth's: its rows are not copied (reth does not read them either).
   | the node finds | why | what to do |
   |---|---|---|
   | less free space than the migration needs | the copy is built beside MDBX | free space, then start again |
+  | `db/` locked by another process's migration ("another process is migrating this database") | two datadirs name one `db/`, and one node is migrating or finishing it | wait for it to finish, then start again |
+  | an MDBX database another process has open, which MDBX refuses the migration's exclusive open with `MDBX_BUSY` ("another process has the MDBX database open") | two datadirs name one `db/`, and an MDBX build runs on the other, committing or idle; the migration would remove the `mdbx.dat` it writes to | MDBX is unchanged: stop that process, then start again |
+  | an MDBX database MDBX refuses to open read-only with `MDBX_WANNA_RECOVERY` (stopped uncleanly under `--db.sync-mode safe-no-sync`) | a read-only open does not recover it; the error says what to do | MDBX is unchanged: start the previous binary (the one that ran reth on MDBX) once and stop it cleanly, then start this build |
   | a row tn-lmdb cannot store: a second value for a dup-sort subkey (`MDBX_KEYEXIST`), or a value over 16 MiB (`MDBX_BAD_VALSIZE`) | tn-lmdb stores one value per subkey and values up to 16 MiB; reth writes neither | MDBX is unchanged: run the MDBX build, and report the error |
   | a copy that fails its checks (a short read, a read-back mismatch, the engine's check) | the copy would lose or change rows | as above |
+  | an `mdbx.dat` whose last transaction id, length or modification time after the copy differs from the migration's record of it at the open ("another process wrote the MDBX database during the migration") | something wrote MDBX while it was copied, past the exclusive open (a write to the file itself, or a process MDBX's file locks do not reach), and the copy misses those writes | MDBX is as that write left it: stop the writer, then start again |
   | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
+  | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or modification time from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | as above; both files are kept |
   | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
+  | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
 - **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build of this
   tree refuses a `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file
@@ -605,10 +740,315 @@ one of reth's: its rows are not copied (reth does not read them either).
   `tn-lmdb.dat`, prune the static files down to it, and fail at genesis. Back up `db/` and
   `static_files/` before the first tn-lmdb start of a datadir. Problems are fixed forward, as for
   the consensus DB.
-- **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start has run
-  the migration.
+- **`db migrate-execution`** (`migrate_reth_db`) runs the migration offline, with the node stopped,
+  so the first start of the new binary does not wait on it: it takes the datadir lock and the
+  node's `--db.*` flags (pass what the node runs with, so the file gets the same page size,
+  reservation and growth step), runs the version check, the migration (or finishes one stopped
+  after its commit point, or refuses what the node's start refuses) and the version file, as the
+  node's open does before it opens, and prints the marker's text (the rows migrated per table)
+  without opening the database. With no MDBX database it has nothing to do and creates nothing.
+  The MDBX build refuses it.
+- **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start (or
+  `db migrate-execution`) has run the migration.
 - **`db load-state`** never migrates either: it refuses a `db/` holding `mdbx.dat`, whatever MDBX
-  holds, before anything opens it (`refuse_pending_migration`); it restores into a fresh datadir.
+  holds, or an unfinished migration (the emptied `db/tn-lmdb-migrating/` beside `tn-lmdb.dat`,
+  which the node's next start finishes), before anything opens it (`refuse_pending_migration`);
+  it restores into a fresh datadir.
+
+### Storage layouts
+
+reth has two storage layouts (`StorageSettings`). **v1** keeps change sets, transaction senders and
+the history indices in database tables, and plain state beside hashed state. **v2** (here without
+RocksDB) moves change sets and senders into static files and keeps only hashed state; its storage
+change sets and history are keyed by the plain slot, as v1's are (vendor/reth CHANGES.md TN-0112).
+v2 runs only on tn-lmdb. Nothing converts a datadir from one
+layout to the other: flipping the recorded layout alone would misread every history index, so a
+datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
+
+- **Recorded twice.** reth's `Metadata` row `storage_settings` (a missing row reads as v1), and TN's
+  marker `tn_storage_layout`, JSON `{"version":1,"layout":"v1"}`. The marker's version is TN's
+  format version of the reth database: a later change to how TN stores a table (packed trie keys, a
+  separate transaction-hash index) takes the next version, and an older binary refuses it rather
+  than misread it.
+- **A new datadir** gets `StorageLayout::for_new_datadirs()`: always v1 on the MDBX build, and
+  `NEW_DATADIR_LAYOUT_TN_LMDB`, v2, on the tn-lmdb build (the v2 write path keeps the history
+  indices and the transaction-hash index in the database: vendor/reth CHANGES.md TN-0110..0112).
+  `the_default_build_gives_new_datadirs_v2` pins both, through the node's own config, and
+  `etc/backend-gate.sh` (run by `./etc/ci-lanes.sh test-default`) fails if any crate turns the
+  `mdbx` feature on in the release graphs or that lane. Benches and tests pick a layout with
+  `RethConfig::with_new_datadir_layout`; in test builds `TN_TEST_NEW_DATADIR_LAYOUT=v1` (or `v2`)
+  picks it for every temp chain (`TEST_NEW_DATADIR_LAYOUT_VAR`), which `test-default` uses to run
+  tn-reth's and tn-engine's suites a second time on v1, the layout migrated datadirs keep; the
+  node's own path never reads it. The marker commits before genesis, and genesis writes
+  `storage_settings` with the layout (`init_genesis_with_settings`).
+- **An existing datadir** opens in its stored layout, never flipped. When it differs from the layout
+  new datadirs get, every start logs a warning naming `db reset-execution`; the node runs as before.
+  A datadir from before the marker (every one is v1) gets the marker at its first open.
+- **Checked at every open**, before reth's consistency check (which prunes static files ahead of the
+  database), with the start refused. A refused start leaves the static files and the database's
+  chain as they were, but the database's own open has run first and left what any open leaves: a
+  `db/` that was missing or empty now holds `database.version` and a database without a chain
+  (reth's tables, empty; on the tn-lmdb build `tn-lmdb.dat`, with `database.version` at 1002), the
+  client version is added to `VersionHistory` when it differs from the last row, and on the
+  tn-lmdb build an MDBX database has been migrated:
+
+  | the node finds | why |
+  |---|---|
+  | v2 on the MDBX build, for a new datadir or an existing one | v2 is tn-lmdb only |
+  | a `storage_settings` row or marker that does not parse, or a marker of another format version | reth's own read takes an unparseable row for v1; a newer binary may have written the datadir |
+  | a marker whose layout disagrees with `storage_settings` | the row was changed without converting the data |
+  | a v2 datadir without the marker | no TN build wrote it |
+  | a v1 datadir whose static files hold a segment only v2 writes (senders, change sets) | another datadir's static files: a half-done swap |
+  | a v2 datadir whose static files hold headers but no senders segment, which v2 writes from genesis | a v1 datadir's static files: the other half-done swap; v2's consistency check would prune them to this database |
+  | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
+
+  One state beside a database without a chain is healed instead: a creation stopped inside
+  genesis's commit. Genesis finalizes its static files before it commits the database, so a stop
+  between the two leaves TN's marker (committed first) and no `storage_settings` row in the
+  database, beside static files holding only this chain's genesis block. The open removes those
+  static files (headers last, so a stop part way is found again) and creates the datadir anew
+  (`holds_only_genesis`). With no marker, or anything past genesis, it refuses as above.
+
+  Once the layout is settled, reth's consistency check (`check_consistency`) prunes static files
+  ahead of the database's stage checkpoints (a stop between a persist's two commits). The other
+  direction, the database ahead of the static files (an unwind target: static files lost, removed
+  or swapped for an older copy), is refused too: TN has no stage pipeline to unwind the database,
+  so the start stops with "storage consistency check found the database ahead of the static
+  files", saying to restore the datadir from a snapshot or backup.
+
+- **Logs:** `new reth datadir: storage layout` or `reth datadir: storage layout` at each start, with
+  the layout; an existing datadir in the other layout logs the warning `this reth datadir keeps its
+  storage layout` with `layout` and `new_datadirs` instead.
+- **Static-file checksums (v2).** A v2 datadir's new static files carry a CRC-32 on every value,
+  on every `.csoff` record (which block owns which change-set rows) and on each `.conf` (vendor/reth
+  CHANGES.md TN-0120..0124; the v1 tables are covered by tn-lmdb's page CRCs, and v1 static files
+  keep upstream's format byte for byte). Every read verifies before it decodes, and the change-set
+  lookups behind the pinned committee and epoch reads verify the row they return. A mismatch is an
+  error, never a value: `static file <path> is damaged: the value at row <r>, column <c> fails
+  its checksum`, `changeset offsets <path> are damaged: record <i> fails its checksum`,
+  `static file configuration <path> is damaged: it fails its checksum`, or
+  `changeset static file is corrupted` (a `.csoff` range past its rows, or a sidecar the startup
+  heal will not cut). It reaches the epoch reads as a node-local provider fault
+  (`StateReadError::Provider`): retried briefly, then the node stops instead of using any other
+  value (`damaged_v2_changeset_fails_pinned_reads_closed`). RPC reads of the damaged rows fail;
+  others answer. Startup opens each segment's latest file to heal an interrupted write, and
+  refuses that file, rather than cutting it, when its `.csoff` holds a committed record that fails
+  its checksum, or when it or its `.csoff` is shorter than its committed configuration (a prune
+  commits the configuration before it shrinks a file, so only damage leaves that); older files are
+  verified as they are read. Startup also refuses a segment whose files skip blocks between two of
+  them (a file missing: `<segment> static files skip blocks`). **Operator response:** the file is damaged on this node only (disk or memory fault,
+  or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
+  wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
+  the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
+  one damaged file usually means more. A v2 datadir written before these checksums does not open
+  (`static file <path> has no checksums`): v2 datadirs must hold only checksummed files, since
+  two flipped bits could otherwise pass a checksummed file off as an unchecked one. Recreate it,
+  or `db reset-execution` and re-execute.
+
+### On-disk format versions
+
+Every format TN writes carries a version marker, and a binary refuses every version it does not
+read. A change to the bytes a marker covers bumps that marker; nothing else tells old bytes from
+new ones.
+
+| marker | covers | bump it when |
+|---|---|---|
+| `TN_LAYOUT_VERSION`, in `Metadata["tn_storage_layout"]` (`src/env/layout.rs`) | how TN stores the reth database: every table's key and value codec (reth Compact or raw, including the dup-sort subkey widths), the codecs of the static-file values (header, transaction, receipt, sender, change-set entry), which tables and static-file segments a layout writes, and how static files commit | a codec or key form changes (packed trie keys), data moves to another store (the transaction-hash index, history shards), a new static-file segment, or segment configuration moves into the database commit |
+| jar version, the first 8 bytes of each `.conf` (vendor/reth nippy-jar) | a jar's framing: value and `.csoff` checksums, the `.conf` fields with `SegmentHeader`, the compressor, the row layout | a jar's layout changes (chunked change sets, fixed-width senders): the next version, 3. `SegmentHeader` has no spare field, so a new field needs it too |
+| tn-lmdb `FORMAT_VERSION`, in the meta record, checked before its CRC (`crates/tn-lmdb/src/meta.rs`) | pages, overflow runs, catalog, free list, meta | any engine format change; never by a flag bit alone, since unknown flags read as damage |
+| `TN_LMDB_DB_VERSION`, `db/database.version` (`src/env/database.rs`) | the engine the `db` directory holds (1002: reth-on-MDBX binaries refuse it) | the backend changes |
+| `EXEC_STATE_PACK_VERSION` (`crates/storage/src/exec_state_pack.rs`) | the state-pack export peers exchange | the export's records change |
+
+- **A new static-file segment, or segment configuration moved into the database commit, bumps
+  `TN_LAYOUT_VERSION`.** An older binary silently skips the files of a segment it does not know
+  (`iter_static_files`, vendor/reth/crates/storage/db/src/static_file/mod.rs: `parse_filename`
+  gives `None`), and one that does not know configuration held in the database heals a stale
+  `.conf` and cuts rows the database committed. Only the marker, checked before any heal, stops it.
+- **reth's compiled-in zstd dictionaries** for transactions and receipts never change: a stored
+  value records that it is compressed, not with which dictionary.
+- **Two releases.** Release N reads the new format (and the old); release N+1 writes it. A
+  one-release rollback then still opens every datadir; a release that writes what its predecessor
+  refuses turns a rollback into a resync.
+
+**Format-freeze fixtures** (`src/env/format_freeze_tests.rs`). `tests/fixtures/format-freeze/`
+holds a v1 and a v2 tn-lmdb datadir built from one fixed chain (`genesis.json` and the module's
+plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions, contract creation, an account removal,
+an epoch close, a two-block output), each with its digests (`digests.txt`).
+`format_fixtures_read_back_unchanged` opens a copy of each with the current code and compares every
+table row, static-file row, provider read and the state-pack export.
+`format_writer_output_unchanged` builds the chain again and compares each tn-lmdb table's raw rows
+and each static file's bytes (the decompressed rows of the LZ4 headers jar), the version markers
+and the block hashes; it is ignored on the adiri build, whose fork schedule builds other blocks.
+Both run in the normal lanes in well under a second. When one fails:
+
+- an unintended change is a bug: fix the code, never the fixtures;
+- an intended format change bumps its marker, moves each old fixture to its own directory (for
+  example `v2` to `v2-layout1`) with a test of what the new binary does with it (opens, converts or
+  refuses it), and then regenerates. A format no release has written has no datadirs to keep
+  reading, so its fixtures are regenerated in place: tn-lmdb's format 7 (tree tags) replaced
+  format 6, and format 8 (overflow-run tags) replaced 7, before tn-lmdb shipped, and the
+  engine's own tests pin the refusal of every earlier version (`a_version_7_record_is_refused`
+  and its siblings in `crates/tn-lmdb/src/meta.rs`;
+  `a_version_4_file_is_refused_at_open` in `crates/tn-lmdb/src/env/tests.rs` opens a whole file);
+- a block-hash difference is an execution change, not a format change (check `TN_*_FORK_EPOCH` in
+  the environment first).
+
+Regenerating is explicit, on the default build:
+
+```sh
+TN_REGENERATE_FORMAT_FIXTURES=1 cargo test -p tn-reth --features test-utils --lib \
+    env::format_freeze_tests::regenerate_format_fixtures -- --ignored --exact
+```
+
+It keeps `genesis.json` (delete it to rebuild it from the current contracts) and rewrites `v1/` and
+`v2/`. `tn-lmdb.dat` differs at every run (transaction ids, boot id); everything else is
+byte-identical, so review the `digests.txt` diff: every changed line must follow from the intended
+change.
+
+### Upgrading a testnet node
+
+A testnet node on `v0.16.0-adiri` runs MDBX for both databases, in storage layout v1. The first
+start of this release's binary (the default build, tn-lmdb):
+
+1. migrates the reth database from MDBX to tn-lmdb ([Migrating from MDBX](#migrating-from-mdbx)):
+   the engine changes, the layout stays v1, and the node records the layout marker. The node opens
+   the reth database before it touches the consensus database, so this step runs first, and can
+   run alone: to run it before the start, with the node stopped, run
+   `telcoin-network db migrate-execution` with the node's `--db.*` flags; the start then finds a
+   tn-lmdb database;
+2. migrates the consensus database from MDBX to tndb and removes the MDBX environments (one-way,
+   #1558);
+3. runs on. Nothing else is needed: a v1 datadir keeps working on this binary.
+
+**Upgrade every node together.** Since #1788 a node record carries a network-key co-signature, and
+this release drops the records `v0.16.0-adiri` publishes (and the old binary cannot use the new
+ones): in an e2e committee started on `v0.16.0-adiri`, a validator restarted on this release
+migrated both databases but could not resolve its peers, and stalled. So a mixed committee does not
+work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
+nodes in place first (they keep v1), and rebuild in the new layout only after that.
+
+**What runs this upgrade.** No automated lane starts from `v0.16.0-adiri`. The e2e lanes'
+previous binary (`make test-e2e-reth-migration`, `make test-e2e-resync`) is this tree's `mdbx`
+build, which already keeps the consensus database in tndb and records the layout marker, so step 1
+and the marker recording of a datadir from before the marker never run there. Unit tests cover
+both: `tn-storage`'s `test_migrate_from_mdbx_*` and
+`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`. The one run on real `v0.16.0-adiri` datadirs is the manual e2e run above: the restarted validator
+migrated both databases and recorded the marker, then could not peer. No lane, and no make target,
+upgrades a whole committee from `v0.16.0-adiri` (every node stopped, then started together on this
+release); rehearse that by hand before upgrading testnet.
+
+**Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
+and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
+the backup is the only way back to `v0.16.0-adiri` (see Rollback).
+
+**Rebuilding in the new layout.** `telcoin-network db reset-execution` moves the execution database
+aside, so the next start rebuilds it from genesis by re-executing the chain, in the layout new
+datadirs get. It moves `db/`, `static_files/` and `restored-state-floor` (the floor of a datadir
+restored from a snapshot, which would refuse the rebuilt chain's old blocks if it stayed) into
+`<datadir>/execution-reset-<UTC time>/`. It renames and never deletes; the consensus database, keys
+and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
+state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
+moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
+refuses to start while a `.partial` directory is there, and running the command again finishes it.
+It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
+for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
+restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
+pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
+new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
+
+- **In place** (an observer, or a validator that can be out for the rebuild):
+
+  ```sh
+  # node stopped
+  telcoin-network db reset-execution --datadir <datadir>          # dry run: prints what moves
+  telcoin-network db reset-execution --datadir <datadir> --force
+  telcoin-network node --datadir <datadir> ...                     # rebuilds from genesis
+  ```
+
+  The node re-executes the consensus output its own consensus database holds, epoch by epoch from
+  epoch 0, then the output after it from peers. Each epoch it re-executes is checked against the
+  epoch record it already holds (certified, or its own from before the reset): when it closes the
+  epoch, and again when it enters the next one, the record's `final_state` must be the epoch's
+  closing block in the rebuilt chain, number and hash.
+  Block hashes chain, so this covers every block up to that closing block: the check finds the
+  first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
+  final_state does not match this node's closing block` with the epoch and both blocks, counts
+  `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
+  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
+  `restored-state-floor` beside a full consensus database (one copied in with a restored
+  observer's execution database by the swap below) moves aside with the execution database, so the
+  rebuild executes and compares every epoch, the restored one included (the restored-block
+  exemption under "Snapshot export / restore" does not apply here). It is out of the
+  committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
+  validator out leaves no margin, so validators take the swap below.
+
+  A validator rebuilt in place keeps the votes and proposals it made in the epoch it was in: they
+  are in `consensus-db/`, which the reset leaves, and the rebuild's closes of the epochs before
+  it keep them (a close removes only the votes and proposals of the epoch it closes and older
+  ones; each close that keeps some logs `keeping that epoch's votes and proposals` with the
+  epoch). When the node is back in that epoch they keep it from voting twice in a round or
+  proposing a second header for one, as after a restart, so it needs no wait before its start,
+  unlike a fresh datadir (Rollback below).
+
+  A record of the node's own that a bad execution wrote stops every rebuild on this release. A
+  node that forked (its execution diverged, and it built and stored its own record for that
+  epoch, which no quorum certified) still holds that record after the reset. The rebuild, on a
+  fixed binary, stops at that epoch with an `uncertified` mismatch, and again on every restart.
+  Nothing replaces the record in place: the consensus database keeps one record per epoch, refuses
+  a different one (a peer's certified record too), and no `db` command removes or rewrites one.
+  The recovery is a fresh datadir, which keeps the keys and config:
+
+  ```sh
+  # node stopped
+  telcoin-network db reset-execution --datadir <datadir> --force   # db/, static_files/, floor
+  mv <datadir>/consensus-db <datadir>/consensus-db.forked           # the stale record's store
+  telcoin-network node --datadir <datadir> ...                       # syncs from genesis
+  ```
+
+  The node then syncs like a new one: the certified records from peers, and the chain from
+  genesis (or restore it from a state pack with `db load-state`, which needs this fresh datadir).
+  A validator's votes and proposals for the epoch it was in stay in the moved-aside
+  `consensus-db.forked/`, so a validator stays stopped until the network has closed the last
+  epoch it took part in, as for a fresh datadir under Rollback below. The side-observer swap below
+  is no way around this: it keeps the validator's `consensus-db/`, and the stale record with it.
+  Keep the moved-aside directories until the cause is known: they hold the diverged chain.
+- **Side-observer swap** (validators): build the new execution database on another node, then swap
+  it in, so the validator is down only for the swap.
+  1. Run an observer on the new binary with the validator's chain config in a fresh datadir (another
+     host, or another datadir and ports on the same host), and let it sync from genesis to the tip.
+     It gets the layout new datadirs get.
+  2. Stop the observer cleanly at the tip, so its files do not change while they are copied.
+  3. Stop the validator, then move its execution database aside:
+     `telcoin-network db reset-execution --datadir <validator-datadir> --force`.
+  4. Copy the observer's `db/` and `static_files/` (and its `restored-state-floor`, only if it has
+     one) into the validator's datadir. Never copy its `consensus-db/` or its keys.
+  5. Start the validator. It opens the copied execution database and executes the consensus output
+     its own consensus database holds past the copy's tip, then rejoins.
+
+**Rollback.**
+
+- **To the database before a reset or a swap** (same binary): stop the node, move the new `db/`,
+  `static_files/` and any `restored-state-floor` out of the datadir, move the entries of
+  `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. Once the
+  rebuilt node is healthy and no rollback is wanted, delete `execution-reset-*` to free the space.
+- **To `v0.16.0-adiri`:** restore the backup taken before the upgrade, then start the old binary.
+  There is no automatic rollback, and without a backup no safe way back for a validator. The old
+  binary cannot open a tn-lmdb `db/` and has no backend guard; what stops it is the version file:
+  it refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything ("breaking
+  database change detected: your database version (v1002) is incompatible with the latest
+  database version (v2)"), so `db/` and `static_files/` are left as they were and the new binary
+  still runs on them. Do not edit or delete the file to get past it: the old binary would then
+  create an empty MDBX database beside `tn-lmdb.dat`, prune the static files down to it, and fail
+  at genesis. The old binary opens the reth database before the consensus database, so it stops
+  before it reaches `consensus-db/` either, which the new binary moved to tndb (one-way, #1558). On
+  a fresh datadir the old binary starts with an empty consensus database and forgets the votes this
+  validator cast in the current epoch, so it could equivocate: keep such a validator stopped until
+  the network has closed the epoch it was in, then start the old binary on a fresh datadir. The
+  version file is the default (tn-lmdb) build's tripwire. A build with `tn-reth`'s `mdbx` feature
+  (no release is one) keeps the reth database on MDBX and `database.version` at reth's 2, but
+  still moves the consensus database to tndb, so `v0.16.0-adiri` started on a datadir that build
+  ran opens it without a refusal, with empty consensus databases: never run the `mdbx` build on a
+  validator's datadir you may roll back.
 
 ### Persist benchmark
 
@@ -618,15 +1058,16 @@ new and existing accounts) and contract writes (new and existing slots) over a p
 persisted one block per commit and several per commit (production persists once per consensus
 output). It also reports reth's own split of each persist (`save_blocks_mdbx`, the database's
 writes, and `save_blocks_commit_mdbx`, its commit, against the static files' write and commit; reth
-keeps these names whatever the engine), so the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment. Run each
-build from its own target directory:
+keeps these names whatever the engine), so the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment;
+`TN_PERSIST_BENCH_LAYOUT=v1` or `v2` compares the storage layouts on one build. Run each build from
+its own target directory:
 
 ```sh
 mkdir -p target/persist-bench-tmp
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
-  cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+  cargo test --release -p tn-reth --features mdbx --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
-  cargo test --release -p tn-reth --features tn-lmdb --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+  cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 ```
 
 Mac results, 2026-10-27 (release, default knobs: 400 blocks of 200 transactions over 10000
@@ -638,8 +1079,9 @@ accounts; the median of 5 alternating runs per build; ms per commit):
 | no-sync | 4 | 86.9 | 77.7 | 0.89 | 41.9 / 30.6 (0.73) |
 
 Both are well inside the reference (tn-lmdb's per-block persist p99 at most 1.25× MDBX's). Most of a
-persist on macOS is reth's static files: their commit is a `File::sync_all`, which is
-`F_FULLFSYNC` on macOS, on every commit in both builds. The verdict uses the no-sync runs
+persist on macOS is reth's static files: their commit was then a `File::sync_all`, which is
+`F_FULLFSYNC` on macOS, on every commit in both builds (a plain `fsync` since vendor/reth
+TN-0117). The verdict uses the no-sync runs
 (MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`). The durable runs
 (3+3: p99 ratio 0.93 and 0.91) predate tn-lmdb's `msync` of mapped pages on macOS. Its scattered
 commits then took a plain `fsync`, which leaves some of those pages unwritten there, so they priced
@@ -660,12 +1102,24 @@ sets before it opens the database), so its rows time no sync.
 `etc/reth-exec-bench.sh <bench dir> [before-commit]` runs `tn-engine`'s busy-node execution bench
 (`exec_bench` in `crates/engine/tests/exec_bench/main.rs`, `#[ignore]`d, its knobs in the module
 docs), which times `execute_consensus_output` per output and splits each output's time by stage.
-Without a commit it builds this checkout twice, MDBX (the default features) and tn-lmdb
-(`--features tn-reth/tn-lmdb`), each into its own target directory under the bench directory, and
+Without a commit it builds this checkout twice, MDBX (`--features tn-reth/mdbx`) and tn-lmdb
+(the default features), each into its own target directory under the bench directory, and
 refuses identical binaries; with a commit it compares that commit (which must have the bench)
-against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`). It runs the profiles in
-`EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch` and
-`busy-export` when named) as interleaved pairs
+against this checkout on one backend (`EXEC_BACKEND`, default `tn-lmdb`), each side built with
+the flags its own manifest needs for it (a commit from before 2026-11-09 selects tn-lmdb with a
+`tn-lmdb` feature). `etc/reth-exec-bench.sh --layout <bench dir>` builds this checkout once on
+tn-lmdb (storage v2 is tn-lmdb only) and runs that one binary on storage layout v1 (A,
+`TN_EXEC_BENCH_LAYOUT=v1`) against v2 (B, `TN_EXEC_BENCH_LAYOUT=v2`); its bases, one per layout,
+share `cache/` with backend mode's. Each layout-mode run also records the bench's differential
+(`TN_EXEC_BENCH_DIFF`, to `reports/<run>.diff`), and each round's second run compares its own to
+the first's (`TN_EXEC_BENCH_DIFF_AGAINST`; with the alternating order, v2's in odd rounds and
+v1's in even ones): the report lists each comparison and their total mismatches above the
+profile's table, and a mismatch fails the run. In commit mode `EXEC_LAYOUT_BEFORE` and
+`EXEC_LAYOUT_AFTER` (`v1` or `v2`) set one side's layout, and the before commit's bench may write
+report version 5, from before the layout knob: such a bench refuses the knob, so for it set only
+`EXEC_LAYOUT_AFTER`. It runs the profiles in
+`EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch`,
+`busy-export` and `busy-history` when named) as interleaved pairs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
 report to the repo root, `reth-exec-<host>-<time>.txt`: per profile, each side's medians over the
 rounds and each pair's B/A ratio, with the median ratio and its spread, beside each run's JSON
@@ -675,7 +1129,14 @@ from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`:
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
 The script's header lists its settings and everything it writes. On macOS both backends' durable
 commits are `msync` (libmdbx its used span, tn-lmdb its dirty pages), and neither flushes the
-drive's cache. The stages named `mdbx`
+drive's cache. The bench's `TN_EXEC_BENCH_LAYOUT` (`v1`, or `v2` on tn-lmdb only,
+through `StorageLayout::select`) picks reth's storage layout, recorded in each report and checked against
+every opened datadir; `TN_EXEC_BENCH_READ_MIX=history` (the `busy-history` profile) has the readers
+read balances and storage at past blocks and transactions by hash; and `TN_EXEC_BENCH_DIFF` writes
+a seeded sample of past-block and by-hash reads with their answers, which `TN_EXEC_BENCH_DIFF_AGAINST`
+compares to an earlier run's (two layouts or backends of one load must answer alike). The report
+also splits the static files by segment, and has a section for their per-segment sync timing that
+stays empty until the static-file provider times them. The stages named `mdbx`
 (`mdbx` and `commit mdbx`, the JSON keys `save_blocks_mdbx` and `commit_mdbx`) carry reth's metric
 names, which reth keeps whatever the engine: on tn-lmdb they time tn-lmdb.
 
@@ -688,12 +1149,14 @@ each as the run's mean, first third and last third, ending with the commit's ms 
 (tn-lmdb: per `tn_lmdb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
 grows at the same ms per page writes more pages, one that grows per page writes the same pages
 slower. Each profile also prints each side's chain, the genesis, aged-tip and final-tip hashes in
-its runs' JSON headers: execution is deterministic, so in backend mode a difference is marked
+its runs' JSON headers: execution is deterministic, so in backend and layout modes, and in commit
+mode with `EXEC_SHARED_BASE=1` (both sides on the before side's aged bases), a difference is marked
 `CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
 dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
-runs. The script reads one JSON report version, the bench's `JSON_REPORT_VERSION`: it refuses a
-directory without `runs.tsv` or with a report of another version, and refuses before building a
-bench (in commit mode, the before commit's too) that writes another. On Linux,
+runs. The script reads JSON report versions 6 (the bench's `JSON_REPORT_VERSION`) and 5 (6 only
+added fields, which a version 5 run renders as `-`): it refuses a directory without `runs.tsv` or
+with a report of another version, and refuses before building this checkout's bench when it
+writes another than 6, and commit mode's before bench when it writes neither. On Linux,
 `EXEC_SYS_SAMPLE=1` runs a sampler beside each run (every second: `/proc/meminfo`'s Dirty and
 Writeback, the `/proc/diskstats` line of the whole disk under the bench directory and the drive's
 temperature; `filefrag`'s extent count of the data file when it appears and every 30 s, when
@@ -906,7 +1369,9 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/env/mod.rs` | `RethEnv` wrapper (node config, blockchain provider, EVM config, task spawner); DB open/genesis init; sets `BASEFEE_ADDRESS`; shared read-only state-DB stack. |
 | `src/env/database.rs` | The database backend (`RethDbEnv`/`RethDb`, MDBX or tn-lmdb): `open_rw`, the backend guard, the `--db.*` mapping, the table stats of `db stats` (`db_table_stats`), `db load-state`'s refusal of a pending migration (`refuse_pending_migration`); see "Database backend". `src/env/database/migrate.rs`: the MDBX to tn-lmdb migration (tn-lmdb build). |
 | `src/env/epoch.rs` | Startup healing and epoch-boundary reads: `EpochState`, committees, BLS pubkeys, worker fee configs, classified registry reads (node-local vs chain-global failures). |
+| `src/env/exec_cache.rs` | The cross-block execution cache (adapted from reth's `cached_state.rs`): account, slot and bytecode values at the last built block's hash, used by the next block built on it and refreshed from each block's bundle; dropped on any failure. Its module docs hold the invariant and the state writers that must not bypass it. |
 | `src/env/execution.rs` | `build_block_from_batch_payload` (recover → execute → assemble), `finish_executing_output` (atomic blocks + finality markers), `finalize_block` (in-memory watches). |
+| `src/env/format_freeze_tests.rs` | Test-only: the format-freeze fixtures' generator and tests (see "On-disk format versions" under "Database backend"). |
 | `src/env/genesis.rs` | Genesis construction, including `ConsensusRegistry` account generation via a pre-genesis EVM and embedded-artifact JSON parsing; temp-chain env for tests. |
 | `src/env/helpers.rs` | Read-side accessors: headers, blocks, receipts, accounts, `read_contract*`, canonical streams and tips. |
 | `src/env/persist_bench.rs` | Test-only, `#[ignore]`d: the per-block persist benchmark (`per_block_persist`; see "Persist benchmark" under "Database backend"). |
@@ -935,7 +1400,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`); `RethDb` is re-exported from `src/env/database.rs`. |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
-| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the database's counters and page size (`db_counters`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`) and the RPC side load (`readers`). See "Execution benchmark". |
+| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the database's counters and page size (`db_counters`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`), the RPC side load (`readers`), the storage-layout differential (`differential`), the storage layout choice (`layout`) and the static files' sync timing (`sf_sync`). See "Execution benchmark". |
 
 ## Feature flags
 
@@ -947,7 +1412,7 @@ From `crates/tn-reth/Cargo.toml`:
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`, 747 millisecond consensus timestamps. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
 | `js-tracer` | Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles boa, a JavaScript engine (35 packages). Without it a JS tracer request gets error `-32603` `JS Tracer is not enabled`, and the built-in tracers work as before. Forwarded by `tn-node` and the `telcoin-network` binary. See [js-tracer.md](js-tracer.md). |
-| `tn-lmdb` | Run the reth execution database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`) instead of MDBX. Off by default. A node's first open on it migrates an MDBX database; see "Database backend". |
+| `mdbx` | Run the reth execution database on MDBX (`reth_db::DatabaseEnv`), the legacy backend, instead of the default tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`). Off by default, and off in every release: kept for the tests of the legacy path until testnet has resynced. The default build's first open migrates an MDBX database; see "Database backend". |
 
 The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
 them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). Three of

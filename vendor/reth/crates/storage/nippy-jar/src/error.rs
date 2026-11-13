@@ -92,4 +92,50 @@ pub enum NippyJarError {
     /// A specified file is missing.
     #[error("Missing file: {}", .0.display())]
     MissingFile(PathBuf),
+
+    /// TN(TN-0120): a value of a checksummed jar does not match its checksum: the data or offsets
+    /// file is damaged.
+    #[error(
+        "static file {} is damaged: the value at row {row}, column {column} fails its checksum",
+        path.display()
+    )]
+    ChecksumMismatch {
+        /// The jar's data file, which names the segment and its block range.
+        path: PathBuf,
+        /// The row within the jar.
+        row: u64,
+        /// The column within the row.
+        column: usize,
+    },
+
+    /// TN(TN-0120): a checksummed jar's configuration file does not match its checksum.
+    #[error("static file configuration {} is damaged: it fails its checksum", .0.display())]
+    ConfigChecksumMismatch(PathBuf),
+
+    /// TN(TN-0120): the configuration names a format version this build does not read.
+    #[error("unsupported static file format version {0}")]
+    UnsupportedVersion(usize),
+
+    /// TN(TN-0120): a checksummed jar's configuration names dictionary zstd compression, which
+    /// this build cannot read back.
+    #[error("unsupported static file compression: zstd with dictionaries in a checksummed jar")]
+    UnsupportedCompression,
+
+    /// TN(TN-0130): a checksummed jar's offsets or data file is shorter than its configuration's
+    /// committed rows. A prune commits the configuration before it cuts the files, so this is
+    /// damage, not an interrupted prune, and the open-time heal cuts nothing.
+    #[error(
+        "static file {} is damaged: its {file} file is shorter than its committed rows",
+        path.display()
+    )]
+    CommittedRowsMissing {
+        /// The jar's data file, which names the segment and its block range.
+        path: PathBuf,
+        /// Which file is short: `offsets` or `data`.
+        file: &'static str,
+    },
+
+    /// TN(TN-0131): a jar's offsets file is empty, without even its offset size byte.
+    #[error("static file offsets file {} is empty", .0.display())]
+    EmptyOffsetsFile(PathBuf),
 }

@@ -39,13 +39,13 @@
 #
 # The jobs compile what the queue compiles, through etc/ci-lanes.sh:
 #
-#   fmt-clippy       fmt and both clippy passes, the release graph and every target under
-#                    --all-features, under the nightly pin
-#   build-tests      the rocksdb guard, then the four test lanes with `--build-only`, under the
-#                    stable pin that builds releases: the same build of the workspace test
-#                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
-#                    2026-10-29
-#   carried-patches  the library tests of the three carried patch crates, which sit outside
+#   fmt-clippy       fmt and the clippy passes, the release graph and every target under
+#                    --all-features and without `mdbx`, under the nightly pin
+#   build-tests      the rocksdb guard, then the three test lanes CI runs (default, adiri,
+#                    vendored reth) with `--build-only`, under the stable pin that builds
+#                    releases: the same build of the workspace test binaries that failed in
+#                    cache-deps.yaml and durable-e2e.yaml on 2026-10-29
+#   carried-patches  the library tests of the four carried patch crates, which sit outside
 #                    the workspace and which an advisory fix can touch too
 #
 # The workspace tests are compiled, not run. A test that fails on main therefore still
@@ -86,7 +86,7 @@ env:
 jobs:
   # Steps up to and including the cache step are pr.yaml's `clippy` job, byte for byte.
   # 90 minutes because the first run after a clippy-cache prefix-key bump finds no entry
-  # and compiles both passes cold.
+  # and compiles every pass cold.
   fmt-clippy:
     if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
@@ -191,11 +191,6 @@ jobs:
       - name: Build the adiri lane's test binaries
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-adiri --build-only
-
-      # The workspace on tn-reth's `tn-lmdb` feature, likewise.
-      - name: Build the tn-lmdb lane's test binaries
-        if: ${{ !cancelled() }}
-        run: ./etc/ci-lanes.sh test-tn-lmdb --build-only
 
       # The nested vendor/reth workspace's tests and the js-tracer build, likewise.
       - name: Build the vendored reth lane's test binaries

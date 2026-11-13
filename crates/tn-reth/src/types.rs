@@ -20,8 +20,8 @@ pub type RpcServer = TransportRpcModules<()>;
 /// This type is a SealedBlock with a list of senders that match the transactions in the block.
 pub type BlockWithSenders = RecoveredBlock<reth_ethereum_primitives::Block>;
 
-/// The reth database (`RethDb`, an `Arc` of `RethDbEnv`): MDBX by default, tn-lmdb with the
-/// `tn-lmdb` feature.
+/// The reth database (`RethDb`, an `Arc` of `RethDbEnv`): tn-lmdb by default, MDBX with the
+/// `mdbx` feature.
 pub use crate::env::database::{RethDb, RethDbEnv};
 
 /// A pooled transaction id.

@@ -26,8 +26,10 @@ pub trait ValueWithSubKey {
 pub enum StorageSlotKey {
     /// An unhashed EVM storage slot, as produced by REVM execution.
     Plain(B256),
-    /// A keccak256-hashed storage slot, as stored in `HashedStorages` and
-    /// in v2-mode `StorageChangeSets`.
+    /// A keccak256-hashed storage slot, as stored in `HashedStorages`.
+    ///
+    /// TN(TN-0112): storage changesets and `StoragesHistory` hold plain slots in both storage
+    /// layouts (upstream 815037e27), so no changeset reader produces this variant.
     Hashed(B256),
 }
 
@@ -51,18 +53,6 @@ impl StorageSlotKey {
     /// Create a hashed slot key from a raw [`B256`].
     pub const fn hashed(key: B256) -> Self {
         Self::Hashed(key)
-    }
-
-    /// Tag a raw [`B256`] based on the storage mode.
-    ///
-    /// When `use_hashed_state` is true the key is assumed already hashed.
-    /// When false it is assumed to be a plain slot.
-    pub const fn from_raw(key: B256, use_hashed_state: bool) -> Self {
-        if use_hashed_state {
-            Self::Hashed(key)
-        } else {
-            Self::Plain(key)
-        }
     }
 
     /// Returns the raw [`B256`] regardless of variant.
@@ -93,28 +83,8 @@ impl StorageSlotKey {
         }
     }
 
-    /// Convert a plain slot to its changeset representation.
-    ///
-    /// In v2 mode (`use_hashed_state = true`), the changeset stores hashed keys,
-    /// so the plain key is hashed. In v1 mode, the plain key is stored as-is.
-    ///
-    /// Panics (debug) if called on an already-hashed key.
-    pub fn to_changeset_key(self, use_hashed_state: bool) -> B256 {
-        debug_assert!(self.is_plain(), "to_changeset_key called on already-hashed key");
-        if use_hashed_state {
-            self.to_hashed()
-        } else {
-            self.as_b256()
-        }
-    }
-
-    /// Like [`to_changeset_key`](Self::to_changeset_key) but returns a tagged
-    /// [`StorageSlotKey`] instead of a raw [`B256`].
-    ///
-    /// Panics (debug) if called on an already-hashed key.
-    pub fn to_changeset(self, use_hashed_state: bool) -> Self {
-        Self::from_raw(self.to_changeset_key(use_hashed_state), use_hashed_state)
-    }
+    // TN(TN-0112): `from_raw`, `to_changeset_key` and `to_changeset` are removed. They encoded
+    // "v2 changesets hold hashed slots", which no longer holds (upstream 815037e27).
 }
 
 impl From<StorageSlotKey> for B256 {
@@ -143,13 +113,7 @@ impl StorageEntry {
         Self { key, value }
     }
 
-    /// Tag this entry's key as a [`StorageSlotKey`] based on the storage mode.
-    ///
-    /// When `use_hashed_state` is true, the key is tagged as already-hashed.
-    /// When false, it is tagged as plain.
-    pub const fn slot_key(&self, use_hashed_state: bool) -> StorageSlotKey {
-        StorageSlotKey::from_raw(self.key, use_hashed_state)
-    }
+    // TN(TN-0112): `slot_key` (tag by storage mode) is removed with `StorageSlotKey::from_raw`.
 }
 
 impl ValueWithSubKey for StorageEntry {

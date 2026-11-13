@@ -17,7 +17,7 @@ use reth_db::static_file::{
 use reth_db_api::table::{Decompress, Value};
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{SealedHeader, SignedTransaction};
-use reth_static_file_types::{ChangesetOffset, ChangesetOffsetReader};
+use reth_static_file_types::ChangesetOffset;
 use reth_storage_api::range_size_hint;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{
@@ -111,15 +111,31 @@ impl<'a, N: NodePrimitives> StaticFileJarProvider<'a, N> {
             return Ok(None);
         };
 
-        let csoff_path = self.data_path().with_extension("csoff");
-        if !csoff_path.exists() {
-            return Ok(None);
-        }
+        let Some(reader) = self.jar.value().csoff_reader() else { return Ok(None) };
+        let Some(offset) = reader.get(index).map_err(ProviderError::other)? else {
+            return Ok(None)
+        };
 
-        let len = header.changeset_offsets_len();
-        let mut reader =
-            ChangesetOffsetReader::new(&csoff_path, len).map_err(ProviderError::other)?;
-        reader.get(index).map_err(ProviderError::other)
+        // TN(TN-0121): the block's rows must lie inside the jar before anything sizes a buffer
+        // with `num_changes` or iterates `changeset_range`. The jar's rows and the sidecar's
+        // length come from one configuration, so only damage gets here.
+        if offset
+            .offset()
+            .checked_add(offset.num_changes())
+            .is_none_or(|end| end > self.rows() as u64)
+        {
+            tracing::error!(
+                target: "providers::static_file",
+                path = %self.data_path().display(),
+                block_number,
+                offset = offset.offset(),
+                num_changes = offset.num_changes(),
+                rows = self.rows(),
+                "Changeset offset points past the jar's rows"
+            );
+            return Err(ProviderError::CorruptedChangeSetStaticFile)
+        }
+        Ok(Some(offset))
     }
 
     /// Reads all changeset offsets from the sidecar file.
@@ -138,15 +154,12 @@ impl<'a, N: NodePrimitives> StaticFileJarProvider<'a, N> {
             return Ok(Some(Vec::new()));
         }
 
-        let csoff_path = self.data_path().with_extension("csoff");
-        if !csoff_path.exists() {
-            return Ok(None);
+        if let Some(reader) = self.jar.value().csoff_reader() {
+            let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
+            Ok(Some(offsets))
+        } else {
+            Ok(None)
         }
-
-        let mut reader =
-            ChangesetOffsetReader::new(&csoff_path, len).map_err(ProviderError::other)?;
-        let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
-        Ok(Some(offsets))
     }
 }
 

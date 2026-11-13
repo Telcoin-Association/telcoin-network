@@ -17,6 +17,9 @@
 //! The cursor factories are self-composable, so stacking replaces reth's
 //! merge+clone+re-sort; prefix sets come from the current block's own hashed state
 //! only, exactly as in reth's path (ancestors contribute empty prefix sets there).
+//!
+//! On the node, the storage roots of the accounts with changed storage run in parallel with
+//! the account walk (`parallel.rs`), over the same layers.
 
 use std::{
     cell::Cell,
@@ -32,25 +35,38 @@ use reth_provider::{
     StorageRootProvider,
 };
 use reth_trie::{
-    hashed_cursor::HashedPostStateCursorFactory, updates::TrieUpdates, AccountProof,
-    HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StateRoot, StorageMultiProof,
-    TrieInput,
+    hashed_cursor::{HashedCursorFactory, HashedPostStateCursorFactory},
+    prefix_set::TriePrefixSets,
+    trie_cursor::TrieCursorFactory,
+    updates::TrieUpdates,
+    AccountProof, HashedPostState, HashedPostStateSorted, HashedStorage, MultiProof,
+    MultiProofTargets, StateRoot, StorageMultiProof, TrieInput,
 };
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
-use tn_types::{Address, B256};
+use tn_types::{Address, BlockNumber, B256};
 
 use crate::{metrics::RETH_METRICS, traits::TelcoinNode};
 
+mod account_split;
 mod cursors;
+mod parallel;
 mod sorted_runs;
 mod storage_cursor;
+mod storage_split;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use account_split::AccountWalk;
 use cursors::RunCursorFactory;
+use parallel::ParallelRoots;
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use parallel::Walks;
 use sorted_runs::SortedTrieRuns;
 use storage_cursor::OverlayCursorFactory;
+#[cfg(test)]
+pub(crate) use storage_split::StorageWalk;
 
 /// Geometrically compacted trie deltas for the blocks built within one consensus output.
 ///
@@ -117,22 +133,41 @@ impl OutputTrieOverlay {
         current: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
         let prefix_sets = current.construct_prefix_sets().freeze();
-        let current_sorted = current.into_sorted();
-        Ok(StateRoot::new(
-            RunCursorFactory::new(DatabaseTrieCursorFactory::new(tx), &self.runs),
-            OverlayCursorFactory::new(
-                HashedPostStateCursorFactory::new(
-                    RunCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &self.runs),
-                    &current_sorted,
-                ),
-                DatabaseHashedCursorFactory::new(tx),
-                &self.runs,
-                &current_sorted,
-            ),
-        )
-        .with_prefix_sets(prefix_sets)
-        .root_with_updates()?)
+        self.serial_root(tx, &current.into_sorted(), prefix_sets)
     }
+
+    /// [`Self::layered_root_with_updates`] from the current block's sorted deltas and prefix sets.
+    fn serial_root<TX: DbTx>(
+        &self,
+        tx: &TX,
+        current: &HashedPostStateSorted,
+        prefix_sets: TriePrefixSets,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        let (trie, hashed) = layered_factories(tx, &self.runs, current);
+        Ok(StateRoot::new(trie, hashed).with_prefix_sets(prefix_sets).root_with_updates()?)
+    }
+}
+
+/// The trie and hashed cursor factories of a block's root over `tx`: `current` over `runs` over
+/// the database. The account walk and every parallel storage-root task build theirs here, so
+/// their layers cannot differ.
+fn layered_factories<'a, TX: DbTx>(
+    tx: &'a TX,
+    runs: &'a SortedTrieRuns,
+    current: &'a HashedPostStateSorted,
+) -> (impl TrieCursorFactory + 'a, impl HashedCursorFactory + 'a) {
+    (
+        RunCursorFactory::new(DatabaseTrieCursorFactory::new(tx), runs),
+        OverlayCursorFactory::new(
+            HashedPostStateCursorFactory::new(
+                RunCursorFactory::new(DatabaseHashedCursorFactory::new(tx), runs),
+                current,
+            ),
+            DatabaseHashedCursorFactory::new(tx),
+            runs,
+            current,
+        ),
+    )
 }
 
 /// Thin [`StateProvider`] wrapper that swaps ONLY the state-root computation.
@@ -162,6 +197,9 @@ pub(crate) struct OverlayRootStateProvider<'a, P> {
     /// computation; the database tip equals the overlay anchor for the whole output
     /// because TN persists strictly after the output's builds and has no reorg path.
     blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
+    /// The number of the block whose root this computes: it picks the blocks whose parallel
+    /// root is checked (`parallel.rs`).
+    block_number: BlockNumber,
     /// Wall time spent in `state_root_with_updates`, read by the block build after `finish`
     /// returns (observability only). A `Cell` is enough: one builder borrows the wrapper on
     /// one thread, and `StateProvider` has no `Send`/`Sync` supertrait.
@@ -169,14 +207,21 @@ pub(crate) struct OverlayRootStateProvider<'a, P> {
 }
 
 impl<'a, P> OverlayRootStateProvider<'a, P> {
-    /// Wrap `inner`, routing state-root computation through `overlay` layered over
-    /// `blockchain_provider`'s database.
+    /// Wrap `inner`, routing block `block_number`'s state-root computation through `overlay`
+    /// layered over `blockchain_provider`'s database.
     pub(crate) fn new(
         inner: &'a P,
         overlay: &'a OutputTrieOverlay,
         blockchain_provider: &'a BlockchainProvider<TelcoinNode>,
+        block_number: BlockNumber,
     ) -> Self {
-        Self { inner, overlay, blockchain_provider, root_elapsed: Cell::new(Duration::ZERO) }
+        Self {
+            inner,
+            overlay,
+            blockchain_provider,
+            block_number,
+            root_elapsed: Cell::new(Duration::ZERO),
+        }
     }
 
     /// Total wall time of the state-root computations routed through this wrapper (exactly
@@ -242,7 +287,8 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
     }
 
     /// The #1301 layered root: current-block deltas over the accumulated output
-    /// overlay over the database, with prefix sets from the current block only.
+    /// overlay over the database, with prefix sets from the current block only, and the
+    /// changed storage roots in parallel unless switched off (`parallel.rs`).
     /// Timed into `RethEnvMetrics::block_state_root_seconds` and the wrapper's
     /// `root_elapsed` lap, from opening the read-only transaction to closing it; a
     /// failed root records neither, since the build that called it fails too.
@@ -253,7 +299,13 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
         let started = Instant::now();
         let root = {
             let provider = self.blockchain_provider.database_provider_ro()?;
-            self.overlay.layered_root_with_updates(provider.tx_ref(), hashed_state)?
+            self.overlay.block_root_with_updates(
+                self.blockchain_provider,
+                provider.tx_ref(),
+                hashed_state,
+                ParallelRoots::from_env(),
+                self.block_number,
+            )?
         };
         let elapsed = started.elapsed();
         self.root_elapsed.set(self.root_elapsed.get().saturating_add(elapsed));

@@ -1,6 +1,7 @@
 use super::{
-    metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
-    StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
+    metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar, LoadedJarRef,
+    StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileSyncStats,
+    SyncPhase,
 };
 use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
@@ -30,11 +31,12 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
-use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
+use reth_nippy_jar::{NippyJar, NippyJarChecker, NippyJarError, CONFIG_FILE_EXTENSION};
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{
-    dashmap::DashMap, AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader,
-    SignedTransaction, StorageSlotKey,
+    dashmap::{mapref::entry::Entry, DashMap},
+    AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader, SignedTransaction,
+    StorageSlotKey,
 };
 use reth_prune_types::PruneSegment;
 use reth_stages_types::PipelineTarget;
@@ -53,7 +55,7 @@ use std::{
     ops::{Bound, Deref, Range, RangeBounds, RangeInclusive},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
 };
@@ -131,6 +133,8 @@ pub struct StaticFileProviderBuilder<P> {
     blocks_per_file: StaticFileMap<u64>,
     path: P,
     genesis_block_number: u64,
+    /// TN(TN-0122): whether the jars the provider creates carry checksums.
+    jar_checksums: bool,
 }
 
 impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
@@ -142,6 +146,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             blocks_per_file: Default::default(),
             use_metrics: false,
             genesis_block_number: 0,
+            jar_checksums: false,
         }
     }
 
@@ -153,6 +158,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             blocks_per_file: Default::default(),
             use_metrics: false,
             genesis_block_number: 0,
+            jar_checksums: false,
         }
     }
 
@@ -218,6 +224,13 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
         self
     }
 
+    /// TN(TN-0122): makes the jars the provider creates carry checksums
+    /// ([`StaticFileProviderInner::set_jar_checksums`]).
+    pub const fn with_jar_checksums(mut self, enabled: bool) -> Self {
+        self.jar_checksums = enabled;
+        self
+    }
+
     /// Builds the final [`StaticFileProvider`] and initializes the index.
     pub fn build<N: NodePrimitives>(self) -> ProviderResult<StaticFileProvider<N>> {
         let mut provider = StaticFileProviderInner::new(self.path, self.access)?;
@@ -229,6 +242,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             provider.blocks_per_file.insert(segment, blocks_per_file);
         }
         provider.genesis_block_number = self.genesis_block_number;
+        provider.jar_checksums = AtomicBool::new(self.jar_checksums);
 
         let provider = StaticFileProvider(Arc::new(provider));
         provider.initialize_index()?;
@@ -391,12 +405,26 @@ impl BeforeCacheInsertHook {
     }
 }
 
+/// TN(TN-0101): what [`StaticFileProvider::prepare_index_update`] did before the index lock.
+struct PreparedIndexUpdate {
+    /// The segment's file range the jar was loaded for.
+    fixed_range: SegmentRangeInclusive,
+    /// The jar cache generation before the load.
+    generation: u64,
+    /// The loaded jar's header.
+    header: SegmentHeader,
+    /// The loaded jar, when it was not published before the lock.
+    jar: Option<LoadedJar>,
+}
+
 /// [`StaticFileProviderInner`] manages all existing [`StaticFileJarProvider`].
 #[derive(Debug)]
 pub struct StaticFileProviderInner<N> {
     /// Maintains a map which allows for concurrent access to different `NippyJars`, over different
     /// segments and ranges.
-    map: DashMap<(BlockNumber, StaticFileSegment), LoadedJar>,
+    ///
+    /// TN(TN-0148): readers clone a jar's `Arc` and drop the shard lock at once (`LoadedJarRef`).
+    map: DashMap<(BlockNumber, StaticFileSegment), Arc<LoadedJar>>,
     /// Incremented before clearing the jar cache so in-flight loads cannot repopulate it with a
     /// snapshot from before the invalidation.
     cache_generation: AtomicU64,
@@ -427,11 +455,175 @@ pub struct StaticFileProviderInner<N> {
     _lock_file: Option<StorageLock>,
     /// Genesis block number, default is 0;
     genesis_block_number: u64,
+    /// TN(TN-0119): sync timings since the last [`StaticFileProvider::take_sync_stats`].
+    sync_stats: parking_lot::Mutex<StaticFileSyncStats>,
+    /// TN(TN-0122): whether the jars this provider creates carry checksums.
+    jar_checksums: AtomicBool,
     #[cfg(test)]
     before_cache_insert: BeforeCacheInsertHook,
     #[cfg(test)]
     after_cache_validation: BeforeCacheInsertHook,
 }
+
+impl<N> StaticFileProviderInner<N> {
+    /// TN(TN-0119): returns the per-segment sync timings recorded since the last call and starts
+    /// a new period. A bench calls it after each persist's commit for that persist's split.
+    pub fn take_sync_stats(&self) -> StaticFileSyncStats {
+        std::mem::take(&mut *self.sync_stats.lock())
+    }
+
+    /// TN(TN-0119): records one sync phase of `segment`.
+    pub(crate) fn record_sync(
+        &self,
+        segment: StaticFileSegment,
+        phase: SyncPhase,
+        elapsed: std::time::Duration,
+    ) {
+        self.sync_stats.lock().record(segment, phase, elapsed);
+    }
+
+    /// TN(TN-0122): sets whether the jars this provider creates from now on carry checksums
+    /// (`reth_nippy_jar::NippyJar::with_checksums`), for the segments [`checksummed_segment`]
+    /// names. [`ProviderFactory`](crate::ProviderFactory) sets it from the datadir's storage
+    /// settings: on for storage v2, off for v1, whose files stay upstream's format byte for byte.
+    /// A jar that exists is read and appended in its own format, which its configuration records;
+    /// with checksums on, a checksummed segment's jar without them is refused (TN-0135,
+    /// [`Self::load_jar`]).
+    pub fn set_jar_checksums(&self, enabled: bool) {
+        self.jar_checksums.store(enabled, Ordering::Relaxed);
+    }
+
+    /// TN(TN-0122): whether a jar of `segment` this provider creates now carries checksums.
+    pub fn jar_checksums(&self, segment: StaticFileSegment) -> bool {
+        self.jar_checksums.load(Ordering::Relaxed) && checksummed_segment(segment)
+    }
+
+    /// TN(TN-0135): loads the configuration of `segment`'s jar at `path`. Under storage v2 (the
+    /// provider's checksums on) every jar of a checksummed segment must carry checksums: a
+    /// version-1 jar there is refused, since two flipped bits turn a version-2 configuration into
+    /// a version-1 one, whose values would then read with their checksums appended and whose
+    /// 20-byte `.csoff` records at a 16-byte stride. A storage-v2 datadir from before checksums
+    /// is refused the same way (storage v2 was never released).
+    pub(crate) fn load_jar(
+        &self,
+        segment: StaticFileSegment,
+        path: &Path,
+    ) -> ProviderResult<NippyJar<SegmentHeader>> {
+        let jar = NippyJar::<SegmentHeader>::load(path).map_err(ProviderError::other)?;
+        if self.jar_checksums(segment) && !jar.has_checksums() {
+            tracing::error!(
+                target: "reth::static_file",
+                %segment,
+                path = %path.display(),
+                "Static file without checksums in a storage v2 datadir"
+            );
+            return Err(ProviderError::other(UncheckedJarError { path: path.to_path_buf() }))
+        }
+        Ok(jar)
+    }
+}
+
+/// TN(TN-0135): a jar of a checksummed segment without checksums, in a storage-v2 datadir
+/// ([`StaticFileProviderInner::load_jar`]).
+#[derive(Debug)]
+pub struct UncheckedJarError {
+    /// The jar's data file.
+    pub path: PathBuf,
+}
+
+impl core::fmt::Display for UncheckedJarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "static file {} has no checksums, but every jar of its segment in a storage v2 \
+             datadir must (its configuration is damaged, or it predates checksums)",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for UncheckedJarError {}
+
+/// TN(TN-0137): a changeset jar with compression, met by a point lookup: its search compares the
+/// stored bytes as keys, and TN writes changesets uncompressed.
+#[derive(Debug)]
+pub struct CompressedChangesetJarError {
+    /// The jar's data file.
+    pub path: PathBuf,
+}
+
+impl core::fmt::Display for CompressedChangesetJarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "changeset static file {} is compressed, but its lookups need the stored keys \
+             uncompressed",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for CompressedChangesetJarError {}
+
+/// TN(TN-0122): the segments whose new jars carry checksums when the provider's checksums are on
+/// (storage v2). The changesets are mandatory: every historical state read below the tip resolves
+/// through them, TN's pinned committee and epoch reads included. The others are checked too, as
+/// long as the read cost stays below the benches' noise.
+pub const fn checksummed_segment(segment: StaticFileSegment) -> bool {
+    match segment {
+        // Mandatory.
+        StaticFileSegment::AccountChangeSets |
+        StaticFileSegment::StorageChangeSets |
+        // The default for the rest; a segment leaves this list if its reads show the cost.
+        StaticFileSegment::Headers |
+        StaticFileSegment::Transactions |
+        StaticFileSegment::Receipts |
+        StaticFileSegment::TransactionSenders => true,
+    }
+}
+
+/// TN(TN-0133): a segment's static files skip blocks between two of its jars: a jar is missing,
+/// or one below the highest is not full. Its blocks would read as absent.
+#[derive(Debug)]
+pub enum StaticFileGapError {
+    /// Found at startup ([`StaticFileProvider::check_contiguity`]): `after` does not start right
+    /// after `before`.
+    Jars {
+        /// The segment.
+        segment: StaticFileSegment,
+        /// The lower jar's block range.
+        before: SegmentRangeInclusive,
+        /// The next jar's block range.
+        after: SegmentRangeInclusive,
+    },
+    /// Found by a read: no jar holds `number` (a block, or a transaction of a transaction
+    /// segment), though the segment has jars below and above it.
+    Number {
+        /// The segment.
+        segment: StaticFileSegment,
+        /// The block or transaction.
+        number: u64,
+    },
+}
+
+impl core::fmt::Display for StaticFileGapError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Jars { segment, before, after } => write!(
+                f,
+                "{segment} static files skip blocks: the jar with blocks {after} does not follow \
+                 the one with blocks {before} (a jar is missing or incomplete)"
+            ),
+            Self::Number { segment, number } => write!(
+                f,
+                "{segment} static files have no jar for {number}, though they have jars below \
+                 and above it (a jar is missing)"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for StaticFileGapError {}
 
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
     /// Creates a new [`StaticFileProviderInner`].
@@ -459,6 +651,8 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             blocks_per_file,
             _lock_file,
             genesis_block_number: 0,
+            sync_stats: Default::default(),
+            jar_checksums: Default::default(),
             #[cfg(test)]
             before_cache_insert: Default::default(),
             #[cfg(test)]
@@ -491,16 +685,15 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
 
         if let Some(block_index) = block_index {
             // Find first block range that contains the requested block
-            if let Some((_, range)) = block_index.iter().find(|(max_block, _)| block <= **max_block)
-            {
+            if let Some((_, range)) = block_index.range(block..).next() {
                 // Found matching range for an existing file using block index
                 return *range;
             } else if let Some((_, range)) = block_index.last_key_value() {
                 // Didn't find matching range for an existing file, derive a new range from the end
                 // of the last existing file range.
                 //
-                // `block` is always higher than `range.end()` here, because we iterated over all
-                // `block_index` ranges above and didn't find one that contains our block
+                // `block` is always higher than `range.end()` here, because `block_index` holds no
+                // range with a `max_block` greater than or equal to `block`
                 let blocks_after_last_range = block - range.end();
                 let segments_to_skip = (blocks_after_last_range - 1) / blocks_per_file;
                 let start = range.end() + 1 + segments_to_skip * blocks_per_file;
@@ -686,7 +879,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            key: StorageSlotKey::from_u256(key).to_hashed(),
+                            // TN(TN-0112): the plain slot, as in v1's changesets (upstream
+                            // 815037e27).
+                            key: StorageSlotKey::from_u256(key).as_b256(),
                             value: revert_to_slot.to_previous_value(),
                         }
                     })
@@ -700,7 +895,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Writes to a static file segment using the provided closure.
     ///
     /// The closure receives a mutable reference to the segment writer. After the closure completes,
-    /// `sync_all()` is called to flush writes to disk.
+    /// `sync_and_freeze()` flushes writes to disk and writes the segment's configuration.
     fn write_segment<F>(
         &self,
         segment: StaticFileSegment,
@@ -712,13 +907,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     {
         let mut w = self.get_writer(first_block_number, segment)?;
         f(&mut w)?;
-        w.sync_all()
+        // TN(TN-0118): the configuration is written here, in the segment's thread, not by
+        // `finalize` on the commit thread, which only updates the reader index.
+        w.sync_and_freeze()
     }
 
     /// Writes all static file data for multiple blocks in parallel per-segment.
     ///
     /// This spawns tasks on the storage thread pool for each segment type and each task calls
-    /// `sync_all()` on its writer when done.
+    /// `sync_and_freeze()` on its writer when done.
     #[instrument(level = "debug", target = "providers::static_file", skip_all)]
     pub fn write_blocks_data(
         &self,
@@ -945,7 +1142,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         segment: StaticFileSegment,
         fixed_block_range_end: BlockNumber,
     ) {
-        self.map.remove(&(fixed_block_range_end, segment));
+        // TN(TN-0148): waits for the jar's readers, as the shard lock did.
+        if let Some((_, jar)) = self.map.remove(&(fixed_block_range_end, segment)) {
+            LoadedJar::release(jar);
+        }
     }
 
     /// This handles history expiry by deleting all static files for the given segment below the
@@ -1019,9 +1219,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let fixed_block_range = self.find_fixed_range(segment, block);
         let key = (fixed_block_range.end(), segment);
         let file = self.path.join(segment.filename(&fixed_block_range));
-        let jar = if let Some((_, jar)) = self.map.remove(&key) {
-            jar.jar
-        } else {
+        // TN(TN-0148): the cached jar is shared with its readers; wait for them, as the shard
+        // lock did, then load the configuration from the file as for an uncached jar.
+        if let Some((_, jar)) = self.map.remove(&key) {
+            LoadedJar::release(jar);
+        }
+        let jar = {
             debug!(
                 target: "providers::static_file",
                 ?file,
@@ -1034,14 +1237,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         let header = jar.user_header().clone();
 
-        // Delete the sidecar file for changeset segments before deleting the main jar
-        if segment.is_change_based() {
-            let csoff_path = file.with_extension("csoff");
-            if csoff_path.exists() {
-                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
-            }
-        }
-
+        // TN(TN-0132): `NippyJar::delete` removes the sidecar too, after the data file.
         jar.delete().map_err(ProviderError::other)?;
 
         // SAFETY: this is currently necessary to ensure that certain indexes like
@@ -1091,14 +1287,16 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         // Avoid using `entry` directly to avoid a write lock in the common case.
         trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Getting provider");
+        // TN(TN-0148): clone the jar's `Arc`; the shard lock is held only for the lookup.
         let mut provider: StaticFileJarProvider<'_, N> = if let Some(jar) = self.map.get(&key) {
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Jar found in cache");
-            jar.into()
+            LoadedJarRef::new(Arc::clone(jar.value())).into()
         } else {
             let generation = self.cache_generation.load(Ordering::Acquire);
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Creating jar from scratch");
             let path = self.path.join(segment.filename(fixed_block_range));
-            let jar = NippyJar::load(&path).map_err(ProviderError::other)?;
+            // TN(TN-0135): through the storage-v2 format check, here and at every jar load below.
+            let jar = self.load_jar(segment, &path)?;
             let loaded = LoadedJar::new(jar)?;
             #[cfg(test)]
             self.before_cache_insert.fire(segment);
@@ -1117,13 +1315,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     } else {
                         trace!(target: "providers::static_file", ?segment, ?fixed_block_range, generation, "Reloading jar after cache invalidation");
                         drop(loaded);
-                        LoadedJar::new(NippyJar::load(&path).map_err(ProviderError::other)?)?
+                        LoadedJar::new(self.load_jar(segment, &path)?)?
                     };
                     #[cfg(test)]
                     self.after_cache_validation.fire(segment);
-                    Ok(loaded)
-                })?
-                .downgrade()
+                    Ok(Arc::new(loaded))
+                })
+                .map(|jar| LoadedJarRef::new(Arc::clone(jar.value())))?
                 .into()
         };
 
@@ -1184,6 +1382,55 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         None
     }
 
+    /// TN(TN-0101): the file work of [`Self::update_index`], done before it takes the index
+    /// lock: the segment's file range from the current index, its jar loaded and, when the
+    /// segment grows past the indexed tip, the jar published to the cache.
+    ///
+    /// Publishing first is safe when the segment grows: lookups route by the index, which still
+    /// stops at the old tip, and the new jar holds every row the old one did. A jar loaded on a
+    /// cache miss can hold rows past the index tip in the same way (TN-0118). When the segment
+    /// shrinks or stays, the jar is published under the lock with the index, as upstream does,
+    /// so no lookup routed by the old index meets a jar without its rows.
+    fn prepare_index_update(
+        &self,
+        segment: StaticFileSegment,
+        segment_max_block: BlockNumber,
+    ) -> ProviderResult<PreparedIndexUpdate> {
+        let generation = self.cache_generation.load(Ordering::Acquire);
+        let (fixed_range, grows) = {
+            let indexes = self.indexes.read();
+            let index = indexes.get(segment);
+            let fixed_range = self.find_fixed_range_with_block_index(
+                segment,
+                index.map(|index| &index.expected_block_ranges_by_max_block),
+                segment_max_block,
+            );
+            (fixed_range, index.is_none_or(|index| segment_max_block > index.max_block))
+        };
+        let jar = self.load_jar(segment, &self.path.join(segment.filename(&fixed_range)))?;
+        let header = jar.user_header().clone();
+        let loaded = LoadedJar::new(jar)?;
+        let jar = if grows {
+            debug!(target: "providers::static_file", ?segment, "Inserting grown jar into cache");
+            // TN(TN-0148): the grown jar extends the cached one's file, under the entry's shard
+            // lock, so a later shrink waits for the readers of both. The replaced jar's readers
+            // keep it: no wait.
+            match self.map.entry((fixed_range.end(), segment)) {
+                Entry::Occupied(mut entry) => {
+                    let loaded = loaded.extending(entry.get());
+                    entry.insert(Arc::new(loaded));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(loaded));
+                }
+            }
+            None
+        } else {
+            Some(loaded)
+        };
+        Ok(PreparedIndexUpdate { fixed_range, generation, header, jar })
+    }
+
     /// Updates the inner transaction and block indexes alongside the internal cached providers in
     /// `self.map`.
     ///
@@ -1201,6 +1448,17 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             ?segment_max_block,
             "Updating provider index"
         );
+        // TN(TN-0101): load the jar before taking the index lock, and when the segment grows,
+        // publish it to the jar cache before the index too. Every static-file lookup of every
+        // segment takes the index lock, so holding it across the file reads, the maps and the
+        // wait for this jar's readers stalled all of them, storage v2's changeset reads included.
+        let prepared = match segment_max_block {
+            Some(segment_max_block) => Some(self.prepare_index_update(segment, segment_max_block)?),
+            None => None,
+        };
+        // TN(TN-0148): the jars replaced or removed below without the segment growing, released
+        // (their readers waited for) after the index lock, which those readers may need.
+        let mut released = Vec::new();
         let mut indexes = self.indexes.write();
 
         match segment_max_block {
@@ -1211,10 +1469,20 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     segment_max_block,
                 );
 
-                let jar = NippyJar::<SegmentHeader>::load(
-                    &self.path.join(segment.filename(&fixed_range)),
-                )
-                .map_err(ProviderError::other)?;
+                // The prepared jar holds only if nothing re-initialized the index or moved the
+                // segment's ranges since; otherwise load it under the lock, as upstream does.
+                let prepared = prepared.filter(|prepared| {
+                    prepared.fixed_range == fixed_range &&
+                        prepared.generation == self.cache_generation.load(Ordering::Acquire)
+                });
+                let (header, unpublished) = match prepared {
+                    Some(PreparedIndexUpdate { header, jar, .. }) => (header, jar),
+                    None => {
+                        let jar = self
+                            .load_jar(segment, &self.path.join(segment.filename(&fixed_range)))?;
+                        (jar.user_header().clone(), Some(LoadedJar::new(jar)?))
+                    }
+                };
 
                 let index = indexes
                     .entry(segment)
@@ -1258,7 +1526,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 // 2. Sync to block 100, this update sets min_block = [0..=100]
                 // 3. Pruner calls get_lowest_static_file_block() -> returns 100 (correct). Without
                 //    this update, it would incorrectly return 0 (stale)
-                if let Some(current_block_range) = jar.user_header().block_range() {
+                if let Some(current_block_range) = header.block_range() {
                     if let Some(min_block_range) = index.min_block_range.as_mut() {
                         // delete_jar WILL ALWAYS re-initialize all indexes, so we are always
                         // sure that current_min is always the lowest.
@@ -1272,10 +1540,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
                 // Updates the tx index by first removing all entries which have a higher
                 // block_start than our current static file.
-                if let Some(tx_range) = jar.user_header().tx_range() {
+                if let Some(tx_range) = header.tx_range() {
                     // Current block range has the same block start as `fixed_range``, but block end
                     // might be different if we are still filling this static file.
-                    if let Some(current_block_range) = jar.user_header().block_range() {
+                    if let Some(current_block_range) = header.block_range() {
                         let tx_end = tx_range.end();
 
                         // Considering that `update_index` is called when we either append/truncate,
@@ -1307,19 +1575,37 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     index.available_block_ranges_by_max_tx.take_if(|index| index.is_empty());
                 }
 
-                // Update the cached provider.
-                debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
-                self.map.insert((fixed_range.end(), segment), LoadedJar::new(jar)?);
+                // Update the cached provider, unless it was published before the lock.
+                if let Some(loaded) = unpublished {
+                    debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
+                    released
+                        .extend(self.map.insert((fixed_range.end(), segment), Arc::new(loaded)));
+                }
 
                 // Delete any cached provider that no longer has an associated jar.
+                // TN(TN-0101): find them under shared shard locks and remove only those;
+                // `retain` write-locks every shard and so waits for every jar reader.
                 debug!(target: "providers::static_file", ?segment, "Cleaning up jar map");
-                self.map.retain(|(end, seg), _| !(*seg == segment && *end > fixed_range.end()));
+                let stale: Vec<_> = self
+                    .map
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .filter(|(end, seg)| *seg == segment && *end > fixed_range.end())
+                    .collect();
+                for key in stale {
+                    released.extend(self.map.remove(&key).map(|(_, jar)| jar));
+                }
             }
             None => {
                 debug!(target: "providers::static_file", ?segment, "Removing segment from index");
                 indexes.remove(segment);
             }
         };
+
+        drop(indexes);
+        for jar in released {
+            LoadedJar::release(jar);
+        }
 
         debug!(target: "providers::static_file", ?segment, "Updated provider index");
         Ok(())
@@ -1371,7 +1657,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         // cache. A fill that started before this point either reloads under its shard lock or
         // publishes before the clear reaches that shard and is removed by it.
         self.cache_generation.fetch_add(1, Ordering::AcqRel);
-        self.map.clear();
+        // TN(TN-0148): take the jars out and release them after the index lock, as `update_index`
+        // does (upstream's `clear` waited for every shard's readers here).
+        let keys: Vec<_> = self.map.iter().map(|entry| *entry.key()).collect();
+        let released: Vec<_> =
+            keys.iter().filter_map(|key| self.map.remove(key).map(|(_, jar)| jar)).collect();
 
         // initialize the expired history height to the lowest static file block
         if let Some(lowest_range) =
@@ -1382,7 +1672,76 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
         }
 
+        drop(indexes);
+        for jar in released {
+            LoadedJar::release(jar);
+        }
         Ok(())
+    }
+
+    /// TN(TN-0133): errors when a segment's jars, as listed on disk, skip or overlap blocks
+    /// between two of them: a jar is missing, or one below the highest is not full. The blocks of
+    /// the gap would read as absent (a range walk comes back short, a point read finds no
+    /// changeset). Only the joins between present jars are checked, not where the lowest jar
+    /// starts, so a segment whose lowest jars were deleted on purpose (history expiry deletes the
+    /// lowest first, `delete_segment_below_block`) passes.
+    pub fn check_contiguity(&self) -> ProviderResult<()> {
+        for (segment, jars) in &*iter_static_files(&self.path).map_err(ProviderError::other)? {
+            for pair in jars.windows(2) {
+                let (before, after) = (pair[0].0, pair[1].0);
+                if after.start() != before.end() + 1 {
+                    tracing::error!(
+                        target: "reth::static_file",
+                        %segment,
+                        %before,
+                        %after,
+                        "Static files skip blocks between two jars"
+                    );
+                    return Err(ProviderError::other(StaticFileGapError::Jars {
+                        segment,
+                        before,
+                        after,
+                    }))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// TN(TN-0133): the error for a read of `number` (a block, or a transaction of a transaction
+    /// segment) that the index sent to `provider`'s jar, which does not hold it, while lower jars
+    /// exist: the jar that held it is missing ([`Self::check_contiguity`] refuses that at
+    /// startup). `None` when the jar holds `number`, or when `number` lies below the segment's
+    /// lowest jar (deleted on purpose, or never written).
+    fn gap_at(
+        &self,
+        segment: StaticFileSegment,
+        provider: &StaticFileJarProvider<'_, N>,
+        number: u64,
+    ) -> Option<ProviderError> {
+        let header = provider.user_header();
+        let jar_blocks = header.block_range()?;
+        let missing = if segment.is_tx_based() {
+            // The index sends a transaction to the first jar whose last transaction is at or
+            // past it, so only one below the jar's first can be missing, and only if the jar is
+            // not the lowest.
+            header.tx_range().is_some_and(|txs| number < txs.start()) &&
+                self.get_lowest_range_start(segment).is_some_and(|low| jar_blocks.start() > low)
+        } else {
+            // The index sends only blocks up to the highest one here.
+            !jar_blocks.contains(number) &&
+                self.get_lowest_range_start(segment).is_some_and(|low| number >= low)
+        };
+        missing.then(|| {
+            tracing::error!(
+                target: "reth::static_file",
+                %segment,
+                number,
+                path = %provider.data_path().display(),
+                "No static file jar holds this number, between the segment's lowest and highest"
+            );
+            ProviderError::other(StaticFileGapError::Number { segment, number })
+        })
     }
 
     /// Ensures that any broken invariants which cannot be healed on the spot return a pipeline
@@ -1443,6 +1802,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         info!(target: "reth::cli", "Verifying storage consistency.");
+
+        // TN(TN-0133): a jar missing between two others cannot be healed.
+        self.check_contiguity()?;
 
         let mut unwind_target: Option<BlockNumber> = None;
 
@@ -1557,6 +1919,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     {
         info!(target: "reth::cli", "Healing static file inconsistencies.");
 
+        // TN(TN-0133): a jar missing between two others cannot be healed; refuse before any heal.
+        self.check_contiguity()?;
+
         for segment in self.segments_to_check(provider) {
             let _guard = info_span!("Healing static file segment", ?segment).entered();
             let _ = self.maybe_heal_segment(segment)?;
@@ -1664,7 +2029,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .join(segment.filename(&self.find_fixed_range(segment, latest_block)));
             debug!(target: "reth::providers::static_file", ?file_path, latest_block, "Loading NippyJar for consistency check");
 
-            let jar = NippyJar::<SegmentHeader>::load(&file_path).map_err(ProviderError::other)?;
+            let jar = self.load_jar(segment, &file_path)?;
             debug!(target: "reth::providers::static_file", "NippyJar loaded, checking consistency");
 
             NippyJarChecker::new(jar).check_consistency().map_err(ProviderError::other)?;
@@ -2184,6 +2549,26 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     }
                     None => {
                         if retrying {
+                            // TN(TN-0121): a number inside the jar's own range has a row: the
+                            // range and the row count come from one configuration. Without one
+                            // the jar is damaged; outside it the data ends (or starts later).
+                            let header = provider.user_header();
+                            let jar_range = if segment.is_tx_based() {
+                                header.tx_range()
+                            } else {
+                                header.block_range()
+                            };
+                            if jar_range.is_some_and(|range| range.contains(number)) {
+                                return Err(ProviderError::other(NippyJarError::Custom(format!(
+                                    "static file {} has no row for {number}, inside its range \
+                                     {jar_range:?}",
+                                    provider.data_path().display()
+                                ))))
+                            }
+                            // TN(TN-0133): nor is a number in a gap between jars the end.
+                            if let Some(err) = self.gap_at(segment, &provider, number) {
+                                return Err(err)
+                            }
                             return Ok(result);
                         }
                         // There is a very small chance of hitting a deadlock if two consecutive
@@ -2477,17 +2862,24 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        // TN(TN-0133): a block in a gap between jars is an error, not an empty changeset.
+        if let Some(err) =
+            self.gap_at(StaticFileSegment::AccountChangeSets, &provider, block_number)
+        {
+            return Err(err)
+        }
 
         if let Some(offset) = provider.read_changeset_offset(block_number)? {
             let mut cursor = provider.cursor()?;
             let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
 
             for i in offset.changeset_range() {
-                if let Some(change) =
-                    cursor.get_one::<reth_db::static_file::AccountChangesetMask>(i.into())?
-                {
-                    changeset.push(change)
-                }
+                // TN(TN-0121): a row missing inside the block's range is damage, not a shorter
+                // changeset.
+                let change = cursor
+                    .get_one::<reth_db::static_file::AccountChangesetMask>(i.into())?
+                    .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+                changeset.push(change)
             }
             Ok(changeset)
         } else {
@@ -2516,36 +2908,8 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         let mut cursor = provider.cursor()?;
         let range = offset.changeset_range();
-        let mut low = range.start;
-        let mut high = range.end;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if let Some(change) =
-                cursor.get_one::<reth_db::static_file::AccountChangesetMask>(mid.into())?
-            {
-                if change.address < address {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            } else {
-                // This is not expected but means we are out of the range / file somehow, and can't
-                // continue
-                debug!(
-                    target: "providers::static_file",
-                    ?low,
-                    ?mid,
-                    ?high,
-                    ?range,
-                    ?block_number,
-                    ?address,
-                    "Cannot continue binary search for account changeset fetch"
-                );
-                low = range.end;
-                break;
-            }
-        }
+        // TN(TN-0124): an account change's stored value starts with its address.
+        let low = changeset_lower_bound(&mut cursor, range.clone(), address.as_slice())?;
 
         if low < range.end &&
             let Some(change) = cursor
@@ -2555,6 +2919,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             return Ok(Some(change));
         }
 
+        changeset_lookup_missed(&mut cursor, range, address.as_slice())?;
         Ok(None)
     }
 
@@ -2571,14 +2936,21 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::AccountChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::AccountChangeSets.filename(block_range))
-                    .with_extension("csoff");
+            for (_, header) in changeset_segments {
+                // TN(TN-0151): a file is named by its fixed range, not by the blocks it holds
+                // (fewer in a segment's last file, which was never counted).
+                let data_path = self.path.join(
+                    StaticFileSegment::AccountChangeSets.filename(&header.expected_block_range()),
+                );
+                let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    // TN(TN-0121): the jar's configuration says whether its records carry
+                    // checksums. TN(TN-0151): loaded through TN-0135's format check.
+                    let checksums = self
+                        .load_jar(StaticFileSegment::AccountChangeSets, &data_path)?
+                        .has_checksums();
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {
@@ -2590,6 +2962,75 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         Ok(count)
     }
+}
+
+/// TN(TN-0124): the first row of a block's changeset `range` whose key is not below `key`, the
+/// key being the leading bytes of the stored value (`AccountBeforeTx` and `StorageBeforeTx` encode
+/// the address, then the plain slot, first and raw, so byte order is key order).
+///
+/// The probes compare the stored bytes without verifying or decoding them; the caller reads the
+/// row it settles on through a verified read and compares its decoded key, so a damaged probe can
+/// only end the search at a row that does not match: not found, which every history caller turns
+/// into an error (`AccountChangesetNotFound` / `StorageChangesetNotFound`). To report the damage
+/// itself, [`changeset_lookup_missed`] reruns the search verifying every probe.
+pub(crate) fn changeset_lower_bound(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+) -> ProviderResult<u64> {
+    changeset_search(cursor, range, key, false)
+}
+
+/// TN(TN-0124): a point lookup that found no row reruns its search with every probe verified,
+/// when the jar has checksums, so a damaged probe that misdirected it is reported as the checksum
+/// error rather than as a missing change. A true miss returns `Ok(())`.
+fn changeset_lookup_missed(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+) -> ProviderResult<()> {
+    if cursor.jar().has_checksums() {
+        changeset_search(cursor, range, key, true)?;
+    }
+    Ok(())
+}
+
+fn changeset_search(
+    cursor: &mut StaticFileCursor<'_>,
+    range: Range<u64>,
+    key: &[u8],
+    verify: bool,
+) -> ProviderResult<u64> {
+    // TN(TN-0137): the raw probes read the stored bytes as the key, which holds only in a jar
+    // without compression.
+    if !verify && cursor.jar().compressor().is_some() {
+        return Err(ProviderError::other(CompressedChangesetJarError {
+            path: cursor.jar().data_path().to_path_buf(),
+        }))
+    }
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        // `read_changeset_offset` checked the range against the jar's rows, so every probe has a
+        // row; a stored value shorter than the key is damage.
+        let below = if verify {
+            let row =
+                cursor.get(mid.into(), 0b1)?.ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+            row[0].get(..key.len()).ok_or(ProviderError::CorruptedChangeSetStaticFile)? < key
+        } else {
+            let stored = cursor
+                .unverified_value(mid as usize, 0)
+                .map_err(ProviderError::other)?
+                .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+            stored.get(..key.len()).ok_or(ProviderError::CorruptedChangeSetStaticFile)? < key
+        };
+        if below {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(low)
 }
 
 impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
@@ -2606,20 +3047,28 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        // TN(TN-0133): a block in a gap between jars is an error, not an empty changeset.
+        if let Some(err) =
+            self.gap_at(StaticFileSegment::StorageChangeSets, &provider, block_number)
+        {
+            return Err(err)
+        }
 
         if let Some(offset) = provider.read_changeset_offset(block_number)? {
             let mut cursor = provider.cursor()?;
             let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
 
             for i in offset.changeset_range() {
-                if let Some(change) = cursor.get_one::<StorageChangesetMask>(i.into())? {
-                    let block_address = BlockNumberAddress((block_number, change.address));
-                    let entry = ChangesetEntry {
-                        key: StorageSlotKey::hashed(change.key),
-                        value: change.value,
-                    };
-                    changeset.push((block_address, entry));
-                }
+                // TN(TN-0121): a row missing inside the block's range is damage, not a shorter
+                // changeset.
+                let change = cursor
+                    .get_one::<StorageChangesetMask>(i.into())?
+                    .ok_or(ProviderError::CorruptedChangeSetStaticFile)?;
+                let block_address = BlockNumberAddress((block_number, change.address));
+                // TN(TN-0112): static-file storage changesets hold plain slots.
+                let entry =
+                    ChangesetEntry { key: StorageSlotKey::plain(change.key), value: change.value };
+                changeset.push((block_address, entry));
             }
             Ok(changeset)
         } else {
@@ -2649,44 +3098,25 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
 
         let mut cursor = provider.cursor()?;
         let range = offset.changeset_range();
-        let mut low = range.start;
-        let mut high = range.end;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if let Some(change) = cursor.get_one::<StorageChangesetMask>(mid.into())? {
-                match (change.address, change.key).cmp(&(address, storage_key)) {
-                    std::cmp::Ordering::Less => low = mid + 1,
-                    _ => high = mid,
-                }
-            } else {
-                debug!(
-                    target: "providers::static_file",
-                    ?low,
-                    ?mid,
-                    ?high,
-                    ?range,
-                    ?block_number,
-                    ?address,
-                    ?storage_key,
-                    "Cannot continue binary search for storage changeset fetch"
-                );
-                low = range.end;
-                break;
-            }
-        }
+        // TN(TN-0124): a storage change's stored value starts with its address and plain slot.
+        let mut key = [0u8; 52];
+        key[..20].copy_from_slice(address.as_slice());
+        key[20..].copy_from_slice(storage_key.as_slice());
+        let low = changeset_lower_bound(&mut cursor, range.clone(), &key)?;
 
         if low < range.end &&
             let Some(change) = cursor
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
         {
+            // TN(TN-0112): static-file storage changesets hold plain slots.
             return Ok(Some(ChangesetEntry {
-                key: StorageSlotKey::hashed(change.key),
+                key: StorageSlotKey::plain(change.key),
                 value: change.value,
             }));
         }
 
+        changeset_lookup_missed(&mut cursor, range, &key)?;
         Ok(None)
     }
 
@@ -2703,14 +3133,21 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::StorageChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::StorageChangeSets.filename(block_range))
-                    .with_extension("csoff");
+            for (_, header) in changeset_segments {
+                // TN(TN-0151): a file is named by its fixed range, not by the blocks it holds
+                // (fewer in a segment's last file, which was never counted).
+                let data_path = self.path.join(
+                    StaticFileSegment::StorageChangeSets.filename(&header.expected_block_range()),
+                );
+                let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                    // TN(TN-0121): the jar's configuration says whether its records carry
+                    // checksums. TN(TN-0151): loaded through TN-0135's format check.
+                    let checksums = self
+                        .load_jar(StaticFileSegment::StorageChangeSets, &data_path)?
+                        .has_checksums();
+                    let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;
                     let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
                     for offset in offsets {
@@ -2934,7 +3371,7 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
             // the hash.
             rayon::spawn(move || {
                 let mut rlp_buf = Vec::with_capacity(128);
-                let _ = manager.fetch_range_with_predicate(
+                let fetched = manager.fetch_range_with_predicate(
                     StaticFileSegment::Transactions,
                     chunk_range,
                     |cursor, number| {
@@ -2948,6 +3385,11 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
                     },
                     |_| true,
                 );
+                // TN(TN-0136): a failed read, a checksum mismatch included, reaches the caller
+                // instead of a list missing the rest of the chunk.
+                if let Err(err) = fetched {
+                    let _ = channel_tx.send(Err(Box::new(err)));
+                }
             });
         }
 
@@ -3525,6 +3967,307 @@ mod tests {
             SegmentRangeInclusive::new(550, 649)
         );
 
+        Ok(())
+    }
+
+    /// TN(TN-0118): `sync_and_freeze` writes the configuration in the segment's thread, before
+    /// `finalize` updates the index on the commit thread, so for the rest of `save_blocks` a jar
+    /// loaded on a cache miss holds rows the index does not name yet. Readers route by the index,
+    /// so reads by number still find nothing past the old tip, and `finalize` replaces the cached
+    /// jar when it publishes the rows. (A range read that runs past the index tip inside such a
+    /// jar can return the new rows early; the index is ahead of the database for the whole
+    /// database commit anyway, so callers already see rows the database has not committed.)
+    #[test]
+    fn frozen_rows_stay_unindexed_until_finalize() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).with_blocks_per_file(10).build()?;
+        let segment = StaticFileSegment::Headers;
+        let hashes = [0x10, 0x11, 0x12].map(|byte| B256::from([byte; 32]));
+        {
+            let mut writer = static_files.latest_writer(segment)?;
+            writer.append_header(&Header::default(), &hashes[0])?;
+            writer.commit()?;
+        }
+
+        let mut writer = static_files.latest_writer(segment)?;
+        for number in 1..=2u64 {
+            let header = Header { number, ..Default::default() };
+            writer.append_header(&header, &hashes[number as usize])?;
+        }
+        writer.sync_and_freeze()?;
+
+        // A cache miss now loads the configuration with all three rows.
+        static_files.remove_cached_provider(segment, 9);
+        assert_eq!(static_files.block_hash(0)?, Some(hashes[0]));
+        assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
+
+        // The index still ends at block 0, so the frozen rows are not readable by number.
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(0));
+        assert_eq!(static_files.block_hash(1)?, None);
+        assert_eq!(static_files.block_hash(2)?, None);
+
+        writer.finalize()?;
+        drop(writer);
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
+        assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
+        assert_eq!(static_files.map.get(&(9, segment)).expect("jar cached").jar.rows(), 3);
+        Ok(())
+    }
+
+    /// TN(TN-0148): a commit that grows the headers returns while a reader still holds the
+    /// headers' current jar, and the reader keeps its snapshot.
+    #[test]
+    fn growing_commit_does_not_wait_for_a_reader_of_the_jar() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x40, 0x41].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+        }
+        let held =
+            static_files.get_segment_provider_for_block(StaticFileSegment::Headers, 0, None)?;
+        thread::scope(|scope| -> eyre::Result<()> {
+            let (tx, rx) = mpsc::channel();
+            let files = &static_files;
+            scope.spawn(move || {
+                let commit = (|| -> eyre::Result<()> {
+                    let mut headers = files.latest_writer(StaticFileSegment::Headers)?;
+                    headers
+                        .append_header(&Header { number: 1, ..Default::default() }, &hashes[1])?;
+                    Ok(headers.commit()?)
+                })();
+                let _ = tx.send(commit);
+            });
+            let commit = rx.recv_timeout(Duration::from_secs(5));
+            // Drop the reader before asserting, so a commit that waits for it can end.
+            let rows = held.rows();
+            drop(held);
+            assert!(matches!(commit, Ok(Ok(()))), "the commit waited for the reader: {commit:?}");
+            assert_eq!(rows, 1);
+            Ok(())
+        })?;
+        assert_eq!(static_files.block_hash(1)?, Some(hashes[1]));
+        Ok(())
+    }
+
+    /// TN(TN-0148): a commit that prunes the headers waits until no reader holds a jar of the file
+    /// from before the prune: the cached jar's or, after a growing commit replaced it without
+    /// waiting, the one before it. The rows a prune cuts are written again by the next append.
+    #[test]
+    fn pruning_commit_waits_for_readers_of_every_earlier_snapshot() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x50, 0x51, 0x52].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+        }
+        // A reader of the snapshot before a growing commit.
+        let held =
+            static_files.get_segment_provider_for_block(StaticFileSegment::Headers, 0, None)?;
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header { number: 1, ..Default::default() }, &hashes[1])?;
+            headers.commit()?;
+        }
+        thread::scope(|scope| -> eyre::Result<()> {
+            let (tx, rx) = mpsc::channel();
+            let files = &static_files;
+            scope.spawn(move || {
+                let commit = (|| -> eyre::Result<()> {
+                    let mut headers = files.latest_writer(StaticFileSegment::Headers)?;
+                    headers.prune_headers(1)?;
+                    Ok(headers.commit()?)
+                })();
+                let _ = tx.send(commit);
+            });
+            let early = rx.recv_timeout(Duration::from_millis(300));
+            assert!(early.is_err(), "the prune did not wait for the reader: {early:?}");
+            assert_eq!(held.rows(), 1);
+            drop(held);
+            let commit = rx.recv_timeout(Duration::from_secs(5));
+            assert!(matches!(commit, Ok(Ok(()))), "the prune did not finish: {commit:?}");
+            Ok(())
+        })?;
+        assert_eq!(static_files.get_highest_static_file_block(StaticFileSegment::Headers), Some(0));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header { number: 1, ..Default::default() }, &hashes[2])?;
+            headers.commit()?;
+        }
+        assert_eq!(static_files.block_hash(1)?, Some(hashes[2]));
+        Ok(())
+    }
+
+    /// TN(TN-0101): a commit that grows the headers while a reader holds a jar, the headers'
+    /// own or another segment's, never makes lookups wait (TN-0148: nor the commit itself, see
+    /// `growing_commit_does_not_wait_for_a_reader_of_the_jar`), and the new header is readable
+    /// once the commit returns.
+    #[test]
+    fn growing_commit_waits_for_jar_readers_outside_the_index_lock() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let hashes = [0x20, 0x21, 0x22].map(|byte| B256::from([byte; 32]));
+        {
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+            headers.append_header(&Header::default(), &hashes[0])?;
+            headers.commit()?;
+            let mut changesets =
+                static_files.latest_writer(StaticFileSegment::AccountChangeSets)?;
+            changesets.append_account_changeset(Vec::new(), 0)?;
+            changesets.commit()?;
+        }
+
+        // The headers' own jar (the cache insert waits for it), then another segment's (the
+        // clean-up of jars above the new range must not wait for it).
+        for (number, held) in
+            [(1u64, StaticFileSegment::Headers), (2, StaticFileSegment::AccountChangeSets)]
+        {
+            // A reader holds the jar, as a range walk does.
+            let held = static_files.get_segment_provider_for_block(held, 0, None)?;
+            thread::scope(|scope| -> eyre::Result<()> {
+                let commit = scope.spawn(|| -> eyre::Result<()> {
+                    let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+                    let header = Header { number, ..Default::default() };
+                    headers.append_header(&header, &hashes[number as usize])?;
+                    Ok(headers.commit()?)
+                });
+                // Give the commit time to reach the jar cache.
+                thread::sleep(Duration::from_millis(200));
+                let (tx, rx) = mpsc::channel();
+                let lookups = &static_files;
+                scope.spawn(move || {
+                    let lookup = lookups
+                        .get_segment_provider_for_block(
+                            StaticFileSegment::AccountChangeSets,
+                            0,
+                            None,
+                        )
+                        .map(drop);
+                    let _ = tx.send(lookup);
+                });
+                let lookup = rx.recv_timeout(Duration::from_secs(2));
+                drop(held);
+                assert!(
+                    matches!(lookup, Ok(Ok(()))),
+                    "block {number}: a lookup waited for the held jar: {lookup:?}"
+                );
+                commit.join().expect("commit thread")
+            })?;
+            let highest = static_files.get_highest_static_file_block(StaticFileSegment::Headers);
+            assert_eq!(highest, Some(number));
+            assert_eq!(static_files.block_hash(number)?, Some(hashes[number as usize]));
+        }
+        Ok(())
+    }
+
+    /// TN(TN-0119): a persist records each sync phase once for its segment, `.csoff` only for
+    /// changeset segments, and a take drains what was recorded. TN(TN-0138): the span of the
+    /// files' syncs, which run at once, holds each of them.
+    #[test]
+    fn sync_stats_record_each_phase_per_segment() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let mut headers = static_files.latest_writer(StaticFileSegment::Headers)?;
+        let mut changesets = static_files.latest_writer(StaticFileSegment::AccountChangeSets)?;
+        // Opening a writer runs its heal, which updates the index; start after it.
+        let _ = static_files.take_sync_stats();
+
+        headers.append_header(&Header::default(), &B256::ZERO)?;
+        headers.sync_and_freeze()?;
+        headers.finalize()?;
+        changesets.append_account_changeset(Vec::new(), 0)?;
+        changesets.sync_and_freeze()?;
+        changesets.finalize()?;
+
+        let stats = static_files.take_sync_stats();
+        assert_eq!(
+            stats.iter().map(|(segment, _)| segment).collect::<Vec<_>>(),
+            [StaticFileSegment::Headers, StaticFileSegment::AccountChangeSets]
+        );
+        for segment in [StaticFileSegment::Headers, StaticFileSegment::AccountChangeSets] {
+            let s = stats.segment(segment);
+            for (phase, phase_stats) in [
+                ("data", s.data_sync),
+                ("offsets", s.offsets_sync),
+                ("files", s.files_sync),
+                ("conf", s.conf_freeze),
+                ("update_index", s.update_index),
+            ] {
+                assert_eq!(phase_stats.calls, 1, "{segment:?} {phase}");
+                assert!(phase_stats.max <= phase_stats.total, "{segment:?} {phase}");
+            }
+            // TN(TN-0138): the files' syncs run inside the span `files_sync` times.
+            let longest = s.data_sync.total.max(s.offsets_sync.total).max(s.csoff_sync.total);
+            assert!(s.files_sync.total >= longest, "{segment:?} files");
+        }
+        assert_eq!(stats.segment(StaticFileSegment::Headers).csoff_sync.calls, 0);
+        assert_eq!(stats.segment(StaticFileSegment::AccountChangeSets).csoff_sync.calls, 1);
+        assert!(static_files.take_sync_stats().is_empty(), "a take drains the stats");
+        Ok(())
+    }
+
+    /// TN(TN-0118): after `sync_and_freeze` the writer is clean, so a commit of every writer
+    /// (`StaticFileWriters::commit`, which `DatabaseProvider::commit` runs instead of `finalize`
+    /// in unwind order or with an unwind queued) has nothing to write, but must still publish
+    /// the frozen rows.
+    #[test]
+    fn commit_publishes_rows_frozen_by_sync_and_freeze() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let segment = StaticFileSegment::Headers;
+        let hashes = [0x30, 0x31, 0x32].map(|byte| B256::from([byte; 32]));
+        {
+            let mut writer = static_files.latest_writer(segment)?;
+            writer.append_header(&Header::default(), &hashes[0])?;
+            writer.commit()?;
+            for number in 1..=2u64 {
+                let header = Header { number, ..Default::default() };
+                writer.append_header(&header, &hashes[number as usize])?;
+            }
+            writer.sync_and_freeze()?;
+        }
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(0));
+
+        static_files.commit()?;
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(2));
+        assert_eq!(static_files.block_hash(2)?, Some(hashes[2]));
+        Ok(())
+    }
+
+    /// TN(TN-0118): `sync_and_freeze` leaves the writer unsynced, so `finalize` syncs the rows
+    /// appended after it before it writes their configuration.
+    #[test]
+    fn finalize_syncs_rows_appended_after_sync_and_freeze() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir).build()?;
+        let segment = StaticFileSegment::Headers;
+        let mut writer = static_files.latest_writer(segment)?;
+        // Opening a writer runs its heal, which updates the index; start after it.
+        let _ = static_files.take_sync_stats();
+
+        writer.append_header(&Header::default(), &B256::ZERO)?;
+        writer.sync_and_freeze()?;
+        writer.append_header(&Header { number: 1, ..Default::default() }, &B256::ZERO)?;
+        writer.finalize()?;
+        drop(writer);
+
+        let stats = static_files.take_sync_stats();
+        let stats = stats.segment(segment);
+        assert_eq!(stats.data_sync.calls, 2, "the second row's data sync");
+        assert_eq!(stats.offsets_sync.calls, 2, "the second row's offsets sync");
+        assert_eq!(stats.conf_freeze.calls, 2);
+        assert_eq!(static_files.get_highest_static_file_block(segment), Some(1));
         Ok(())
     }
 }

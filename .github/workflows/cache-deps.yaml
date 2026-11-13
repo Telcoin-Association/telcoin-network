@@ -14,12 +14,12 @@
 #
 # Two warm jobs, two entries, one per toolchain pr.yaml uses:
 #
-#   clippy-cache  both clippy passes (etc/ci-lanes.sh), the release graph and every target
-#                 under --all-features, under the nightly pin; read by pr.yaml's `clippy`
-#                 job and main-compiles.yaml's `fmt-clippy`
-#   test-cache    dependencies for the test lanes (default, adiri, tn-lmdb, vendored reth)
+#   clippy-cache  the clippy passes (etc/ci-lanes.sh), the release graph and every target
+#                 under --all-features and without `mdbx`, under the nightly pin; read by
+#                 pr.yaml's `clippy` job and main-compiles.yaml's `fmt-clippy`
+#   test-cache    dependencies for the test lanes (default, adiri, vendored reth)
 #                 under the stable pin; read by pr.yaml's `test`, `adiri-test` and
-#                 `tn-lmdb-test` and by main-compiles.yaml's `build-tests`. Workspace test
+#                 `vendor-reth-test` and by main-compiles.yaml's `build-tests`. Workspace test
 #                 binaries are rebuilt per run because rust-cache does not save workspace crates.
 #
 # A third job, prune-caches, runs after both warms on main and deletes the superseded
@@ -131,9 +131,10 @@ jobs:
   # `fmt-clippy` job.
   warm-clippy-cache:
     runs-on: ubuntu-latest
-    # Both passes from cold, after a heavy dependency bump or a prefix-key bump: 10 m 21 s
-    # with no entry to restore (2026-10-29; 5 m 21 s release graph, 5 m 00 s all targets
-    # under --all-features). The three-pass lane this replaced took 16.5 min cold, and one
+    # The release-graph and --all-features passes from cold, after a heavy dependency bump or
+    # a prefix-key bump: 10 m 21 s with no entry to restore (2026-10-29; 5 m 21 s release
+    # graph, 5 m 00 s all targets under --all-features); the pass without `mdbx` reuses the
+    # second's dependencies. The older three-pass lane those replaced took 16.5 min cold, and one
     # library-only pass 11.5 min with a partial cache.
     timeout-minutes: 120
     steps:
@@ -173,7 +174,7 @@ jobs:
       - name: Build both clippy passes
         run: ./etc/ci-lanes.sh clippy
 
-  # Steps up to the cache step mirror pr.yaml's `test`, `adiri-test` and `tn-lmdb-test` jobs
+  # Steps up to the cache step mirror pr.yaml's `test`, `adiri-test` and `vendor-reth-test` jobs
   # and main-compiles.yaml's `build-tests` job.
   warm-test-cache:
     runs-on: ubuntu-latest
@@ -212,16 +213,13 @@ jobs:
       # (tn-reth/adiri pulls in faucet and tn-types/adiri, and resolver-2 unification is
       # per selected package), so its dependency artifacts are distinct from the default
       # lane's; the sets coexist in target/, and rust-cache keeps every variant of a
-      # dependency it finds there. The tn-lmdb lane is built for the same reason: whatever
-      # its feature set unifies differently is saved beside the rest. One entry keeps the
-      # quota predictable.
+      # dependency it finds there. One entry keeps the quota predictable.
       # The vendored reth lane builds the nested vendor/reth workspace into target/vendor-reth,
       # inside the same target dir, so its dependencies land in the same entry.
       - name: Build the test binaries of the test lanes
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
-          ./etc/ci-lanes.sh test-tn-lmdb --build-only
           ./etc/ci-lanes.sh test-vendor-reth --build-only
 
   # Deletes the superseded cache generations, through .github/scripts/prune_caches.sh,

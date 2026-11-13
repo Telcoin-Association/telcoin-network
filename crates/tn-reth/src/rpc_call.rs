@@ -29,7 +29,7 @@ use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, Call, EthCall, LoadState, SpawnBlocking, Trace},
     EthApiTypes, FromEthApiError, RpcBlock, RpcNodeCore,
 };
-use reth_rpc_eth_types::EthApiError;
+use reth_rpc_eth_types::{builder::config::PendingBlockKind, EthApiError};
 use tn_types::{gas_accumulator::WorkerBaseFee, MIN_PROTOCOL_BASE_FEE};
 
 /// The simulation methods whose tip environments use the worker's current fee.
@@ -88,18 +88,54 @@ pub(crate) struct SimulationWithEpochBaseFee<Api> {
     eth_api: Api,
     /// Resolve the current fee even after accumulator slots are replaced.
     base_fee: WorkerBaseFee,
+    /// The node's `--rpc.pending-block` kind, which decides what `pending` selects.
+    pending_block: PendingBlockKind,
 }
 
 impl<Api> SimulationWithEpochBaseFee<Api> {
     /// Wrap a built reth API without changing its execution configuration.
-    pub(crate) const fn new(eth_api: Api, base_fee: WorkerBaseFee) -> Self {
-        Self { eth_api, base_fee }
+    pub(crate) const fn new(
+        eth_api: Api,
+        base_fee: WorkerBaseFee,
+        pending_block: PendingBlockKind,
+    ) -> Self {
+        Self { eth_api, base_fee, pending_block }
     }
 }
 
 /// Whether a request follows the chain tip instead of selecting a historical block.
 pub(crate) fn targets_tip(block_id: BlockId) -> bool {
     matches!(block_id, BlockId::Number(BlockNumberOrTag::Latest | BlockNumberOrTag::Pending))
+}
+
+/// The block a tip request simulates on.
+///
+/// Under `--rpc.pending-block none` (TN's default) no pending block exists, so reth's
+/// `eth_callMany`, `eth_simulateV1` and `debug_traceCallMany` answered `pending` with
+/// "block not found" while `eth_call` and `eth_estimateGas` fell back to the latest state.
+/// Here `pending` selects the latest block instead, which is what the flag's help promises;
+/// every other block id, and every other pending-block kind, passes through unchanged.
+pub(crate) fn tip_block(
+    block: Option<BlockId>,
+    pending_block: PendingBlockKind,
+) -> Option<BlockId> {
+    match block {
+        Some(block) if block.is_pending() && pending_block == PendingBlockKind::None => {
+            Some(BlockId::latest())
+        }
+        other => other,
+    }
+}
+
+/// [`tip_block`] applied to a call-many state context.
+pub(crate) fn tip_context(
+    context: Option<StateContext>,
+    pending_block: PendingBlockKind,
+) -> Option<StateContext> {
+    context.map(|context| StateContext {
+        block_number: tip_block(context.block_number, pending_block),
+        ..context
+    })
 }
 
 /// Fill only a missing base-fee override, preserving zero and every other field.
@@ -269,6 +305,7 @@ where
         state_context: Option<StateContext>,
         state_override: Option<StateOverride>,
     ) -> RpcResult<Vec<Vec<EthCallResponse>>> {
+        let state_context = tip_context(state_context, self.pending_block);
         EthCall::call_many(
             &self.eth_api,
             bundles_at_epoch(bundles, &state_context, &self.base_fee),
@@ -285,6 +322,7 @@ where
         mut payload: SimulatePayload,
         block: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<alloy::network::Ethereum>>>> {
+        let block = tip_block(block, self.pending_block);
         // Match reth's RPC entry point: the helper itself does not acquire this guard.
         let _permit = self.eth_api.tracing_task_guard().clone().acquire_owned().await;
         // Leave oversized payloads untouched for reth's cheap block-count rejection.

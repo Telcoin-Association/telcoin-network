@@ -5,13 +5,13 @@
 
 Re-executes every transaction of a block the node holds and returns one trace per transaction. The node starts from the parent block's state, applies the block's pre-transaction system calls, and then traces the transactions in order, each on the state the previous one left.
 
-Tracing the genesis block (`0x0`) fails with error `-32001` `block not found: hash 0x0000000000000000000000000000000000000000000000000000000000000000`: the tracer looks up the genesis block's parent, whose hash is zero. `trace_block` returns `[]` for genesis instead.
+Tracing the genesis block (`0x0`) fails with error `-32000` `genesis is not traceable`: tracing replays a block on its parent's state, and genesis has no parent. `trace_block` returns `[]` for genesis instead.
 
 Traces cover the block's transactions only. The system calls a block runs before its transactions (EIP-4788 beacon root, EIP-2935 block hashes) and the epoch-closing system calls (`applyIncentives` and `concludeEpoch`) are not transactions, so no tracer shows them.
 
 #### Parameters
 
-`block parameter`: `QUANTITY|TAG` \[_Required_] - Hexadecimal block number, or one of the string tags `latest`, `earliest`, `safe`, or `finalized`. See the [default block parameter](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block). A block the node does not have fails with error `-32001` and a message such as `block not found: 0x5`.
+`block parameter`: `QUANTITY|TAG` \[_Required_] - Hexadecimal block number, or one of the string tags `latest`, `earliest`, `safe`, or `finalized`. See the [default block parameter](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block). A block the node does not have fails with error `-32000` and a message such as `block 0x5 not found`.
 
 `Object` - (optional) The tracing options, as for [debug\_traceTransaction](debug_tracetransaction.md#parameters): `tracer`, `tracerConfig`, and the struct logger fields `enableMemory`, `disableStack`, `disableStorage` and `enableReturnData`. When omitted, the struct logger runs with its defaults.
 

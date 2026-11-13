@@ -10,8 +10,11 @@
 //!
 //! - [`RethEnv::new`] MUST run inside a tokio runtime: `init_provider_factory` captures
 //!   `tokio::runtime::Handle::current()`, which panics outside one.
-//! - Opening an env initializes genesis in the database when absent (`init_genesis`), always from
-//!   the LOCAL chain spec in the supplied config — genesis is never fetched from the network.
+//! - Opening an env initializes genesis in the database when absent (`init_genesis_with_settings`),
+//!   always from the LOCAL chain spec in the supplied config — genesis is never fetched from the
+//!   network.
+//! - Opening an env settles the datadir's storage layout first (`layout::settle`): a new datadir
+//!   gets the config's layout for new datadirs, an existing one keeps its own.
 //! - [`RethEnv::new`] has two process-global side effects (base-fee address pinning and metrics
 //!   registration) — see its docs.
 //! - Opening an env loads the datadir's restored-state floor marker when one exists (a datadir
@@ -24,7 +27,7 @@ use std::{
 };
 
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_db_common::init::init_genesis;
+use reth_db_common::init::init_genesis_with_settings;
 use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -49,15 +52,22 @@ use crate::{
 
 pub(crate) mod database;
 mod epoch;
+mod exec_cache;
 mod execution;
+// The fixtures are tn-lmdb datadirs, and storage v2 runs on the tn-lmdb build only.
+#[cfg(all(test, not(feature = "mdbx")))]
+mod format_freeze_tests;
 mod genesis;
 mod helpers;
+mod layout;
 mod output_overlay;
 #[cfg(test)]
 mod persist_bench;
 mod rpc;
 
+pub use exec_cache::ExecutionCacheStats;
 pub use execution::{BlockBuildTimings, OutputBuildScope};
+pub use layout::StorageLayout;
 pub use output_overlay::OutputTrieOverlay;
 
 /// This is a wrapped abstraction around Reth.
@@ -105,6 +115,10 @@ struct RethEnvInner {
     /// Built once and shared by every worker's RPC server (`get_rpc_server`), so all lanes use
     /// one ordered target list, one connection pool per target and one metrics set.
     tx_forwarder: Option<Arc<TxForwarder>>,
+    /// The cross-block execution cache between block builds (`env/exec_cache.rs`): checked out
+    /// by each block build and saved back, anchored at the built block's hash, only when the
+    /// build succeeds.
+    execution_cache: parking_lot::Mutex<exec_cache::ExecutionCacheSlot>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -197,7 +211,8 @@ impl RethEnv {
 
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
-        let provider_factory = Self::init_provider_factory(&node_config, database)?;
+        let provider_factory =
+            Self::init_provider_factory(&node_config, database, reth_config.new_datadir_layout())?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
         let restored_state_floor = Self::read_restored_state_floor(&node_config)?;
@@ -215,6 +230,7 @@ impl RethEnv {
                 task_spawner,
                 restored_state_floor,
                 tx_forwarder,
+                execution_cache: parking_lot::Mutex::new(exec_cache::ExecutionCacheSlot::new()),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
@@ -377,6 +393,15 @@ impl RethEnv {
             })
     }
 
+    /// The restored-state floor of a snapshot-restored datadir: block `B`, the snapshot's final
+    /// block, read from the marker at construction. `None` on a datadir that was not restored.
+    ///
+    /// This node did not execute `B` or any block below it: the restore imported `B`'s state and
+    /// scaffolded the headers below it. Every block above `B` was executed here.
+    pub fn restored_state_floor(&self) -> Option<u64> {
+        self.inner.restored_state_floor
+    }
+
     /// Return the lowest block number whose header is guaranteed REAL on this datadir.
     ///
     /// `0` on a normally-synced node: every persisted header is real down to genesis. On a
@@ -401,10 +426,14 @@ impl RethEnv {
             .map_or(0, |b| b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1))
     }
 
-    /// Initialize the provider factory and related components
+    /// Initialize the provider factory and related components.
+    ///
+    /// `new_datadir_layout` is the storage layout a new datadir gets; an existing datadir keeps
+    /// its own (`layout::settle`).
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
         database: RethDb,
+        new_datadir_layout: StorageLayout,
     ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();
@@ -418,16 +447,24 @@ impl RethEnv {
             runtime,
         )?;
 
+        // Settle the datadir's storage layout before anything else reads or writes through the
+        // factory: the consistency check below prunes static files by the layout's rules, so a
+        // datadir it cannot classify safely is refused first.
+        let layout = layout::settle(&provider_factory, new_datadir_layout)?;
+
         // Reconcile the storage backends before anything reads or writes through the factory.
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
-        // multi-backend commit: static files finalize, RocksDB commits, then MDBX commits last.
-        // A crash inside that window durably leaves static files and/or RocksDB one block ahead
-        // of the MDBX tip. `check_consistency` heals exactly that direction in place: it prunes
-        // the leading backends down to the MDBX stage checkpoints, which `save_blocks` advances
-        // inside the same MDBX transaction as the blocks. Without this call the divergence is
-        // permanent: every restart re-persists the same block into static files that already
-        // hold it, `save_blocks` fails with `UnexpectedStaticFileBlockNumber`, and the engine's
-        // `retryable_persist_fault` correctly treats that as terminal (issue #1238).
+        // multi-backend commit: static files are made durable, RocksDB commits, then MDBX commits
+        // last. The static files' segment threads in `save_blocks` sync each segment and write
+        // its configuration (vendored TN-0118), so from the end of `save_blocks` a crash, or a
+        // failure before the MDBX commit, durably leaves static files and/or RocksDB one output
+        // ahead of the MDBX tip. `check_consistency` heals exactly that direction in place: it
+        // prunes the leading backends down to the MDBX stage checkpoints, which
+        // `save_blocks` advances inside the same MDBX transaction as the blocks. Without
+        // this call the divergence is permanent: every restart re-persists the same block
+        // into static files that already hold it, `save_blocks` fails with
+        // `UnexpectedStaticFileBlockNumber`, and the engine's `retryable_persist_fault`
+        // correctly treats that as terminal (issue #1238).
         //
         // A returned unwind target is the opposite divergence: MDBX committed past a backend
         // that lost data. The commit ordering cannot produce that state; only corruption or
@@ -435,9 +472,10 @@ impl RethEnv {
         // but TN has no stage pipeline to unwind MDBX, so refuse to start instead of serving a
         // datadir whose backends disagree.
         //
-        // If TN ever adopts reth's storage v2 settings, re-verify snapshot-restored datadirs
-        // against this check first: v2 adds checked segments (transaction senders) that the
-        // restore scaffold must leave exactly at the stage checkpoints, or startup refuses here.
+        // Under reth's storage v2 layout the check also covers the transaction senders and both
+        // changeset segments. A snapshot restore must leave each exactly at the stage
+        // checkpoints, or startup refuses here: `SnapshotRestorer::import_chain_scaffold` advances
+        // them (`snapshot_restores_across_storage_layouts` reopens a restored v2 datadir).
         let (rocksdb_unwind, static_file_unwind) = provider_factory.check_consistency()?;
         [("RocksDB", rocksdb_unwind), ("the static files", static_file_unwind)]
             .into_iter()
@@ -454,9 +492,10 @@ impl RethEnv {
                 ))
             })?;
 
-        // Initialize genesis if needed
-        let genesis_hash = init_genesis(&provider_factory)?;
-        debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
+        // Initialize genesis if needed, in the settled layout: a new datadir records it in reth's
+        // `storage_settings` row with genesis; an existing one keeps its row.
+        let genesis_hash = init_genesis_with_settings(&provider_factory, layout.settings())?;
+        debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, %layout, "Initialized genesis");
 
         Ok(provider_factory)
     }
@@ -602,9 +641,10 @@ mod tests {
     /// `retryable_persist_fault` correctly treated that as terminal: a crash loop.
     ///
     /// The test persists block 1 through the production path, then reproduces the crash window
-    /// for block 2 by hand: `save_blocks` appends block 2 to both backends, ONLY the headers
-    /// static-file writer commits, and the MDBX transaction is dropped uncommitted. On disk the
-    /// headers static file is durably at 2 while MDBX is at 1, exactly the post-crash state.
+    /// for block 2 by hand: `save_blocks` appends block 2 to both backends and makes the static
+    /// files durable (each segment's configuration included, vendored TN-0118), the headers
+    /// writer's commit publishes its index, and the MDBX transaction is dropped uncommitted. On
+    /// disk the static files are durably at 2 while MDBX is at 1, exactly the post-crash state.
     /// A "restart" (a second `RethEnv` over the same datadir) must then (a) construct Ok,
     /// (b) heal the headers static-file tip back to 1 (`check_consistency` prunes the leading
     /// static files down to the MDBX stage checkpoints), and (c) accept block 2 again through
@@ -625,9 +665,10 @@ mod tests {
         assert_eq!(env1.last_block_number()?, 1, "block 1 must be committed");
 
         // block 2: build it, then simulate the crash inside the commit window. save_blocks
-        // appends block 2 to the static-file writers and the MDBX transaction; committing ONLY
-        // the headers static-file writer and then dropping the provider (aborting the MDBX
-        // transaction) leaves the headers static file durably at 2 while MDBX stays at 1.
+        // appends block 2 to the static-file writers and the MDBX transaction and leaves the
+        // static files durably at 2; the headers writer's commit only publishes its index for
+        // the assertion below, and dropping the provider aborts the MDBX transaction, so MDBX
+        // stays at 1.
         let output2 = consensus_output_for_tests(2, 0, 2, false);
         let payload2 = TNPayload::new_for_test(header1.clone(), &output2);
         let no_txs: Vec<Vec<u8>> = Vec::new();
@@ -648,10 +689,13 @@ mod tests {
             Some(2),
             "crash window must leave the headers static file durably at 2"
         );
+        // the committed tip reads from the `Finish` checkpoint, so it stays at 1 although the
+        // headers static file is at 2; the provider's own `last_block_number`
+        // resolves through that static file and would say 2 here
+        assert_eq!(env1.last_block_number()?, 1, "the committed tip must ignore the torn header");
         // the MDBX-side oracle is the Headers stage checkpoint: it is exactly what
-        // `check_consistency` compares the static-file tip against, and unlike
-        // `last_block_number` (which resolves through the headers static file, now at 2) it
-        // only moves when the MDBX transaction commits
+        // `check_consistency` compares the static-file tip against, and like the `Finish`
+        // checkpoint it only moves when the MDBX transaction commits
         let headers_checkpoint = env1
             .blockchain_provider()
             .database_provider_ro()?
@@ -682,33 +726,6 @@ mod tests {
         execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
         assert_eq!(env2.last_block_number()?, 2, "block 2 must commit after the heal");
 
-        Ok(())
-    }
-
-    /// A new datadir is written with reth's storage v1 layout, and a restart keeps it.
-    ///
-    /// The layout decides where receipts, change sets and history indices live, and historical
-    /// reads (including consensus-registry reads at past blocks) depend on the history indices.
-    /// A node on v2 would write no MDBX history indices and disagree with v1 nodes on those
-    /// reads. TN pins v1 through one vendored line, `StorageSettings::base()` (TN-0014), which
-    /// `init_genesis` writes into a new datadir; upstream main returns v2 there, so an upstream
-    /// sync that takes that line would silently switch new nodes. This test fails instead.
-    #[tokio::test]
-    async fn test_new_datadir_uses_storage_v1() -> eyre::Result<()> {
-        use reth_provider::{MetadataProvider as _, StorageSettings, StorageSettingsCache as _};
-
-        assert_eq!(StorageSettings::base(), StorageSettings::v1());
-
-        let genesis = test_genesis_with_consensus_registry(4);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-        let tmp = TempDir::new().expect("create temp dir");
-        for run in ["new datadir", "reopened datadir"] {
-            let tm = TaskManager::new(run);
-            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
-            let provider = env.blockchain_provider().database_provider_ro()?;
-            assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
-            assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
-        }
         Ok(())
     }
 }

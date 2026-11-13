@@ -75,6 +75,8 @@ pub struct DefaultRpcServerArgs {
     rpc_max_response_size: MaxU32,
     rpc_max_subscriptions_per_connection: MaxU32,
     rpc_max_connections: MaxU32,
+    rpc_max_batch_requests: u32,
+    rpc_max_active_filters: usize,
     rpc_max_tracing_requests: usize,
     rpc_max_blocking_io_requests: usize,
     rpc_max_trace_filter_blocks: u64,
@@ -249,6 +251,18 @@ impl DefaultRpcServerArgs {
         self
     }
 
+    /// TN(TN-0055): set the default max calls per batch request
+    pub const fn with_rpc_max_batch_requests(mut self, v: u32) -> Self {
+        self.rpc_max_batch_requests = v;
+        self
+    }
+
+    /// TN(TN-0056): set the default max installed filters
+    pub const fn with_rpc_max_active_filters(mut self, v: usize) -> Self {
+        self.rpc_max_active_filters = v;
+        self
+    }
+
     /// Set the default max connections
     pub const fn with_rpc_max_connections(mut self, v: MaxU32) -> Self {
         self.rpc_max_connections = v;
@@ -386,6 +400,8 @@ impl Default for DefaultRpcServerArgs {
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
+            rpc_max_batch_requests: constants::DEFAULT_MAX_BATCH_REQUESTS,
+            rpc_max_active_filters: constants::DEFAULT_MAX_ACTIVE_FILTERS,
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
             rpc_max_blocking_io_requests: constants::DEFAULT_MAX_BLOCKING_IO_REQUEST,
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
@@ -525,6 +541,14 @@ pub struct RpcServerArgs {
     /// Maximum number of RPC server connections.
     #[arg(long = "rpc.max-connections", alias = "rpc-max-connections", value_name = "COUNT", default_value_t = DefaultRpcServerArgs::get_global().rpc_max_connections)]
     pub rpc_max_connections: MaxU32,
+
+    /// TN(TN-0055): maximum number of calls in one JSON-RPC batch request, on HTTP, WS and IPC.
+    #[arg(long = "rpc.max-batch-requests", value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..), default_value_t = DefaultRpcServerArgs::get_global().rpc_max_batch_requests)]
+    pub rpc_max_batch_requests: u32,
+
+    /// TN(TN-0056): maximum number of installed filters (`eth_new*Filter`) across all clients.
+    #[arg(long = "rpc.max-active-filters", value_name = "COUNT", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), default_value_t = DefaultRpcServerArgs::get_global().rpc_max_active_filters)]
+    pub rpc_max_active_filters: usize,
 
     /// Maximum number of concurrent tracing requests.
     ///
@@ -811,6 +835,8 @@ impl Default for RpcServerArgs {
             rpc_max_response_size,
             rpc_max_subscriptions_per_connection,
             rpc_max_connections,
+            rpc_max_batch_requests,
+            rpc_max_active_filters,
             rpc_max_tracing_requests,
             rpc_max_blocking_io_requests,
             rpc_max_trace_filter_blocks,
@@ -855,6 +881,8 @@ impl Default for RpcServerArgs {
             rpc_max_response_size,
             rpc_max_subscriptions_per_connection,
             rpc_max_connections,
+            rpc_max_batch_requests,
+            rpc_max_active_filters,
             rpc_max_tracing_requests,
             rpc_max_blocking_io_requests,
             rpc_max_trace_filter_blocks,
@@ -1020,6 +1048,8 @@ mod tests {
             rpc_max_response_size: 160u32.into(),
             rpc_max_subscriptions_per_connection: 1024u32.into(),
             rpc_max_connections: 500u32.into(),
+            rpc_max_batch_requests: 100,
+            rpc_max_active_filters: 1000,
             rpc_max_tracing_requests: 16,
             rpc_max_blocking_io_requests: 256,
             rpc_max_trace_filter_blocks: 4000,

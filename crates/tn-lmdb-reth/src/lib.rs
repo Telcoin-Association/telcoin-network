@@ -53,10 +53,16 @@
 //! a dup table with another key width or `packed_max`: `DatabaseError::Open` with
 //! `MDBX_INCOMPATIBLE` and a message naming the table and both forms (`create_tables` meeting one
 //! gives the engine's `TableKind`: `DatabaseError::CreateTable` with MDBX's own
-//! `MDBX_INCOMPATIBLE` message). Test-only knobs, `TnLmdbArgs::composite_dup_tables` and
-//! `TnLmdbArgs::packed_dup_max`, open the nested layouts' tables composite or with a small bound
-//! (128 bytes: a key promotes at its second or third row), so the tests run every call on three
-//! forms: packed, packed-small and composite (the changesets' path).
+//! `MDBX_INCOMPATIBLE` message). The engine's catalog holds neither W nor a composite table's
+//! split, so `create_tables` also records each dup-sort table's layout (K, W, form) in a small
+//! plain table of the file's, `TnLmdbRethLayout`, which the open compares with this build's
+//! `DUP_LAYOUTS`: a difference is the same refusal, naming the table and both layouts
+//! (`a_file_whose_recorded_layout_differs_is_refused_at_open`). A file without the record (written
+//! before it) opens, no tn-lmdb file being in production yet. Test-only knobs,
+//! `TnLmdbArgs::composite_dup_tables` and `TnLmdbArgs::packed_dup_max`, open the nested layouts'
+//! tables composite or with a small bound (128 bytes: a key promotes at its second or third row),
+//! so the tests run every call on three forms: packed, packed-small and composite (the changesets'
+//! path).
 //!
 //! A leaf cell holds its value right after its key, so a read takes the value, the subkey then
 //! the rest, as one slice of the page (read by the move itself, the engine's tail moves such as
@@ -127,7 +133,7 @@
 //! | `TableNotFound`, `StaleTable`, a table never created | `MDBX_NOTFOUND` |
 //! | an unpositioned `delete_current` | `MDBX_ENODATA` |
 //! | `TableKind` | `MDBX_INCOMPATIBLE` |
-//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidMapReserve`, `InvalidDupOptions` | `MDBX_EINVAL` |
+//! | `InvalidTableName`, `InvalidPageSize`, `InvalidMaxGrowth`, `InvalidMapReserve`, `InvalidGapFill`, `InvalidDupOptions` | `MDBX_EINVAL` |
 //!
 //! A refused second value for a dup-sort row's subkey (below) is `MDBX_KEYEXIST` with a message of
 //! this crate's saying it stores one value per subkey. Six engine errors keep their own message,
@@ -141,9 +147,10 @@
 //! `MDBX_VERSION_MISMATCH`. `Failed` is also this crate's refusal of a write transaction whose held
 //! delete (the dup rewrite) broke the adapter's invariant: its row missing (damage the engine did
 //! not detect), or a second delete held before the first ran (an adapter bug); or whose
-//! `delete_current_duplicates` on an engine dup table removed no row, or left a row of its key (the
-//! tree and the cursor disagree). Its message says the environment did not latch: the commit
-//! refuses that transaction, and later ones carry on.
+//! `delete_current_duplicates` on an engine dup table removed no row, or left a row of its key
+//! anywhere in the tree (seen by the cursor's follower sharing the key, or by a look for the key's
+//! rows: the tree and the cursor disagree). Its message says the environment did not latch: the
+//! commit refuses that transaction, and later ones carry on.
 //!
 //! **Differences from MDBX.** reth's code reaches none of them. Each cursor difference is pinned
 //! beside MDBX's result by `known_cursor_deviations_from_mdbx` or
@@ -181,7 +188,17 @@
 //!   (`DatabaseError::Commit`); a dropped cursor cannot report it. It is never lost: the
 //!   transaction keeps it and its commit refuses it (the transaction aborts), and the errors that
 //!   damage and I/O give fail the environment as they would have. reth meets this only on such a
-//!   failure.
+//!   failure;
+//! - a damaged value or key (one reth's `Decompress` or `Decode` cannot read: a truncated
+//!   `Bytecode`, say) is `DatabaseError::Decode` at a `get` or a cursor's read, where reth's
+//!   decoders panic on it (`from_compact` expects its input well formed) and MDBX's backend lets
+//!   the panic through. The decode runs under a panic catch (`tx::guarded`), which costs nothing on
+//!   a value that decodes; `a_damaged_value_is_a_decode_error_not_a_panic` pins it. The process's
+//!   panic hook still runs first, at every read of the row: the default hook prints the panic's
+//!   message and where it panicked (in reth's decoder) to stderr, and a backtrace under
+//!   `RUST_BACKTRACE`, naming neither the table nor the key. The catch then logs an `error` naming
+//!   the table, the stored key in hex and the panic's message. This crate installs no hook; a build
+//!   with `panic = "abort"` would abort at the panic instead.
 //!
 //! The data:
 //! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for
@@ -216,16 +233,21 @@
 //! ends the key's rows as MDBX's does, and after `last` (or a fresh cursor's `prev`, a refused
 //! `append`, or an `append` that replaces the last key's value) a cursor, read-only or write, ends
 //! the table as MDBX's does. These still differ:
-//! 1. **past either end:** after `next` past the last row, `prev` before the first, a delete of the
-//!    table's last row or a `seek` past the end, MDBX's cursor stays on the end row (`current`
-//!    returns it, `delete_current` deletes it, `next` and `prev` step from it), where this one is
-//!    past the end (`current` finds nothing, `delete_current` is `MDBX_ENODATA`). This covers
-//!    `next_no_dup` before the first row (MDBX's goes to the second key) and
-//!    `delete_current_duplicates` there (MDBX's deletes the first key's rows), a table emptied by a
-//!    delete and given a row (MDBX's `prev` finds nothing), and two unset cursors that MDBX's
-//!    places: after a missed seek on an empty table that another writer then fills (MDBX's is as a
-//!    fresh one), and after a missed seek once another writer has deleted the row it landed on and
-//!    every row after it (MDBX's is then at the end);
+//! 1. **past either end:** this cursor goes past the end (`current` finds nothing, `delete_current`
+//!    is `MDBX_ENODATA`, and `prev` or `next` takes the end row), where MDBX's stays on an end row,
+//!    by case: after `next` past the last row (reached by `next`, not `last`, which both match) it
+//!    is on the last row, where `current` returns it, `delete_current` deletes it, `next` finds
+//!    nothing again and `prev` steps to the row before; after `prev` before the first row it is on
+//!    the first row, where `current` returns it, `delete_current` deletes it and `next` steps to
+//!    the second; after a delete of the table's last row it is on the new last row, where `current`
+//!    returns it and `prev` steps to the row before; and after a `seek` past the end it is on the
+//!    last row, where `current` returns it and `prev` returns that same row (no step, so there
+//!    `prev` matches this cursor's). This covers `next_no_dup` before the first row (MDBX's goes to
+//!    the second key) and `delete_current_duplicates` there (MDBX's deletes the first key's rows),
+//!    a table emptied by a delete and given a row (MDBX's `prev` finds nothing), and two unset
+//!    cursors that MDBX's places: after a missed seek on an empty table that another writer then
+//!    fills (MDBX's is as a fresh one), and after a missed seek once another writer has deleted the
+//!    row it landed on and every row after it (MDBX's is then at the end);
 //! 2. **another writer's delete and put:** another writer's delete of the cursor's row, then a put
 //!    between the row and its follower, or of the row's key, before the cursor's next call: the
 //!    cursor finds its place again at that call and is on the new row, where MDBX's is on the
@@ -306,6 +328,12 @@
 //! seed each run, printed with the counts and in a failure's message (`PROPTEST_RNG_SEED` reruns
 //! it, or picks the seed); `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs
 //! the scripts of seed 1 and pins their counts by class, so a class whose share moved fails.
+//! `random_scripts_match_mdbx_multi_leaf` (and `_heavy`) runs the same scripts on tables seeded
+//! with 250 rows under one `PlainStorageState` key and 250 `CanonicalHeaders`, the drawn keys and
+//! slots spread over them and the dup values in a wide encoding (subkeys that differ past their
+//! first byte, rests of several lengths), so the cursor writes and moves run inside multi-leaf
+//! nested trees and composite trees; in every run the dup table's skipped cursor calls must stay
+//! under a fifth of those run.
 //!
 //! **The crash cycles** (`killed_child_reopens_to_its_last_commit`, 5 cycles, and
 //! `killed_child_reopens_to_its_last_commit_heavy`, 200 in release; Unix only) run a child process
@@ -344,5 +372,8 @@ mod tests;
 pub use cursor::{TnLmdbCursor, TnLmdbCursorMut};
 pub use env::{RethTableStat, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
 pub use timeout::DEFAULT_READ_TRANSACTION_TIMEOUT;
-pub use tn_lmdb::{CheckReport, IoStats, SyncMode, TableCheck, MIN_GROWTH};
+pub use tn_lmdb::{
+    CheckReport, GapFill, IoStats, ParseGapFillError, SyncMode, TableCheck, MAX_GAP_FILL,
+    MIN_GROWTH,
+};
 pub use tx::{TnLmdbTx, TnLmdbTxMut};

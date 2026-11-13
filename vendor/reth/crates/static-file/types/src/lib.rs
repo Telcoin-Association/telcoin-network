@@ -15,10 +15,13 @@ mod compression;
 mod event;
 mod segment;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", unix))]
 mod changeset_offsets;
-#[cfg(feature = "std")]
-pub use changeset_offsets::{ChangesetOffsetReader, ChangesetOffsetWriter};
+#[cfg(all(feature = "std", unix))]
+pub use changeset_offsets::{
+    changeset_offset_record_size, ChangesetOffsetCache, ChangesetOffsetChecksumMismatch,
+    ChangesetOffsetReader, ChangesetOffsetWriter, CHANGESET_OFFSET_CACHE_BYTES,
+};
 
 use alloy_primitives::BlockNumber;
 pub use compression::Compression;

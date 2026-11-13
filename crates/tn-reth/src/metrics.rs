@@ -9,7 +9,17 @@
 //! whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total` (expected -
 //! duplicates/invalid transactions across independently-batching workers, labeled by `reason`, see
 //! [`InvalidTxSkipReason`]). See [`RethEnvMetrics`] and the skip-reason docs for per-series
-//! semantics.
+//! semantics. A third series, `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked
+//! hits of the cross-block execution cache that differed from the parent state, and a fourth,
+//! `tn_reth.parallel_state_root_mismatches_total` (alertable), sampled block roots whose parallel
+//! storage roots differed from the serial computation. A fifth,
+//! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
+//! counts blocks whose split account walk ran on one thread instead, and a sixth,
+//! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
+//! storage tries whose split storage root was not used. A seventh,
+//! `tn_reth.parallel_state_root_task_failures_total` (labeled by `reason`, see
+//! [`ParallelRootTaskFailure`]), counts the parallel state-root tasks that failed and left their
+//! part to the serial computation.
 //!
 //! Six histograms in the same group time the stages of each block built, one sample per block
 //! each: `tn_reth.block_signer_recovery_seconds` (per batch, ahead of the build: in the bytes
@@ -130,6 +140,9 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
     register_invalid_tx_skip_series();
+    register_account_walk_fallback_series();
+    register_storage_walk_fallback_series();
+    register_parallel_root_task_failure_series();
     register_retired_pool_handoff_series();
 }
 
@@ -174,6 +187,34 @@ pub(crate) struct RethEnvMetrics {
     /// issues #933 / #938); reaching that path at all means a batch carrying undecodable
     /// transaction bytes was certified, i.e. batch validation was bypassed somewhere upstream.
     pub(crate) unrecoverable_txs_dropped_total: Counter,
+
+    /// Checked hits of the cross-block execution cache that differed from the parent state.
+    ///
+    /// Alert on any nonzero value. One hit of each kind in `CHECK_ONE_HIT_IN` is re-read from
+    /// the parent state (`env/exec_cache.rs`); a stale one means an invariant of the cache failed.
+    /// The block is built again without the cache, so this node still builds the right block, but
+    /// unchecked stale hits of earlier blocks may already have forked it from its peers: compare
+    /// its recent block hashes with a peer's before trusting it, and report it. The sample follows
+    /// this node's own cache's hit counts, so a zero on one node says nothing about another.
+    pub(crate) exec_cache_stale_hits_total: Counter,
+
+    /// Compared block roots whose parallel storage roots gave another root or other trie updates
+    /// than the serial computation.
+    ///
+    /// Alert on any nonzero value. The blocks whose number is a multiple of
+    /// `CHECK_ONE_BLOCK_IN`, of those with parallel work (storage-root tasks or a split account
+    /// walk), are also computed serially (`env/output_overlay/parallel.rs`); a difference means
+    /// the parallel path is wrong. The block uses the serial result. Every node checks the same
+    /// blocks, so nodes running the same code publish the same root either way, but the
+    /// unchecked blocks the same bug hit carry the wrong one on all of them. The response is
+    /// network-wide: switch the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
+    /// or only the split the fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
+    /// `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it;
+    /// switching one node off only parts it from its peers. A node whose pool runs one thread
+    /// runs the same parallel code. The error log says whether the split composed the block's
+    /// root; a split's difference is also counted as [`AccountWalkFallback::Mismatch`], a
+    /// composed storage root's as [`StorageWalkFallback::Mismatch`].
+    pub(crate) parallel_state_root_mismatches_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
     ///
@@ -242,9 +283,9 @@ pub(crate) struct RethEnvMetrics {
     /// Part of [`RethEnvMetrics::block_finish_seconds`].
     pub(crate) block_state_root_seconds: Histogram,
 
-    /// Time from the end of `finish` to the built block: taking the bundle and advancing the
-    /// output's read cache with it, sorting the block's hashed state and trie updates, then
-    /// extending the output's overlay with them (`OutputTrieOverlay::extend_from_block`).
+    /// Time from the end of `finish` to the built block: taking the bundle, sorting the block's
+    /// hashed state and trie updates, then extending the output's overlay with them
+    /// (`OutputTrieOverlay::extend_from_block`).
     pub(crate) block_overlay_extend_seconds: Histogram,
 }
 
@@ -400,6 +441,191 @@ fn register_invalid_tx_skip_series() {
 /// series observable from a unit test.
 pub(crate) fn record_invalid_tx_skipped(reason: InvalidTxSkipReason) {
     metrics::counter!(INVALID_TXS_SKIPPED, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for blocks whose state root would split the account walk but ran it on one thread
+/// (`env/output_overlay/account_split.rs`), kept next to its only emission helper so the
+/// registration in [`register_account_walk_fallback_series`] and the increment in
+/// [`record_account_walk_fallback`] cannot drift apart. One series per [`AccountWalkFallback`].
+const ACCOUNT_WALK_FALLBACKS: &str = "tn_reth.account_walk_fallbacks_total";
+
+/// Why a block's split account walk ran on one thread (or, for [`Self::Mismatch`], why its
+/// result was replaced by the serial one). Labels [`ACCOUNT_WALK_FALLBACKS`].
+///
+/// Only blocks the split would take count: a node with `TN_PARALLEL_ACCOUNT_WALK=0` or
+/// `TN_PARALLEL_STATE_ROOT=0` counts nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountWalkFallback {
+    /// Fewer changed accounts than `SPLIT_MIN_ACCOUNTS`: the split's fixed costs are not worth
+    /// paying. Expected on most blocks of a quiet chain.
+    FewChanges,
+    /// The trie's shape is not one the split composes: a first nibble's node with a leaf or an
+    /// extension child, fewer than two non-empty first nibbles, or a rebuilt node that failed its
+    /// hash check. Expected while the account trie is small (a few thousand accounts or fewer);
+    /// the block paid for the split and then the walk on one thread.
+    Shape,
+    /// The database holds an account-trie node at the empty path, which reth never writes.
+    /// Alert on any nonzero value: the stored trie is not one reth wrote.
+    StoredRootNode,
+    /// A sampled serial check found the split's root or trie updates wrong; the block used the
+    /// serial result. Alert on any nonzero value: also counted in
+    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
+    /// (`TN_PARALLEL_ACCOUNT_WALK=0`) and report it.
+    Mismatch,
+}
+
+impl AccountWalkFallback {
+    /// Every variant, for zero-registration in [`register_account_walk_fallback_series`]. Extend
+    /// it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::FewChanges, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FewChanges => "few_changes",
+            Self::Shape => "shape",
+            Self::StoredRootNode => "stored_root_node",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Register one account-walk fallback series per [`AccountWalkFallback`] at zero. Called from
+/// [`init`], for the reasons given there.
+fn register_account_walk_fallback_series() {
+    AccountWalkFallback::ALL.iter().for_each(|reason| {
+        metrics::counter!(ACCOUNT_WALK_FALLBACKS, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one block whose split account walk fell back, labeled by [`AccountWalkFallback`]. The
+/// macro path re-resolves the recorder on every call, keeping the series observable from a unit
+/// test.
+pub(crate) fn record_account_walk_fallback(reason: AccountWalkFallback) {
+    metrics::counter!(ACCOUNT_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for hot storage tries whose storage root would be split by first nibble but was
+/// computed on one task or by the walk (`env/output_overlay/storage_split.rs`), kept next to its
+/// only emission helper so the registration in [`register_storage_walk_fallback_series`] and the
+/// increment in [`record_storage_walk_fallback`] cannot drift apart. One series per
+/// [`StorageWalkFallback`].
+const STORAGE_WALK_FALLBACKS: &str = "tn_reth.storage_walk_fallbacks_total";
+
+/// Why a hot storage trie (a storage-root target with at least `SPLIT_MIN_SLOTS` changed slots)
+/// was not split, or its split result not used. Labels [`STORAGE_WALK_FALLBACKS`]; counted once
+/// per such trie and block.
+///
+/// Only tries the split would take count: a node with `TN_PARALLEL_STORAGE_WALK=0` or
+/// `TN_PARALLEL_STATE_ROOT=0` counts nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageWalkFallback {
+    /// The stored trie failed the pre-check (a first-nibble node missing or with a leaf or
+    /// extension child): a trie of a few thousand slots or fewer. Not tried, so free: its storage
+    /// root ran on one task.
+    SmallTrie,
+    /// The pieces composed nothing (the block's changes left a first-nibble node that is not a
+    /// branch over hashed children, fewer than two non-empty first nibbles, or an empty storage):
+    /// the block paid for the pieces and then the walk computed the storage root serially.
+    Shape,
+    /// The database holds a storage-trie node at the empty path, which reth never writes. Alert
+    /// on any nonzero value: the stored trie is not one reth wrote.
+    StoredRootNode,
+    /// A sampled serial check found a block with a composed storage root wrong; the block used
+    /// the serial result. Alert on any nonzero value: also counted in
+    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
+    /// (`TN_PARALLEL_STORAGE_WALK=0`) and report it.
+    Mismatch,
+}
+
+impl StorageWalkFallback {
+    /// Every variant, for zero-registration in [`register_storage_walk_fallback_series`]. Extend
+    /// it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SmallTrie => "small_trie",
+            Self::Shape => "shape",
+            Self::StoredRootNode => "stored_root_node",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Register one storage-walk fallback series per [`StorageWalkFallback`] at zero. Called from
+/// [`init`], for the reasons given there.
+fn register_storage_walk_fallback_series() {
+    StorageWalkFallback::ALL.iter().for_each(|reason| {
+        metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one hot storage trie whose split fell back, labeled by [`StorageWalkFallback`]. The
+/// macro path re-resolves the recorder on every call, keeping the series observable from a unit
+/// test.
+pub(crate) fn record_storage_walk_fallback(reason: StorageWalkFallback) {
+    metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for parallel state-root work (a storage-root task, a walk helper, an account
+/// subtrie or a storage piece) that failed and left its part to the serial computation
+/// (`env/output_overlay/parallel.rs`), kept next to its only emission helper so the registration
+/// in [`register_parallel_root_task_failure_series`] and the increment in
+/// [`record_parallel_root_task_failure`] cannot drift apart. One series per
+/// [`ParallelRootTaskFailure`].
+const PARALLEL_ROOT_TASK_FAILURES: &str = "tn_reth.parallel_state_root_task_failures_total";
+
+/// Why a piece of a block's parallel state-root work failed. Labels
+/// [`PARALLEL_ROOT_TASK_FAILURES`]; counted once per failed task, helper, subtrie or piece.
+///
+/// A failure costs time, not correctness: the block computes that part serially, on this node
+/// only. It is the one place a node's parallel work differs from its peers'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParallelRootTaskFailure {
+    /// Opening the task's read-only transaction failed.
+    Provider,
+    /// A database read failed.
+    Database,
+    /// The task's transaction saw another finalized block than the walk's: something wrote the
+    /// state or trie tables while an output's blocks were built. Alert on any nonzero value: the
+    /// node has no such writer (`parallel.rs`'s module docs), and a writer that did not advance
+    /// the finalized block would go unseen.
+    TipMoved,
+    /// The task panicked.
+    Panicked,
+}
+
+impl ParallelRootTaskFailure {
+    /// Every variant, for zero-registration in [`register_parallel_root_task_failure_series`].
+    /// Extend it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::Provider, Self::Database, Self::TipMoved, Self::Panicked];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Database => "database",
+            Self::TipMoved => "tip_moved",
+            Self::Panicked => "panicked",
+        }
+    }
+}
+
+/// Register one parallel-root task failure series per [`ParallelRootTaskFailure`] at zero.
+/// Called from [`init`], for the reasons given there.
+fn register_parallel_root_task_failure_series() {
+    ParallelRootTaskFailure::ALL.iter().for_each(|reason| {
+        metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one failed piece of parallel state-root work, labeled by [`ParallelRootTaskFailure`].
+/// Called on the failure path only. The macro path re-resolves the recorder on every call,
+/// keeping the series observable from a unit test.
+pub(crate) fn record_parallel_root_task_failure(reason: ParallelRootTaskFailure) {
+    metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(1);
 }
 
 /// Counter names for the retired-worker pool handoff, kept next to their only emission sites so
@@ -1257,6 +1483,117 @@ mod tests {
                     reason.label()
                 );
             });
+    }
+
+    /// [`register_storage_walk_fallback_series`] registers one series per
+    /// [`StorageWalkFallback`] at zero, and a recorded fallback moves only its own reason's.
+    #[test]
+    fn test_storage_walk_fallbacks_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_storage_walk_fallback_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == StorageWalkFallback::SmallTrie { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
+    }
+
+    /// [`register_account_walk_fallback_series`] registers one series per
+    /// [`AccountWalkFallback`] at zero, and a recorded fallback moves only its own reason's.
+    #[test]
+    fn test_account_walk_fallbacks_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_account_walk_fallback_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        AccountWalkFallback::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, ACCOUNT_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_account_walk_fallback(AccountWalkFallback::Shape);
+            record_account_walk_fallback(AccountWalkFallback::Shape);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        AccountWalkFallback::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == AccountWalkFallback::Shape { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, ACCOUNT_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
+    }
+
+    /// [`register_parallel_root_task_failure_series`] registers one series per
+    /// [`ParallelRootTaskFailure`] at zero, and a recorded failure moves only its own reason's.
+    #[test]
+    fn test_parallel_root_task_failures_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_parallel_root_task_failure_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == ParallelRootTaskFailure::TipMoved { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
     }
 
     /// [`InvalidTxSkipReason::classify`] must map each named cause to its own label and

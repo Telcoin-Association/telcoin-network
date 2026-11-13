@@ -139,8 +139,13 @@ where
         // Repair a stale slot even if a previous recovery already executed the whole suffix
         // and there is nothing left to replay, including across an epoch boundary.
         self.consensus_chain.recover_latest_consensus_from_execution(&executed).await?;
-        let missing =
-            state_sync::get_missing_consensus(&self.consensus_bus, &self.consensus_chain).await?;
+        // only this epoch's headers, plus the first of another epoch, which is refused below
+        let missing = state_sync::get_missing_consensus(
+            &self.consensus_bus,
+            &self.consensus_chain,
+            committee.epoch(),
+        )
+        .await?;
         let mut last_replayed_hash = None;
         let mut epoch_close_hash = None;
         let mut parent = executed;

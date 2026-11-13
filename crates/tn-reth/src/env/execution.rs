@@ -19,9 +19,13 @@
 //! database transaction with the current block's deltas layered over the overlay.
 //! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
 //! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
-//! cost bound. All other state reads still resolve through reth's memory overlay,
-//! behind a read cache that the engine keeps for the whole output (see
-//! [`OutputBuildScope`]).
+//! cost bound. The storage roots of the accounts with changed storage run on parallel tasks
+//! beside the account walk, a block with many changed accounts splits the walk itself by first
+//! nibble, and a hot contract's storage root is split the same way (`output_overlay/parallel.rs`,
+//! `output_overlay/account_split.rs`, `output_overlay/storage_split.rs`; `TN_PARALLEL_STATE_ROOT=0`
+//! turns all off, `TN_PARALLEL_ACCOUNT_WALK=0` and `TN_PARALLEL_STORAGE_WALK=0` each split). All
+//! other state reads go through the cross-block execution cache (`exec_cache.rs`: values at the
+//! parent block, kept across blocks and outputs) and, on a miss, reth's memory overlay.
 //!
 //! # Deliberate transaction drops (fork safety)
 //!
@@ -76,14 +80,9 @@ use reth_evm::{
 };
 use reth_provider::{
     BlockExecutionOutput, CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProviderFactory as _,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory as _,
 };
-use reth_revm::{
-    cached::{CachedAccount, CachedReads},
-    database::StateProviderDatabase,
-    db::BundleState,
-    State,
-};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::BundleState, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
     deconstruct_nonce, ConsensusNumHash, ConsensusOutput, EngineUpdate, Recovered, Round,
@@ -99,9 +98,24 @@ use crate::{
 };
 
 use super::{
+    exec_cache::{CachedStateProvider, ExecutionCache},
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
     RethEnv,
 };
+
+/// A payload executed and finished by `RethEnv::execute_payload`, not yet sealed into an
+/// [`ExecutedBlock`].
+struct ExecutedPayload {
+    /// The block, its execution result and its state and trie deltas.
+    outcome: BlockBuilderOutcome<TNPrimitives>,
+    /// The block's bundle: the state persistence writes and the cache takes.
+    bundle: BundleState,
+    /// When `finish` returned: the start of the overlay-extend stage.
+    finish_ended: Instant,
+    /// The attempt's laps so far: `evm`, `root`, and in `finish` the part of `builder.finish`
+    /// outside the root (`seal_executed_payload` adds the rest).
+    timings: BlockBuildTimings,
+}
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -133,7 +147,7 @@ impl RethEnv {
     /// cursors: current block's sorted deltas over the accumulated overlay over the
     /// database, prefix sets from the current block only (see
     /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
-    /// still resolve through reth's memory overlay, unchanged.
+    /// go through the cross-block execution cache, then reth's memory overlay on a miss.
     ///
     /// For `N` blocks with at most `M` delta entries each, sorting remains
     /// `O(M log M)` per block. Equal-level sorted runs compact with cumulative
@@ -147,14 +161,24 @@ impl RethEnv {
     /// pass a fresh empty overlay per block: the database then already holds the
     /// parent state, so the empty overlay is exact.
     ///
+    /// # Stale cache hits
+    ///
+    /// When a checked hit of the execution cache differs from the parent state
+    /// (`env/exec_cache.rs`, "Checks"), the attempt is discarded before it touches
+    /// `overlay`, the whole cache is dropped, and the block is built once more without a
+    /// cache, from the same recovered transactions, so the returned block is the one a node
+    /// without the cache builds. That rebuild reads no cache, so it cannot see a stale hit; one
+    /// would be a bug and fails the build. The rebuilt block's stage timings and invalid
+    /// transaction skips are recorded a second time; signer recovery runs once.
+    ///
     /// # Callers
     ///
     /// The engine never calls this: it recovers signers with [`Self::recover_output_signers`]
     /// and builds through [`Self::build_block_from_recovered_payload`]. Every remaining caller of
     /// this and [`Self::build_block_from_batch_payload_timed`] is a test, a `#[cfg(test)]` module
     /// or a `test-utils` helper. Both are kept as the differential oracle for the recovered path:
-    /// they recover each batch themselves and build from an empty read cache, so a test can
-    /// compare their blocks with the recovered build's.
+    /// they recover each batch themselves, so a test can compare their blocks with the recovered
+    /// build's.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
@@ -172,9 +196,9 @@ impl RethEnv {
     /// phases, and the root lap is read off the state-root provider wrapper after `finish`
     /// returns. The signers are recovered first, exactly as [`Self::recover_output_signers`]
     /// recovers one batch, and the recovered transactions go through the build that
-    /// [`Self::build_block_from_recovered_payload`] runs, so both entry points share one build.
-    /// Every call starts from an empty read cache; only the caller's `overlay` carries over from
-    /// one block of an output to the next.
+    /// [`Self::build_block_from_recovered_payload`] runs, so both entry points share one build,
+    /// the execution cache included. Only the caller's `overlay` carries over from one block of
+    /// an output to the next.
     ///
     /// Like the untimed call, this has no production caller: tests keep it as the differential
     /// oracle for the recovered path (see the callers note on
@@ -191,10 +215,7 @@ impl RethEnv {
         record_unrecoverable(transactions.len(), recovered.len());
         let recover = stamp.elapsed();
 
-        // a fresh read cache per call: these callers build one block at a time, often persisting
-        // between builds, so no read is kept past the block it was made for
-        let (block, timings) =
-            self.build_recovered_block(payload, recovered, overlay, &mut CachedReads::default())?;
+        let (block, timings) = self.build_recovered_block(payload, &recovered, overlay)?;
         Ok((block, BlockBuildTimings { recover, ..timings }))
     }
 
@@ -249,14 +270,15 @@ impl RethEnv {
     /// `recovered` is the batch's entry of [`Self::recover_output_signers`]: the transactions
     /// that survived signer recovery, in batch order. The build is the one
     /// [`Self::build_block_from_batch_payload`] runs after its own recovery (see its docs for
-    /// the drop semantics and the state-root path), so the same recovered transactions build
-    /// the same block. The returned timings' `recover` lap is zero: no recovery runs here.
+    /// the drop semantics, the state-root path and stale cache hits), so the same recovered
+    /// transactions build the same block. The build borrows `recovered`: each attempt clones a
+    /// transaction into the block builder, because a stale cache hit executes the block twice.
+    /// The returned timings' `recover` lap is zero: no recovery runs here.
     ///
     /// `scope` is the consensus output's [`OutputBuildScope`]: the block's state root layers over
-    /// its trie overlay, and its account, storage, code and block-hash reads go through its read
-    /// cache before the parent state provider. A successful build leaves both describing the
-    /// returned block's post-state, ready for the next block of the output. After an error the
-    /// scope no longer matches any block the caller will build next: drop it.
+    /// its trie overlay, and a successful build leaves it describing the returned block's
+    /// post-state, ready for the next block of the output. After an error the scope no longer
+    /// matches any block the caller will build next: drop it.
     ///
     /// # Errors
     ///
@@ -270,31 +292,88 @@ impl RethEnv {
         scope: &mut OutputBuildScope,
     ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
         scope.check_parent(payload.parent_header.hash())?;
-        let OutputBuildScope { overlay, reads, tip } = scope;
-        let (block, timings) = self.build_recovered_block(payload, recovered, overlay, reads)?;
+        let OutputBuildScope { overlay, tip } = scope;
+        let (block, timings) = self.build_recovered_block(payload, &recovered, overlay)?;
         *tip = Some(block.recovered_block.hash());
         Ok((block, timings))
     }
 
     /// The block build behind every entry point: execute `recovered` on the parent state read
-    /// through `reads`, root it over `overlay`, then advance `overlay` and `reads` to the built
-    /// block's post-state.
+    /// through the execution cache, root it over `overlay`, then extend `overlay` with the built
+    /// block and check the cache in at it. On a stale cache hit the attempt is discarded and the
+    /// block built once more without a cache (see "Stale cache hits" on
+    /// [`Self::build_block_from_batch_payload`]); the returned laps are the final attempt's.
     ///
-    /// Neither is advanced on an error: every fallible step runs before the bundle is taken.
+    /// `overlay` is not extended on an error: every fallible step runs before the seal.
     fn build_recovered_block(
         &self,
         payload: TNPayload,
-        recovered: Vec<Recovered<TransactionSigned>>,
+        recovered: &[Recovered<TransactionSigned>],
         overlay: &mut OutputTrieOverlay,
-        reads: &mut CachedReads,
     ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
+        let parent_hash = payload.parent_header.hash();
+        trace!(target: "engine::dump", parent_header = ?payload.parent_header, "retrieving state for next block");
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(parent_hash)?;
+        // Cross-block read cache (`env/exec_cache.rs`): the saved cache when it is anchored at
+        // this block's parent, else an empty one. Checked out for the whole build and checked in
+        // only at the end of a successful one, so any error below drops it (its code table
+        // kept). The state root keeps the plain provider: it reads the trie, not values.
+        let exec_cache = self.check_out_execution_cache(parent_hash);
+        let cached_provider = CachedStateProvider::new(&state_provider, exec_cache.as_ref());
+        let executed = self.execute_payload(
+            payload.clone(),
+            recovered,
+            &state_provider,
+            &cached_provider,
+            overlay,
+        );
+        if !cached_provider.served_stale() {
+            return match executed {
+                Ok(executed) => Ok(self.seal_executed_payload(executed, overlay, exec_cache)),
+                Err(err) => {
+                    // a failed attempt says nothing against `keccak256(code) -> code`
+                    if let Some(cache) = exec_cache {
+                        self.keep_execution_cache_code(cache);
+                    }
+                    Err(err)
+                }
+            };
+        }
+
+        // A checked hit was stale, so other hits of this attempt may have been too: whatever it
+        // returned (block or error) is discarded, and the cache with it.
+        self.drop_stale_execution_cache(exec_cache);
+        error!(target: "engine", %parent_hash, "execution cache dropped after a stale hit: building the block again without it");
+        let uncached_provider = CachedStateProvider::new(&state_provider, None);
+        let executed =
+            self.execute_payload(payload, recovered, &state_provider, &uncached_provider, overlay)?;
+        if uncached_provider.served_stale() {
+            return Err(TnRethError::ExecutionCacheStaleOnRebuild(parent_hash));
+        }
+        Ok(self.seal_executed_payload(executed, overlay, None))
+    }
+
+    /// Execute `recovered` on `payload`'s parent state and finish the block: the body of
+    /// [`Self::build_recovered_block`] up to the state root. Reads go through
+    /// `exec_provider` (over `state_provider`, the parent state); the root runs over
+    /// `state_provider` and `overlay`. Besides the returned value it changes only the stage
+    /// metrics, the skip counters and the execution cache's fills.
+    fn execute_payload(
+        &self,
+        payload: TNPayload,
+        recovered: &[Recovered<TransactionSigned>],
+        state_provider: &StateProviderBox,
+        exec_provider: &CachedStateProvider<'_, &StateProviderBox>,
+        overlay: &OutputTrieOverlay,
+    ) -> TnRethResult<ExecutedPayload> {
         let parent_header = payload.parent_header.clone();
-        trace!(target: "engine::dump", ?parent_header, "retrieving state for next block");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db =
-            State::builder().with_database(reads.as_db_mut(state)).with_bundle_update().build();
+        let state = StateProviderDatabase::new(exec_provider);
+        // per attempt, so a rebuild after a stale hit starts from nothing cached
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
 
         debug!(
             target: "engine",
@@ -314,15 +393,12 @@ impl RethEnv {
         builder.apply_pre_execution_changes().inspect_err(|err| {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
-        let setup = lap(&mut stamp);
 
-        // Execute the recovered transactions sequentially, in batch order.
+        // Execute the recovered transactions sequentially, in batch order. Each is cloned into
+        // the builder: a rebuild after a stale cache hit executes the same transactions again.
         for tx in recovered {
-            // the hash is cached at decode and is not an execution input: reading it first lets
-            // the transaction move into the builder without a per-transaction clone
-            let tx_hash = *tx.tx_hash();
             // forks are impossible
-            match builder.execute_transaction(tx) {
+            match builder.execute_transaction(tx.clone()) {
                 Ok(_gas_used) => (),
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -331,7 +407,7 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    debug!(target: "engine", %error, ?tx_hash, "skipping invalid transaction");
+                    debug!(target: "engine", %error, tx_hash = ?tx.tx_hash(), "skipping invalid transaction");
                     // expected in normal operation - see the reason docs, this is not an alert
                     record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
                     continue;
@@ -340,36 +416,56 @@ impl RethEnv {
                 Err(err) => return Err(err.into()),
             }
         }
-        let evm = setup.saturating_add(lap(&mut stamp));
+        let evm = lap(&mut stamp);
 
-        let finish_started = Instant::now();
+        let finish_started = stamp;
         RETH_METRICS.block_execute_seconds.record(finish_started.duration_since(execute_started));
 
-        // Scope the wrapper so its borrows of the overlay are dropped before the
-        // overlay is extended below (`Arc::make_mut` must not see a live borrow).
+        // Scope the wrapper so its borrow of the overlay ends here; the caller extends the
+        // overlay in `seal_executed_payload` (`Arc::make_mut` must not see a live borrow).
         // `finish` runs the state root through the wrapper, which times it; the root lap is
         // read off the wrapper before it drops and taken out of the finish lap below.
-        let (BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates }, root) = {
+        let (outcome, root) = {
             let root_provider = OverlayRootStateProvider::new(
-                &state_provider,
+                state_provider,
                 overlay,
                 &self.inner.blockchain_provider,
+                parent_header.number + 1,
             );
             let outcome = builder.finish(&root_provider)?;
             (outcome, root_provider.root_elapsed())
         };
         let finish_ended = Instant::now();
         RETH_METRICS.block_finish_seconds.record(finish_ended.duration_since(finish_started));
+        let finish = finish_ended.saturating_duration_since(finish_started).saturating_sub(root);
+        Ok(ExecutedPayload {
+            outcome,
+            bundle: db.take_bundle(),
+            finish_ended,
+            timings: BlockBuildTimings { recover: Duration::ZERO, evm, root, finish },
+        })
+    }
+
+    /// Seal an [`ExecutedPayload`] into the block: sort its deltas, extend `overlay` with them
+    /// and check `exec_cache` in with its bundle. Returns the block and the attempt's laps, the
+    /// seal added to the finish lap.
+    fn seal_executed_payload(
+        &self,
+        executed: ExecutedPayload,
+        overlay: &mut OutputTrieOverlay,
+        exec_cache: Option<ExecutionCache>,
+    ) -> (ExecutedBlock, BlockBuildTimings) {
+        let ExecutedPayload {
+            outcome: BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates },
+            bundle,
+            finish_ended,
+            timings,
+        } = executed;
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
-        // `finish` merged every transition of the block, the closing system calls included, so
-        // the bundle is the block's whole state change; the build cannot fail past this point
-        let bundle = db.take_bundle();
-        // end the state's borrow of the read cache before the cache is advanced
-        drop(db);
-        advance_cached_reads(reads, &bundle);
         let block_execution_output =
             BlockExecutionOutput { result: execution_result, state: bundle };
+        let block_hash = block.hash();
         let (sorted_hashed_state, sorted_trie_updates) =
             rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
         let computed_trie_data = ComputedTrieData::without_trie_input(
@@ -382,14 +478,18 @@ impl RethEnv {
         // `ComputedTrieData`, so nothing is recomputed.
         overlay.extend_from_block(&computed_trie_data);
         RETH_METRICS.block_overlay_extend_seconds.record(finish_ended.elapsed());
-        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
+        // The bundle the cache takes is the one persistence writes (`save_blocks` reads
+        // `execution_output.state`); last step, after everything fallible.
+        if let Some(cache) = exec_cache {
+            self.check_in_execution_cache(cache, block_hash, &block_execution_output.state);
+        }
+        let block = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
             computed_trie_data,
         );
-        let finish = lap(&mut stamp).saturating_sub(root);
-
-        Ok((res, BlockBuildTimings { recover: Duration::ZERO, evm, root, finish }))
+        let finish = timings.finish.saturating_add(finish_ended.elapsed());
+        (block, BlockBuildTimings { finish, ..timings })
     }
 
     /// Finalize the block (header) executed from consensus output in memory.
@@ -453,6 +553,13 @@ impl RethEnv {
     /// and the counters `tn_reth.persisted_accounts_total` and
     /// `tn_reth.persisted_storage_slots_total`. A failed attempt records nothing.
     pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
+        // The cache is anchored at the last built block, whose state the failed commit did not
+        // make durable; the blocks are rebuilt or the node stops, so start the next build empty.
+        self.persist_blocks(blocks).inspect_err(|_| self.clear_execution_cache())
+    }
+
+    /// The body of [`Self::persist_executed_output`], with its error contract.
+    fn persist_blocks(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(feature = "test-utils", test))]
@@ -644,6 +751,17 @@ impl RethEnv {
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// BENCH-ONLY: the static files' sync timings since the last call, per segment and phase
+    /// (data, offsets and `.csoff` syncs and the `.conf` freeze, which `save_blocks` runs in
+    /// each segment's thread, and the index update in the commit), and starts a new period
+    /// (vendored TN-0119). Call it after each [`Self::persist_executed_output`] for that
+    /// persist's split. Timings are this environment's own; no other provider adds to them.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn take_static_file_sync_stats(&self) -> reth_provider::providers::StaticFileSyncStats {
+        use reth_provider::StaticFileProviderFactory as _;
+        self.inner.blockchain_provider.static_file_provider().take_sync_stats()
+    }
 }
 
 /// `tn_reth.persist_save_blocks_seconds`: `save_blocks` time per successful persist.
@@ -656,30 +774,14 @@ const PERSISTED_ACCOUNTS_TOTAL: &str = "tn_reth.persisted_accounts_total";
 const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_total";
 
 /// The build state one consensus output's blocks share: the trie overlay their state roots layer
-/// over and the cache their state reads go through.
+/// over, and the block the output was last advanced to.
 ///
 /// The engine creates one scope per consensus output, before its first block, and passes it to
 /// [`RethEnv::build_block_from_recovered_payload`] for each block of the output in order. A
-/// successful build advances both halves to the built block's post-state; the scope is dropped
-/// with the output.
-///
-/// # Invariant
-///
-/// The read cache is a subset of the true pre-block state for the next block of this output:
-/// every cached account, storage slot, bytecode and block hash equals what that block's parent
-/// state provider returns for it, and anything absent is read from the provider. A hit therefore
-/// returns exactly what a fresh read would, and every block is byte-identical to the block an
-/// empty cache builds; the differential tests in `tests/it/trie_overlay.rs` and
-/// `tests/it/cached_reads_props.rs` pin that. Each build advances the cache from the block's
-/// bundle state, the change set the next block's provider resolves the parent from (see
-/// `advance_cached_reads`), so senders, recipients and contracts read by several blocks of one
-/// output are loaded from the database once.
-///
-/// One revm `State` kept across the blocks would also save the reads but breaks the roots: an
-/// account's `DestroyedChanged` status stays sticky across blocks, and reth rebuilds such an
-/// account's storage as wiped, so an account created and self-destructed in one block, recreated
-/// with a storage write in the next and written again in a third would lose the second block's
-/// slot from the state root.
+/// successful build extends the overlay with the built block's deltas and moves the tip to it;
+/// the scope is dropped with the output. State reads do not live here: they go through the
+/// cross-block execution cache (`exec_cache.rs`), which outlives the output and checks its own
+/// anchor.
 ///
 /// # Errors
 ///
@@ -689,13 +791,11 @@ const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_tot
 ///
 /// The scope remembers the block it was last advanced to and refuses a payload on any other
 /// parent ([`TnRethError::ScopeParentMismatch`]), so a scope kept past its output or reused on
-/// another branch fails closed instead of serving reads of a different state.
+/// another branch fails closed instead of layering the root over a different state.
 #[derive(Debug, Default)]
 pub struct OutputBuildScope {
     /// The output's accumulated trie overlay (see [`OutputTrieOverlay`]).
     overlay: OutputTrieOverlay,
-    /// Reads of the next block's parent state, advanced past every built block.
-    reads: CachedReads,
     /// The hash of the block the scope was last advanced to: the only parent it builds on.
     /// `None` until the first block of the output is built.
     tip: Option<B256>,
@@ -703,15 +803,9 @@ pub struct OutputBuildScope {
 
 impl OutputBuildScope {
     /// An empty scope for the first block of an output: no overlay (the database holds the
-    /// parent state) and no cached reads.
+    /// parent state).
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// The read cache the next block of the output starts from (tests inspect it).
-    #[cfg(any(feature = "test-utils", test))]
-    pub fn reads(&self) -> &CachedReads {
-        &self.reads
     }
 
     /// Fail closed unless `parent` is the block the scope was last advanced to (any parent
@@ -728,8 +822,9 @@ impl OutputBuildScope {
 
 /// Wall time of the phases of one [`RethEnv::build_block_from_batch_payload_timed`] call.
 ///
-/// The four laps are disjoint; opening the parent state provider falls outside all of them.
-/// Observability only: nothing here feeds block contents.
+/// The four laps are disjoint; opening the parent state provider and checking the execution
+/// cache out fall outside all of them, and so does an attempt discarded after a stale cache hit
+/// (the laps are the final attempt's). Observability only: nothing here feeds block contents.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlockBuildTimings {
     /// Parallel signer recovery of the batch's transactions; zero from
@@ -741,8 +836,8 @@ pub struct BlockBuildTimings {
     /// transaction it opens.
     pub root: Duration,
     /// The rest of `builder.finish` (closing system calls, bundle merge, hashed post-state and
-    /// block assembly), plus the bundle take, the read-cache advance, the delta sorts and the
-    /// overlay extend.
+    /// block assembly), plus the bundle take, the delta sorts, the overlay extend and the
+    /// execution cache's check-in.
     pub finish: Duration,
 }
 
@@ -881,57 +976,6 @@ fn record_unrecoverable(handed: usize, recovered: usize) {
         .increment(u64::try_from(handed.saturating_sub(recovered)).unwrap_or(u64::MAX));
 }
 
-/// Advance an output's read cache from a built block's parent state to its post-state.
-///
-/// `bundle` is the block's whole state change. The next block's parent state provider answers
-/// every address in it from it (`BundleAccount::account_info`, `BundleAccount::storage_slot`)
-/// and every other address from the state below, which the block left unchanged, so cache
-/// entries of addresses outside the bundle stay valid. Each address in the bundle gets the
-/// provider's answer:
-///
-/// - destroyed in the block (`Destroyed`, `DestroyedChanged` when recreated after the destruct,
-///   `DestroyedAgain`) or left without info (deleted, or cleared as empty under EIP-161): the entry
-///   is evicted with its storage, and the next read reaches the provider, which applies the wipe;
-/// - otherwise the new info without its code and its `account_id` (revm's hint for faster access to
-///   the account's storage; a provider read carries neither, and revm loads code by hash) and each
-///   written slot's present value. A storage-known status (an account the block created) also drops
-///   the account's other cached slots, which the provider answers as zero.
-///
-/// Cached bytecode is keyed by its own hash, and cached block hashes belong to blocks below the
-/// one that read them (revm asks the database only for the 256 before the current block), so
-/// both name the same values for every later block of the output: `contracts` and
-/// `block_hashes` are kept as they are.
-fn advance_cached_reads(reads: &mut CachedReads, bundle: &BundleState) {
-    // each bundle account updates only its own entry, so the map's iteration order cannot change
-    // the result
-    for (address, account) in &bundle.state {
-        // evicting a recreated account (`DestroyedChanged`) is a deliberate, conservative choice:
-        // it is storage-known, so it could be kept like `InMemoryChange`, but eviction costs one
-        // re-read of a rare account and keeps the advance to the cases the differential tests pin
-        let info = match &account.info {
-            Some(info) if !account.status.was_destroyed() => info,
-            _ => {
-                reads.accounts.remove(address);
-                continue;
-            }
-        };
-        // `copy_without_code` keeps the storage hint, which a provider read never sets
-        let mut info = info.copy_without_code();
-        info.account_id = None;
-        let cached = reads
-            .accounts
-            .entry(*address)
-            .or_insert_with(|| CachedAccount { info: None, storage: Default::default() });
-        cached.info = Some(info);
-        if account.status.is_storage_known() {
-            cached.storage.clear();
-        }
-        cached
-            .storage
-            .extend(account.storage.iter().map(|(slot, value)| (*slot, value.present_value)));
-    }
-}
-
 /// Return the time since `stamp` and move `stamp` to now, so consecutive calls time
 /// consecutive phases.
 fn lap(stamp: &mut Instant) -> Duration {
@@ -958,11 +1002,7 @@ mod tests {
     };
     use alloy::primitives::{Address, U256};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use reth_revm::{
-        db::{states::StorageSlot, AccountStatus, BundleAccount, BundleState},
-        primitives::KECCAK_EMPTY,
-        state::{AccountInfo, Bytecode},
-    };
+    use reth_revm::{db::BundleState, state::AccountInfo};
     use tempfile::TempDir;
     use tn_types::{test_genesis, Bytes, TaskManager};
 
@@ -1037,146 +1077,6 @@ mod tests {
         assert!(matches!(find(PERSISTED_STORAGE_SLOTS_TOTAL), DebugValue::Counter(8)));
     }
 
-    /// Account info carrying code and an `account_id` storage hint, neither of which a cache entry
-    /// may keep.
-    fn info_with_code(balance: u64, nonce: u64) -> AccountInfo {
-        let code = Bytecode::new_raw(alloy::primitives::Bytes::from_static(&[0x60, 0x00]));
-        AccountInfo {
-            balance: U256::from(balance),
-            nonce,
-            code_hash: code.hash_slow(),
-            account_id: Some(3),
-            code: Some(code),
-        }
-    }
-
-    /// A cache entry with `info` and the `(slot, value)` pairs of `storage`.
-    fn cached(info: Option<AccountInfo>, storage: &[(u64, u64)]) -> CachedAccount {
-        let storage = storage.iter().map(|(slot, value)| (U256::from(*slot), U256::from(*value)));
-        CachedAccount { info, storage: storage.collect() }
-    }
-
-    /// A bundle account with `info`, `status` and the `(slot, before, after)` writes of `storage`.
-    fn bundled(
-        info: Option<AccountInfo>,
-        storage: &[(u64, u64, u64)],
-        status: AccountStatus,
-    ) -> BundleAccount {
-        let storage = storage.iter().map(|(slot, before, after)| {
-            (U256::from(*slot), StorageSlot::new_changed(U256::from(*before), U256::from(*after)))
-        });
-        BundleAccount::new(None, info, storage.collect(), status)
-    }
-
-    /// The read cache moves to the block's post-state: destroyed (also destroyed-then-changed and
-    /// destroyed again), EIP-161-cleared and info-less accounts are evicted with their storage; a
-    /// changed account takes its new info without code or `account_id` and its written slots
-    /// and keeps its other cached slots; a created account keeps only the slots the block
-    /// wrote; an account the cache did not hold is added; untouched accounts, code and block
-    /// hashes stay as they were.
-    #[test]
-    fn test_advance_cached_reads_follows_bundle() {
-        let address = Address::with_last_byte;
-        let (destroyed, destroyed_changed, cleared, absent, destroyed_again) =
-            (address(1), address(2), address(3), address(4), address(9));
-        let (changed, created, uncached, untouched) =
-            (address(5), address(6), address(7), address(8));
-        let old_info =
-            |balance: u64| AccountInfo { balance: U256::from(balance), ..Default::default() };
-
-        let mut reads = CachedReads::default();
-        reads.accounts.insert(destroyed, cached(Some(old_info(1)), &[(1, 5)]));
-        reads.accounts.insert(destroyed_changed, cached(Some(old_info(2)), &[(1, 5)]));
-        reads.accounts.insert(cleared, cached(Some(AccountInfo::default()), &[]));
-        reads.accounts.insert(absent, cached(None, &[]));
-        reads.accounts.insert(changed, cached(Some(old_info(10)), &[(1, 5), (3, 8)]));
-        reads.accounts.insert(destroyed_again, cached(Some(old_info(3)), &[(1, 5)]));
-        // stale non-zero slots under an absent account (orphaned storage): the block creates the
-        // account, after which the provider answers zero for every slot the block did not write
-        reads.accounts.insert(created, cached(None, &[(4, 7), (9, 3)]));
-        reads.accounts.insert(untouched, cached(Some(old_info(1)), &[(1, 1)]));
-        reads.contracts.insert(B256::with_last_byte(1), Bytecode::default());
-        reads.block_hashes.insert(7, B256::with_last_byte(7));
-        let contracts = reads.contracts.clone();
-        let block_hashes = reads.block_hashes.clone();
-
-        let bundle = BundleState {
-            state: [
-                (destroyed, bundled(None, &[], AccountStatus::Destroyed)),
-                (
-                    destroyed_changed,
-                    bundled(
-                        Some(info_with_code(2, 1)),
-                        &[(2, 0, 7)],
-                        AccountStatus::DestroyedChanged,
-                    ),
-                ),
-                // the transition EIP-161 makes of a touched empty account
-                (cleared, bundled(None, &[], AccountStatus::Destroyed)),
-                (absent, bundled(None, &[], AccountStatus::LoadedNotExisting)),
-                // destroyed, recreated and cleared again within the block
-                (destroyed_again, bundled(None, &[], AccountStatus::DestroyedAgain)),
-                (
-                    changed,
-                    bundled(Some(info_with_code(11, 2)), &[(1, 5, 6)], AccountStatus::Changed),
-                ),
-                (
-                    created,
-                    bundled(
-                        Some(info_with_code(0, 1)),
-                        &[(2, 0, 3)],
-                        AccountStatus::InMemoryChange,
-                    ),
-                ),
-                (
-                    uncached,
-                    bundled(Some(info_with_code(4, 0)), &[(5, 0, 6)], AccountStatus::Changed),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-        advance_cached_reads(&mut reads, &bundle);
-
-        for evicted in [destroyed, destroyed_changed, cleared, absent, destroyed_again] {
-            assert!(!reads.accounts.contains_key(&evicted), "{evicted} must be evicted");
-        }
-        // `AccountInfo`'s `PartialEq` ignores code and `account_id`: compare every field
-        let fields = |address: Address| {
-            let account = &reads.accounts[&address];
-            let info = account.info.as_ref().expect("cached info");
-            let mut storage: Vec<(U256, U256)> =
-                account.storage.iter().map(|(slot, value)| (*slot, *value)).collect();
-            storage.sort();
-            (
-                info.balance,
-                info.nonce,
-                info.code_hash,
-                info.code.is_none(),
-                info.account_id,
-                storage,
-            )
-        };
-        let slots = |pairs: &[(u64, u64)]| -> Vec<(U256, U256)> {
-            pairs.iter().map(|(slot, value)| (U256::from(*slot), U256::from(*value))).collect()
-        };
-        let code_hash = info_with_code(0, 0).code_hash;
-        assert_eq!(
-            fields(changed),
-            (U256::from(11), 2, code_hash, true, None, slots(&[(1, 6), (3, 8)]))
-        );
-        assert_eq!(fields(created), (U256::ZERO, 1, code_hash, true, None, slots(&[(2, 3)])));
-        assert_eq!(fields(uncached), (U256::from(4), 0, code_hash, true, None, slots(&[(5, 6)])));
-        assert_eq!(
-            fields(untouched),
-            (U256::from(1), 0, KECCAK_EMPTY, false, None, slots(&[(1, 1)]))
-        );
-        assert_eq!(reads.accounts.len(), 4, "only the changed, created, uncached and untouched");
-        assert_eq!(reads.contracts, contracts, "cached code is kept");
-        assert_eq!(reads.block_hashes, block_hashes, "cached block hashes are kept");
-    }
-
     /// A scope builds only on the block it was last advanced to; before its first build any
     /// parent passes.
     #[test]
@@ -1202,6 +1102,50 @@ mod tests {
         assert!(stamp >= start);
         assert_eq!(stamp.saturating_duration_since(start), first);
         assert_eq!(duration_ms(Duration::from_micros(2_500)), 2);
+    }
+
+    /// `take_static_file_sync_stats` reports one persist's static-file syncs: under storage v1
+    /// the headers, transactions and receipts segments each sync their data and offsets (one span
+    /// of the files' syncs, which run at once), freeze their `.conf` and update the index exactly
+    /// once, and a second take is empty. The first
+    /// persist only warms up: opening a segment's writer runs its heal, which updates the index.
+    #[tokio::test]
+    async fn test_persist_reports_static_file_sync_stats() -> eyre::Result<()> {
+        use reth_provider::StaticFileSegment;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("static file sync stats");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let output1 = consensus_output_for_tests(2, 0, 1, false);
+        let payload1 = TNPayload::new_for_test(chain.sealed_genesis_header(), &output1);
+        let block1 = execute_payload_and_update_canonical_chain(&env, payload1, vec![])?;
+        let _ = env.take_static_file_sync_stats();
+
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 =
+            TNPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &output2);
+        execute_payload_and_update_canonical_chain(&env, payload2, vec![])?;
+        let stats = env.take_static_file_sync_stats();
+        for segment in [
+            StaticFileSegment::Headers,
+            StaticFileSegment::Transactions,
+            StaticFileSegment::Receipts,
+        ] {
+            let s = stats.segment(segment);
+            for (phase, calls) in [
+                ("data", s.data_sync.calls),
+                ("offsets", s.offsets_sync.calls),
+                ("files", s.files_sync.calls),
+                ("conf", s.conf_freeze.calls),
+                ("update_index", s.update_index.calls),
+            ] {
+                assert_eq!(calls, 1, "{segment:?} {phase}");
+            }
+        }
+        assert!(env.take_static_file_sync_stats().is_empty(), "a take drains the stats");
+        Ok(())
     }
 
     /// Every block `build_block_from_batch_payload` builds records exactly one sample in each

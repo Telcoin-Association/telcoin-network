@@ -64,6 +64,12 @@ pub enum InitStorageError {
     /// State root doesn't match the expected one.
     #[error("state root mismatch: {_0}")]
     StateRootMismatch(GotExpected<B256>),
+    /// TN(TN-0116): a storage v2 genesis allocates storage to an account without code.
+    #[error(
+        "genesis account {_0} has storage but no code; storage v2 refuses it, because it could \
+         not record those slots if a later block wiped the account"
+    )]
+    GenesisStorageWithoutCode(Address),
 }
 
 impl From<DatabaseError> for InitStorageError {
@@ -145,28 +151,41 @@ where
                 // database. Since `factory.block_hash` will only query the static files, we need to
                 // make sure that our database has been written to, and throw error if it's empty.
                 if factory.get_stage_checkpoint(StageId::Headers)?.is_none() {
-                    error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
-                    return Err(InitStorageError::UninitializedDatabase)
-                }
+                    // TN(TN-0083): the commit below finalizes the static files before the MDBX
+                    // transaction, so a first launch that crashed between the two leaves the
+                    // genesis header in static files and nothing in the database, and every
+                    // restart failed here until the operator deleted the datadir.
+                    // With no stage checkpoint at all the database is empty, so the launch
+                    // resumes: `insert_genesis_header` keeps the header already there. Storage v1
+                    // only: under v2 genesis also committed block 0 of the changeset segments,
+                    // which the resumed `insert_genesis_state` fails to append again. TN's
+                    // `layout::settle` removes such a genesis, or refuses the datadir, first.
+                    if database_is_empty(factory)? {
+                        warn!(target: "reth::storage", "Genesis header found on static files with an empty database; resuming an interrupted first launch.");
+                    } else {
+                        error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
+                        return Err(InitStorageError::UninitializedDatabase)
+                    }
+                } else {
+                    let stored = factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
+                    if stored != genesis_storage_settings {
+                        warn!(
+                            target: "reth::storage",
+                            ?stored,
+                            requested = ?genesis_storage_settings,
+                            "Storage settings mismatch detected"
+                        );
+                    }
 
-                let stored = factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
-                if stored != genesis_storage_settings {
-                    warn!(
-                        target: "reth::storage",
-                        ?stored,
-                        requested = ?genesis_storage_settings,
-                        "Storage settings mismatch detected"
-                    );
+                    debug!("Genesis already written, skipping.");
+                    return Ok(hash)
                 }
-
-                debug!("Genesis already written, skipping.");
-                return Ok(hash)
+            } else {
+                return Err(InitStorageError::GenesisHashMismatch {
+                    chainspec_hash: hash,
+                    storage_hash: block_hash,
+                })
             }
-
-            return Err(InitStorageError::GenesisHashMismatch {
-                chainspec_hash: hash,
-                storage_hash: block_hash,
-            })
         }
         Err(e) => {
             debug!(?e);
@@ -176,10 +195,24 @@ where
 
     debug!("Writing genesis block.");
 
+    let alloc = &genesis.alloc;
+
+    // TN(TN-0116): a genesis account with storage but no code (and a zero nonce) is the only
+    // account a later block can wipe with its storage in place (EIP-161's empty-account deletion,
+    // or a `SELFDESTRUCT` after a create over it), which v2 cannot record and refuses at that block
+    // (`DatabaseProvider::ensure_wiped_accounts_had_no_storage`). Refuse it before anything is
+    // written, at genesis, instead of halting the chain later.
+    if genesis_storage_settings.storage_v2 &&
+        let Some((address, _)) = alloc.iter().find(|(_, account)| {
+            account.storage.as_ref().is_some_and(|storage| !storage.is_empty()) &&
+                account.code.as_ref().is_none_or(|code| code.is_empty())
+        })
+    {
+        return Err(InitStorageError::GenesisStorageWithoutCode(*address))
+    }
+
     // Make sure to set storage settings before anything writes
     factory.set_storage_settings_cache(genesis_storage_settings);
-
-    let alloc = &genesis.alloc;
 
     // use transaction to insert genesis header
     let provider_rw = factory.database_provider_rw()?;
@@ -250,6 +283,17 @@ where
     provider_rw.commit()?;
 
     Ok(hash)
+}
+
+/// TN(TN-0083): whether no stage has a checkpoint, i.e. no genesis write ever committed to the
+/// database.
+fn database_is_empty<PF: StageCheckpointReader>(factory: &PF) -> Result<bool, InitStorageError> {
+    for stage in StageId::ALL {
+        if factory.get_stage_checkpoint(stage)?.is_some() {
+            return Ok(false)
+        }
+    }
+    Ok(true)
 }
 
 /// Inserts the genesis state into the database.
@@ -638,6 +682,7 @@ mod tests {
         HOLESKY_GENESIS_HASH, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH,
     };
     use alloy_genesis::Genesis;
+    use alloy_primitives::Bytes;
     use reth_chainspec::{Chain, ChainSpec, HOLESKY, MAINNET, SEPOLIA};
     use reth_db::DatabaseEnv;
     use reth_db_api::{
@@ -688,6 +733,43 @@ mod tests {
 
         // actual, expected
         assert_eq!(genesis_hash, HOLESKY_GENESIS_HASH);
+    }
+
+    /// TN(TN-0083): a storage-v1 first launch that committed the genesis header to static files
+    /// but not to the database resumes instead of failing on every restart.
+    #[test]
+    fn init_genesis_resumes_after_a_torn_first_launch() {
+        let factory = create_test_provider_factory_with_chain_spec(SEPOLIA.clone());
+        {
+            let provider_rw = factory.database_provider_rw().unwrap();
+            insert_genesis_header(&provider_rw, &factory.chain_spec()).unwrap();
+            provider_rw.static_file_provider().commit().unwrap();
+            // the MDBX transaction is dropped uncommitted: the crash between the two commits
+        }
+        assert_eq!(factory.block_hash(0).unwrap(), Some(SEPOLIA_GENESIS_HASH));
+        assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_none());
+
+        assert_eq!(init_genesis(&factory).unwrap(), SEPOLIA_GENESIS_HASH);
+        assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_some());
+        assert_eq!(factory.block_hash(0).unwrap(), Some(SEPOLIA_GENESIS_HASH));
+        // the next start is the ordinary "already written" path
+        assert_eq!(init_genesis(&factory).unwrap(), SEPOLIA_GENESIS_HASH);
+    }
+
+    /// TN(TN-0083): a database that holds any checkpoint without the Headers one is still
+    /// refused; only an empty database is a torn first launch.
+    #[test]
+    fn init_genesis_refuses_a_partly_written_database() {
+        let factory = create_test_provider_factory_with_chain_spec(SEPOLIA.clone());
+        let provider_rw = factory.database_provider_rw().unwrap();
+        insert_genesis_header(&provider_rw, &factory.chain_spec()).unwrap();
+        provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0)).unwrap();
+        provider_rw.commit().unwrap();
+
+        assert!(matches!(
+            init_genesis(&factory).unwrap_err(),
+            InitStorageError::UninitializedDatabase
+        ));
     }
 
     #[test]
@@ -772,6 +854,114 @@ mod tests {
             let (accounts, storages) = collect_from_mdbx(&factory);
             assert_eq!(accounts, expected_accounts);
             assert_eq!(storages, expected_storages);
+        }
+    }
+
+    /// TN(TN-0112): a genesis-allocated slot reads its genesis value at a block after genesis
+    /// under storage v2, as under v1. Genesis writes `StoragesHistory` with the plain slot; while
+    /// the vendored v2 read history by `keccak256(slot)`, such a slot read as never written (zero).
+    #[test]
+    fn v2_genesis_storage_reads_after_genesis() {
+        use reth_provider::{HistoricalStateProviderRef, StateProvider, StorageChangeSetReader};
+
+        let address = Address::with_last_byte(2);
+        let slot = B256::with_last_byte(1);
+        let value = B256::with_last_byte(0x2a);
+        let chain_spec = Arc::new(ChainSpec {
+            chain: Chain::from_id(1),
+            genesis: Genesis {
+                alloc: BTreeMap::from([(
+                    address,
+                    GenesisAccount {
+                        balance: U256::from(1),
+                        // TN(TN-0116): v2 refuses genesis storage without code.
+                        code: Some(Bytes::from_static(&[0x00])),
+                        storage: Some(BTreeMap::from([(slot, value)])),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            hardforks: Default::default(),
+            paris_block_and_final_difficulty: None,
+            deposit_contract: None,
+            ..Default::default()
+        });
+
+        let mut layouts = Vec::new();
+        for settings in [StorageSettings::v1(), StorageSettings::v2()] {
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+            init_genesis_with_settings(&factory, settings).unwrap();
+            let provider = factory.provider().unwrap();
+
+            // The state at the start of block 1 is genesis'; at block 0 the slot is unset.
+            let after_genesis = HistoricalStateProviderRef::new(&provider, 1);
+            assert_eq!(
+                after_genesis.storage(address, slot).unwrap(),
+                Some(U256::from_be_bytes(value.0)),
+                "{settings:?}"
+            );
+            let before_genesis = HistoricalStateProviderRef::new(&provider, 0);
+            assert_eq!(
+                before_genesis.storage(address, slot).unwrap().unwrap_or_default(),
+                U256::ZERO,
+                "{settings:?}"
+            );
+
+            let changeset = provider.storage_changeset(0).unwrap();
+            assert_eq!(changeset.len(), 1, "{settings:?}");
+            assert_eq!(changeset[0].1.key.as_b256(), slot, "{settings:?}: plain changeset slot");
+
+            let tx = provider.tx_ref();
+            layouts.push((
+                collect_table_entries::<DatabaseEnv, tables::AccountsHistory>(tx).unwrap(),
+                collect_table_entries::<DatabaseEnv, tables::StoragesHistory>(tx).unwrap(),
+            ));
+        }
+        assert_eq!(layouts[0], layouts[1], "genesis history differs between v1 and v2");
+    }
+
+    /// TN(TN-0116): a v2 genesis that allocates storage to an account without code is refused
+    /// before anything is written; v1, which can record a wipe of it, writes it.
+    #[test]
+    fn v2_genesis_refuses_storage_without_code() {
+        let address = Address::with_last_byte(3);
+        for code in [None, Some(Bytes::new())] {
+            let chain_spec = Arc::new(ChainSpec {
+                chain: Chain::from_id(1),
+                genesis: Genesis {
+                    alloc: BTreeMap::from([(
+                        address,
+                        GenesisAccount {
+                            balance: U256::from(1),
+                            code: code.clone(),
+                            storage: Some(BTreeMap::from([(B256::ZERO, B256::with_last_byte(1))])),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                hardforks: Default::default(),
+                paris_block_and_final_difficulty: None,
+                deposit_contract: None,
+                ..Default::default()
+            });
+
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+            let err = init_genesis_with_settings(&factory, StorageSettings::v2()).unwrap_err();
+            assert!(
+                matches!(err, InitStorageError::GenesisStorageWithoutCode(a) if a == address),
+                "{code:?}: {err}"
+            );
+            let static_files = factory.static_file_provider();
+            assert_eq!(
+                static_files.get_highest_static_file_block(StaticFileSegment::Headers),
+                None
+            );
+            assert_eq!(factory.storage_settings().unwrap(), None, "{code:?}: settings written");
+
+            let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+            init_genesis_with_settings(&factory, StorageSettings::v1()).unwrap();
         }
     }
 

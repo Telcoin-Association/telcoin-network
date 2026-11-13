@@ -95,6 +95,14 @@ crates from git revisions that TN ships from crates.io. `sync` and `pick` list u
 to them, and TN mirrors one in both manifests only on purpose. Dropping was chosen over a warning
 alone: it is barely more code, and the safe state is the default.
 
+2026-11-06: the packages only reth's tests need are now pinned, in `tn/test-only.lock`, which
+`cargo.sh` adds to the seed. The nested lockfile stays generated, so TN's versions still win for
+every package TN ships, and a dependency bump in TN's lockfile needs no second lockfile edit unless
+it breaks a pin. Before, a crates.io release of a test-only package reached the lane the day it
+was published, and a test-only package that needed a newer shared crate moved that crate for the
+vendored code too: reth's tests ran TN's code on libc 0.2.191 while TN shipped 0.2.183.
+`tn/lockfile.py check` fails on either.
+
 ## D8. Git workflow
 
 Decided with the maintainer, 2026-10-30: commits and tags on `sls_tndb_b_vendor`, pushed only
@@ -127,6 +135,10 @@ The tndb-b work (`tndb-b-reth`, the `tndb-b` feature) is replacing MDBX as TN's 
 but MDBX is still the default and the migration source. The vendored `reth-libmdbx` and
 `reth-mdbx-sys` stay in place. Gating them out is listed in ROADMAP.md, for whoever lands the
 tndb-b switch.
+
+Since 2026-11-09 (D22) tn-lmdb, as tndb-b is now called, is the default, and MDBX is the opt-in
+`mdbx` build. MDBX stays compiled in every build for D22's reasons: the default build migrates an
+MDBX datadir, and the `mdbx` build runs on it.
 
 ## D10. Reduction keeps behavior identical: restore the features a removed crate enabled
 
@@ -202,6 +214,14 @@ it.) Upstream main returns v2 from `base()`, so a sync conflicts on that line; r
 upstream would make new nodes write no history indices and disagree with v1 nodes on historical
 reads. `tn-reth`'s `test_new_datadir_uses_storage_v1` fails if that happens.
 
+Since 2026-11-09 (D22) TN creates v2 datadirs itself, without RocksDB: `settle`
+(`crates/tn-reth/src/env/layout.rs`) picks a new datadir's layout (v2 on tn-lmdb, v1 on the
+`mdbx` build) and genesis is written with it (`init_genesis_with_settings`), so `base()`, still
+v1, no longer decides it. History and the transaction-hash index stay in database tables, keyed
+as in v1 (TN-0110 to TN-0112). `the_default_build_gives_new_datadirs_v2` replaced
+`test_new_datadir_uses_storage_v1`. Step B itself is still deferred: the stub and the plumbing
+remain.
+
 ## D16. The JS-tracer interrupt is ported, not upgraded or removed
 
 Upstream fixed the JS-tracer DoS (57825d41d) with `JsInspectorInterrupt` from revm-inspectors
@@ -214,7 +234,7 @@ it as a wrapper around `DebugInspector` in a TN-owned file, and keeps `debug.rs`
 upstream's version so the next sync swaps the wrapper for `JsInspector::with_interrupt`.
 
 Correction, 2026-11-04: the port first claimed it needed no Boa change because Boa's loop and
-recursion limits bound the work inside one callback. They don't (review finding T1-2). Boa counts
+recursion limits bound the work inside one callback. They don't. Boa counts
 loop iterations per call frame, 200,000 each, so a callback that calls a looping function from a
 loop runs as long as its script says, and Boa 0.21 has no time limit. The interrupt is read only
 between hooks: it stops a trace after the running callback returns, and never stops `setup` or
@@ -241,7 +261,8 @@ from the first survey. One item was raised and two lowered:
 Non-security High items (txpool nonce order, storage fixes) were first tracked with a
 recommendation, not applied, because they were outside the direction given. They were applied
 later, the pool nonce order as TN-0022 and the static-file fixes as TN-0023, along with
-d3d7fb31d (lowered to Medium above) as TN-0024. The MDBX fixes still wait for the tndb-b work.
+d3d7fb31d (lowered to Medium above) as TN-0024. The MDBX fixes still wait for the tndb-b work
+(two of them are provider fixes that reach tn-lmdb too: `tn/notes/upstream-backports.md`).
 
 2026-11-04: the review of 2026-11-01 found four upstream fixes the survey missed. Three are
 applied: d85d9deae (TN-0034), the permit part of 055fafc72 (TN-0035) and revm-inspectors
@@ -282,7 +303,8 @@ were left for a deliberate decision instead:
   engine, the largest cut left, but `debug_trace*` would then refuse JS tracers (D21 later made
   it opt-in at build time). Path expansion
   in flags (shellexpand) and reth's logging stack also stay for this reason.
-- **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work owns these (D15, Phase 3):
+- **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work (tn-lmdb, the default since
+  D22) owns these (D15, Phase 3):
   the static-file watcher's switch in the MDBX provider builder, reth-db's storage lock,
   parity-scale-codec and modular-bitfield.
 - **Consensus-sensitive code.** reth-trie, the EVM and execution crates (Phase 4).
@@ -315,3 +337,18 @@ builds. `crates/tn-reth/js-tracer.md` covers what the feature does, why it is of
 on, and the steps for removing it entirely. Measured on macOS arm64, a stripped release binary
 is 7.9 MB smaller without the feature (54.8 MB against 62.7 MB), and a clean release build takes
 about as long (1m50s against 1m54s on 16 cores).
+
+## D22. tn-lmdb is the default reth backend; MDBX is opt-in until testnet resyncs
+
+User decision, 2026-11-09 (storage v2 for the mainnet freeze): mainnet launches on tn-lmdb (the
+engine called tndb-b until 2026-11-04, `crates/tn-lmdb`, through `crates/tn-lmdb-reth`), in storage
+layout v2. TN's `tn-lmdb` feature, which selected it, is inverted: every build runs reth's
+database on `tn_lmdb_reth::TnLmdbEnv`, and an opt-in `mdbx` feature on `tn-reth` (forwarded by
+`tn-node`, `telcoin-network-cli` and `telcoin-network`) selects MDBX instead. MDBX stays because
+the default build migrates an MDBX datadir at its first open (`tn-reth`'s
+`src/env/database/migrate.rs` reads it through `reth_db::mdbx`), and its build keeps the legacy
+path under test (`./etc/ci-lanes.sh test-mdbx`) and serves as the previous binary of the migration
+e2e lanes. v2 refuses MDBX. MDBX and layout v1 are removed together, the vendored MDBX code
+included (ROADMAP.md, Phase 3), once testnet has resynced. No vendored file changed: reth's
+crates were already generic over the database on every path TN uses, and `reth-db`'s `mdbx`
+feature stays on, enabled by `reth-node-core`, `reth-db-common` and `reth-provider`.

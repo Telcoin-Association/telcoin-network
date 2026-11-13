@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy clippy-fix docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -67,13 +67,13 @@ help:
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
 	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
 	@echo ;
-	@echo "make test-e2e-tn-lmdb" ;
-	@echo "    :::> Build the e2e node binary with its reth database on tn-lmdb and run the restart, epoch and sigkill suites on it," ;
-	@echo "    :::> then test-e2e-reth-migration. test-restarts-tn-lmdb, test-epochs-tn-lmdb and test-sigkill-tn-lmdb run one suite each." ;
-	@echo ;
 	@echo "make test-e2e-reth-migration" ;
-	@echo "    :::> Build the default (MDBX) and tn-lmdb e2e node binaries; start a committee on MDBX and restart each validator on tn-lmdb." ;
-	@echo "    :::> Each must migrate its reth database and follow the chain. TN_BIN_PATH_PREV = MDBX binary, TN_BIN_PATH = tn-lmdb binary." ;
+	@echo "    :::> Build the default (tn-lmdb) and MDBX e2e node binaries; start a committee on MDBX and restart each validator on tn-lmdb." ;
+	@echo "    :::> Each must migrate its reth database and follow the chain. TN_BIN_PATH_PREV = MDBX binary, TN_BIN_PATH = default binary." ;
+	@echo ;
+	@echo "make test-e2e-resync" ;
+	@echo "    :::> Build the default (tn-lmdb) and MDBX e2e binaries; upgrade a validator of a TN_RESYNC_BIN_PREV committee in place, run db reset-execution" ;
+	@echo "    :::> on it, and require it to rebuild from genesis and match a validator still on PREV. TN_RESYNC_BIN_PREV defaults to the MDBX binary." ;
 	@echo ;
 	@echo "make build-e2e-bin-prev" ;
 	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
@@ -95,7 +95,9 @@ help:
 	@echo "    :::> cargo fmt (nightly toolchain pinned in rust-nightly)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
+	@echo "    :::> The CI clippy lane (./etc/ci-lanes.sh clippy): the release graph, all features, and all features but mdbx (nightly toolchain pinned in rust-nightly)." ;
+	@echo "make clippy-fix" ;
+	@echo "    :::> cargo clippy --fix over all features, then over the default features (the tn-lmdb arms)." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
@@ -172,8 +174,11 @@ quic-attest:
 udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
 
+# --all-features builds the reth database on MDBX (tn-reth's opt-in `mdbx`), so the default
+# features check the default backend's (tn-lmdb's) test code too.
 check:
 	cargo check --workspace --all-features --all-targets ;
+	cargo check --workspace --all-targets ;
 
 # run workspace unit tests (using nextest for faster parallel execution)
 test:
@@ -237,23 +242,25 @@ build-e2e-bin-adiri:
 # so the producing and the consuming path cannot diverge.
 E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
 
-# Target root for the tn-lmdb e2e node binary: the one whose reth execution database runs on tn-lmdb
-# instead of MDBX. Nested in E2E_TARGET_ROOT, and separate from it, for the same reasons as
-# E2E_TARGET_ROOT_ADIRI: `tn-lmdb` changes tn-reth and everything built on it, so a shared root
-# would rebuild on every switch between lanes and leave `target/e2e/telcoin-network` running
-# whichever backend built last, with no way for a lane consuming TN_BIN_PATH to tell.
-E2E_TARGET_ROOT_TN_LMDB := $(E2E_TARGET_ROOT)/tn-lmdb-e2e
+# Target root for the MDBX e2e node binary: the one whose reth execution database runs on MDBX,
+# the legacy backend, instead of the default tn-lmdb. Nested in E2E_TARGET_ROOT, and separate from
+# it, for the same reasons as E2E_TARGET_ROOT_ADIRI: `mdbx` changes tn-reth and everything built on
+# it, so a shared root would rebuild on every switch between lanes and leave
+# `target/e2e/telcoin-network` running whichever backend built last, with no way for a lane
+# consuming TN_BIN_PATH to tell.
+E2E_TARGET_ROOT_MDBX := $(E2E_TARGET_ROOT)/mdbx-e2e
 
-# Build the node binary WITH `tn-lmdb`. Like build-e2e-bin it builds without `adiri`, so the fork
-# variables below mean on the tn-lmdb lanes what they mean on test-restarts, test-epochs and
+# Build the node binary WITH `mdbx`: the previous binary of the migration and resync lanes below
+# (what a testnet node runs before it upgrades). Like build-e2e-bin it builds without `adiri`, so
+# the fork variables below mean on those lanes what they mean on test-restarts, test-epochs and
 # test-sigkill.
-.PHONY: build-e2e-bin-tn-lmdb
-build-e2e-bin-tn-lmdb:
-	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils,telcoin-network/tn-lmdb --target-dir "$(E2E_TARGET_ROOT_TN_LMDB)" ;
+.PHONY: build-e2e-bin-mdbx
+build-e2e-bin-mdbx:
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils,telcoin-network/mdbx --target-dir "$(E2E_TARGET_ROOT_MDBX)" ;
 
-# Location of the binary built by build-e2e-bin-tn-lmdb. Same expression pairing as E2E_BIN above,
+# Location of the binary built by build-e2e-bin-mdbx. Same expression pairing as E2E_BIN above,
 # so the producing and the consuming path cannot diverge.
-E2E_BIN_TN_LMDB := $(E2E_TARGET_ROOT_TN_LMDB)/e2e/telcoin-network
+E2E_BIN_MDBX := $(E2E_TARGET_ROOT_MDBX)/e2e/telcoin-network
 
 # The commit the mixed-binary (rolling upgrade) e2e tests run as the PREVIOUS node version: the old
 # half of an in-place upgrade, or a validator still on the old binary when the rest of the network
@@ -470,36 +477,38 @@ test-e2e-forked:
 test-e2e-governance-safe: build-e2e-bin-adiri
 	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
 
-# run the restart, epoch and sigkill suites on the tn-lmdb node binary: the spawned nodes keep their
-# reth execution database on tn-lmdb, so these are the crash and restart cycles for that engine.
-# Each suite has its own target (the same command line as test-restarts, test-epochs and
-# test-sigkill, with TN_BIN_PATH from E2E_BIN_TN_LMDB) so one can be rerun alone; test-e2e-tn-lmdb runs
-# all three in order, then test-e2e-reth-migration (below: how an MDBX node moves onto tn-lmdb),
-# and stops at the first that fails. The test binaries themselves build without `tn-lmdb`: they
-# drive the node processes and never open a spawned node's reth database.
-.PHONY: test-e2e-tn-lmdb test-restarts-tn-lmdb test-epochs-tn-lmdb test-sigkill-tn-lmdb
-test-e2e-tn-lmdb: test-restarts-tn-lmdb test-epochs-tn-lmdb test-sigkill-tn-lmdb test-e2e-reth-migration
-
-test-restarts-tn-lmdb: build-e2e-bin-tn-lmdb
-	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
-
-test-epochs-tn-lmdb: build-e2e-bin-tn-lmdb
-	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-
-test-sigkill-tn-lmdb: build-e2e-bin-tn-lmdb
-	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E '$(SIGKILL_FILTER)' ;
-
 # run the MDBX to tn-lmdb reth database migration on live validators
-# (crates/e2e-tests/tests/it/reth_db_migration.rs): the committee starts on the default e2e binary,
-# then each validator in turn restarts on the tn-lmdb e2e binary and must migrate its reth database
-# and follow the chain. Both binaries are built from this tree, in these roles:
-#   TN_BIN_PATH_PREV = E2E_BIN       the default build, reth database on MDBX (what a node runs now)
-#   TN_BIN_PATH      = E2E_BIN_TN_LMDB  the tn-lmdb build (what the node is upgraded to)
+# (crates/e2e-tests/tests/it/reth_db_migration.rs): the committee starts on the MDBX e2e binary,
+# then each validator in turn restarts on the default (tn-lmdb) e2e binary and must migrate its
+# reth database and follow the chain. Both binaries are built from this tree, in these roles:
+#   TN_BIN_PATH_PREV = E2E_BIN_MDBX  the `mdbx` build, reth database on MDBX (what a node runs now)
+#   TN_BIN_PATH      = E2E_BIN       the default build, tn-lmdb (what the node is upgraded to)
 # TN_E2E_TN_LMDB_BIN=1 is the marker the test reads to tell this lane from `make test-e2e`, which
-# selects every #[ignore] test with TN_BIN_PATH at the default binary; without it the test skips.
+# selects every #[ignore] test with TN_BIN_PATH at the default binary and no MDBX previous binary;
+# without it the test skips.
 .PHONY: test-e2e-reth-migration
-test-e2e-reth-migration: build-e2e-bin build-e2e-bin-tn-lmdb
-	TN_BIN_PATH="$(E2E_BIN_TN_LMDB)" TN_BIN_PATH_PREV="$(E2E_BIN)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all reth_db_migration:: ;
+test-e2e-reth-migration: build-e2e-bin build-e2e-bin-mdbx
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(E2E_BIN_MDBX)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all reth_db_migration:: ;
+
+# run the execution database rebuild (crates/e2e-tests/tests/it/resync.rs): a committee starts on
+# TN_RESYNC_BIN_PREV (an MDBX reth database), validator-4 is upgraded in place to the default
+# (tn-lmdb) e2e binary (its reth database migrates, and its consensus database too when PREV
+# predates tndb), then stopped, reset with `db reset-execution --force`, and started again: it
+# must rebuild its execution database from genesis, rejoin the committee, and agree with
+# validator-1 (still on PREV) on every block and on historical reads. TN_E2E_TN_LMDB_BIN=1
+# declares TN_BIN_PATH the tn-lmdb build (see test-e2e-reth-migration).
+#
+# TN_RESYNC_BIN_PREV defaults to this tree's MDBX e2e binary. The release the network runs is the
+# real PREV (make build-e2e-bin-prev TN_PREV_REF=v0.16.0-adiri, then
+# make test-e2e-resync TN_RESYNC_BIN_PREV=$(E2E_BIN_PREV)), but v0.16.0-adiri and this tree do not
+# peer since #1788 changed node records: the upgraded validator migrates both databases and then
+# cannot resolve its peers, so that run fails at the upgrade, before the reset.
+TN_RESYNC_BIN_PREV ?= $(E2E_BIN_MDBX)
+
+.PHONY: test-e2e-resync
+test-e2e-resync: build-e2e-bin build-e2e-bin-mdbx
+	@test -x "$(TN_RESYNC_BIN_PREV)" || { echo "no previous node binary at $(TN_RESYNC_BIN_PREV)" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(TN_RESYNC_BIN_PREV)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all resync:: ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -514,9 +523,18 @@ coverage-html:
 fmt:
 	cargo +$(NIGHTLY) fmt --all ;
 
-# clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
+# lint what CI lints: the three passes of `./etc/ci-lanes.sh clippy` (the release graph; the
+# workspace's every target with every feature, which runs reth on MDBX; and with every feature but
+# `mdbx`, the default tn-lmdb arms), under the lane's flags (nightly toolchain pinned in
+# rust-nightly)
 clippy:
-	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
+	./etc/ci-lanes.sh clippy ;
+
+# apply clippy's fixes to the code of both reth backends: every feature (the `mdbx` arms), then
+# the default features (the tn-lmdb arms `--all-features` never compiles)
+clippy-fix:
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --fix ;
 
 # log docker in to ghcr.io as your GitHub user; docker prompts for the password:
 # paste a classic PAT with write:packages only, never the gh token

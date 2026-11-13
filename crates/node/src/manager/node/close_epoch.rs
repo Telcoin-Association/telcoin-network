@@ -29,8 +29,8 @@ use tn_storage::{
 };
 use tn_types::{
     deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, Certificate,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, DbTxMut as _,
+    Epoch, EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -387,9 +387,16 @@ where
     /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
     /// the initial committee is available before any certificate exists. Once a
     /// real cert is present we must overwrite that filler, which is why epoch 0
-    /// only short-circuits on a record that already carries a certificate
-    /// (`Some(_)`) — skipping this would leave the dummy in place and break sync.
-    /// For later epochs an existing record short-circuits unconditionally.
+    /// only reuses a record that already carries a certificate
+    /// (`Some(_)`) — reusing an uncertified one would leave the dummy in place and break sync.
+    /// For later epochs any existing record is reused.
+    ///
+    /// A reused record is first checked against this node's closing block (the replay guard,
+    /// [`Self::check_stored_record`]): a node that re-executes history (`db reset-execution`, a
+    /// restart replay, an observer holding records fetched from peers) closes epochs whose record
+    /// it already has. A record whose `final_state` is not the closing block this node just
+    /// executed means this node's execution has diverged from the chain the record commits to, so
+    /// the close returns an error and the node stops before it publishes the record.
     ///
     /// When building a fresh record, the previous epoch's `next_committee` must
     /// match this epoch's committee; a mismatch means the committee handoff is
@@ -399,24 +406,30 @@ where
         epoch: Epoch,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
-        if epoch == 0 {
-            // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
-            // code using these records. In this case there will not be a cert so we
-            // want to overwrite this with the correct record. That is why we need to
-            // use Some(_) (this means we have a certificate) instead of _ like in the general case.
-            // Without this we never overwrite the dummy epoch 0 record with the proper record and
-            // would break sync.
-            if let Some((epoch_rec, Some(_))) =
-                self.consensus_chain.epochs().get_epoch_by_number(epoch).await
-            {
-                // We already have this record...
-                self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
-                return Ok(());
+        // The epoch-closing block, sampled ONCE: a reused record is compared with it below, and a
+        // new record commits it as `final_state` (see the pinning comment further down).
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+
+        // Epoch 0 will have a "dummy" epoch record to make the initial committee available to code
+        // using these records. In this case there will not be a cert so we want to overwrite this
+        // with the correct record. That is why epoch 0 reuses only a record with a certificate,
+        // instead of any record like in the general case. Without this we never overwrite the
+        // dummy epoch 0 record with the proper record and would break sync. An uncertified record
+        // 0 that is not the dummy (this node's own, still waiting for its certificate) is built
+        // again: the build is deterministic, so `save_record` accepts an identical record and
+        // refuses a different one (`ConflictingRecord`), which stops the node.
+        //
+        // A failed read answers `None` here, never a reason to skip the guard: the record is then
+        // built and `save_record` compares the whole stored record (its digest) with the new one.
+        let stored = match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
+            Some((epoch_rec, cert)) if cert.is_some() || epoch != 0 => {
+                Some((epoch_rec, cert.is_some()))
             }
-        } else if let Some((epoch_rec, _)) =
-            self.consensus_chain.epochs().get_epoch_by_number(epoch).await
-        {
-            // We already have this record...
+            _ => None,
+        };
+        if let Some((epoch_rec, certified)) = stored {
+            // We already have this record: check it against our own closing block, then reuse it.
+            self.check_stored_record(&epoch_rec, certified, parent_state, engine).await?;
             self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
             return Ok(());
         }
@@ -433,15 +446,19 @@ where
         // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
         // not the reth canonical tip: the engine publishes each executed output's last block
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
-        // mid-execution but never lead it. At every call site (the live boundary arm and the
-        // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
-        // `wait_for_consensus_execution` as well as try_restore_state() on startup) the wait
-        // resolved on the exact write that carries the
-        // closing block, so this read IS that block; the pin makes the record's committee reads
-        // and its `final_state` derive from the same header by construction instead of by
-        // timing.
+        // mid-execution but never lead it. At every call site this read IS the closing block:
+        // - the live boundary arm and the two recovery arms of `run_epoch` (replay-and-close and
+        //   the leftover drain) each run after `close_epoch`'s `wait_for_consensus_execution`,
+        //   which resolved on the exact write that carries the closing block;
+        // - the re-derive path of `recover_previous_epoch_record` runs before any output of the
+        //   next epoch executes, on the value `try_restore_state` primed from the executed blocks
+        //   at startup, and checks it is the executed closing block
+        //   (`last_executed_output_blocks(1)`) before it calls here.
+        // The pin makes the record's committee reads and its `final_state` derive from the same
+        // header by construction instead of by timing.
         //
-        // `parent_state` is sampled ONCE and threaded into the retry below as its pin, and both
+        // `parent_state` is sampled ONCE (at the top, so the replay guard above compares the same
+        // pin) and threaded into the retry below as its pin, and both
         // committees resolve through ONE batched by-hash read. Sampling once is required, not
         // merely tidy: the watch is live, so re-sampling it per attempt would both shift the pin
         // between attempts and desynchronize the committee reads from the `parent_state` passed to
@@ -456,7 +473,6 @@ where
         // A Provider fault is node-local (peers reading the same block may succeed), so retry
         // briefly before halting; ChainGlobal returns from the first attempt, halting exactly
         // where it did before the retry existed. The net delta is two extra tries on Provider.
-        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let epochs = [epoch, epoch + 1];
         let committees =
             retry_provider_faults("epoch-record committee reads", &parent_state, |pin| {
@@ -531,9 +547,19 @@ where
     /// epoch's record write and its tables clear leaves behind. A mid-epoch restart or a
     /// mode-change re-entry into epoch N finds only epoch N's rows and keeps them, including the
     /// `Votes` and `LastProposed` that guard against equivocation.
+    ///
+    /// A present record is also checked against `epoch_start_header`, the entry read's pin: epoch
+    /// N-1's closing block, `getEpochInfo(N).blockHeight - 1` in this node's chain
+    /// ([`Self::check_stored_record`]). Without it a restart would clear the close-time replay
+    /// guard: a node that stopped because record N-1 does not match its closing block has already
+    /// executed that block, so it restarts into epoch N, never closes N-1 again, and would run on.
+    /// The same holds for a kill between executing the closing block and closing the epoch, with
+    /// the record already fetched from peers. The pin derives from the registry at any tip, so the
+    /// check also runs on a mid-epoch restart and a mode-change re-entry.
     pub(super) async fn recover_previous_epoch_record(
         &mut self,
         current_epoch: Epoch,
+        epoch_start_header: &SealedHeader,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
         if current_epoch == 0 {
@@ -543,6 +569,32 @@ where
         if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
             // Do not be fooled by the dummy epoch 0 record on the epoch 0 -> 1 transition.
             if previous_epoch != 0 || !self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                // the record is present and is not the dummy (the dummy is only replaced, never
+                // stored again), so it commits epoch `previous_epoch`'s closing block. a read that
+                // fails here stops the node: the check is never skipped for it
+                let (record, cert) = self
+                    .consensus_chain
+                    .epochs()
+                    .get_epoch_by_number(previous_epoch)
+                    .await
+                    .ok_or_else(|| {
+                        eyre!(
+                            "failed to READ the stored epoch {previous_epoch} record entering \
+                             epoch {current_epoch}, so it cannot be checked against the closing \
+                             block {} ({}): a storage error, not a missing record - do NOT delete \
+                             chain-data",
+                            epoch_start_header.number,
+                            epoch_start_header.hash()
+                        )
+                    })?;
+                self.check_stored_record(
+                    &record,
+                    cert.is_some(),
+                    epoch_start_header.num_hash(),
+                    engine,
+                )
+                .await?;
+
                 // the record is present, but a kill between its write and the epoch tables clear
                 // that follows it leaves the tables holding an older epoch's rows. clearing them
                 // here deletes nothing epoch `current_epoch` needs:
@@ -562,6 +614,9 @@ where
                 //   the first point does not hold, so the clear is skipped whenever `Votes` or
                 //   `LastProposed` holds a row of `current_epoch`: those guards stay, and the older
                 //   rows go at the next boundary as they always did
+                // - a rebuild after `db reset-execution` carries this node's votes and proposals of
+                //   the epoch it was in back through the epochs before it; the clear keeps every
+                //   vote and proposal of `current_epoch` and later
                 // - `OurNodeBatchesCache` is kept, as always
                 self.clear_stale_epoch_tables(current_epoch)?;
                 return Ok(());
@@ -622,7 +677,8 @@ where
         // - every row is from `previous_epoch` or earlier. the epoch `current_epoch` primary is
         //   only built after this function returns, and any earlier pass through here would have
         //   persisted the record, so it has never run on this node and has written no vote or
-        //   proposal that could guard against equivocation
+        //   proposal that could guard against equivocation. a vote or proposal of a later epoch (a
+        //   rebuild after `db reset-execution` carries them) is kept by the clear
         // - `previous_epoch`'s committed output lives in the consensus chain pack, which is not
         //   cleared, and was executed through its closing block. its certificates and votes are not
         //   read again: the epoch `current_epoch` primary neither votes on nor builds on another
@@ -637,8 +693,59 @@ where
             current_epoch,
             "re-derived epoch record written - clearing the previous epoch's consensus db tables",
         );
-        self.clear_consensus_db_for_next_epoch()?;
+        self.clear_consensus_db_for_next_epoch(previous_epoch)?;
         Ok(())
+    }
+
+    /// The replay guard: compare a stored epoch record's `final_state` with `local`, the closing
+    /// block this node executed for that epoch, and return an error that stops the node when they
+    /// differ ([`check_stored_final_state`] decides).
+    ///
+    /// `certified` is only reported: a record with a certificate is the committee's, one without
+    /// is this node's own from an earlier execution. Either way a different `final_state` means
+    /// this execution diverged from the chain the record commits to (a nondeterminism bug, or a
+    /// state-root rule change), and every block after it would build on a chain no record
+    /// attests, so the node stops instead of running on.
+    ///
+    /// The restored-state floor is an in-memory value read when the reth env opened, so this makes
+    /// no read that could fail.
+    async fn check_stored_record(
+        &self,
+        stored: &EpochRecord,
+        certified: bool,
+        local: BlockNumHash,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        let restored_floor = engine.get_reth_env().await.restored_state_floor();
+        match check_stored_final_state(stored, certified, local, restored_floor) {
+            Ok(StoredFinalState::Matches) => Ok(()),
+            Ok(StoredFinalState::Restored { floor }) => {
+                debug!(
+                    target: "epoch-manager",
+                    epoch = stored.epoch,
+                    floor,
+                    closing_block = local.number,
+                    "stored epoch record not compared: its closing block is at or below this \
+                     datadir's restored-state floor, so this node restored it and did not execute it",
+                );
+                Ok(())
+            }
+            Err(mismatch) => {
+                self.metrics.final_state_mismatches_total.increment(1);
+                error!(
+                    target: "epoch-manager",
+                    epoch = mismatch.epoch,
+                    certified = mismatch.certified,
+                    recorded_number = mismatch.recorded.number,
+                    recorded_hash = %mismatch.recorded.hash,
+                    local_number = mismatch.local.number,
+                    local_hash = %mismatch.local.hash,
+                    "stored epoch record final_state does not match this node's closing block: \
+                     this node's execution diverged from the recorded chain, stopping the node",
+                );
+                Err(mismatch.into())
+            }
+        }
     }
 
     /// Clear the epoch tables when [`stale_epoch_table_row`] finds a row of an epoch older than
@@ -674,7 +781,8 @@ where
                 "epoch record present but the consensus db tables still hold rows of an older epoch \
                  (killed between the record write and the tables clear); clearing them",
             );
-            self.clear_consensus_db_for_next_epoch()?;
+            // `current_epoch` is at least 1 here: epoch 0 has no previous record to recover
+            self.clear_consensus_db_for_next_epoch(current_epoch - 1)?;
         }
         Ok(())
     }
@@ -983,16 +1091,46 @@ where
     /// is separate from the epoch database's, so their clear is not ordered with the others on
     /// disk; a batch-cache row left by a kill inside the clear is the window the per-table clears
     /// have always had, narrower now that the caches are cleared first.
-    pub(super) fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
+    ///
+    /// `closed_epoch` is the epoch whose tables this clears: the epoch just closed, or the one
+    /// before the epoch being entered. This node's votes and proposals of a later epoch are kept.
+    /// `db reset-execution` keeps the consensus database, and the rebuild replays and closes every
+    /// epoch before the one the node was voting and proposing in; those rows are what keeps it
+    /// from voting twice in a round, or proposing or certifying a second header for one, once it
+    /// is back in that epoch. So when [`later_epoch_guard_row`] finds one, `ProposedCertificates`,
+    /// `LastProposed` and `Votes` lose only their rows of `closed_epoch` and older. Nothing reads
+    /// the kept rows before then: no primary runs in a replayed epoch, the proposer reads
+    /// `LastProposed` only for its own epoch, and a stored vote of a later epoch refuses a header
+    /// of an older one. The close of that later epoch clears them.
+    pub(super) fn clear_consensus_db_for_next_epoch(
+        &self,
+        closed_epoch: Epoch,
+    ) -> eyre::Result<()> {
+        let db = &self.consensus_db;
         // the tables whose rows carry no epoch first, see above
-        self.consensus_db.clear_table::<Payload>()?;
-        self.consensus_db.clear_table::<NodeBatchesCache>()?;
-        self.consensus_db.clear_table::<CertificateDigestByRound>()?;
-        self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
-        self.consensus_db.clear_table::<ProposedCertificates>()?;
-        self.consensus_db.clear_table::<LastProposed>()?;
-        self.consensus_db.clear_table::<Votes>()?;
-        self.consensus_db.clear_table::<Certificates>()?;
+        db.clear_table::<Payload>()?;
+        db.clear_table::<NodeBatchesCache>()?;
+        db.clear_table::<CertificateDigestByRound>()?;
+        db.clear_table::<CertificateDigestByOrigin>()?;
+        if let Some((table, later_epoch)) = later_epoch_guard_row(db, closed_epoch) {
+            warn!(
+                target: "epoch-manager",
+                table,
+                later_epoch,
+                closed_epoch,
+                "the consensus db holds this node's votes or proposals of an epoch after the one \
+                 whose tables are cleared (a rebuild replaying epochs this node already ran); \
+                 keeping that epoch's votes and proposals",
+            );
+            remove_rows_through::<ProposedCertificates, _>(db, closed_epoch, Certificate::epoch)?;
+            remove_rows_through::<LastProposed, _>(db, closed_epoch, Header::epoch)?;
+            remove_rows_through::<Votes, _>(db, closed_epoch, VoteInfo::epoch)?;
+        } else {
+            db.clear_table::<ProposedCertificates>()?;
+            db.clear_table::<LastProposed>()?;
+            db.clear_table::<Votes>()?;
+        }
+        db.clear_table::<Certificates>()?;
         // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
         // orphans and clear then.
         Ok(())
@@ -1070,6 +1208,81 @@ pub fn build_epoch_record(
     Ok(record)
 }
 
+/// A stored epoch record whose `final_state` is not the closing block this node executed for the
+/// epoch. Returned by [`check_stored_final_state`]; it stops the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FinalStateMismatch {
+    /// The record's epoch.
+    pub(super) epoch: Epoch,
+    /// Whether the stored record carries a certificate.
+    pub(super) certified: bool,
+    /// The stored record's `final_state`.
+    pub(super) recorded: BlockNumHash,
+    /// This node's closing block for the epoch.
+    pub(super) local: BlockNumHash,
+}
+
+impl std::fmt::Display for FinalStateMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { epoch, certified, recorded, local } = self;
+        let kind = if *certified { "certified" } else { "uncertified" };
+        write!(
+            f,
+            "epoch {epoch}: the stored {kind} epoch record's final_state is block {} ({}), but \
+             this node's closing block for the epoch is block {} ({}): this node's execution \
+             diverged from the recorded chain - stopping the node rather than run on a chain no \
+             epoch record attests (do NOT delete chain-data: keep the datadir to find the first \
+             block that differs)",
+            recorded.number, recorded.hash, local.number, local.hash
+        )
+    }
+}
+
+impl std::error::Error for FinalStateMismatch {}
+
+/// What [`check_stored_final_state`] found when it did not refuse the record.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StoredFinalState {
+    /// The record's `final_state` is this node's closing block.
+    Matches,
+    /// Not compared: this node did not execute the closing block. It is at or below the
+    /// restored-state floor `floor` of a snapshot-restored datadir, so the restore imported it
+    /// (`db load-state` checked the pack's final block against this certified record).
+    Restored { floor: u64 },
+}
+
+/// The replay guard's decision for a stored epoch record and `local`, the closing block this node
+/// executed for the record's epoch.
+///
+/// - At or below `restored_floor` (a snapshot-restored datadir), this node did not execute `local`,
+///   so there is nothing to compare: [`StoredFinalState::Restored`]. Only the restored block itself
+///   can be a closing block there, since no block below it was ever executed.
+/// - Otherwise the record's `final_state`, number and hash, must be `local`. There is no "unset"
+///   value: a default `final_state` (block 0, the zero hash) is compared like any other and never
+///   matches a closing block. The epoch-0 dummy record, the one record with a default
+///   `final_state`, never reaches this check (`write_epoch_record` builds over it, and
+///   `recover_previous_epoch_record` re-derives it).
+pub(super) fn check_stored_final_state(
+    stored: &EpochRecord,
+    certified: bool,
+    local: BlockNumHash,
+    restored_floor: Option<u64>,
+) -> Result<StoredFinalState, FinalStateMismatch> {
+    if let Some(floor) = restored_floor.filter(|floor| local.number <= *floor) {
+        return Ok(StoredFinalState::Restored { floor });
+    }
+    if stored.final_state == local {
+        Ok(StoredFinalState::Matches)
+    } else {
+        Err(FinalStateMismatch {
+            epoch: stored.epoch,
+            certified,
+            recorded: stored.final_state,
+            local,
+        })
+    }
+}
+
 /// Decode which consensus header the executed closing block points to, and verify it closes the
 /// epoch we intend to re-derive.
 ///
@@ -1140,19 +1353,65 @@ fn stale_first_row<T: Table, DB: TNDatabase>(
 /// if either does.
 ///
 /// Those two tables are what keep this node from voting twice in a round or proposing two headers
-/// for one, so they are the rows a clear must never take from the epoch in progress. `Votes`
-/// holds at most one row per authority and `LastProposed` a single row, so every row of both is
-/// read.
+/// for one, so they are the rows a clear must never take from the epoch in progress.
 pub(super) fn current_epoch_guard_row<DB: TNDatabase>(
     db: &DB,
     current_epoch: Epoch,
 ) -> Option<&'static str> {
-    if db.iter::<Votes>().any(|(_, vote)| vote.epoch() == current_epoch) {
-        return Some(Votes::NAME);
+    guard_row(db, |epoch| epoch == current_epoch).map(|(table, _)| table)
+}
+
+/// The name of the guard table, `Votes` or `LastProposed`, that holds a row of an epoch after
+/// `closed_epoch`, and that epoch, if either does.
+///
+/// `ProposedCertificates` is not read. The certifier stores a certificate only for a header the
+/// proposer stored in `LastProposed` first, and every clear removes an epoch's rows from
+/// `ProposedCertificates` before it removes them from `LastProposed`, so a later epoch's row there
+/// comes with one in `LastProposed`. The table also holds a row for every header this node had
+/// certified in the epoch, too many to read at every close.
+fn later_epoch_guard_row<DB: TNDatabase>(
+    db: &DB,
+    closed_epoch: Epoch,
+) -> Option<(&'static str, Epoch)> {
+    guard_row(db, |epoch| epoch > closed_epoch)
+}
+
+/// The name of the guard table, `Votes` or `LastProposed`, holding a row whose epoch `matches`,
+/// and that epoch, from the first such row. `Votes` holds at most one row per authority and
+/// `LastProposed` a single row, so every row of both is read.
+fn guard_row<DB: TNDatabase>(
+    db: &DB,
+    matches: impl Fn(Epoch) -> bool,
+) -> Option<(&'static str, Epoch)> {
+    db.iter::<Votes>()
+        .map(|(_, vote)| vote.epoch())
+        .find(|epoch| matches(*epoch))
+        .map(|epoch| (Votes::NAME, epoch))
+        .or_else(|| {
+            db.iter::<LastProposed>()
+                .map(|(_, header)| header.epoch())
+                .find(|epoch| matches(*epoch))
+                .map(|epoch| (LastProposed::NAME, epoch))
+        })
+}
+
+/// Remove `T`'s rows whose epoch, as `epoch_of` reads it, is `closed_epoch` or older, in one
+/// transaction, and keep the others.
+fn remove_rows_through<T: Table, DB: TNDatabase>(
+    db: &DB,
+    closed_epoch: Epoch,
+    epoch_of: fn(&T::Value) -> Epoch,
+) -> eyre::Result<()> {
+    let closed: Vec<T::Key> = db
+        .iter::<T>()
+        .filter(|(_, value)| epoch_of(value) <= closed_epoch)
+        .map(|(key, _)| key)
+        .collect();
+    let mut txn = db.write_txn()?;
+    for key in &closed {
+        txn.remove::<T>(key)?;
     }
-    db.iter::<LastProposed>()
-        .any(|(_, header)| header.epoch() == current_epoch)
-        .then_some(LastProposed::NAME)
+    txn.commit()
 }
 
 #[cfg(test)]
@@ -1709,5 +1968,326 @@ mod tests {
             assert_eq!(stale_epoch_table_row(&db, 9), Some((Certificates::NAME, 8)));
             assert_eq!(current_epoch_guard_row(&db, 9), Some(guard), "guard in {guard}");
         }
+    }
+
+    /// A rebuild after `db reset-execution` replays and closes the epochs before the one this node
+    /// was voting and proposing in. Those closes keep that epoch's votes, last proposal and
+    /// proposed certificates, and remove the closed epoch's, so entering that epoch finds its
+    /// guards and nothing stale; its own close clears them with the rest.
+    #[tokio::test]
+    async fn a_replayed_close_keeps_a_later_epochs_votes_and_proposals() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replayed_close_guards")?;
+        let (manager, _engine, _tasks, _keys) = guard_manager(&temp, None).await?;
+        let db = &manager.consensus_db;
+        for (_, write) in epoch_carrying_tables() {
+            write(db, 3);
+        }
+        // rows of the closed epoch beside them: another author's vote and a proposed certificate
+        let other_author = AuthorityIdentifier::from_bytes([4; 32]);
+        db.insert::<Votes>(
+            &other_author,
+            &VoteInfo { epoch: 0, round: 1, vote_digest: VoteDigest::default() },
+        )?;
+        let closed = certificate_of_epoch(0);
+        db.insert::<ProposedCertificates>(&closed.header().digest(), &closed)?;
+        db.insert::<Payload>(&(BlockHash::repeat_byte(1), 0), &0)?;
+
+        manager.clear_consensus_db_for_next_epoch(0)?;
+        let votes: Vec<_> =
+            db.iter::<Votes>().map(|(author, vote)| (author, vote.epoch())).collect();
+        assert_eq!(votes, [(row_author(), 3)], "the later epoch's vote stays, the closed one goes");
+        assert_eq!(db.get::<LastProposed>(&LAST_PROPOSAL_KEY)?.map(|h| h.epoch()), Some(3));
+        let proposed: Vec<_> =
+            db.iter::<ProposedCertificates>().map(|(_, cert)| cert.epoch()).collect();
+        assert_eq!(proposed, [3], "the later epoch's proposed certificate stays");
+        assert_eq!(db.iter::<Certificates>().count(), 0, "certificates are not guards");
+        assert_eq!(db.iter::<Payload>().count(), 0);
+
+        // the next replayed entry and close, and the entry into epoch 3, keep them too
+        assert_eq!(stale_epoch_table_row(db, 1), None);
+        manager.clear_consensus_db_for_next_epoch(1)?;
+        assert_eq!(stale_epoch_table_row(db, 3), None, "nothing stale entering epoch 3");
+        assert_eq!(current_epoch_guard_row(db, 3), Some(Votes::NAME));
+        assert_eq!(db.iter::<ProposedCertificates>().count(), 1);
+
+        // epoch 3's own close clears every table
+        manager.clear_consensus_db_for_next_epoch(3)?;
+        assert_eq!(db.iter::<Votes>().count(), 0);
+        assert_eq!(db.iter::<LastProposed>().count(), 0);
+        assert_eq!(db.iter::<ProposedCertificates>().count(), 0);
+        Ok(())
+    }
+
+    /// The replay guard tests' manager: an [`EpochManager`] over a fresh datadir, with `floor` as
+    /// its restored-state floor when given (the `run_epoch` tests' harness), its engine, the task
+    /// manager holding the reth env's tasks, and the genesis committee's keys.
+    async fn guard_manager(
+        temp: &tempfile::TempDir,
+        floor: Option<u64>,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, DatabaseType>,
+        ExecutionNode,
+        TaskManager,
+        Vec<BlsPublicKey>,
+    )> {
+        let (manager, engine, _reth_env, tasks, committee) =
+            super::super::run_epoch::tests::manager_with_engine_and_floor(temp, floor).await?;
+        let keys = committee.bls_keys().iter().copied().collect();
+        Ok((manager, engine, tasks, keys))
+    }
+
+    /// A block numbered `number` whose hash is `hash_byte` repeated.
+    fn block(number: u64, hash_byte: u8) -> BlockNumHash {
+        BlockNumHash::new(number, B256::repeat_byte(hash_byte))
+    }
+
+    /// A header for `block`, as the bus and the epoch-entry read hand it over.
+    fn header_of(block: BlockNumHash) -> SealedHeader {
+        SealedHeader::new(ExecHeader { number: block.number, ..Default::default() }, block.hash)
+    }
+
+    /// Make `block` the last block the bus reports executed: the closing block
+    /// `write_epoch_record` pins.
+    fn execute_to(manager: &EpochManager<std::path::PathBuf, DatabaseType>, block: BlockNumHash) {
+        manager.consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(header_of(block)))
+        });
+    }
+
+    /// A certificate for `record`. Storage checks only that it names the record's digest.
+    fn certificate_for(record: &EpochRecord) -> tn_types::EpochCertificate {
+        tn_types::EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: tn_types::BlsSignature::default(),
+            signed_authorities: Default::default(),
+        }
+    }
+
+    /// Store a certified epoch 0 record and an epoch 1 record committing `final_state`, with a
+    /// certificate when `certify`. Returns epoch 1's record.
+    async fn store_epoch1_record(
+        manager: &EpochManager<std::path::PathBuf, DatabaseType>,
+        keys: &[BlsPublicKey],
+        final_state: BlockNumHash,
+        certify: bool,
+    ) -> eyre::Result<EpochRecord> {
+        let epochs = manager.consensus_chain.epochs();
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.to_vec(),
+            next_committee: keys.to_vec(),
+            final_state: block(10, 0x10),
+            ..Default::default()
+        };
+        epochs.save(record0.clone(), certificate_for(&record0)).await?;
+        let record1 = EpochRecord {
+            epoch: 1,
+            committee: keys.to_vec(),
+            next_committee: keys.to_vec(),
+            parent_hash: record0.digest(),
+            final_state,
+            ..Default::default()
+        };
+        if certify {
+            epochs.save(record1.clone(), certificate_for(&record1)).await?;
+        } else {
+            epochs.save_record(record1.clone()).await?;
+        }
+        Ok(record1)
+    }
+
+    /// The [`FinalStateMismatch`] a refused close returned.
+    fn expect_mismatch(result: eyre::Result<()>) -> FinalStateMismatch {
+        let err =
+            result.expect_err("a record that does not match the closing block stops the node");
+        err.downcast_ref::<FinalStateMismatch>()
+            .cloned()
+            .unwrap_or_else(|| panic!("not a final-state mismatch: {err:#}"))
+    }
+
+    /// A stored record whose `final_state` is the closing block this node executed is reused and
+    /// published, with a certificate or without one.
+    #[tokio::test]
+    async fn replay_guard_reuses_a_stored_record_that_matches_the_closing_block() -> eyre::Result<()>
+    {
+        for certify in [true, false] {
+            let temp = tempfile::TempDir::with_prefix("replay_guard_match")?;
+            let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+            let closing = block(20, 0x20);
+            let record = store_epoch1_record(&manager, &keys, closing, certify).await?;
+            execute_to(&manager, closing);
+            manager.write_epoch_record(1, &engine).await?;
+            assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record));
+        }
+        Ok(())
+    }
+
+    /// A certified record whose closing block has another hash at the same height stops the
+    /// close, unpublished, and the error names the epoch and both blocks.
+    #[tokio::test]
+    async fn replay_guard_stops_on_a_closing_block_with_another_hash() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_hash")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(20, 0x20);
+        store_epoch1_record(&manager, &keys, recorded, true).await?;
+        let local = block(20, 0x21);
+        execute_to(&manager, local);
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: true, recorded, local });
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
+        let message = mismatch.to_string();
+        for part in ["epoch 1", "certified", &recorded.hash.to_string(), &local.hash.to_string()] {
+            assert!(message.contains(part), "{part} missing from: {message}");
+        }
+        Ok(())
+    }
+
+    /// A certified record whose closing block is at another height stops the close.
+    #[tokio::test]
+    async fn replay_guard_stops_on_a_closing_block_at_another_number() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_number")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(20, 0x20);
+        store_epoch1_record(&manager, &keys, recorded, true).await?;
+        let local = block(21, 0x20);
+        execute_to(&manager, local);
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: true, recorded, local });
+        Ok(())
+    }
+
+    /// A record without a certificate (this node's own, from an earlier execution) is compared
+    /// too, and a default `final_state` is not an "unset" value that skips the compare.
+    #[tokio::test]
+    async fn replay_guard_compares_an_uncertified_record_with_a_default_final_state(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_default")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = BlockNumHash::default();
+        store_epoch1_record(&manager, &keys, recorded, false).await?;
+        let local = block(20, 0x20);
+        execute_to(&manager, local);
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: false, recorded, local });
+        Ok(())
+    }
+
+    /// A certified epoch-0 record is compared like any later epoch's: epoch 0 builds over only an
+    /// uncertified record 0, so a certified one whose `final_state` is not the closing block stops
+    /// the close, unpublished, and one that matches is reused.
+    #[tokio::test]
+    async fn replay_guard_stops_on_a_certified_epoch0_record_that_does_not_match(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_epoch0")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(10, 0x10);
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: recorded,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save(record0.clone(), certificate_for(&record0)).await?;
+        let local = block(10, 0x11);
+        execute_to(&manager, local);
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(0, &engine).await);
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 0, certified: true, recorded, local });
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
+
+        execute_to(&manager, recorded);
+        manager.write_epoch_record(0, &engine).await?;
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record0));
+        Ok(())
+    }
+
+    /// The dummy epoch-0 record (no certificate, a default `final_state`) is not compared: the
+    /// close builds the real record 0 over it from the closing block.
+    #[tokio::test]
+    async fn replay_guard_builds_over_the_dummy_epoch0_record() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_dummy")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save_dummy_epoch0(dummy.clone()).await?;
+        // epoch 0 closes at genesis here: the build reads both committees at the closing block,
+        // so it must be a real one
+        let genesis = engine
+            .get_reth_env()
+            .await
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre!("genesis header"))?
+            .num_hash();
+        assert_ne!(dummy.final_state, genesis, "a compare with the dummy would refuse the close");
+        execute_to(&manager, genesis);
+        manager.last_consensus_header = Some(tn_types::ConsensusHeader::default());
+
+        manager.write_epoch_record(0, &engine).await?;
+        let (record, cert) = manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .ok_or_else(|| eyre!("record 0"))?;
+        assert_eq!(record.final_state, genesis, "the record built from the closing block");
+        assert!(cert.is_none());
+        assert!(!manager.consensus_chain.epochs().contains_dummy_epoch0().await);
+        Ok(())
+    }
+
+    /// On a snapshot-restored datadir a closing block at or below the restored-state floor was
+    /// restored, not executed, so neither the close nor the epoch entry compares it; above the
+    /// floor both do.
+    #[tokio::test]
+    async fn replay_guard_skips_a_closing_block_this_node_restored() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_floor")?;
+        let floor = 20;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, Some(floor)).await?;
+        let recorded = block(floor, 0x20);
+        let record = store_epoch1_record(&manager, &keys, recorded, true).await?;
+
+        let restored = block(floor, 0x21);
+        execute_to(&manager, restored);
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record));
+        manager.recover_previous_epoch_record(2, &header_of(restored), &engine).await?;
+
+        let executed = block(floor + 1, 0x21);
+        execute_to(&manager, executed);
+        let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(mismatch.local, executed);
+        let mismatch = expect_mismatch(
+            manager.recover_previous_epoch_record(2, &header_of(executed), &engine).await,
+        );
+        assert_eq!(mismatch.local, executed);
+        Ok(())
+    }
+
+    /// Entering epoch 2 with epoch 1's record present checks it against the entry pin, epoch 1's
+    /// closing block: a node the close-time guard stopped has already executed that block, so a
+    /// restart enters epoch 2 and must stop again instead of running on.
+    #[tokio::test]
+    async fn epoch_entry_stops_on_a_previous_record_that_does_not_match_its_closing_block(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_entry")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(20, 0x20);
+        store_epoch1_record(&manager, &keys, recorded, true).await?;
+
+        manager.recover_previous_epoch_record(2, &header_of(recorded), &engine).await?;
+        let local = block(20, 0x21);
+        let mismatch = expect_mismatch(
+            manager.recover_previous_epoch_record(2, &header_of(local), &engine).await,
+        );
+        assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: true, recorded, local });
+        Ok(())
     }
 }

@@ -12,6 +12,16 @@ pub use static_file::{
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
 };
+// TN(TN-0119): per-segment sync timings for benches.
+pub use static_file::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
+// TN(TN-0122): which segments' new jars carry checksums under storage v2.
+pub use static_file::checksummed_segment;
+// TN(TN-0133): a gap between a segment's jars.
+pub use static_file::StaticFileGapError;
+// TN(TN-0135): a jar without checksums in a storage-v2 datadir.
+pub use static_file::UncheckedJarError;
+// TN(TN-0137): a compressed changeset jar met by a point lookup.
+pub use static_file::CompressedChangesetJarError;
 
 mod state;
 pub use state::{

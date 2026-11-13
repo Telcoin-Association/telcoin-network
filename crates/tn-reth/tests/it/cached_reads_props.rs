@@ -1,22 +1,20 @@
-//! Property-based tests for the output-scoped read cache (`OutputBuildScope`).
+//! Property-based tests for the shared build path: one build scope (`OutputBuildScope`) per
+//! consensus output, with reads through the cross-block execution cache (`exec_cache.rs`).
 //!
 //! These tests verify, over random native transfers, storage writes, CREATE2 creations (with and
 //! without a self-destruct in the creating transaction), calls into the created children,
 //! zero-value sends to an empty genesis account and BLOCKHASH reads of the two blocks before the
-//! current one, spread across the 2-4 unpersisted blocks of one consensus output, that keeping
-//! one read cache for the whole output is invisible to consensus:
-//! - the shared cache builds the blocks a fresh cache per block builds: equal block hash, state
-//!   root, receipts root, gas used, receipts and bundle state;
-//! - after every block, each cached account, storage slot, bytecode and block hash equals what the
-//!   next block's parent state provider returns for it (the cache is a subset of the true pre-block
-//!   state).
+//! current one, spread across the 2-4 unpersisted blocks of one consensus output, that the
+//! execution cache is invisible to consensus: the bytes build, which reads through the cache the
+//! previous block's builds checked in, builds the blocks the recovered build with the shared scope
+//! builds from an empty cache (equal block hash, state root, receipts root, gas used, receipts and
+//! bundle state), and no checked hit is stale.
 
 use crate::pipeline_helpers::{
     block_differences, child_init_code, deploy_code, PipelineTestEnv, FACTORY_RUNTIME,
 };
 use proptest::prelude::*;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
-use std::collections::BTreeSet;
 use tn_reth::{test_utils::TransactionFactory, ExecutedBlock, OutputBuildScope, OutputTrieOverlay};
 use tn_types::{Address, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
@@ -179,21 +177,16 @@ impl Fixture {
     }
 }
 
-/// Build `blocks` as one unpersisted output after the fixture's setup block, with a fresh read
-/// cache per block and with one shared scope, calling `check` after each block with the
-/// environment, both builds and the shared scope.
+/// Build `blocks` as one unpersisted output after the fixture's setup block, each block twice
+/// (`PipelineTestEnv::build_unpersisted_fresh_and_shared`), calling `check` after each block with
+/// both builds. No block may have been rebuilt after a stale execution-cache hit.
 ///
 /// Every block must include all of its transactions, and every one but a factory call (which
 /// reverts when its child exists) must succeed, so a generator out of step with the senders'
 /// nonces fails here instead of comparing empty blocks.
 fn run_output(
     blocks: &[Vec<Op>],
-    mut check: impl FnMut(
-        &PipelineTestEnv,
-        &ExecutedBlock,
-        &ExecutedBlock,
-        &OutputBuildScope,
-    ) -> Result<(), TestCaseError>,
+    mut check: impl FnMut(&ExecutedBlock, &ExecutedBlock) -> Result<(), TestCaseError>,
 ) -> Result<(), TestCaseError> {
     let fail = |err: eyre::Report| TestCaseError::fail(err.to_string());
     let mut fixture = Fixture::new().map_err(fail)?;
@@ -220,7 +213,13 @@ fn run_output(
                 op
             );
         }
-        check(&fixture.env, &fresh, &shared, &scope)?;
+        prop_assert_eq!(
+            fixture.env.reth_env.execution_cache_rebuilds(),
+            0,
+            "block {} hit a stale cache entry",
+            number + 1
+        );
+        check(&fresh, &shared)?;
     }
     Ok(())
 }
@@ -228,81 +227,15 @@ fn run_output(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
-    /// A shared read cache builds every block of the output exactly as a fresh cache per block.
+    /// The execution cache builds every block of the output exactly as an empty cache.
     #[test]
     fn prop_shared_cache_builds_identical_blocks(blocks in output_ops()) {
         let mut number = 0;
-        run_output(&blocks, |_, fresh, shared, _| {
+        run_output(&blocks, |fresh, shared| {
             number += 1;
             let differences = block_differences(fresh, shared);
             prop_assert!(differences.is_empty(), "block {} differs in {:?}", number, differences);
             Ok(())
         })?;
     }
-
-    /// After every block, each cached account, slot, bytecode and block hash equals the next
-    /// block's parent state: what the state provider at the block just built returns for it.
-    #[test]
-    fn prop_cache_is_subset_of_next_parent_state(blocks in output_ops()) {
-        let mut number = 0;
-        run_output(&blocks, |env, fresh, _, scope| {
-            number += 1;
-            let mismatches = env
-                .cache_mismatches(scope, fresh)
-                .map_err(|err| TestCaseError::fail(err.to_string()))?;
-            prop_assert!(mismatches.is_empty(), "block {}: {:?}", number, mismatches);
-            Ok(())
-        })?;
-    }
-}
-
-/// Non-proptest: a sender repeated across an output's blocks is read once and then served from
-/// the cache, which follows its nonce, and the store contract's written slot is cached at its new
-/// value.
-#[test]
-fn test_repeated_sender_and_slot_follow_the_output() -> Result<(), TestCaseError> {
-    let blocks = vec![
-        vec![Op::Store { from: 0, key: 1, value: 2, read: 1 }],
-        vec![Op::Store { from: 0, key: 1, value: 3, read: 1 }],
-        vec![Op::Transfer { from: 0, to: 0, amount: 1 }],
-    ];
-    let mut number = 0u64;
-    run_output(&blocks, |env, fresh, shared, scope| {
-        number += 1;
-        prop_assert!(block_differences(fresh, shared).is_empty());
-        let user = env.user_factory.address();
-        let cached = scope.reads().accounts[&user].info.as_ref().map(|info| info.nonce);
-        // nonces 0-3 set up the fixture before the output
-        prop_assert_eq!(cached, Some(number + 4));
-        let store = user.create(0);
-        let slot = scope.reads().accounts[&store].storage.get(&U256::from(1)).copied();
-        // block 1 writes 2 + 0, block 2 writes 3 + 2 (read from the cache), block 3 leaves it
-        prop_assert_eq!(slot, Some(U256::from(if number == 1 { 2 } else { 5 })));
-        Ok(())
-    })
-}
-
-/// Non-proptest: BLOCKHASH reads fill the cache's block hashes. The first block reads the setup
-/// block's hash from the database, the second reads the first block's from the in-memory chain,
-/// and the third reads the first block's again, now from the cache; both builds agree and every
-/// cached hash is the chain's.
-#[test]
-fn test_block_hash_reads_are_cached() -> Result<(), TestCaseError> {
-    let depths = [1, 1, 2];
-    let blocks: Vec<Vec<Op>> =
-        depths.iter().map(|&depth| vec![Op::BlockHash { from: 0, depth }]).collect();
-    let mut read = BTreeSet::new();
-    let mut index = 0;
-    run_output(&blocks, |env, fresh, shared, scope| {
-        prop_assert!(block_differences(fresh, shared).is_empty());
-        let mismatches = env
-            .cache_mismatches(scope, fresh)
-            .map_err(|err| TestCaseError::fail(err.to_string()))?;
-        prop_assert!(mismatches.is_empty(), "block {}: {:?}", index + 1, mismatches);
-        read.insert(fresh.recovered_block.number - depths[index]);
-        let cached: BTreeSet<u64> = scope.reads().block_hashes.keys().copied().collect();
-        prop_assert_eq!(&cached, &read, "block {}", index + 1);
-        index += 1;
-        Ok(())
-    })
 }

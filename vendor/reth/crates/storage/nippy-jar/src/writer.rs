@@ -1,12 +1,13 @@
 use crate::{
-    compression::Compression, ColumnResult, NippyJar, NippyJarChecker, NippyJarError,
-    NippyJarHeader,
+    compression::{Compression, Compressors},
+    value_checksum, ColumnResult, NippyJar, NippyJarChecker, NippyJarError, NippyJarHeader,
+    CHECKSUM_SIZE,
 };
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
 };
+use zstd::{bulk::Compressor, zstd_safe};
 
 /// Size of one offset in bytes.
 pub(crate) const OFFSET_SIZE_BYTES: u8 = 8;
@@ -24,6 +25,9 @@ pub(crate) const OFFSET_SIZE_BYTES: u8 = 8;
 ///
 /// ## Data file layout
 /// The data file is represented just as a sequence of bytes of data without any delimiters
+///
+/// TN(TN-0120): in a checksummed jar ([`NippyJar::with_checksums`]) each value is followed by its
+/// [`value_checksum`], and the offsets count those bytes as part of the value.
 #[derive(Debug)]
 pub struct NippyJarWriter<H: NippyJarHeader = ()> {
     /// Associated [`NippyJar`], containing all necessary configurations for data
@@ -35,6 +39,8 @@ pub struct NippyJarWriter<H: NippyJarHeader = ()> {
     offsets_file: BufWriter<File>,
     /// Temporary buffer to reuse when compressing data.
     tmp_buf: Vec<u8>,
+    /// TN(TN-0146): the compressors of a dictionary zstd jar, kept for the writer's life.
+    dictionary_compressors: Option<DictionaryCompressors>,
     /// Used to find the maximum uncompressed size of a row in a jar.
     uncompressed_row_size: usize,
     /// Partial offset list which hasn't been flushed to disk.
@@ -50,13 +56,21 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     ///
     /// It will **always** attempt to heal any inconsistent state when called.
     pub fn new(jar: NippyJar<H>) -> Result<Self, NippyJarError> {
-        let (data_file, offsets_file, is_created) =
-            Self::create_or_open_files(jar.data_path(), &jar.offsets_path())?;
+        // TN(TN-0149): a compressor `load` refuses is refused before any file is created.
+        jar.check_compression()?;
+        // TN(TN-0132): a jar whose configuration counts rows has no file to create: one missing
+        // is damage, not a new jar.
+        if jar.rows > 0 {
+            for path in [jar.data_path().to_path_buf(), jar.offsets_path()] {
+                if !path.exists() {
+                    return Err(NippyJarError::MissingFile(path))
+                }
+            }
+        }
+
+        let (data_file, offsets_file, is_created) = Self::create_or_open_files(&jar)?;
 
         let (jar, data_file, offsets_file) = if is_created {
-            // Makes sure we don't have dangling data and offset files when we just created the file
-            jar.freeze_config()?;
-
             (jar, BufWriter::new(data_file), BufWriter::new(offsets_file))
         } else {
             // If we are opening a previously created jar, we need to check its consistency, and
@@ -70,11 +84,13 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
             (jar, data_file.expect("qed"), offsets_file.expect("qed"))
         };
 
+        let dictionary_compressors = DictionaryCompressors::new(&jar)?;
         let mut writer = Self {
             jar,
             data_file,
             offsets_file,
             tmp_buf: Vec::with_capacity(1_000_000),
+            dictionary_compressors,
             uncompressed_row_size: 0,
             offsets: Vec::with_capacity(1_000_000),
             column: 0,
@@ -118,16 +134,29 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         self.jar.rows()
     }
 
+    /// Whether the jar's values, configuration and changeset offsets carry checksums
+    /// ([`NippyJar::has_checksums`]).
+    pub const fn has_checksums(&self) -> bool {
+        self.jar.has_checksums()
+    }
+
     /// Consumes the writer and returns the associated [`NippyJar`].
     pub fn into_jar(self) -> NippyJar<H> {
         self.jar
     }
 
-    fn create_or_open_files(
-        data: &Path,
-        offsets: &Path,
-    ) -> Result<(File, File, bool), NippyJarError> {
+    fn create_or_open_files(jar: &NippyJar<H>) -> Result<(File, File, bool), NippyJarError> {
+        let (data, offsets) = (jar.data_path(), &jar.offsets_path());
         let is_created = !data.exists() || !offsets.exists();
+
+        // TN(TN-0150): a new jar's configuration (no rows) is written before its files exist.
+        // Jars are found by their data file (`iter_static_files`), which loads the configuration
+        // beside it, so a creation stopped at any point leaves a configuration no listing sees, or
+        // a jar without rows, which the next open resets (`NippyJarChecker`). Written after the
+        // files, a stop in between left a data file with no configuration, which no start loads.
+        if is_created {
+            jar.freeze_config()?;
+        }
 
         if !data.exists() {
             // File::create is write-only (no reading possible)
@@ -144,6 +173,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
         let mut offsets_file = OpenOptions::new().read(true).write(true).open(offsets)?;
         if is_created {
+            // TN(TN-0132): whichever file was not missing is left over from a deletion that
+            // stopped part way (`NippyJar::delete`) and holds nothing of this jar.
+            data_file.set_len(0)?;
+            data_file.seek(SeekFrom::Start(0))?;
+            offsets_file.set_len(0)?;
+
             let mut buf = Vec::with_capacity(1 + OFFSET_SIZE_BYTES as usize);
 
             // First byte of the offset file is the size of one offset in bytes
@@ -155,6 +190,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
             offsets_file.write_all(&buf)?;
             offsets_file.seek(SeekFrom::End(0))?;
+
+            // TN(TN-0150): the new files' directory entries are durable before the writer
+            // returns, as the configuration's directory sync made them when it came last.
+            if let Some(dir) = data.parent() {
+                reth_fs_util::fsync_file(&File::open(dir)?)?;
+            }
         }
 
         Ok((data_file, offsets_file, is_created))
@@ -227,14 +268,25 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Writes column to data file. If it's the last column of the row, call `finalize_row()`
     fn write_column(&mut self, value: &[u8]) -> Result<usize, NippyJarError> {
         self.uncompressed_row_size += value.len();
-        let len = if let Some(compression) = &self.jar.compressor {
+        let (stored, len) = if let Some(compressors) = &mut self.dictionary_compressors {
+            let stored = compressors.compress(self.column, value, &mut self.tmp_buf)?;
+            (stored, stored.len())
+        } else if let Some(compression) = &self.jar.compressor {
             let before = self.tmp_buf.len();
             let len = compression.compress_to(value, &mut self.tmp_buf)?;
-            self.data_file.write_all(&self.tmp_buf[before..before + len])?;
-            len
+            (&self.tmp_buf[before..before + len], len)
         } else {
-            self.data_file.write_all(value)?;
-            value.len()
+            (value, value.len())
+        };
+        self.data_file.write_all(stored)?;
+
+        // TN(TN-0120): `jar.rows` counts the uncommitted rows too, so it is this row's index.
+        let len = if self.jar.has_checksums() {
+            let checksum = value_checksum(self.jar.rows as u64, self.column, stored);
+            self.data_file.write_all(&checksum.to_le_bytes())?;
+            len + CHECKSUM_SIZE
+        } else {
+            len
         };
 
         self.column += 1;
@@ -247,6 +299,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     }
 
     /// Prunes rows from data and offsets file and updates its configuration on disk
+    ///
+    /// TN(TN-0130): the configuration with the new row count is committed before either file
+    /// shrinks, so a prune stopped part way leaves files longer than their configuration: an
+    /// uncommitted tail, which the open-time heal cuts as it cuts an interrupted append. Files
+    /// shorter than their configuration are then damage, which a checksummed jar's heal refuses
+    /// ([`NippyJarChecker`]). A finished prune leaves the files it left before.
     pub fn prune_rows(&mut self, num_rows: usize) -> Result<(), NippyJarError> {
         self.dirty = true;
 
@@ -260,14 +318,18 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         let offsets_prune_count = num_offsets.min(self.offsets.len().saturating_sub(1)); // last element is the expected size of the data file
         let remaining_to_prune = num_offsets.saturating_sub(offsets_prune_count);
 
+        // TN(TN-0130): the lengths the files are cut to once the configuration is committed.
+        let mut data_len = None;
+        let mut offsets_len = None;
+
         // Prune in-memory offsets if needed
         if offsets_prune_count > 0 {
             // Determine new length based on the offset to prune up to
             let new_len = self.offsets[(self.offsets.len() - 1) - offsets_prune_count]; // last element is the expected size of the data file
             self.offsets.truncate(self.offsets.len() - offsets_prune_count);
 
-            // Truncate the data file to the new length
-            self.data_file.get_mut().set_len(new_len)?;
+            // The data file is cut to the new length
+            data_len = Some(new_len);
         }
 
         // Prune from on-disk offset list if there are still rows left to prune
@@ -297,8 +359,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
                     // file size = 0). This maintains the same structure as when
                     // a file is initially created.
                     // See `NippyJarWriter::create_or_open_files` for the initial file format.
-                    self.offsets_file.get_mut().set_len(1 + OFFSET_SIZE_BYTES as u64)?;
-                    self.data_file.get_mut().set_len(0)?;
+                    offsets_len = Some(1 + OFFSET_SIZE_BYTES as u64);
+                    data_len = Some(0);
                 } else {
                     // Calculate the new length for the on-disk offset list
                     let new_len = 1 + new_num_offsets * OFFSET_SIZE_BYTES as u64;
@@ -310,9 +372,9 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
                     self.offsets_file.get_ref().read_exact(&mut last_offset)?;
                     let last_offset = u64::from_le_bytes(last_offset);
 
-                    // Update the lengths of both the offsets and data files
-                    self.offsets_file.get_mut().set_len(new_len)?;
-                    self.data_file.get_mut().set_len(last_offset)?;
+                    // The lengths of both the offsets and data files
+                    offsets_len = Some(new_len);
+                    data_len = Some(last_offset);
                 }
             } else {
                 return Err(NippyJarError::InvalidPruning(0, remaining_to_prune as u64))
@@ -321,27 +383,37 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
         if remaining_to_prune > 0 {
             // Every uncommitted row was pruned, so the remaining in-memory offset (the previous
-            // data file end) is stale: the on-disk prune shrank the data file below it.
+            // data file end) is stale: the on-disk prune shrinks the data file below it.
             self.offsets.clear();
         } else {
             // The config written below counts the uncommitted rows that were not pruned, so their
-            // offsets must be on disk too. If we crash before the config is written, the offsets
-            // file is longer than the config expects and the checker heals it as an interrupted
-            // append.
+            // offsets and data must be on disk first. If we crash before the config is written,
+            // the offsets file is longer than the config expects and the checker heals it as an
+            // interrupted append.
             self.commit_offsets_inner()?;
+            reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+            reth_fs_util::fsync_file(self.data_file.get_ref())?;
         }
-
-        self.offsets_file.get_ref().sync_all()?;
-        self.data_file.get_ref().sync_all()?;
-
-        self.offsets_file.seek(SeekFrom::End(0))?;
-        self.data_file.seek(SeekFrom::End(0))?;
 
         self.jar.rows = self.jar.rows.saturating_sub(num_rows);
         if self.jar.rows == 0 {
             self.jar.max_row_size = 0;
         }
         self.jar.freeze_config()?;
+
+        // TN(TN-0130): the files shrink only now, after the configuration that no longer counts
+        // the pruned rows.
+        if let Some(len) = offsets_len {
+            self.offsets_file.get_mut().set_len(len)?;
+        }
+        if let Some(len) = data_len {
+            self.data_file.get_mut().set_len(len)?;
+        }
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
+
+        self.offsets_file.seek(SeekFrom::End(0))?;
+        self.data_file.seek(SeekFrom::End(0))?;
 
         Ok(())
     }
@@ -369,11 +441,30 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// This does NOT commit the configuration. Call [`Self::finalize`] after to write the
     /// configuration and mark the writer as clean.
     pub fn sync_all(&mut self) -> Result<(), NippyJarError> {
-        self.data_file.flush()?;
-        self.data_file.get_ref().sync_all()?;
-
+        self.sync_data()?;
         self.commit_offsets()?;
         Ok(())
+    }
+
+    /// Flushes and syncs the data file, the first half of [`Self::sync_all`];
+    /// [`Self::commit_offsets`] is the second.
+    ///
+    /// TN(TN-0119): split out, and `commit_offsets` made public, so the static-file writer can
+    /// time the two syncs apart.
+    pub fn sync_data(&mut self) -> Result<(), NippyJarError> {
+        self.sync_jobs().0.run()
+    }
+
+    /// The two halves of [`Self::sync_all`], [`Self::sync_data`] and [`Self::commit_offsets`], as
+    /// jobs that borrow disjoint parts of the writer, so they can run on two threads at once.
+    ///
+    /// TN(TN-0138): the static-file writer runs them beside its `.csoff` sync. Their order does
+    /// not matter: the configuration, written only after both, bounds what a reopen keeps.
+    pub const fn sync_jobs(&mut self) -> (DataSync<'_>, OffsetsSync<'_>) {
+        (
+            DataSync { data_file: &mut self.data_file },
+            OffsetsSync { offsets_file: &mut self.offsets_file, offsets: &mut self.offsets },
+        )
     }
 
     /// Commits configuration to disk and marks the writer as clean.
@@ -405,11 +496,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     }
 
     /// Flushes offsets to disk.
-    pub(crate) fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
-        self.commit_offsets_inner()?;
-        self.offsets_file.get_ref().sync_all()?;
-
-        Ok(())
+    pub fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
+        self.sync_jobs().1.run()
     }
 
     #[cfg(feature = "test-utils")]
@@ -419,34 +507,10 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Flushes offsets to disk.
     ///
-    /// CAUTION: Does not call `sync_all` on the offsets file and requires a manual call to
-    /// `self.offsets_file.get_ref().sync_all()`.
+    /// CAUTION: Does not sync the offsets file and requires a manual call to
+    /// `reth_fs_util::fsync_file(self.offsets_file.get_ref())`.
     fn commit_offsets_inner(&mut self) -> Result<(), NippyJarError> {
-        // The last offset on disk can be the first offset of `self.offsets` given how
-        // `append_column()` works alongside commit. So we need to skip it.
-        let mut last_offset_ondisk = if self.offsets_file.get_ref().metadata()?.len() > 1 {
-            self.offsets_file.seek(SeekFrom::End(-(OFFSET_SIZE_BYTES as i64)))?;
-            let mut buf = [0u8; OFFSET_SIZE_BYTES as usize];
-            self.offsets_file.get_ref().read_exact(&mut buf)?;
-            Some(u64::from_le_bytes(buf))
-        } else {
-            None
-        };
-
-        self.offsets_file.seek(SeekFrom::End(0))?;
-
-        // Appends new offsets to disk
-        for offset in self.offsets.drain(..) {
-            if let Some(last_offset_ondisk) = last_offset_ondisk.take() &&
-                last_offset_ondisk == offset
-            {
-                continue
-            }
-            self.offsets_file.write_all(&offset.to_le_bytes())?;
-        }
-        self.offsets_file.flush()?;
-
-        Ok(())
+        self.sync_jobs().1.write()
     }
 
     /// Returns the maximum row size for the associated [`NippyJar`].
@@ -481,7 +545,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Returns the path to the data file for the associated [`NippyJar`].
     #[cfg(test)]
-    pub fn data_path(&self) -> &Path {
+    pub fn data_path(&self) -> &std::path::Path {
         self.jar.data_path()
     }
 
@@ -495,5 +559,109 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     #[cfg(any(test, feature = "test-utils"))]
     pub const fn jar(&self) -> &NippyJar<H> {
         &self.jar
+    }
+}
+
+/// TN(TN-0146): the compressors of a dictionary zstd jar, one per column from the configuration's
+/// dictionaries. Made once per writer: a context per value would cost more than compressing a
+/// small value. The writer used to compress every value without the dictionaries the cursor
+/// decompresses with.
+struct DictionaryCompressors(Vec<Compressor<'static>>);
+
+impl std::fmt::Debug for DictionaryCompressors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DictionaryCompressors").field(&self.0.len()).finish()
+    }
+}
+
+impl DictionaryCompressors {
+    /// The compressors of `jar` if it compresses with dictionaries.
+    fn new<H: NippyJarHeader>(jar: &NippyJar<H>) -> Result<Option<Self>, NippyJarError> {
+        let Some(Compressors::Zstd(zstd)) = jar.compressor() else { return Ok(None) };
+        if !zstd.use_dict {
+            return Ok(None)
+        }
+        let compressors = zstd.compressors()?.ok_or(NippyJarError::CompressorNotReady)?;
+        if compressors.len() != jar.columns {
+            return Err(NippyJarError::ColumnLenMismatch(jar.columns, compressors.len()))
+        }
+        Ok(Some(Self(compressors)))
+    }
+
+    /// Replaces `buf` with `value` compressed with `column`'s dictionary and returns it.
+    fn compress<'b>(
+        &mut self,
+        column: usize,
+        value: &[u8],
+        buf: &'b mut Vec<u8>,
+    ) -> Result<&'b [u8], NippyJarError> {
+        buf.clear();
+        buf.reserve(zstd_safe::compress_bound(value.len()));
+        self.0[column].compress_to_buffer(value, buf)?;
+        Ok(buf)
+    }
+}
+
+/// The data file's half of [`NippyJarWriter::sync_all`], from [`NippyJarWriter::sync_jobs`]:
+/// writes out the buffered rows, then syncs the file.
+#[derive(Debug)]
+pub struct DataSync<'a> {
+    data_file: &'a mut BufWriter<File>,
+}
+
+impl DataSync<'_> {
+    /// Flushes and syncs the data file ([`NippyJarWriter::sync_data`]).
+    pub fn run(self) -> Result<(), NippyJarError> {
+        self.data_file.flush()?;
+        // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`), as at every sync of the
+        // writer.
+        reth_fs_util::fsync_file(self.data_file.get_ref())?;
+        Ok(())
+    }
+}
+
+/// The offsets file's half of [`NippyJarWriter::sync_all`], from [`NippyJarWriter::sync_jobs`]:
+/// appends the offsets not yet on disk, then syncs the file.
+#[derive(Debug)]
+pub struct OffsetsSync<'a> {
+    offsets_file: &'a mut BufWriter<File>,
+    offsets: &'a mut Vec<u64>,
+}
+
+impl OffsetsSync<'_> {
+    /// Appends and syncs the offsets ([`NippyJarWriter::commit_offsets`]).
+    pub fn run(mut self) -> Result<(), NippyJarError> {
+        self.write()?;
+        reth_fs_util::fsync_file(self.offsets_file.get_ref())?;
+        Ok(())
+    }
+
+    /// Appends the offsets, draining them, and flushes the file without syncing it.
+    fn write(&mut self) -> Result<(), NippyJarError> {
+        // The last offset on disk can be the first offset of `self.offsets` given how
+        // `append_column()` works alongside commit. So we need to skip it.
+        let mut last_offset_ondisk = if self.offsets_file.get_ref().metadata()?.len() > 1 {
+            self.offsets_file.seek(SeekFrom::End(-(OFFSET_SIZE_BYTES as i64)))?;
+            let mut buf = [0u8; OFFSET_SIZE_BYTES as usize];
+            self.offsets_file.get_ref().read_exact(&mut buf)?;
+            Some(u64::from_le_bytes(buf))
+        } else {
+            None
+        };
+
+        self.offsets_file.seek(SeekFrom::End(0))?;
+
+        // Appends new offsets to disk
+        for offset in self.offsets.drain(..) {
+            if let Some(last_offset_ondisk) = last_offset_ondisk.take() &&
+                last_offset_ondisk == offset
+            {
+                continue
+            }
+            self.offsets_file.write_all(&offset.to_le_bytes())?;
+        }
+        self.offsets_file.flush()?;
+
+        Ok(())
     }
 }

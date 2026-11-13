@@ -4697,8 +4697,9 @@ mod tests {
     }
 
     /// A loopback socket bound to `addr` that does not listen: a connect to it
-    /// is refused, and while it is held no other socket can take the port (a
-    /// freed port can go to the next `bind(0)`, the gateway's own included).
+    /// fails, and while it is held no other socket can take the port (a freed
+    /// port can go to the next `bind(0)`, the gateway's own included). How the
+    /// connect fails depends on the OS: [`HELD_PORT_STATUS`].
     fn hold_port(addr: SocketAddr) -> tokio::net::TcpSocket {
         let socket = tokio::net::TcpSocket::new_v4().expect("socket");
         // a port that just served a connection can be in TIME_WAIT
@@ -4709,9 +4710,20 @@ mod tests {
         socket
     }
 
+    /// The status of a forward to a [`hold_port`] port. Linux answers a SYN to
+    /// a bound socket that does not listen with a reset, so the connect is
+    /// refused (502); the BSDs, macOS included, drop the SYN, so the connect
+    /// times out (504). Either way it is a failed connect, which counts toward
+    /// `rpc_failure` (reqwest flags a connect timeout as a connect error).
+    const HELD_PORT_STATUS: StatusCode = if cfg!(target_os = "linux") {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::GATEWAY_TIMEOUT
+    };
+
     #[tokio::test]
     async fn a_forward_that_gets_a_response_restarts_the_failure_run() {
-        // hold a loopback port without listening on it, so forwards to it are refused
+        // hold a loopback port without listening on it, so forwards to it fail to connect
         let held = hold_port(SocketAddr::from(([127, 0, 0, 1], 0)));
         let addr = held.local_addr().expect("local addr");
         // no idle connections, so every forward opens a new one and the third
@@ -4731,7 +4743,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "the held port {addr} refuses the forward");
+        assert_eq!(status, HELD_PORT_STATUS, "the held port {addr} fails the forward's connect");
 
         // the worker answers once on the same port, then goes away again
         let listener = held.listen(1024).expect("listen");
@@ -4744,10 +4756,10 @@ mod tests {
         let _ = worker.await;
         let _held = hold_port(addr);
 
-        // one refused forward after the response: the run restarted, so the
+        // one failed forward after the response: the run restarted, so the
         // count is 1, below the threshold of 2
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "the held port {addr} refuses the forward");
+        assert_eq!(status, HELD_PORT_STATUS, "the held port {addr} fails the forward's connect");
         assert_eq!(ready_status(gateway).await, StatusCode::OK, "the response reset the count");
     }
 

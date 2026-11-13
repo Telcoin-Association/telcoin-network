@@ -3,7 +3,10 @@
 //! `db stats` prints read-only statistics for the execution database. `db validate` walks a
 //! consensus epoch pack's `data` stream and reports integrity issues, reproducing the importer's
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
-//! Misordered (present, but in the wrong consensus-header group).
+//! Misordered (present, but in the wrong consensus-header group). `db reset-execution` moves the
+//! execution database aside, so the next start rebuilds it from genesis (`reset_execution`).
+//! `db migrate-execution` runs the MDBX to tn-lmdb migration of the execution database with the
+//! node stopped (`tn_reth::migrate_reth_db`).
 
 use crate::{
     node::{validate_faucet_build, NamedChain, OptInValueParser},
@@ -22,9 +25,9 @@ use std::{
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
-    db_check, db_table_stats, iter_static_files, refuse_pending_migration,
-    snapshot::SnapshotRestorer, DbCheckReport, DbTableStat, RethCommand, RethConfig, RethEnv,
-    StaticFileProvider, TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE,
+    db_check, db_table_stats, iter_static_files, migrate_reth_db, refuse_pending_migration,
+    snapshot::SnapshotRestorer, DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig,
+    RethEnv, StaticFileProvider, TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE,
     DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
@@ -45,6 +48,9 @@ use tn_types::{
     ExecHeader, SealedHeader, TaskManager, B256,
 };
 
+mod reset_execution;
+pub(crate) use reset_execution::refuse_interrupted_reset;
+
 /// Inspect and diagnose telcoin-network databases.
 #[derive(Debug, Parser)]
 pub struct DbCommand {
@@ -57,21 +63,30 @@ pub struct DbCommand {
 #[derive(Debug, Subcommand)]
 enum DbSubcommand {
     /// Print execution database statistics: the static files and each table of the reth
-    /// database. The default build reads while the node runs, and refuses a tn-lmdb or migrated
-    /// database as the node does. A build with the `tn-lmdb` feature needs the node stopped: it
-    /// refuses while a node holds the datadir, and holds the datadir while it runs, so a node
-    /// started meanwhile is refused until the report finishes. It never migrates: it refuses an
-    /// MDBX database not yet migrated to tn-lmdb (the node's first start migrates it), and an
-    /// `mdbx.dat` the node refuses too.
+    /// database. The default (tn-lmdb) build needs the node stopped: it refuses while a node holds
+    /// the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
+    /// until the report finishes. It never migrates: it refuses an MDBX database not yet migrated
+    /// to tn-lmdb (the node's first start migrates it), and an `mdbx.dat` the node refuses too. A
+    /// build with the `mdbx` feature reads while the node runs, and refuses a tn-lmdb or migrated
+    /// database as the node does.
     Stats,
 
-    /// Check the reth execution database at rest (a build with the `tn-lmdb` feature): the
-    /// engine's full check of its newest committed state, every page's checksum and structure,
-    /// every tree and overflow run, each table's counts and the file's page accounting, which
-    /// reads do not run. Read-only (changes no file); the node MUST be stopped: it refuses while
-    /// a node holds the datadir, and holds the datadir while it runs. Damage is an error naming
-    /// what failed. The default build refuses: MDBX keeps no page checksums.
+    /// Check the reth execution database at rest (the default, tn-lmdb, build): the engine's full
+    /// check of its newest committed state, every page's checksum and structure, every tree and
+    /// overflow run, each table's counts and the file's page accounting, which reads do not run.
+    /// Read-only (changes no file); the node MUST be stopped: it refuses while a node holds the
+    /// datadir, and holds the datadir while it runs. Damage is an error naming what failed. A
+    /// build with the `mdbx` feature refuses: MDBX keeps no page checksums.
     Check,
+
+    /// Migrate the reth execution database from MDBX to tn-lmdb now, with the node stopped,
+    /// instead of at the node's next start (the default, tn-lmdb, build; a build with the `mdbx`
+    /// feature refuses). Takes the node's `--db.*` flags, so the migrated file gets the page
+    /// size, reservation and growth step the node runs with: pass the node's. Refuses while a
+    /// node holds the datadir, and holds the datadir while it runs. Finishes a migration a
+    /// stopped start left after its commit point, refuses what the node's start refuses, and with
+    /// no MDBX database has nothing to do. Prints the rows migrated per table.
+    MigrateExecution(DbMigrateExecutionArgs),
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
     /// Read-only (never mutates). Validate the CURRENT/latest epoch only with the node STOPPED —
@@ -95,6 +110,97 @@ enum DbSubcommand {
     /// file); refuses while a node holds the datadir, as the other at-rest tools do, and holds the
     /// datadir while it runs, so a node started meanwhile is refused until the report finishes.
     TndbStat,
+
+    /// Move the execution database aside, so the next start rebuilds it from genesis by
+    /// re-executing the chain, in the storage layout new datadirs get. Moves `db`,
+    /// `static_files` and `restored-state-floor` into `execution-reset-<UTC time>` under the
+    /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
+    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
+    /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
+    /// rebuild replays epoch 0 from the node's own packs. Dry-run by default; pass `--force` to
+    /// apply.
+    ResetExecution(DbResetExecutionArgs),
+}
+
+/// Move the execution database aside (`db reset-execution`).
+#[derive(Debug, Args)]
+pub struct DbResetExecutionArgs {
+    /// Move the entries. Without it, print what would move and change nothing.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbResetExecutionArgs {
+    /// Run the reset on `datadir` (a dry run without `--force`) and print what it did.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let plan = reset_execution::reset_execution(&datadir, self.force)?;
+        let moves = plan.moves.iter().map(|m| m.display().to_string()).collect::<Vec<_>>();
+        if let Some(partial) = &plan.resumes {
+            println!("finishing the unfinished execution reset in {}", partial.display());
+        }
+        if self.force {
+            println!(
+                "moved the execution database ({}) aside to {}; the next start rebuilds it from \
+                 genesis. To undo, stop the node and move the entries back into {}",
+                moves.join(", "),
+                plan.target.display(),
+                datadir.display(),
+            );
+        } else {
+            println!(
+                "dry run: would move {} into {}; pass --force to apply",
+                moves.join(", "),
+                plan.target.display(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Migrate the execution database from MDBX to tn-lmdb (`db migrate-execution`).
+#[derive(Debug, Args)]
+pub struct DbMigrateExecutionArgs {
+    /// The node's `--db.*` flags: the migrated file takes their page size, reservation and growth
+    /// step, so pass what the node runs with.
+    #[clap(flatten)]
+    pub db: DatabaseArgs,
+}
+
+impl DbMigrateExecutionArgs {
+    /// Run the migration of the reth database under `datadir`, holding the datadir lock, and print
+    /// what it did.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // Refuse while a live node holds the datadir, and hold it so a node cannot start while
+        // the database moves; released when this returns.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+        // an unfinished `db reset-execution` may hold `db/` in its staging directory
+        refuse_interrupted_reset(&datadir)?;
+        let db = datadir.reth_db_path();
+        match migrate_reth_db(&db, &self.db)? {
+            Some(marker) => print!("the reth database at {}: {marker}", db.display()),
+            None => println!("nothing to migrate: no MDBX database at {}", db.display()),
+        }
+        Ok(())
+    }
+}
+
+/// Print `db stats`'s report for `datadir` to `out`: the static files first, then each table of
+/// the reth database, so the static files are reported even when the tables cannot be read (an
+/// MDBX database not yet migrated, say).
+fn print_stats(datadir: &PathBuf, out: &mut impl std::io::Write) -> eyre::Result<()> {
+    if let Some(static_files_table) = static_files_summary_table_for_datadir(datadir)? {
+        writeln!(out, "{static_files_table}")?;
+    } else {
+        writeln!(
+            out,
+            "(no static files directory found at {})",
+            datadir.join("static_files").display()
+        )?;
+    }
+    writeln!(out)?;
+    let db_stats = db_table_stats(&datadir.reth_db_path())?;
+    writeln!(out, "{}", stats_table(&db_stats))?;
+    Ok(())
 }
 
 impl DbCommand {
@@ -112,33 +218,26 @@ impl DbCommand {
                 let _pid_lock = DB_TABLE_STATS_NEEDS_STOPPED_NODE
                     .then(|| PidLock::acquire(&datadir))
                     .transpose()?;
-                let db_stats = db_table_stats(&datadir.reth_db_path())?;
-                if let Some(static_files_table) = static_files_summary_table_for_datadir(&datadir)?
-                {
-                    println!("{static_files_table}");
-                    println!();
-                } else {
-                    println!(
-                        "(no static files directory found at {})",
-                        datadir.join("static_files").display()
-                    );
-                    println!();
-                }
-                println!("{}", stats_table(&db_stats));
+                // what an unfinished `db reset-execution` moved is not the datadir's state
+                refuse_interrupted_reset(&datadir)?;
+                print_stats(&datadir, &mut std::io::stdout())?;
             }
             DbSubcommand::Check => {
                 let _pid_lock =
                     DB_CHECK_NEEDS_STOPPED_NODE.then(|| PidLock::acquire(&datadir)).transpose()?;
+                refuse_interrupted_reset(&datadir)?;
                 let report = db_check(&datadir.reth_db_path())?;
                 println!("{}", check_summary(&report));
                 println!();
                 println!("{}", check_table(&report));
             }
+            DbSubcommand::MigrateExecution(args) => args.execute(datadir)?,
             DbSubcommand::Validate(args) => args.execute()?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
             DbSubcommand::TndbStat => tndb_stat(&datadir)?,
+            DbSubcommand::ResetExecution(args) => args.execute(datadir)?,
         }
         Ok(())
     }
@@ -758,6 +857,12 @@ impl DbLoadStateArgs {
             bail!("datadir {} does not exist", datadir.display());
         }
         let _pid_lock = PidLock::acquire(&datadir)?;
+
+        // An unfinished `db reset-execution` holds part of the execution database in its staging
+        // directory: a restore beside it would leave the datadir holding two, and the reset's rerun
+        // would then refuse to finish. Refused before anything is read or written, as the node
+        // does.
+        refuse_interrupted_reset(&datadir)?;
 
         // A restore never migrates the reth database. `SnapshotRestorer::open` refuses a datadir
         // holding chain data only once the database is open, and on a build whose open first moves
@@ -1759,6 +1864,53 @@ mod tests {
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
     }
 
+    /// `db stats`, `db check` and `db migrate-execution` refuse a datadir holding an unfinished
+    /// `db reset-execution`, rather than report on (or migrate) a datadir whose `db/` the reset may
+    /// have moved into its staging directory.
+    #[test]
+    fn db_execution_commands_refuse_an_interrupted_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        fs::create_dir_all(partial.join("db")).unwrap();
+        for command in [
+            super::DbSubcommand::Stats,
+            super::DbSubcommand::Check,
+            super::DbSubcommand::MigrateExecution(super::DbMigrateExecutionArgs {
+                db: Default::default(),
+            }),
+        ] {
+            let name = format!("{command:?}");
+            let err = super::DbCommand { command }
+                .execute(datadir.clone())
+                .expect_err("an unfinished reset");
+            assert!(format!("{err:#}").contains("did not finish"), "{name}: {err:#}");
+        }
+    }
+
+    /// `db load-state` refuses a datadir holding an unfinished `db reset-execution` (an
+    /// `execution-reset-*.partial` directory), before it reads the config or creates anything.
+    #[test]
+    fn db_load_state_refuses_an_interrupted_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        fs::create_dir_all(partial.join("db")).unwrap();
+
+        let err = super::DbLoadStateArgs {
+            pack: dir.path().join("bundle"),
+            chain: None,
+            allow_faucet_on_chain: false,
+        }
+        .execute(datadir.clone())
+        .expect_err("an unfinished reset");
+        assert!(err.to_string().contains("did not finish"), "the reset's refusal: {err:#}");
+        let mut entries: Vec<_> =
+            fs::read_dir(&datadir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        entries.retain(|name| name != "telcoin.pid" && name != partial.file_name().unwrap());
+        assert!(entries.is_empty(), "nothing else is made in the datadir: {entries:?}");
+    }
+
     /// `db load-state` never migrates the reth database: on a build whose open first moves an MDBX
     /// database onto tn-lmdb, a datadir holding `db/mdbx.dat` is refused before anything opens it
     /// (`tn_reth::refuse_pending_migration`, the first check after the datadir lock), and the file
@@ -1773,19 +1925,96 @@ mod tests {
         fs::create_dir_all(&db).unwrap();
         fs::write(db.join("mdbx.dat"), b"an MDBX database").unwrap();
 
-        let err = super::DbLoadStateArgs {
-            pack: dir.path().join("bundle"),
-            chain: None,
-            allow_faucet_on_chain: false,
-        }
-        .execute(datadir)
-        .expect_err("no bundle, and on tn-lmdb an MDBX database");
+        let load = || {
+            super::DbLoadStateArgs {
+                pack: dir.path().join("bundle"),
+                chain: None,
+                allow_faucet_on_chain: false,
+            }
+            .execute(datadir.clone())
+        };
+        let err = load().expect_err("no bundle, and on tn-lmdb an MDBX database");
         let msg = format!("{err:#}");
         let migrating_build = tn_reth::refuse_pending_migration(&db).is_err();
         assert_eq!(msg.contains("never migrates its reth database"), migrating_build, "{msg}");
         assert_eq!(fs::read(db.join("mdbx.dat")).unwrap(), b"an MDBX database", "mdbx.dat kept");
         let entries: Vec<_> = fs::read_dir(&db).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(entries, ["mdbx.dat"], "nothing else is made in the reth database directory");
+
+        // A migration stopped after it removed MDBX's files, before its marker: the emptied temp
+        // directory beside `tn-lmdb.dat`. The node's next start finishes it, so a migrating
+        // build refuses it the same way, and leaves it as it is.
+        fs::remove_file(db.join("mdbx.dat")).unwrap();
+        fs::write(db.join("tn-lmdb.dat"), b"a tn-lmdb database").unwrap();
+        fs::create_dir(db.join("tn-lmdb-migrating")).unwrap();
+        let err = load().expect_err("no bundle, and on tn-lmdb an unfinished migration");
+        let msg = format!("{err:#}");
+        assert_eq!(msg.contains("never migrates its reth database"), migrating_build, "{msg}");
+        assert_eq!(msg.contains("unfinished MDBX to tn-lmdb migration"), migrating_build, "{msg}");
+        let mut entries: Vec<_> =
+            fs::read_dir(&db).unwrap().map(|e| e.unwrap().file_name()).collect();
+        entries.sort();
+        assert_eq!(entries, ["tn-lmdb-migrating", "tn-lmdb.dat"], "left as it was");
+    }
+
+    /// `db migrate-execution` refuses while a node holds the datadir lock, and releases the lock
+    /// on exit. A build that runs reth on MDBX refuses before it opens anything; the tn-lmdb build
+    /// finds nothing to migrate in a datadir without a reth database, and creates none.
+    #[test]
+    fn db_migrate_execution_takes_the_datadir_lock_and_refuses_on_the_mdbx_build() {
+        use tn_config::{PidLock, TelcoinDirs as _};
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let migrate =
+            || super::DbMigrateExecutionArgs { db: Default::default() }.execute(datadir.clone());
+
+        let held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = format!("{:#}", migrate().expect_err("a node holds the datadir"));
+        assert!(err.contains("another telcoin process"), "unexpected error: {err}");
+
+        drop(held);
+        let run = migrate();
+        if tn_reth::BACKEND == "MDBX" {
+            let err = format!("{:#}", run.expect_err("the MDBX build never migrates"));
+            assert!(err.contains("build without the `mdbx` feature"), "unexpected error: {err}");
+        } else {
+            run.expect("nothing to migrate");
+        }
+        assert!(!datadir.reth_db_path().exists(), "no reth database is created");
+        drop(PidLock::acquire(&datadir).expect("migrate-execution must release the lock on exit"));
+    }
+
+    /// `db migrate-execution` takes the node's `--db.*` flags.
+    #[test]
+    fn parse_db_migrate_execution_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "migrate-execution",
+            "--db.page-size",
+            "8192",
+        ])
+        .expect("parsed");
+        let Commands::Db(db) = cli.command else {
+            panic!("expected the db subcommand");
+        };
+        let super::DbSubcommand::MigrateExecution(args) = db.command else {
+            panic!("expected migrate-execution");
+        };
+        assert_eq!(args.db.page_size, Some(8192));
+    }
+
+    /// `db stats` prints the static files before it reads the tables: a datadir whose tables
+    /// cannot be read (here there is no reth database) still reports them.
+    #[test]
+    fn db_stats_prints_the_static_files_before_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let datadir = dir.path().to_path_buf();
+        let err = super::print_stats(&datadir, &mut out).expect_err("no reth database");
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("(no static files directory found at"), "{printed}");
+        assert!(!format!("{err:#}").contains("static files"), "fails on the tables: {err:#}");
     }
 
     /// `db stats` holds the datadir lock only when the reth database cannot be read beside a
@@ -2770,6 +2999,23 @@ mod tests {
         super::chain_data_dirs(&datadir_path).iter().for_each(|dir| {
             assert!(!dir.exists(), "{} must not exist after a pre-import refusal", dir.display());
         });
+    }
+
+    #[test]
+    fn parse_db_reset_execution_subcommand() {
+        for (args, force) in [
+            (&["tn", "db", "reset-execution"][..], false),
+            (&["tn", "db", "reset-execution", "--force"][..], true),
+        ] {
+            let cli = Cli::<NoArgs>::try_parse_args_from(args.iter().copied()).expect("parsed");
+            let Commands::Db(db) = cli.command else {
+                panic!("expected the db subcommand");
+            };
+            let super::DbSubcommand::ResetExecution(reset) = db.command else {
+                panic!("expected reset-execution");
+            };
+            assert_eq!(reset.force, force, "{args:?}");
+        }
     }
 
     #[test]

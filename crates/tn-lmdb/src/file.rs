@@ -71,6 +71,7 @@ use std::{
     fs::File,
     io,
     ops::Range,
+    os::fd::{AsFd as _, BorrowedFd},
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
         Arc,
@@ -94,6 +95,19 @@ pub const MIN_GROWTH: u64 = 1 << 20;
 /// The default largest growth step (1 GiB), `EnvOptions::max_growth`'s default: past it a large
 /// file grows linearly, not by doubling.
 pub(crate) const MAX_GROWTH: u64 = 1 << 30;
+
+/// What [`PageFile::read_resident`] read.
+#[derive(Debug)]
+pub(crate) enum Resident {
+    /// Every byte: the page cache held the whole range (on macOS, always: a plain `pread`).
+    Whole,
+    /// Not every byte: some page of the range is not in the page cache.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NotWhole,
+    /// The kernel or the file system refuses a read that does not wait for the disk.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unsupported(io::Error),
+}
 
 /// A reader's view of a page file's mapping that needs no lock: the mapping's base address and
 /// length, plus a length the owner has published as readable. One view, shared (`Arc`) between the
@@ -162,7 +176,10 @@ impl MapView {
         // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), and
         // `[offset, end)` lies within it and within the published bytes, which the owner does not
         // modify while a reader can reach them, but for the meta pages, which only the writer
-        // that rewrites them slices (see the method docs).
+        // that rewrites them slices (see the method docs). "Reach" rests on undamaged published
+        // pointers: reads do not recompute CRCs, so a pointer damaged at rest can name a page
+        // the writer is reusing, and this slice then overlaps the writer's stores until the
+        // checks after it refuse the page (README, do-not-flag item 2).
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
     }
 }
@@ -210,6 +227,14 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next fdatasync (see [`Self::fail_next_fsync`]).
     #[cfg(test)]
     fail_next_fsync: AtomicBool,
+    /// Test-only: [`Self::read_resident`] finds no range whole in the page cache, as a gap fill
+    /// over a file the cache does not hold would.
+    #[cfg(test)]
+    pub(crate) miss_reads: bool,
+    /// Test-only: [`Self::read_resident`] is refused (`Resident::Unsupported`) on any file system,
+    /// as on one that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`).
+    #[cfg(test)]
+    pub(crate) refuse_reads: bool,
 }
 
 impl PageFile {
@@ -270,7 +295,27 @@ impl PageFile {
             fail_next_msync: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_fsync: AtomicBool::new(false),
+            #[cfg(test)]
+            miss_reads: false,
+            #[cfg(test)]
+            refuse_reads: false,
         })
+    }
+
+    /// The file's metadata (`fstat`): the boot record's identity and ctime of it.
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    /// The file's descriptor, for advice on its page cache (`sys::will_need`).
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+
+    /// A second descriptor of the file (`dup`): it shares the open file description, so it holds
+    /// the file's lock after this page file drops, until it closes too.
+    pub(crate) fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     /// The physical file length in bytes.
@@ -357,6 +402,8 @@ impl PageFile {
         self.len = target;
         self.backed = target;
         self.size_unsynced.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        crate::disk_model::resized(self.ino, target);
         Ok(())
     }
 
@@ -450,7 +497,9 @@ impl PageFile {
     ///
     /// The tree layer upholds the rule that makes this sound: the writer mutates only its private
     /// pages (pages it allocated in this transaction, which no reader's snapshot reaches), so no
-    /// reader ever reads bytes being written.
+    /// reader ever reads bytes being written. A reader reaches a page through published
+    /// pointers, whose CRCs reads do not recompute: one damaged at rest can name a private page,
+    /// which the reader slices and refuses (README, do-not-flag item 2).
     #[inline]
     pub(crate) fn page_mut(&mut self, pgno: u32, page_size: usize) -> Result<&mut [u8]> {
         self.pages_mut(pgno, page_size, page_size)
@@ -485,6 +534,96 @@ impl PageFile {
             Ok(()) => {
                 Error::Failed(format!("page file: page {pgno} lies past the end of the file"))
             }
+        }
+    }
+
+    /// Read the `buf.len()` bytes at `offset` into `buf` through the file, not the mapping, for
+    /// the gap fill (`Writer::fill_gaps`), when the page cache holds them all
+    /// ([`Self::read_cached`]). Any error but those `read_cached` maps is returned (and the caller
+    /// fails the commit). The range must lie inside the file.
+    pub(crate) fn read_resident(&self, offset: u64, buf: &mut [u8]) -> Result<Resident> {
+        self.check_poison()?;
+        self.check_inside(offset, buf.len())?;
+        #[cfg(test)]
+        if self.miss_reads {
+            return Ok(Resident::NotWhole);
+        }
+        #[cfg(test)]
+        if self.refuse_reads {
+            return Ok(Resident::Unsupported(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+        Ok(self.read_cached(offset, buf)?)
+    }
+
+    /// Linux: one `preadv2` with `RWF_NOWAIT` (through `rustix`, so no `unsafe` here), which
+    /// copies only what the page cache holds and never waits for the disk. `Whole` once it read
+    /// every byte; `NotWhole` for a short read (a page past the first is not cached: nothing was
+    /// read from the disk) or `EAGAIN` (the first is not: the kernel starts a read of the range,
+    /// which nothing waits for, of the range alone under [`Self::advise_random_reads`]);
+    /// `Unsupported` when the kernel or the file system refuses the flag (`EOPNOTSUPP`, `EINVAL`,
+    /// `ENOSYS`). `EINTR` reissues the call.
+    #[cfg(target_os = "linux")]
+    fn read_cached(&self, offset: u64, buf: &mut [u8]) -> io::Result<Resident> {
+        use rustix::io::{preadv2, Errno, ReadWriteFlags};
+        let want = buf.len();
+        loop {
+            let flags = ReadWriteFlags::NOWAIT;
+            match preadv2(&self.file, &mut [io::IoSliceMut::new(&mut *buf)], offset, flags) {
+                Err(Errno::INTR) => {}
+                Ok(n) if n == want => return Ok(Resident::Whole),
+                Ok(_) | Err(Errno::AGAIN) => return Ok(Resident::NotWhole),
+                Err(e @ (Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS)) => {
+                    return Ok(Resident::Unsupported(e.into()))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// macOS: no read there reports what the page cache holds without new `unsafe` (`mincore` is
+    /// a raw call), so a plain `pread` (`read_exact_at`, which reissues an interrupted call):
+    /// always `Whole`, and a page not in memory costs a synchronous read.
+    #[cfg(target_os = "macos")]
+    fn read_cached(&self, offset: u64, buf: &mut [u8]) -> io::Result<Resident> {
+        use std::os::unix::fs::FileExt as _;
+        self.file.read_exact_at(buf, offset)?;
+        Ok(Resident::Whole)
+    }
+
+    /// Write `bytes` at `offset` through the file (`pwrite`, `write_all_at`), never through the
+    /// mapping: the gap fill's write of bytes [`Self::read_resident`] read from the same offset
+    /// (`Writer::fill_gaps` says why that changes no byte). The bytes reach the page cache only;
+    /// step 4's sync writes them with the commit's pages. Refused once poisoned; a failure
+    /// poisons the file. The range must lie inside the file.
+    pub(crate) fn rewrite(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.check_poison()?;
+        self.check_inside(offset, bytes.len())?;
+        self.file.write_all_at(bytes, offset).inspect_err(|_| self.poison())?;
+        Ok(())
+    }
+
+    /// `Err(Failed)` unless `[offset, offset + len)` lies inside the file.
+    fn check_inside(&self, offset: u64, len: usize) -> Result<()> {
+        if offset.checked_add(len as u64).is_some_and(|end| end <= self.len) {
+            return Ok(());
+        }
+        Err(Error::Failed(format!(
+            "page file: {len} bytes at {offset} reach past the end of the file ({})",
+            self.len
+        )))
+    }
+
+    /// Linux: advise the file's reads `POSIX_FADV_RANDOM` (through `rustix`), so a gap fill's
+    /// read that misses the page cache starts a read of its own range only, not the larger
+    /// window the kernel's readahead would add. It concerns reads through the file, never the
+    /// mapping (whose advice is [`advise_access`]'s), and the engine reads through the file only
+    /// at open and for the gap fill. A hint: a failure is logged and changes nothing else.
+    /// Elsewhere nothing: macOS's gap fill reads with a plain `pread`.
+    pub(crate) fn advise_random_reads(&self) {
+        #[cfg(target_os = "linux")]
+        if let Err(err) = rustix::fs::fadvise(&self.file, 0, None, rustix::fs::Advice::Random) {
+            tracing::warn!("tn-lmdb: POSIX_FADV_RANDOM for the gap fill's reads failed: {err}");
         }
     }
 
@@ -646,7 +785,7 @@ pub(crate) struct ReadOnlyFile {
     _map: Mmap,
     /// The file, declared after the mapping so it unmaps before the file closes (fields drop in
     /// declaration order) and the shared lock lasts as long as the mapping.
-    _file: File,
+    file: File,
     /// The lock-free reader view of the mapping.
     view: Arc<MapView>,
 }
@@ -664,12 +803,17 @@ impl ReadOnlyFile {
         advise_access(readahead, |advice| map.advise(advice));
         let view = Arc::new(MapView::new());
         view.set_mapping(map.as_ptr(), map.len() as u64);
-        Ok(Self { _file: file, _map: map, view })
+        Ok(Self { file, _map: map, view })
     }
 
     /// The lock-free reader view of the mapping (see [`MapView`]).
     pub(crate) fn view(&self) -> Arc<MapView> {
         Arc::clone(&self.view)
+    }
+
+    /// The file's descriptor, for advice on its page cache (`sys::will_need`).
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 
@@ -745,6 +889,38 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_advice_log() -> Vec<Option<Advice>> {
     ADVICE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Test-only: whether the file system holding `dir` refuses reads that do not wait for the disk
+/// (tmpfs refuses `RWF_NOWAIT`), where a gap fill turns itself off at its first read: the
+/// fallback a gap fill test asserts there. Probed on a file of its own by a `preadv2` of its own,
+/// not through [`PageFile::read_cached`], so a fault in that function's error mapping makes such
+/// a test fail rather than expect the fallback. Never on macOS, whose plain `pread` nothing
+/// refuses.
+#[cfg(test)]
+pub(crate) fn refuses_nowait_reads(dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::io::{preadv2, Errno, ReadWriteFlags};
+        use std::os::unix::fs::FileExt as _;
+        let probe = tempfile::tempfile_in(dir).expect("a probe file");
+        probe.write_all_at(&[1; 4096], 0).expect("the probe's page");
+        let mut page = [0; 4096];
+        loop {
+            let read =
+                preadv2(&probe, &mut [io::IoSliceMut::new(&mut page)], 0, ReadWriteFlags::NOWAIT);
+            match read {
+                Err(Errno::INTR) => {}
+                Err(Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS) => return true,
+                Ok(_) | Err(_) => return false,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
 }
 
 #[cfg(test)]

@@ -8,19 +8,27 @@
 //!     --ignored --exact exec_bench --nocapture
 //! ```
 //!
-//! Add `--features tn-reth/tn-lmdb` to run the tn-lmdb backend. Run it with `--exact`: it installs
-//! the process's global metrics recorder, and a test that opened a reth env first in the same
-//! process would leave reth's metric handles bound to no recorder.
+//! It runs the default backend, tn-lmdb; add `--features tn-reth/mdbx` to run MDBX. Run it with
+//! `--exact`: it installs the process's global metrics recorder, and a test that opened a reth env
+//! first in the same process would leave reth's metric handles bound to no recorder.
 //!
 //! **Phases.**
 //!
 //! 1. A [`CaptureRecorder`] is installed before any env opens. It keeps every sample of the
 //!    per-block stages (`tn_reth.block_*_seconds`) and of reth's `save_blocks_*` split; with
 //!    `METRICS=prom` everything also goes to tn-metrics' Prometheus recorder, as on a node run with
-//!    `--metrics`.
-//! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend and page size in
-//!    `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE`: both backends fix the page size when
-//!    the file is created, so the base, the aged base and every clone share it.
+//!    `--metrics`. A global tracing subscriber is installed too (`init_test_tracing`: errors to
+//!    stdout unless `RUST_LOG` says otherwise), as the node installs reth's tracer at startup.
+//!    Without a global dispatcher every `trace`-level span of reth-trie's walk takes tracing's
+//!    `log` fallback, which took 9% of the state root's CPU samples (about 57 ms an output) in a
+//!    samply profile of the peak profile (Mac M1 Max, storage v2, at 2ef5c7f90, 2026-11-10); with
+//!    one they are disabled at their call sites, as on a node. Numbers from before the subscriber
+//!    are not like for like.
+//! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend, storage layout
+//!    and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE` and reth's storage
+//!    layout `LAYOUT` ([`StorageLayout`]): both are fixed when the datadir is created, so the base,
+//!    the aged base and every clone share them. The layout is selected in one place,
+//!    `StorageLayout::select`, which sets it on the env's config (v2 needs the tn-lmdb build).
 //! 3. The aged base: `AGING` outputs executed on a clone of the base, closed and cached beside it
 //!    under [`base_dir_name`] with an `extra` that keys the aging ([`Aging::extra`]). It is built
 //!    in a `.building` dir, its meta ([`AgedMeta`]) synced, and becomes the aged base by one
@@ -29,9 +37,10 @@
 //! 4. The run: the aged base is cloned into a fresh dir under `TMPDIR` (refused on tmpfs, and when
 //!    it is on another file system than the cache: the clone would copy every byte) and opened with
 //!    [`slim_chain`] and the production `--db.*` flags for `SYNC` and `PAGE_SIZE`; a clone whose
-//!    database has another page size ([`db_page_size`]) stops the run. Worker 0's transaction pool
-//!    and HTTP RPC methods are built on it as the node builds them ([`BenchNode::serve`]), so the
-//!    pool's maintenance follows every executed output, side load or not. `WARMUP` outputs execute
+//!    database has another page size ([`db_page_size`]), or that holds another storage layout than
+//!    `LAYOUT` ([`StorageLayout::of`]), stops the run. Worker 0's transaction pool and HTTP RPC
+//!    methods are built on it as the node builds them ([`BenchNode::serve`]), so the pool's
+//!    maintenance follows every executed output, side load or not. `WARMUP` outputs execute
 //!    untimed, then all `OUTPUTS` outputs are built and signed up front, then the timed loop
 //!    executes them. Each output runs on a blocking task, as `ExecutorEngine` runs it, while a task
 //!    drains the engine-update channel. Just before and just after each output's call, outside its
@@ -59,9 +68,12 @@
 //!    `get_account_balances` every 250 ms as the batch builder does, and just before each output
 //!    executes `SUBMIT_FRACTION` of its raw transactions are queued for `eth_sendRawTransaction`,
 //!    as user transactions arriving over RPC. At each window's start the readers' gate switches and
-//!    their samples go to the window that ended. Each executed output's transaction hashes (the
-//!    keccak of each raw transaction) feed the readers' receipt lookups. With `READERS=0` there are
-//!    no windows, readers, poller or submitter.
+//!    their samples go to the window that ended. `READ_MIX` picks the readers' kinds
+//!    ([`Knobs::read_mix`]): the latest-state and recent reads, or the past-block balances and
+//!    storage slots (over the whole chain and over the last epoch's blocks) and transactions by
+//!    hash (executed ones and random misses), or both. The warm-up's and each executed output's
+//!    transaction hashes (the keccak of each raw transaction) feed the readers' receipt and by-hash
+//!    lookups. With `READERS=0` there are no windows, readers, poller or submitter.
 //! 6. The export, with `EXPORT=1` ([`Export`]): just before the first timed output the clone's
 //!    state is pinned at the tip (`RethEnv::pin_state_view`, checked with `verify_tip` as the node
 //!    checks its pin), and a side thread writes it to an exec state pack in the run's temp dir with
@@ -71,6 +83,14 @@
 //!    before the view drops: MDBX cannot reuse the pages a long reader pins, so its growth while
 //!    pinned shows. A row is `export_active` when the export ran at any point during its output.
 //!    The export ends before the env closes; a failed export is reported, then fails the bench.
+//! 7. The differential, with `DIFF` ([`run_differential`], over
+//!    `tn_reth::test_utils::load::differential`): after the timed loop, with the writer idle, a
+//!    seeded sample of `DIFF_QUERIES` reads of the finished chain (headers, balances and storage
+//!    slots at past blocks, transactions and receipts by hash, misses) is written with its answers
+//!    to `DIFF`. Two runs of one load (two storage layouts, say) draw the same queries, so their
+//!    files must match; with `DIFF_AGAINST` naming an earlier run's file the bench compares them. A
+//!    query's error, a mismatch, or a failed record or comparison is reported, then fails the
+//!    bench.
 //!
 //! **Knobs** (environment variables, each refused when malformed, as is an unknown
 //! `TN_EXEC_BENCH_*` name):
@@ -98,6 +118,12 @@
 //!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tn-lmdb 4096): the database page size in
 //!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
 //!   every open. Each page size has its own base and aged base.
+//! - `TN_EXEC_BENCH_GAP_FILL` (0): tn-lmdb's gap fill, a width in pages or `auto`, passed as
+//!   `--db.gap-fill` to the run's open (not the bases'): 0 (or `off`) is off, at most 64; refused
+//!   on MDBX. Its counters (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`,
+//!   `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_refusals`, `tn_lmdb_gap_fill_ns`, and under `auto` the
+//!   `tn_lmdb_gap_auto_*` counters and gauges: the width chosen and the fit) are among the
+//!   per-output database counters.
 //! - `TN_EXEC_BENCH_READERS` (0): reader threads, plus the balance poller when above 0; 0 runs no
 //!   side load.
 //! - `TN_EXEC_BENCH_SUBMIT_FRACTION` (0.25): the fraction, from 0 to 1, of each on-window output's
@@ -112,12 +138,24 @@
 //!   base are cached. It must be on `TMPDIR`'s file system.
 //! - `TN_EXEC_BENCH_REPORT` (unset): a path to also write the report to as JSON ([`json_report`]).
 //!   Its dir must exist; it is checked before the run.
+//! - `TN_EXEC_BENCH_LAYOUT` (`v1`): reth's storage layout of the bases and the run, `v1` or `v2`;
+//!   each layout has its own bases. `v2` needs the tn-lmdb build (an MDBX build refuses it).
+//! - `TN_EXEC_BENCH_READ_MIX` (`rpc`): the readers' kinds: `rpc` (balance, token balance, receipt,
+//!   logs, block, all at the tip), `history` (balances and storage slots at past blocks of the
+//!   chain and of the last epoch, an epoch being `EPOCH_EVERY` outputs, or 50 with none;
+//!   transactions by hash, executed and missing) or `all`.
+//! - `TN_EXEC_BENCH_DIFF` (unset): a path to write the differential to (phase 7). Its dir must
+//!   exist; it is checked before the run.
+//! - `TN_EXEC_BENCH_DIFF_AGAINST` (unset): an earlier run's differential to compare this run's to;
+//!   it needs `DIFF`, naming another file, and must exist before the run.
+//! - `TN_EXEC_BENCH_DIFF_QUERIES` (10000): the differential's queries, at least 1.
 //!
 //! **Report.** The moment the timed loop ends the bench prints and flushes one line, `timed loop
 //! done: elapsed_s=<seconds>` (`etc/reth-exec-bench.sh`'s system sampler places the loop's end by
 //! it); the report follows once the run has closed. A header with the backend, sync mode, metrics
 //! mode, pacing, every knob, the page size (the open clone's, read with [`db_page_size`], and
-//! `PAGE_SIZE` as set or `default`), where the disk bytes come from ([`DISK_BYTES_SOURCE`], with
+//! `PAGE_SIZE` as set or `default`), the storage layout (the open clone's, and `LAYOUT`), where
+//! the disk bytes come from ([`DISK_BYTES_SOURCE`], with
 //! the first failed read's reason), the host and the date (the base's `db` size is its data file's
 //! allocated bytes, then its length, which MDBX preallocates), the chain (the genesis hash, the
 //! hash of the tip the run starts from and of the tip after the timed loop: execution is
@@ -133,7 +171,12 @@
 //!   closed; then the allocated bytes the timed loop added per output, from before to after; then
 //!   the logical growth, the tables' total size added per executed output (warm-up and timed), from
 //!   the clone before the env opened to the closed clone ([`Footprint`]). tn-lmdb's data file grows
-//!   in preallocated steps, so over a short run its allocated growth reads 0.
+//!   in preallocated steps, so over a short run its allocated growth reads 0. Then the static files
+//!   by segment once closed, beside the data file's size ([`segments_report`]): per segment
+//!   (headers, transactions, receipts, and with them transaction senders and the account and
+//!   storage changesets) its jars, the allocated MiB of its data, offsets, config, changeset
+//!   offsets (`.csoff`) and other files, its total allocated and length, and the allocated KiB it
+//!   grew per executed output since the env's open.
 //! - `database writes per output`, after the sizes: what each timed output's call wrote
 //!   ([`DbWrites`]): each database counter that moved, as its mean per output (`_ns` counters in
 //!   ms; `tn_lmdb_max_gate_lag`, a maximum since the open, as its largest, [`MAXIMA`]), leaving out
@@ -142,6 +185,10 @@
 //!   outputs in ten consecutive groups (group `k` from `k * n / 10` to `(k + 1) * n / 10`), each
 //!   with its outputs, its mean `commit mdbx` ms and disk MiB per output, and the data file's
 //!   length at its end. None for fewer than 10 outputs.
+//! - `static-file syncs`, after the database writes: per segment and phase (data, offsets,
+//!   changeset offsets, config, directory) the syncs and the ms per timed output and the longest
+//!   sync, from the env's static-file timers ([`SfSyncStats`]); one line while the provider keeps
+//!   none.
 //! - `table`: the largest of reth's tables in the closed clone (`db_table_stats`), with rows and
 //!   size, then the total over every table. When the table stats fail, the section says so with the
 //!   error, the report and the JSON are still written, and the bench then fails.
@@ -153,7 +200,11 @@
 //!   balance, or a zero one, in a window's last poll); the reader and poller calls in off windows.
 //!   Any reader or submitter error, degraded window or off-window call fails the bench after the
 //!   report and the JSON are written; refused submissions of mined or pooled transactions are
-//!   counted, not errors.
+//!   counted, not errors. The kinds listed are the mix's, and any other with a call.
+//! - `differential`, last: with `DIFF`, the queries and the tip they ran at, their time, errors and
+//!   path, per kind the queries, p50 and p99 latency and errors, the first error, and the
+//!   comparison with `DIFF_AGAINST`'s file (records compared, mismatches, the first few); one line
+//!   without.
 //! - `epoch closes`, after the throughput: with `EPOCH_EVERY`, the closing outputs' count and the
 //!   writer's main stages ([`SPLIT_KEYS`]) over the normal and the closing outputs (mean, p50, p99,
 //!   and close over normal); one line without.
@@ -169,73 +220,84 @@
 //! - `total`: the wall time of one `execute_consensus_output` call.
 //! - `execute`, `finish` and `overlay extend`: the output's blocks' `tn_reth.block_*_seconds`,
 //!   summed. `finish` includes `hashed state` and `state root`.
-//! - `signer recovery`: the output's per-batch `tn_reth.block_signer_recovery_seconds`, summed.
-//!   `execute_consensus_output` recovers every batch's signers concurrently before the first block,
-//!   so the samples overlap: their sum is not part of `execute`, and the recovery's wall time falls
-//!   in `other`.
+//! - `signer recovery`: the wall time of the signer-recovery jobs that finished during the output's
+//!   call (`tn_engine.recover_seconds`, one sample per output). As the engine does when it queues
+//!   an output, [`run_outputs`] starts each output's recovery on a blocking job and the call waits
+//!   for it before the first block. Back to back, output `i + 1`'s job starts with output `i`'s
+//!   call, so a row holds the next output's job and the run's mean is the job's mean; the part the
+//!   call waited for falls in `other`. Paced, each output's job starts at its own slot.
 //! - `save_blocks`: reth's `save_blocks_total`. `mdbx` is its database writes, which include
 //!   `insert_block` through `update_history_indices`; `sf` is the static-file writes, which run
 //!   beside them on another thread.
 //! - `commit sf` and `commit mdbx`: the static files' commit and the database commit after
 //!   `save_blocks`, outside `save_blocks_total`.
 //! - `other`: `total` minus `execute`, `finish`, `overlay extend`, `save_blocks`, `commit sf` and
-//!   `commit mdbx`: the engine's own work (signer recovery included), announcing the output and
-//!   finalizing.
+//!   `commit mdbx`: the engine's own work (the wait for the output's signer recovery included),
+//!   announcing the output and finalizing.
 //!
 //! reth names the database stages `mdbx` (its metrics `save_blocks_mdbx` and
 //! `save_blocks_commit_mdbx`) whatever the engine, and the labels and JSON keys keep its names: on
 //! the tn-lmdb build `mdbx` and `commit mdbx` time tn-lmdb.
 //!
 //! **JSON report.** One object, its names snake_case with the unit in the name, for scripts that
-//! aggregate runs: `report_version` (5); `header` (backend, sync, `page_size_bytes` (the open
-//! clone's), `disk_bytes_source` (`"proc_pid_rusage"`, `"/proc/self/io"` or null),
-//! `disk_bytes_error` (the first failed read's reason, or null), `db_counter_names` (the database
-//! counters' names in the build's order: JSON objects come out with their keys sorted), metrics,
-//! pacing, host, date, base, aged, `genesis_hash`, `aged_tip_hash` (the tip the run starts from:
-//! the aged base's, or the genesis with `AGING=0`), `final_tip_hash` (the tip after the timed
-//! loop), `pool_rpc`, and `knobs`, every knob, with `page_size` null for the backend's default);
-//! `rows`, one per timed output (`first_block`, `last_block`, `gas`, `txs`, `late`, `side_load`,
-//! `epoch_close`, `export_active`, each stage as `<key>_ms`, `db_counters` (an object of each
-//! database counter's name, `mdbx_*` or `tn_lmdb_*`, and its difference over the output),
-//! `disk_bytes_written` (null when a read failed or the target has no
-//! source), `major_faults` and `minor_faults` (the process's, every thread's, over the output's
-//! call, [`page_faults`]; null when a read failed) and `db_file_len_bytes` (after the output));
+//! aggregate runs: `report_version` (6); `header` (backend, sync, `page_size_bytes` (the open
+//! clone's), `layout` (the open clone's storage layout, `v1` or `v2`), `disk_bytes_source`
+//! (`"proc_pid_rusage"`, `"/proc/self/io"` or null), `disk_bytes_error` (the first failed read's
+//! reason, or null), `db_counter_names` (the database counters' names in the build's order: JSON
+//! objects come out with their keys sorted), metrics, pacing, host, date, base, aged,
+//! `genesis_hash`, `aged_tip_hash` (the tip the run starts from: the aged base's, or the genesis
+//! with `AGING=0`), `final_tip_hash` (the tip after the timed loop), `pool_rpc`, and `knobs`, every
+//! knob, with `page_size` null for the backend's default); `rows`, one per timed output
+//! (`first_block`, `last_block`, `gas`, `txs`, `late`, `side_load`, `epoch_close`, `export_active`,
+//! each stage as `<key>_ms`, `db_counters` (an object of each database counter's name, `mdbx_*` or
+//! `tn_lmdb_*`, and its difference over the output), `disk_bytes_written` (null when a read failed
+//! or the target has no source), `major_faults` and `minor_faults` (the process's, every thread's,
+//! over the output's call, [`page_faults`]; null when a read failed), `db_file_len_bytes` (after
+//! the output) and `sf_sync` (null when not measured, else per `"<segment>.<phase>"` its `calls`,
+//! `total_ns` and `max_ns`));
 //! `stats`, per
 //! stage key (`mean_ms`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `share_pct`); `throughput`;
 //! `thirds` (null for fewer than 3 outputs; else `outputs_per_third` and `stages`, per stage key
 //! `first_mean_ms`, `first_p50_ms`, `last_mean_ms`, `last_p50_ms`, `mean_ratio`, `p50_ratio`);
 //! `sizes` (`open`, `before_timed`, `after_timed` and `closed`, each `db_len_bytes`,
 //! `db_allocated_bytes`, `static_files_len_bytes` and `static_files_allocated_bytes`, then
-//! `db_growth_per_output_bytes`, `static_files_growth_per_output_bytes` and
-//! `db_logical_growth_per_output_bytes`); `db_writes` (`counters_mean_per_output`, every counter's
-//! mean per output but the maxima, `counters_max`, each of [`MAXIMA`]'s largest,
-//! `disk_bytes_mean_per_output` (null when no output has it), `disk_bytes_outputs`,
-//! `db_file_len_before_bytes`, `db_file_len_after_bytes`, `db_file_growth_bytes`,
-//! `db_file_growth_per_output_bytes`, and `deciles`, null for fewer than 10 outputs, else ten of
-//! `outputs`, `commit_mdbx_mean_ms`, `disk_bytes_mean` (or null), `db_file_len_mean_bytes` and
-//! `db_file_len_end_bytes`); `tables` (`failed`, `error`, `baseline_total_size_bytes`,
-//! `count`, `total_entries`, `total_size_bytes`, and `by_size`, every table largest first; the last
-//! four null when `failed`); and `side_load`, null with `READERS=0`, else `off_outputs`,
-//! `on_outputs`, `on_time_s`, `errors`, `writer` (per [`SPLIT_KEYS`] key `off` and `on`, each
-//! `mean_ms`, `p50_ms` and `p99_ms` or null, and `mean_ratio`, `p50_ratio`, `p99_ratio`),
-//! `readers` (per kind `method`, `ops`, `ops_per_s`, `p50_ms`, `p99_ms`, `ok`, `empty`, `errors`,
-//! `first_error`), `submitter` (`accepted`, `nonce_too_low`, `already_known`, `errors`,
-//! `first_error`, `p50_ms`, `p99_ms`), `poller` (`polls`, `p50_ms`, `p99_ms`, `degraded_windows`)
-//! and `off_window_calls`; `epoch_closes`, null with `EPOCH_EVERY=0`, else `closes`,
-//! `normal_outputs` and `writer` (per [`SPLIT_KEYS`] key `normal` and `closing`, each `mean_ms`,
-//! `p50_ms` and `p99_ms` or null, and `mean_ratio`, `p50_ratio`, `p99_ratio`, closing over
-//! normal); and `export`, null with `EXPORT=0`, else `failed`, `error`, `block`, `duration_s`,
+//! `db_growth_per_output_bytes`, `static_files_growth_per_output_bytes`,
+//! `db_logical_growth_per_output_bytes` and `static_file_segments`, per segment `jars`, the
+//! `<part>_len_bytes` and `<part>_allocated_bytes` of its `data`, `offsets`, `config`, `csoff`,
+//! `other` and `total` once closed and of its `open_total`, and
+//! `growth_per_output_allocated_bytes` and `growth_per_output_len_bytes` per executed output);
+//! `db_writes` (`counters_mean_per_output`, every counter's mean per output but the maxima,
+//! `counters_max`, each of [`MAXIMA`]'s largest, `disk_bytes_mean_per_output` (null when no output
+//! has it), `disk_bytes_outputs`, `db_file_len_before_bytes`, `db_file_len_after_bytes`,
+//! `db_file_growth_bytes`, `db_file_growth_per_output_bytes`, and `deciles`, null for fewer than 10
+//! outputs, else ten of `outputs`, `commit_mdbx_mean_ms`, `disk_bytes_mean` (or null),
+//! `db_file_len_mean_bytes` and `db_file_len_end_bytes`); `tables` (`failed`, `error`,
+//! `baseline_total_size_bytes`, `count`, `total_entries`, `total_size_bytes`, and `by_size`, every
+//! table largest first; the last four null when `failed`); and `side_load`, null with `READERS=0`,
+//! else `off_outputs`, `on_outputs`, `on_time_s`, `errors`, `writer` (per [`SPLIT_KEYS`] key `off`
+//! and `on`, each `mean_ms`, `p50_ms` and `p99_ms` or null, and `mean_ratio`, `p50_ratio`,
+//! `p99_ratio`), `readers` (per kind `method`, `ops`, `ops_per_s`, `p50_ms`, `p99_ms`, `ok`,
+//! `empty`, `errors`, `first_error`), `submitter` (`accepted`, `nonce_too_low`, `already_known`,
+//! `errors`, `first_error`, `p50_ms`, `p99_ms`), `poller` (`polls`, `p50_ms`, `p99_ms`,
+//! `degraded_windows`) and `off_window_calls`; `epoch_closes`, null with `EPOCH_EVERY=0`, else
+//! `closes`, `normal_outputs` and `writer` (per [`SPLIT_KEYS`] key `normal` and `closing`, each
+//! `mean_ms`, `p50_ms` and `p99_ms` or null, and `mean_ratio`, `p50_ratio`, `p99_ratio`, closing
+//! over normal); and `export`, null with `EXPORT=0`, else `failed`, `error`, `block`, `duration_s`,
 //! `account_count`, `storage_slots`, `bytecodes`, `pack_len_bytes`, `pack_allocated_bytes`,
 //! `at_pin` and `at_finish` (each as a `sizes` point), `db_allocated_growth_bytes` and
 //! `db_len_growth_bytes` (from `block` on null when `failed`), `overlapped_outputs`, and `writer`
-//! (per key `idle` and `active`, with the ratios active over idle). The stage keys are
-//! [`STAGES`]'s. It is written to a temp file, synced and renamed into place.
+//! (per key `idle` and `active`, with the ratios active over idle); `sf_sync`, null when no timed
+//! output measured the static files' syncs, else [`sf_sync_json`]'s; and `differential`, null
+//! without `DIFF`, else [`differential_json`]'s. The stage keys are [`STAGES`]'s. Version 6 added
+//! the layout, the readers' mix and the differential knobs, the history kinds under `readers`
+//! (the report lists the mix's kinds), `static_file_segments`, `sf_sync` and `differential`. It is
+//! written to a temp file, synced and renamed into place.
 //!
 //! **Durable sync on macOS.** Both backends make a commit durable by `msync`, and neither flushes
 //! the drive's cache. libmdbx, in the write-map mode reth opens it in, msyncs its whole used span
 //! and its meta pages; tn-lmdb msyncs its commit's dirty pages and its meta page. Both write every
-//! page, so Mac durable times compare the same guarantee. reth's static files sync by
-//! `File::sync_all` (`F_FULLFSYNC` on macOS) in both builds.
+//! page, so Mac durable times compare the same guarantee. reth's static files sync by a plain
+//! `fsync` on macOS in both builds (vendor/reth TN-0117; `F_FULLFSYNC` before it).
 //!
 //! **Reading the database writes.** The disk bytes are only an approximation: Linux's
 //! `write_bytes` counts a page as it is dirtied, so a page dirtied once and synced counts once, and
@@ -260,7 +322,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
-use tn_engine::execute_consensus_output;
+use tn_engine::{
+    execute_consensus_output,
+    test_utils::{execute_queued_output, QueuedRecovery},
+};
 use tn_reth::{
     db_table_stats, default_page_size,
     payload::BuildArguments,
@@ -268,16 +333,19 @@ use tn_reth::{
     test_utils::load::{
         announce_temp_dir,
         base::{base_dir_name, BACKEND, META_FILE},
-        build_base, clone_datadir, db_counters, db_file_bytes, db_page_size, dir_bytes,
-        open_production_env_with_db, poll_addresses,
+        build_base, clone_datadir, db_counters, db_file_bytes, db_page_size,
+        differential::{self, DiffComparison, DiffHeader, DiffSummary, DIFF_VERSION},
+        dir_bytes, open_production_env_with_layout, poll_addresses,
         readers::{KindSamples, PollSamples, POLL_INTERVAL},
-        slim_chain,
+        sf_sync::PhaseTiming,
+        slim_chain, static_file_sizes,
         workload::WorkloadConfig,
         BaseMeta, CaptureRecorder, LoadOutput, OutputConfig, OutputFactory, PrefillSpec, ReadKind,
-        ReadSamples, Readers, SubmitSamples, Submitter,
+        ReadMix, ReadSamples, Readers, SegmentFiles, SfSyncSource as _, SfSyncStats, StorageLayout,
+        SubmitSamples, Submitter,
     },
     worker::WorkerNetwork,
-    DbTableStat, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
+    DbTableStat, GapFill, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
 };
 use tn_storage::{
     disk::{fsync_directory, fsync_file},
@@ -307,19 +375,23 @@ impl BenchNode {
     fn open(spec: &PrefillSpec) -> eyre::Result<Self> {
         let tmp = tempfile::tempdir()?;
         let datadir = tmp.path().to_path_buf();
-        Self::open_at(&datadir, Arc::new(spec.genesis().into()), &[], Some(tmp))
+        let chain = Arc::new(spec.genesis().into());
+        Self::open_at(&datadir, chain, &[], StorageLayout::default(), Some(tmp))
     }
 
-    /// Open the datadir `datadir` on `chain` with the `--db.*` flags `db_flags` and one worker's
-    /// accumulator, keeping `tmp` (the dir holding `datadir`, if any) until the env closes.
+    /// Open the datadir `datadir` on `chain` with the `--db.*` flags `db_flags` in the storage
+    /// `layout` (which the datadir must hold, [`open_production_env_with_layout`]) and one
+    /// worker's accumulator, keeping `tmp` (the dir holding `datadir`, if any) until the env
+    /// closes.
     fn open_at(
         datadir: &Path,
         chain: Arc<RethChainSpec>,
         db_flags: &[&str],
+        layout: StorageLayout,
         tmp: Option<TempDir>,
     ) -> eyre::Result<Self> {
         let tasks = TaskManager::default();
-        let (env, db) = open_production_env_with_db(datadir, chain, db_flags, &tasks)?;
+        let (env, db) = open_production_env_with_layout(datadir, chain, db_flags, layout, &tasks)?;
         Ok(Self {
             env,
             db,
@@ -421,12 +493,13 @@ impl BenchNode {
         Ok((tip, updates))
     }
 
-    /// Run `output` through `execute_consensus_output` on a blocking task on the canonical tip,
-    /// sending its engine update on `engine_update_tx`, and return the new tip and the call's
-    /// wall time.
+    /// Run `output` through the engine's queued-output path on a blocking task on the canonical
+    /// tip, with its signers from `recovery` (the job started when it was queued) and its engine
+    /// update sent on `engine_update_tx`, and return the new tip and the call's wall time.
     async fn execute_timed(
         &self,
         output: ConsensusOutput,
+        recovery: QueuedRecovery,
         engine_update_tx: &mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<(SealedHeader, Duration)> {
         let args = BuildArguments::new(self.env.clone(), output, self.env.canonical_tip());
@@ -434,8 +507,9 @@ impl BenchNode {
         let engine_update_tx = engine_update_tx.clone();
         let (tip, wall) = tokio::task::spawn_blocking(move || {
             let start = Instant::now();
-            let tip = execute_consensus_output(
+            let tip = execute_queued_output(
                 args,
+                recovery,
                 gas_accumulator,
                 RepackMonitor::default(),
                 engine_update_tx,
@@ -598,7 +672,7 @@ async fn test_load_outputs_close_three_epochs_through_execute_consensus_output()
 const KNOB_PREFIX: &str = "TN_EXEC_BENCH_";
 
 /// The knob names this build reads, after [`KNOB_PREFIX`].
-const KNOB_NAMES: [&str; 21] = [
+const KNOB_NAMES: [&str; 27] = [
     "OUTPUTS",
     "BATCHES",
     "GAS",
@@ -613,6 +687,7 @@ const KNOB_NAMES: [&str; 21] = [
     "METRICS",
     "SYNC",
     "PAGE_SIZE",
+    "GAP_FILL",
     "READERS",
     "SUBMIT_FRACTION",
     "WINDOW",
@@ -620,6 +695,11 @@ const KNOB_NAMES: [&str; 21] = [
     "EXPORT",
     "CACHE_DIR",
     "REPORT",
+    "LAYOUT",
+    "READ_MIX",
+    "DIFF",
+    "DIFF_AGAINST",
+    "DIFF_QUERIES",
 ];
 
 /// The engine-update channel's capacity.
@@ -702,6 +782,8 @@ struct Knobs {
     sync: SyncMode,
     /// The requested page size in bytes; `None` for the backend's default ([`Knobs::page_size`]).
     page_size: Option<u32>,
+    /// tn-lmdb's gap fill for the run's open (`--db.gap-fill`; off by default).
+    gap_fill: GapFill,
     readers: usize,
     submit_fraction: f64,
     window: usize,
@@ -709,7 +791,41 @@ struct Knobs {
     export: bool,
     cache_dir: PathBuf,
     report: Option<PathBuf>,
+    /// reth's storage layout of the bases and the run ([`StorageLayout`]).
+    layout: StorageLayout,
+    read_mix: ReadMixKnob,
+    /// Where the differential is written ([`Differential`]), or `None` for none.
+    diff: Option<PathBuf>,
+    /// An earlier run's differential to compare this run's to.
+    diff_against: Option<PathBuf>,
+    diff_queries: usize,
 }
+
+/// Which reads the side load's readers draw ([`ReadMix`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadMixKnob {
+    /// [`ReadMix::rpc`]: the latest-state and recent reads.
+    Rpc,
+    /// [`ReadMix::history`]: past-block balances and storage, transactions by hash.
+    History,
+    /// [`ReadMix::all`]: both.
+    All,
+}
+
+impl ReadMixKnob {
+    /// The mix's knob value and report label.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::History => "history",
+            Self::All => "all",
+        }
+    }
+}
+
+/// The outputs an epoch spans for the readers' `*_epoch` reads when `EPOCH_EVERY` closes none:
+/// the `busy-epoch` profile's cadence.
+const DEFAULT_EPOCH_OUTPUTS: usize = 50;
 
 impl Knobs {
     /// The knobs from this process's environment.
@@ -729,7 +845,8 @@ impl Knobs {
 
     /// The knobs from the `TN_EXEC_BENCH_*` variables in `vars` (others are ignored), the
     /// defaults for those absent. Refuses an unknown knob, a malformed value, a `PAGE_SIZE` that
-    /// is not a power of two from 4096 to 65536, and `EPOCH_EVERY` without `REGISTRY=1`.
+    /// is not a power of two from 4096 to 65536, `EPOCH_EVERY` without `REGISTRY=1`, and
+    /// `DIFF_AGAINST` without `DIFF` or naming the same file.
     fn parse(vars: impl IntoIterator<Item = (String, String)>) -> eyre::Result<Self> {
         let mut set = BTreeMap::new();
         for (name, value) in vars {
@@ -812,10 +929,27 @@ impl Knobs {
             Some(dir) => PathBuf::from(dir),
             None => default_cache_dir(),
         };
-        let report = match get("REPORT") {
-            Some("") => eyre::bail!("{KNOB_PREFIX}REPORT is empty"),
-            report => report.map(PathBuf::from),
+        let path = |knob: &str| -> eyre::Result<Option<PathBuf>> {
+            match get(knob) {
+                Some("") => eyre::bail!("{KNOB_PREFIX}{knob} is empty"),
+                path => Ok(path.map(PathBuf::from)),
+            }
         };
+        let report = path("REPORT")?;
+        let layout = StorageLayout::parse(choice("LAYOUT", &["v1", "v2"])?)?;
+        let read_mix = match choice("READ_MIX", &["rpc", "history", "all"])? {
+            "rpc" => ReadMixKnob::Rpc,
+            "history" => ReadMixKnob::History,
+            _ => ReadMixKnob::All,
+        };
+        let diff = path("DIFF")?;
+        let diff_against = path("DIFF_AGAINST")?;
+        if let Some(against) = &diff_against {
+            eyre::ensure!(
+                diff.as_ref().is_some_and(|diff| diff != against),
+                "{KNOB_PREFIX}DIFF_AGAINST compares this run's differential to an earlier one: it                  needs {KNOB_PREFIX}DIFF, naming another file"
+            );
+        }
         Ok(Self {
             outputs: count("OUTPUTS", 300, 1)?,
             batches: count("BATCHES", 8, 1)?,
@@ -831,6 +965,12 @@ impl Knobs {
             metrics,
             sync,
             page_size,
+            gap_fill: match get("GAP_FILL") {
+                None => GapFill::OFF,
+                Some(value) => {
+                    value.parse().map_err(|e| eyre::eyre!("{KNOB_PREFIX}GAP_FILL: {e}"))?
+                }
+            },
             readers: count("READERS", 0, 0)?,
             submit_fraction,
             window: count("WINDOW", 20, 1)?,
@@ -838,7 +978,24 @@ impl Knobs {
             export,
             cache_dir,
             report,
+            layout,
+            read_mix,
+            diff,
+            diff_against,
+            diff_queries: count("DIFF_QUERIES", 10_000, 1)?,
         })
+    }
+
+    /// The readers' mix: `READ_MIX`, its `*_epoch` reads over the last epoch's blocks, an epoch
+    /// being `EPOCH_EVERY` outputs (or [`DEFAULT_EPOCH_OUTPUTS`] with none) of `BATCHES` blocks.
+    fn read_mix(&self) -> ReadMix {
+        let outputs = if self.epoch_every > 0 { self.epoch_every } else { DEFAULT_EPOCH_OUTPUTS };
+        let epoch_blocks = (outputs * self.batches) as u64;
+        match self.read_mix {
+            ReadMixKnob::Rpc => ReadMix::rpc(),
+            ReadMixKnob::History => ReadMix::history(epoch_blocks),
+            ReadMixKnob::All => ReadMix::all(epoch_blocks),
+        }
     }
 
     /// The prefilled genesis the knobs describe.
@@ -899,8 +1056,9 @@ impl Knobs {
     fn line(&self) -> String {
         format!(
             "outputs={} batches={} gas={} warmup={} aging={} prefill={} senders={} pools={} \
-             seed={} registry={} pace_ms={} metrics={} sync={} page_size={} readers={} \
-             submit_fraction={} window={} epoch_every={} export={} cache_dir={} report={}",
+             seed={} registry={} pace_ms={} metrics={} sync={} page_size={} gap_fill={} readers={} \
+             submit_fraction={} window={} epoch_every={} export={} cache_dir={} report={} \
+             layout={} read_mix={} diff={} diff_against={} diff_queries={}",
             self.outputs,
             self.batches,
             self.gas,
@@ -915,17 +1073,26 @@ impl Knobs {
             self.metrics.label(),
             self.sync.label(),
             self.page_size_label(),
+            self.gap_fill,
             self.readers,
             self.submit_fraction,
             self.window,
             self.epoch_every,
             u8::from(self.export),
             self.cache_dir.display(),
-            self.report
-                .as_ref()
-                .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+            path_text(self.report.as_deref()),
+            self.layout.label(),
+            self.read_mix.label(),
+            path_text(self.diff.as_deref()),
+            path_text(self.diff_against.as_deref()),
+            self.diff_queries,
         )
     }
+}
+
+/// A path knob as the knob line shows it: the path, or `none`.
+fn path_text(path: Option<&Path>) -> String {
+    path.map_or_else(|| "none".to_owned(), |path| path.display().to_string())
 }
 
 /// `<workspace>/target/exec-bench-cache`.
@@ -1106,7 +1273,7 @@ async fn aged_base(
     aging: &Aging,
     recorder: &CaptureRecorder,
 ) -> eyre::Result<Source> {
-    let name = base_dir_name(&base.spec, base.page_size, &aging.extra()?)?;
+    let name = base_dir_name(&base.spec, base.layout, base.page_size, &aging.extra()?)?;
     let dir = cache_dir.join(&name);
     if dir.symlink_metadata().is_ok() {
         let meta_path = dir.join(AGED_META_FILE);
@@ -1141,7 +1308,7 @@ async fn aged_base(
     let tip = {
         let page_text = base.page_size.to_string();
         let flags = db_flags(SyncMode::Durable, &page_text);
-        let node = BenchNode::open_at(&building, slim_chain(base), &flags, None)?;
+        let node = BenchNode::open_at(&building, slim_chain(base), &flags, base.layout, None)?;
         let mut factory = node.factory(base.spec, aging.workload, aging.output_config)?;
         let updates = EngineUpdates::spawn();
         let mut left = aging.outputs;
@@ -1203,13 +1370,17 @@ enum Per {
     Block,
     /// One per output: `persist_executed_output`'s `save_blocks` and commit.
     Output,
+    /// One per output, recorded by the output's signer-recovery job, which runs beside the call
+    /// before it (see [`run_outputs`]): drained once per run, not before each output, and not
+    /// counted, since a row takes the samples recorded since the row before.
+    Overlapped,
 }
 
 /// The captured histograms, by raw name (before tn-metrics' prefix), and their samples per
 /// output. Every value is in seconds.
 const CAPTURED: [(&str, Per); 16] = [
     (EXECUTE, Per::Block),
-    ("tn_reth.block_signer_recovery_seconds", Per::Block),
+    (RECOVER, Per::Overlapped),
     (FINISH, Per::Block),
     ("tn_reth.block_hashed_state_seconds", Per::Block),
     ("tn_reth.block_state_root_seconds", Per::Block),
@@ -1226,8 +1397,10 @@ const CAPTURED: [(&str, Per); 16] = [
     (COMMIT_MDBX, Per::Output),
 ];
 
-/// A block's EVM execution (signer recovery runs before it, once per batch).
+/// A block's EVM execution (its signers were recovered before the output's first block).
 const EXECUTE: &str = "tn_reth.block_execute_seconds";
+/// One output's signer-recovery job, its wall time.
+const RECOVER: &str = "tn_engine.recover_seconds";
 /// A block's `builder.finish`, hashed state and state root included.
 const FINISH: &str = "tn_reth.block_finish_seconds";
 /// Extending the output's trie overlay with a block.
@@ -1282,6 +1455,9 @@ struct OutputRow {
     faults: Option<PageFaults>,
     /// The database data file's length after the output, in bytes ([`db_file_bytes`]).
     db_file_len: u64,
+    /// The static files' syncs over the output's call, per segment and phase, or `None` when the
+    /// env does not measure them ([`SfSyncStats`]).
+    sf_sync: Option<SfSyncStats>,
 }
 
 impl OutputRow {
@@ -1302,7 +1478,7 @@ impl OutputRow {
 
 /// Each [`CAPTURED`] histogram's samples for one output of `blocks` blocks, summed, taking them
 /// with `drain`. Refuses a histogram whose sample count is not one per block or one per output
-/// ([`Per`]).
+/// ([`Per`]); an overlapped one is summed whatever its count.
 fn stage_sums(
     mut drain: impl FnMut(&str) -> Vec<f64>,
     blocks: usize,
@@ -1313,6 +1489,10 @@ fn stage_sums(
         let expected = match per {
             Per::Block => blocks,
             Per::Output => 1,
+            Per::Overlapped => {
+                *sum = samples.iter().sum();
+                continue;
+            }
         };
         let hint = if samples.is_empty() {
             " (a metric handle that registered before the capture recorder records nothing: run \
@@ -1400,8 +1580,10 @@ fn submitted(count: usize, fraction: f64) -> impl Iterator<Item = usize> {
 /// What the side load recorded over the timed loop.
 #[derive(Clone, Debug, Default)]
 struct SideSamples {
+    /// The kinds the readers draw ([`ReadMix::kinds`]).
+    mix: &'static [ReadKind],
     /// Each reader kind's calls in the on windows, in [`ReadKind::ALL`] order.
-    kinds: [KindSamples; 5],
+    kinds: [KindSamples; ReadKind::COUNT],
     /// The balance poller's latencies in the on windows.
     polls: Vec<Duration>,
     /// On windows whose last poll had no balance, or a zero one, for a polled address: the pool
@@ -1422,7 +1604,7 @@ impl SideSamples {
         &mut self,
         on: bool,
         elapsed: Duration,
-        kinds: [&KindSamples; 5],
+        kinds: [&KindSamples; ReadKind::COUNT],
         polls: &PollSamples,
         polled: &[Address],
     ) {
@@ -1454,6 +1636,14 @@ impl SideSamples {
         self.add_window(on, elapsed, kinds, &window.polls, polled);
     }
 
+    /// The kinds the report lists, in [`ReadKind::ALL`] order: the mix's, and any other with a
+    /// call (a [`ReadKind::Block`] fetched in place of a receipt or a transaction by hash).
+    fn reported_kinds(&self) -> impl Iterator<Item = (ReadKind, &KindSamples)> {
+        ReadKind::ALL.into_iter().zip(&self.kinds).filter(|(kind, samples)| {
+            self.mix.contains(kind) || samples.ok + samples.empty + samples.errors > 0
+        })
+    }
+
     /// The reader errors, the degraded polls, the calls in off windows and the submitter's
     /// errors: any makes the bench fail.
     fn errors(&self) -> u64 {
@@ -1479,16 +1669,17 @@ struct SideLoad {
 }
 
 impl SideLoad {
-    /// Start `knobs.readers` readers and the poller (gate off) and the submitter over `methods`
-    /// and `pool`, drawing accounts of `spec`.
+    /// Start `knobs.readers` readers of the knobs' mix and the poller (gate off) and the
+    /// submitter over `methods` and `pool`, drawing accounts of `spec`.
     fn start(
         methods: Methods,
         pool: WorkerTxPool,
         spec: PrefillSpec,
         knobs: &Knobs,
     ) -> eyre::Result<Self> {
+        let mix = knobs.read_mix();
         let mut readers =
-            Readers::start(methods.clone(), spec, knobs.readers, knobs.seed.wrapping_add(2))?;
+            Readers::start(methods.clone(), spec, mix, knobs.readers, knobs.seed.wrapping_add(2))?;
         let polled = poll_addresses(&spec, knobs.seed)?;
         readers.poll_balances(pool, polled.clone(), POLL_INTERVAL)?;
         Ok(Self {
@@ -1497,7 +1688,7 @@ impl SideLoad {
             submit_fraction: knobs.submit_fraction,
             window: knobs.window,
             polled,
-            samples: SideSamples::default(),
+            samples: SideSamples { mix: mix.kinds, ..SideSamples::default() },
             current: None,
         })
     }
@@ -1865,8 +2056,20 @@ async fn run_outputs(
     let mut rows = Vec::with_capacity(outputs.len());
     let mut expected = Vec::with_capacity(outputs.len());
     let mut parent = node.env.canonical_tip().number;
+    // the recovery jobs' own task manager, so their handles do not fill the env's
+    let mut recovery_tasks = TaskManager::default();
+    let recovery_spawner = recovery_tasks.get_spawner();
+    // the overlapped histograms keep their samples across the outputs of this run
+    for (name, per) in CAPTURED {
+        if per == Per::Overlapped {
+            recorder.drain(name);
+        }
+    }
+    // the next output's recovery job, started with the call before it when back to back
+    let mut queued: Option<QueuedRecovery> = None;
+    let mut outputs = outputs.into_iter().peekable();
     timed.resume();
-    for load in outputs {
+    while let Some(load) = outputs.next() {
         let index = timed.next;
         timed.next += 1;
         let t0 = *timed.t0.get_or_insert_with(Instant::now);
@@ -1890,16 +2093,30 @@ async fn run_outputs(
         let hashes = timed.side.is_some().then(|| tx_hashes(&load));
         // the commit histograms also record the env's other commits (opening it, say): start each
         // output with no samples
-        for (name, _) in CAPTURED {
-            recorder.drain(name);
+        for (name, per) in CAPTURED {
+            if per != Per::Overlapped {
+                recorder.drain(name);
+            }
         }
         // the database's and the process's write counters around the call, outside its wall
         // time: the commit completes inside the call, so the difference is this output's
         let counters_before = db_counters(&node.db)?;
+        // the static files' sync timers start each output from zero too
+        node.env.take_sf_sync_stats();
         let disk_before = timed.disk_bytes();
         let faults_before = page_faults();
+        // As the engine queues outputs: this output's job started with the call before it (back
+        // to back) or starts now (its slot, or the run's first output), and back to back the next
+        // output is queued, its job started, as this call starts.
+        let recovery =
+            queued.take().unwrap_or_else(|| QueuedRecovery::spawn(&load.output, &recovery_spawner));
+        if timed.pace.is_none() {
+            queued =
+                outputs.peek().map(|next| QueuedRecovery::spawn(&next.output, &recovery_spawner));
+        }
+        recovery_tasks.update_tasks();
         let started = Instant::now();
-        let (tip, wall) = node.execute_timed(load.output, &updates.tx).await?;
+        let (tip, wall) = node.execute_timed(load.output, recovery, &updates.tx).await?;
         let export_active = timed
             .export
             .as_ref()
@@ -1907,6 +2124,7 @@ async fn run_outputs(
         let faults_after = page_faults();
         let disk_after = timed.disk_bytes();
         let counters = db_counters(&node.db)?.since(&counters_before);
+        let sf_sync = node.env.take_sf_sync_stats();
         let (db_file_len, _) = db_file_bytes(&node.db_dir)?;
         let stages = stage_sums(|name| recorder.drain(name), blocks)?;
         if let (Some(side), Some(hashes)) = (timed.side.as_deref_mut(), hashes) {
@@ -1932,6 +2150,7 @@ async fn run_outputs(
                 .map(|(before, after)| after.saturating_sub(before)),
             faults: faults_before.zip(faults_after).map(|(before, after)| after.since(before)),
             db_file_len,
+            sf_sync,
             ..OutputRow::default()
         });
         parent = tip.number;
@@ -2009,11 +2228,7 @@ enum Stage {
 const STAGES: [(&str, &str, Stage); 18] = [
     ("total", "total", Stage::Total),
     ("  execute", "execute", Stage::Captured(EXECUTE)),
-    (
-        "  signer recovery",
-        "signer_recovery",
-        Stage::Captured("tn_reth.block_signer_recovery_seconds"),
-    ),
+    ("  signer recovery", "signer_recovery", Stage::Captured(RECOVER)),
     ("  finish", "finish", Stage::Captured(FINISH)),
     ("    hashed state", "hashed_state", Stage::Captured("tn_reth.block_hashed_state_seconds")),
     ("    state root", "state_root", Stage::Captured("tn_reth.block_state_root_seconds")),
@@ -2266,6 +2481,10 @@ const TOP_TABLES: usize = 10;
 /// The clone's footprint: its sizes through the run and its tables once closed.
 struct Footprint {
     sizes: RunSizes,
+    /// The static files by segment once the env opened on the clone ([`static_file_sizes`]).
+    segments_open: Vec<(&'static str, SegmentFiles)>,
+    /// The static files by segment once the env closed.
+    segments_closed: Vec<(&'static str, SegmentFiles)>,
     /// The tables' total size in the clone before the env opened it.
     baseline_table_bytes: u64,
     /// The outputs executed on the clone: the warm-up and the timed outputs.
@@ -2569,17 +2788,6 @@ fn latency_ms(latencies: &[Duration]) -> Option<Stats> {
     (!values.is_empty()).then(|| Stats::of(&values))
 }
 
-/// A reader kind's report label and JSON key.
-fn kind_key(kind: ReadKind) -> &'static str {
-    match kind {
-        ReadKind::Balance => "balance",
-        ReadKind::TokenBalance => "token_balance",
-        ReadKind::Receipt => "receipt",
-        ReadKind::Logs => "logs",
-        ReadKind::Block => "block",
-    }
-}
-
 /// `stats`' p50 and p99 to three places, or `-` for none.
 fn p50_p99_text(stats: Option<Stats>) -> (String, String) {
     stats.map_or_else(
@@ -2593,6 +2801,8 @@ struct Header {
     knobs: Knobs,
     /// The run's database page size in bytes, read from the open clone ([`db_page_size`]).
     page_size: u32,
+    /// The run's storage layout, read from the open clone ([`StorageLayout::of`]).
+    layout: StorageLayout,
     host: String,
     date: String,
     base: String,
@@ -2610,6 +2820,8 @@ struct Header {
     export: Option<Result<ExportRun, String>>,
     /// Why a timed output's [`disk_bytes_written`] read failed, the first time one did.
     disk_error: Option<String>,
+    /// With `DIFF`, the differential's record and comparison.
+    differential: Option<Differential>,
 }
 
 /// `bytes` in MiB.
@@ -2643,12 +2855,14 @@ fn report(
         header.page_size,
         knobs.page_size_label()
     );
+    out +=
+        &format!("  storage layout: {} (LAYOUT={})\n", header.layout.label(), knobs.layout.label());
     out += &disk_bytes_line(DISK_BYTES_SOURCE, header.disk_error.as_deref());
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
         out += "  note: on macOS both backends' durable commits are msync (libmdbx its used span, \
-                tn-lmdb its dirty pages), neither a drive-cache flush; the static files' syncs are \
-                F_FULLFSYNC in both\n";
+                tn-lmdb its dirty pages), neither a drive-cache flush; the static files' syncs are a \
+                plain fsync (vendor/reth TN-0117), not F_FULLFSYNC\n";
     }
     out += &format!("  base: {}\n  aged: {}\n", header.base, header.aged);
     out += &format!(
@@ -2746,7 +2960,9 @@ fn report(
                  failed\n"
             .to_owned(),
     };
+    out += &segments_report(footprint);
     out += &db_writes_report(&DbWrites::of(rows, sizes.before_timed.db_len_bytes), rows.len());
+    out += &sf_sync_report(rows);
     out += &export_report(header.export.as_ref(), rows);
 
     let tables = match &footprint.tables {
@@ -2754,6 +2970,7 @@ fn report(
         Err(e) => {
             out += &format!("table: FAILED reading the closed clone's table stats: {e}\n");
             out += &side_report(rows, side);
+            out += &differential_report(header.differential.as_ref());
             return out;
         }
     };
@@ -2780,6 +2997,271 @@ fn report(
         mib(tables.iter().map(|table| table.size_bytes).sum())
     );
     out += &side_report(rows, side);
+    out += &differential_report(header.differential.as_ref());
+    out
+}
+
+/// The static files by segment once the env closed, next to the database's file: each segment's
+/// jars, its parts' allocated MiB (data, offsets, config, changeset offsets, other), its total
+/// allocated and length, and the allocated bytes it grew per executed output from the env's open.
+fn segments_report(footprint: &Footprint) -> String {
+    let closed = &footprint.sizes.closed;
+    let mut out = format!(
+        "static files by segment, closed (MiB allocated; db file {:.1} allocated of {:.1}):\n",
+        mib(closed.db_allocated_bytes),
+        mib(closed.db_len_bytes)
+    );
+    out += &format!(
+        "  {:<22} {:>5} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>11}\n",
+        "segment", "jars", "data", "off", "conf", "csoff", "other", "alloc", "len", "KiB/output"
+    );
+    for row in segment_rows(footprint) {
+        let parts = row.closed;
+        out += &format!(
+            "  {:<22} {:>5} {:>9.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>9.2} {:>9.2} {:>11.2}\n",
+            row.segment,
+            parts.jars,
+            mib(parts.data.1),
+            mib(parts.offsets.1),
+            mib(parts.config.1),
+            mib(parts.csoff.1),
+            mib(parts.other.1),
+            mib(parts.total().1),
+            mib(parts.total().0),
+            row.growth_per_output_allocated / 1024.0
+        );
+    }
+    out
+}
+
+/// One segment's sizes over the run ([`segment_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SegmentRow {
+    segment: &'static str,
+    /// Its files once the env closed.
+    closed: SegmentFiles,
+    /// Its total length and allocated bytes once the env opened (zero when it had no file then).
+    open: (u64, u64),
+    /// The allocated bytes it grew per executed output, from the open to the closed clone.
+    growth_per_output_allocated: f64,
+    /// The length it grew per executed output.
+    growth_per_output_len: f64,
+}
+
+/// The segments of the closed clone, in [`static_file_sizes`]' order, with their growth from the
+/// open over the executed outputs.
+fn segment_rows(footprint: &Footprint) -> Vec<SegmentRow> {
+    let executed = footprint.executed.max(1) as f64;
+    footprint
+        .segments_closed
+        .iter()
+        .map(|&(segment, closed)| {
+            let open = footprint
+                .segments_open
+                .iter()
+                .find(|(name, _)| *name == segment)
+                .map_or((0, 0), |(_, files)| files.total());
+            let (len, allocated) = closed.total();
+            SegmentRow {
+                segment,
+                closed,
+                open,
+                growth_per_output_allocated: (allocated as f64 - open.1 as f64) / executed,
+                growth_per_output_len: (len as f64 - open.0 as f64) / executed,
+            }
+        })
+        .collect()
+}
+
+/// One (segment, phase) of the static files' syncs over the timed outputs ([`sf_sync_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SfSyncRow {
+    segment: &'static str,
+    phase: &'static str,
+    /// Its syncs per measured output.
+    calls_per_output: f64,
+    /// The stats of its summed time per measured output in ms, an output without it counting 0.
+    per_output: Stats,
+    /// Its longest sync in ms.
+    max_call_ms: f64,
+}
+
+/// The static files' syncs per (segment, phase) over the rows that measured them, in segment then
+/// phase order, with how many rows did; no rows for none.
+fn sf_sync_rows(rows: &[OutputRow]) -> (usize, Vec<SfSyncRow>) {
+    let measured: Vec<&SfSyncStats> = rows.iter().filter_map(|row| row.sf_sync.as_ref()).collect();
+    let mut keys: Vec<(&'static str, &'static str)> =
+        measured.iter().flat_map(|stats| stats.phases.keys().copied()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let out = keys
+        .into_iter()
+        .map(|key| {
+            let timing = |stats: &SfSyncStats| stats.phases.get(&key).copied().unwrap_or_default();
+            let per_output: Vec<f64> =
+                measured.iter().map(|stats| timing(stats).total_ns as f64 / 1e6).collect();
+            let calls: u64 = measured.iter().map(|stats| timing(stats).calls).sum();
+            let max_ns = measured.iter().map(|stats| timing(stats).max_ns).max().unwrap_or(0);
+            SfSyncRow {
+                segment: key.0,
+                phase: key.1,
+                calls_per_output: calls as f64 / measured.len() as f64,
+                per_output: Stats::of(&per_output),
+                max_call_ms: max_ns as f64 / 1e6,
+            }
+        })
+        .collect();
+    (measured.len(), out)
+}
+
+/// The report's static-file sync section: per segment and phase the syncs per output and their ms
+/// per output; one line when the env measures none.
+fn sf_sync_report(rows: &[OutputRow]) -> String {
+    let (measured, phases) = sf_sync_rows(rows);
+    if measured == 0 {
+        return "static-file syncs: not measured (the static-file provider keeps no per-segment \
+                timers)\n"
+            .to_owned();
+    }
+    let mut out = format!(
+        "static-file syncs over {measured} timed outputs (ms per output; max = the longest sync)\n"
+    );
+    out += &format!(
+        "  {:<22} {:<6} {:>9} {:>9} {:>9} {:>9} {:>9}\n",
+        "segment", "phase", "calls", "mean", "p50", "p99", "max"
+    );
+    for row in phases {
+        out += &format!(
+            "  {:<22} {:<6} {:>9.2} {:>9.3} {:>9.3} {:>9.3} {:>9.3}\n",
+            row.segment,
+            row.phase,
+            row.calls_per_output,
+            row.per_output.mean,
+            row.per_output.p50,
+            row.per_output.p99,
+            row.max_call_ms
+        );
+    }
+    out
+}
+
+/// The differential's outcome with `DIFF` (see the module docs).
+#[derive(Clone, Debug, PartialEq)]
+struct Differential {
+    /// Where it was written.
+    path: PathBuf,
+    /// What it recorded, or why recording failed.
+    summary: Result<DiffSummary, String>,
+    /// How long recording took.
+    elapsed: Duration,
+    /// With `DIFF_AGAINST`, the earlier file and the comparison, or why it failed.
+    against: Option<(PathBuf, Result<DiffComparison, String>)>,
+}
+
+impl Differential {
+    /// The failures that fail the bench: a failed record or comparison, a query's error, a
+    /// mismatch.
+    fn failures(&self) -> u64 {
+        let recorded = self.summary.as_ref().map_or(1, DiffSummary::errors);
+        let compared = match &self.against {
+            None => 0,
+            Some((_, Ok(comparison))) => comparison.mismatches as u64,
+            Some((_, Err(_))) => 1,
+        };
+        recorded + compared
+    }
+}
+
+/// With `DIFF`, record the differential of `knobs.diff_queries` queries on `methods` at the tip
+/// `tip` of the chain from `genesis_hash`, drawing addresses of `spec`, then with `DIFF_AGAINST`
+/// compare it to the earlier file. Failures are kept in the outcome, not returned.
+fn run_differential(
+    knobs: &Knobs,
+    methods: &Methods,
+    spec: &PrefillSpec,
+    genesis_hash: B256,
+    tip: &SealedHeader,
+) -> Option<Differential> {
+    let path = knobs.diff.clone()?;
+    let header = DiffHeader {
+        diff_version: DIFF_VERSION,
+        genesis_hash,
+        tip_number: tip.number,
+        tip_hash: tip.hash(),
+        seed: knobs.seed.wrapping_add(3),
+        queries: knobs.diff_queries,
+        layout: knobs.layout.label().to_owned(),
+        backend: BACKEND.to_owned(),
+    };
+    let started = Instant::now();
+    let summary =
+        tokio::task::block_in_place(|| differential::record(methods, spec, header, &path))
+            .map_err(|e| format!("{e:#}"));
+    let elapsed = started.elapsed();
+    let against = knobs.diff_against.clone().map(|earlier| {
+        let comparison = summary
+            .as_ref()
+            .map_err(|_| "nothing recorded to compare".to_owned())
+            .and_then(|_| differential::compare(&earlier, &path).map_err(|e| format!("{e:#}")));
+        (earlier, comparison)
+    });
+    Some(Differential { path, summary, elapsed, against })
+}
+
+/// The report's differential section: the queries per kind with their latency and errors, then
+/// the comparison; one line without `DIFF`.
+fn differential_report(differential: Option<&Differential>) -> String {
+    let Some(differential) = differential else {
+        return "differential: off (DIFF unset)\n".to_owned();
+    };
+    let summary = match &differential.summary {
+        Ok(summary) => summary,
+        Err(e) => {
+            return format!("differential: FAILED writing {}: {e}\n", differential.path.display())
+        }
+    };
+    let header = summary.header.as_ref();
+    let mut out = format!(
+        "differential: {} queries at block {} in {:.3} s, errors {}, written to {}\n",
+        header.map_or(0, |h| h.queries),
+        header.map_or(0, |h| h.tip_number),
+        differential.elapsed.as_secs_f64(),
+        summary.errors(),
+        differential.path.display()
+    );
+    out += &format!(
+        "  {:<12} {:>9} {:>9} {:>9} {:>7}   (ms; the writer idle)\n",
+        "kind", "queries", "p50", "p99", "errors"
+    );
+    for (kind, samples) in &summary.kinds {
+        let (p50, p99) = p50_p99_text(latency_ms(&samples.latencies));
+        out += &format!(
+            "  {:<12} {:>9} {p50:>9} {p99:>9} {:>7}\n",
+            kind.key(),
+            samples.latencies.len(),
+            samples.errors
+        );
+    }
+    if let Some(e) = &summary.first_error {
+        out += &format!("  first error: {e}\n");
+    }
+    match &differential.against {
+        None => out += "  compared: no (DIFF_AGAINST unset)\n",
+        Some((earlier, Err(e))) => {
+            out += &format!("  compared against {}: FAILED: {e}\n", earlier.display())
+        }
+        Some((earlier, Ok(comparison))) => {
+            out += &format!(
+                "  compared against {}: {} records, {} mismatches\n",
+                earlier.display(),
+                comparison.compared,
+                comparison.mismatches
+            );
+            for shown in &comparison.shown {
+                out += &format!("    {shown}\n");
+            }
+        }
+    }
     out
 }
 
@@ -2798,17 +3280,17 @@ fn side_report(rows: &[OutputRow], side: Option<&SideSamples>) -> String {
     );
     out += &split_text("off", "on", &writer_split(rows));
     out += &format!(
-        "{:<12} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7}   (on windows; ms)\n",
+        "{:<18} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7}   (on windows; ms)\n",
         "readers", "ops", "ops/s", "p50", "p99", "ok", "empty", "errors"
     );
     let on_s = side.on_time.as_secs_f64();
-    for (kind, samples) in ReadKind::ALL.iter().zip(&side.kinds) {
+    for (kind, samples) in side.reported_kinds() {
         let ops = samples.ok + samples.empty + samples.errors;
         let ops_per_s = if on_s > 0.0 { ops as f64 / on_s } else { 0.0 };
         let (p50, p99) = p50_p99_text(latency_ms(&samples.latencies));
         out += &format!(
-            "  {:<10} {ops:>9} {ops_per_s:>9.1} {p50:>9} {p99:>9} {:>9} {:>7} {:>7}\n",
-            kind_key(*kind),
+            "  {:<16} {ops:>9} {ops_per_s:>9.1} {p50:>9} {p99:>9} {:>9} {:>7} {:>7}\n",
+            kind.key(),
             samples.ok,
             samples.empty,
             samples.errors
@@ -2942,7 +3424,7 @@ fn export_report(export: Option<&Result<ExportRun, String>>, rows: &[OutputRow])
 
 /// The JSON report's layout version, bumped when a field is added, changes meaning or goes away:
 /// `etc/reth-exec-bench.sh` reads this version only.
-const JSON_REPORT_VERSION: u32 = 5;
+const JSON_REPORT_VERSION: u32 = 6;
 
 /// The JSON report of the timed `rows`, the clone's `footprint` and the `side` load, if it ran
 /// (see the module docs). Its field names stay stable for the scripts that aggregate runs:
@@ -2982,6 +3464,7 @@ fn json_report(
             fields.insert("major_faults".to_owned(), json!(row.faults.map(|f| f.major)));
             fields.insert("minor_faults".to_owned(), json!(row.faults.map(|f| f.minor)));
             fields.insert("db_file_len_bytes".to_owned(), row.db_file_len.into());
+            fields.insert("sf_sync".to_owned(), row_sf_sync_json(row.sf_sync.as_ref()));
             Value::Object(fields)
         })
         .collect();
@@ -3019,6 +3502,7 @@ fn json_report(
         "db_logical_growth_per_output_bytes".to_owned(),
         json!(footprint.logical_growth_per_output()),
     );
+    sizes_json.insert("static_file_segments".to_owned(), segments_json(footprint));
     let tables = match &footprint.tables {
         Ok(tables) => json!({
             "failed": false,
@@ -3049,12 +3533,42 @@ fn json_report(
     let db_writes =
         db_writes_json(&DbWrites::of(rows, sizes.before_timed.db_len_bytes), rows.len());
     let counter_names: Vec<&str> = rows[0].db_counters.iter().map(|&(name, _)| name).collect();
+    let knobs_json = json!({
+        "outputs": knobs.outputs,
+        "batches": knobs.batches,
+        "gas": knobs.gas,
+        "warmup": knobs.warmup,
+        "aging": knobs.aging,
+        "prefill": knobs.prefill,
+        "senders": knobs.senders,
+        "pools": knobs.pools,
+        "seed": knobs.seed,
+        "registry": knobs.registry,
+        "pace_ms": knobs.pace_ms,
+        "metrics": knobs.metrics.label(),
+        "sync": knobs.sync.label(),
+        "page_size": knobs.page_size,
+        "readers": knobs.readers,
+        "submit_fraction": knobs.submit_fraction,
+        "window": knobs.window,
+        "epoch_every": knobs.epoch_every,
+        "export": knobs.export,
+        "cache_dir": knobs.cache_dir.display().to_string(),
+        "report": knobs.report.as_ref().map(|path| path.display().to_string()),
+        "layout": knobs.layout.label(),
+        "read_mix": knobs.read_mix.label(),
+        "diff": knobs.diff.as_ref().map(|path| path.display().to_string()),
+        "diff_against": knobs.diff_against.as_ref().map(|path| path.display().to_string()),
+        "diff_queries": knobs.diff_queries,
+        "gap_fill": knobs.gap_fill.to_string(),
+    });
     json!({
         "report_version": JSON_REPORT_VERSION,
         "header": {
             "backend": BACKEND,
             "sync": knobs.sync.label(),
             "page_size_bytes": header.page_size,
+            "layout": header.layout.label(),
             "disk_bytes_source": DISK_BYTES_SOURCE,
             "disk_bytes_error": header.disk_error,
             "db_counter_names": counter_names,
@@ -3068,29 +3582,7 @@ fn json_report(
             "aged_tip_hash": header.aged_tip_hash,
             "final_tip_hash": header.final_tip_hash,
             "pool_rpc": "on",
-            "knobs": {
-                "outputs": knobs.outputs,
-                "batches": knobs.batches,
-                "gas": knobs.gas,
-                "warmup": knobs.warmup,
-                "aging": knobs.aging,
-                "prefill": knobs.prefill,
-                "senders": knobs.senders,
-                "pools": knobs.pools,
-                "seed": knobs.seed,
-                "registry": knobs.registry,
-                "pace_ms": knobs.pace_ms,
-                "metrics": knobs.metrics.label(),
-                "sync": knobs.sync.label(),
-                "page_size": knobs.page_size,
-                "readers": knobs.readers,
-                "submit_fraction": knobs.submit_fraction,
-                "window": knobs.window,
-                "epoch_every": knobs.epoch_every,
-                "export": knobs.export,
-                "cache_dir": knobs.cache_dir.display().to_string(),
-                "report": knobs.report.as_ref().map(|path| path.display().to_string()),
-            },
+            "knobs": knobs_json,
         },
         "rows": rows_json,
         "stats": stats,
@@ -3113,6 +3605,172 @@ fn json_report(
         "side_load": side.map(|side| side_json(rows, side)),
         "epoch_closes": epoch_closes,
         "export": header.export.as_ref().map(|export| export_json(export, rows)),
+        "sf_sync": sf_sync_json(rows),
+        "differential": header.differential.as_ref().map(differential_json),
+    })
+}
+
+/// A part's length and allocated bytes as `<name>_len_bytes` and `<name>_allocated_bytes` in
+/// `fields`.
+fn insert_bytes(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    bytes: (u64, u64),
+) {
+    fields.insert(format!("{name}_len_bytes"), bytes.0.into());
+    fields.insert(format!("{name}_allocated_bytes"), bytes.1.into());
+}
+
+/// The closed clone's static files by segment as JSON ([`segment_rows`]): per segment `jars`, each
+/// part's and the total's length and allocated bytes once closed, the total once open, and the
+/// growth per executed output.
+fn segments_json(footprint: &Footprint) -> serde_json::Value {
+    use serde_json::{Map, Value};
+
+    let segments: Map<String, Value> = segment_rows(footprint)
+        .into_iter()
+        .map(|row| {
+            let mut fields = Map::new();
+            let files = row.closed;
+            fields.insert("jars".to_owned(), files.jars.into());
+            insert_bytes(&mut fields, "data", files.data);
+            insert_bytes(&mut fields, "offsets", files.offsets);
+            insert_bytes(&mut fields, "config", files.config);
+            insert_bytes(&mut fields, "csoff", files.csoff);
+            insert_bytes(&mut fields, "other", files.other);
+            insert_bytes(&mut fields, "total", files.total());
+            insert_bytes(&mut fields, "open_total", row.open);
+            fields.insert(
+                "growth_per_output_allocated_bytes".to_owned(),
+                row.growth_per_output_allocated.into(),
+            );
+            fields
+                .insert("growth_per_output_len_bytes".to_owned(), row.growth_per_output_len.into());
+            (row.segment.to_owned(), Value::Object(fields))
+        })
+        .collect();
+    Value::Object(segments)
+}
+
+/// A row's static-file syncs as JSON: `"<segment>.<phase>"` to its `calls`, `total_ns` and
+/// `max_ns`, or null when not measured.
+fn row_sf_sync_json(stats: Option<&SfSyncStats>) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let Some(stats) = stats else { return Value::Null };
+    let phases: Map<String, Value> = stats
+        .phases
+        .iter()
+        .map(|(&(segment, phase), timing): (_, &PhaseTiming)| {
+            let value = json!({
+                "calls": timing.calls,
+                "total_ns": timing.total_ns,
+                "max_ns": timing.max_ns,
+            });
+            (format!("{segment}.{phase}"), value)
+        })
+        .collect();
+    Value::Object(phases)
+}
+
+/// The static-file syncs over the timed outputs as JSON ([`sf_sync_rows`]): null when no output
+/// measured them, else `outputs` (those that did) and `phases`, one per segment and phase with
+/// `segment`, `phase`, `calls_per_output`, `mean_ms`, `p50_ms`, `p99_ms` and `max_call_ms`.
+fn sf_sync_json(rows: &[OutputRow]) -> serde_json::Value {
+    use serde_json::{json, Value};
+
+    let (measured, phases) = sf_sync_rows(rows);
+    if measured == 0 {
+        return Value::Null;
+    }
+    let phases: Vec<Value> = phases
+        .into_iter()
+        .map(|row| {
+            json!({
+                "segment": row.segment,
+                "phase": row.phase,
+                "calls_per_output": row.calls_per_output,
+                "mean_ms": row.per_output.mean,
+                "p50_ms": row.per_output.p50,
+                "p99_ms": row.per_output.p99,
+                "max_call_ms": row.max_call_ms,
+            })
+        })
+        .collect();
+    json!({ "outputs": measured, "phases": phases })
+}
+
+/// The differential as JSON: `path`, `failed`, `error`, `tip_number`, `seed`, `queries`,
+/// `duration_s`, `errors`, `first_error`, `kinds` (per kind `queries`, `p50_ms`, `p99_ms`,
+/// `errors`), and `against` (null without `DIFF_AGAINST`, else `path`, `failed`, `error`,
+/// `compared`, `mismatches` and `shown`); from `tip_number` to `kinds` null when `failed`.
+fn differential_json(differential: &Differential) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let against = differential.against.as_ref().map(|(earlier, comparison)| match comparison {
+        Ok(comparison) => json!({
+            "path": earlier.display().to_string(),
+            "failed": false,
+            "error": null,
+            "compared": comparison.compared,
+            "mismatches": comparison.mismatches,
+            "shown": comparison.shown,
+        }),
+        Err(e) => json!({
+            "path": earlier.display().to_string(),
+            "failed": true,
+            "error": e,
+            "compared": null,
+            "mismatches": null,
+            "shown": null,
+        }),
+    });
+    let path = differential.path.display().to_string();
+    let summary = match &differential.summary {
+        Ok(summary) => summary,
+        Err(e) => {
+            return json!({
+                "path": path,
+                "failed": true,
+                "error": e,
+                "tip_number": null,
+                "seed": null,
+                "queries": null,
+                "duration_s": differential.elapsed.as_secs_f64(),
+                "errors": null,
+                "first_error": null,
+                "kinds": null,
+                "against": against,
+            })
+        }
+    };
+    let kinds: Map<String, Value> = summary
+        .kinds
+        .iter()
+        .map(|(kind, samples)| {
+            let latency = latency_ms(&samples.latencies);
+            let value = json!({
+                "queries": samples.latencies.len(),
+                "p50_ms": latency.map(|stats| stats.p50),
+                "p99_ms": latency.map(|stats| stats.p99),
+                "errors": samples.errors,
+            });
+            (kind.key().to_owned(), value)
+        })
+        .collect();
+    let header = summary.header.as_ref();
+    json!({
+        "path": path,
+        "failed": false,
+        "error": null,
+        "tip_number": header.map(|h| h.tip_number),
+        "seed": header.map(|h| h.seed),
+        "queries": header.map(|h| h.queries),
+        "duration_s": differential.elapsed.as_secs_f64(),
+        "errors": summary.errors(),
+        "first_error": summary.first_error,
+        "kinds": kinds,
+        "against": against,
     })
 }
 
@@ -3195,9 +3853,8 @@ fn side_json(rows: &[OutputRow], side: &SideSamples) -> serde_json::Value {
 
     let writer = split_json(writer_split(rows), "off", "on");
     let on_s = side.on_time.as_secs_f64();
-    let readers: Map<String, Value> = ReadKind::ALL
-        .iter()
-        .zip(&side.kinds)
+    let readers: Map<String, Value> = side
+        .reported_kinds()
         .map(|(kind, samples)| {
             let ops = samples.ok + samples.empty + samples.errors;
             let ops_per_s = if on_s > 0.0 { ops as f64 / on_s } else { 0.0 };
@@ -3213,7 +3870,7 @@ fn side_json(rows: &[OutputRow], side: &SideSamples) -> serde_json::Value {
                 "errors": samples.errors,
                 "first_error": samples.first_error,
             });
-            (kind_key(*kind).to_owned(), value)
+            (kind.key().to_owned(), value)
         })
         .collect();
     let submits = &side.submits;
@@ -3294,7 +3951,25 @@ async fn exec_bench() -> eyre::Result<()> {
     let knobs = Knobs::from_env()?;
     // refuse a report path that cannot be written before the run, not after it
     let report_target = knobs.report.as_deref().map(report_target).transpose()?;
+    if let Some(diff) = &knobs.diff {
+        let dir = diff.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        eyre::ensure!(
+            diff.file_name().is_some() && dir.is_dir(),
+            "{KNOB_PREFIX}DIFF={}: {} is not a directory",
+            diff.display(),
+            dir.display()
+        );
+    }
+    if let Some(against) = &knobs.diff_against {
+        eyre::ensure!(
+            against.is_file(),
+            "{KNOB_PREFIX}DIFF_AGAINST={} is not a file",
+            against.display()
+        );
+    }
 
+    // a global tracing dispatcher, as the node has (see the module docs, phase 1)
+    tn_types::test_utils::init_test_tracing();
     // the recorder goes first: reth's metric handles bind to the recorder current at their first
     // registration, which the first env open does
     let (inner, prometheus) = match knobs.metrics {
@@ -3321,8 +3996,9 @@ async fn exec_bench() -> eyre::Result<()> {
     announce_temp_dir(&tmp_root);
     let spec = knobs.spec();
     let page_size = knobs.page_size();
-    let base_cached = knobs.cache_dir.join(base_dir_name(&spec, page_size, "")?).exists();
-    let (base_dir, base) = build_base(&spec, page_size, &knobs.cache_dir)?;
+    let layout = knobs.layout;
+    let base_cached = knobs.cache_dir.join(base_dir_name(&spec, layout, page_size, "")?).exists();
+    let (base_dir, base) = build_base(&spec, layout, page_size, &knobs.cache_dir)?;
     let base_line = format!(
         "{} ({}, {} accounts, db {} MiB allocated of {} MiB)",
         base_dir.display(),
@@ -3368,15 +4044,21 @@ async fn exec_bench() -> eyre::Result<()> {
         db_table_stats(&datadir.join("db"))?.iter().map(|stat| stat.total_size).sum();
     // the driver keeps `tmp`: the clone outlives the env, to be measured closed
     let page_text = page_size.to_string();
-    let node =
-        BenchNode::open_at(&datadir, slim_chain(&base), &db_flags(knobs.sync, &page_text), None)?;
+    let gap_text = knobs.gap_fill.to_string();
+    let mut flags = db_flags(knobs.sync, &page_text).to_vec();
+    if knobs.gap_fill.is_on() {
+        flags.extend(["--db.gap-fill", gap_text.as_str()]);
+    }
+    let node = BenchNode::open_at(&datadir, slim_chain(&base), &flags, layout, None)?;
     let effective_page_size = db_page_size(&node.db)?;
+    let effective_layout = StorageLayout::of(&node.env)?;
     eyre::ensure!(
         effective_page_size == page_size,
         "the clone's database has {effective_page_size}-byte pages, the run asked for {page_size}"
     );
     let (pool, methods) = node.serve()?;
     let mut sizes = RunSizes { open: Sizes::of(&datadir)?, ..RunSizes::default() };
+    let segments_open = static_file_sizes(&datadir.join("static_files"))?;
     let tip = node.env.canonical_tip();
     eyre::ensure!(
         (tip.number, tip.hash()) == (source.tip_number, source.tip_hash),
@@ -3389,10 +4071,16 @@ async fn exec_bench() -> eyre::Result<()> {
     let mut factory = node.factory(spec, knobs.run_workload(), knobs.output_config())?;
     let updates = EngineUpdates::spawn();
     let warmup = factory.generate(knobs.warmup);
+    // the readers' by-hash lookups draw from every executed transaction, the warm-up's included
+    let warmup_hashes: Vec<B256> =
+        if knobs.readers > 0 { warmup.iter().flat_map(tx_hashes).collect() } else { Vec::new() };
     run_outputs(&node, &updates, &recorder, warmup, &mut Timed::default()).await?;
     let mut side_load = (knobs.readers > 0)
         .then(|| SideLoad::start(methods.clone(), pool.clone(), spec, &knobs))
         .transpose()?;
+    if let Some(side) = &side_load {
+        side.readers.feed_tx_hashes(warmup_hashes);
+    }
     let mut timed = Timed { pace: knobs.pace(), side: side_load.as_mut(), ..Timed::default() };
     let mut rows = Vec::with_capacity(knobs.outputs);
     for (count, closes) in segments(knobs.outputs, knobs.epoch_every) {
@@ -3416,7 +4104,8 @@ async fn exec_bench() -> eyre::Result<()> {
         }
     }
     let elapsed = timed.elapsed();
-    let final_tip_hash = node.env.canonical_tip().hash();
+    let final_tip = node.env.canonical_tip();
+    let final_tip_hash = final_tip.hash();
     // the system sampler of `etc/reth-exec-bench.sh` places the timed loop's end by this line
     println!("timed loop done: elapsed_s={:.3}", elapsed.as_secs_f64());
     std::io::stdout().flush()?;
@@ -3432,6 +4121,9 @@ async fn exec_bench() -> eyre::Result<()> {
         Some(Ok(run)) => (Some(Ok(run)), None),
         Some(Err(e)) => (Some(Err(format!("{e:#}"))), Some(e)),
     };
+    // the differential reads the finished chain with the writer idle; failures are reported,
+    // then fail the bench
+    let differential = run_differential(&knobs, &methods, &spec, base.genesis_hash, &final_tip);
     let sent = updates.close().await?;
     eyre::ensure!(
         sent == knobs.warmup + knobs.outputs,
@@ -3445,6 +4137,7 @@ async fn exec_bench() -> eyre::Result<()> {
         upkeep.abort();
     }
     sizes.closed = Sizes::of(&datadir)?;
+    let segments_closed = static_file_sizes(&datadir.join("static_files"))?;
     // the database is closed: the tn-lmdb build's table stats refuse an open one. A failure is
     // reported, then returned, so the run's figures are not lost
     let closed_stats = match closed {
@@ -3456,13 +4149,20 @@ async fn exec_bench() -> eyre::Result<()> {
         Err(e) => (Err(format!("{e:#}")), Some(e)),
     };
     drop(tmp);
-    let footprint =
-        Footprint { sizes, baseline_table_bytes, executed: knobs.warmup + knobs.outputs, tables };
+    let footprint = Footprint {
+        sizes,
+        segments_open,
+        segments_closed,
+        baseline_table_bytes,
+        executed: knobs.warmup + knobs.outputs,
+        tables,
+    };
 
     let date = command_line("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_default();
     let header = Header {
         knobs,
         page_size: effective_page_size,
+        layout: effective_layout,
         host: host(),
         date,
         base: base_line,
@@ -3473,6 +4173,7 @@ async fn exec_bench() -> eyre::Result<()> {
         elapsed,
         export,
         disk_error,
+        differential,
     };
     print!("{}", report(&header, &rows, &footprint, side.as_ref()));
     if let Some((dir, name)) = report_target {
@@ -3492,6 +4193,14 @@ async fn exec_bench() -> eyre::Result<()> {
     }
     if let Some(e) = export_error {
         return Err(e.wrap_err("the export beside the timed loop"));
+    }
+    if let Some(differential) = &header.differential {
+        eyre::ensure!(
+            differential.failures() == 0,
+            "the differential had {} failures (a failed record or comparison, query errors, \
+             mismatches): see the report",
+            differential.failures()
+        );
     }
     Ok(())
 }
@@ -3535,6 +4244,7 @@ mod tests {
             metrics: MetricsMode::Off,
             sync: SyncMode::Durable,
             page_size: None,
+            gap_fill: GapFill::OFF,
             readers: 0,
             submit_fraction: 0.25,
             window: 20,
@@ -3542,8 +4252,14 @@ mod tests {
             export: false,
             cache_dir: default_cache_dir(),
             report: None,
+            layout: StorageLayout::V1,
+            read_mix: ReadMixKnob::Rpc,
+            diff: None,
+            diff_against: None,
+            diff_queries: 10_000,
         };
         assert_eq!(knobs, expected);
+        assert_eq!(knobs.read_mix(), ReadMix::rpc());
         assert!(knobs.cache_dir.ends_with("target/exec-bench-cache"));
         let workspace = knobs.cache_dir.ancestors().nth(2).unwrap();
         assert!(workspace.join("crates/engine/Cargo.toml").exists(), "{}", workspace.display());
@@ -3602,6 +4318,11 @@ mod tests {
             ("WINDOW", "7"),
             ("CACHE_DIR", "/some/cache"),
             ("REPORT", "/some/report.json"),
+            ("LAYOUT", "v2"),
+            ("READ_MIX", "history"),
+            ("DIFF", "/some/b.jsonl"),
+            ("DIFF_AGAINST", "/some/a.jsonl"),
+            ("DIFF_QUERIES", "600"),
         ]))
         .unwrap();
         assert_eq!((knobs.outputs, knobs.warmup, knobs.aging), (5, 0, 0));
@@ -3626,7 +4347,18 @@ mod tests {
             "{}",
             knobs.line()
         );
-        assert!(knobs.line().ends_with(" report=/some/report.json"), "{}", knobs.line());
+        assert!(
+            knobs.line().ends_with(
+                " report=/some/report.json layout=v2 read_mix=history diff=/some/b.jsonl \
+                 diff_against=/some/a.jsonl diff_queries=600"
+            ),
+            "{}",
+            knobs.line()
+        );
+        assert_eq!(knobs.layout, StorageLayout::V2);
+        assert_eq!(knobs.read_mix(), ReadMix::history(50 * 2), "50 outputs of 2 blocks");
+        let epochs = Knobs::parse(vars(&[("READ_MIX", "all"), ("EPOCH_EVERY", "10")])).unwrap();
+        assert_eq!(epochs.read_mix(), ReadMix::all(10 * 8), "an epoch of 10 outputs of 8 blocks");
         let edges = Knobs::parse(vars(&[("SUBMIT_FRACTION", "0"), ("WINDOW", "1")])).unwrap();
         assert_eq!((edges.submit_fraction, edges.window), (0.0, 1));
         assert_eq!(Knobs::parse(vars(&[("SUBMIT_FRACTION", "1")])).unwrap().submit_fraction, 1.0);
@@ -3635,7 +4367,7 @@ mod tests {
     /// A malformed value and an unknown knob are refused, each by name.
     #[test]
     fn test_knobs_refused() {
-        let cases: [(&str, &str, &str); 19] = [
+        let cases: [(&str, &str, &str); 25] = [
             ("OUTPUTS", "many", "OUTPUTS=\"many\" is not a whole number"),
             ("OUTPUTS", "0", "OUTPUTS=0 is below 1"),
             ("BATCHES", "0", "BATCHES=0 is below 1"),
@@ -3655,11 +4387,19 @@ mod tests {
             ("EPOCH_EVERY", "often", "EPOCH_EVERY=\"often\" is not a whole number"),
             ("EXPORT", "2", "EXPORT=\"2\" is not one of 0, 1"),
             ("READER", "1", "unknown knob TN_EXEC_BENCH_READER"),
+            ("LAYOUT", "v3", "LAYOUT=\"v3\" is not one of v1, v2"),
+            ("READ_MIX", "past", "READ_MIX=\"past\" is not one of rpc, history, all"),
+            ("DIFF", "", "DIFF is empty"),
+            ("DIFF_AGAINST", "", "DIFF_AGAINST is empty"),
+            ("DIFF_AGAINST", "/a.jsonl", "DIFF_AGAINST compares this run's differential"),
+            ("DIFF_QUERIES", "0", "DIFF_QUERIES=0 is below 1"),
         ];
         for (knob, value, needle) in cases {
             let err = Knobs::parse(vars(&[(knob, value)])).unwrap_err().to_string();
             assert!(err.contains(needle), "{knob}={value:?}: {err}");
         }
+        let same = Knobs::parse(vars(&[("DIFF", "/a.jsonl"), ("DIFF_AGAINST", "/a.jsonl")]));
+        assert!(same.unwrap_err().to_string().contains("naming another file"));
         assert_eq!(Knobs::parse(vars(&[("SYNC", "durable")])).unwrap(), defaults());
     }
 
@@ -3898,7 +4638,7 @@ mod tests {
 
         let rows = export_rows();
         let plain = json_report(&header(defaults()), &rows, &footprint(), None);
-        assert_eq!(plain["report_version"], 5);
+        assert_eq!(plain["report_version"], 6);
         assert_eq!(plain["epoch_closes"], Value::Null);
         assert_eq!(plain["export"], Value::Null);
         assert_eq!(plain["header"]["knobs"]["epoch_every"], 0);
@@ -4016,6 +4756,7 @@ mod tests {
         BaseMeta {
             layout_version: 1,
             backend: BACKEND.to_owned(),
+            layout: StorageLayout::V1,
             page_size: 4096,
             spec: defaults().spec(),
             slim_genesis_hash: B256::ZERO,
@@ -4076,7 +4817,7 @@ mod tests {
         let index = CAPTURED.iter().position(|(captured, _)| *captured == name).unwrap() + 1;
         match CAPTURED[index - 1].1 {
             Per::Block => vec![index as f64 * 1e-3; blocks],
-            Per::Output => vec![index as f64 * 1e-2],
+            Per::Output | Per::Overlapped => vec![index as f64 * 1e-2],
         }
     }
 
@@ -4258,6 +4999,7 @@ mod tests {
         Header {
             knobs,
             page_size: 16_384,
+            layout: StorageLayout::V1,
             host: "host (cpu)".to_owned(),
             date: "today".to_owned(),
             base: "base".to_owned(),
@@ -4268,11 +5010,26 @@ mod tests {
             elapsed: Duration::from_secs(1),
             export: None,
             disk_error: None,
+            differential: None,
+        }
+    }
+
+    /// A segment of `jars` jars whose data take `data` bytes, with 4 KiB of offsets and config
+    /// each and `csoff` bytes of changeset offsets, allocated as long.
+    fn segment(jars: u64, data: u64, csoff: u64) -> SegmentFiles {
+        SegmentFiles {
+            jars,
+            data: (data, data),
+            offsets: (4096, 4096),
+            config: (4096, 4096),
+            csoff: (csoff, csoff),
+            other: (0, 0),
         }
     }
 
     /// A footprint whose timed loop grew the database by 3 MiB and the static files by 3 KiB,
-    /// with two tables 3 MiB larger in all than before 3 executed outputs.
+    /// with two tables 3 MiB larger in all than before 3 executed outputs; the headers segment
+    /// grew by 3 KiB and a storage changesets segment appeared.
     fn footprint() -> Footprint {
         let at = |db_allocated_bytes, static_files_allocated_bytes| Sizes {
             db_len_bytes: 4 << 30,
@@ -4287,6 +5044,11 @@ mod tests {
                 after_timed: at(14 << 20, (2 << 20) + 3 * 1024),
                 closed: at(14 << 20, (2 << 20) + 3 * 1024),
             },
+            segments_open: vec![("headers", segment(1, 1 << 20, 0))],
+            segments_closed: vec![
+                ("headers", segment(1, (1 << 20) + 3 * 1024, 0)),
+                ("storage-change-sets", segment(2, 6 * 1024, 3 * 1024)),
+            ],
             baseline_table_bytes: 4 << 20,
             executed: 3,
             tables: Ok(tables_by_size(vec![
@@ -4358,7 +5120,9 @@ mod tests {
         let empty = KindSamples::default();
         let mut side = SideSamples::default();
         let first = kind(2, 3, 1, 1, Some("first"));
-        let window = [&first, &empty, &empty, &empty, &kind(5, 1, 0, 0, None)];
+        let fifth = kind(5, 1, 0, 0, None);
+        let mut window = [&empty; ReadKind::COUNT];
+        (window[0], window[4]) = (&first, &fifth);
         side.add_window(
             true,
             Duration::from_secs(2),
@@ -4367,7 +5131,8 @@ mod tests {
             &[a, b],
         );
         let second = kind(4, 1, 0, 2, Some("second"));
-        let window = [&second, &empty, &empty, &empty, &empty];
+        let mut window = [&empty; ReadKind::COUNT];
+        window[0] = &second;
         side.add_window(true, Duration::from_secs(1), window, &polls(2, &[(a, 1)]), &[a, b]);
         assert_eq!(side.on_time, Duration::from_secs(3));
         let balance = &side.kinds[0];
@@ -4380,18 +5145,25 @@ mod tests {
         assert_eq!(side.errors(), 3 + 1);
 
         // a zero balance degrades a window too; a window without polls is not judged
-        side.add_window(true, Duration::ZERO, [&empty; 5], &polls(1, &[(a, 0), (b, 1)]), &[a, b]);
-        side.add_window(true, Duration::ZERO, [&empty; 5], &polls(0, &[]), &[a, b]);
+        side.add_window(
+            true,
+            Duration::ZERO,
+            [&empty; ReadKind::COUNT],
+            &polls(1, &[(a, 0), (b, 1)]),
+            &[a, b],
+        );
+        side.add_window(true, Duration::ZERO, [&empty; ReadKind::COUNT], &polls(0, &[]), &[a, b]);
         assert_eq!(side.degraded_polls, 2);
 
         // an off window adds no samples: its calls only count against the gate
         let off = kind(1, 2, 1, 1, Some("off"));
-        side.add_window(false, Duration::from_secs(5), [&off; 5], &polls(3, &[]), &[a, b]);
-        assert_eq!(side.off_calls, 5 * 4 + 3);
+        let window = [&off; ReadKind::COUNT];
+        side.add_window(false, Duration::from_secs(5), window, &polls(3, &[]), &[a, b]);
+        assert_eq!(side.off_calls, ReadKind::COUNT as u64 * 4 + 3);
         assert_eq!(side.on_time, Duration::from_secs(3));
         assert_eq!(side.kinds[0].ok, 4);
         side.submits.errors = 7;
-        assert_eq!(side.errors(), 3 + 2 + 23 + 7);
+        assert_eq!(side.errors(), 3 + 2 + ReadKind::COUNT as u64 * 4 + 3 + 7);
     }
 
     /// Rows split by `side_load`: each split stage's stats over its side, on over off of the
@@ -4442,6 +5214,19 @@ mod tests {
         );
         assert!(report.starts_with(&first), "{report}");
         assert!(report.contains("\n  page size: 16384 bytes (PAGE_SIZE=default)\n"), "{report}");
+        assert!(report.contains("\n  storage layout: v1 (LAYOUT=v1)\n"), "{report}");
+        let segments = "\nstatic files by segment, closed (MiB allocated; db file 14.0 allocated \
+                        of 4096.0):\n";
+        assert!(report.contains(segments), "{report}");
+        let headers = ["headers", "1", "1.00", "0.00", "0.00", "0.00", "0.00", "1.01", "1.01"];
+        assert_eq!(words(&report, "  headers ")[..9], headers, "{report}");
+        assert_eq!(words(&report, "  headers ")[9], "1.00", "3 KiB over 3 outputs");
+        let changes = ["storage-change-sets", "2", "0.01", "0.00", "0.00", "0.00", "0.00", "0.02"];
+        assert_eq!(words(&report, "  storage-change-sets ")[..8], changes, "{report}");
+        assert_eq!(words(&report, "  storage-change-sets ")[9], "5.67", "17 KiB from none");
+        let unmeasured = "\nstatic-file syncs: not measured (the static-file provider keeps no \
+                          per-segment timers)\n";
+        assert!(report.contains(unmeasured), "{report}");
         for (label, _, _) in STAGES {
             let rows = report.lines().filter(|line| line.starts_with(&format!("{label} ")));
             assert_eq!(rows.count(), 2, "{label}: a stats row and a thirds row\n{report}");
@@ -4464,7 +5249,10 @@ mod tests {
         let logical =
             "growth per executed output (logical, table bytes): db 1024.0 KiB over 3 outputs";
         assert!(report.contains(logical), "{report}");
-        assert!(report.ends_with("side load: off (READERS=0)\n"), "{report}");
+        assert!(
+            report.ends_with("side load: off (READERS=0)\ndifferential: off (DIFF unset)\n"),
+            "{report}"
+        );
         assert!(report.contains("\nepoch closes: none (EPOCH_EVERY=0)\n"), "{report}");
         assert!(report.contains("\nexport: off (EXPORT=0)\n"), "{report}");
         assert!(report.contains("(the 2 largest of 2 tables, closed clone)"), "{report}");
@@ -4490,11 +5278,16 @@ mod tests {
         );
         assert!(!report.contains("PlainStorageState"), "{report}");
         assert!(report.contains("\nside load: 3 outputs off, 0 on"), "{report}");
+        assert!(report.ends_with("differential: off (DIFF unset)\n"), "{report}");
     }
 
     /// Side-load samples: 2 s on, 4 balance reads (one an error), a submitter and a poller.
     fn side() -> SideSamples {
-        let mut side = SideSamples { on_time: Duration::from_secs(2), ..SideSamples::default() };
+        let mut side = SideSamples {
+            mix: &ReadKind::RPC,
+            on_time: Duration::from_secs(2),
+            ..SideSamples::default()
+        };
         side.kinds[0] = kind(2, 2, 1, 1, Some("bad balance"));
         side.polls = vec![Duration::from_millis(1), Duration::from_millis(3)];
         side.submits = SubmitSamples {
@@ -4533,16 +5326,34 @@ mod tests {
             assert!(report.contains(&format!("\n  {label:<10} ")), "{key}\n{report}");
         }
         let balance =
-            "  balance            4       2.0     2.000     2.000         2       1       1";
+            "  balance                  4       2.0     2.000     2.000         2       1       1";
         assert!(report.contains(balance), "{report}");
         assert!(report.contains("    first error (eth_getBalance): bad balance\n"), "{report}");
-        let logs = "  logs               0       0.0         -         -         0       0       0";
+        let logs =
+            "  logs                     0       0.0         -         -         0       0       0";
         assert!(report.contains(logs), "{report}");
         let submitter =
             "submitter: accepted=3 nonce_too_low=1 already_known=1 errors=0 p50_ms=4.000";
         assert!(report.contains(submitter), "{report}");
         assert!(report.contains("poller: polls=2 p50_ms=1.000 p99_ms=3.000 degraded_windows=0"));
         assert!(report.ends_with("calls in off windows: 0\n"), "{report}");
+        assert!(!report.contains("balance_at"), "a kind outside the mix without calls is left out");
+
+        // a kind outside the mix shows once it has calls: a block fetched in place of a lookup
+        let mut history = SideSamples { mix: &ReadKind::HISTORY, ..side() };
+        history.kinds[ReadKind::Logs as usize] = KindSamples::default();
+        let report = side_report(&side_rows(), Some(&history));
+        let kinds: Vec<&str> = report
+            .lines()
+            .skip_while(|line| !line.starts_with("readers "))
+            .skip(1)
+            .take_while(|line| line.starts_with("  "))
+            .filter(|line| !line.starts_with("    "))
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect();
+        let mut expected = vec!["balance"];
+        expected.extend(ReadKind::HISTORY.map(ReadKind::key));
+        assert_eq!(kinds, expected, "{report}");
     }
 
     /// The JSON report holds the header with every knob, one row per output with every stage in
@@ -4570,8 +5381,32 @@ mod tests {
         let at = |pointer: &str| {
             json.pointer(pointer).unwrap_or_else(|| panic!("no {pointer} in {json:#}")).clone()
         };
-        assert_eq!(at("/report_version"), 5);
+        assert_eq!(at("/report_version"), 6);
         assert_eq!(at("/header/backend"), BACKEND);
+        assert_eq!(at("/header/layout"), "v1");
+        assert_eq!(at("/header/knobs/layout"), "v1");
+        assert_eq!(at("/header/knobs/read_mix"), "rpc");
+        assert_eq!(at("/header/knobs/diff"), serde_json::Value::Null);
+        assert_eq!(at("/header/knobs/diff_against"), serde_json::Value::Null);
+        assert_eq!(at("/header/knobs/diff_queries"), 10_000);
+        assert_eq!(at("/rows/1/sf_sync"), serde_json::Value::Null, "not measured");
+        assert_eq!(at("/sf_sync"), serde_json::Value::Null, "not measured");
+        assert_eq!(at("/differential"), serde_json::Value::Null, "DIFF unset");
+        let segments = at("/sizes/static_file_segments");
+        let names: Vec<&String> = segments.as_object().unwrap().keys().collect();
+        assert_eq!(names, ["headers", "storage-change-sets"]);
+        assert_eq!(at("/sizes/static_file_segments/headers/jars"), 1);
+        assert_eq!(at("/sizes/static_file_segments/headers/offsets_len_bytes"), 4096);
+        assert_eq!(at("/sizes/static_file_segments/headers/config_allocated_bytes"), 4096);
+        let total = (1_u64 << 20) + 3 * 1024 + 8192;
+        assert_eq!(at("/sizes/static_file_segments/headers/total_allocated_bytes"), total);
+        assert_eq!(at("/sizes/static_file_segments/headers/open_total_len_bytes"), total - 3072);
+        let growth = at("/sizes/static_file_segments/headers/growth_per_output_allocated_bytes");
+        assert_eq!(growth, 1024.0);
+        assert_eq!(at("/sizes/static_file_segments/storage-change-sets/csoff_len_bytes"), 3072);
+        let growth =
+            at("/sizes/static_file_segments/storage-change-sets/growth_per_output_len_bytes");
+        assert_eq!(growth, 17_408.0 / 3.0, "from no file at the open");
         assert_eq!(at("/header/genesis_hash"), serde_json::json!(B256::repeat_byte(1)));
         assert_eq!(at("/header/aged_tip_hash"), serde_json::json!(B256::repeat_byte(2)));
         assert_eq!(at("/header/final_tip_hash"), format!("0x{}", "03".repeat(32)));
@@ -4676,6 +5511,146 @@ mod tests {
         assert_eq!(json["sizes"]["db_logical_growth_per_output_bytes"], serde_json::Value::Null);
     }
 
+    /// The static-file syncs per segment and phase over the outputs that measured them: calls and
+    /// ms per output (an output without a phase counting 0), the longest sync; in the text and
+    /// in the JSON, rows included. Without any measured output the section is one line and null.
+    #[test]
+    fn test_sf_sync_report_and_json() {
+        let mut rows = [
+            row(1, 8, 0.5, 1, 1, false),
+            row(9, 16, 0.5, 1, 1, false),
+            row(17, 24, 0.5, 1, 1, false),
+        ];
+        let mut first = SfSyncStats::default();
+        first.add("headers", "data", 1, 2_000_000, 2_000_000);
+        first.add("receipts", "conf", 2, 1_000_000, 700_000);
+        let mut second = SfSyncStats::default();
+        second.add("headers", "data", 1, 4_000_000, 4_000_000);
+        rows[0].sf_sync = Some(first);
+        rows[1].sf_sync = Some(second);
+        let (measured, phases) = sf_sync_rows(&rows);
+        assert_eq!(measured, 2, "the third output measured nothing");
+        let keys: Vec<_> = phases.iter().map(|row| (row.segment, row.phase)).collect();
+        assert_eq!(keys, [("headers", "data"), ("receipts", "conf")]);
+        assert_eq!((phases[0].calls_per_output, phases[0].per_output.mean), (1.0, 3.0));
+        assert_eq!((phases[0].per_output.p50, phases[0].max_call_ms), (2.0, 4.0));
+        assert_eq!((phases[1].calls_per_output, phases[1].per_output.mean), (1.0, 0.5));
+        assert_eq!(phases[1].max_call_ms, 0.7);
+
+        let report = sf_sync_report(&rows);
+        assert!(report.starts_with("static-file syncs over 2 timed outputs"), "{report}");
+        let headers = ["headers", "data", "1.00", "3.000", "2.000", "4.000", "4.000"];
+        assert_eq!(words(&report, "  headers "), headers, "{report}");
+        let json = json_report(&header(defaults()), &rows, &footprint(), None);
+        assert_eq!(json["sf_sync"]["outputs"], 2);
+        assert_eq!(json["sf_sync"]["phases"][1]["segment"], "receipts");
+        assert_eq!(json["sf_sync"]["phases"][1]["phase"], "conf");
+        assert_eq!(json["sf_sync"]["phases"][1]["mean_ms"], 0.5);
+        assert_eq!(json["sf_sync"]["phases"][0]["max_call_ms"], 4.0);
+        assert_eq!(json["rows"][0]["sf_sync"]["receipts.conf"]["calls"], 2);
+        assert_eq!(json["rows"][0]["sf_sync"]["receipts.conf"]["max_ns"], 700_000);
+        assert_eq!(json["rows"][2]["sf_sync"], serde_json::Value::Null);
+
+        let none = [row(1, 8, 0.5, 1, 1, false)];
+        assert_eq!(sf_sync_rows(&none), (0, vec![]));
+        assert!(sf_sync_report(&none).starts_with("static-file syncs: not measured"));
+    }
+
+    /// A differential of two kinds, one error, compared with one mismatch.
+    fn differential() -> Differential {
+        let header = DiffHeader {
+            diff_version: DIFF_VERSION,
+            genesis_hash: B256::repeat_byte(1),
+            tip_number: 24,
+            tip_hash: B256::repeat_byte(3),
+            seed: 3,
+            queries: 3,
+            layout: "v1".to_owned(),
+            backend: BACKEND.to_owned(),
+        };
+        let mut summary = DiffSummary { header: Some(header), ..DiffSummary::default() };
+        let samples = |ms: &[u64], errors| differential::DiffKindSamples {
+            latencies: ms.iter().map(|ms| Duration::from_millis(*ms)).collect(),
+            errors,
+        };
+        summary.kinds.insert(differential::DiffKind::Header, samples(&[1, 3], 0));
+        summary.kinds.insert(differential::DiffKind::BalanceAt, samples(&[2], 1));
+        summary.first_error = Some("query 1 (eth_getBalance): gone".to_owned());
+        let comparison = DiffComparison {
+            compared: 3,
+            mismatches: 1,
+            shown: vec!["record 1 differs".to_owned()],
+        };
+        Differential {
+            path: PathBuf::from("/d/b.jsonl"),
+            summary: Ok(summary),
+            elapsed: Duration::from_millis(1500),
+            against: Some((PathBuf::from("/d/a.jsonl"), Ok(comparison))),
+        }
+    }
+
+    /// The differential section: the queries per kind with their latency and errors, the first
+    /// error and the comparison, in the text and the JSON; a failed record or comparison is
+    /// reported, and every failure counts against the bench.
+    #[test]
+    fn test_differential_report_and_json() {
+        let differential = differential();
+        assert_eq!(differential.failures(), 2, "one query error, one mismatch");
+        let report = differential_report(Some(&differential));
+        let first = "differential: 3 queries at block 24 in 1.500 s, errors 1, written to \
+                     /d/b.jsonl\n";
+        assert!(report.starts_with(first), "{report}");
+        assert_eq!(words(&report, "  header "), ["header", "2", "1.000", "3.000", "0"]);
+        assert_eq!(words(&report, "  balance_at "), ["balance_at", "1", "2.000", "2.000", "1"]);
+        assert!(report.contains("  first error: query 1 (eth_getBalance): gone\n"), "{report}");
+        let compared =
+            "  compared against /d/a.jsonl: 3 records, 1 mismatches\n    record 1 differs\n";
+        assert!(report.ends_with(compared), "{report}");
+
+        let json = differential_json(&differential);
+        assert_eq!(json["path"], "/d/b.jsonl");
+        assert_eq!((json["failed"].clone(), json["errors"].clone()), (false.into(), 1.into()));
+        assert_eq!((json["tip_number"].clone(), json["queries"].clone()), (24.into(), 3.into()));
+        assert_eq!(json["kinds"]["header"]["queries"], 2);
+        assert_eq!(json["kinds"]["header"]["p99_ms"], 3.0);
+        assert_eq!(json["kinds"]["balance_at"]["errors"], 1);
+        assert_eq!(json["against"]["mismatches"], 1);
+        assert_eq!(json["against"]["shown"][0], "record 1 differs");
+        let mut header = header(defaults());
+        header.differential = Some(differential.clone());
+        let report_json = json_report(&header, &[row(1, 8, 0.5, 1, 1, false)], &footprint(), None);
+        assert_eq!(report_json["differential"], json);
+
+        let failed = Differential {
+            summary: Err("disk full".to_owned()),
+            against: Some((PathBuf::from("/d/a.jsonl"), Err("nothing recorded".to_owned()))),
+            ..differential.clone()
+        };
+        assert_eq!(failed.failures(), 2, "the record and the comparison");
+        let report = differential_report(Some(&failed));
+        assert_eq!(report, "differential: FAILED writing /d/b.jsonl: disk full\n");
+        let json = differential_json(&failed);
+        assert_eq!(
+            (json["failed"].clone(), json["error"].clone()),
+            (true.into(), "disk full".into())
+        );
+        assert_eq!(json["kinds"], serde_json::Value::Null);
+        assert_eq!(json["against"]["failed"], true);
+        let clean = Differential { against: None, ..differential };
+        let clean = Differential {
+            summary: clean.summary.map(|mut summary| {
+                summary.kinds.values_mut().for_each(|kind| kind.errors = 0);
+                summary
+            }),
+            ..clean
+        };
+        assert_eq!(clean.failures(), 0);
+        assert!(
+            differential_report(Some(&clean)).ends_with("  compared: no (DIFF_AGAINST unset)\n")
+        );
+        assert_eq!(differential_report(None), "differential: off (DIFF unset)\n");
+    }
+
     /// The JSON `side_load` object holds the writer split per split stage, each reader kind, the
     /// submitter, the poller and the error total, and each row says whether its side load was on.
     #[test]
@@ -4701,8 +5676,11 @@ mod tests {
         assert_eq!(at("/side_load/writer/total/on/p99_ms"), 500.0);
         assert_eq!(at("/side_load/writer/total/mean_ratio"), 4.0);
         assert_eq!(at("/side_load/writer/execute/p50_ratio"), serde_json::Value::Null);
-        for kind in ReadKind::ALL {
-            let fields = &json["side_load"]["readers"][kind_key(kind)];
+        for kind in ReadKind::HISTORY {
+            assert!(json["side_load"]["readers"].get(kind.key()).is_none(), "{kind:?} not drawn");
+        }
+        for kind in ReadKind::RPC {
+            let fields = &json["side_load"]["readers"][kind.key()];
             assert_eq!(fields["method"], kind.method());
             for field in ["ops", "ops_per_s", "p50_ms", "p99_ms", "ok", "empty", "errors"] {
                 assert!(fields.get(field).is_some(), "{kind:?} {field}");

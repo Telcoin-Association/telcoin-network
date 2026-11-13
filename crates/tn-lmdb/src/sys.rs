@@ -18,7 +18,16 @@
 //!
 //! In tests every successful sync reports to the disk model (`disk_model`).
 
-use std::{fs::File, io, os::fd::AsRawFd, path::Path, sync::OnceLock};
+use std::{
+    fs::File,
+    io,
+    os::fd::{AsRawFd, BorrowedFd},
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
+};
 
 /// A boot id: 16 bytes that differ from one boot of the host to the next ([`boot_id`]). All zeros
 /// stands for an unknown one.
@@ -138,7 +147,7 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
 /// source, so a caller that walks the sources (as the reth adapter does for an error's code)
 /// still finds the OS error code, which the wrapping `io::Error` itself no longer carries.
 #[derive(Debug)]
-struct Context {
+pub(crate) struct Context {
     /// What was being done.
     what: String,
     /// The error it met.
@@ -148,7 +157,7 @@ struct Context {
 impl Context {
     /// `source`, as an `io::Error` of its kind that says it happened while doing `what`.
     #[cold]
-    fn wrap(what: String, source: io::Error) -> io::Error {
+    pub(crate) fn wrap(what: String, source: io::Error) -> io::Error {
         io::Error::new(source.kind(), Context { what, source })
     }
 }
@@ -226,7 +235,7 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
 ///
 /// `from` must be the file's current length (macOS reserves from the physical end of file). Where
 /// the filesystem cannot preallocate, this falls back to a plain (sparse) resize so the file
-/// still works.
+/// still works, with a warning once per process ([`sparse_fallback`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> {
     let len = to.saturating_sub(from);
@@ -248,9 +257,24 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
         // fallocate; fall back to a plain resize (sparse) rather than failing an
         // otherwise-serviceable growth.
         Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) => {
+            sparse_fallback(&err);
             file.set_len(to)
         }
         Err(err) => Err(err), // ENOSPC / EDQUOT / EFBIG / EIO propagate as the growth's io::Error
+    }
+}
+
+/// Warn, once per process, that [`allocate_range`] fell back to a sparse resize (`err` is the
+/// preallocation's refusal): the file then lacks the guarantee the preallocation exists for, and
+/// a full disk can be a `SIGBUS` on a mapped write instead of an error (README, Platform notes).
+fn sparse_fallback(err: &io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            target: "tn_lmdb",
+            "the file system cannot preallocate the data file's growth ({err}); it grows sparse, \
+             so a full disk can be a SIGBUS on a write instead of an error"
+        );
     }
 }
 
@@ -289,6 +313,7 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
     }
     if let Err(err) = reserved {
         if err.raw_os_error() == Some(libc::ENOTSUP) {
+            sparse_fallback(&err);
             return file.set_len(to);
         }
         return Err(err);
@@ -356,6 +381,39 @@ pub(crate) fn drop_cached_pages(file: &File) -> io::Result<()> {
     #[cfg(test)]
     crate::disk_model::cache_dropped(file);
     Ok(())
+}
+
+/// Start reading `len` bytes of `file` at `offset` into the page cache, without waiting for them:
+/// Linux `posix_fadvise(POSIX_FADV_WILLNEED)` (through `rustix`, so no `unsafe` here), which
+/// queues the reads and returns; pages already cached are skipped. Open's check of a weak head
+/// gives it for the pages it is about to read (`check::check_since`), so the device reads them
+/// together rather than one fault at a time on a cold cache. A hint: an error is ignored, and the
+/// reads then fault in one by one as without it. Elsewhere a no-op. In tests each call is logged
+/// (`take_will_need_log`).
+pub(crate) fn will_need(file: BorrowedFd<'_>, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    if let Some(len) = std::num::NonZeroU64::new(len) {
+        let _ = rustix::fs::fadvise(file, offset, Some(len), rustix::fs::Advice::WillNeed);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+    #[cfg(test)]
+    WILL_NEED_LOG.with(|log| log.borrow_mut().push((offset, len)));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the byte ranges [`will_need`] advised on this thread, `(offset, len)`, in order.
+    /// Read with [`take_will_need_log`].
+    static WILL_NEED_LOG: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: the ranges this thread advised since the last call, oldest first (see
+/// [`WILL_NEED_LOG`]).
+#[cfg(test)]
+pub(crate) fn take_will_need_log() -> Vec<(u64, u64)> {
+    WILL_NEED_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 /// Take an exclusive, non-blocking `flock` on `file`, held until every descriptor of its open file

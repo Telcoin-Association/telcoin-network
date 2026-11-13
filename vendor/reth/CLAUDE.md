@@ -5,17 +5,18 @@ crates TN uses plus the test-only `reth-testing-utils`, with TN's changes on top
 cargo workspace that TN's root manifest reaches by path dependencies (README.md, "How TN builds
 against it").
 
-**Size: don't read the copy to understand TN's work.** `crates/` and `testing/` hold about 199k
+**Size: don't read the copy to understand TN's work.** `crates/` and `testing/` hold about 210k
 lines of Rust, almost all of it upstream code TN never changed. TN's whole change set is
-`vendor.py diff`: 110 files, about 14k lines removed and 2.5k added, most of the removals whole
-files. Start from that diff or from a ledger entry, never from a directory listing.
+`vendor.py diff`: 187 files (7 of them binary test fixtures), about 17k lines removed and 14k
+added, most of the removals whole files. Start from that diff or from a ledger entry, never from
+a directory listing.
 
 **Read in this order:**
 1. this file;
 2. README.md, the section for your task (building, testing, changing vendored code, taking
    upstream changes, checking the feature graph);
 3. the CHANGES.md entry for the `TN-NNNN` id you meet;
-4. DECISIONS.md (D1 to D21) only when you need the reason behind a rule.
+4. DECISIONS.md (D1 to D22) only when you need the reason behind a rule.
 
 **Skip:** `Cargo.lock` (both), `patches/revm-inspectors/src/` (registry source; its
 `upstream.diff` is the whole change), and any file under `crates/` that `vendor.py status` does
@@ -34,13 +35,16 @@ not list.
 | known issues this work leaves open | `tn/notes/open-issues.md` |
 | what comes next | ROADMAP.md |
 | the TN side of the boundary | `crates/tn-reth` (README.md; `js-tracer.md` for the opt-in `js-tracer` feature) |
-| the carried revm-inspectors fix | `patches/revm-inspectors/PATCH.md` |
+| the carried revm-inspectors fixes | `patches/revm-inspectors/PATCH.md` |
 | CI for this code | `etc/ci-lanes.sh test-vendor-reth`; `.github/workflows/pr.yaml` jobs `vendor-reth-test` and `revm-inspectors-patch` |
 | the RocksDB ban | `etc/rocksdb-gate.sh` (DECISIONS.md D14) |
+| how reth's test-only dependencies are pinned | `tn/test-only.lock`, `tn/lockfile.py` (DECISIONS.md D7) |
 
 TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (primitives,
-`ChainSpec`, reth's `TaskSpawner` for TN's task manager), `tn-config`, `tn-exex`, `tn-storage`
-(`reth-libmdbx`), and `reth-metrics` derives in several crates (usage-map.md has the list).
+`ChainSpec`, reth's `TaskSpawner` for TN's task manager), `tn-config`, `tn-exex`, `tn-lmdb-reth`
+(implements `reth-db-api` over tn-lmdb, the default execution database), `tn-storage`
+(`reth-libmdbx`: the old consensus DB its MDBX migration reads, and a test backend), and
+`reth-metrics` derives in several crates (usage-map.md has the list).
 
 ## TN's edits by area
 
@@ -48,14 +52,22 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 |---|---|
 | crates removed or cut down | TN-0005, TN-0006, TN-0008, TN-0009, TN-0011, TN-0012, TN-0028 to TN-0032 |
 | RPC surface removed (namespaces TN never serves) | TN-0010, TN-0021, TN-0033 |
-| build only (deps, build scripts, features, formatting) | TN-0002, TN-0007, TN-0020, TN-0025 to TN-0027 |
-| tests only | TN-0001, TN-0003, TN-0004 |
-| RocksDB removed; storage v1 as the default | TN-0014 |
+| build only (deps, build scripts, features, formatting) | TN-0002, TN-0007, TN-0020, TN-0025 to TN-0027, TN-0080 |
+| tooling (`vendor.py ledger`, `lockfile.py`) | TN-0084, TN-0085, TN-0143 |
+| tests only | TN-0001, TN-0003, TN-0004, TN-0045, TN-0142 |
+| RocksDB removed (`StorageSettings::base()` stays v1) | TN-0014 |
 | upstream sync to v1.11.4 | TN-0013 |
-| RPC security backports | TN-0015 to TN-0017, TN-0019, TN-0034, TN-0035 |
-| RPC limits TN adds beyond upstream | TN-0036, TN-0037 |
-| transaction pool backports | TN-0018, TN-0022, TN-0024 |
-| static files and nippy-jar backports | TN-0023 |
+| RPC security backports | TN-0015 to TN-0017, TN-0019, TN-0034, TN-0035, TN-0046, TN-0058, TN-0076 |
+| RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077 to TN-0079 |
+| transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0041 to TN-0043, TN-0073 to TN-0075 |
+| RPC and CLI fixes backported after v1.11.4 | TN-0039, TN-0040, TN-0044, TN-0047 to TN-0051, TN-0059, TN-0060, TN-0062 to TN-0072 |
+| storage and static-file backports | TN-0023, TN-0052, TN-0106 to TN-0109, TN-0159 |
+| trie backports | TN-0081, TN-0102 to TN-0105, TN-0140, TN-0141 |
+| execution and storage fixes | TN-0082, TN-0083 |
+| storage v2 without RocksDB (history and tx hashes in the database, plain-slot keys, v2 genesis, tests) | TN-0100, TN-0110 to TN-0113, TN-0115, TN-0116 |
+| checksummed static files (NippyJar format 2) and jar crash safety | TN-0120 to TN-0123, TN-0130 to TN-0137, TN-0146, TN-0149 |
+| static-file performance (commit syncs, `.csoff` cache, jar cache) | TN-0101, TN-0117 to TN-0119, TN-0124, TN-0138, TN-0144, TN-0148 |
+| storage roots from a `StorageRootSource` (TN's parallel state roots) | TN-0139 |
 
 CHANGES.md is ordered by section, then by id, newest last within a section.
 
@@ -67,13 +79,19 @@ execution and storage path:
 - vendored: `crates/evm/*`, `crates/ethereum/{evm,primitives,hardforks}`, `crates/revm`,
   `crates/trie/*`, `crates/storage/*` (`db-common` holds genesis init), `crates/static-file/types`,
   `crates/chainspec`, `crates/primitives-traits`, `crates/chain-state`;
-- TN: `crates/tn-reth/src/evm/`, `env/execution.rs`, `env/genesis.rs`, `system_calls.rs`;
+- TN: `crates/tn-reth/src/evm/`, `system_calls.rs`, and in `src/env/`: `execution.rs`,
+  `genesis.rs`, `exec_cache*` (the cross-block execution cache), `output_overlay*` (state roots,
+  the parallel ones included), `layout.rs`, `database*` (open, MDBX migration); the database
+  engine, `crates/tn-lmdb` and `crates/tn-lmdb-reth`;
 - third party: any version or feature change to revm, alloy, k256, secp256k1, blst or c-kzg.
 
 Invariants that must hold:
-- `StorageSettings::base()` returns v1 (TN-0014). Upstream main returns v2. The test
-  `test_new_datadir_uses_storage_v1` (`crates/tn-reth/src/env/mod.rs`) fails if a sync takes
-  upstream's line.
+- A datadir's layout is TN's choice, recorded at creation and never flipped: `settle`
+  (`crates/tn-reth/src/env/layout.rs`) gives a new datadir v2 on the default tn-lmdb build and v1
+  on the MDBX build, and genesis is written with it (`init_genesis_with_settings`). Pinned by
+  `the_default_build_gives_new_datadirs_v2` there; `crates/tn-reth/src/env/format_freeze_tests.rs`
+  pins both layouts' on-disk bytes. reth's `StorageSettings::base()` (v1 by TN-0014; upstream main
+  returns v2) is not on TN's path.
 - Removing a crate or an edge must not switch off a feature something else relied on (D10).
 - No RocksDB, in any form, anywhere in the lockfile (D14).
 
@@ -92,7 +110,7 @@ validator proposes, but every validator executes the same batches the same way.
 ## Commands
 
 ```
-python3 -I vendor/reth/tn/vendor.py status | check | diff [path...]
+python3 -I vendor/reth/tn/vendor.py status | check | ledger | diff [path...]
 vendor/reth/tn/cargo.sh check --workspace --all-targets      # never -p alone (D18)
 vendor/reth/tn/cargo.sh nextest run -p reth-rpc               # add --features js-tracer for JS tracers
 vendor/reth/tn/cargo.sh nextest run -p reth-db --test-threads 2   # macOS MDBX ENOMEM otherwise
@@ -101,8 +119,8 @@ etc/ci-lanes.sh test-vendor-reth                              # what CI runs for
 etc/rocksdb-gate.sh
 ```
 
-`cargo.sh` runs cargo inside the nested workspace with the revm-inspectors patch applied and
-builds into `target/vendor-reth`; never run a bare `cargo` in `vendor/reth`. nextest there reads
+`cargo.sh` runs cargo inside the nested workspace (whose `.cargo/config.toml` applies the
+revm-inspectors patch, TN-0080) and builds into `target/vendor-reth`; never run a bare `cargo` in `vendor/reth`. nextest there reads
 `vendor/reth/.config/nextest.toml`, not the root's. TN's own `cargo` commands build the vendored crates as path
 dependencies but never run their tests, and TN's clippy lane skips them.
 
@@ -111,14 +129,15 @@ dependencies but never run their tests, and TN's clippy lane skips them.
 README.md, "Changing vendored code", has the procedure. In short: one focused commit, a CHANGES.md
 entry, a `TN(TN-NNNN):` comment where the edit would surprise a reader of reth's code, no
 cosmetic edits (each one conflicts at every sync), and the fork checks above when the change
-touches the execution or storage path. Nothing checks ledger coverage automatically: compare
-`vendor.py status` with the entries' *Files* lines yourself.
+touches the execution or storage path. `vendor.py ledger` checks the ledger against `status`:
+name each changed file in an entry, from `vendor/reth` or from a crate the entry named before it.
 
 ## Reviewing this code
 
 Review TN's diff, not the copy. A cheap integrity pass:
-1. `vendor.py status` lists only files some ledger entry names.
-2. Every `TN(TN-NNNN)` id in the code has an entry, and every entry's files appear in `status`.
+1. `vendor.py ledger` passes: every file `status` lists is named by an entry, and every
+   `TN(TN-NNNN)` id in the code has one.
+2. Every entry's files appear in `status` (by eye; an entry can name a file it later restored).
 3. `vendor.py check` and `etc/rocksdb-gate.sh` pass.
 4. `git diff main -- Cargo.lock` adds no package and changes no third-party version.
 
@@ -127,9 +146,11 @@ Then read `vendor.py diff` area by area, with the ledger entry beside it.
 These are deliberate; don't report them:
 - The RocksDB stubs (`providers/rocksdb_stub.rs`, `traits/rocksdb_provider.rs`) and the
   storage-v2 plumbing stay until the storage work replaces them (D15, ROADMAP "RocksDB step B").
-- MDBX stays compiled (D9). Its upstream fixes are tracked for the tndb-b owners.
+- MDBX stays compiled (D9, D22): the opt-in `mdbx` build runs on it and the default build migrates
+  an MDBX datadir. Its upstream fixes are tracked in `tn/notes/upstream-backports.md`.
 - reth's code style, lints and rustfmt config apply here, not TN's.
-- The nested `Cargo.lock` is generated and git-ignored (D7).
+- The nested `Cargo.lock` is generated and git-ignored (D7); `tn/test-only.lock` pins what only
+  reth's tests need, and `tn/lockfile.py check` guards both.
 - Tests that needed a removed crate were dropped with it (D11).
 - `cargo.sh check -p <crate>` fails for some crates; build with `--workspace` (D18).
 - Carried crates still have code TN doesn't call; trimming it is ROADMAP work (D12, D20).
@@ -139,13 +160,13 @@ These are deliberate; don't report them:
 ## Tracking upstream reth
 
 The upstream clone is `$RETH_UPSTREAM`, or `~/.cache/tn-vendor/reth`, which `vendor.py` clones
-on first use. The last survey of upstream `main` stopped at `84caec584` (2026-10-30); the tracker
+on first use. The last survey of upstream `main` stopped at `44a74f9ea` (2026-11-06); the tracker
 records it. To survey what landed since, over the carried paths only:
 
 ```
 U=${RETH_UPSTREAM:-$HOME/.cache/tn-vendor/reth}
 git -C "$U" fetch origin
-git -C "$U" log --no-merges --oneline 84caec584..origin/main -- \
+git -C "$U" log --no-merges --oneline 44a74f9ea..origin/main -- \
   $(grep -v '^#' vendor/reth/tn/crates.txt | awk 'NF{print $1}')
 ```
 
@@ -153,7 +174,8 @@ Triage by subject first (fix, security, panic, overflow, DoS, limit), then `git 
 read diffs only for candidates. Skip files TN deleted (the `deleted` lines of `vendor.py status`).
 Record each verdict and the new survey point in `tn/notes/upstream-backports.md`, and apply a fix
 with `vendor.py pick <sha>`. A release bump is `vendor.py sync <tag>` (README.md). Watch
-revm-inspectors releases too: `patches/revm-inspectors/PATCH.md` says when that patch retires.
+revm-inspectors releases too: `patches/revm-inspectors/PATCH.md` says what an upgrade must re-port
+and when the recursion-limit part retires.
 
 ## Tracking TN main
 

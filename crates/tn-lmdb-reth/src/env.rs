@@ -1,7 +1,7 @@
 //! [`TnLmdbEnv`]: the environment, its table map, and reth's `Database` and `DatabaseMetrics`.
 
 use crate::{
-    dup::{dup_layout, DupLayout},
+    dup::{dup_layout, DupLayout, DUP_LAYOUTS},
     error,
     timeout::{ReaderState, ReaderTimeouts, DEFAULT_READ_TRANSACTION_TIMEOUT},
     tx::{TnLmdbTx, TnLmdbTxMut},
@@ -25,7 +25,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tn_lmdb::{CheckReport, DupOptions, Env, EnvOptions, IoStats, ReadTxn, SyncMode, Table};
+use tn_lmdb::{
+    CheckReport, DupOptions, Env, EnvOptions, GapFill, IoStats, ReadTxn, SyncMode, Table,
+};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tn-lmdb.dat";
@@ -156,6 +158,13 @@ pub struct TnLmdbArgs {
     /// commit that changes something writes over it, so a later open with `true` in the same boot
     /// can open at them again. Applies to read-only opens too.
     pub trust_unsynced: bool,
+    /// Gap fill (default off): the engine's `EnvOptions::gap_fill`. A durable step first rewrites
+    /// each gap of at most so many clean pages between two runs of its dirty pages with the bytes
+    /// they hold, so the disk takes fewer, larger writes for more bytes: a fixed width
+    /// ([`GapFill::Pages`]) for disks that cap I/Os per second (cloud block storage), not for
+    /// local NVMe; [`GapFill::Auto`] chooses the width per scattered step from the syncs' measured
+    /// costs, for either. An open refuses a width past [`tn_lmdb::MAX_GAP_FILL`] (`MDBX_EINVAL`).
+    pub gap_fill: GapFill,
     /// How long a read transaction may live (default [`DEFAULT_READ_TRANSACTION_TIMEOUT`], MDBX's
     /// five minutes; `None`: for ever): past it, every call of the transaction and of its
     /// cursors fails with MDBX's `ReadTransactionTimeout`, so that a reader held open by mistake
@@ -193,6 +202,7 @@ impl Default for TnLmdbArgs {
             sync_period: engine.sync_period,
             sync_bytes: engine.sync_bytes,
             trust_unsynced: engine.trust_unsynced,
+            gap_fill: engine.gap_fill,
             read_transaction_timeout: Some(DEFAULT_READ_TRANSACTION_TIMEOUT),
             #[cfg(test)]
             nested_dup: true,
@@ -245,6 +255,13 @@ impl TnLmdbArgs {
     /// Set the largest growth step of the file, at least [`tn_lmdb::MIN_GROWTH`].
     pub const fn with_max_growth(mut self, max_growth: u64) -> Self {
         self.max_growth = max_growth;
+        self
+    }
+
+    /// Set [`Self::gap_fill`]: a width in pages (0: off) of at most [`tn_lmdb::MAX_GAP_FILL`], or
+    /// [`GapFill::Auto`].
+    pub const fn with_gap_fill(mut self, gap_fill: GapFill) -> Self {
+        self.gap_fill = gap_fill;
         self
     }
 
@@ -302,9 +319,26 @@ impl TnLmdbArgs {
             sync_period: self.sync_period,
             sync_bytes: self.sync_bytes,
             trust_unsynced: self.trust_unsynced,
+            gap_fill: self.gap_fill,
             ..EnvOptions::default()
         }
     }
+}
+
+/// The plain engine table recording the layout each dup-sort table of the file was created with
+/// ([`DUP_LAYOUTS`]): a row per table, its name to its [`layout_record`].
+/// [`TnLmdbEnv::create_tables_for`] writes a table's row as it creates the table, and
+/// [`TnLmdbEnv::open`] compares each row with this build's layout: the engine's catalog records a
+/// dup table's key width and `packed_max`, not its subkey width, and nothing of a composite table's
+/// split, so a change of those in [`DUP_LAYOUTS`] would otherwise open an old file silently. A file
+/// without the table or a row (written before the record) opens, lenient on purpose: no tn-lmdb
+/// file is in production yet; a layout change once one is can make the record required.
+pub(crate) const LAYOUT_TABLE: &str = "TnLmdbRethLayout";
+
+/// A layout's row in [`LAYOUT_TABLE`]: its key width, its subkey width, and its form (1 an
+/// engine dup table, 0 composite keys in a plain table).
+fn layout_record(layout: DupLayout) -> [u8; 3] {
+    [layout.key as u8, layout.subkey as u8, u8::from(layout.nested)]
 }
 
 /// One table of the map: its engine handle and how its rows are laid out.
@@ -518,6 +552,18 @@ impl TnLmdbEnv {
                 tables.entries.insert(name, entry);
             }
         }
+        // The layouts the file was written with ([`LAYOUT_TABLE`]), each against this build's.
+        if let Some(records) = txn.open_table(LAYOUT_TABLE).map_err(open_error)? {
+            for (name, _) in DUP_LAYOUTS {
+                let Some(layout) = tables.layout(name) else { continue };
+                let expected = layout_record(layout);
+                if let Some(found) = txn.get(&records, name.as_bytes()).map_err(open_error)? {
+                    if found != expected {
+                        return Err(error::layout_mismatch(name, found, expected));
+                    }
+                }
+            }
+        }
         let watch =
             ReaderWatch::new(env.clone(), LONG_READER_WARN_AFTER, LONG_READER_WARN_INTERVAL);
         let timeouts = args.read_transaction_timeout.map(ReaderTimeouts::start).transpose()?;
@@ -545,19 +591,28 @@ impl TnLmdbEnv {
     /// table whose layout is an engine dup table as one (`DupLayout::options`, resolved at the
     /// file's page size), every other table as a plain one. A table the file holds in the other
     /// form (or a dup table with other options) is the engine's `TableKind`, `MDBX_INCOMPATIBLE`
-    /// as [`DatabaseError::CreateTable`].
+    /// as [`DatabaseError::CreateTable`]. A dup-sort table's layout is recorded (the
+    /// `TnLmdbRethLayout` table) as the call creates the table, never for one the file already
+    /// holds: its row, if any, is the one [`TnLmdbEnv::open`] compared, and a table without one was
+    /// written before the record, with a layout this call cannot know.
     pub fn create_tables_for<TS: TableSet>(&mut self) -> Result<(), DatabaseError> {
         let mut txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
+        let create_error = |e: tn_lmdb::Error| DatabaseError::CreateTable(error::info(&e));
+        let records = txn.create_table(LAYOUT_TABLE).map_err(create_error)?;
         let mut created = Vec::new();
         for info in TS::tables() {
             let name = info.name();
-            let create_error = |e: tn_lmdb::Error| DatabaseError::CreateTable(error::info(&e));
-            let options = self.tables.options(self.tables.layout(name)).map_err(create_error)?;
+            let layout = self.tables.layout(name);
+            let options = self.tables.options(layout).map_err(create_error)?;
+            let held = txn.open_table(name).map_err(create_error)?.is_some();
             let table = match options {
                 Some(options) => txn.create_dup_table(name, options),
                 None => txn.create_table(name),
             }
             .map_err(create_error)?;
+            if let Some(layout) = layout.filter(|_| !held) {
+                txn.put(&records, name.as_bytes(), &layout_record(layout)).map_err(create_error)?;
+            }
             created.push((name, self.tables.entry(&txn, table)?));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;

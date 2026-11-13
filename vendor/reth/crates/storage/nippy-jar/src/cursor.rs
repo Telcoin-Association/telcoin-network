@@ -1,6 +1,6 @@
 use crate::{
     compression::{Compression, Compressors, Zstd},
-    DataReader, NippyJar, NippyJarError, NippyJarHeader, RefRow,
+    value_checksum, DataReader, NippyJar, NippyJarError, NippyJarHeader, RefRow, CHECKSUM_SIZE,
 };
 use std::{ops::Range, sync::Arc};
 use zstd::bulk::Decompressor;
@@ -143,14 +143,36 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
         ))
     }
 
-    /// Takes the column index and reads the range value for the corresponding column.
-    fn read_value(
-        &mut self,
+    /// TN(TN-0120): the stored bytes of the value at `row` and `column`, compressed if the jar
+    /// compresses, **without verifying its checksum**, or `None` past the last row.
+    ///
+    /// For a caller that only compares a prefix of the value to steer a search and then reads the
+    /// value it settles on through a verified read (`row_by_number_with_cols`), so that a damaged
+    /// probe can only misdirect the search, never hand out a value. A checksummed value shorter
+    /// than its checksum is an error.
+    pub fn unverified_value(
+        &self,
+        row: usize,
         column: usize,
-        row: &mut Vec<ValueRange>,
-    ) -> Result<(), NippyJarError> {
+    ) -> Result<Option<&[u8]>, NippyJarError> {
+        if row >= self.jar.rows || column >= self.jar.columns {
+            return Ok(None)
+        }
+        let mut range = self.stored_range(row as u64, column)?;
+        if self.jar.has_checksums() {
+            range.end = range
+                .end
+                .checked_sub(CHECKSUM_SIZE)
+                .filter(|end| *end >= range.start)
+                .ok_or_else(|| self.checksum_mismatch(row as u64, column))?;
+        }
+        Ok(Some(self.reader.data(range)))
+    }
+
+    /// The data file range of the value at `row` and `column`, its checksum included.
+    fn stored_range(&self, row: u64, column: usize) -> Result<Range<usize>, NippyJarError> {
         // Find out the offset of the column value
-        let offset_pos = self.row as usize * self.jar.columns + column;
+        let offset_pos = row as usize * self.jar.columns + column;
         let value_offset = self.reader.offset(offset_pos)? as usize;
 
         // A value ends where the next one starts. After the last value, the final offset marks the
@@ -164,19 +186,50 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             return Err(NippyJarError::InconsistentState)
         }
 
-        let column_offset_range = value_offset..next_value_offset;
+        Ok(value_offset..next_value_offset)
+    }
+
+    /// The error for the value at `row` and `column` failing its checksum.
+    fn checksum_mismatch(&self, row: u64, column: usize) -> NippyJarError {
+        NippyJarError::ChecksumMismatch { path: self.jar.data_path().to_path_buf(), row, column }
+    }
+
+    /// Takes the column index and reads the range value for the corresponding column.
+    fn read_value(
+        &mut self,
+        column: usize,
+        row: &mut Vec<ValueRange>,
+    ) -> Result<(), NippyJarError> {
+        let mut column_offset_range = self.stored_range(self.row, column)?;
+
+        // TN(TN-0120): a checksummed jar's value ends with its checksum, which is verified here,
+        // before anything decompresses or decodes the value, and not handed out.
+        if self.jar.has_checksums() {
+            if column_offset_range.len() < CHECKSUM_SIZE {
+                return Err(self.checksum_mismatch(self.row, column))
+            }
+            let stored_end = column_offset_range.end - CHECKSUM_SIZE;
+            let stored = self.reader.data(column_offset_range.start..stored_end);
+            let checksum = self.reader.data(stored_end..column_offset_range.end);
+            if value_checksum(self.row, column, stored).to_le_bytes() != checksum {
+                return Err(self.checksum_mismatch(self.row, column))
+            }
+            column_offset_range.end = stored_end;
+        }
 
         if let Some(compression) = self.jar.compressor() {
             let from = self.internal_buffer.len();
             match compression {
                 Compressors::Zstd(z) if z.use_dict => {
-                    // If we are here, then for sure we have the necessary dictionaries and they're
-                    // loaded (happens during deserialization). Otherwise, there's an issue
-                    // somewhere else and we can't recover here anyway.
-                    let dictionaries = z.dictionaries.as_ref().expect("dictionaries to exist")
-                        [column]
-                        .loaded()
-                        .expect("dictionary to be loaded");
+                    // TN(TN-0134): a configuration without this column's loaded dictionary (a
+                    // version-1 configuration has no checksum, so damage can say anything) is an
+                    // error, not a panic.
+                    let dictionaries = z
+                        .dictionaries
+                        .as_ref()
+                        .and_then(|dictionaries| dictionaries.get(column))
+                        .and_then(|dictionary| dictionary.loaded())
+                        .ok_or(NippyJarError::DictionaryNotLoaded)?;
                     let mut decompressor = Decompressor::with_prepared_dictionary(dictionaries)?;
                     Zstd::decompress_with_dictionary(
                         self.reader.data(column_offset_range),

@@ -1,4 +1,4 @@
-# Carried patch: revm-inspectors JavaScript recursion limit
+# Carried patch: revm-inspectors JavaScript recursion limit and trace size cap
 
 This is the published revm-inspectors 0.34.3 source, including both upstream licenses. Its
 registry archive SHA-256 is
@@ -7,7 +7,9 @@ recorded before the patch). The upstream revision is `5c5a3fabc2ff2cf9341aa6904f
 The normalized registry `Cargo.toml`, `Cargo.toml.orig`, dependencies and features are unchanged,
 so the lockfile entry keeps its version and dependency list and only loses its registry source.
 
-## The change
+## The changes
+
+### The JavaScript recursion limit
 
 `RECURSION_LIMIT` in `src/tracing/js/mod.rs` goes from 10,000 to 128, the value upstream chose in
 #548 (a5638ca, "Lower recursion limit to protect native stacks", released in 0.44.2). A recursive
@@ -23,6 +25,36 @@ built on a thread with a 2 MiB stack, must fail with a `setup` error, and recurs
 limit must still work. With the old limit both recursion tests abort the test process (SIGABRT,
 stack overflow).
 
+### A cap on what a trace records (TN-0079, TN-0153)
+
+`TracingInspector` records a step for every opcode when steps are requested (the struct logger,
+and `vmTrace`), copying the whole stack at each step unless the stack is disabled and memory when
+it is enabled, and nothing counted steps or bytes; geth's `limit` option is ignored. Under a 50M
+gas cap a call with a 1,000-word stack looping on cheap opcodes recorded tens of GB before the
+response was built, and the node was OOM-killed. Whatever the preset, it also
+keeps a trace of every call and create, with a fresh copy of the call's input, the init code and
+the output, so a contract looping on `STATICCALL` with 16 KiB of calldata did the same through
+`callTracer` and the parity `trace_*` methods, which record no steps.
+
+The inspector now counts the bytes its trace holds (`TracingInspector::recorded_bytes`): each
+call's and create's trace node with its input or init code and its output (TN-0153), and each
+step with its stack snapshot, a fresh memory copy, return data, immediate bytes and the values
+`step_end` records (TN-0079). Logs and storage changes are not counted; gas bounds them. Past
+`TracingInspectorConfig::max_recorded_bytes` it ends the transaction as the JS interrupt does:
+the context error becomes `EVMError::Custom("trace too large: ...")`. A step halts the
+interpreter with `FatalExternalError`; a call or create that would pass the cap is not made, and
+its hook returns a `FatalExternalError` outcome, which revm never hands to the calling frame
+because it takes the context error first. Every preset sets the cap to
+`DEFAULT_MAX_RECORDED_BYTES` (160 MiB, reth's default `--rpc.max-response-size`). Steps, and
+calls' input and output for the tracers that return them (in hex), serialize to more bytes than
+the trace holds for them, so such a trace could not be returned anyway; the struct logger and
+`prestateTracer`, which return no call input or output, refuse a transaction whose calls copy
+more than the cap. `merge` keeps the tighter of two caps, and `None` disables it. The counter is an
+`Arc<AtomicUsize>` kept across `fuse` and shared between inspectors through
+`share_recorded_bytes`, so reth bounds a request, not a transaction (see TN-0079 in
+`vendor/reth/CHANGES.md` for the call sites). Tests are in `src/tracing/mod.rs` and
+`src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
+
 The crate's `.gitignore` is removed, because it would hide the standalone `Cargo.lock` from git.
 `upstream.diff` is the full difference from the registry archive (without
 `.cargo_vcs_info.json` and `.cargo-ok`); regenerate it with
@@ -33,13 +65,17 @@ directory holding the extracted archive as `upstream` and this directory as `pat
 ## Scope
 
 revm-inspectors is used only for RPC tracing (`debug_*`, `trace_*`, `eth_simulateV1`'s
-transfer tracing). Block execution never runs an inspector from it. The limit applies only to
-JavaScript tracers, which TN builds only with the opt-in `js-tracer` feature
-(`crates/tn-reth/js-tracer.md`). The default build compiles the patched crate without Boa, and
-its code there is identical to the registry's.
+transfer tracing). Block execution never runs an inspector from it. The recursion limit applies
+only to JavaScript tracers, which TN builds only with the opt-in `js-tracer` feature
+(`crates/tn-reth/js-tracer.md`). The trace cap applies to every build: the default build compiles
+the patched crate without Boa, and its code there differs from the registry's by the cap alone
+(`src/tracing/{mod,config}.rs`).
 
-The nested reth workspace has no `[patch]` of its own, so `vendor/reth/tn/cargo.sh` passes this
-one with `--config`, and reth's tests run against the code TN ships.
+The nested reth workspace carries the same patch in `vendor/reth/.cargo/config.toml` (TN-0080),
+which every cargo invocation there reads, the one cargo-nextest runs included, so reth's tests run
+against the code TN ships. Until TN-0080 `tn/cargo.sh` passed the patch with `--config`, which
+cargo does not forward to external subcommands, and the `test-vendor-reth` lane tested the
+registry crate.
 
 ## Advisories
 
@@ -64,10 +100,14 @@ include) if it is not in the local registry, and run
 
 ## Retirement
 
-Remove this patch when TN's reth moves to a revm-inspectors release that contains #548 (0.44.2
-or later). Check that release's `RECURSION_LIMIT`, then delete:
+The recursion limit retires when TN's reth moves to a revm-inspectors release that contains #548
+(0.44.2 or later); check that release's `RECURSION_LIMIT`. The trace size cap has no upstream
+equivalent, so the patch directory stays: on an upgrade, take the new registry source, re-apply
+the cap (the `TN(TN-0079)` and `TN(TN-0153)` hunks of `upstream.diff`), and update the checksum,
+revision and `upstream.diff` above. Should upstream grow a cap of its own, drop TN's and, if nothing else is
+carried, delete:
 - this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;
-- the `--config` line in `vendor/reth/tn/cargo.sh`;
+- the `[patch.crates-io]` entry in `vendor/reth/.cargo/config.toml`;
 - the `revm-inspectors-patch` job in `.github/workflows/pr.yaml` and its entries in the
   `CI Success` gate (`etc/transport-patches/test_ci_gate.py` tests the gate);
 - its step in `.github/workflows/main-compiles.yaml`, and the patch-crate count in

@@ -226,6 +226,24 @@ async fn replay_checkpoint_does_not_promote_to_an_unreplayed_pack_tip() -> eyre:
     Ok(())
 }
 
+#[tokio::test]
+async fn replay_checkpoint_refuses_missing_output_of_another_epoch() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, _, _) = imported_manager(&temp, 2, 2).await?;
+    // Execution stopped inside epoch 0, but the node enters epoch 1: the missing epoch-0 output
+    // must be refused, not replayed under the wrong committee and not skipped.
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let err = manager
+        .replay_missed_consensus(fixture.committee().advance_epoch_for_test(1), &to_engine)
+        .await
+        .err()
+        .expect("missing output of epoch 0 must be refused on entry to epoch 1");
+    assert!(err.to_string().contains("Crossed epoch boundary"), "unexpected error: {err}");
+    assert!(engine_rx.try_recv().is_err(), "nothing may reach the engine");
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
 /// A fresh observer that saved outputs 1 to 3 and executed none of them. Output 1 is built on
 /// `B256::ZERO`, which is not the default header's digest in either build flavor, like the anchor
 /// adiri's block 1 was built on. Output 2 is built on output 1, or on `B256::ZERO` as well when
@@ -294,6 +312,31 @@ async fn replay_rejects_block2_not_built_on_block1_when_nothing_executed() -> ey
     );
     assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), outputs[0].consensus_header_hash());
     assert!(engine_rx.try_recv().is_err(), "nothing past the gap may reach the engine");
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}
+
+/// The block-1 anchor exemption carries a fresh node's replay through its first epoch close: the
+/// replay stops at the boundary output and hands its header to the close, where
+/// `write_epoch_record` compares a stored record with the closing block this node executed.
+#[tokio::test]
+async fn replay_anchored_on_block1_stops_at_the_epoch_close() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, outputs) = fresh_manager_with_saved_outputs(&temp, false).await?;
+    // output 3 commits at the boundary, so epoch 0 closes there
+    manager.epoch_boundary = 3;
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let mut replay = manager.replay_missed_consensus(fixture.committee(), &to_engine).await?;
+    assert_eq!(replay.take_epoch_close_hash(), Some(outputs[2].consensus_header_hash()));
+    for expected in &outputs {
+        assert_eq!(engine_rx.try_recv()?.consensus_header_hash(), expected.consensus_header_hash());
+    }
+    assert!(engine_rx.try_recv().is_err());
+    assert_eq!(
+        manager.last_consensus_header.as_ref().map(|header| header.digest()),
+        Some(outputs[2].consensus_header_hash()),
+        "the close reads the boundary header the replay stashed"
+    );
     manager.consensus_chain.clone().close().await;
     Ok(())
 }

@@ -22,8 +22,8 @@ pub(crate) const SHORT_VERSION: &str = {
 /// - The long SHA of the latest commit.
 /// - The build datetime
 /// - The build features (this crate's: a feature set on tn-reth alone does not show here)
-/// - The engine reth's database runs on, read from tn-reth's build (`MDBX`, or `tn-lmdb` with its
-///   `tn-lmdb` feature, however the feature was spelled on the command line)
+/// - The engine reth's database runs on, read from tn-reth's build (`tn-lmdb`, or `MDBX` with its
+///   `mdbx` feature, however the feature was spelled on the command line)
 ///
 /// # Example:
 ///

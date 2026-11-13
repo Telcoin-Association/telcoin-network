@@ -1,0 +1,5 @@
+# The fixtures are exact bytes: never convert line endings or diff them as text.
+* -text -diff
+*.txt diff
+*.json diff
+.gitattributes diff

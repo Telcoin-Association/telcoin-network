@@ -12,7 +12,10 @@
 use std::fs;
 
 use super::{
-    crash::{assert_gets, matrix, matrix_of, run_case, slack, weak_matrix, Base, Case, Mode},
+    crash::{
+        assert_gets, matrix, matrix_of, run_case, slack, weak_matrix, with_gap_fill, Base, Case,
+        Mode,
+    },
     damage::tree,
     *,
 };
@@ -208,6 +211,19 @@ fn runs_crash_growing(txn: &mut RwTxn, state: &mut State) {
 #[test]
 fn every_crash_point_recovers_a_workload_of_overflow_runs() {
     matrix(&runs_base(4096), 2);
+}
+
+/// The run workload's matrix with `EnvOptions::gap_fill` at its largest: the gaps between
+/// the crash commit's runs and pages, rewritten before the data sync, recover as without it.
+#[test]
+fn every_crash_point_recovers_a_workload_of_overflow_runs_with_gap_fill() {
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix(&runs_base(4096), 2));
+}
+
+/// The run workload's matrix with `GapFill::Auto`.
+#[test]
+fn every_crash_point_recovers_a_workload_of_overflow_runs_with_auto_gap_fill() {
+    with_gap_fill(GapFill::Auto, || matrix(&runs_base(4096), 2));
 }
 
 /// The run workload's matrix at two page sizes, with many random power losses.

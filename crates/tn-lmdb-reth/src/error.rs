@@ -102,6 +102,7 @@ pub(crate) fn info(error: &tn_lmdb::Error) -> DatabaseErrorInfo {
         | E::InvalidPageSize(_)
         | E::InvalidMaxGrowth(_)
         | E::InvalidMapReserve(_)
+        | E::InvalidGapFill(_)
         | E::InvalidDupOptions(_) => Mdbx::INVALID_PARAMETER.info(),
         E::Failed(_) => Mdbx::PANIC.with_message(error.to_string()),
         E::Full(_) => Mdbx::MAP_FULL.with_message(error.to_string()),
@@ -180,6 +181,26 @@ pub(crate) fn form_mismatch(
          another tn-lmdb-reth layout",
         form(found),
         form(expected)
+    );
+    DatabaseError::Open(Mdbx::INCOMPATIBLE.with_message(message))
+}
+
+/// The error for a dup-sort table whose layout record in the file (`crate::env::LAYOUT_TABLE`:
+/// key width, subkey width, form) differs from this build's: `MDBX_INCOMPATIBLE`, as
+/// [`DatabaseError::Open`], with a message naming the table and both layouts.
+pub(crate) fn layout_mismatch(table: &str, found: &[u8], expected: [u8; 3]) -> DatabaseError {
+    let layout = |record: &[u8]| match record {
+        [key, subkey, form] => format!(
+            "key {key}, subkey {subkey}, {}",
+            if *form == 1 { "an engine dup table" } else { "composite keys" }
+        ),
+        other => format!("the unreadable record {other:?}"),
+    };
+    let message = format!(
+        "table {table} was written with a layout of {}, this build's is {}; the file was written \
+         by another tn-lmdb-reth layout",
+        layout(found),
+        layout(&expected)
     );
     DatabaseError::Open(Mdbx::INCOMPATIBLE.with_message(message))
 }

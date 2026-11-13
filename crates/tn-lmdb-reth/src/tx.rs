@@ -56,9 +56,61 @@ pub(crate) fn compressed<'b, V: Compress>(value: &'b V, buf: &'b mut Vec<u8>) ->
     buf
 }
 
-/// The value of table `T` stored as `bytes`, if any.
-fn decompress<T: Table>(bytes: Option<&[u8]>) -> Result<Option<T::Value>, DatabaseError> {
-    bytes.map(T::Value::decompress).transpose()
+/// `f`, a decode of a row of table `T` stored at `key` (its key or its value), with a panic in it
+/// caught and made [`DatabaseError::Decode`]: reth's `Decompress` and `Decode` (its `Compact`
+/// forms) expect their input well formed and panic on a damaged one (a truncated `Bytecode`, say),
+/// where this crate reports it as the read's error (the crate docs' differences from MDBX). Costs
+/// nothing on the path that does not panic.
+///
+/// The process's panic hook runs before the catch: the default hook prints the panic's message and
+/// where it panicked (in reth's decoder) to stderr, and a backtrace under `RUST_BACKTRACE`, at
+/// every read of the row, naming neither the table nor the key. The catch then logs one error that
+/// names both ([`decode_panicked`]). This crate installs no hook.
+pub(crate) fn guarded<T: Table, V>(
+    key: &[u8],
+    f: impl FnOnce() -> Result<V, DatabaseError>,
+) -> Result<V, DatabaseError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|panic| Err(decode_panicked(T::NAME, key, &*panic)))
+}
+
+/// The error of a decode of a row of `table` stored at `key` that panicked with `panic`
+/// ([`guarded`]): an `error` log naming the table, the key in hex and the panic's message, then
+/// [`DatabaseError::Decode`].
+#[cold]
+#[inline(never)]
+fn decode_panicked(table: &str, key: &[u8], panic: &(dyn std::any::Any + Send)) -> DatabaseError {
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(a panic without a message)");
+    tracing::error!(
+        table,
+        key = %Hex(key),
+        panic = message,
+        "a stored row of the reth database does not decode (its decoder panicked): the read fails \
+         with DatabaseError::Decode; the row is damaged"
+    );
+    DatabaseError::Decode
+}
+
+/// Bytes as lower-case hex, for a log line.
+struct Hex<'a>(&'a [u8]);
+
+impl std::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// The value of table `T` stored at `key` as `bytes`, if any; a damaged one is
+/// [`DatabaseError::Decode`] ([`guarded`]).
+fn decompress<T: Table>(
+    key: &[u8],
+    bytes: Option<&[u8]>,
+) -> Result<Option<T::Value>, DatabaseError> {
+    guarded::<T, _>(key, || bytes.map(T::Value::decompress).transpose())
 }
 
 /// The value of `key` in table `T` (on a dup-sort table, the key's first, as MDBX's `get`
@@ -69,7 +121,7 @@ fn get_value<T: Table>(
     key: &[u8],
 ) -> Result<Option<T::Value>, DatabaseError> {
     let Some(dup) = dup else {
-        return decompress::<T>(txn.reads().get(table, key).map_err(error::read)?);
+        return decompress::<T>(key, txn.reads().get(table, key).map_err(error::read)?);
     };
     // A key of another width is no row's: a miss with no seek (a nested table's engine would
     // refuse it).
@@ -84,7 +136,7 @@ fn get_value<T: Table>(
                 else {
                     return Ok(None);
                 };
-                decompress::<T>(dup.joined(stored, tail, &mut value))
+                decompress::<T>(stored, dup.joined(stored, tail, &mut value))
             })
             .map_err(error::read)?;
     }
@@ -97,7 +149,7 @@ fn get_value<T: Table>(
     else {
         return Ok(None);
     };
-    decompress::<T>(dup.joined(stored, tail, &mut value))
+    decompress::<T>(stored, dup.joined(stored, tail, &mut value))
 }
 
 /// A transaction [`get_value`] reads through: its [`ReadTxn`] calls, and the lookup of an outer
@@ -248,11 +300,10 @@ impl DbTx for TnLmdbTx {
         Ok(stat.entries as usize)
     }
 
-    /// Does nothing: tn-lmdb has no read timeout to disable. A long read transaction only holds
-    /// back page reuse, so the file grows until it ends; a commit made while it has held a
-    /// superseded snapshot for over a minute logs a warning instead (at most once a minute).
     /// Takes the transaction out of the read transaction timeout, as on MDBX; one already timed
-    /// out stays so.
+    /// out stays so. A long read transaction holds back page reuse, so the file grows until it
+    /// ends; a commit made while it has held a superseded snapshot for over a minute logs a
+    /// warning (at most once a minute).
     fn disable_long_read_transaction_safety(&mut self) {
         if let Some(timeouts) = &self.timeouts {
             timeouts.opt_out(&self.reader);

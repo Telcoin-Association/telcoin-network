@@ -7,14 +7,22 @@ use std::{
     fs,
     os::unix::fs::FileExt as _,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use tempfile::TempDir;
 
 use crate::{
-    env::{Env, EnvOptions, SyncMode},
+    catalog::TableRecord,
+    env::{Env, EnvOptions, GapFill, SyncMode, MAX_GAP_FILL},
     meta::{Meta, Tag, MAX_WEAK_RUN, META_LEN},
-    CheckReport, ReadTxn, RwTxn, Table,
+    overflow::{run_pages, run_txn},
+    page::{self, Val},
+    tree::{
+        test_harness::{walk_outer_tree, walk_packing_tree, walk_tree},
+        TreeRoot,
+    },
+    CheckReport, ReadTxn, RoTxn, RwTxn, Table,
 };
 
 mod append;
@@ -154,25 +162,125 @@ fn state_of<'n>(txn: &impl ReadTxn, names: impl IntoIterator<Item = &'n str>) ->
 }
 
 /// The newest committed state of `env`, every table of it (the check names them), once
-/// `Env::check` passes: a plain table's rows by its cursors ([`rows`]), a dup table's (which has
-/// no cursor) by a walk of its trees that checks the totals (`dup_rows_for_test`), with its
-/// figures in the check those of its `table_stat`.
+/// `Env::check` passes: a plain table's rows by its cursors ([`rows`]), a dup table's by a walk
+/// of its trees that checks the totals (`dup_rows_for_test`), which its dup cursor must agree
+/// with ([`dup_cursor_rows`]), with its figures in the check those of its `table_stat`.
 fn newest_state(env: &Env) -> State {
     let report = check(env);
-    let ro = env.begin_ro().expect("ro");
+    let ro = Arc::new(env.begin_ro().expect("ro"));
     assert_eq!(ro.txn_id(), report.txn_id);
     let mut state = State::new();
     for name in report.tables.keys() {
         let table = ro.open_table(name).expect("open table").expect("the check names it");
-        let rows = if ro.table_stat(&table).expect("stat").dup.is_some() {
-            dup::assert_dup_figures(&report, &ro, name);
-            ro.dup_rows_for_test(&table).into_iter().collect()
+        let rows = if let Some(dup) = ro.table_stat(&table).expect("stat").dup {
+            dup::assert_dup_figures(&report, &*ro, name);
+            let walked = ro.dup_rows_for_test(&table);
+            dup_cursor_rows(&ro, &table, &walked, usize::from(dup.key_len));
+            walked.into_iter().collect()
         } else {
-            rows(&ro, &table)
+            rows(&*ro, &table)
         };
         state.insert(name.clone(), rows);
     }
     state
+}
+
+/// Dup table `table`'s rows by its dup cursor (`DupRoCursor`: `first`, then `next` to the end,
+/// which crosses outer keys) are `walked`'s, the walk of its trees, and `seek_dup` of every
+/// seventh row's outer key (`key_len` bytes) and subkey lands on that row: the dup cursors read
+/// the files the reopens recover.
+fn dup_cursor_rows(ro: &Arc<RoTxn>, table: &Table, walked: &[(Vec<u8>, Vec<u8>)], key_len: usize) {
+    let mut cursor = ro.dup_cursor_owned(table).expect("dup cursor");
+    let mut scanned = Vec::new();
+    let mut row = cursor.first().expect("first").map(|(k, v)| (k.to_vec(), v.to_vec()));
+    while let Some(kv) = row {
+        scanned.push(kv);
+        row = cursor.next().expect("next").map(|(k, v)| (k.to_vec(), v.to_vec()));
+    }
+    assert!(
+        scanned == walked,
+        "table {}: the dup cursor's rows differ from the walk's",
+        table.name()
+    );
+    for (k, v) in walked.iter().step_by(7) {
+        let got = cursor.seek_dup(&k[..key_len], &k[key_len..]).expect("seek_dup");
+        assert_eq!(got, Some((&k[..], &v[..])), "table {}: seek_dup", table.name());
+    }
+}
+
+/// The pages the newest state of `env` names that were written after txn `since`: the catalog's,
+/// every table's (a dup table's outer tree's and its nested trees'), the free tree's, each
+/// tree's pages by the test harness's walk and the overflow runs its leaves name, kept when the
+/// page's or the run's header txn is past `since`. With `since` the last sync's txn these are the
+/// pages a trusted weak head needs on a reopen: what open's check of it reads
+/// (`check::check_since`), and what a loss must keep for the head to be opened.
+fn pages_since(env: &Env, since: u64) -> Vec<u32> {
+    use crate::tree::PageRead as _;
+    let snapshot = env.inner().current();
+    let store = &*snapshot;
+    let meta = snapshot.meta;
+    let catalog = walk_tree(store, &meta.catalog);
+    let mut walks = vec![walk_tree(store, &meta.free)];
+    for (_, record) in &catalog.entries {
+        let record = TableRecord::decode(record).expect("a table record");
+        let Some(dup) = record.dup else {
+            walks.push(walk_tree(store, &record.root));
+            continue;
+        };
+        let outer = if dup.packed_max == 0 {
+            walk_outer_tree(store, &record.root)
+        } else {
+            walk_packing_tree(store, &record.root)
+        };
+        for (_, cell) in outer.entries.iter().filter(|(key, _)| !outer.packed.contains(key)) {
+            let cell = cell.as_slice().try_into().expect("a nested cell");
+            walks.push(walk_tree(store, &TreeRoot::decode(cell, 0).expect("a nested root")));
+        }
+        walks.push(outer);
+    }
+    walks.push(catalog);
+    let mut pages = Vec::new();
+    for walk in &walks {
+        let written_since = |&p: &u32| page::txn(store.page_any(p).expect("a page")) > since;
+        pages.extend(walk.pages.iter().filter(|p| written_since(p)));
+        for &leaf in &walk.leaves {
+            let leaf = store.page_any(leaf).expect("a leaf");
+            for i in 0..page::nkeys(leaf) {
+                let Val::Overflow(ovf) = page::leaf_entry(leaf, i).expect("an entry").1 else {
+                    continue;
+                };
+                if run_txn(store.page_any(ovf.pgno).expect("a run")) > since {
+                    let n = run_pages(ovf.len as usize, snapshot.geometry.page_size()) as u32;
+                    pages.extend(ovf.pgno..ovf.pgno + n);
+                }
+            }
+        }
+    }
+    pages
+}
+
+/// Whether a volume loss kept every page the trusted weak head at txn `head` needs: each of
+/// `pages` ([`pages_since`] at the head, before the loss) reads the same bytes in `before` (the
+/// file's bytes at the head) and in `after` (the bytes the loss left), and `after` holds the
+/// head's `page_count` pages (of `page_size` bytes; the head's record is read from `before`'s
+/// slots). Open's check of the head reads exactly those pages, with the pages written by the last
+/// sync, which a loss never changes, so it must pass and open must keep the head. The converse is
+/// not asserted: a lost page may still pass (a sector torn inside a leaf's free gap, which its
+/// CRC does not cover), so a fallen-back open after a lost page is left to the engine's check.
+fn head_survived(before: &[u8], after: &[u8], page_size: u32, head: u64, pages: &[u32]) -> bool {
+    let size = page_size as usize;
+    let page_count = (0..2)
+        .find_map(|slot| {
+            let record = before[slot * size..][..META_LEN].try_into().expect("a record");
+            Meta::decode(record).ok().map(|(meta, _)| meta).filter(|meta| meta.txn == head)
+        })
+        .expect("the head's record")
+        .page_count;
+    after.len() >= page_count as usize * size
+        && pages.iter().all(|&p| {
+            let at = p as usize * size..(p as usize + 1) * size;
+            before[at.clone()] == after[at]
+        })
 }
 
 /// Store `value` under `key` in table `name` (created if missing), in the transaction and in

@@ -8,11 +8,11 @@ A Telcoin Network node serves JSON-RPC over three transports, and each transport
 | --- | --- | --- | --- |
 | HTTP | `--http` | `--http.addr` (default `127.0.0.1`), `--http.port` (default `8545`) | `--http.api` |
 | WebSocket | `--ws` | `--ws.addr` (default `127.0.0.1`), `--ws.port` (default `8546`) | `--ws.api` |
-| IPC | on unless `--ipcdisable` | `--ipcpath` (default `/tmp/tn.ipc`) | always the default set; there is no `--ipc.api` |
+| IPC | on unless `--ipcdisable` | `--ipcpath` (default `/tmp/tn.ipc`, host-global; `--instance N` appends `-N`, workers above 0 append `-wN`; a node refuses to start if another process serves the socket) | always the default set; there is no `--ipc.api` |
 
 Subscriptions (`eth_subscribe`) need a WebSocket or IPC connection.
 
-A node that runs more than one worker starts one RPC server per worker. Worker 0 uses the ports and IPC path above; every other worker binds its own derived ports and IPC path, which the node logs at startup (`worker rpc endpoints resolved`). Every worker's server serves the same namespace selection.
+A node that runs more than one worker starts one RPC server per worker. Worker 0 uses the ports and IPC path above; every other worker binds its own derived ports and IPC path, which the node logs at startup (`worker rpc endpoints resolved`). Every worker's server serves the same namespace selection and applies the same CORS and origin lists as worker 0. When HTTP and WebSocket share a port, worker 0 serves both on one server with one list (`--ws.origins`, or `--http.corsdomain` when only that is set; two different lists are refused at startup), and every other worker applies that list to both its HTTP and its WebSocket server.
 
 ## Choosing namespaces
 
@@ -55,13 +55,15 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. A `debug_trace*` request keeps its slot until its trace ends, even after a timeout or a disconnect |
+| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. Values below 2 are refused: `trace_filter` takes two slots at once. A request keeps its slot until its trace ends, even after a timeout or a disconnect |
 | `--rpc.max-trace-filter-blocks` | `100` | Largest block range one `trace_filter` request may cover |
 | `--rpc.max-blocks-per-filter` | `100000` (`0` = no limit) | Largest block range for `eth_getLogs` and log filters |
 | `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return |
 | `--rpc.gascap` | `50000000` | Gas limit for `eth_call`, `eth_estimateGas` and the debug and trace call methods |
 | `--rpc.max-response-size` | `160` (MB) | Largest response the server sends |
 | `--rpc.max-connections` | `500` | Concurrent RPC connections |
+| `--rpc.max-batch-requests` | `100` | Most calls in one JSON-RPC batch request, on HTTP, WebSocket and IPC; a larger batch is refused whole |
+| `--rpc.max-active-filters` | `1000` | Most installed filters (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`) across all clients; a filter is removed when uninstalled or left unpolled for five minutes |
 | `--http.corsdomain` | none | Origins allowed to call the HTTP server from a browser |
 | `--ws.origins` | unset: any origin | Origins allowed to open a WebSocket connection. Unset, the node checks no origin, so any web page can connect. A request without an `Origin` header (a client that is not a browser) always passes |
 | `--rpc.jwtsecret` | none | Hex-encoded secret; when set, HTTP and WebSocket requests need a JWT bearer token |

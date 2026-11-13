@@ -113,15 +113,14 @@ fi
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and the four unit-test lanes. These live in etc/ci-lanes.sh because
-# .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
-# `merge_group` against main + this PR. One definition, so the queue cannot end up
+# fmt, clippy and the three test lanes CI runs (ci-lanes.sh's `test-mdbx` is run by hand). These
+# live in etc/ci-lanes.sh because .github/workflows/pr.yaml runs the very same file, on
+# `pull_request` and again on `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
 ./etc/ci-lanes.sh fmt
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
-./etc/ci-lanes.sh test-tn-lmdb
 ./etc/ci-lanes.sh test-vendor-reth
 
 # The engine's and the adapter's heavy test variants (`#[ignore = "heavy: run with --release"]`:
@@ -131,6 +130,14 @@ fi
 # benchmark and the stamp probe guard nothing and are skipped, as the crates' CLAUDE.md say.
 cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe
 cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --skip tn_lmdb_vs_mdbx
+
+# The vendored reth's own invariants: every TN change to the copy is named by a ledger entry,
+# the copy matches the upstream pin plus the ledger, and the manifests stay inside the carried
+# crate set. They need the upstream clone (~/.cache/tn-vendor/reth, cloned on first use), which
+# CI does not have; the attested run makes the claim the ledger otherwise only asserts.
+python3 -I vendor/reth/tn/vendor.py status > /dev/null
+python3 -I vendor/reth/tn/vendor.py ledger
+python3 -I vendor/reth/tn/vendor.py check
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
@@ -152,15 +159,20 @@ cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
-# The reth database migration suite (`reth_db_migration`): a committee starts on the default
-# (MDBX) build, and each validator in turn restarts on the tn-lmdb build in place, which must
-# migrate its reth database and follow the chain. The run above selects the test but it skips
-# (passing, with its message hidden by nextest's capture) without the TN_E2E_TN_LMDB_BIN marker
-# and the MDBX previous binary, which only its make target sets: the target builds the tn-lmdb
-# e2e binary (`tn-lmdb-e2e/` under the same target root) and passes both, so the lane has one
-# definition. The restart, epoch and sigkill suites on the tn-lmdb binary (`make
-# test-e2e-tn-lmdb`) run in the nightly durable-e2e workflow, not here.
+# The reth database migration and rebuild suites (`reth_db_migration`, `resync`): a committee
+# starts on the MDBX build, and a validator moves onto the default (tn-lmdb) build in place, which
+# migrates its reth database and keeps storage layout v1; `resync` then rebuilds it from genesis in
+# layout v2 and compares it with a validator still on MDBX. Both skip without an MDBX previous
+# binary (TN_BIN_PATH_PREV, with the TN_E2E_TN_LMDB_BIN marker), which the run above does not set,
+# so they run here through their make targets: those build the MDBX e2e binary (`mdbx-e2e/` under
+# the same target root) and pass both, so each lane has one definition.
+# The rolling-upgrade suite (`make test-upgrade`) stays manual. Its previous binary has to be the
+# release the network runs, and since #1788 changed node records that release (v0.16.0-adiri) and
+# this tree do not peer: an upgraded validator migrates both databases and then cannot resolve its
+# peers (crates/tn-reth/README.md, "Upgrade every node together"). It joins this script once a
+# release that peers with this tree is the previous binary.
 make test-e2e-reth-migration
+make test-e2e-resync
 
 echo "all checks passed - submitting attestation on-chain..."
 

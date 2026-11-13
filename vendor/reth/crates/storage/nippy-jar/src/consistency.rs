@@ -2,7 +2,7 @@ use crate::{writer::OFFSET_SIZE_BYTES, NippyJar, NippyJarError, NippyJarHeader};
 use std::{
     cmp::Ordering,
     fs::{File, OpenOptions},
-    io::{BufWriter, Seek, SeekFrom},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -51,6 +51,15 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
 
     fn handle_consistency(&mut self, mode: ConsistencyFailStrategy) -> Result<(), NippyJarError> {
         self.load_files(mode)?;
+
+        // TN(TN-0131): a jar without committed rows holds nothing its configuration counts, so
+        // whatever its files hold is uncommitted: restore the files a new jar starts with. A
+        // crash after a rotation wrote the next jar's configuration (rows 0) can leave its
+        // offsets file empty or torn, which the reader below cannot open.
+        if self.jar.rows == 0 && mode.should_heal() {
+            return self.reset_files()
+        }
+
         let mut reader = self.jar.open_data_reader()?;
 
         // When an offset size is smaller than the initial (8), we are dealing with immutable
@@ -84,6 +93,14 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
                 reader = self.jar.open_data_reader()?;
             }
             Ordering::Greater => {
+                // TN(TN-0130): a prune commits the configuration before it cuts the files, so
+                // in a checksummed jar a short offsets file is damage. A plain jar keeps the heal
+                // below: it may hold an interrupted prune of an older build, which cut the files
+                // first.
+                if self.jar.has_checksums() {
+                    return Err(self.committed_rows_missing("offsets"))
+                }
+
                 // Happened during a pruning job
                 // `num rows = (file size - 1 - size of one offset) / num columns`
                 self.jar.rows = ((actual_offsets_file_size.
@@ -117,6 +134,12 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
                 self.data_file().get_mut().set_len(last_offset)?;
             }
             Ordering::Greater => {
+                // TN(TN-0130): as above, a data file shorter than the committed rows' offsets is
+                // damage in a checksummed jar.
+                if self.jar.has_checksums() {
+                    return Err(self.committed_rows_missing("data"))
+                }
+
                 // Happened during a pruning job, so we need to reverse iterate offsets until we
                 // find the matching one.
                 for index in 0..reader.offsets_count()? {
@@ -149,6 +172,46 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
         self.data_file().seek(SeekFrom::End(0))?;
 
         Ok(())
+    }
+
+    /// TN(TN-0131): sets the offsets file to a new jar's (the offset size, then a final offset
+    /// of 0) and empties the data file, unless they are that already.
+    fn reset_files(&mut self) -> Result<(), NippyJarError> {
+        let mut empty = [0u8; 1 + OFFSET_SIZE_BYTES as usize];
+        empty[0] = OFFSET_SIZE_BYTES;
+
+        let offsets = self.offsets_file().get_mut();
+        let mut current = Vec::with_capacity(empty.len());
+        offsets.seek(SeekFrom::Start(0))?;
+        Read::by_ref(offsets).take(empty.len() as u64 + 1).read_to_end(&mut current)?;
+        if current != empty {
+            offsets.set_len(0)?;
+            offsets.seek(SeekFrom::Start(0))?;
+            offsets.write_all(&empty)?;
+            reth_fs_util::fsync_file(offsets)?;
+        }
+        let data = self.data_file().get_mut();
+        if data.metadata()?.len() != 0 {
+            data.set_len(0)?;
+            reth_fs_util::fsync_file(data)?;
+        }
+
+        self.offsets_file().seek(SeekFrom::End(0))?;
+        self.data_file().seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+
+    /// TN(TN-0130): the error for a checksummed jar whose `file` is shorter than its committed
+    /// rows.
+    fn committed_rows_missing(&self, file: &'static str) -> NippyJarError {
+        tracing::error!(
+            target: "nippy-jar",
+            path = %self.jar.data_path().display(),
+            rows = self.jar.rows,
+            file,
+            "Static file is shorter than its committed rows"
+        );
+        NippyJarError::CommittedRowsMissing { path: self.jar.data_path().to_path_buf(), file }
     }
 
     /// Loads data and offsets files.

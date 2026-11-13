@@ -7430,6 +7430,7 @@ dependencies = [
 name = "reth-fs-util"
 version = "1.11.3"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7521,6 +7522,8 @@ version = "1.11.3"
 dependencies = [
  "anyhow",
  "bincode",
+ "crc",
+ "crc32fast",
  "derive_more",
  "lz4_flex",
  "memmap2",
@@ -7969,8 +7972,10 @@ name = "reth-static-file-types"
 version = "1.11.3"
 dependencies = [
  "alloy-primitives",
+ "crc32fast",
  "derive_more",
  "fixed-map",
+ "reth-fs-util",
  "reth-stages-types",
  "serde",
  "strum",
@@ -9893,6 +9898,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
@@ -10124,6 +10130,7 @@ dependencies = [
  "dirs-next",
  "enr",
  "eyre",
+ "fixed-cache",
  "futures",
  "jsonrpsee",
  "metrics",
@@ -10174,6 +10181,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tn-config",

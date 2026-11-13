@@ -6,8 +6,8 @@
 
 * `fromBlock`: `QUANTITY|TAG` - (optional, default: `"latest"`) Hexadecimal block number, or `"latest"` for the last mined block, `"safe"` for the latest safe block, `"finalized"` for the latest finalized block, or `"earliest"` for not yet mined transactions.
 * `toBlock`: `QUANTITY|TAG` - (optional, default: `"latest"`) Hexadecimal block number, or `"latest"` for the last mined block, `"safe"` for the latest safe block, `"finalized"` for the latest finalized block, or `"earliest"` for not yet mined transactions.
-* `address`: `DATA|Array`, 20 Bytes - (optional) Contract address or a list of addresses from which logs should originate.
-* `topics`: `Array of DATA`, - (optional) Array of 32 Bytes `DATA` topics. Topics are order-dependent. Each topic can also be an array of DATA with "or" options.
+* `address`: `DATA|Array`, 20 Bytes - (optional) Contract address or a list of at most 1,000 addresses from which logs should originate.
+* `topics`: `Array of DATA`, - (optional) Array of 32 Bytes `DATA` topics. Topics are order-dependent. Each topic can also be an array of DATA with "or" options, at most 1,000 per position.
 * `blockhash`: `DATA`, 32 Bytes - (optional) Per EIP-234, `blockHash` restricts the logs returned to the single block with the 32-byte hash `blockHash`. Using `blockHash` is equivalent to `fromBlock` = `toBlock` = the block number with hash `blockHash`. If `blockHash` is present in the filter criteria, then neither `fromBlock` nor `toBlock` are allowed.
 
 #### Returns

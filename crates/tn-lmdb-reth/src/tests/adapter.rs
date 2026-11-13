@@ -1,7 +1,7 @@
 //! The adapter's own tests: MDBX's error codes, the metrics, a blocked second writer, cursors
 //! sharing a write transaction (run on MDBX too, which is the oracle), the long-read tests of
-//! `reth-db`'s `implementation/mdbx/tx.rs` (tn-lmdb has no read timeout), and the long-reader
-//! warning that replaces it.
+//! `reth-db`'s `implementation/mdbx/tx.rs` (the read transaction timeout and its opt-out), and the
+//! long-reader warning.
 
 use super::{dup::error_name, mdbx_port::create_test_db, Form};
 use crate::{
@@ -170,10 +170,11 @@ fn a_long_reader_warning_is_due_first_then_once_per_interval() {
     assert!(!warning_due(secs(65), secs(5), minute), "a time before the last warning");
 }
 
-/// Keeps the text of each `WARN` event emitted on the thread it is the default subscriber of.
-struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+/// Keeps the text of each event at its level emitted on the thread it is the default subscriber
+/// of.
+struct LogCapture(tracing::Level, Arc<parking_lot::Mutex<Vec<String>>>);
 
-impl tracing::Subscriber for WarnCapture {
+impl tracing::Subscriber for LogCapture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -183,12 +184,12 @@ impl tracing::Subscriber for WarnCapture {
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        if *event.metadata().level() == tracing::Level::WARN {
+        if *event.metadata().level() == self.0 {
             let mut text = String::new();
             event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
                 text += &format!("{}={value:?} ", field.name());
             });
-            self.0.lock().push(text);
+            self.1.lock().push(text);
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
@@ -206,7 +207,8 @@ fn a_long_reader_warns_after_a_commit_at_most_once_per_interval() {
     };
     let warnings = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let count = || warnings.lock().len();
-    tracing::subscriber::with_default(WarnCapture(Arc::clone(&warnings)), || {
+    let capture = LogCapture(tracing::Level::WARN, Arc::clone(&warnings));
+    tracing::subscriber::with_default(capture, || {
         db.set_long_reader_limits(AGE, Duration::from_secs(3600));
         let reader = db.tx().unwrap();
         put(&db, 1);
@@ -271,6 +273,7 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         (E::InvalidPageSize(3), Error::DecodeError),
         (E::InvalidMaxGrowth(4096), Error::DecodeError),
         (E::InvalidMapReserve(u64::MAX), Error::DecodeError),
+        (E::InvalidGapFill(65), Error::DecodeError),
         (E::KeyTooShort { len: 4, min: 5 }, Error::BadValSize),
         (E::TableKind("t".into()), Error::Incompatible),
         (E::InvalidDupOptions("packed_max must be 0".into()), Error::DecodeError),
@@ -354,6 +357,24 @@ fn with_max_growth_reaches_the_engine() {
         DatabaseError::Open(err) if err == Error::DecodeError.into()));
     assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
     let args = TnLmdbArgs::default().with_max_growth(crate::MIN_GROWTH);
+    super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
+}
+
+/// `TnLmdbArgs::with_gap_fill` reaches the engine's `EnvOptions::gap_fill`: more than
+/// `MAX_GAP_FILL` pages is refused at a read-write open (`MDBX_EINVAL`) before the file is
+/// created, and `MAX_GAP_FILL` itself opens, as does `crate::GapFill::Auto`.
+#[test]
+fn with_gap_fill_reaches_the_engine() {
+    assert_eq!(TnLmdbArgs::default().gap_fill, crate::GapFill::OFF, "off by default");
+    let dir = tempfile::tempdir().unwrap();
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Pages(crate::MAX_GAP_FILL + 1));
+    assert!(matches!(
+        super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap_err(),
+        DatabaseError::Open(err) if err == Error::DecodeError.into()));
+    assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Pages(crate::MAX_GAP_FILL));
+    drop(super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap());
+    let args = TnLmdbArgs::default().with_gap_fill(crate::GapFill::Auto);
     super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
 }
 
@@ -631,6 +652,116 @@ fn a_file_whose_table_form_disagrees_is_refused_at_open() {
     }
 }
 
+/// `create_tables` records each dup-sort table's layout in the file (`TnLmdbRethLayout`: key
+/// width, subkey width, form), which the engine's catalog does not hold in full (a dup table's
+/// key width and `packed_max`, no subkey width, no composite split): an open compares each row
+/// with this build's layout and refuses a difference with `MDBX_INCOMPATIBLE`, read-write and
+/// read-only, naming the table and both layouts. The file's own layout put back opens with the
+/// rows, and so does a file without the row (one written before the record), which a later
+/// `create_tables` leaves without it: the call records the layout of a table it creates only.
+#[test]
+fn a_file_whose_recorded_layout_differs_is_refused_at_open() {
+    use tn_lmdb::ReadTxn;
+    let a = Address::with_last_byte(1);
+    let row = StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) };
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, TnLmdbArgs::default()).unwrap();
+    db.create_tables().unwrap();
+    db.update(|tx| tx.put::<PlainStorageState>(a, row)).unwrap().unwrap();
+    drop(db);
+    // PlainStorageState's record, rewritten through the engine (the adapter refuses the open).
+    let record = |write: &dyn Fn(&mut tn_lmdb::RwTxn, &tn_lmdb::Table)| {
+        let _open = super::SPAWN_LOCK.read();
+        let path = dir.path().join(crate::DATA_FILE);
+        let env = tn_lmdb::Env::open(&path, tn_lmdb::EnvOptions::default()).unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        let table = txn.open_table(crate::env::LAYOUT_TABLE).unwrap().unwrap();
+        write(&mut txn, &table);
+        txn.commit().unwrap();
+    };
+    let name = b"PlainStorageState";
+    record(&|txn, table| assert_eq!(txn.get(table, name).unwrap(), Some(&[20, 32, 1][..])));
+    record(&|txn, table| txn.put(table, name, &[20, 31, 1]).unwrap());
+    let message = "table PlainStorageState was written with a layout of key 20, subkey 31, an \
+                   engine dup table, this build's is key 20, subkey 32, an engine dup table; the \
+                   file was written by another tn-lmdb-reth layout";
+    for kind in [TnLmdbEnvKind::RW, TnLmdbEnvKind::RO] {
+        match super::open_env(dir.path(), kind, TnLmdbArgs::default()).map(drop) {
+            Err(DatabaseError::Open(info)) => {
+                assert_eq!(info.code, Error::Incompatible.to_err_code());
+                assert_eq!(info.message.to_string(), message, "{kind:?}");
+            }
+            other => panic!("not refused at open: {:?}", other.map_err(dbg)),
+        }
+    }
+    let opens = || {
+        let db = super::open_env(dir.path(), TnLmdbEnvKind::RO, TnLmdbArgs::default()).unwrap();
+        assert_eq!(db.tx().unwrap().get::<PlainStorageState>(a).unwrap(), Some(row));
+    };
+    // A record differing in its form is refused too; the file's own layout opens, as does a file
+    // without the row.
+    record(&|txn, table| txn.put(table, name, &[20, 32, 0]).unwrap());
+    assert!(super::open_env(dir.path(), TnLmdbEnvKind::RO, TnLmdbArgs::default()).is_err());
+    record(&|txn, table| txn.put(table, name, &[20, 32, 1]).unwrap());
+    opens();
+    record(&|txn, table| assert!(txn.delete(table, name).unwrap()));
+    opens();
+    let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, TnLmdbArgs::default()).unwrap();
+    db.create_tables().unwrap();
+    drop(db);
+    record(&|txn, table| assert_eq!(txn.get(table, name).unwrap(), None, "no row stamped"));
+    record(&|txn, table| assert!(txn.get(table, b"HashedStorages").unwrap().is_some()));
+}
+
+/// A damaged value (a truncated `Bytecode`, put through the raw table) is `DatabaseError::Decode`
+/// at a typed `get` and at a typed cursor's reads, in a read-only and a write transaction, where
+/// reth's `Decompress` panics on it (`Bytecode::from_compact` expects its length prefix): the
+/// crate docs' differences from MDBX, whose backend lets the panic through. Each read logs one
+/// error naming the table, the key in hex and the panic's message (the panic hook names neither).
+/// The row stays, raw, and the transaction goes on.
+#[test]
+fn a_damaged_value_is_a_decode_error_not_a_panic() {
+    type Logged = parking_lot::Mutex<Vec<String>>;
+    fn decode<V: std::fmt::Debug>(errors: &Logged, result: Result<Option<V>, DatabaseError>) {
+        assert!(matches!(result, Err(DatabaseError::Decode)), "{result:?}");
+        let logged = std::mem::take(&mut *errors.lock());
+        assert_eq!(logged.len(), 1, "one error per read: {logged:?}");
+        let key: String = KEY.iter().map(|byte| format!("{byte:02x}")).collect();
+        for names in ["table=\"Bytecodes\"".to_string(), format!("key={key}"), "panic=".into()] {
+            assert!(logged[0].contains(&names), "names {names}: {logged:?}");
+        }
+    }
+    const KEY: [u8; 32] = {
+        let mut key = [0; 32];
+        key[31] = 1;
+        key
+    };
+    let (_dir, db) = create_test_db(TnLmdbEnvKind::RW);
+    let key = B256::from(KEY);
+    let raw = |tx: &<TnLmdbEnv as Database>::TXMut| {
+        tx.put::<RawTable<Bytecodes>>(RawKey::new(key), RawValue::from_vec(vec![0, 0]))
+    };
+    db.update(|tx| raw(tx)).unwrap().unwrap();
+    let errors = Arc::new(Logged::default());
+    let capture = LogCapture(tracing::Level::ERROR, Arc::clone(&errors));
+    tracing::subscriber::with_default(capture, || {
+        let tx = db.tx().unwrap();
+        decode(&errors, tx.get::<Bytecodes>(key));
+        let mut c = tx.cursor_read::<Bytecodes>().unwrap();
+        decode(&errors, c.first());
+        decode(&errors, c.seek_exact(key));
+        decode(&errors, c.walk(None).unwrap().next().transpose());
+        drop(c);
+        drop(tx);
+        let tx = db.tx_mut().unwrap();
+        decode(&errors, tx.get::<Bytecodes>(key));
+        decode(&errors, tx.cursor_write::<Bytecodes>().unwrap().last());
+        assert_eq!(tx.entries::<Bytecodes>().unwrap(), 1);
+        raw(&tx).unwrap();
+        tx.commit().unwrap();
+    });
+}
+
 #[test]
 fn a_second_writer_waits_for_the_first_to_commit() {
     let (_dir, db) = create_test_db(TnLmdbEnvKind::RW);
@@ -890,6 +1021,7 @@ const DEVIATIONS: &[(&[u64], &str, &str, &str)] = &[
     (&[2, 4, 6, 8], "s:9 c p", "s:9=none c=8 p=8", "s:9=none c=none p=8"),
     (&[2, 4, 6, 8], "f p c n", "f=2 p=none c=2 n=4", "f=2 p=none c=none n=2"),
     (&[2, 4, 6, 8], "f p d", "f=2 p=none d=ok", "f=2 p=none d=nodata"),
+    (&[2, 4, 6, 8], "se:6 n n c p", "se:6=6 n=8 n=none c=8 p=6", "se:6=6 n=8 n=none c=none p=8"),
     (
         &[4],
         "se:4 d put:3 n p",

@@ -44,6 +44,12 @@ pub enum TnRethError {
     /// it is treated as an error instead.
     #[error("receipts not found for existing block {0} during replay")]
     ReplayReceiptsMissing(u64),
+    /// A block built again without the execution cache, after a checked cache hit was stale,
+    /// saw a stale hit too. Impossible by construction (the rebuild reads no cache): a bug in
+    /// `RethEnv::build_recovered_block`, the build behind every block-building entry point.
+    /// Carries the block's parent hash.
+    #[error("execution cache: the uncached rebuild of a block on parent {0} saw a stale hit")]
+    ExecutionCacheStaleOnRebuild(alloy::primitives::B256),
     /// Failed to recover a transaction's signer from its signature.
     #[error(transparent)]
     SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
@@ -104,6 +110,20 @@ pub enum TnRethError {
         /// The band offset for this worker (stride times worker id).
         offset: u32,
     },
+    /// Another process is serving the IPC socket this worker would bind.
+    ///
+    /// reth unlinks whatever is at the path before it listens, so a second node started on the
+    /// same host without `--instance` or `--ipcpath` would silently take the socket over while
+    /// the first kept serving an unlinked inode. A stale socket file (no listener) is not an
+    /// error: reth replaces it, which keeps restart-after-crash working.
+    #[error(
+        "another process is serving the IPC socket {path}; stop it, or start this node with \
+         --instance or --ipcpath"
+    )]
+    IpcSocketInUse {
+        /// The socket path this worker would have bound.
+        path: String,
+    },
     /// Multi-worker RPC derivation needs the ws base port at or above the http base.
     ///
     /// http bands stride down and ws bands stride up from the operator's bases, so
@@ -128,9 +148,9 @@ pub enum TnRethError {
     /// A consensus output's build scope was handed a payload on a parent other than the block it
     /// was last advanced to.
     ///
-    /// The scope's read cache and trie overlay describe the post-state of exactly that block;
-    /// building on any other parent from them would serve stale reads and roots and fork the
-    /// node, so the build fails closed instead.
+    /// The scope's trie overlay describes the post-state of exactly that block; building on any
+    /// other parent over it would compute wrong roots and fork the node, so the build fails
+    /// closed instead.
     #[error("output build scope is at block {expected}, but the payload's parent is {got}")]
     ScopeParentMismatch {
         /// The block the scope was last advanced to.

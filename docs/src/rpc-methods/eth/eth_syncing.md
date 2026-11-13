@@ -6,9 +6,14 @@
 
 #### Returns
 
-`Boolean` - Telcoin Network nodes always return `false`.
+`Object|Boolean` - A sync-status object while the node is syncing, `false` otherwise.
 
-Standard Ethereum clients return either a sync-status object (`startingBlock`, `currentBlock`, `highestBlock`) or `false` when not syncing. Telcoin Network nodes execute consensus output directly and always report `false` here, even while a node is still catching up to the rest of the network.
+The node reports syncing from startup until its first epoch sets its mode, and while it is a committee validator catching up on consensus output before it takes part again. A caught-up validator and an observer report `false`. The sync-status object has these fields:
+
+* `startingBlock`: `QUANTITY` - The node's latest block when its RPC server started.
+* `currentBlock`: `QUANTITY` - The node's latest executed block.
+* `highestBlock`: `QUANTITY` - The same as `currentBlock`: the node does not report the network's tip.
+* `stages`: `Array` - reth's stage checkpoints, each a `name` and a `block`.
 
 #### Example
 

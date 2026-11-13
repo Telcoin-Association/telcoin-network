@@ -72,6 +72,9 @@
 #[cfg(test)]
 mod clippy {
     use proptest as _;
+    // the format-freeze tests' digests, compiled out on the mdbx build
+    #[cfg(feature = "mdbx")]
+    use sha2 as _;
     use tn_reth as _;
 }
 
@@ -95,7 +98,7 @@ pub use reth_db::{static_file::iter_static_files, Database as RethDatabaseT};
 pub use reth_errors::{ProviderError, RethError};
 pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
-    args::{ColorMode, LogArgs},
+    args::{ColorMode, DatabaseArgs, LogArgs},
     dirs::MaybePlatformPath,
 };
 /// Test-only re-export so engine tests can construct static-file provider errors.
@@ -112,6 +115,9 @@ pub use reth_transaction_pool::{
     identifier::{SenderId, SenderIdentifiers},
     BestTransactions, EthPooledTransaction,
 };
+/// tn-lmdb's gap fill setting (`--db.gap-fill`, [`RethConfig::db_gap_fill`]): off, a width in
+/// pages, or `auto`.
+pub use tn_lmdb_reth::GapFill;
 
 mod cli;
 pub mod dirs;
@@ -127,6 +133,7 @@ mod evm;
 pub mod forward;
 mod forward_pending;
 mod metrics;
+mod rpc_blocking;
 mod rpc_bundle;
 mod rpc_call;
 mod rpc_debug;
@@ -142,12 +149,13 @@ pub mod system_calls;
 mod types;
 pub mod worker;
 pub use cli::{
-    init_reth_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+    init_reth_defaults, RethCommand, RethConfig, DEFAULT_DB_GAP_FILL,
+    TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
 pub use env::{
     database::{
-        db_check, db_table_stats, default_page_size, refuse_pending_migration, DbCheckReport,
-        DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
+        db_check, db_table_stats, default_page_size, migrate_reth_db, refuse_pending_migration,
+        DbCheckReport, DbTableCheck, DbTableStat, BACKEND, DB_CHECK_NEEDS_STOPPED_NODE,
         DB_TABLE_STATS_NEEDS_STOPPED_NODE,
     },
     *,
@@ -168,6 +176,10 @@ pub use types::*;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
+
+// It compares the two layouts, and v2 runs on the tn-lmdb build only.
+#[cfg(all(test, not(feature = "mdbx")))]
+mod storage_layout_tests;
 
 /// True when this binary was compiled with the `faucet` cargo feature.
 ///

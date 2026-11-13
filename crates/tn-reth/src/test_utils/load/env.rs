@@ -2,8 +2,12 @@
 //! (evicted from the page cache on Linux), the temp-dir guard against memory file systems, and the
 //! on-disk size of the database.
 
-use crate::{init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethDb, RethEnv};
+use super::StorageLayout;
+use crate::{
+    init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethDb, RethEnv, StaticFileSegment,
+};
 use clap::Parser as _;
+use serde::Serialize;
 use std::{
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
@@ -14,11 +18,11 @@ use tn_storage::disk::{drop_cached_pages, fsync_file};
 use tn_types::{gas_accumulator::GasAccumulator, TaskManager};
 
 /// This build's database data file inside the database directory.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const DATA_FILE: &str = "mdbx.dat";
 
 /// This build's database data file inside the database directory.
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const DATA_FILE: &str = tn_lmdb_reth::DATA_FILE;
 
 /// Open the reth env in `datadir` (database in `datadir/db`) as the node opens it: the `--db.*`
@@ -57,6 +61,41 @@ pub fn open_production_env_with_db(
     db_flags: &[&str],
     task_manager: &TaskManager,
 ) -> eyre::Result<(RethEnv, RethDb)> {
+    open_env(datadir, chain, db_flags, None, task_manager)
+}
+
+/// [`open_production_env_with_db`] in the storage layout `layout`: a new datadir is created in it
+/// ([`StorageLayout::select`], which refuses a layout the env cannot select yet), and the opened
+/// env's datadir must hold it ([`StorageLayout::of`]), new or not; otherwise the env is dropped
+/// and this is an error.
+pub fn open_production_env_with_layout(
+    datadir: &Path,
+    chain: Arc<RethChainSpec>,
+    db_flags: &[&str],
+    layout: StorageLayout,
+    task_manager: &TaskManager,
+) -> eyre::Result<(RethEnv, RethDb)> {
+    let (env, db) = open_env(datadir, chain, db_flags, Some(layout), task_manager)?;
+    let held = StorageLayout::of(&env)?;
+    eyre::ensure!(
+        held == layout,
+        "the datadir {} holds storage layout {}, not the requested {}",
+        datadir.display(),
+        held.label(),
+        layout.label()
+    );
+    Ok((env, db))
+}
+
+/// Open the env as [`open_production_env_with_db`] does, selecting `layout` (if any) for a new
+/// datadir.
+fn open_env(
+    datadir: &Path,
+    chain: Arc<RethChainSpec>,
+    db_flags: &[&str],
+    layout: Option<StorageLayout>,
+    task_manager: &TaskManager,
+) -> eyre::Result<(RethEnv, RethDb)> {
     if let Some(flag) = db_flags.iter().find(|w| w.starts_with('-') && !w.starts_with("--db.")) {
         eyre::bail!("open_production_env takes only --db.* flags, not {flag}");
     }
@@ -65,7 +104,10 @@ pub fn open_production_env_with_db(
         RethCommand::try_parse_from(std::iter::once("tn-reth").chain(db_flags.iter().copied()))?;
     command.rpc.http = true;
     command.rpc.ipcdisable = true;
-    let reth_config = RethConfig::new(command, None, datadir, true, chain);
+    let mut reth_config = RethConfig::new(command, None, datadir, true, chain);
+    if let Some(layout) = layout {
+        layout.select(&mut reth_config)?;
+    }
     let database = RethEnv::new_database(&reth_config, datadir.join("db"))?;
     let env = RethEnv::new(
         &reth_config,
@@ -233,6 +275,89 @@ pub fn dir_bytes(dir: &Path) -> eyre::Result<(u64, u64)> {
     Ok(total)
 }
 
+/// One static-file segment's files under a datadir's `static_files` ([`static_file_sizes`]),
+/// each part as its total length and allocated bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SegmentFiles {
+    /// The segment's jars (block ranges): its data files.
+    pub jars: u64,
+    /// The data files.
+    pub data: (u64, u64),
+    /// The offsets files (`.off`).
+    pub offsets: (u64, u64),
+    /// The config files (`.conf`).
+    pub config: (u64, u64),
+    /// The changeset offsets sidecars (`.csoff`), which only the changeset segments have.
+    pub csoff: (u64, u64),
+    /// Its other files (a temp file, say).
+    pub other: (u64, u64),
+}
+
+impl SegmentFiles {
+    /// Every part's length and allocated bytes, summed.
+    pub fn total(&self) -> (u64, u64) {
+        [self.data, self.offsets, self.config, self.csoff, self.other]
+            .into_iter()
+            .fold((0, 0), |sum, part| (sum.0 + part.0, sum.1 + part.1))
+    }
+}
+
+/// The label [`static_file_sizes`] gives the files of no segment.
+pub const NO_SEGMENT: &str = "other";
+
+/// The files under `dir` (a datadir's `static_files`) by segment, in reth's segment order
+/// (`StaticFileSegment::iter`), the segments without files left out: a file
+/// `static_file_<segment>_<start>_<end>` is a jar's data, and its `.off`, `.conf` and `.csoff`
+/// siblings the jar's offsets, config and changeset offsets. Files of no segment, and anything
+/// under a subdirectory, come last as [`NO_SEGMENT`]'s `other`, when there are any.
+pub fn static_file_sizes(dir: &Path) -> eyre::Result<Vec<(&'static str, SegmentFiles)>> {
+    let mut segments: Vec<(&'static str, SegmentFiles)> = StaticFileSegment::iter()
+        .map(|segment| (segment.as_str(), SegmentFiles::default()))
+        .collect();
+    let mut unnamed = SegmentFiles::default();
+    let add = |part: &mut (u64, u64), bytes: (u64, u64)| {
+        *part = (part.0 + bytes.0, part.1 + bytes.1);
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.path().symlink_metadata()?;
+        if meta.is_dir() {
+            add(&mut unnamed.other, dir_bytes(&entry.path())?);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let bytes = (meta.len(), meta.blocks() * 512);
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let (stem, extension) = name.split_once('.').unwrap_or((&name, ""));
+        let segment = stem
+            .strip_prefix("static_file_")
+            .and_then(|rest| rest.split('_').next())
+            .and_then(|label| segments.iter_mut().find(|(name, _)| *name == label));
+        let Some((_, files)) = segment else {
+            add(&mut unnamed.other, bytes);
+            continue;
+        };
+        match extension {
+            "" => {
+                files.jars += 1;
+                add(&mut files.data, bytes);
+            }
+            "off" => add(&mut files.offsets, bytes),
+            "conf" => add(&mut files.config, bytes),
+            "csoff" => add(&mut files.csoff, bytes),
+            _ => add(&mut files.other, bytes),
+        }
+    }
+    segments.retain(|(_, files)| *files != SegmentFiles::default());
+    if unnamed != SegmentFiles::default() {
+        segments.push((NO_SEGMENT, unnamed));
+    }
+    Ok(segments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +512,102 @@ mod tests {
     }
 
     /// The clone refuses a destination that exists, and leaves it alone.
+    /// The static files split by segment and part, in reth's segment order, the files of no
+    /// segment last; a production env's genesis writes the headers, transactions and receipts
+    /// segments, whose parts sum to the directory's bytes.
+    #[tokio::test]
+    async fn test_static_file_sizes_by_segment() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path();
+        for (name, len) in [
+            ("static_file_storage-change-sets_0_499999", 100),
+            ("static_file_storage-change-sets_0_499999.csoff", 7),
+            ("static_file_headers_0_499999", 10),
+            ("static_file_headers_500000_999999", 20),
+            ("static_file_headers_0_499999.off", 3),
+            ("static_file_headers_0_499999.conf", 5),
+            ("static_file_headers_0_499999.conf.tmp", 1),
+            ("lock", 2),
+        ] {
+            std::fs::write(dir.join(name), vec![1u8; len])?;
+        }
+        let sizes = static_file_sizes(dir)?;
+        let names: Vec<&str> = sizes.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["headers", "storage-change-sets", NO_SEGMENT]);
+        let len = |part: (u64, u64)| part.0;
+        let headers = sizes[0].1;
+        assert_eq!(headers.jars, 2);
+        assert_eq!(
+            [headers.data, headers.offsets, headers.config, headers.csoff, headers.other].map(len),
+            [30, 3, 5, 0, 1]
+        );
+        let changes = sizes[1].1;
+        assert_eq!((changes.jars, len(changes.data), len(changes.csoff)), (1, 100, 7));
+        assert_eq!(len(sizes[2].1.other), 2);
+        assert_eq!(len(headers.total()), 39);
+        assert!(headers.total().1 >= headers.data.1, "allocated bytes sum too");
+
+        let datadir = tmp.path().join("datadir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tasks = TaskManager::default();
+        let env = open_production_env(&datadir, chain, &DURABLE, &tasks)?;
+        drop(env);
+        let sizes = static_file_sizes(&datadir.join("static_files"))?;
+        let names: Vec<&str> = sizes.iter().map(|(name, _)| *name).collect();
+        assert!(names.starts_with(&["headers", "transactions", "receipts"]), "{names:?}");
+        let total: u64 = sizes.iter().map(|(_, files)| files.total().0).sum();
+        assert_eq!(total, dir_bytes(&datadir.join("static_files"))?.0);
+        assert!(sizes[0].1.jars >= 1 && sizes[0].1.config.0 > 0, "{sizes:?}");
+        Ok(())
+    }
+
+    /// A new datadir opened in layout v1 holds v1, reopens in it and reads it back; v2 is refused
+    /// until the env can select it, before any datadir is created.
+    #[tokio::test]
+    async fn test_open_with_layout_selects_and_checks_it() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let datadir = tmp.path().join("v1");
+        for run in ["new", "reopened"] {
+            let tasks = TaskManager::new(run);
+            let (env, _db) = open_production_env_with_layout(
+                &datadir,
+                chain.clone(),
+                &DURABLE,
+                StorageLayout::V1,
+                &tasks,
+            )?;
+            assert_eq!(StorageLayout::of(&env)?, StorageLayout::V1, "{run}");
+        }
+        let v2 = tmp.path().join("v2");
+        if !cfg!(feature = "mdbx") {
+            for run in ["new", "reopened"] {
+                let tasks = TaskManager::new(run);
+                let (env, _db) = open_production_env_with_layout(
+                    &v2,
+                    chain.clone(),
+                    &DURABLE,
+                    StorageLayout::V2,
+                    &tasks,
+                )?;
+                assert_eq!(StorageLayout::of(&env)?, StorageLayout::V2, "{run}");
+            }
+        } else {
+            // v2 is tn-lmdb only: the MDBX build refuses it before the database opens.
+            let tasks = TaskManager::default();
+            let Err(refused) =
+                open_production_env_with_layout(&v2, chain, &DURABLE, StorageLayout::V2, &tasks)
+            else {
+                panic!("v2 opened on MDBX");
+            };
+            assert!(refused.to_string().contains("tn-lmdb only"), "{refused}");
+            assert!(!v2.join("db").exists(), "refused before the database opens");
+        }
+        assert_eq!(StorageLayout::parse("v2")?, StorageLayout::V2);
+        assert!(StorageLayout::parse("v3").is_err());
+        Ok(())
+    }
+
     #[test]
     fn test_clone_datadir_refuses_existing_destination() -> eyre::Result<()> {
         let tmp = tempfile::tempdir()?;

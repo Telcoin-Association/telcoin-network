@@ -1,5 +1,5 @@
 use crate::primitives::alloy_primitives::{BlockNumber, StorageKey, StorageValue};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use core::ops::{Deref, DerefMut};
 use reth_primitives_traits::Account;
 use reth_storage_api::{AccountReader, BlockHashReader, BytecodeReader, StateProvider};
@@ -149,9 +149,16 @@ impl<DB: EvmStateProvider> DatabaseRef for StateProviderDatabase<DB> {
 
     /// Retrieves the bytecode associated with a given code hash.
     ///
-    /// Returns `Ok` with the bytecode if found, or the default bytecode otherwise.
+    /// Returns `Ok` with the bytecode if found. TN(TN-0082): a row missing for any code hash
+    /// but the empty code's is an error, not empty code. A node whose database
+    /// lost the row would otherwise run every call to that contract as a no-op and commit a
+    /// root the other validators do not; the block fails instead.
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self.bytecode_by_hash(&code_hash)?.unwrap_or_default().0)
+        match self.bytecode_by_hash(&code_hash)? {
+            Some(code) => Ok(code.0),
+            None if code_hash == KECCAK256_EMPTY => Ok(Bytecode::default()),
+            None => Err(ProviderError::BytecodeNotFound(code_hash)),
+        }
     }
 
     /// Retrieves the storage value at a specific index for a given address.
@@ -167,5 +174,23 @@ impl<DB: EvmStateProvider> DatabaseRef for StateProviderDatabase<DB> {
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         // Get the block hash or default hash with an attempt to convert U256 block number to u64
         Ok(self.0.block_hash(number)?.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::b256;
+    use reth_storage_api::noop::NoopProvider;
+
+    /// TN(TN-0082): a missing bytecode row is an error, except for the empty code's hash.
+    #[test]
+    fn missing_bytecode_is_an_error_except_for_the_empty_code() {
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        assert_eq!(db.code_by_hash_ref(KECCAK256_EMPTY).unwrap(), Bytecode::default());
+        let hash = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        assert!(
+            matches!(db.code_by_hash_ref(hash), Err(ProviderError::BytecodeNotFound(h)) if h == hash)
+        );
     }
 }

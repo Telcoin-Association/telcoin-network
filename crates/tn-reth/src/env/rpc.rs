@@ -46,6 +46,7 @@ use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 use crate::{
     error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
+    rpc_blocking::RpcTaskSpawner,
     rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
     rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
@@ -151,8 +152,9 @@ fn worker_shifted_port(
 /// - `http_port` shifted down by `200 * worker_id` when the http server is enabled;
 /// - `ws_port` shifted up by `400 * worker_id` when the ws server is enabled;
 /// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled;
-/// - when http and ws share one port, `ws_allowed_origins` falling back to `http_corsdomain`, the
-///   list the shared server checks WebSocket origins against.
+/// - when http and ws share one port, `ws_allowed_origins` falling back to `http_corsdomain` and
+///   `http_corsdomain` falling back to `ws_allowed_origins`: the shared server applies whichever
+///   list is set to both transports.
 ///
 /// When both http and ws are enabled on fixed (non-zero) ports, the derivation needs
 /// `ws_port >= http_port` (reth's own default layout; equality is the shared http+ws
@@ -201,23 +203,46 @@ fn worker_rpc_server_args(
             } else {
                 format!("{}-w{worker_id}", base.ipcpath)
             };
-            // On a shared http+ws port reth checks WebSocket origins against `--ws.origins`, or
-            // against `--http.corsdomain` when only that is set. The shift puts this worker's ws
-            // on its own server, which reads `--ws.origins` alone, so carry the list worker 0
-            // enforces instead of accepting every origin.
-            let ws_allowed_origins = if base.http && base.ws && base.http_port == base.ws_port {
-                base.ws_allowed_origins.clone().or_else(|| base.http_corsdomain.clone())
+            // On a shared http+ws port reth applies one list to both transports: `--ws.origins`,
+            // or `--http.corsdomain` when only that is set. The shift puts this worker's http and
+            // ws on separate servers, which read only their own flag, so carry the list worker 0
+            // applies to each. Without it, the ws server accepts every origin, and the http
+            // server sends no CORS headers when only `--ws.origins` is set.
+            let shared_port = base.http && base.ws && base.http_port == base.ws_port;
+            let (http_corsdomain, ws_allowed_origins) = if shared_port {
+                (
+                    base.http_corsdomain.clone().or_else(|| base.ws_allowed_origins.clone()),
+                    base.ws_allowed_origins.clone().or_else(|| base.http_corsdomain.clone()),
+                )
             } else {
-                base.ws_allowed_origins.clone()
+                (base.http_corsdomain.clone(), base.ws_allowed_origins.clone())
             };
             Ok(reth_node_core::args::RpcServerArgs {
                 http_port,
                 ws_port,
                 ipcpath,
+                http_corsdomain,
                 ws_allowed_origins,
                 ..base
             })
         }
+    }
+}
+
+/// Whether a process is listening on the IPC socket at `path`.
+///
+/// Connecting to a live Unix socket succeeds at once; a stale socket file refuses the
+/// connection and a missing one does not exist, and both of those reth replaces when it
+/// listens. Named pipes on Windows are not probed.
+fn ipc_socket_is_live(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -233,8 +258,8 @@ fn worker_rpc_server_args(
 ///   consumer of the cache.
 /// - `send_raw_transaction_sync_timeout`: applied here, absent from reth's reference. No CLI flag
 ///   feeds it yet, so it re-applies the default (forward compatibility).
-/// - task spawner: reth injects its own; TN keeps the builder's default executor, the same behavior
-///   as before this fix.
+/// - task spawner: reth injects its own; TN sets an [`RpcTaskSpawner`] in `get_rpc_server`, so the
+///   API's blocking work runs on RPC's own pool.
 fn apply_eth_config<N: RpcNodeCore, Rpc, NextEnv>(
     builder: EthApiBuilder<N, Rpc, NextEnv>,
     config: EthConfig,
@@ -293,11 +318,15 @@ impl RethEnv {
             TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
+        // RPC's blocking work runs on its own pool, so it cannot take the blocking threads block
+        // execution and certificate validation use (`rpc_blocking.rs`). Every other task keeps
+        // its spawner: TN's for the modules, the env's non-critical one for the eth API (below).
+        let rpc_executor = RpcTaskSpawner::new(self.inner.task_spawner.clone())?;
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network.clone())
-            .with_executor(Box::new(self.inner.task_spawner.clone()))
+            .with_executor(Box::new(rpc_executor))
             .with_evm_config(self.inner.evm_config.clone())
             .with_consensus(tn_execution.clone());
 
@@ -324,8 +353,9 @@ impl RethEnv {
         // they would keep the database open after the node's tasks shut down. Reth spawns the
         // cache as a critical task; here they are tracked as non-critical ones: they only serve
         // RPC, and a panic in one leaves the RPC cache dead with the node running, as on reth's
-        // own executor, instead of ending the validator.
-        let rpc_tasks = self.inner.task_spawner.non_critical();
+        // own executor, instead of ending the validator. Their blocking work (cache misses, calls,
+        // traces) runs on RPC's own pool, as the modules' does.
+        let rpc_tasks = RpcTaskSpawner::new(self.inner.task_spawner.non_critical())?;
         let eth_cache = EthStateCache::spawn_with(
             self.inner.blockchain_provider.clone(),
             eth_config.cache,
@@ -360,7 +390,9 @@ impl RethEnv {
         // drove its answer to the 500-gwei clamp on adiri (issue #1305).
         let gas_price = GasPriceWithEpochBaseFee::new(base_fee.clone());
         // Simulations use the same epoch fee as quotes and pool admission (#1348).
-        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone());
+        let pending_block = self.node_config().rpc.rpc_pending_block;
+        let simulation =
+            SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone(), pending_block);
         // Guard the eth submission methods with the operator's `--rpc.txfeecap` (issue
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
@@ -393,7 +425,8 @@ impl RethEnv {
             engine_events,
         );
         let bundle = BundleWithEpochBaseFee::new(registry.bundle_api(), base_fee.clone());
-        let debug = DebugSimulationWithEpochBaseFee::new(registry.debug_api(), base_fee);
+        let debug =
+            DebugSimulationWithEpochBaseFee::new(registry.debug_api(), base_fee, pending_block);
         let mut server = registry.create_transport_rpc_modules(modules_config);
         // `tn` is selected like reth's modules; it is in the default set and always on IPC.
         if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
@@ -433,8 +466,11 @@ impl RethEnv {
         server: &RpcServer,
         worker_id: WorkerId,
     ) -> TnRethResult<RpcServerHandle> {
-        let server_config =
-            worker_rpc_server_args(&self.node_config().rpc, worker_id)?.rpc_server_config();
+        let args = worker_rpc_server_args(&self.node_config().rpc, worker_id)?;
+        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath) {
+            return Err(TnRethError::IpcSocketInUse { path: args.ipcpath });
+        }
+        let server_config = args.rpc_server_config();
         let handle = server_config.start(server).await?;
         tracing::info!(
             target: "tn::execution",
@@ -1609,12 +1645,13 @@ mod tests {
         assert_eq!(worker_two.ipcpath, format!("{}-w2", base.ipcpath));
     }
 
-    /// With http and ws on one port and only `--http.corsdomain` set, worker 0's shared server
-    /// checks WebSocket origins against that list. A worker above 0 gets its ws on a separate
-    /// server, which reads `--ws.origins` alone, so the derivation must carry the list there or
-    /// that worker accepts WebSocket upgrades from every origin.
+    /// With http and ws on one port, worker 0's shared server applies whichever of
+    /// `--http.corsdomain` and `--ws.origins` is set to both transports. A worker above 0 gets
+    /// separate servers that read only their own flag, so the derivation must carry the list to
+    /// each: otherwise its ws server accepts WebSocket upgrades from every origin, or its http
+    /// server sends no CORS headers.
     #[test]
-    fn test_shared_port_origins_carry_to_shifted_ws_server() {
+    fn test_shared_port_origins_carry_to_shifted_servers() {
         let base = reth_node_core::args::RpcServerArgs {
             http: true,
             ws: true,
@@ -1632,18 +1669,36 @@ mod tests {
         assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://observer.example"));
         assert_eq!(worker_one.http_corsdomain, base.http_corsdomain);
 
-        // an explicit ws list wins, as it does on the shared server
+        // only `--ws.origins`: the shared server sends CORS headers from it, so the shifted
+        // http server must too
+        let ws_only = reth_node_core::args::RpcServerArgs {
+            http_corsdomain: None,
+            ws_allowed_origins: Some("https://ws.example".to_string()),
+            ..base.clone()
+        };
+        let worker_zero = worker_rpc_server_args(&ws_only, 0).expect("worker 0 derivation");
+        assert_eq!(worker_zero.http_corsdomain, None, "worker 0 keeps the config");
+        let worker_one = worker_rpc_server_args(&ws_only, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.http_corsdomain.as_deref(), Some("https://ws.example"));
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://ws.example"));
+
+        // both set: each server keeps its own list (reth refuses a shared port whose lists
+        // differ, so worker 0 has already failed if they do)
         let both = reth_node_core::args::RpcServerArgs {
             ws_allowed_origins: Some("https://ws.example".to_string()),
             ..base.clone()
         };
         let worker_one = worker_rpc_server_args(&both, 1).expect("worker 1 derivation");
         assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://ws.example"));
+        assert_eq!(worker_one.http_corsdomain.as_deref(), Some("https://observer.example"));
 
-        // separate base ports already give ws its own server, so nothing is carried
+        // separate base ports already give each transport its own server, so nothing is carried
         let separate = reth_node_core::args::RpcServerArgs { ws_port: 8546, ..base };
         let worker_one = worker_rpc_server_args(&separate, 1).expect("worker 1 derivation");
         assert_eq!(worker_one.ws_allowed_origins, None);
+        let separate_ws_only = reth_node_core::args::RpcServerArgs { ws_port: 8546, ..ws_only };
+        let worker_one = worker_rpc_server_args(&separate_ws_only, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.http_corsdomain, None);
     }
 
     /// A worker band cannot collide with any `--instance` offset. Instance arithmetic
@@ -1821,6 +1876,63 @@ mod tests {
             )
             .expect("rpc server");
         reth_env.start_rpc(&server, worker_id).await.expect("rpc server starts")
+    }
+
+    /// A listening socket is live; a stale socket file and a missing path are not.
+    #[cfg(unix)]
+    #[test]
+    fn ipc_socket_probe_tells_live_from_stale() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let live = tmp_dir.path().join("live.ipc");
+        let stale = tmp_dir.path().join("stale.ipc");
+        let missing = tmp_dir.path().join("missing.ipc");
+        let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+
+        assert!(ipc_socket_is_live(&live.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&stale.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&missing.to_string_lossy()));
+        drop(listener);
+        assert!(!ipc_socket_is_live(&live.to_string_lossy()));
+    }
+
+    /// A second server on a live IPC path is refused before it binds, so a second node
+    /// started with the default `--ipcpath` cannot take over the first node's socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_start_rpc_refuses_live_ipc_socket() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+        let accumulator = GasAccumulator::new(1);
+        let handle = start_worker_rpc(&reth_env, &accumulator, 0).await;
+        assert_eq!(handle.ipc_endpoint(), Some(ipcpath.clone()));
+
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(0)).expect("txn pool");
+        let server = reth_env
+            .get_rpc_server(
+                pool,
+                WorkerNetwork::new_for_test(reth_env.chainspec()),
+                accumulator.worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )
+            .expect("rpc server");
+        let err = reth_env.start_rpc(&server, 0).await.expect_err("the socket is live");
+        assert!(matches!(&err, TnRethError::IpcSocketInUse { path } if *path == ipcpath), "{err}");
+        // the first server still owns its socket
+        assert!(ipc_socket_is_live(&ipcpath));
     }
 
     /// Two workers on one `RethEnv` bind two live IPC sockets. Before #1287 both

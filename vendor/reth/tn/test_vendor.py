@@ -1,5 +1,6 @@
 """vendor.py against throwaway upstream and TN repositories: upstream renames (T4-2), git-ignored
-files (T4-3) and upstream [patch] entries (T4-6). Needs git; no network, no cargo."""
+files (T4-3), upstream [patch] entries (T4-6) and the ledger check. Needs git; no network, no
+cargo."""
 
 import importlib.util
 import os
@@ -257,6 +258,76 @@ lto = true
         self.assertEqual(out.returncode, 1)
         self.assertIn(f"  + [patch.crates-io] {entry}", out.stdout)
         self.assertNotIn("inkwell", r.read("Cargo.toml"))
+
+
+
+def entry(tn, files):
+    return f"- **{tn}** — A change. *Kind*: fix.\n  *Files*: {files}.\n  *Why*: a reason.\n\n"
+
+
+class Ledger(Fixture):
+    def test_paths_expand_wrap_and_resolve_against_the_entry_crate(self):
+        text = "## Section\n\n" + entry(
+            "TN-0001", "`crates/foo/src/{lib.rs, sub/{a,b}.rs}`, `src/\n  plain.rs`, "
+            "`tests/` and the workspace manifest") + entry("TN-0002", "`crates/foo/src/lib.rs`")
+        named = vendor.ledger_paths(text, ["crates/foo", "crates/bar"])
+        self.assertEqual(named, {
+            "Cargo.toml": {"TN-0001"},
+            "crates/foo/src/lib.rs": {"TN-0001", "TN-0002"},
+            "crates/foo/src/sub/a.rs": {"TN-0001"},
+            "crates/foo/src/sub/b.rs": {"TN-0001"},
+            "crates/foo/src/plain.rs": {"TN-0001"},
+            "crates/foo/tests/": {"TN-0001"},
+        })
+        self.assertTrue(vendor.names_path(named, "crates/foo/tests/it/main.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/other.rs"))
+
+    def test_prose_tokens_and_bare_directories_name_nothing(self):
+        # R28: a backticked crate path in the *Why* prose covered every file of that crate, and
+        # a bare directory token did the same; only the *Files* sentence names paths, and only a
+        # trailing slash makes a token a directory.
+        text = ("## Section\n\n- **TN-0001** — A change. *Kind*: fix.\n"
+                "  *Files*: `crates/foo/src/lib.rs`, `crates/foo/src`.\n"
+                "  *Why*: this leaves `crates/bar` and `crates/foo/src/plain.rs` alone.\n\n")
+        named = vendor.ledger_paths(text, ["crates/foo", "crates/bar"])
+        self.assertEqual(named, {"crates/foo/src/lib.rs": {"TN-0001"}, "crates/foo/src": {"TN-0001"}})
+        self.assertFalse(vendor.names_path(named, "crates/bar/src/lib.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/plain.rs"))
+        self.assertFalse(vendor.names_path(named, "crates/foo/src/sub/a.rs"))
+
+    def test_reports_unnamed_files_and_undefined_ids(self):
+        r = self.repos
+        r.commit_tn({LIMITS_SRC: LIMITS.replace("    1024\n", TN_LIMIT),
+                     "crates/foo/src/plain.rs": PLAIN + "// TN(TN-0001, TN-0002): two ids.\n",
+                     "CHANGES.md": entry("TN-0001", f"`{LIMITS_SRC}`")})
+        out = r.vendor("ledger")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("not in CHANGES.md: modified  crates/foo/src/plain.rs", out.stdout)
+        self.assertNotIn(LIMITS_SRC, out.stdout)
+        self.assertIn("no CHANGES.md entry for TN-0002: crates/foo/src/plain.rs", out.stdout)
+
+        write(r.tn / "vendor/reth", {"CHANGES.md": entry("TN-0001", f"`{LIMITS_SRC}`")
+                                     + entry("TN-0002", "`crates/foo/src/plain.rs`")})
+        out = r.vendor("ledger")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("names all 2 changed files", out.stdout)
+
+        # two branches that each took the next free id: every file is named and every id is
+        # defined, but one id now means two changes
+        write(r.tn / "vendor/reth", {"CHANGES.md": entry("TN-0001", f"`{LIMITS_SRC}`")
+                                     + entry("TN-0002", "`crates/foo/src/plain.rs`")
+                                     + "## Another section\n\n"
+                                     + entry("TN-0001", "`crates/foo/src/plain.rs`")})
+        out = r.vendor("ledger")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("CHANGES.md defines TN-0001 in 2 entries", out.stdout)
+        self.assertNotIn("TN-0002 in", out.stdout)
+
+    def test_duplicate_ids_counts_entries_per_id(self):
+        text = ("## Section\n\n" + entry("TN-0001", "`a`") + entry("TN-0002", "`b`")
+                + "## Other\n\n" + entry("TN-0001", "`c`") + entry("TN-0001", "`d`"))
+        self.assertEqual(vendor.duplicate_ids(text), {"TN-0001": 3})
+        self.assertEqual(vendor.duplicate_ids(entry("TN-0001", "`a`")), {})
 
 
 if __name__ == "__main__":

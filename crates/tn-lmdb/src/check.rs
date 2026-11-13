@@ -15,7 +15,10 @@
 //! state (README, Open and recovery). So it keeps only the pages it claims ([`Claims::Visited`]),
 //! where `Env::check` keeps a word for every page of the state ([`Claims::Every`]).
 
-use std::collections::{hash_map::Entry, BTreeMap, HashMap};
+use std::{
+    collections::{hash_map::Entry, BTreeMap, HashMap},
+    os::fd::BorrowedFd,
+};
 
 use memmap2::MmapMut;
 
@@ -29,6 +32,7 @@ use crate::{
     overflow::{self, Ovf, RunCrc},
     packed,
     page::{self, Kind, Val},
+    sys,
     tree::{nested_tag, PageRead, TreeRoot},
 };
 
@@ -179,6 +183,44 @@ struct Checker<'s> {
     since: Option<u64>,
     /// Hold each root's and record's counters to what the walk found (a full walk only).
     accounting: bool,
+    /// [`check_since`]'s reads started ahead of the walk (`None`: none started).
+    ahead: Option<Ahead<'s>>,
+}
+
+/// Reads started ahead of [`check_since`]'s walk on a cold page cache: before the walk descends
+/// from a branch it advises every child it will descend into (`sys::will_need`), and before it
+/// reads a leaf's entries every overflow run and nested root it will read from them, so the
+/// device reads a page's children together, not one fault at a time. Each batch is sorted and
+/// its adjacent pages merged into one range.
+struct Ahead<'f> {
+    /// The database file.
+    fd: BorrowedFd<'f>,
+    /// The batch: `(first page, pages)` of each range added since the last [`Self::start`].
+    batch: Vec<(u32, u32)>,
+}
+
+impl Ahead<'_> {
+    /// Add `pages` pages from `pgno` to the batch.
+    fn add(&mut self, pgno: u32, pages: u32) {
+        self.batch.push((pgno, pages));
+    }
+
+    /// Advise the batch, sorted and with adjacent or overlapping ranges merged, and empty it.
+    fn start(&mut self, page_size: u64) {
+        self.batch.sort_unstable();
+        let mut ranges =
+            self.batch.drain(..).map(|(p, n)| (u64::from(p), u64::from(p) + u64::from(n)));
+        let Some(mut run) = ranges.next() else { return };
+        for (from, to) in ranges {
+            if from <= run.1 {
+                run.1 = run.1.max(to);
+                continue;
+            }
+            sys::will_need(self.fd, run.0 * page_size, (run.1 - run.0) * page_size);
+            run = (from, to);
+        }
+        sys::will_need(self.fd, run.0 * page_size, (run.1 - run.0) * page_size);
+    }
 }
 
 /// The pages claimed twice: every one counted, the first [`LISTED`] kept as `(page, first owner,
@@ -291,6 +333,9 @@ impl Checker<'_> {
                 return Err(corrupt(p, "holds keys outside its parents' separators".to_string()));
             }
             let n = page::nkeys(page);
+            if leaf && self.ahead.is_some() {
+                self.read_ahead_of_leaf(page, n, policy, root.tag)?;
+            }
             if leaf {
                 leaves += 1;
                 if depth > 1 && n == 0 {
@@ -345,6 +390,12 @@ impl Checker<'_> {
                     hi.clone()
                 };
                 stack.push((child, child_txn, depth + 1, child_lo, child_hi));
+                if let Some(ahead) = &mut self.ahead {
+                    ahead.add(child, 1);
+                }
+            }
+            if let Some(ahead) = &mut self.ahead {
+                ahead.start(geometry.page_size() as u64);
             }
         }
         if !self.twice.is_empty() || !self.accounting {
@@ -469,6 +520,46 @@ impl Checker<'_> {
         })
     }
 
+    /// Start the reads of what the leaf `page` (of `n` entries) names that the walk will read
+    /// next ([`Ahead`]): each overflow run it descends into, and in a dup table's outer tree
+    /// each nested root. An entry that fails to decode is left to the walk, which reports it.
+    /// `tag` is the tree's own tag, from which a nested root's is derived (`nested_tag`), so the
+    /// root decoded here is the one the walk fetches through `checked_page`; this reads no page.
+    fn read_ahead_of_leaf(
+        &mut self,
+        page: &[u8],
+        n: usize,
+        policy: Leaves,
+        tag: u32,
+    ) -> Result<()> {
+        let page_size = self.snapshot.geometry.page_size();
+        for i in 0..n {
+            let (k, v) = page::leaf_entry(page, i)?;
+            let (pgno, pages, txn) = match v {
+                Val::Overflow(ovf) => {
+                    let pages = overflow::run_pages(ovf.len as usize, page_size);
+                    (ovf.pgno, u32::try_from(pages).unwrap_or(u32::MAX), ovf.txn)
+                }
+                Val::Nested(cell) if policy == Leaves::DupOuter => {
+                    match TreeRoot::decode(cell, nested_tag(tag, k)) {
+                        Ok(root) if !root.is_empty() => (root.root, 1, root.root_txn),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if self.descends(txn) {
+                if let Some(ahead) = &mut self.ahead {
+                    ahead.add(pgno, pages);
+                }
+            }
+        }
+        if let Some(ahead) = &mut self.ahead {
+            ahead.start(page_size as u64);
+        }
+        Ok(())
+    }
+
     /// Check the overflow run `ovf` names as a read does, plus its full CRC even for a 1-page run
     /// ([`RunCrc::Always`]) and its zero pad, then claim each of its pages for `owner`. Returns
     /// its page count.
@@ -497,7 +588,7 @@ pub(crate) fn named_after(txn: u32, since: u64) -> bool {
 
 /// `Env::check` of one snapshot.
 pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
-    walk_state(snapshot, None, true)
+    walk_state(snapshot, None, true, None)
 }
 
 /// Open's check of a trusted weak head (README, Open and recovery): `snapshot` is the head's
@@ -513,9 +604,19 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
 /// claims ([`Claims::Visited`]): its memory follows the pages it reads, not the file's page count.
 /// When `since` is 2^31 or more txns before the head, the walk descends into everything. Returns
 /// the pages checked.
-pub(crate) fn check_since(snapshot: &Snapshot, since: u64) -> Result<u64> {
+///
+/// With `fd`, the database file, the walk starts the reads of what it will read next ahead of
+/// itself ([`Ahead`]): an open drops the file's cached pages after an unclean end (`boot_record`),
+/// so this check reads from the device, and one page at a time it would cost a device read per
+/// page in turn.
+pub(crate) fn check_since(
+    snapshot: &Snapshot,
+    since: u64,
+    fd: Option<BorrowedFd<'_>>,
+) -> Result<u64> {
     let prune = snapshot.meta.txn.checked_sub(since).is_some_and(|gap| gap < 1 << 31);
-    let report = walk_state(snapshot, prune.then_some(since), false)?;
+    let ahead = fd.map(|fd| Ahead { fd, batch: Vec::new() });
+    let report = walk_state(snapshot, prune.then_some(since), false, ahead)?;
     Ok(report.catalog_pages + report.table_pages + report.free_tree_pages)
 }
 
@@ -523,7 +624,12 @@ pub(crate) fn check_since(snapshot: &Snapshot, since: u64) -> Result<u64> {
 /// a table of every page, [`Claims::every`], which a host that refuses it fails as
 /// [`Error::OutOfMemory`]) or of [`check_since`] (`since`: only what was written after it, its
 /// claims in a map of the pages claimed).
-fn walk_state(snapshot: &Snapshot, since: Option<u64>, accounting: bool) -> Result<CheckReport> {
+fn walk_state<'s>(
+    snapshot: &'s Snapshot,
+    since: Option<u64>,
+    accounting: bool,
+    ahead: Option<Ahead<'s>>,
+) -> Result<CheckReport> {
     let meta = snapshot.meta;
     let mut checker = Checker {
         snapshot,
@@ -536,6 +642,7 @@ fn walk_state(snapshot: &Snapshot, since: Option<u64>, accounting: bool) -> Resu
         twice: Twice::default(),
         since,
         accounting,
+        ahead,
     };
     let mut report =
         CheckReport { txn_id: meta.txn, page_count: meta.page_count, ..Default::default() };
@@ -798,7 +905,7 @@ mod tests {
             view: Arc::clone(&head.view),
             tables: Default::default(),
         };
-        let pages = check_since(&huge, since).expect("the pages since the last sync pass");
+        let pages = check_since(&huge, since, None).expect("the pages since the last sync pass");
         let slots = CLAIM_SLOTS.with(std::cell::Cell::get);
         assert!(0 < pages && pages < state_pages, "{pages} of {state_pages} pages checked");
         let claimed = pages + full.free_pages;

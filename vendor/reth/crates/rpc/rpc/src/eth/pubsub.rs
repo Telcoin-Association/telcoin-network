@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::eth::filter::check_filter_size;
 use alloy_primitives::TxHash;
 use alloy_rpc_types_eth::{
     pubsub::{Params, PubSubSyncStatus, SubscriptionKind, SyncStatusMetadata},
@@ -21,7 +22,10 @@ use reth_rpc_eth_types::logs_utils;
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::BlockNumReader;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
-use reth_transaction_pool::{NewTransactionEvent, TransactionPool};
+use reth_transaction_pool::{
+    NewSubpoolTransactionStream, NewTransactionEvent, SubPool, TransactionListenerKind,
+    TransactionPool,
+};
 use serde::Serialize;
 use tokio_stream::{
     wrappers::{BroadcastStream, ReceiverStream},
@@ -65,14 +69,19 @@ where
     }
 
     /// Returns a stream that yields all transaction hashes emitted by the txpool.
-    pub fn pending_transaction_hashes_stream(&self) -> impl Stream<Item = TxHash> {
+    ///
+    /// TN(TN-0056): `None` when the pool refuses another RPC listener.
+    pub fn pending_transaction_hashes_stream(&self) -> Option<impl Stream<Item = TxHash>> {
         self.inner.pending_transaction_hashes_stream()
     }
 
     /// Returns a stream that yields all transactions emitted by the txpool.
+    ///
+    /// TN(TN-0056): `None` when the pool refuses another RPC listener.
     pub fn full_pending_transaction_stream(
         &self,
-    ) -> impl Stream<Item = NewTransactionEvent<<Eth::Pool as TransactionPool>::Transaction>> {
+    ) -> Option<impl Stream<Item = NewTransactionEvent<<Eth::Pool as TransactionPool>::Transaction>>>
+    {
         self.inner.full_pending_transaction_stream()
     }
 
@@ -114,24 +123,27 @@ where
                     match params {
                         Params::Bool(true) => {
                             // full transaction objects requested
-                            let stream = self.full_pending_transaction_stream().filter_map(|tx| {
-                                let tx_value = match self
-                                    .inner
-                                    .eth_api
-                                    .converter()
-                                    .fill_pending(tx.transaction.to_consensus())
-                                {
-                                    Ok(tx) => Some(tx),
-                                    Err(err) => {
-                                        error!(target = "rpc",
-                                            %err,
-                                            "Failed to fill transaction with block context"
-                                        );
-                                        None
-                                    }
-                                };
-                                std::future::ready(tx_value)
-                            });
+                            let stream = self
+                                .full_pending_transaction_stream()
+                                .ok_or_else(too_many_listeners_err)?
+                                .filter_map(|tx| {
+                                    let tx_value = match self
+                                        .inner
+                                        .eth_api
+                                        .converter()
+                                        .fill_pending(tx.transaction.to_consensus())
+                                    {
+                                        Ok(tx) => Some(tx),
+                                        Err(err) => {
+                                            error!(target = "rpc",
+                                                %err,
+                                                "Failed to fill transaction with block context"
+                                            );
+                                            None
+                                        }
+                                    };
+                                    std::future::ready(tx_value)
+                                });
                             return pipe_from_stream(accepted_sink, stream).await
                         }
                         Params::Bool(false) | Params::None => {
@@ -145,7 +157,9 @@ where
                     }
                 }
 
-                pipe_from_stream(accepted_sink, self.pending_transaction_hashes_stream()).await
+                let stream =
+                    self.pending_transaction_hashes_stream().ok_or_else(too_many_listeners_err)?;
+                pipe_from_stream(accepted_sink, stream).await
             }
             SubscriptionKind::Syncing => {
                 // get new block subscription
@@ -223,6 +237,14 @@ where
         kind: SubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
+        // TN(TN-0155): a `logs` subscription keeps its filter for the life of the connection, so
+        // it takes `eth_newFilter`'s size limit, refused before the subscription is accepted.
+        if let (SubscriptionKind::Logs, Some(Params::Logs(filter))) = (&kind, &params) &&
+            let Err(err) = check_filter_size(filter)
+        {
+            pending.reject(err).await;
+            return Ok(())
+        }
         let sink = pending.accept().await?;
         let pubsub = self.clone();
         self.inner.subscription_task_spawner.spawn_task(Box::pin(async move {
@@ -248,6 +270,15 @@ impl From<SubscriptionSerializeError> for ErrorObject<'static> {
     fn from(value: SubscriptionSerializeError) -> Self {
         internal_rpc_err(value.to_string())
     }
+}
+
+/// TN(TN-0056): the pool refused another RPC transaction listener.
+fn too_many_listeners_err() -> ErrorObject<'static> {
+    jsonrpsee::types::error::ErrorObject::owned(
+        jsonrpsee::types::error::ErrorCode::ServerIsBusy.code(),
+        "too many pending transaction listeners",
+        None::<()>,
+    )
 }
 
 /// Pipes all stream items to the subscription sink.
@@ -334,15 +365,26 @@ where
     Eth: RpcNodeCore<Pool: TransactionPool>,
 {
     /// Returns a stream that yields all transaction hashes emitted by the txpool.
-    fn pending_transaction_hashes_stream(&self) -> impl Stream<Item = TxHash> {
-        ReceiverStream::new(self.eth_api.pool().pending_transactions_listener())
+    ///
+    /// TN(TN-0056): `None` when the pool refuses another RPC listener.
+    fn pending_transaction_hashes_stream(&self) -> Option<impl Stream<Item = TxHash>> {
+        self.eth_api
+            .pool()
+            .try_pending_transactions_listener_for(TransactionListenerKind::PropagateOnly)
+            .map(ReceiverStream::new)
     }
 
     /// Returns a stream that yields all transactions emitted by the txpool.
+    ///
+    /// TN(TN-0056): `None` when the pool refuses another RPC listener.
     fn full_pending_transaction_stream(
         &self,
-    ) -> impl Stream<Item = NewTransactionEvent<<Eth::Pool as TransactionPool>::Transaction>> {
-        self.eth_api.pool().new_pending_pool_transactions_listener()
+    ) -> Option<impl Stream<Item = NewTransactionEvent<<Eth::Pool as TransactionPool>::Transaction>>>
+    {
+        self.eth_api
+            .pool()
+            .try_new_transactions_listener_for(TransactionListenerKind::PropagateOnly)
+            .map(|receiver| NewSubpoolTransactionStream::new(receiver, SubPool::Pending))
     }
 }
 
@@ -374,10 +416,10 @@ where
 
     /// Returns a stream that yields all logs that match the given filter.
     fn log_stream(&self, filter: Filter) -> impl Stream<Item = Log> {
-        BroadcastStream::new(self.eth_api.provider().subscribe_to_canonical_state())
-            .map(move |canon_state| {
-                canon_state.expect("new block subscription never ends").block_receipts()
-            })
+        self.eth_api
+            .provider()
+            .canonical_state_stream()
+            .map(move |canon_state| canon_state.block_receipts())
             .flat_map(futures::stream::iter)
             .flat_map(move |(block_receipts, removed)| {
                 let all_logs = logs_utils::matching_block_logs_with_tx_hashes(

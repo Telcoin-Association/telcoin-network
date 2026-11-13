@@ -54,6 +54,8 @@ telcoin-network keytool generate observer \
     --address 0xYOUR_EXECUTION_ADDRESS
 ```
 
+Without `--external-*-addr` flags the listeners bind 127.0.0.1, which reaches only peers on the same host; an observer joining a public network binds every interface at startup, as [Run an observer against testnet](#run-an-observer-against-testnet) shows.
+
 ### keytool generate flags
 
 | Flag                               | Default                    | Description                                                                                                           |
@@ -317,8 +319,21 @@ Generate a config and keys for your observer node:
 
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
-Start your observer node:
-`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+Find the two UDP ports keytool picked for the node's listeners, the primary's first and then worker 0's:
+`grep -o 'udp/[0-9]*' DATADIR/node-info.yaml`
+
+Start your observer node, binding those two ports on every interface:
+
+```bash
+PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/PRIMARY_PORT/quic-v1 \
+WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/WORKER_PORT/quic-v1 \
+target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR
+```
+
+keytool writes a 127.0.0.1 listener when no `--external-*-addr` flag is given, and a QUIC dial leaves from the listener's socket, which cannot send from 127.0.0.1 to a public address, so without the two variables every dial to the bootstrap peers times out and the node finds no peers.
+The variables change only what the node binds: the address it advertises stays the one in `node-info.yaml`.
+Binding 0.0.0.0 accepts inbound QUIC on those ports wherever a firewall allows it; an observer works outbound-only, so the firewall can drop inbound UDP.
+[Transport](../../docs/src/network/transport.md#listener-addresses) describes the override.
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
@@ -431,12 +446,14 @@ Complete tree after the node has run:
   genesis/                        # chain genesis data
     genesis.yaml                  #   EVM genesis block
     committee.yaml                #   committee membership + bootstrap peers
-  db/                             # execution layer database (reth): mdbx.dat, or tn-lmdb.dat
-                                  #   in a build with the `tn-lmdb` feature, which moves an
-                                  #   MDBX database onto tn-lmdb at its first start and leaves
-                                  #   the marker mdbx-migrated (the copy is built in
-                                  #   tn-lmdb-migrating/, gone once the migration is done)
+  db/                             # execution layer database (reth): tn-lmdb.dat (mdbx.dat
+                                  #   in a build with the legacy `mdbx` feature); the default
+                                  #   build moves an MDBX database onto tn-lmdb at its first
+                                  #   start and leaves the marker mdbx-migrated (the copy is
+                                  #   built in tn-lmdb-migrating/, gone once the migration is done)
   static_files/                   # execution layer static files (block data)
+  execution-reset-<UTC time>/     # what `db reset-execution` moved aside (db/, static_files/,
+                                  #   restored-state-floor); `.partial` while it moves them
   consensus-db/                   # consensus protocol database
     tndb/                         #   consensus DB (tndb): one log per environment
       epoch/                      #     certificates, votes, payloads, last proposal
@@ -447,15 +464,38 @@ Complete tree after the node has run:
 ```
 
 `telcoin-network db stats` prints the static files and each table of the execution database:
-rows, pages and size. The default build reads while the node runs, and refuses a tn-lmdb database
-(`db/tn-lmdb.dat`, or the marker `db/mdbx-migrated`) as the node does. A build with the `tn-lmdb`
-feature needs the node stopped: it refuses while a node holds the datadir, and holds the datadir
-while it runs, so a node started meanwhile is refused until the report finishes. It never runs the
-MDBX to tn-lmdb migration: an MDBX database not yet migrated is refused until the node has started
-once, and an `mdbx.dat` the node refuses too (beside the marker, or beside a `tn-lmdb.dat` no
-migration left) is refused as the node refuses it. `telcoin-network db load-state` never runs the
-migration either: it restores into a fresh datadir, and a build with the `tn-lmdb` feature
-refuses a `db/` holding `mdbx.dat` before anything opens it.
+rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
+holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
+until the report finishes. It never runs the MDBX to tn-lmdb migration: an MDBX database not yet
+migrated is refused until the node has started once, and an `mdbx.dat` the node refuses too
+(beside the marker, or beside a `tn-lmdb.dat` no migration left) is refused as the node refuses
+it. A build with the legacy `mdbx` feature reads while the node runs, and refuses a tn-lmdb
+database (`db/tn-lmdb.dat`, or the marker `db/mdbx-migrated`) as the node does.
+`telcoin-network db load-state` never runs the migration either: it restores into a fresh
+datadir, and the default build refuses a `db/` holding `mdbx.dat`, or an unfinished migration
+(`db/tn-lmdb-migrating/` beside `tn-lmdb.dat`, which the node's next start finishes), before
+anything opens it.
+
+`telcoin-network db migrate-execution` runs the MDBX to tn-lmdb migration of the execution
+database with the node stopped, instead of at the node's next start: it refuses while a node
+holds the datadir, holds the datadir while it runs, takes the node's `--db.*` flags (pass what
+the node runs with, so the migrated file gets the same page size, reservation and growth step),
+finishes a migration a stopped start left after its commit point, refuses what the node's start
+refuses, and prints the rows migrated per table. With no MDBX database it has nothing to do. A
+build with the legacy `mdbx` feature refuses it.
+
+`telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
+and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
+rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
+would move. It refuses while a node holds the datadir. It also refuses a datadir whose consensus
+database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
+load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
+from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
+`consensus-db/` moved aside first. While a reset is unfinished (an `execution-reset-*.partial`
+directory), the node, `db load-state`, `db stats`, `db check` and `db migrate-execution` refuse the
+datadir, and running the reset again finishes it. The layouts, the upgrade from
+`v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage
+layouts" and "Upgrading a testnet node" sections.
 
 ## RPC configuration
 

@@ -6,9 +6,10 @@
 //! since validator RPC endpoints may be publicly reachable:
 //!
 //! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
-//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), and 1024
-//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`). These cap memory held
-//!   per connection and the fan-out of websocket subscriptions.
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 1024
+//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per
+//!   batch request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out
+//!   of websocket subscriptions, and how many calls one request can queue.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
 //!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
@@ -55,6 +56,10 @@ pub const DEFAULT_IPC_ENDPOINT: &str = r"\\.\pipe\tn.ipc";
 /// The default IPC endpoint
 #[cfg(not(windows))]
 pub const DEFAULT_IPC_ENDPOINT: &str = "/tmp/tn.ipc";
+
+/// The most permits a tokio semaphore can hold; a larger permit flag panics while the RPC
+/// server is built.
+const MAX_PERMITS: u64 = tokio::sync::Semaphore::MAX_PERMITS as u64;
 
 /// Default max number of subscriptions per connection.
 pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 1024;
@@ -133,7 +138,11 @@ pub struct RpcServerArgs {
     #[arg(long)]
     pub ipcdisable: bool,
 
-    /// Filename for IPC socket/pipe within the datadir
+    /// Path of the IPC socket (or named pipe on Windows).
+    ///
+    /// The path is host-global, not inside the datadir: `--instance N` appends `-N`, and each
+    /// worker above 0 appends `-wN`. A node refuses to start when another process is already
+    /// serving the socket; a stale socket file left by a crash is replaced.
     #[arg(long, default_value_t = DEFAULT_IPC_ENDPOINT.to_string())]
     pub ipcpath: String,
 
@@ -157,6 +166,23 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-subscriptions-per-connection", alias = "rpc-max-subscriptions-per-connection", default_value_t = RPC_DEFAULT_MAX_SUBS_PER_CONN.into())]
     pub rpc_max_subscriptions_per_connection: MaxU32,
 
+    /// Maximum number of calls in one JSON-RPC batch request, on HTTP, WS and IPC.
+    ///
+    /// A larger batch is refused whole. Each call in a batch holds its parsed parameters until it
+    /// runs, so this bounds what one request can queue (vendored TN-0055).
+    #[arg(long = "rpc.max-batch-requests", value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..), default_value_t = constants::DEFAULT_MAX_BATCH_REQUESTS)]
+    pub rpc_max_batch_requests: u32,
+
+    /// Maximum number of installed filters (`eth_newFilter`, `eth_newBlockFilter`,
+    /// `eth_newPendingTransactionFilter`) across all clients.
+    ///
+    /// Filters outlive the connection that made them and are removed only when uninstalled or
+    /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored
+    /// TN-0056). Each log filter names at most 1,000 addresses and 1,000 values per topic
+    /// position (vendored TN-0155).
+    #[arg(long = "rpc.max-active-filters", value_name = "COUNT", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), default_value_t = constants::DEFAULT_MAX_ACTIVE_FILTERS)]
+    pub rpc_max_active_filters: usize,
+
     /// Maximum number of RPC server connections.
     #[arg(long = "rpc.max-connections", alias = "rpc-max-connections", value_name = "COUNT", default_value_t = RPC_DEFAULT_MAX_CONNECTIONS.into())]
     pub rpc_max_connections: MaxU32,
@@ -167,7 +193,10 @@ pub struct RpcServerArgs {
     /// Tracing requests are generally CPU bound.
     /// Choosing a value that is higher than the available CPU cores can have a negative impact on
     /// the performance of the node and affect the node's ability to maintain sync.
-    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", default_value_t = constants::default_max_tracing_requests())]
+    ///
+    /// At least 2: `trace_filter` takes two permits at once, so with one permit it would wait
+    /// forever holding the only one, and every other tracing method with it.
+    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(2..=MAX_PERMITS), default_value_t = constants::default_max_tracing_requests())]
     pub rpc_max_tracing_requests: usize,
 
     /// Maximum number of blocks for `trace_filter` requests.
@@ -221,8 +250,9 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent getproof requests.
-    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
+    /// Maximum number of concurrent getproof requests. At least 1: with none, every
+    /// `eth_getProof` would wait forever.
+    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 
     /// The pending block behavior for `pending`-tag RPC queries.
@@ -286,6 +316,8 @@ impl Default for RpcServerArgs {
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
+            rpc_max_batch_requests: constants::DEFAULT_MAX_BATCH_REQUESTS,
+            rpc_max_active_filters: constants::DEFAULT_MAX_ACTIVE_FILTERS,
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
@@ -327,6 +359,8 @@ impl From<RpcServerArgs> for reth_node_core::args::RpcServerArgs {
             rpc_max_response_size: v.rpc_max_response_size,
             rpc_max_subscriptions_per_connection: v.rpc_max_subscriptions_per_connection,
             rpc_max_connections: v.rpc_max_connections,
+            rpc_max_batch_requests: v.rpc_max_batch_requests,
+            rpc_max_active_filters: v.rpc_max_active_filters,
             rpc_max_tracing_requests: v.rpc_max_tracing_requests,
             rpc_max_trace_filter_blocks: v.rpc_max_trace_filter_blocks,
             rpc_max_blocks_per_filter: v.rpc_max_blocks_per_filter,
@@ -381,6 +415,36 @@ mod tests {
     use crate::cli::RethCommand;
     use clap::Parser;
     use reth_rpc_builder::config::RethRpcServerConfig as _;
+
+    /// A permit count the semaphores cannot serve is refused at parse time: zero permits (or
+    /// one for tracing, which `trace_filter` needs two of) would hang the methods behind
+    /// them, and a count above tokio's maximum panics while the RPC server is built.
+    #[test]
+    fn permit_flags_are_bounded() {
+        let parse = |flag: &str, value: &str| {
+            RethCommand::try_parse_from(["tn-reth", flag, value]).map(|cmd| cmd.rpc)
+        };
+        let too_many = (MAX_PERMITS + 1).to_string();
+
+        assert!(parse("--rpc.max-tracing-requests", "0").is_err());
+        assert!(parse("--rpc.max-tracing-requests", "1").is_err());
+        assert!(parse("--rpc.max-tracing-requests", &too_many).is_err());
+        assert_eq!(parse("--rpc.max-tracing-requests", "2").unwrap().rpc_max_tracing_requests, 2);
+
+        assert!(parse("--rpc.proof-permits", "0").is_err());
+        assert!(parse("--rpc.proof-permits", &too_many).is_err());
+        assert_eq!(parse("--rpc.proof-permits", "1").unwrap().rpc_proof_permits, 1);
+
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", "0").is_err());
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", &too_many).is_err());
+        assert_eq!(
+            parse("--rpc-cache.max-concurrent-db-requests", "1")
+                .unwrap()
+                .rpc_state_cache
+                .max_concurrent_db_requests,
+            1
+        );
+    }
 
     /// The manual `Default` impl and the clap CLI default must agree on TN's own
     /// IPC endpoint, not reth's `/tmp/reth.ipc`.

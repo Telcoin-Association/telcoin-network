@@ -681,6 +681,7 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
             rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
             txpool: Default::default(),
             db: Default::default(),
+            db_gap_fill: None,
         },
         None,
         temp_dir.path(),

@@ -23,6 +23,7 @@ use crate::{
     disk_model,
     env::{self, CrashAt},
     error::Result,
+    file,
     meta::{slot_to_write, META_LEN},
     packed::PackedView,
     page::{self, Find, Val},
@@ -202,27 +203,54 @@ impl Mode {
 /// with the writer's clock moved to it, reaches it.
 const AUTO_PERIOD: Duration = Duration::from_secs(3600);
 
+thread_local! {
+    /// The `EnvOptions::gap_fill` every environment of this thread's matrix opens with
+    /// ([`open_in`]; off, but under [`with_gap_fill`]).
+    static GAP_FILL: std::cell::Cell<GapFill> = const { std::cell::Cell::new(GapFill::OFF) };
+}
+
+/// Run `f` (a matrix) with every environment it opens filling gaps as `gap_fill` says, and its
+/// dry runs checking that the durable steps filled some at the largest width, and that auto chose
+/// a width.
+pub(super) fn with_gap_fill(gap_fill: GapFill, f: impl FnOnce()) {
+    GAP_FILL.set(gap_fill);
+    f();
+    GAP_FILL.set(GapFill::OFF);
+}
+
 /// Open the file at `path` as `mode` commits.
 fn open_in(path: &Path, mode: Mode) -> Env {
     let sync_period = (mode == Mode::AutoSync).then_some(AUTO_PERIOD);
-    Env::open(path, EnvOptions { sync_period, ..options(mode.sync()) }).expect("open")
+    let gap_fill = GAP_FILL.get();
+    Env::open(path, EnvOptions { sync_period, gap_fill, ..options(mode.sync()) }).expect("open")
 }
 
-/// The crash points of a commit, in protocol order.
-const POINTS: [CrashAt; 7] = [
+/// The crash points of a commit, in protocol order. `AfterWeakMetaCopy` is a point of a
+/// `SyncMode::NoSync` commit that defers its sync alone ([`in_deferred_commit`]): the matrix
+/// skips it in the other modes, whose crash commit never copies a weak meta.
+const POINTS: [CrashAt; 8] = [
     CrashAt::BeforeSave,
     CrashAt::AfterSave,
     CrashAt::AfterStamp,
+    CrashAt::AfterWeakMetaCopy,
     CrashAt::AfterDataSync,
     CrashAt::AfterSizeSync,
     CrashAt::AfterMetaCopy,
     CrashAt::AfterMetaMsync,
 ];
 
+/// True if `at` is a point of a `SyncMode::NoSync` commit that defers its sync, the last of them
+/// after its weak meta copy; the other points are the following sync's.
+fn in_deferred_commit(at: CrashAt) -> bool {
+    matches!(
+        at,
+        CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp | CrashAt::AfterWeakMetaCopy
+    )
+}
+
 /// True if `at` stops a commit in `mode` (else it stops the following sync).
 fn stops_the_commit(mode: Mode, at: CrashAt) -> bool {
-    mode != Mode::NoSync
-        || matches!(at, CrashAt::BeforeSave | CrashAt::AfterSave | CrashAt::AfterStamp)
+    mode != Mode::NoSync || in_deferred_commit(at)
 }
 
 /// Copy the base to a tracked case file, open it as `mode` commits, make the commits (in
@@ -291,8 +319,24 @@ pub(super) fn run_case(base: &Base, mode: Mode, by_msync: bool, at: Option<Crash
     }
     let (by_file, reused, runs) =
         env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
+    let s = env.io_stats();
+    let (gaps_filled, gap_auto_steps, gap_fill_refusals) =
+        (s.gaps_filled, s.gap_auto_steps, s.gap_fill_refusals);
     env.crash();
-    Case { path, first, durable, latest, before, slot, by_file, reused, runs }
+    Case {
+        path,
+        first,
+        durable,
+        latest,
+        before,
+        slot,
+        by_file,
+        reused,
+        runs,
+        gaps_filled,
+        gap_auto_steps,
+        gap_fill_refusals,
+    }
 }
 
 /// What [`run_case`] left.
@@ -318,6 +362,13 @@ pub(super) struct Case {
     pub(super) reused: usize,
     /// How the writer placed the overflow runs of the case's commits.
     pub(super) runs: RunStats,
+    /// The gaps the case's durable steps filled (`EnvOptions::gap_fill`, [`with_gap_fill`]).
+    pub(super) gaps_filled: u64,
+    /// The case's scattered durable steps whose width `GapFill::Auto` chose.
+    pub(super) gap_auto_steps: u64,
+    /// `IoStats::gap_fill_refusals`: 1 when the file system refused the gap fill's reads, which
+    /// turned it off.
+    pub(super) gap_fill_refusals: u64,
 }
 
 /// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
@@ -353,8 +404,10 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
     let trusted = record.filter(|&(_, weak)| process || !weak);
     let reaches_m = trusted.is_some_and(|(txn, _)| txn == m_txn);
     // `M`'s steady record survives exactly when step 6 completed, may during it, and must not
-    // before it; in `NoSync` its weak record is in the slot from the crash commit on.
-    let weak_m = mode == Mode::NoSync && !stops_the_commit(mode, at);
+    // before it; in `NoSync` its weak record is in the slot from the crash commit's weak meta copy
+    // on, through the sync after it.
+    let weak_m =
+        mode == Mode::NoSync && (at == CrashAt::AfterWeakMetaCopy || !stops_the_commit(mode, at));
     match (at, loss) {
         (CrashAt::AfterMetaMsync, _) => assert!(reaches_m, "{case}: the msynced meta survives"),
         (CrashAt::AfterMetaCopy, Loss::Process) => {
@@ -402,9 +455,48 @@ fn crash_case(base: &Base, mode: Mode, by_msync: bool, at: CrashAt, loss: Loss) 
 /// sync is an `fsync`, which writes every page: only a commit that does not grow shows what one
 /// `msync` alone covers), and the base's `layout`.
 fn dry_run(base: &Base, mode: Mode, by_msync: bool) {
-    let Case { path, latest, by_file, reused, .. } = run_case(base, mode, by_msync, None);
+    let Case {
+        path, latest, by_file, reused, gaps_filled, gap_auto_steps, gap_fill_refusals, ..
+    } = run_case(base, mode, by_msync, None);
     assert_eq!(by_file, !by_msync, "{mode:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{mode:?}: pages were reused");
+    // Off, no gap is filled; at the largest gap fill the crash commit's runs always leave gaps to
+    // fill. A smaller one fills those the layout leaves short enough, perhaps none. Auto chose the
+    // width of the crash commit's durable step, a scattered one (its warm-up's first, 8 pages,
+    // the crash commit's in `Mode::Durable`), and filled what that width finds. On a file system
+    // that refuses reads that do not wait for the disk (tmpfs), the first gap read turns gap fill
+    // off instead (at the largest, always), and the rest of the case runs without it: auto files
+    // no step from the one refused on.
+    let gap_fill = GAP_FILL.get();
+    let case =
+        format!("{mode:?} page size {} gap fill {gap_fill}, by_msync={by_msync}", base.page_size);
+    let refused = gap_fill.is_on() && file::refuses_nowait_reads(base.dir.path());
+    let counts = (gaps_filled, gap_fill_refusals);
+    match gap_fill {
+        GapFill::OFF => assert_eq!(counts, (0, 0), "{case}: off fills nothing"),
+        GapFill::Pages(MAX_GAP_FILL) if refused => {
+            assert_eq!(counts, (0, 1), "{case}: refused, so turned off")
+        }
+        _ if refused => assert!(gaps_filled == 0 && gap_fill_refusals <= 1, "{case}: {counts:?}"),
+        GapFill::Pages(MAX_GAP_FILL) => {
+            assert!(gaps_filled > 0 && gap_fill_refusals == 0, "{case}: {counts:?}")
+        }
+        _ => {
+            assert_eq!(gap_fill_refusals, 0, "{case}");
+            eprintln!("{case}: {gaps_filled} gaps filled");
+        }
+    }
+    match gap_fill {
+        GapFill::Auto if refused => {
+            let chose = gap_auto_steps + gap_fill_refusals > 0;
+            assert!(chose, "{case}: auto chose a width, filed or refused: {counts:?}")
+        }
+        GapFill::Auto => assert!(gap_auto_steps > 0, "{case}: auto chose a width"),
+        _ => assert_eq!(gap_auto_steps, 0, "{case}: only auto chooses"),
+    }
+    if refused {
+        eprintln!("{case}: the file system refuses RWF_NOWAIT: gap fill turned itself off");
+    }
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     let grew = fs::metadata(&path).expect("metadata").len() > base_len;
     assert_eq!(grew, base.grows, "{mode:?}: the file grew");
@@ -428,6 +520,9 @@ pub(super) fn matrix_of(base: &Base, seeds: u64, modes: &[Mode]) {
         for by_msync in [false, true] {
             dry_run(base, mode, by_msync);
             for (n, at) in POINTS.into_iter().enumerate() {
+                if at == CrashAt::AfterWeakMetaCopy && mode != Mode::NoSync {
+                    continue;
+                }
                 for loss in [Loss::Process, Loss::Strict] {
                     crash_case(base, mode, by_msync, at, loss);
                 }
@@ -456,6 +551,35 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
     }
 }
 
+/// The matrix with `EnvOptions::gap_fill` at its largest, in every environment it opens: the
+/// durable steps rewrite the gaps between the crash commit's runs before the data sync (its dry
+/// runs check that they filled some), and every cell recovers exactly as without it.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill() {
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix(&base(4096), 3));
+}
+
+/// The matrix with `GapFill::Auto`: auto chooses the width of the crash commit's durable step
+/// (the warm-up's first, 8 pages, in `Mode::Durable`) before its data sync and files its outcome
+/// after, and every cell recovers exactly as without it. The fills' own crash safety at a width
+/// that always fills is the matrix at `MAX_GAP_FILL`'s.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_auto_gap_fill() {
+    with_gap_fill(GapFill::Auto, || matrix(&base(4096), 3));
+}
+
+/// The gap-filled matrix at two page sizes, at 4 pages, at the largest and at auto, with many
+/// random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_gap_fill_heavy() {
+    for page_size in [4096, 16384] {
+        for gap_fill in [GapFill::Pages(4), GapFill::Pages(MAX_GAP_FILL), GapFill::Auto] {
+            with_gap_fill(gap_fill, || matrix(&base(page_size), 40));
+        }
+    }
+}
+
 /// The matrix of a `NoSync` commit past `EnvOptions::sync_period` ([`Mode::AutoSync`]), which
 /// runs the durable steps over its own pages and those of the two commits before it, which
 /// deferred theirs: every crash point recovers by the `Durable` rules, `L` being the last synced
@@ -464,6 +588,20 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
 #[test]
 fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows() {
     matrix_of(&base(4096), 3, &[Mode::AutoSync]);
+}
+
+/// The automatic sync's matrix with `EnvOptions::gap_fill` at its largest: the sync fills the
+/// gaps between the runs of its own pages and the deferred commits' pages.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_with_gap_fill() {
+    with_gap_fill(GapFill::Pages(MAX_GAP_FILL), || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
+}
+
+/// The automatic sync's matrix with `GapFill::Auto`.
+#[test]
+fn every_crash_point_of_an_automatic_sync_recovers_the_state_the_protocol_allows_with_auto_gap_fill(
+) {
+    with_gap_fill(GapFill::Auto, || matrix_of(&base(4096), 3, &[Mode::AutoSync]));
 }
 
 /// The automatic sync's matrix at two page sizes, with many random power losses.
@@ -782,9 +920,11 @@ fn reopen_head_or_last_sync(
 /// checks the pages it names that were written since the last sync, and falls back to the last
 /// sync when any fails: here the kernel wrote back the weak meta's page before the others, then
 /// the volume went. Over random writebacks (some pages torn by sector) each copy opens to exactly
-/// the head's state or the last sync, never `Corrupt`, and checks; after a strict loss it opens
-/// at the last sync, which checks and takes a commit. With `trust_unsynced` off every one opens at
-/// the last sync, unchecked.
+/// the head's state or the last sync, never `Corrupt`, and checks, and never falls back when
+/// every page the head names since the last sync survived ([`head_survived`]: the oracle's
+/// direction the check is held to); a strict loss with exactly those pages written back opens at
+/// the head. After a strict loss it opens at the last sync, which checks and takes a commit.
+/// With `trust_unsynced` off every one opens at the last sync, unchecked.
 #[test]
 fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync() {
     volume_lost_opens_at_the_last_sync(&base(4096), 32);
@@ -803,13 +943,29 @@ fn a_volume_lost_in_the_same_boot_opens_at_the_last_sync_heavy() {
 /// writebacks.
 fn volume_lost_opens_at_the_last_sync(base: &Base, seeds: u64) {
     let (path, synced, head) = lost_head(base, "lost");
+    let new = fs::read(&path).expect("the head's bytes");
+    // The pages the head needs, from the head file itself (a process crash: every page is there).
+    let needed = {
+        let env = Env::open_read_only(&path, options(SyncMode::NoSync)).expect("the head");
+        assert_eq!(env.stat().txn_id, head.0, "the head file opens at the head");
+        assert!(env::take_weak_head_check().is_some_and(|c| c.is_ok()), "the head's check passes");
+        pages_since(&env, synced.0)
+    };
     let mut fell_back = 0;
     for seed in 0..seeds {
         let copy = base.dir.path().join(format!("lost{seed}"));
         disk_model::copy_tracked(&path, &copy);
         disk_model::volume_loss_random(&copy, seed);
         let case = format!("{seed}");
-        fell_back += u32::from(reopen_head_or_last_sync(&copy, &synced, &head, &case));
+        let kept =
+            head_survived(&new, &fs::read(&copy).expect("read"), base.page_size, head.0, &needed);
+        let fell = reopen_head_or_last_sync(&copy, &synced, &head, &case);
+        assert!(
+            !(kept && fell),
+            "seed {seed}: every page the head names since the last sync survived, yet open fell \
+             back"
+        );
+        fell_back += u32::from(fell);
         let env = open_trusting(&copy, false).expect("the last sync");
         assert_eq!(
             env::take_weak_head_check(),
@@ -822,6 +978,22 @@ fn volume_lost_opens_at_the_last_sync(base: &Base, seeds: u64) {
         fs::remove_file(&copy).expect("remove");
     }
     assert!(fell_back > 0, "some writeback leaves the head naming lost pages");
+    // A strict loss after a writeback of exactly the pages the head needs: open keeps the head.
+    let copy = base.dir.path().join("lost-needed");
+    disk_model::copy_tracked(&path, &copy);
+    disk_model::volume_loss(&copy);
+    let file = fs::OpenOptions::new().write(true).open(&copy).expect("open");
+    let size = u64::from(base.page_size);
+    for &p in &needed {
+        let at = (u64::from(p) * size) as usize;
+        file.write_all_at(&new[at..at + size as usize], at as u64).expect("write the page back");
+    }
+    drop(file);
+    assert!(
+        !reopen_head_or_last_sync(&copy, &synced, &head, "needed pages"),
+        "the head's pages survived"
+    );
+    disk_model::untrack(&copy);
     disk_model::volume_loss(&path);
     let strict = reopen_head_or_last_sync(&path, &synced, &head, "strict");
     assert!(strict, "a strict loss falls back");

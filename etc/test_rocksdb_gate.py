@@ -32,6 +32,8 @@ class RocksdbGate(unittest.TestCase):
         (self.root / "etc").mkdir()
         shutil.copy(GATE, self.root / "etc" / GATE.name)
         (self.root / "Cargo.lock").write_text(LOCK)
+        (self.root / "vendor/reth/tn").mkdir(parents=True)
+        (self.root / "vendor/reth/tn/test-only.lock").write_text(LOCK)
         (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/x"]\n')
         for d in ("vendor/reth/crates/x", "bin/x", "crates/x", "examples/x", "patches/x"):
             (self.root / d).mkdir(parents=True)
@@ -43,8 +45,8 @@ class RocksdbGate(unittest.TestCase):
         return r.returncode, r.stdout + r.stderr
 
     def test_clean_tree_passes(self):
-        self.assertEqual(self.gate(), (0, "rocksdb guard passed: no rocksdb package in Cargo.lock "
-                                          "and no rocksdb in any manifest\n"))
+        self.assertEqual(self.gate(), (0, "rocksdb guard passed: no rocksdb package in either "
+                                          "lockfile and no rocksdb in any manifest\n"))
 
     def test_any_rocksdb_package_in_the_lockfile_fails(self):
         for name in ("rocksdb", "librocksdb-sys", "rust-librocksdb-sys", "rust-rocksdb"):
@@ -53,6 +55,19 @@ class RocksdbGate(unittest.TestCase):
                 rc, out = self.gate()
                 self.assertEqual(rc, 1)
                 self.assertIn(f'name = "{name}"', out)
+
+    def test_rocksdb_pinned_for_the_vendored_tests_fails(self):
+        (self.root / "vendor/reth/tn/test-only.lock").write_text(
+            LOCK + STANZA.format(name="librocksdb-sys"))
+        rc, out = self.gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("vendor/reth/tn/test-only.lock contains RocksDB packages", out)
+
+    def test_missing_test_only_lock_fails_closed(self):
+        (self.root / "vendor/reth/tn/test-only.lock").unlink()
+        rc, out = self.gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("vendor/reth/tn/test-only.lock not found", out)
 
     def test_manifest_under_patches_fails(self):
         (self.root / "patches/x/Cargo.toml").write_text(

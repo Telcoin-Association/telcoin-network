@@ -50,6 +50,7 @@ use reth_node_core::{
     node_config::{NodeConfig, DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB},
 };
 use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
+use tn_lmdb_reth::GapFill;
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::{info, warn};
 
@@ -57,14 +58,23 @@ use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
     rpc_tx_forward::TxForwardConfig,
+    StorageLayout,
 };
 
 /// A wrapper abstraction around a Reth node config.
 ///
 /// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
-/// `--sanitize-txs`), which reth's `NodeConfig` has no place for.
+/// `--sanitize-txs`), which reth's `NodeConfig` has no place for. The third is the storage layout
+/// a new datadir gets ([`RethConfig::new_datadir_layout`]). The fourth is tn-lmdb's gap fill,
+/// `--db.gap-fill` (off, a width in pages, or auto; [`RethConfig::db_gap_fill`]), which reth's
+/// `DatabaseArgs` has no place for.
 #[derive(Clone, Debug)]
-pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>, pub(crate) TxForwardConfig);
+pub struct RethConfig(
+    pub(crate) NodeConfig<RethChainSpec>,
+    pub(crate) TxForwardConfig,
+    pub(crate) StorageLayout,
+    pub(crate) GapFill,
+);
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -87,7 +97,29 @@ pub struct RethCommand {
     /// All database related arguments
     #[clap(flatten)]
     pub db: DatabaseArgs,
+
+    /// tn-lmdb only: gap fill, `auto`, `off` or a width in pages (at most 64; 0 is off). Unset, it
+    /// is `auto` on Linux and off elsewhere ([`DEFAULT_DB_GAP_FILL`]). A durable commit first
+    /// rewrites each gap of at most this many clean pages between two runs of its dirty pages with
+    /// the bytes they hold, so the disk takes fewer, larger writes for more bytes written. A width
+    /// suits disks that cap I/Os per second (cloud block storage), not local NVMe; `auto` chooses
+    /// the width per commit from the disk's measured costs (settling at 0 where filling does not
+    /// pay). Refused on MDBX, whose build defaults to off.
+    #[arg(long = "db.gap-fill", value_name = "PAGES|auto", help_heading = "Database")]
+    pub db_gap_fill: Option<GapFill>,
 }
+
+/// The gap fill a node runs with when `--db.gap-fill` is unset.
+///
+/// [`GapFill::Auto`] on the tn-lmdb build on Linux: bytes on disk are the same whatever width it
+/// picks, it settles at 0 on local NVMe, and it cuts the write I/Os of a durable commit on cloud
+/// block storage that caps them per second. Off on the MDBX build, which refuses gap fill, and on
+/// other OSes: macOS syncs a commit as ranged msyncs, which mislead the width's cost fit.
+pub const DEFAULT_DB_GAP_FILL: GapFill = if cfg!(all(target_os = "linux", not(feature = "mdbx"))) {
+    GapFill::Auto
+} else {
+    GapFill::OFF
+};
 
 /// The reth rpc modules an operator may enable at all.
 ///
@@ -290,7 +322,8 @@ impl RethConfig {
         // TN's per-sender slot default is seeded into reth's global pool defaults by
         // `init_reth_defaults` before parsing, so `txpool` already carries either that default
         // or the operator's explicit value. Nothing to override here.
-        let RethCommand { mut rpc, txpool, db } = reth_config;
+        let RethCommand { mut rpc, txpool, db, db_gap_fill } = reth_config;
+        crate::env::database::warn_max_size_is_a_reservation(&db);
 
         Self::validate_rpc_modules(rpc.http, &mut rpc.http_api);
         Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);
@@ -445,13 +478,50 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this, tx_forward)
+        Self(
+            this,
+            tx_forward,
+            StorageLayout::for_new_datadirs(),
+            db_gap_fill.unwrap_or(DEFAULT_DB_GAP_FILL),
+        )
     }
 
     /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
     /// restores, tests), with transaction forwarding off.
     pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
-        Self(node_config, TxForwardConfig::default())
+        Self(
+            node_config,
+            TxForwardConfig::default(),
+            StorageLayout::for_new_datadirs(),
+            GapFill::OFF,
+        )
+    }
+
+    /// The storage layout a new datadir gets: [`StorageLayout::for_new_datadirs`] unless
+    /// [`Self::with_new_datadir_layout`] chose another. An existing datadir always opens in the
+    /// layout it was created with (`env::layout`).
+    pub fn new_datadir_layout(&self) -> StorageLayout {
+        self.2
+    }
+
+    /// This config, giving a new datadir `layout`: for benches and tests that compare the
+    /// layouts. The MDBX build refuses v2 when it creates the datadir.
+    pub fn with_new_datadir_layout(mut self, layout: StorageLayout) -> Self {
+        self.2 = layout;
+        self
+    }
+
+    /// tn-lmdb's gap fill (`--db.gap-fill`; [`DEFAULT_DB_GAP_FILL`] when unset, off for a config
+    /// built without a parsed [`RethCommand`]), which the database open passes to
+    /// the engine (`EnvOptions::gap_fill`). The MDBX build refuses any but off at the open.
+    pub fn db_gap_fill(&self) -> GapFill {
+        self.3
+    }
+
+    /// This config, with tn-lmdb's gap fill at `gap_fill`: for benches.
+    pub fn with_db_gap_fill(mut self, gap_fill: GapFill) -> Self {
+        self.3 = gap_fill;
+        self
     }
 
     /// The node's `--forward-txs` / `--sanitize-txs` settings.

@@ -331,6 +331,11 @@ impl TransactionFactory {
         Address::from_slice(&hash[12..])
     }
 
+    /// The nonce of the next transaction.
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     /// Change the nonce for the next transaction.
     pub fn set_nonce(&mut self, nonce: u64) {
         self.nonce = nonce;

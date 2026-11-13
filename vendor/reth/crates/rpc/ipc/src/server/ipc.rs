@@ -6,7 +6,7 @@ use jsonrpsee::{
     core::{server::helpers::prepare_error, JsonRawValue},
     server::middleware::rpc::RpcServiceT,
     types::{
-        error::{reject_too_big_request, ErrorCode},
+        error::{reject_too_big_batch_request, reject_too_big_request, ErrorCode},
         ErrorObject, Id, InvalidRequest, Notification, Request,
     },
     BatchResponseBuilder, MethodResponse,
@@ -31,6 +31,7 @@ pub(crate) struct Batch<S> {
 pub(crate) async fn process_batch_request<S>(
     b: Batch<S>,
     max_response_body_size: usize,
+    max_batch_requests: usize,
 ) -> Option<String>
 where
     S: RpcServiceT<MethodResponse = MethodResponse> + Send,
@@ -38,6 +39,13 @@ where
     let Batch { data, rpc_service } = b;
 
     if let Ok(batch) = serde_json::from_slice::<Vec<&JsonRawValue>>(&data) {
+        // TN(TN-0055): the same limit and error as jsonrpsee's HTTP and WS servers.
+        if batch.len() > max_batch_requests {
+            return Some(
+                batch_response_error(Id::Null, reject_too_big_batch_request(max_batch_requests))
+                    .to_string(),
+            )
+        }
         let mut got_notif = false;
         let mut batch_response = BatchResponseBuilder::new_with_limit(max_response_body_size);
 
@@ -114,6 +122,7 @@ pub(crate) async fn call_with_service<S>(
     rpc_service: S,
     max_response_body_size: usize,
     max_request_body_size: usize,
+    max_batch_requests: usize,
     conn: Arc<OwnedSemaphorePermit>,
 ) -> Option<String>
 where
@@ -153,7 +162,12 @@ where
             }
         }
     } else {
-        process_batch_request(Batch { data, rpc_service }, max_response_body_size).await
+        process_batch_request(
+            Batch { data, rpc_service },
+            max_response_body_size,
+            max_batch_requests,
+        )
+        .await
     };
 
     drop(conn);

@@ -19,7 +19,7 @@ use crate::pipeline_helpers::{
 };
 use reth_chain_state::ComputedTrieData;
 use reth_provider::{DBProvider as _, HashedPostStateProvider as _, StateRootProvider as _};
-use reth_revm::{db::AccountStatus, primitives::KECCAK_EMPTY, state::AccountInfo};
+use reth_revm::db::AccountStatus;
 use reth_trie::{HashedPostState, HashedStorage, StateRoot, TrieInput, TrieInputSorted};
 use reth_trie_db::DatabaseStateRoot as _;
 use secp256k1::rand::{rngs::StdRng, RngCore as _, SeedableRng as _};
@@ -123,9 +123,9 @@ fn seeded_deltas(rng: &mut StdRng) -> Vec<HashedPostState> {
     ]
 }
 
-/// Trie-level differential: per block, the layered-cursor root and updates equal
-/// reth's `overlay_root_from_nodes_with_updates` over the `prepend_self`-merged
-/// `TrieInput` built from the same deltas (#1301).
+/// Trie-level differential: per block, the layered-cursor root and updates, serial and with
+/// parallel storage roots, equal reth's `overlay_root_from_nodes_with_updates` over the
+/// `prepend_self`-merged `TrieInput` built from the same deltas (#1301).
 /// Includes interleaving distinct keys across carries at 8, 16, 32, and 64 blocks.
 #[test]
 fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<()> {
@@ -156,6 +156,12 @@ fn test_layered_overlay_root_matches_merged_trie_input_oracle() -> eyre::Result<
 
             assert_eq!(new_root, oracle_root, "state root diverged at block {i}");
             assert_eq!(new_updates, oracle_updates, "trie updates diverged at block {i}");
+
+            // the same root with the changed storage roots on parallel tasks
+            let (par_root, par_updates) =
+                env.reth_env.parallel_layered_root_for_test(&overlay, delta.clone())?;
+            assert_eq!(par_root, oracle_root, "parallel state root diverged at block {i}");
+            assert_eq!(par_updates, oracle_updates, "parallel trie updates diverged at block {i}");
 
             // advance both accumulations exactly as production does: the block's own
             // sorted deltas plus the updates its root computation produced
@@ -328,7 +334,7 @@ fn test_timed_build_matches_untimed_build() -> eyre::Result<()> {
 /// Signers recovered ahead of the build (`recover_output_signers`, as the engine's background job
 /// runs it) build the blocks the bytes path builds. One three-batch output, split across two
 /// certificates, is built block by block through `build_block_from_batch_payload` from each
-/// batch's bytes (its own output overlay, a fresh read cache per block) and through
+/// batch's bytes (its own output overlay) and through
 /// `build_block_from_recovered_payload` from the batch's entry of the recovered signers (one
 /// build scope for the output, as the engine passes it), and the two must agree on the block
 /// hash, state root, gas, receipts and bundle state.
@@ -461,26 +467,15 @@ fn test_recovered_build_matches_bytes_build() -> eyre::Result<()> {
 /// read of an account that neither touches it nor changes it.
 const PROBE_RUNTIME: [u8; 7] = [0x5f, 0x35, 0x3f, 0x5f, 0x35, 0x55, 0x00];
 
-/// The cache entry of `address`: `None` without one, `Some(None)` for an account cached as absent.
-fn cached_info(scope: &OutputBuildScope, address: Address) -> Option<Option<AccountInfo>> {
-    scope.reads().accounts.get(&address).map(|account| account.info.clone())
-}
-
-/// The cached value of `address`'s storage `slot`, if the cache holds one.
-fn cached_slot(scope: &OutputBuildScope, address: Address, slot: u64) -> Option<U256> {
-    scope.reads().accounts.get(&address)?.storage.get(&U256::from(slot)).copied()
-}
-
-/// One read cache kept across the blocks of a consensus output builds the blocks a fresh cache
-/// per block builds (E5). A three-block output is built in memory, without persisting, twice from
-/// the same payloads: through the bytes path, which reads every value from the parent state
-/// provider, and through the recovered path with ONE build scope for the output. The two must
-/// agree on block hash, state root, receipts root, gas, receipts and bundle state at every block,
-/// and the shared cache's contents are asserted after each block.
+/// The cross-block execution cache builds an unpersisted output's blocks exactly as a build
+/// without it (E5). A three-block output is built in memory, without persisting, twice from the
+/// same payloads on one env: first through the bytes path, which finds the execution cache
+/// anchored at its parent (checked in by the previous block's builds) and reads through it, then
+/// through the recovered path with ONE build scope for the output, which finds the cache moved
+/// past its parent and starts empty. The two must agree on block hash, state root, receipts root,
+/// gas, receipts and bundle state at every block, and no checked hit may have been stale.
 ///
-/// The output walks every branch of the cache's update rule with a repeated sender:
-/// After every block the whole cache is also checked against the state the next block reads
-/// (`PipelineTestEnv::cache_mismatches`).
+/// The output walks every wiped-account case of the cache with a repeated sender:
 ///
 /// - block 1 deploys a CREATE2 factory and a probe by transaction, probes an existing empty
 ///   account, creates and self-destructs child A in one transaction and funds child B's future
@@ -494,7 +489,7 @@ fn cached_slot(scope: &OutputBuildScope, address: Address, slot: u64) -> Option<
 /// One revm `State` kept across the blocks fails this shape: A's sticky `DestroyedChanged` makes
 /// reth rebuild its storage as wiped and drop block 2's slot 1 from the root.
 #[test]
-fn test_shared_read_cache_matches_fresh_reads() -> eyre::Result<()> {
+fn test_execution_cache_matches_fresh_reads() -> eyre::Result<()> {
     let mut env = PipelineTestEnv::new_with_empty_governance_eoa();
     let user = env.user_factory.address();
     let empty = env.governance_factory.address();
@@ -540,71 +535,35 @@ fn test_shared_read_cache_matches_fresh_reads() -> eyre::Result<()> {
 
     let mut overlay = OutputTrieOverlay::new();
     let mut scope = OutputBuildScope::new();
-    let mut sent = 0;
     for (i, txs) in blocks.iter().enumerate() {
-        sent += txs.len() as u64;
         let (fresh, shared) =
             env.build_unpersisted_fresh_and_shared(txs, &mut overlay, &mut scope)?;
         assert_eq!(block_differences(&fresh, &shared), Vec::<&str>::new(), "block {}", i + 1);
-        // every cached account, slot, bytecode and block hash equals the next block's parent state
-        assert_eq!(env.cache_mismatches(&scope, &fresh)?, Vec::<String>::new(), "block {}", i + 1);
+        assert_eq!(env.reth_env.execution_cache_rebuilds(), 0, "block {}: a stale hit", i + 1);
         assert_eq!(fresh.recovered_block.transaction_count(), txs.len(), "block {}", i + 1);
         for index in 0..txs.len() {
             assert!(env.tx_succeeded(&fresh, index), "block {} tx {index} failed", i + 1);
         }
         let bundle = &fresh.execution_output.state;
-        let reads = scope.reads();
-        // the sender and every contract read by the block are cached at their post-block state,
-        // without code; the read cache never carries an account's code or `account_id` storage hint
-        assert!(reads
-            .accounts
-            .values()
-            .filter_map(|account| account.info.as_ref())
-            .all(|info| info.code.is_none() && info.account_id.is_none()));
-        let user_info = cached_info(&scope, user).flatten().expect("sender cached");
-        assert_eq!(user_info.nonce, sent, "sender nonce after block {}", i + 1);
-        let factory_info = cached_info(&scope, factory).flatten().expect("factory cached");
-        assert_eq!(factory_info.code_hash, keccak256(FACTORY_RUNTIME));
-
         match i {
             0 => {
                 // created and destroyed in one transaction: not an account after the block
-                assert_eq!(cached_info(&scope, child_a).flatten(), None, "A after block 1");
                 assert!(bundle.state.get(&child_a).is_none_or(|account| account.info.is_none()));
-                // read, not touched: the empty account is cached as it is, an existing account
-                let empty_info = cached_info(&scope, empty).flatten().expect("empty cached");
-                assert!(empty_info.is_empty(), "the empty account is cached empty");
-                // funded by a transfer: a balance-only account
-                let b = cached_info(&scope, child_b).flatten().expect("B funded in block 1");
-                assert_eq!((b.balance, b.code_hash), (U256::from(1), KECCAK_EMPTY));
             }
             1 => {
-                // recreated with slot 1: cached without code, storage from the bundle only
-                let a = cached_info(&scope, child_a).flatten().expect("A cached after block 2");
-                assert_eq!((a.balance, a.nonce, a.code_hash), (U256::from(7), 1, child_code_hash));
-                assert_eq!(cached_slot(&scope, child_a, 1), Some(U256::from(7)));
-                assert_eq!(scope.reads().accounts[&child_a].storage.len(), 1);
-                // destroyed and recreated within the block: evicted, read again from the provider
+                // destroyed and recreated within the block
                 assert_eq!(bundle.state[&child_b].status, AccountStatus::DestroyedChanged);
-                assert_eq!(cached_info(&scope, child_b), None, "B evicted after block 2");
-                // cleared under EIP-161: destroyed without info, evicted
+                // cleared under EIP-161: destroyed without info
                 assert!(bundle.state[&empty].info.is_none());
                 assert!(bundle.state[&empty].status.was_destroyed());
-                assert_eq!(cached_info(&scope, empty), None, "cleared account evicted");
             }
             _ => {
-                assert_eq!(cached_slot(&scope, child_a, 1), Some(U256::from(7)));
-                assert_eq!(cached_slot(&scope, child_a, 2), Some(U256::from(12)));
-                // re-read from the provider in block 3: the value block 2 wrote
-                assert_eq!(cached_slot(&scope, child_b, 1), Some(U256::from(9)));
-                assert_eq!(cached_slot(&scope, child_b, 2), Some(U256::from(14)));
                 // touched again: no longer an account, and no second destruction in the bundle
-                assert_eq!(cached_info(&scope, empty), Some(None), "cleared account stays absent");
                 assert!(
                     !bundle.state.contains_key(&empty),
                     "a dead account is not destroyed twice"
                 );
-                // the probe stored A's code hash, read through the cached info
+                // the probe stored A's code hash
                 assert_eq!(
                     bundle.state[&probe].storage[&U256::from_be_bytes(child_a.into_word().0)]
                         .present_value,

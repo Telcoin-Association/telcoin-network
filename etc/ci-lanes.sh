@@ -4,7 +4,7 @@
 #
 # Two callers run these, and the point of this file is that they cannot drift apart:
 #
-#   etc/test-and-attest.sh     a maintainer runs every lane locally, plus the e2e suites,
+#   etc/test-and-attest.sh     a maintainer runs the lanes of `all` locally, plus the e2e suites,
 #                              then attests the HEAD commit hash on adiri.
 #   .github/workflows/pr.yaml  runs them on `pull_request` (for PRs no maintainer has
 #                              attested) and on `merge_group` (for every PR, against
@@ -15,7 +15,7 @@
 # the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
 # exists only because nextest has no other way to build a lane without running it.
 #
-# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes with
+# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes of `all` with
 # `--build-only` after every push to main that the merge queue did not make. A
 # security-advisory merge reaches main without either pr.yaml event, so that workflow is
 # what says such a commit still compiles. It reports after the fact and gates nothing.
@@ -29,8 +29,8 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>
-#        etc/ci-lanes.sh <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-mdbx|test-vendor-reth|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-mdbx|test-vendor-reth> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
 # the four test lanes and nothing else, and it is the only option there is: no flag passes
@@ -63,8 +63,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tn-lmdb|test-vendor-reth|all>" >&2
-    echo "       $0 <test-default|test-adiri|test-tn-lmdb|test-vendor-reth> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-mdbx|test-vendor-reth|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-mdbx|test-vendor-reth> --build-only" >&2
     exit 2
 }
 
@@ -88,7 +88,7 @@ lane_fmt() {
 }
 
 lane_clippy() {
-    # Two passes, because neither compiles what the other does.
+    # Three passes, because none compiles what the others do.
     #
     # 1. The release graph: the packages of the three shipped binaries, libraries and
     #    binaries only, under default features and with no dev-dependencies. `--workspace`
@@ -99,28 +99,53 @@ lane_clippy() {
     #    `test-utils` feature on (the only extras their union adds are reqwest/json and
     #    hyper-util/server-graceful), so this pass compiles each crate the way the release
     #    does, and it is the only compile of the `#[cfg(not(feature = "test-utils"))]` arms
-    #    in tn-types. No lane compiled that graph before this pass (2026-10-29).
+    #    in tn-types. No lane compiled that graph before this pass (2026-10-29). It is also the
+    #    shipped tn-lmdb graph: tn-lmdb is the default backend, so this pass is the one compile
+    #    of the `#[cfg(not(feature = "test-utils"))]` arms of tn-reth's backend code.
     # 2. --workspace --all-targets --all-features: every lib, bin, test, bench and example
     #    target and every positive feature arm, so test code is compiled and linted too.
     #    When the lane built libraries only, test code that did not compile reached main
     #    (2026-10-29). crates/tn-reth's output_overlay bench needs `bench-internals`, and
     #    no lane compiled it before.
+    # 3. The same, with every feature but `mdbx`. `--all-features` includes tn-reth's opt-in
+    #    `mdbx` feature, which swaps the reth execution database to MDBX, so pass 2 lints the
+    #    MDBX arms and never the default backend's (tn-lmdb's) test and test-utils code: the
+    #    `#[cfg(not(feature = "mdbx"))]` test arms, the MDBX migration's tests among them.
+    #    The release graph pass lints only their library code. `mdbx` adds no dependency, so
+    #    this pass reuses pass 2's dependencies and re-lints only what depends on tn-reth.
     #
-    # Neither pass lints code that compiles only under default features outside the release
-    # graph, test code and its `#[cfg(not(feature = ...))]` arms included. lane_test_default
-    # compiles it under the same RUSTFLAGS wherever it runs (the merge queue, and pull
-    # requests that are neither drafts nor a maintainer's), and the attested run compiles
-    # it before a maintainer's PR can be queued. A third pass, --all-targets under default
-    # features, compiled exactly the targets nextest compiles under the same feature
+    # No pass lints code that compiles only under default features outside the release
+    # graph, test code and its other `#[cfg(not(feature = ...))]` arms included.
+    # lane_test_default compiles it under the same RUSTFLAGS wherever it runs (the merge
+    # queue, and pull requests that are neither drafts nor a maintainer's), and the attested
+    # run compiles it before a maintainer's PR can be queued. A pass with --all-targets under
+    # default features compiled exactly the targets nextest compiles under the same feature
     # resolution, and was dropped for that reason.
     run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network -p tn-worker-gateway -p tn-node-record-api -- -D warnings
     run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
-    # 3. The shipped tn-lmdb graph: the node binary with `tn-lmdb` on and nothing else, as
-    #    `make build-e2e-bin-tn-lmdb` and a release with the feature build it. The all-features
-    #    pass compiles the feature only beside `test-utils`, so the `#[cfg(not(feature =
-    #    "test-utils"))]` arms under `tn-lmdb` (tn-reth's backend code) compiled in no lane.
-    run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network --features telcoin-network/tn-lmdb -- -D warnings
-    echo "clippy passed: release graph, workspace all targets with all features, the tn-lmdb release graph"
+    # A separate assignment, so a failed `cargo metadata` stops the lane (set -e) instead of
+    # leaving an empty list, which would lint default features only.
+    local features
+    features=$(workspace_features_but_mdbx)
+    [[ -n $features ]] || { echo "clippy: no workspace features read" >&2; exit 1; }
+    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --features "$features" \
+        -- -D warnings
+    echo "clippy passed: release graph, workspace all targets with all features and with all but mdbx"
+}
+
+# Every feature of every workspace member except `default` and `mdbx`, package-qualified and
+# comma-separated, from the manifests: clippy's third pass, `--all-features` without the opt-in
+# MDBX backend. Read from cargo, so a feature added later joins the pass with no edit here.
+workspace_features_but_mdbx() {
+    cargo metadata --locked --no-deps --format-version 1 | python3 -B -I -c '
+import json, sys
+meta = json.load(sys.stdin)
+members = set(meta["workspace_members"])
+print(",".join(sorted(
+    pkg["name"] + "/" + feature
+    for pkg in meta["packages"] if pkg["id"] in members
+    for feature in pkg["features"] if feature not in ("default", "mdbx")
+)))'
 }
 
 # Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
@@ -183,6 +208,12 @@ check_gateway_image_context() {
 
 lane_test_default() {
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
+    # This lane is the tn-lmdb lane, and the release is the tn-lmdb build, only while no crate
+    # turns tn-reth's `mdbx` feature on: every backend test checks "this build's engine", so a
+    # crate that did would move both onto MDBX with every test green. etc/backend-gate.sh reads
+    # the resolved features (compiles nothing); its planted-workspace tests run first.
+    run python3 -B -I -m unittest discover -s etc -p 'test_backend_gate.py'
+    run ./etc/backend-gate.sh
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
@@ -198,6 +229,17 @@ lane_test_default() {
     # `check_gateway_image_context` above covers the image's COPY list.
     run cargo build --locked -p tn-worker-gateway --bin worker-gateway
     run cargo nextest run --locked --workspace "${run_mode[@]}"
+    # New tn-lmdb datadirs are storage layout v2, so the run above gives every temp chain v2,
+    # and layout v1 on tn-lmdb, which every testnet datadir migrated from MDBX keeps until it is
+    # rebuilt, would run only in its explicit-layout tests. TN_TEST_NEW_DATADIR_LAYOUT=v1 gives
+    # temp chains v1 instead (`TEST_NEW_DATADIR_LAYOUT_VAR` in tn-reth's env/genesis.rs). It is
+    # test-only: tn-reth reads it only in test builds and only in its temp chain constructors,
+    # never on the node's or `db load-state`'s path, and `the_default_build_gives_new_datadirs_v2`
+    # checks the node's config still gives v2 under it. tn-reth's and tn-engine's suites hold
+    # the commit, startup-heal, epoch and pinned-read tests that run on temp chains. The filter
+    # keeps the workspace's feature resolution, so the binaries above are reused, not rebuilt.
+    run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked --workspace \
+        -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
 }
 
 lane_test_adiri() {
@@ -223,26 +265,30 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
-lane_test_tn_lmdb() {
-    # lane_test_default runs every reth database on MDBX, the default backend, so it never
-    # runs reth on tn-lmdb. This is the same workspace run with tn-reth's `tn-lmdb` feature:
-    # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
-    # the CLI and every test built on them) to tn-lmdb, so between the two lanes each of those
-    # tests runs once against each engine. The feature changes only tn-reth (it adds tn-lmdb-reth
-    # as tn-reth's dependency, with no feature change on any other package), so a package with no
-    # dependency path to tn-reth, dev-dependencies included (`cargo tree --workspace -i tn-reth
-    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's,
-    # the adapter's and the engine bench's suites are such packages and are excluded. Every
-    # other package reaches tn-reth, if only through a dev-dependency, and reruns here
-    # (tn-utils, with no path either, holds a single test).
+lane_test_mdbx() {
+    # Not part of CI, the merge queue, the attestation or `all`: MDBX is the legacy backend, kept
+    # unchanged until testnet has resynced and then removed, and the migration and resync e2e
+    # suites (make test-e2e-reth-migration, test-e2e-resync) cover the move off it. Run by hand.
+    #
+    # lane_test_default runs every reth database on tn-lmdb, the default backend, so it never
+    # runs reth on MDBX. This is the same workspace run with tn-reth's opt-in `mdbx` feature,
+    # the legacy backend kept until testnet has resynced: feature unification switches every
+    # crate that opens a reth database (tn-reth, tn-node, the CLI and every test built on them)
+    # to MDBX, so between the two lanes each of those tests runs once against each engine. The
+    # feature changes only tn-reth's own code (it adds no dependency and changes no feature of
+    # any other package), so a package with no dependency path to tn-reth, dev-dependencies
+    # included (`cargo tree --workspace -i tn-reth -e normal,build,dev`), builds and tests the
+    # same as in lane_test_default. The engine's, the adapter's and the engine bench's suites are such
+    # packages and are excluded. Every other package reaches tn-reth, if only through a dev-dependency, and
+    # reruns here (tn-utils, with no path either, holds a single test).
     run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
-        --exclude tn-lmdb-bench \
-        --features tn-reth/tn-lmdb "${run_mode[@]}"
-    # The adiri-gated tn-reth suites on tn-lmdb: the consensus-registry fork tests and their
+        --exclude tn-lmdb-bench --features tn-reth/mdbx "${run_mode[@]}"
+    # The adiri-gated tn-reth suites on MDBX: the consensus-registry fork tests and their
     # determinism oracles read reth state through the database, and lane_test_adiri runs them
-    # on MDBX only. The other adiri packages have no database path of their own.
+    # on tn-lmdb, the default backend, only. The other adiri packages have no database path of
+    # their own.
     run cargo nextest run --locked -p tn-reth \
-        --features tn-reth/adiri,tn-reth/test-utils,tn-reth/tn-lmdb "${run_mode[@]}"
+        --features tn-reth/adiri,tn-reth/test-utils,tn-reth/mdbx "${run_mode[@]}"
 }
 
 lane_test_vendor_reth() {
@@ -250,9 +296,13 @@ lane_test_vendor_reth() {
     # repositories, workspaces and lockfiles.
     run python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py'
     run python3 -B -I -m unittest discover -s etc -p 'test_rocksdb_gate.py'
+    # The nested workspace resolves only packages TN's Cargo.lock or tn/test-only.lock pins, and
+    # the vendored crates resolve TN's versions of what they share with TN (tn/lockfile.py).
+    run python3 -B -I vendor/reth/tn/lockfile.py check
     # reth's own unit and integration tests for the vendored crates (vendor/reth/README.md).
     # They resolve only inside the nested workspace, which tn/cargo.sh runs with its lockfile
-    # seeded from TN's; reth's dev-dependencies add packages to it, so --locked cannot apply.
+    # seeded from TN's and tn/test-only.lock; reth's dev-dependencies add packages to it, so
+    # --locked cannot apply, and the check above stands in for it.
     # Neither the root workspace lanes above nor clippy reach these tests, and the regression
     # tests of every backport in vendor/reth/CHANGES.md live here. reth-db runs on its own with
     # two threads: at the default count macOS fails some MDBX opens with ENOMEM
@@ -271,7 +321,7 @@ case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri | test-tn-lmdb | test-vendor-reth) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-mdbx | test-vendor-reth) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -283,14 +333,13 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
-test-tn-lmdb) lane_test_tn_lmdb ;;
+test-mdbx) lane_test_mdbx ;;
 test-vendor-reth) lane_test_vendor_reth ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
-    lane_test_tn_lmdb
     lane_test_vendor_reth
     ;;
 *) usage ;;

@@ -1,4 +1,4 @@
-use jsonrpsee::server::ServerConfigBuilder;
+use jsonrpsee::server::{BatchRequestConfig, ServerConfigBuilder};
 use reth_node_core::args::RpcServerArgs;
 use reth_rpc_eth_types::{EthConfig, EthStateCacheConfig, GasPriceOracleConfig};
 use reth_rpc_layer::JwtSecret;
@@ -76,6 +76,7 @@ impl RethRpcServerConfig for RpcServerArgs {
             .max_trace_filter_blocks(self.rpc_max_trace_filter_blocks)
             .max_blocks_per_filter(self.rpc_max_blocks_per_filter.unwrap_or_max())
             .max_logs_per_response(self.rpc_max_logs_per_response.unwrap_or_max() as usize)
+            .max_active_filters(self.rpc_max_active_filters)
             .eth_proof_window(self.rpc_eth_proof_window)
             .rpc_gas_cap(self.rpc_gas_cap)
             .rpc_max_simulate_blocks(self.rpc_max_simulate_blocks)
@@ -143,11 +144,14 @@ impl RethRpcServerConfig for RpcServerArgs {
             .max_request_body_size(self.rpc_max_request_size_bytes())
             .max_response_body_size(self.rpc_max_response_size_bytes())
             .max_subscriptions_per_connection(self.rpc_max_subscriptions_per_connection.get())
+            // TN(TN-0055): jsonrpsee's default is unlimited.
+            .set_batch_request_config(BatchRequestConfig::Limit(self.rpc_max_batch_requests))
     }
 
     fn ipc_server_builder(&self) -> IpcServerBuilder<Identity, Identity> {
         IpcServerBuilder::default()
             .max_subscriptions_per_connection(self.rpc_max_subscriptions_per_connection.get())
+            .max_batch_requests(self.rpc_max_batch_requests)
             .max_request_body_size(self.rpc_max_request_size_bytes())
             .max_response_body_size(self.rpc_max_response_size_bytes())
             .max_connections(self.rpc_max_connections.get())

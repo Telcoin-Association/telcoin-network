@@ -251,8 +251,16 @@ pub async fn last_consensus_parent(
     Ok((parent.digest(), parent.number))
 }
 
-/// Collect and return any consensus headers that were not executed before last shutdown.
-/// This will be consensus that was reached but had not executed before a shutdown.
+/// Collect and return the consensus headers of `epoch` that were not executed before last
+/// shutdown. This will be consensus that was reached but had not executed before a shutdown.
+///
+/// The headers stored after the last executed one are returned in ascending number order (a
+/// number absent from the store is skipped), up to and including the first header whose leader
+/// epoch is not `epoch`. That header is kept so the caller still sees execution fall behind
+/// across an epoch boundary; nothing past it is read. The caller replays one epoch per entry and
+/// refuses a header of another epoch, so it never needs more. Collecting to the consensus tip
+/// instead would read every later epoch's headers at each epoch entry: quadratic over a rebuild
+/// of a long chain (`db reset-execution`).
 ///
 /// A failed storage lookup is propagated (the cursors below decide what gets re-executed, so
 /// computing them from silently-defaulted headers at number 0 would skip the replay); a
@@ -260,6 +268,7 @@ pub async fn last_consensus_parent(
 pub async fn get_missing_consensus(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
+    epoch: Epoch,
 ) -> eyre::Result<Vec<ConsensusHeader>> {
     let mut result = Vec::new();
     // Get the DB and load our last executed consensus block.
@@ -273,7 +282,15 @@ pub async fn get_missing_consensus(
         .await?
         .unwrap_or_else(|| last_executed_block.clone());
 
-    info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+    info!(
+        target: "state-sync",
+        epoch,
+        last_executed = last_executed_block.number,
+        last_executed_epoch = last_executed_block.sub_dag.leader_epoch(),
+        last_recorded = last_db_block.number,
+        last_recorded_epoch = last_db_block.sub_dag.leader_epoch(),
+        "comparing last executed block and last recorded consensus block"
+    );
 
     // if the last recorded consensus block is larger than the last executed block,
     // forward the stored consensus block to engine for execution
@@ -282,13 +299,24 @@ pub async fn get_missing_consensus(
             if let Some(consensus_header) =
                 consensus_chain.consensus_header_by_number(consensus_block_number).await?
             {
-                debug!(target: "state-sync", ?consensus_header, "collecting unexecuted consensus header");
+                let header_epoch = consensus_header.sub_dag.leader_epoch();
+                debug!(target: "state-sync", number = consensus_header.number, header_epoch, "collecting unexecuted consensus header");
                 result.push(consensus_header);
+                if header_epoch != epoch {
+                    break;
+                }
             }
         }
     }
 
-    info!(target: "state-sync", ?result, "missing consensus headers that need execution:");
+    info!(
+        target: "state-sync",
+        epoch,
+        count = result.len(),
+        first = ?result.first().map(|header| header.number),
+        last = ?result.last().map(|header| header.number),
+        "missing consensus headers that need execution"
+    );
     Ok(result)
 }
 
@@ -684,8 +712,8 @@ mod tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
-        CommittedSubDag, ConsensusNumHash, EpochSeedChainValue, ExecHeader, ReputationScores,
-        Round, SealedHeader, TnReceiver, B256,
+        CommittedSubDag, Committee, ConsensusNumHash, EpochRecord, EpochSeedChainValue, ExecHeader,
+        ReputationScores, Round, SealedHeader, TnReceiver, B256,
     };
 
     /// Consensus output `number` chained on `parent`, built from one round-1 certificate per
@@ -707,17 +735,27 @@ mod tests {
         parent: ConsensusHeaderDigest,
         round: Round,
     ) -> ConsensusOutput {
-        let committee = fixture.committee();
+        output_of(fixture, &fixture.committee(), number, parent, round)
+    }
+
+    /// [`output_with_leader_round`] led by `committee`'s epoch.
+    fn output_of(
+        fixture: &CommitteeFixture<MemDatabase>,
+        committee: &Committee,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        round: Round,
+    ) -> ConsensusOutput {
         let certificates: Vec<_> = fixture
             .authorities()
-            .map(|a| fixture.certificate(&a.header_with_round(&committee, round)))
+            .map(|a| fixture.certificate(&a.header_with_round(committee, round)))
             .collect();
         let leader = certificates.last().cloned().expect("fixture yields certificates");
         let sub_dag = CommittedSubDag::new(
             certificates,
             leader,
             number - 1,
-            ReputationScores::new(&committee),
+            ReputationScores::new(committee),
             None,
             EpochSeedChainValue::genesis_placeholder(),
         );
@@ -1139,6 +1177,109 @@ mod tests {
         Ok(())
     }
 
+    /// A consensus chain of `epochs` epochs of `per_epoch` outputs each, numbered from 1, and the
+    /// outputs in number order. Every epoch but the last is closed (its record saved and the next
+    /// epoch opened), so their headers read back from sealed packs.
+    async fn chain_of_epochs(
+        fixture: &CommitteeFixture<MemDatabase>,
+        temp_dir: &TempDir,
+        epochs: Epoch,
+        per_epoch: u64,
+    ) -> eyre::Result<(ConsensusChain, Vec<ConsensusOutput>)> {
+        let genesis = fixture.committee();
+        let mut chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), genesis.clone()).await?;
+        let mut outputs: Vec<ConsensusOutput> = Vec::new();
+        let mut parent: ConsensusHeaderDigest = B256::ZERO.into();
+        for epoch in 0..epochs {
+            let committee = genesis.advance_epoch_for_test(epoch);
+            if let Some(last) = outputs.last() {
+                let record = EpochRecord {
+                    epoch: epoch - 1,
+                    committee: committee.bls_keys().iter().copied().collect(),
+                    next_committee: committee.bls_keys().iter().copied().collect(),
+                    final_consensus: ConsensusNumHash::new(
+                        last.number(),
+                        last.consensus_header_hash(),
+                    ),
+                    ..Default::default()
+                };
+                chain.epochs().save_record(record.clone()).await?;
+                chain.new_epoch(record, committee.clone()).await?;
+            }
+            for _ in 0..per_epoch {
+                let output = output_of(fixture, &committee, outputs.len() as u64 + 1, parent, 1);
+                parent = output.consensus_header_hash();
+                save_consensus(output.clone(), &mut chain, &PrimaryMetrics::default()).await?;
+                outputs.push(output);
+            }
+        }
+        Ok((chain, outputs))
+    }
+
+    /// Record `output` as executed on `consensus_bus` the way the engine's canonical tip names
+    /// it: the block's nonce carries the epoch and its parent beacon root the header's digest.
+    fn executed_through(consensus_bus: &ConsensusBusApp, output: &ConsensusOutput) {
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                0,
+                ConsensusNumHash::new(output.number(), output.consensus_header_hash()),
+                Some(SealedHeader::new(
+                    ExecHeader {
+                        number: output.number(),
+                        nonce: output.nonce().into(),
+                        parent_beacon_block_root: Some(output.consensus_header_hash().into()),
+                        ..Default::default()
+                    },
+                    B256::ZERO,
+                )),
+            )
+        });
+    }
+
+    /// The replay at an epoch entry is handed that epoch's unexecuted headers and the first
+    /// header of another epoch (which it refuses), however far the consensus chain runs ahead of
+    /// execution, as after `db reset-execution` on a long chain. What it is handed is the leading
+    /// part of every stored header after the executed one, which it used to be handed whole, so
+    /// it sees the same headers up to the point where it stops.
+    #[tokio::test]
+    async fn missing_consensus_stops_after_the_entered_epoch() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (chain, outputs) = chain_of_epochs(&fixture, &temp_dir, 4, 3).await?;
+        // (executed through, entered epoch, headers expected)
+        let cases: [(usize, Epoch, &[u64]); 7] = [
+            // nothing executed: epoch 0, then epoch 1's first header, not the other 8
+            (0, 0, &[1, 2, 3, 4]),
+            (3, 1, &[4, 5, 6, 7]),
+            // a restart inside epoch 1
+            (4, 1, &[5, 6, 7]),
+            (6, 2, &[7, 8, 9, 10]),
+            // the last epoch runs to the tip
+            (9, 3, &[10, 11, 12]),
+            (12, 3, &[]),
+            // execution behind the entered epoch: one header, which the replay refuses
+            (0, 1, &[1]),
+        ];
+        for (executed, epoch, expected) in cases {
+            let consensus_bus = ConsensusBusApp::new();
+            if executed > 0 {
+                executed_through(&consensus_bus, &outputs[executed - 1]);
+            }
+            let missing = get_missing_consensus(&consensus_bus, &chain, epoch).await?;
+            let numbers: Vec<_> = missing.iter().map(|header| header.number).collect();
+            assert_eq!(numbers, expected, "executed through {executed}, entering epoch {epoch}");
+            let stored_after: Vec<_> =
+                outputs[executed..].iter().map(ConsensusOutput::consensus_header).collect();
+            assert_eq!(
+                missing,
+                stored_after[..missing.len()],
+                "the headers stored after {executed}, in order"
+            );
+        }
+        Ok(())
+    }
+
     // ---- bench5 f3-rejoin ----
 
     /// Leader round of the consensus block 1 the node executed before `prime_consensus` runs.
@@ -1216,6 +1357,33 @@ mod tests {
         fn enter(&self, _: &tracing::span::Id) {}
 
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The epoch-entry log gives the number of missing headers and their range, never the
+    /// headers: at the first entry of a rebuild that would put every header of the chain, each
+    /// with its sub-dag, into one line.
+    #[tokio::test]
+    async fn missing_consensus_logs_a_count_and_range_not_the_headers() -> eyre::Result<()> {
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(StateSyncInfoLines(lines.clone()));
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let (chain, _) = chain_of_epochs(&fixture, &temp_dir, 2, 3).await?;
+        let missing = get_missing_consensus(&ConsensusBusApp::new(), &chain, 0).await?;
+        assert_eq!(missing.len(), 4);
+        let lines = lines.lock().clone();
+        assert!(
+            lines.iter().any(|line| line.contains("count=4")
+                && line.contains("first=Some(1)")
+                && line.contains("last=Some(4)")),
+            "no line gives the count and range: {lines:?}"
+        );
+        let header_len = format!("{:?}", missing[0]).len();
+        assert!(
+            lines.iter().all(|line| line.len() < header_len),
+            "a line is as long as a header ({header_len} bytes): {lines:?}"
+        );
+        Ok(())
     }
 
     /// A validator promoted back into the committee mid-epoch has followed consensus to a header

@@ -1,5 +1,6 @@
 use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
+    SyncPhase,
 };
 use crate::providers::static_file::metrics::StaticFileProviderOperation;
 use alloy_consensus::BlockHeader;
@@ -11,8 +12,8 @@ use reth_db_api::models::CompactU256;
 use reth_nippy_jar::{NippyJar, NippyJarError, NippyJarWriter};
 use reth_node_types::NodePrimitives;
 use reth_static_file_types::{
-    ChangesetOffset, ChangesetOffsetReader, ChangesetOffsetWriter, SegmentHeader,
-    SegmentRangeInclusive, StaticFileSegment,
+    changeset_offset_record_size, ChangesetOffset, ChangesetOffsetReader, ChangesetOffsetWriter,
+    SegmentHeader, SegmentRangeInclusive, StaticFileSegment,
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult, StaticFileWriterError};
 use std::{
@@ -21,7 +22,7 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, instrument};
 
@@ -163,7 +164,8 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
 
     /// Finalizes all writers by committing their configuration to disk and updating indices.
     ///
-    /// Must be called after `sync_all` was called on individual writers.
+    /// Must be called after `sync_all` (or `sync_and_freeze`, which also wrote the
+    /// configuration) was called on individual writers.
     /// Returns an error if any writer has prune queued.
     #[instrument(
         name = "StaticFileWriters::finalize",
@@ -191,6 +193,47 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
         debug!(target: "providers::static_file", "Finalized all static file segments into disk");
         Ok(())
     }
+}
+
+/// One sync of [`StaticFileProviderRW::sync_all`], with the phase it is timed as.
+type SyncJob<'a> = (SyncPhase, Box<dyn FnOnce() -> ProviderResult<()> + Send + 'a>);
+
+/// TN(TN-0138): runs `jobs` at once, the last on this thread and each other one on a scoped
+/// thread of its own, and returns once all have ended, with each one's result and time in the
+/// order given. A thread that cannot be started is its job's error (the job does not run). A job
+/// that panics resumes its panic here once the others have ended.
+fn sync_at_once(jobs: Vec<SyncJob<'_>>) -> Vec<(SyncPhase, ProviderResult<Duration>)> {
+    fn timed(job: Box<dyn FnOnce() -> ProviderResult<()> + Send + '_>) -> ProviderResult<Duration> {
+        let start = Instant::now();
+        job().map(|()| start.elapsed())
+    }
+
+    std::thread::scope(|scope| {
+        let mut jobs = jobs.into_iter();
+        let here = jobs.next_back();
+        let spawned: Vec<_> = jobs
+            .map(|(phase, job)| {
+                let thread = std::thread::Builder::new()
+                    .name("sf-sync".to_owned())
+                    .spawn_scoped(scope, move || timed(job));
+                (phase, thread)
+            })
+            .collect();
+        let here = here.map(|(phase, job)| (phase, timed(job)));
+        spawned
+            .into_iter()
+            .map(|(phase, thread)| {
+                let result = match thread {
+                    Ok(thread) => {
+                        thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    }
+                    Err(err) => Err(ProviderError::other(err)),
+                };
+                (phase, result)
+            })
+            .chain(here)
+            .collect()
+    })
 }
 
 /// Mutable reference to a [`StaticFileProviderRW`] behind a [`RwLockWriteGuard`].
@@ -235,10 +278,16 @@ pub struct StaticFileProviderRW<N> {
     prune_on_commit: Option<PruneStrategy>,
     /// Whether `sync_all()` has been called. Used by `finalize()` to avoid redundant syncs.
     synced: bool,
+    /// TN(TN-0118): set when [`Self::sync_and_freeze`] wrote the configuration, so the next
+    /// [`Self::finalize`] or [`Self::commit`] still updates the reader index.
+    index_pending: bool,
     /// Changeset offsets sidecar writer (only for changeset segments).
     changeset_offsets: Option<ChangesetOffsetWriter>,
     /// Current block's changeset offset being written.
     current_changeset_offset: Option<ChangesetOffset>,
+    /// TN(TN-0138): test-only fault injection, the syncs of [`Self::sync_all`] that fail.
+    #[cfg(test)]
+    pub(crate) fail_syncs: Vec<SyncPhase>,
 }
 
 impl<N: NodePrimitives> StaticFileProviderRW<N> {
@@ -263,8 +312,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             metrics,
             prune_on_commit: None,
             synced: false,
+            index_pending: false,
             changeset_offsets: None,
             current_changeset_offset: None,
+            #[cfg(test)]
+            fail_syncs: Vec::new(),
         };
 
         // Run NippyJar healing BEFORE setting up changeset sidecar
@@ -301,7 +353,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             ),
             Err(ProviderError::MissingStaticFileBlock(_, _)) => {
                 let path = static_file_provider.directory().join(segment.filename(&block_range));
-                (create_jar(segment, &path, block_range), path)
+                let checksums = static_file_provider.jar_checksums(segment);
+                (create_jar(segment, &path, block_range, checksums), path)
             }
             Err(err) => return Err(err),
         };
@@ -376,6 +429,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// - Truncates sidecar if offsets point past healed `NippyJar` data
     fn heal_changeset_sidecar(&mut self) -> ProviderResult<()> {
         let csoff_path = self.data_path.with_extension("csoff");
+        // TN(TN-0121): the jar's configuration says whether the sidecar's records carry checksums.
+        let checksums = self.writer.has_checksums();
+        let record_size = changeset_offset_record_size(checksums);
 
         // Step 1: Read all three sources of truth
         let header_claims_blocks = self.writer.user_header().changeset_offsets_len();
@@ -385,41 +441,76 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let actual_sidecar_blocks = if csoff_path.exists() {
             let file_len = reth_fs_util::metadata(&csoff_path).map_err(ProviderError::other)?.len();
             // Remove partial records from crash mid-write
-            let aligned_len = file_len - (file_len % 16);
-            aligned_len / 16
+            let aligned_len = file_len - (file_len % record_size);
+            aligned_len / record_size
         } else {
             0
         };
 
         // Fresh segment or no sidecar data - nothing to heal
         if header_claims_blocks == 0 && actual_sidecar_blocks == 0 {
-            self.changeset_offsets =
-                Some(ChangesetOffsetWriter::new(&csoff_path, 0).map_err(ProviderError::other)?);
+            self.changeset_offsets = Some(
+                ChangesetOffsetWriter::new(&csoff_path, 0, checksums)
+                    .map_err(ProviderError::other)?,
+            );
             return Ok(());
         }
 
         // Step 2: Validate sidecar offsets against actual NippyJar state
-        let valid_blocks = if actual_sidecar_blocks > 0 {
-            let mut reader = ChangesetOffsetReader::new(&csoff_path, actual_sidecar_blocks)
+        //
+        // TN(TN-0121): only the committed records (the header's count) are read, in one bulk
+        // read: the ones past it are cut below whatever they hold (`correct_blocks` is at most the
+        // header's count). A committed record that fails its checksum is an error, never cut.
+        let committed_blocks = actual_sidecar_blocks.min(header_claims_blocks);
+        let valid_blocks = if committed_blocks > 0 {
+            let reader = ChangesetOffsetReader::new(&csoff_path, committed_blocks, checksums)
                 .map_err(ProviderError::other)?;
+            let offsets = reader.get_range(0, committed_blocks).map_err(ProviderError::other)?;
 
             // Find last block where offset + num_changes <= actual_nippy_rows
             // This correctly handles rows=0 with offset=0, num_changes=0 (empty blocks)
-            let mut valid = 0u64;
-            for i in 0..actual_sidecar_blocks {
-                if let Some(offset) = reader.get(i).map_err(ProviderError::other)? {
-                    if offset.offset() + offset.num_changes() <= actual_nippy_rows {
-                        valid = i + 1;
-                    } else {
-                        // This block points past EOF - stop here
-                        break;
-                    }
-                }
+            let fits = |offset: &ChangesetOffset| {
+                offset.offset().saturating_add(offset.num_changes()) <= actual_nippy_rows
+            };
+            let valid = offsets.iter().position(|offset| !fits(offset)).unwrap_or(offsets.len());
+
+            // TN(TN-0121): an interrupted prune leaves a trailing run of records past the rows
+            // (offsets only grow). A record that fits again after one that does not is damage:
+            // refuse rather than cut the committed blocks after the damaged record.
+            if let Some(index) = offsets[valid..].iter().position(fits) {
+                tracing::error!(
+                    target: "reth::static_file",
+                    path = %csoff_path.display(),
+                    damaged = valid,
+                    fits_again = valid + index,
+                    actual_rows = actual_nippy_rows,
+                    "Changeset offset record points past the rows, but a later one does not"
+                );
+                return Err(ProviderError::CorruptedChangeSetStaticFile)
             }
-            valid
+            valid as u64
         } else {
             0
         };
+
+        // TN(TN-0130): a prune commits the header before it cuts the rows or the sidecar, so in a
+        // checksummed jar a sidecar shorter than the header, or a committed record past the
+        // rows, is damage: refuse and cut nothing. A plain jar keeps the heal below, since it may
+        // hold an interrupted prune of an older build, which cut them first.
+        if checksums &&
+            (actual_sidecar_blocks < header_claims_blocks || valid_blocks < committed_blocks)
+        {
+            tracing::error!(
+                target: "reth::static_file",
+                path = %csoff_path.display(),
+                header_claims = header_claims_blocks,
+                sidecar_has = actual_sidecar_blocks,
+                valid_blocks,
+                actual_rows = actual_nippy_rows,
+                "Changeset offsets are shorter than their committed header"
+            );
+            return Err(ProviderError::CorruptedChangeSetStaticFile)
+        }
 
         // Step 3: Determine correct state from synced files (source of truth)
         // Header is the commit marker - never enlarge, only shrink
@@ -446,8 +537,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     .write(true)
                     .open(&csoff_path)
                     .map_err(ProviderError::other)?;
-                file.set_len(correct_blocks * 16).map_err(ProviderError::other)?;
-                file.sync_all().map_err(ProviderError::other)?;
+                file.set_len(correct_blocks * record_size).map_err(ProviderError::other)?;
+                // TN(TN-0117): a plain `fsync` on macOS (no `F_FULLFSYNC`).
+                reth_fs_util::fsync_file(&file).map_err(ProviderError::other)?;
 
                 tracing::debug!(
                     target: "reth::static_file",
@@ -484,7 +576,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         // Open sidecar writer with corrected count (won't error now that sizes match)
-        let csoff_writer = ChangesetOffsetWriter::new(&csoff_path, correct_blocks)
+        let csoff_writer = ChangesetOffsetWriter::new(&csoff_path, correct_blocks, checksums)
             .map_err(ProviderError::other)?;
 
         self.changeset_offsets = Some(csoff_writer);
@@ -492,6 +584,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Commit healed header if needed (after sidecar writer is set up)
         if needs_header_commit {
             self.writer.commit().map_err(ProviderError::other)?;
+            // TN(TN-0121): publish the shrunk range, or the consistency check that opened this
+            // writer reads the old tip and misses the loss until the next start.
+            self.update_index()?;
 
             tracing::info!(
                 target: "reth::static_file",
@@ -530,23 +625,124 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// configuration and mark the writer as clean.
     ///
     /// Returns an error if prune is queued (use [`Self::commit`] instead).
+    ///
+    /// TN(TN-0138): the `.csoff`, data and offsets syncs run at once (`sync_at_once`), each on
+    /// its own thread. Only that all three are durable before the configuration matters, not
+    /// their order: the configuration bounds what a reopen keeps (the heal cuts any file back to
+    /// it), and it is written only after this returns `Ok`. This returns once all three have
+    /// ended; if any failed, the error is the first in the order they ran one after another
+    /// before (`.csoff`, data, offsets), the error that order returned.
     pub fn sync_all(&mut self) -> ProviderResult<()> {
         if self.prune_on_commit.is_some() {
             return Err(StaticFileWriterError::FinalizeWithPruneQueued.into());
         }
 
-        // Write the final block's offset and sync the sidecar for changeset segments
+        // Write the final block's offset for changeset segments
         self.flush_current_changeset_offset()?;
-        if let Some(writer) = &mut self.changeset_offsets {
-            writer.sync().map_err(ProviderError::other)?;
-            // Update the header with the actual number of offsets written
-            self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
-        }
 
-        if self.writer.is_dirty() {
-            self.writer.sync_all().map_err(ProviderError::other)?;
+        let mut jobs: Vec<SyncJob<'_>> = Vec::with_capacity(3);
+        let dirty = self.writer.is_dirty();
+        let (data, offsets) = self.writer.sync_jobs();
+        if let Some(writer) = &mut self.changeset_offsets {
+            jobs.push((
+                SyncPhase::Csoff,
+                Box::new(move || writer.sync().map_err(ProviderError::other)),
+            ));
+        }
+        if dirty {
+            // TN(TN-0119): `NippyJarWriter::sync_all`'s two halves, timed apart.
+            jobs.push((
+                SyncPhase::Data,
+                Box::new(move || data.run().map_err(ProviderError::other)),
+            ));
+            jobs.push((
+                SyncPhase::Offsets,
+                Box::new(move || offsets.run().map_err(ProviderError::other)),
+            ));
+        }
+        let ran = !jobs.is_empty();
+        let start = Instant::now();
+        let results = sync_at_once(jobs);
+        let files = start.elapsed();
+        #[cfg(test)]
+        let results = self.inject_sync_faults(results);
+
+        let mut first_error = None;
+        for (phase, result) in results {
+            match result {
+                Ok(elapsed) => {
+                    if phase == SyncPhase::Csoff &&
+                        let Some(writer) = &self.changeset_offsets
+                    {
+                        // Update the header with the actual number of offsets written
+                        self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
+                    }
+                    self.record_sync(phase, elapsed);
+                }
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        if ran {
+            self.record_sync(SyncPhase::Files, files);
         }
         self.synced = true;
+        Ok(())
+    }
+
+    /// The results of [`Self::sync_all`]'s syncs with the phases in `fail_syncs` failed, as if
+    /// their `fsync` had returned an error after the write; a phase that failed already keeps its
+    /// own error.
+    #[cfg(test)]
+    fn inject_sync_faults(
+        &self,
+        results: Vec<(SyncPhase, ProviderResult<Duration>)>,
+    ) -> Vec<(SyncPhase, ProviderResult<Duration>)> {
+        results
+            .into_iter()
+            .map(|(phase, result)| {
+                let result = if self.fail_syncs.contains(&phase) {
+                    result.and_then(|_| {
+                        Err(ProviderError::other(std::io::Error::other(format!(
+                            "injected {phase:?} sync fault"
+                        ))))
+                    })
+                } else {
+                    result
+                };
+                (phase, result)
+            })
+            .collect()
+    }
+
+    /// Syncs all data like [`Self::sync_all`], then writes the configuration to disk, leaving
+    /// only the reader index update to [`Self::finalize`].
+    ///
+    /// TN(TN-0118): `StaticFileProvider::write_blocks_data` calls this in each segment's thread,
+    /// so the configuration's write and syncs (temp file `fsync`, rename, directory `fsync`) run
+    /// beside the database writes of `save_blocks` instead of one segment after another in
+    /// `DatabaseProvider::commit`. The configuration is still durable before the database commit
+    /// (`save_blocks` joins the threads first), so a crash or a failed database commit leaves
+    /// static files ahead of the database checkpoints, the state a crash between `finalize` and
+    /// the database commit always left, which `check_consistency` prunes back at the next open.
+    /// Readers route by the index, so the rows stay invisible until `finalize` publishes them.
+    ///
+    /// Returns an error if prune is queued (use [`Self::commit`] instead).
+    pub fn sync_and_freeze(&mut self) -> ProviderResult<()> {
+        self.sync_all()?;
+        if self.writer.is_dirty() {
+            let start = Instant::now();
+            self.writer.finalize().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::ConfFreeze, start.elapsed());
+            self.index_pending = true;
+        }
+        // Everything appended so far is durable; rows appended after this make the writer dirty
+        // again, and `finalize` must then sync them.
+        self.synced = false;
         Ok(())
     }
 
@@ -572,8 +768,15 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.sync_all()?;
             }
 
+            let start = Instant::now();
             self.writer.finalize().map_err(ProviderError::other)?;
+            self.record_sync(SyncPhase::ConfFreeze, start.elapsed());
+            self.index_pending = true;
+        }
+        // TN(TN-0118): also after `sync_and_freeze`, which wrote the configuration already.
+        if self.index_pending {
             self.update_index()?;
+            self.index_pending = false;
         }
         self.synced = false;
         Ok(())
@@ -652,7 +855,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             );
 
             self.update_index()?;
+        } else if self.index_pending {
+            // TN(TN-0118): `sync_and_freeze` wrote the configuration; publish it.
+            self.update_index()?;
         }
+        self.index_pending = false;
 
         Ok(())
     }
@@ -716,7 +923,18 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 .then(|| self.writer.user_header().expected_block_start() - 1)
             });
 
-        self.reader().update_index(self.writer.user_header().segment(), segment_max_block)
+        let start = Instant::now();
+        self.reader().update_index(self.writer.user_header().segment(), segment_max_block)?;
+        self.record_sync(SyncPhase::UpdateIndex, start.elapsed());
+        Ok(())
+    }
+
+    /// TN(TN-0119): records a sync phase of this writer's segment in its provider's
+    /// [`StaticFileSyncStats`](super::StaticFileSyncStats), if the provider is still alive.
+    fn record_sync(&self, phase: SyncPhase, elapsed: std::time::Duration) {
+        if let Some(reader) = self.reader.upgrade() {
+            reader.record_sync(self.writer.user_header().segment(), phase, elapsed);
+        }
     }
 
     /// Ensures that the writer is positioned at the specified block number.
@@ -774,7 +992,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 if segment.is_change_based() {
                     let csoff_path = data_path.with_extension("csoff");
                     self.changeset_offsets = Some(
-                        ChangesetOffsetWriter::new(&csoff_path, 0).map_err(ProviderError::other)?,
+                        ChangesetOffsetWriter::new(&csoff_path, 0, self.writer.has_checksums())
+                            .map_err(ProviderError::other)?,
                     );
                 }
 
@@ -896,8 +1115,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             // Read offset for the block after last_block from sidecar.
             // Use committed length from header, ignoring any uncommitted records
             // that may exist in the file after a crash.
-            let mut reader = ChangesetOffsetReader::new(&csoff_path, changeset_offsets_len)
-                .map_err(ProviderError::other)?;
+            let reader = ChangesetOffsetReader::new(
+                &csoff_path,
+                changeset_offsets_len,
+                self.writer.has_checksums(),
+            )
+            .map_err(ProviderError::other)?;
             if let Some(next_offset) = reader.get(blocks_to_keep).map_err(ProviderError::other)? {
                 next_offset.offset()
             } else {
@@ -909,6 +1132,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let total_rows = self.writer.rows() as u64;
         let rows_to_delete = total_rows.saturating_sub(rows_to_keep);
 
+        // TN(TN-0130): the header takes its final form before anything is committed, and it is
+        // committed before any file shrinks: `prune_rows` writes it before it cuts the rows, and
+        // the sidecar is cut after the commit below. A prune stopped part way then leaves only
+        // uncommitted bytes past the configuration, which the next open cuts; the rows or the
+        // sidecar shorter than the header can only be damage (`heal_changeset_sidecar`). The
+        // finished prune writes the configuration it wrote before.
         if rows_to_delete > 0 {
             // Calculate the number of blocks to prune
             let current_block_end = self
@@ -920,9 +1149,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
             // Update segment header - for changesets, prune expects number of blocks, not rows
             self.writer.user_header_mut().prune(blocks_to_remove);
-
-            // Prune the actual rows
-            self.writer.prune_rows(rows_to_delete as usize).map_err(ProviderError::other)?;
         }
 
         // Update the block range
@@ -930,17 +1156,27 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         // Sync changeset offsets to match the new block range
         self.writer.user_header_mut().sync_changeset_offsets();
+        // The sidecar's record count once it is cut below, which `commit` used to read from it.
+        self.writer.user_header_mut().set_changeset_offsets_len(blocks_to_keep);
 
-        // Truncate the sidecar file to match the new block count
-        if let Some(writer) = &mut self.changeset_offsets {
-            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+        if rows_to_delete > 0 {
+            // Prune the actual rows
+            self.writer.prune_rows(rows_to_delete as usize).map_err(ProviderError::other)?;
         }
 
         // Clear current changeset offset tracking since we've pruned
         self.current_changeset_offset = None;
 
         // Commits new changes to disk
-        self.commit()?;
+        self.writer.commit().map_err(ProviderError::other)?;
+
+        // Truncate the sidecar file to match the new block count
+        if let Some(writer) = &mut self.changeset_offsets {
+            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+        }
+
+        self.update_index()?;
+        self.index_pending = false;
 
         Ok(())
     }
@@ -1031,18 +1267,19 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer.set_dirty();
         self.data_path = data_path.clone();
 
-        // Delete the sidecar file for changeset segments before deleting the main jar
+        // TN(TN-0132): the sidecar goes with the jar below (`NippyJar::delete`), after its data
+        // file: removed first, it left a jar that does not load when the deletion stopped there.
         if segment.is_change_based() {
-            let csoff_path = current_path.with_extension("csoff");
-            if csoff_path.exists() {
-                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
-            }
             // Re-initialize the changeset offsets writer for the previous file
             let new_csoff_path = data_path.with_extension("csoff");
             let committed_len = self.writer.user_header().changeset_offsets_len();
             self.changeset_offsets = Some(
-                ChangesetOffsetWriter::new(&new_csoff_path, committed_len)
-                    .map_err(ProviderError::other)?,
+                ChangesetOffsetWriter::new(
+                    &new_csoff_path,
+                    committed_len,
+                    self.writer.has_checksums(),
+                )
+                .map_err(ProviderError::other)?,
             );
         }
 
@@ -1645,12 +1882,18 @@ fn create_jar(
     segment: StaticFileSegment,
     path: &Path,
     expected_block_range: SegmentRangeInclusive,
+    checksums: bool,
 ) -> NippyJar<SegmentHeader> {
     let mut jar = NippyJar::new(
         segment.columns(),
         path,
         SegmentHeader::new(expected_block_range, None, None, segment),
     );
+
+    // TN(TN-0122): the provider's policy (`StaticFileProviderInner::jar_checksums`).
+    if checksums {
+        jar = jar.with_checksums();
+    }
 
     // Transaction and Receipt already have the compression scheme used natively in its encoding.
     // (zstd-dictionary)

@@ -172,8 +172,8 @@ pub(crate) fn execute_consensus_output_with_signers(
     // ONE build scope for the whole output, anchored at the pre-output database tip: its trie
     // overlay takes each built block's sorted deltas in place, so later blocks' state roots
     // layer the accumulated deltas over the database instead of re-merging every unpersisted
-    // ancestor per block through reth's memory-overlay provider (#1301), and its read cache
-    // keeps the parent-state reads of earlier blocks, advanced past each block, so an account
+    // ancestor per block through reth's memory-overlay provider (#1301). State reads go through
+    // the env's cross-block execution cache instead (`exec_cache.rs` in tn-reth), so an account
     // or slot read by several blocks of the output is loaded once. Dropped with this function:
     // persistence uses the per-block deltas, never this accumulation, and every error path
     // returns, discarding it together with the rolled-back in-memory advance.
@@ -494,12 +494,11 @@ impl OutputTimings {
 /// Execute the transaction and update canon chain in-memory.
 ///
 /// `build_scope` is the consensus output's shared [`OutputBuildScope`]: the build computes this
-/// block's state root layered over its trie overlay (#1301) and reads the parent state through
-/// its read cache, then advances both to this block's post-state for the NEXT block of the
-/// output. `recovered` is the batch's entry of the output's recovered signers. The build's phase
-/// laps are added to `timings`. `consensus_number` only labels the `next block executed` line,
-/// together with the payload's batch index and digest, so each block joins back to its consensus
-/// output and batch.
+/// block's state root layered over its trie overlay (#1301), then advances the scope to this
+/// block's post-state for the NEXT block of the output. `recovered` is the batch's entry of the
+/// output's recovered signers. The build's phase laps are added to `timings`. `consensus_number`
+/// only labels the `next block executed` line, together with the payload's batch index and digest,
+/// so each block joins back to its consensus output and batch.
 // the per-output accumulators and the log context are separate on purpose; bundling them into a
 // struct would only rename the same eight values
 #[allow(clippy::too_many_arguments)]
@@ -537,7 +536,7 @@ fn execute_payload(
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
     // output: the next block in the loop resolves its parent state through this advance
-    // (account/storage/bytecode reads that miss the scope's read cache go to reth's memory
+    // (account/storage/bytecode reads that miss the execution cache go to reth's memory
     // overlay; the state root itself runs over the scope's trie overlay instead, see #1301). The
     // advance is speculative until the whole output commits durably after the loop; if a later
     // block fails to build, `execute_consensus_output` compensates it via

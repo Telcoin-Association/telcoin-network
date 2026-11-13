@@ -3,7 +3,8 @@
 //! pool while the writer executes outputs.
 //!
 //! - [`Readers`]: `threads` reader threads, each with its own seeded RNG, call the RPC [`Methods`]
-//!   that `RethEnv::get_rpc_server` builds for HTTP, with every [`ReadKind`] equally likely:
+//!   that `RethEnv::get_rpc_server` builds for HTTP, with every kind of their [`ReadMix`] equally
+//!   likely. [`ReadMix::rpc`] draws the latest-state and recent reads:
 //!   - [`ReadKind::Balance`]: `eth_getBalance` of a Zipf-drawn prefilled account at `latest`;
 //!   - [`ReadKind::TokenBalance`]: `eth_call` of `balanceOf` on [`STABLECOIN_A`] or
 //!     [`STABLECOIN_B`] for a Zipf-drawn prefilled account at `latest`;
@@ -13,6 +14,23 @@
 //!   - [`ReadKind::Logs`]: `eth_getLogs` of [`SWAP_ROUTER`]'s `ISwapRouter::Swap` events over the
 //!     last [`LOG_BLOCKS`] blocks up to `eth_blockNumber` (that lookup is not timed);
 //!   - [`ReadKind::Block`]: `eth_getBlockByNumber("latest", true)`.
+//!
+//!   [`ReadMix::history`] draws the historical-state and by-hash reads, each past block drawn after
+//!   an untimed `eth_blockNumber`, uniformly from the blocks below the tip (`*_chain`) or from the
+//!   last [`ReadMix::epoch_blocks`] of them (`*_epoch`):
+//!   - [`ReadKind::BalanceAtChain`], [`ReadKind::BalanceAtEpoch`]: `eth_getBalance` of a Zipf-drawn
+//!     prefilled account at a past block;
+//!   - [`ReadKind::StorageAtChain`], [`ReadKind::StorageAtEpoch`]: `eth_getStorageAt` of a
+//!     Zipf-drawn prefilled account's balance slot on [`STABLECOIN_A`] or [`STABLECOIN_B`] at a
+//!     past block;
+//!   - [`ReadKind::TxByHash`]: `eth_getTransactionByHash` of an executed transaction, drawn from a
+//!     uniform sample ([`EXECUTED_TXS`] at most) of every hash the driver fed
+//!     ([`Readers::feed_tx_hashes`]); a hash without an answer is an error. With none fed yet the
+//!     reader fetches the latest block instead;
+//!   - [`ReadKind::TxByHashMiss`]: `eth_getTransactionByHash` of a random hash, which must answer
+//!     `null`.
+//!
+//!   [`ReadMix::all`] draws both sets.
 //! - [`Readers::poll_balances`]: one more thread calls the pool's `TxPool::get_account_balances`
 //!   for an address set ([`poll_addresses`]) every [`POLL_INTERVAL`], as the batch builder does.
 //! - [`Submitter`]: one thread sends queued raw transactions through `eth_sendRawTransaction`, so
@@ -34,7 +52,9 @@
 //! (already pooled) is expected and counted apart from the errors.
 
 use super::{
-    state::{ISwapRouter, PrefillSpec, IERC20, STABLECOIN_A, STABLECOIN_B, SWAP_ROUTER},
+    state::{
+        balance_slot, ISwapRouter, PrefillSpec, IERC20, STABLECOIN_A, STABLECOIN_B, SWAP_ROUTER,
+    },
     workload::{WorkloadConfig, Zipf},
 };
 use crate::{TxPool as _, WorkerTxPool};
@@ -66,6 +86,9 @@ pub const POLL_ACCOUNTS: usize = 64;
 /// The recent transaction hashes [`ReadKind::Receipt`] draws from.
 const RECENT_TXS: usize = 1_024;
 
+/// The largest sample of executed transaction hashes [`ReadKind::TxByHash`] draws from.
+pub const EXECUTED_TXS: usize = 1 << 16;
+
 /// How long an idle thread parks before it checks the gate again.
 const IDLE: Duration = Duration::from_millis(5);
 
@@ -82,22 +105,132 @@ pub enum ReadKind {
     Logs,
     /// `eth_getBlockByNumber` of the latest block with its transactions.
     Block,
+    /// `eth_getBalance` of a prefilled account at a past block of the whole chain.
+    BalanceAtChain,
+    /// `eth_getBalance` of a prefilled account at a past block of the last epoch's.
+    BalanceAtEpoch,
+    /// `eth_getStorageAt` of a prefilled account's token balance at a past block of the chain.
+    StorageAtChain,
+    /// `eth_getStorageAt` of a prefilled account's token balance at a past block of the last
+    /// epoch's.
+    StorageAtEpoch,
+    /// `eth_getTransactionByHash` of an executed transaction.
+    TxByHash,
+    /// `eth_getTransactionByHash` of a random hash.
+    TxByHashMiss,
 }
 
 impl ReadKind {
-    /// Every kind; a reader draws among them uniformly.
-    pub const ALL: [Self; 5] =
+    /// How many kinds there are.
+    pub const COUNT: usize = 11;
+
+    /// Every kind, in the order [`ReadSamples`] keeps them.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Balance,
+        Self::TokenBalance,
+        Self::Receipt,
+        Self::Logs,
+        Self::Block,
+        Self::BalanceAtChain,
+        Self::BalanceAtEpoch,
+        Self::StorageAtChain,
+        Self::StorageAtEpoch,
+        Self::TxByHash,
+        Self::TxByHashMiss,
+    ];
+
+    /// The latest-state and recent reads ([`ReadMix::rpc`]).
+    pub const RPC: [Self; 5] =
         [Self::Balance, Self::TokenBalance, Self::Receipt, Self::Logs, Self::Block];
+
+    /// The historical-state and by-hash reads ([`ReadMix::history`]).
+    pub const HISTORY: [Self; 6] = [
+        Self::BalanceAtChain,
+        Self::BalanceAtEpoch,
+        Self::StorageAtChain,
+        Self::StorageAtEpoch,
+        Self::TxByHash,
+        Self::TxByHashMiss,
+    ];
 
     /// The RPC method the kind calls.
     pub const fn method(self) -> &'static str {
         match self {
-            Self::Balance => "eth_getBalance",
+            Self::Balance | Self::BalanceAtChain | Self::BalanceAtEpoch => "eth_getBalance",
             Self::TokenBalance => "eth_call",
             Self::Receipt => "eth_getTransactionReceipt",
             Self::Logs => "eth_getLogs",
             Self::Block => "eth_getBlockByNumber",
+            Self::StorageAtChain | Self::StorageAtEpoch => "eth_getStorageAt",
+            Self::TxByHash | Self::TxByHashMiss => "eth_getTransactionByHash",
         }
+    }
+
+    /// The kind's report label and JSON key.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Balance => "balance",
+            Self::TokenBalance => "token_balance",
+            Self::Receipt => "receipt",
+            Self::Logs => "logs",
+            Self::Block => "block",
+            Self::BalanceAtChain => "balance_at_chain",
+            Self::BalanceAtEpoch => "balance_at_epoch",
+            Self::StorageAtChain => "storage_at_chain",
+            Self::StorageAtEpoch => "storage_at_epoch",
+            Self::TxByHash => "tx_by_hash",
+            Self::TxByHashMiss => "tx_by_hash_miss",
+        }
+    }
+}
+
+/// The kinds the readers draw, each equally likely, and the span of the `*_epoch` kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadMix {
+    /// The kinds.
+    pub kinds: &'static [ReadKind],
+    /// The blocks below the tip the `*_epoch` kinds draw from: the last epoch's worth.
+    pub epoch_blocks: u64,
+}
+
+impl ReadMix {
+    /// [`ReadKind::RPC`], the latest-state and recent reads.
+    pub const fn rpc() -> Self {
+        Self { kinds: &ReadKind::RPC, epoch_blocks: 1 }
+    }
+
+    /// [`ReadKind::HISTORY`], the past-block and by-hash reads, the `*_epoch` kinds over the last
+    /// `epoch_blocks` blocks (at least 1).
+    pub const fn history(epoch_blocks: u64) -> Self {
+        Self { kinds: &ReadKind::HISTORY, epoch_blocks }
+    }
+
+    /// Every kind, [`ReadKind::ALL`].
+    pub const fn all(epoch_blocks: u64) -> Self {
+        Self { kinds: &ReadKind::ALL, epoch_blocks }
+    }
+}
+
+/// Where a past-block read draws its block from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Span {
+    /// Uniformly from the blocks below the tip.
+    Chain,
+    /// Uniformly from the last [`ReadMix::epoch_blocks`] blocks below the tip.
+    Epoch,
+}
+
+impl Span {
+    /// The blocks the span covers below `tip`, an epoch being `epoch_blocks` (at least 1): from
+    /// the genesis, or the epoch's first, to the block below the tip; the genesis alone while the
+    /// tip is the genesis.
+    fn blocks(self, tip: u64, epoch_blocks: u64) -> std::ops::RangeInclusive<u64> {
+        let last = tip.saturating_sub(1);
+        let first = match self {
+            Self::Chain => 0,
+            Self::Epoch => tip.saturating_sub(epoch_blocks.max(1)),
+        };
+        first..=last
     }
 }
 
@@ -137,7 +270,7 @@ pub struct PollSamples {
 #[derive(Clone, Debug, Default)]
 pub struct ReadSamples {
     /// Each kind's samples, in [`ReadKind::ALL`] order.
-    kinds: [KindSamples; 5],
+    kinds: [KindSamples; ReadKind::COUNT],
     /// The balance poller's samples.
     pub polls: PollSamples,
 }
@@ -165,6 +298,8 @@ enum Answer {
     Logs(usize),
     /// The block's number and its transactions' hashes.
     Block(u64, Vec<B256>),
+    /// The transaction's block number, or `None` when the node has no such transaction.
+    Tx(Option<u64>),
 }
 
 impl Answer {
@@ -175,6 +310,7 @@ impl Answer {
             Self::Receipt(found) => found.is_none(),
             Self::Logs(count) => *count == 0,
             Self::Block(_, txs) => txs.is_empty(),
+            Self::Tx(found) => found.is_none(),
         }
     }
 }
@@ -192,6 +328,13 @@ enum Read {
     Logs(u64, u64),
     /// The latest block.
     Block,
+    /// The native balance of an account at a block drawn from a span.
+    BalanceAt(Address, u64, Span),
+    /// The storage of a token (first) at a slot (second) at a block drawn from a span.
+    StorageAt(Address, B256, u64, Span),
+    /// A transaction by hash: `true` for an executed one, which must answer, `false` for a
+    /// random hash, which must not.
+    Tx(B256, bool),
 }
 
 impl Read {
@@ -203,6 +346,12 @@ impl Read {
             Self::Receipt(_) => ReadKind::Receipt,
             Self::Logs(..) => ReadKind::Logs,
             Self::Block => ReadKind::Block,
+            Self::BalanceAt(.., Span::Chain) => ReadKind::BalanceAtChain,
+            Self::BalanceAt(.., Span::Epoch) => ReadKind::BalanceAtEpoch,
+            Self::StorageAt(.., Span::Chain) => ReadKind::StorageAtChain,
+            Self::StorageAt(.., Span::Epoch) => ReadKind::StorageAtEpoch,
+            Self::Tx(_, true) => ReadKind::TxByHash,
+            Self::Tx(_, false) => ReadKind::TxByHashMiss,
         }
     }
 
@@ -223,6 +372,9 @@ impl Read {
                 "topics": [ISwapRouter::Swap::SIGNATURE_HASH],
             })],
             Self::Block => rpc_params!["latest", true],
+            Self::BalanceAt(account, block, _) => rpc_params![account, block_tag(*block)],
+            Self::StorageAt(token, slot, block, _) => rpc_params![token, slot, block_tag(*block)],
+            Self::Tx(hash, _) => rpc_params![hash],
         };
         let value = call(methods, handle, method, params)?;
         self.check(&value).map_err(|e| format!("{method}: {e}"))
@@ -271,12 +423,36 @@ impl Read {
                     txs.iter().map(|tx| tx_hash(&tx["hash"])).collect::<Result<Vec<_>, _>>()?;
                 Ok(Answer::Block(number(&value["number"])?, hashes))
             }
+            Self::BalanceAt(..) => quantity(value).map(Answer::Balance),
+            Self::StorageAt(..) => Ok(Answer::Balance(U256::from_be_bytes(tx_hash(value)?.0))),
+            Self::Tx(hash, executed) => {
+                if value.is_null() {
+                    return if *executed {
+                        Err(format!("the executed transaction {hash} has no answer"))
+                    } else {
+                        Ok(Answer::Tx(None))
+                    };
+                }
+                let found = tx_hash(&value["hash"])?;
+                if found != *hash {
+                    return Err(format!("transaction {found}, asked for {hash}"));
+                }
+                if !executed {
+                    return Err(format!("the random hash {hash} answered a transaction"));
+                }
+                Ok(Answer::Tx(Some(number(&value["blockNumber"])?)))
+            }
         }
     }
 }
 
+/// The RPC block tag of block `number`: its hex quantity.
+pub(super) fn block_tag(number: u64) -> String {
+    format!("{number:#x}")
+}
+
 /// Call `method` with `params` on `methods` from this thread, within `handle`'s runtime.
-fn call(
+pub(super) fn call(
     methods: &Methods,
     handle: &Handle,
     method: &str,
@@ -286,33 +462,33 @@ fn call(
 }
 
 /// The JSON string `value`.
-fn text(value: &Value) -> Result<&str, String> {
+pub(super) fn text(value: &Value) -> Result<&str, String> {
     value.as_str().ok_or_else(|| format!("not a string: {value}"))
 }
 
 /// The `0x`-prefixed hex quantity `value`.
-fn quantity(value: &Value) -> Result<U256, String> {
+pub(super) fn quantity(value: &Value) -> Result<U256, String> {
     let digits = text(value)?.strip_prefix("0x").ok_or("quantity without 0x")?;
     U256::from_str_radix(digits, 16).map_err(|e| format!("bad quantity {value}: {e}"))
 }
 
 /// The hex quantity `value` as a block number.
-fn number(value: &Value) -> Result<u64, String> {
+pub(super) fn number(value: &Value) -> Result<u64, String> {
     u64::try_from(quantity(value)?).map_err(|e| format!("block number {value}: {e}"))
 }
 
 /// The 32-byte hex `value`.
-fn tx_hash(value: &Value) -> Result<B256, String> {
+pub(super) fn tx_hash(value: &Value) -> Result<B256, String> {
     text(value)?.parse().map_err(|e| format!("bad hash {value}: {e}"))
 }
 
 /// Lock `mutex`, taking the data over from a thread that panicked holding it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The current tokio runtime, which must be multi-thread (see the module docs).
-fn runtime() -> eyre::Result<Handle> {
+pub(super) fn runtime() -> eyre::Result<Handle> {
     let handle = Handle::try_current()
         .map_err(|_| eyre::eyre!("the side load starts within a tokio runtime"))?;
     eyre::ensure!(
@@ -336,6 +512,42 @@ struct Shared {
     samples: Mutex<ReadSamples>,
     /// The recent transaction hashes, oldest first.
     recent: Mutex<VecDeque<B256>>,
+    /// A uniform sample of every executed transaction hash fed.
+    executed: Mutex<Reservoir>,
+}
+
+/// A uniform sample of at most [`EXECUTED_TXS`] of the hashes added so far (Vitter's algorithm R),
+/// its replacements drawn from its own RNG.
+#[derive(Debug)]
+struct Reservoir {
+    /// The sample.
+    hashes: Vec<B256>,
+    /// The hashes added so far.
+    seen: u64,
+    /// The replacements' RNG.
+    rng: StdRng,
+}
+
+impl Default for Reservoir {
+    fn default() -> Self {
+        Self { hashes: Vec::new(), seen: 0, rng: StdRng::seed_from_u64(0) }
+    }
+}
+
+impl Reservoir {
+    /// Add `hash`: kept while the sample is short, else in place of a random one with probability
+    /// `EXECUTED_TXS / seen`.
+    fn add(&mut self, hash: B256) {
+        if self.hashes.len() < EXECUTED_TXS {
+            self.hashes.push(hash);
+        } else {
+            let slot = self.rng.random_range(0..=self.seen);
+            if let Some(kept) = self.hashes.get_mut(slot as usize) {
+                *kept = hash;
+            }
+        }
+        self.seen += 1;
+    }
 }
 
 impl Shared {
@@ -392,6 +604,13 @@ impl Shared {
         (!recent.is_empty()).then(|| recent[rng.random_range(0..recent.len())])
     }
 
+    /// An executed transaction hash drawn uniformly from the sample, or `None` with none fed.
+    fn executed_tx(&self, rng: &mut StdRng) -> Option<B256> {
+        let executed = lock(&self.executed);
+        let hashes = &executed.hashes;
+        (!hashes.is_empty()).then(|| hashes[rng.random_range(0..hashes.len())])
+    }
+
     /// Sleep until `deadline`, waking early when the threads stop.
     fn pause(&self, deadline: Instant) {
         while !self.stop.load(Ordering::SeqCst) {
@@ -414,6 +633,8 @@ struct Reader {
     spec: PrefillSpec,
     /// The account sampler, shared by every reader.
     zipf: Arc<Zipf>,
+    /// The kinds it draws and the epoch span.
+    mix: ReadMix,
     /// This reader's RNG.
     rng: StdRng,
     /// The gate and the samples.
@@ -435,7 +656,7 @@ impl Reader {
     fn run(mut self) {
         let shared = Arc::clone(&self.shared);
         while let Some(entered) = shared.enter() {
-            let kind = ReadKind::ALL[self.rng.random_range(0..ReadKind::ALL.len())];
+            let kind = self.mix.kinds[self.rng.random_range(0..self.mix.kinds.len())];
             self.read(kind);
             drop(entered);
         }
@@ -459,8 +680,8 @@ impl Reader {
         self.shared.record(read.kind(), answer.map(|answer| (latency, answer)));
     }
 
-    /// The query for `kind`: a [`ReadKind::Receipt`] without a recent transaction fetches the
-    /// latest block instead.
+    /// The query for `kind`: a [`ReadKind::Receipt`] without a recent transaction, or a
+    /// [`ReadKind::TxByHash`] without an executed one, fetches the latest block instead.
     fn plan(&mut self, kind: ReadKind) -> Result<Read, String> {
         Ok(match kind {
             ReadKind::Balance => Read::Balance(self.account()),
@@ -477,7 +698,32 @@ impl Reader {
                 Read::Logs(tip.saturating_sub(LOG_BLOCKS - 1), tip)
             }
             ReadKind::Block => Read::Block,
+            ReadKind::BalanceAtChain => {
+                Read::BalanceAt(self.account(), self.past_block(Span::Chain)?, Span::Chain)
+            }
+            ReadKind::BalanceAtEpoch => {
+                Read::BalanceAt(self.account(), self.past_block(Span::Epoch)?, Span::Epoch)
+            }
+            ReadKind::StorageAtChain | ReadKind::StorageAtEpoch => {
+                let span = if kind == ReadKind::StorageAtChain { Span::Chain } else { Span::Epoch };
+                let token = if self.rng.random() { STABLECOIN_A } else { STABLECOIN_B };
+                let slot = balance_slot(self.account());
+                Read::StorageAt(token, slot, self.past_block(span)?, span)
+            }
+            ReadKind::TxByHash => self
+                .shared
+                .executed_tx(&mut self.rng)
+                .map_or(Read::Block, |hash| Read::Tx(hash, true)),
+            ReadKind::TxByHashMiss => Read::Tx(B256::from(self.rng.random::<[u8; 32]>()), false),
         })
+    }
+
+    /// A block below the tip (`eth_blockNumber`, untimed) drawn uniformly from `span`: the whole
+    /// chain or the last [`ReadMix::epoch_blocks`] blocks; the genesis while the tip is the
+    /// genesis.
+    fn past_block(&mut self, span: Span) -> Result<u64, String> {
+        let tip = number(&call(&self.methods, &self.handle, "eth_blockNumber", rpc_params![])?)?;
+        Ok(self.rng.random_range(span.blocks(tip, self.mix.epoch_blocks)))
     }
 
     /// A Zipf-drawn prefilled account.
@@ -524,16 +770,18 @@ pub struct Readers {
 }
 
 impl Readers {
-    /// Start `threads` readers over `methods` with the gate off, drawing accounts of `spec`;
-    /// reader `i`'s RNG is seeded with `seed + i`.
+    /// Start `threads` readers over `methods` with the gate off, drawing the kinds of `mix` and
+    /// accounts of `spec`; reader `i`'s RNG is seeded with `seed + i`.
     ///
     /// Call it within the multi-thread tokio runtime the env's tasks run on.
     pub fn start(
         methods: Methods,
         spec: PrefillSpec,
+        mix: ReadMix,
         threads: usize,
         seed: u64,
     ) -> eyre::Result<Self> {
+        eyre::ensure!(!mix.kinds.is_empty(), "the readers' mix has no kind");
         let handle = runtime()?;
         let zipf = Arc::new(account_sampler(&spec)?);
         let mut readers = Self { shared: Arc::default(), handle, threads: Vec::new() };
@@ -543,6 +791,7 @@ impl Readers {
                 handle: readers.handle.clone(),
                 spec,
                 zipf: zipf.clone(),
+                mix,
                 rng: StdRng::seed_from_u64(seed.wrapping_add(i as u64)),
                 shared: readers.shared.clone(),
             };
@@ -582,9 +831,14 @@ impl Readers {
         Ok(())
     }
 
-    /// Add `hashes` to the transactions [`ReadKind::Receipt`] draws from; only executed ones
-    /// answer with a receipt.
+    /// Add the executed transactions `hashes` to those [`ReadKind::Receipt`] (the recent ones)
+    /// and [`ReadKind::TxByHash`] (a uniform sample of all fed) draw from. Feed only executed
+    /// transactions: a [`ReadKind::TxByHash`] of a hash without an answer is an error.
     pub fn feed_tx_hashes(&self, hashes: impl IntoIterator<Item = B256>) {
+        let hashes: Vec<B256> = hashes.into_iter().collect();
+        let mut executed = lock(&self.shared.executed);
+        hashes.iter().for_each(|hash| executed.add(*hash));
+        drop(executed);
         self.shared.remember(hashes);
     }
 
@@ -736,7 +990,7 @@ mod tests {
             execute_payload_and_update_canonical_chain,
             load::{
                 open_production_env,
-                state::{balance_slot, ACCOUNT_NATIVE, SENDER_NATIVE},
+                state::{ACCOUNT_NATIVE, ACCOUNT_TOKENS, SENDER_NATIVE},
                 workload::LoadKind,
                 LoadOutput, OutputConfig, OutputFactory,
             },
@@ -863,18 +1117,108 @@ mod tests {
         assert_eq!(node.read(Read::Logs(1, tip.number)), Ok(Answer::Logs(swaps)));
         assert_eq!(node.read(Read::Logs(0, 0)), Ok(Answer::Logs(0)), "genesis has no swaps");
 
-        let readers = Readers::start(node.methods.clone(), spec(), 2, 7)?;
+        let readers = Readers::start(node.methods.clone(), spec(), ReadMix::rpc(), 2, 7)?;
         readers.set_on(true);
         tokio::time::sleep(Duration::from_millis(300)).await;
         readers.set_on(false);
         let samples = readers.stop()?;
-        for kind in ReadKind::ALL {
+        for kind in ReadKind::RPC {
             let calls = samples.kind(kind);
             assert_eq!(calls.errors, 0, "{kind:?}: {:?}", calls.first_error);
             assert!(calls.ok > 0, "{kind:?} answered with content");
             assert_eq!(calls.latencies.len() as u64, calls.ok + calls.empty, "{kind:?}");
         }
         Ok(())
+    }
+
+    /// The past-block and by-hash queries answer with the state at their block and the executed
+    /// transactions; a random hash answers `null`, and an answer of the wrong kind is an error.
+    /// Two readers of the history mix on for 300 ms record every kind with no errors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_readers_answer_history_kinds() -> eyre::Result<()> {
+        let (node, _, executed) = Node::with_history()?;
+        let tip = node.env.canonical_tip();
+        assert!(tip.number >= 4, "three outputs of two blocks");
+        let sender = spec().sender(0).address();
+        let account = spec().account(0);
+        let past = tip.number - 2;
+        let past_hash = node.env.sealed_header_by_number(past)?.expect("a past header").hash();
+        let state = node.env.state_by_block_hash_for_test(past_hash)?;
+        let native = state.account_balance(&sender)?.unwrap_or_default();
+        assert_ne!(native, U256::from(SENDER_NATIVE), "the sender paid for gas by then");
+
+        let at = |account, block| Read::BalanceAt(account, block, Span::Chain);
+        assert_eq!(node.read(at(sender, 0)), Ok(Answer::Balance(U256::from(SENDER_NATIVE))));
+        assert_eq!(node.read(at(sender, past)), Ok(Answer::Balance(native)));
+        let epoch = Read::BalanceAt(account, 0, Span::Epoch);
+        assert_eq!(node.read(epoch), Ok(Answer::Balance(U256::from(ACCOUNT_NATIVE))));
+        let held = state.storage(STABLECOIN_B, balance_slot(sender))?.unwrap_or_default();
+        let slot =
+            |holder, block| Read::StorageAt(STABLECOIN_B, balance_slot(holder), block, Span::Chain);
+        assert_eq!(node.read(slot(sender, past)), Ok(Answer::Balance(held)));
+        assert_eq!(node.read(slot(account, 0)), Ok(Answer::Balance(U256::from(ACCOUNT_TOKENS))));
+
+        let first = executed.first().expect("three outputs");
+        let hash = keccak256(&first.raw_txs(0)[0]);
+        let random = B256::repeat_byte(7);
+        assert_eq!(node.read(Read::Tx(hash, true)), Ok(Answer::Tx(Some(1))));
+        assert_eq!(node.read(Read::Tx(random, false)), Ok(Answer::Tx(None)));
+        assert!(node.read(Read::Tx(random, true)).is_err(), "an executed hash must answer");
+        assert!(node.read(Read::Tx(hash, false)).is_err(), "a random hash must not answer");
+
+        let readers = Readers::start(node.methods.clone(), spec(), ReadMix::history(2), 2, 9)?;
+        let hashes = executed.iter().flat_map(|load| {
+            (0..load.batches.len()).flat_map(move |i| load.raw_txs(i).iter().map(keccak256))
+        });
+        readers.feed_tx_hashes(hashes.collect::<Vec<_>>());
+        readers.set_on(true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        readers.set_on(false);
+        let samples = readers.stop()?;
+        for kind in ReadKind::HISTORY {
+            let calls = samples.kind(kind);
+            assert_eq!(calls.errors, 0, "{kind:?}: {:?}", calls.first_error);
+            let answered = if kind == ReadKind::TxByHashMiss { calls.empty } else { calls.ok };
+            assert!(answered > 0, "{kind:?} answered");
+            assert_eq!(calls.latencies.len() as u64, calls.ok + calls.empty, "{kind:?}");
+        }
+        for kind in ReadKind::RPC {
+            let calls = samples.kind(kind);
+            assert_eq!(calls.latencies.len() as u64 + calls.errors, 0, "{kind:?} is not drawn");
+        }
+        Ok(())
+    }
+
+    /// A span covers the blocks below the tip: the whole chain, or the last epoch's blocks.
+    #[test]
+    fn test_span_blocks() {
+        assert_eq!(Span::Chain.blocks(100, 10), 0..=99);
+        assert_eq!(Span::Epoch.blocks(100, 10), 90..=99);
+        assert_eq!(Span::Epoch.blocks(5, 10), 0..=4, "a chain shorter than an epoch");
+        assert_eq!(Span::Epoch.blocks(100, 0), 99..=99, "an epoch of at least one block");
+        assert_eq!(Span::Chain.blocks(0, 10), 0..=0, "the genesis while it is the tip");
+        assert_eq!(Span::Epoch.blocks(0, 10), 0..=0);
+    }
+
+    /// The executed-hash sample keeps every hash while it is short, then stays at
+    /// [`EXECUTED_TXS`] with later hashes replacing earlier ones.
+    #[test]
+    fn test_reservoir_samples_every_hash_fed() {
+        let mut reservoir = Reservoir::default();
+        let hash = |i: u64| B256::from(U256::from(i));
+        (0..EXECUTED_TXS as u64).for_each(|i| reservoir.add(hash(i)));
+        assert_eq!(reservoir.hashes, (0..EXECUTED_TXS as u64).map(hash).collect::<Vec<_>>());
+        let total = 4 * EXECUTED_TXS as u64;
+        (EXECUTED_TXS as u64..total).for_each(|i| reservoir.add(hash(i)));
+        assert_eq!(reservoir.hashes.len(), EXECUTED_TXS);
+        assert_eq!(reservoir.seen, total);
+        let late = reservoir
+            .hashes
+            .iter()
+            .filter(|h| U256::from_be_bytes(h.0) >= U256::from(EXECUTED_TXS))
+            .count();
+        // uniform: about three quarters of the sample come from the later three quarters
+        assert!((late as f64 / EXECUTED_TXS as f64 - 0.75).abs() < 0.02, "{late}");
     }
 
     /// Every call recorded in `samples`: answered or not, read or poll.
@@ -891,7 +1235,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_readers_off_gate_stops_samples() -> eyre::Result<()> {
         let (node, _, _) = Node::with_history()?;
-        let mut readers = Readers::start(node.methods.clone(), spec(), 2, 3)?;
+        let mut readers = Readers::start(node.methods.clone(), spec(), ReadMix::rpc(), 2, 3)?;
         let addresses = poll_addresses(&spec(), 3)?;
         readers.poll_balances(node.pool.clone(), addresses, Duration::from_millis(10))?;
 
@@ -945,7 +1289,7 @@ mod tests {
         assert_eq!(addresses.len(), POLL_ACCOUNTS + spec().senders);
         assert_eq!(addresses.iter().collect::<HashSet<_>>().len(), addresses.len(), "distinct");
 
-        let mut readers = Readers::start(node.methods.clone(), spec(), 0, 5)?;
+        let mut readers = Readers::start(node.methods.clone(), spec(), ReadMix::rpc(), 0, 5)?;
         readers.poll_balances(node.pool.clone(), addresses.clone(), Duration::from_millis(20))?;
         readers.set_on(true);
         tokio::time::sleep(Duration::from_millis(150)).await;

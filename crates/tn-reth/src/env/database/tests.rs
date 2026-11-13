@@ -27,9 +27,9 @@ fn config(db: DatabaseArgs) -> RethConfig {
 }
 
 /// This build's data file, and the other build's.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 const OWN_AND_OTHER_DATA_FILE: (&str, &str) = ("mdbx.dat", TN_LMDB_DATA_FILE);
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 const OWN_AND_OTHER_DATA_FILE: (&str, &str) = (tn_lmdb_reth::DATA_FILE, MDBX_DATA_FILE);
 
 /// A database directory holding the other engine's data file is refused before anything is
@@ -48,9 +48,9 @@ fn open_rw_refuses_the_other_engines_database() {
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
     assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     assert!(msg.contains("fresh datadir"), "says what the operator can do: {msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     {
         assert!(msg.contains("migration") && msg.contains("unchanged"), "says why: {msg}");
         assert_eq!(std::fs::read(path.join(other)).expect("read"), b"planted", "MDBX unchanged");
@@ -65,7 +65,7 @@ fn open_rw_refuses_the_other_engines_database() {
 }
 
 /// The MDBX build refuses `db check` without opening anything: MDBX keeps no page checksums.
-#[cfg(not(feature = "tn-lmdb"))]
+#[cfg(feature = "mdbx")]
 #[test]
 fn db_check_is_refused_on_the_mdbx_build() {
     let tmp = TempDir::new().expect("tempdir");
@@ -106,9 +106,9 @@ fn check_backend_fails_on_a_stat_error() {
     std::fs::write(&file, b"not a directory").expect("file");
     let path = file.join("db");
 
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     let checked = check_backend(&path);
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     let checked = check_backend(&path, tn_lmdb_reth::TnLmdbArgs::default());
     let err = checked.expect_err("a stat error fails the guard");
     let msg = format!("{err:#}");
@@ -127,9 +127,9 @@ fn open_rw_creates_and_reopens_this_engines_database() {
     let own_exists = path.join(OWN_AND_OTHER_DATA_FILE.0).try_exists().expect("stat");
     assert!(own_exists, "this engine's data file");
     // the MDBX build writes reth's version; the tn-lmdb build its own, which reth's check refuses
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     reth_db::version::check_db_version_file(&path).expect("reth's version file");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     assert_eq!(reth_db::version::get_db_version(&path).expect("a version"), TN_LMDB_DB_VERSION);
 
     drop(open_rw(&config, &path).expect("reopen"));
@@ -200,9 +200,9 @@ fn db_table_stats_lists_populated_tables() {
 fn db_table_stats_skips_tables_the_database_lacks() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     drop(reth_db::create_db(&path, test_db_args().database_args()).expect("create"));
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     drop(
         tn_lmdb_reth::TnLmdbEnv::open(
             &path,
@@ -223,9 +223,9 @@ fn db_table_stats_skips_tables_the_database_lacks() {
 fn db_table_stats_refuses_the_other_engines_database() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     write_stats_rows(&path);
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     std::fs::create_dir(&path).expect("db dir");
     std::fs::write(path.join(OWN_AND_OTHER_DATA_FILE.1), b"planted").expect("plant");
 
@@ -233,9 +233,9 @@ fn db_table_stats_refuses_the_other_engines_database() {
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
     assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     assert!(msg.contains("pending or unfinished") && msg.contains("start the node"), "{msg}");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     assert!(!path.join(OWN_AND_OTHER_DATA_FILE.0).try_exists().expect("stat"), "nothing made");
 }
 
@@ -266,24 +266,68 @@ fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
 
     std::fs::write(path.join("mdbx.dat"), b"an MDBX database").expect("plant");
     let checked = refuse_pending_migration(&path);
-    #[cfg(not(feature = "tn-lmdb"))]
+    #[cfg(feature = "mdbx")]
     checked.expect("the MDBX build never migrates");
-    #[cfg(feature = "tn-lmdb")]
+    #[cfg(not(feature = "mdbx"))]
     {
         let msg = format!("{:#}", checked.expect_err("the open would migrate it"));
         assert!(msg.contains(&path.join("mdbx.dat").display().to_string()), "names it: {msg}");
     }
     assert_eq!(std::fs::read(path.join("mdbx.dat")).expect("read"), b"an MDBX database");
     assert_eq!(std::fs::read_dir(&path).expect("list").count(), 2, "nothing else is made");
+
+    // A migration stopped after its commit point that already removed MDBX's files: the temp
+    // directory, emptied by the rename, beside `tn-lmdb.dat` and no marker. The open would finish
+    // it, so the tn-lmdb build refuses it too; a temp directory still holding a copy (a stale one
+    // the open removes beside a tn-lmdb database) is no migration.
+    std::fs::remove_file(path.join("mdbx.dat")).expect("remove");
+    let temp = path.join(MIGRATING_DIR);
+    std::fs::create_dir(&temp).expect("temp dir");
+    let checked = refuse_pending_migration(&path);
+    #[cfg(feature = "mdbx")]
+    checked.expect("the MDBX build never finishes a migration");
+    #[cfg(not(feature = "mdbx"))]
+    {
+        let msg = format!("{:#}", checked.expect_err("the open would finish it"));
+        assert!(msg.contains("unfinished MDBX to tn-lmdb migration"), "says why: {msg}");
+        assert!(msg.contains(&temp.display().to_string()), "names the temp directory: {msg}");
+        assert!(msg.contains("next start finishes"), "{msg}");
+    }
+    assert!(temp.try_exists().expect("stat"), "the temp directory is kept");
+    std::fs::write(temp.join("tn-lmdb.dat"), b"a stopped copy").expect("plant");
+    refuse_pending_migration(&path).expect("a stale copy beside a tn-lmdb database");
 }
 
-/// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
+/// `--db.max-size` on the command line draws a warning when the node's config is built from the
+/// parsed command (`RethConfig::new`) on the tn-lmdb build, where the flag is the mapping's
+/// reservation and not the cap reth's help describes; unset, it draws none, and the MDBX build,
+/// which runs reth's cap, warns of nothing.
+#[test]
+fn max_size_on_the_command_line_warns_that_it_is_a_reservation() {
+    use clap::Parser as _;
+    crate::init_reth_defaults();
+    let tmp = TempDir::new().expect("tempdir");
+    let chain: Arc<crate::RethChainSpec> = Arc::new(test_genesis().into());
+    let warned = |args: &[&str]| {
+        let command = crate::RethCommand::try_parse_from(args).expect("parsed");
+        let warnings = WarnCapture::default();
+        tracing::subscriber::with_default(warnings.clone(), || {
+            RethConfig::new(command, None, tmp.path(), true, chain.clone())
+        });
+        warnings.find("reservation, not a cap")
+    };
+    assert_eq!(warned(&["tn-reth"]), None, "no flag, no warning");
+    let warned = warned(&["tn-reth", "--db.max-size", "4GB"]);
+    assert_eq!(warned.is_some(), !cfg!(feature = "mdbx"), "{warned:?}");
+    if let Some(warned) = warned {
+        assert!(warned.contains("max_size=4294967296"), "names the size: {warned}");
+    }
+}
+
 /// A subscriber keeping the text of every WARN event's fields, for a test asserting a warning.
-#[cfg(not(feature = "tn-lmdb"))]
 #[derive(Clone, Default)]
 struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
 
-#[cfg(not(feature = "tn-lmdb"))]
 impl WarnCapture {
     /// The first warning whose text holds `text`.
     fn find(&self, text: &str) -> Option<String> {
@@ -291,7 +335,6 @@ impl WarnCapture {
     }
 }
 
-#[cfg(not(feature = "tn-lmdb"))]
 impl tracing::Subscriber for WarnCapture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
@@ -314,7 +357,8 @@ impl tracing::Subscriber for WarnCapture {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-#[cfg(not(feature = "tn-lmdb"))]
+/// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
+#[cfg(feature = "mdbx")]
 mod mdbx {
     use super::*;
 
@@ -332,7 +376,7 @@ mod mdbx {
             let msg = format!("{err:#}");
             let marker = path.join(MIGRATED_MARKER).display().to_string();
             assert!(msg.contains(&marker), "names the marker: {msg}");
-            assert!(msg.contains("is missing") && msg.contains("`tn-lmdb` feature"), "{msg}");
+            assert!(msg.contains("is missing") && msg.contains("`mdbx` feature"), "{msg}");
         };
         refused(open_rw(&config(test_db_args()), &path).expect_err("the marker alone"));
         refused(db_table_stats(&path).expect_err("the stats refuse it too"));
@@ -373,7 +417,7 @@ mod mdbx {
     }
 }
 
-#[cfg(feature = "tn-lmdb")]
+#[cfg(not(feature = "mdbx"))]
 mod tn_lmdb {
     use super::*;
     use reth_db::{cursor::DbCursorRO as _, mdbx::SyncMode as MdbxSyncMode, ClientVersion};
@@ -507,6 +551,83 @@ mod tn_lmdb {
             err.to_string().contains("--db.growth-step") && err.to_string().contains("minimum"),
             "names the flag and the minimum: {err}"
         );
+    }
+
+    /// `--db.gap-fill` parses into `RethConfig::db_gap_fill` (unset: `crate::DEFAULT_DB_GAP_FILL`,
+    /// `auto` on Linux and off on macOS; a width in pages, `off`
+    /// or `auto`; past `MAX_GAP_FILL` or anything else refused at the parse, naming the flag) and
+    /// reaches the engine: a width past its `MAX_GAP_FILL` given by `with_db_gap_fill` is refused
+    /// at the open, naming the flag, before the database is created; a width or `auto` opens, and
+    /// its durable commits fill gaps (`IoStats::gaps_filled` is the engine's own count; `auto`'s
+    /// warm-up fills from its first scattered commit, `IoStats::gap_auto_steps`). On a file system
+    /// that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first
+    /// commit with a gap to fill turns gap fill off instead, a width and `auto` alike
+    /// (`IoStats::gap_fill_refusals`, the engine's documented fallback), filling none: the option
+    /// reached the engine either way.
+    #[test]
+    fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
+        use clap::Parser as _;
+        use tn_lmdb_reth::GapFill;
+        let command = |flags: &[&str]| {
+            crate::RethCommand::try_parse_from(
+                std::iter::once("tn-reth").chain(flags.iter().copied()),
+            )
+        };
+        let parse = |flags: &[&str]| {
+            let chain = Arc::new(test_genesis().into());
+            let command = command(flags).expect("parse");
+            RethConfig::new(command, None, TempDir::new().expect("tempdir").path(), true, chain)
+        };
+        let unset = if cfg!(target_os = "linux") { GapFill::Auto } else { GapFill::OFF };
+        assert_eq!(crate::DEFAULT_DB_GAP_FILL, unset, "auto on Linux, off elsewhere");
+        assert_eq!(parse(&[]).db_gap_fill(), unset, "an unset flag takes the default");
+        assert_eq!(parse(&["--db.gap-fill", "4"]).db_gap_fill(), GapFill::Pages(4));
+        assert_eq!(parse(&["--db.gap-fill", "off"]).db_gap_fill(), GapFill::OFF);
+        assert_eq!(parse(&["--db.gap-fill", "auto"]).db_gap_fill(), GapFill::Auto);
+        for bad in ["65", "fast"] {
+            let err = command(&["--db.gap-fill", bad]).expect_err(bad).to_string();
+            assert!(err.contains("--db.gap-fill") && err.contains(bad), "{bad}: {err}");
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let wide =
+            config(test_db_args()).with_db_gap_fill(GapFill::Pages(tn_lmdb_reth::MAX_GAP_FILL + 1));
+        let err = open_rw(&wide, &path).expect_err("past the maximum").to_string();
+        assert!(err.contains("--db.gap-fill"), "{err}");
+        assert!(!path.join(tn_lmdb_reth::DATA_FILE).exists(), "the refusal created the database");
+        for (gap_fill, dir) in [(GapFill::Pages(4), "fixed"), (GapFill::Auto, "auto")] {
+            let path = tmp.path().join(dir);
+            let db =
+                open_rw(&config(test_db_args()).with_db_gap_fill(gap_fill), &path).expect("opens");
+            for i in 0..64u64 {
+                db.update(|tx| {
+                    for j in 0..64u64 {
+                        let k = (i * 64 + j).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+                        tx.put::<tables::CanonicalHeaders>(k, B256::with_last_byte(i as u8))?;
+                    }
+                    Ok::<_, reth_db::DatabaseError>(())
+                })
+                .expect("tx")
+                .expect("put");
+            }
+            let s = db.io_stats();
+            assert!(s.sync_runs > s.commits, "{gap_fill}: the commits formed runs: {s:?}");
+            let auto = gap_fill == GapFill::Auto;
+            assert!(auto || s.gap_auto_steps == 0, "{gap_fill}: only auto chooses: {s:?}");
+            match s.gap_fill_refusals {
+                0 => {
+                    assert!(
+                        s.gaps_filled > 0,
+                        "{gap_fill}: the durable commits filled gaps: {s:?}"
+                    );
+                    assert!(!auto || s.gap_auto_steps > 0, "{gap_fill}: auto chose: {s:?}");
+                }
+                _ => {
+                    let counts = (s.gap_fill_refusals, s.gaps_filled);
+                    assert_eq!(counts, (1, 0), "{gap_fill}: refused once: {s:?}");
+                }
+            }
+        }
     }
 
     /// `--db.sync-mode safe-no-sync`'s automatic syncs: one second, 64 MiB.
@@ -766,11 +887,10 @@ mod tn_lmdb {
     }
 
     /// The rollback tripwire: reth's `create_db`, which a binary running reth on MDBX alone calls
-    /// first on every start (a release from before the backend guard has the same function),
-    /// refuses a tn-lmdb database before it creates anything, so it never opens an empty MDBX
-    /// database beside `tn-lmdb.dat` (whose consistency check would prune the static files down
-    /// to it). Run over a new tn-lmdb database and over one that held reth's version, as a
-    /// migrated one does.
+    /// first on every start (`v0.16.0-adiri`'s reth v1.11.3 has the same function), refuses a
+    /// tn-lmdb database before it creates anything, so it never opens an empty MDBX database beside
+    /// `tn-lmdb.dat` (whose consistency check would prune the static files down to it). Run over a
+    /// new tn-lmdb database and over one that held reth's version, as a migrated one does.
     #[test]
     fn an_mdbx_only_binary_refuses_a_tn_lmdb_database() {
         use reth_db::version::{db_version_file_path, DatabaseVersionError, DB_VERSION};

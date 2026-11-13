@@ -42,8 +42,8 @@ build of `telcoin-network` (the profile the Docker image uses) is 54.8 MB withou
 62.7 MB with it. Build time barely changes: a clean release build took 1m50s without it and 1m54s
 with it on 16 cores, because boa compiles in parallel with the rest of the graph.
 
-A JavaScript tracer is code the RPC caller supplies, and the node runs it on its blocking pool at
-every EVM step of the traced transaction. Nothing limits how long one of its functions runs:
+A JavaScript tracer is code the RPC caller supplies, and the node runs it on RPC's blocking pool
+(`rpc_blocking.rs`) at every EVM step of the traced transaction. Nothing limits how long one of its functions runs:
 
 - boa's loop limit doesn't. revm-inspectors sets it to 200,000 iterations, but boa counts them per
   call frame, so a function that calls a looping function from a loop gets a fresh 200,000 on
@@ -55,11 +55,13 @@ every EVM step of the traced transaction. Nothing limits how long one of its fun
   client disconnected, until the trace finished or the node ran out of memory (upstream reth
   #27543). Now an expired request returns an error at once, and an expired or abandoned trace
   stops at the first EVM step after the running callback returns. `setup` and `result` run outside
-  the EVM steps, so nothing stops them.
+  the EVM steps, so nothing stops them. The node sets no upper bound on `timeout`, as geth sets
+  none: a client that asks for hours keeps its trace running, and holding its tracing permit,
+  until the trace ends or, once the client disconnects, until it stops as an abandoned trace does.
 
 What bounds the cost is the number of threads. Each `debug_trace*` request holds a tracing permit
 (`--rpc.max-tracing-requests`) until its trace ends, even after it times out or the client leaves
-(TN-0036). So at most that many blocking threads run debug traces at once, however long one takes.
+(TN-0036); `debug_executionWitness*` and `trace_*` do the same (TN-0038). So at most that many blocking threads run debug traces at once, however long one takes.
 The cost moves to other callers instead: a trace that runs for an hour keeps its permit for an hour,
 and the `debug_trace*`, `debug_executionWitness*` and `trace_*` requests that share the permits
 queue behind it.
@@ -120,9 +122,9 @@ If the team decides to drop JavaScript tracers for good:
    [README](README.md#feature-flags) feature table, the test's `cfg(feature = "js-tracer")` branch
    (keep its refusal check), this file, and the note about it on the
    [`debug_traceTransaction`](../../docs/src/rpc-methods/debug/debug_tracetransaction.md) page.
-   Remove the two `js-tracer` runs from `lane_test_vendor_reth` in `etc/ci-lanes.sh`, and
-   consider retiring `patches/revm-inspectors`, which matters only to JavaScript tracers (its
-   PATCH.md lists what to delete).
+   Remove the two `js-tracer` runs from `lane_test_vendor_reth` in `etc/ci-lanes.sh`. Keep
+   `patches/revm-inspectors`: its recursion limit then no longer matters, but its trace cap
+   (TN-0079, TN-0153) applies to every build (its PATCH.md, "Retirement", says when it can go).
 2. In `vendor/reth`, as a ledgered change (`CHANGES.md`): delete `js_tracer_interrupt.rs`, the
    `js-tracer` code in `crates/rpc/rpc/src/debug.rs` and
    `crates/rpc/rpc-eth-types/src/error/mod.rs`, and the `js-tracer` features of reth-rpc,

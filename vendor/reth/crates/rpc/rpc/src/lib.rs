@@ -31,8 +31,11 @@
 // allowlist (`tn-reth/src/cli.rs`) never lets an operator enable.
 mod aliases;
 mod debug;
+// TN(TN-0036, TN-0038): the tracing-permit tests' harness.
 pub mod eth;
 mod net;
+#[cfg(test)]
+mod permit_test_utils;
 mod rpc;
 mod trace;
 mod web3;

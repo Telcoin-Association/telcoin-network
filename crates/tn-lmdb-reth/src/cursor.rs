@@ -47,7 +47,7 @@ use crate::{
     dup::{DupLayout, DUP_LAYOUTS},
     error::{self, Mdbx},
     timeout::ReaderState,
-    tx::{compressed, no_data, SharedTxn, TxnState},
+    tx::{compressed, guarded, no_data, SharedTxn, TxnState},
 };
 use parking_lot::Mutex;
 use reth_db_api::{
@@ -668,8 +668,8 @@ struct Rows {
 /// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in on a
 /// plain engine cursor ([`flat_seek_dup`]). Every layout's `key + subkey` fits (`StoragesTrie`'s
 /// 97 bytes is the widest), so building the seek key from reth's encoded keys allocates nothing;
-/// only a longer raw input takes a `Vec`. The encodes themselves may allocate: `StoragesTrie`'s
-/// subkey, `StoredNibblesSubKey`, encodes to a `Vec`.
+/// only a longer raw input takes a `Vec`. `StoragesTrie`'s subkey, `StoredNibblesSubKey`, encodes
+/// to a `[u8; 65]`, so its encode does not allocate either.
 const SEEK_KEY_STACK: usize = 128;
 
 // Every layout's `key ‖ subkey` fits the stack buffer, and its key width the engine's `u16`
@@ -787,26 +787,29 @@ macro_rules! pair {
     };
 }
 
-/// The row of table `T`, which has no duplicates, stored as `entry`, if any.
+/// The row of table `T`, which has no duplicates, stored as `entry`, if any. A damaged key or
+/// value is `DatabaseError::Decode` ([`guarded`]).
 fn plain<T: Table>(entry: Option<Entry<'_>>) -> PairResult<T> {
     let Some((key, value)) = entry else { return Ok(None) };
-    Ok(Some((T::Key::decode(key)?, T::Value::decompress(value)?)))
+    guarded::<T, _>(key, || Ok(Some((T::Key::decode(key)?, T::Value::decompress(value)?))))
 }
 
 /// The row of dup-sort table `T` read as its stored key and its full value ([`Rows::dup_row`]),
-/// if any, decoded.
+/// if any, decoded. A damaged key or value is `DatabaseError::Decode` ([`guarded`]).
 #[inline(always)]
 fn dup_decoded<T: Table>(dup: DupLayout, row: Option<Entry<'_>>) -> PairResult<T> {
     let Some((key, value)) = row else { return Ok(None) };
     let (key_part, _) = dup.split(key).ok_or(DatabaseError::Decode)?;
-    Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?)))
+    guarded::<T, _>(key, || Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?))))
 }
 
 /// The value of the row of dup-sort table `T` read as its stored key and its full value
-/// ([`Rows::dup_row`]), if any, decoded.
+/// ([`Rows::dup_row`]), if any, decoded. A damaged value is `DatabaseError::Decode`
+/// ([`guarded`]).
 #[inline(always)]
 fn dup_value_of<T: Table>(row: Option<Entry<'_>>) -> ValueOnlyResult<T> {
-    row.map(|(_, value)| T::Value::decompress(value)).transpose()
+    let Some((key, value)) = row else { return Ok(None) };
+    guarded::<T, _>(key, || T::Value::decompress(value).map(Some))
 }
 
 impl Rows {
@@ -1521,8 +1524,12 @@ pub(crate) struct Deferred {
 pub(crate) enum WipeFault {
     /// The wipe removed no row.
     NoRowRemoved,
-    /// The wipe left a row of the key after the cursor.
+    /// The wipe left a row of the key after the cursor (the cursor's follower shares the key).
     RowLeft,
+    /// The wipe did not run, and read as one row removed: every row of the key is left in the
+    /// tree, with the cursor out of the deleted state (its follower does not share the key), so
+    /// only the tree's own look for the key's rows sees them.
+    NotRun,
 }
 
 /// The test-only counts of [`Deferred`]: the rewrites made as one engine put, the held deletes
@@ -1969,21 +1976,24 @@ impl<T: Table> TnLmdbCursorMut<T> {
             }
             return result.map_err(fail);
         };
+        // An insert of a key that has any row is MDBX's `MDBX_KEYEXIST` whatever its value's
+        // size (MDBX finds the key before it checks the value), with the cursor on the key's
+        // first row. The key's rows are looked for apart from the cursor ([`has_rows`]), so a row
+        // the engine refuses (by its size) leaves the cursor where it was.
+        if operation == DatabaseWriteOperation::CursorInsert
+            && key.len() == dup.key
+            && has_rows(txn, table, dup, key).map_err(fail)?
+        {
+            let result = cursor.seek(txn, key).and(Err(tn_lmdb::Error::KeyExists));
+            rows.wrote(&result);
+            return result.map_err(fail);
+        }
         let rest = rest.ok_or_else(|| error::bad_size(operation, T::NAME, key))?;
         let stored = stored.as_slice();
         // `Ok(false)`: a second value for a subkey the key holds, refused ([`insert_dup_at`]).
         let result = match operation {
             DatabaseWriteOperation::CursorUpsert => insert_dup_at(cursor, txn, table, stored, rest),
-            DatabaseWriteOperation::CursorInsert => {
-                // MDBX refuses a key that has any row, and leaves the cursor on its first. The
-                // key's rows are looked for apart from the cursor ([`has_rows`]), so a row the
-                // engine refuses (by its size) leaves the cursor where it was.
-                if has_rows(txn, table, dup, key).map_err(fail)? {
-                    cursor.seek(txn, key).and(Err(tn_lmdb::Error::KeyExists))
-                } else {
-                    cursor.insert(txn, stored, rest).map(|()| true)
-                }
-            }
+            DatabaseWriteOperation::CursorInsert => cursor.insert(txn, stored, rest).map(|()| true),
             DatabaseWriteOperation::CursorAppend => match cursor.append(txn, stored, rest) {
                 // MDBX's append to a dup-sort table also takes the last key again, with a value
                 // anywhere among its rows; a smaller key is refused with the cursor on the last
@@ -2193,19 +2203,33 @@ impl<T: DupSort> DbDupCursorRW<T> for TnLmdbCursorMut<T> {
             // next call, which another write may come before: by then a row put again in the key
             // at or after the cursor's subkey would be found instead, where the loop's cursor
             // stays on the next key's.
-            let deleted = txn.delete_prefix(&self.table, &key).map_err(error::delete)?;
+            #[cfg(test)]
+            let fault = state.deferred.wipe_fault.take();
+            #[cfg(test)]
+            let wiped = !matches!(fault, Some(WipeFault::NotRun));
+            #[cfg(not(test))]
+            let wiped = true;
+            let deleted = if wiped {
+                txn.delete_prefix(&self.table, &key).map_err(error::delete)?
+            } else {
+                1
+            };
             let shares = self.cursor.follower_shares_prefix(txn, dup.key).map_err(error::delete)?;
             #[cfg(test)]
-            let (deleted, shares) = match state.deferred.wipe_fault.take() {
+            let (deleted, shares) = match fault {
                 Some(WipeFault::NoRowRemoved) => (0, shares),
                 Some(WipeFault::RowLeft) => (deleted, true),
-                None => (deleted, shares),
+                _ => (deleted, shares),
             };
             // The walk took the cursor's row and left no row of its key, else the tree and the
             // cursor disagree (damage the engine did not detect, or a bug): a wipe reported done
-            // would keep rows reth deleted, or leave the cursor blind to them. Refused, and the
-            // commit refuses the transaction ([`Deferred::fail`]).
-            if deleted == 0 || shares {
+            // would keep rows reth deleted, or leave the cursor blind to them. A row left is seen
+            // from both sides: the cursor's follower sharing the key (`shares`, true only in the
+            // deleted state), and the tree still holding a row of the key anywhere ([`has_rows`],
+            // which sees a row before the cursor's subkey, or the cursor's own row, too). Refused,
+            // and the commit refuses the transaction ([`Deferred::fail`]).
+            let left = shares || has_rows(txn, &self.table, dup, &key).map_err(error::delete)?;
+            if deleted == 0 || left {
                 let what = if deleted == 0 {
                     "a wipe of the cursor's key removed no row"
                 } else {

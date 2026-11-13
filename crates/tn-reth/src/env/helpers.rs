@@ -20,7 +20,10 @@
 //!   `last_block_number`, `last_finalized_block_number`. These see the in-flight blocks only once
 //!   the output commits. `lookup_head` also belongs here: reth's `NodeConfig::lookup_head` resolves
 //!   the head *number* from the `Finish` stage checkpoint via `database_provider_ro()`, so it
-//!   tracks the committed database even though the follow-up header fetch is in-memory-aware.
+//!   tracks the committed database even though the follow-up header fetch is in-memory-aware. The
+//!   tip readers here use that checkpoint too, not the provider's `last_block_number`: a commit
+//!   finalizes the static files before the MDBX transaction, so the Headers static file can be one
+//!   block ahead of MDBX for a moment.
 //!
 //! Concretely: `sealed_header_by_hash` can return a header whose number exceeds
 //! `last_block_number()`, and `header_by_number(canonical_tip().number)` can return `None`,
@@ -124,6 +127,28 @@ impl RethEnv {
         &self,
     ) -> TnRethResult<impl reth_provider::DBProvider + use<>> {
         Ok(self.inner.blockchain_provider.database_provider_ro()?)
+    }
+
+    /// TEST-ONLY: `overlay`'s layered root for `current` over this env's database with the
+    /// parallel storage-root tasks, the account walk and the hot storage tries split when the block
+    /// is worth it, and no serial comparison (`output_overlay/parallel.rs`). The walks are chosen
+    /// here, not by `TN_PARALLEL_ACCOUNT_WALK` or `TN_PARALLEL_STORAGE_WALK`.
+    ///
+    /// The #1301 trie-level differential test checks it against the same oracle as the serial
+    /// root.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn parallel_layered_root_for_test(
+        &self,
+        overlay: &crate::OutputTrieOverlay,
+        current: reth_trie::HashedPostState,
+    ) -> TnRethResult<(B256, reth_trie::updates::TrieUpdates)> {
+        let provider = self.inner.blockchain_provider.database_provider_ro()?;
+        Ok(overlay.layered_root_with_updates_parallel(
+            &self.inner.blockchain_provider,
+            reth_provider::DBProvider::tx_ref(&provider),
+            current,
+            crate::env::output_overlay::Walks::SPLIT,
+        )?)
     }
 
     /// Look up and return the sealed header for block number.
@@ -319,8 +344,13 @@ impl RethEnv {
     /// Committed-DB read (see the module docs): blocks of an in-flight consensus output are not
     /// counted until the output commits, so this can lag [`Self::canonical_tip`]. Provider
     /// errors propagate — there is no fallback value.
+    ///
+    /// The number is the `Finish` stage checkpoint, which `save_blocks` writes in the same MDBX
+    /// transaction as the blocks. The provider's `last_block_number` reads the Headers static
+    /// file instead, which a commit finalizes before the MDBX transaction commits, so inside that
+    /// window it reports a block MDBX does not hold yet.
     pub fn last_block_number(&self) -> TnRethResult<u64> {
-        Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number()?)
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.best_block_number()?)
     }
 
     /// Return the block number and hash for the current canonical tip.

@@ -8,6 +8,14 @@ use alloy_rpc_types_trace::{
 };
 use revm::bytecode::opcode::OpCode;
 
+/// TN(TN-0079, TN-0153): the default for [`TracingInspectorConfig::max_recorded_bytes`],
+/// 160 MiB: reth's default `--rpc.max-response-size`. Steps serialize to more bytes than the
+/// trace holds for them, and so do calls' input and output (in hex) for the tracers that return
+/// them, so for those a trace past the cap could not be returned anyway. A tracer that returns
+/// no call input or output (the struct logger, `prestateTracer`) refuses a transaction whose
+/// calls copy more than the cap, although its response would fit.
+pub const DEFAULT_MAX_RECORDED_BYTES: usize = 160 << 20;
+
 /// 256 bits each marking whether an opcode should be included into steps trace or not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
@@ -76,6 +84,14 @@ pub struct TracingInspectorConfig {
     pub record_logs: bool,
     /// Whether to record immediate bytes for opcodes.
     pub record_immediate_bytes: bool,
+    /// TN(TN-0079, TN-0153): the most bytes the trace may hold before the transaction halts
+    /// with a `trace too large` error: every call's and create's trace with its input or init
+    /// code and its output (TN-0153), and the recorded steps with their stack and memory
+    /// snapshots, return data and immediate bytes (TN-0079). Logs and storage changes are not
+    /// counted; gas bounds them. Counted per inspector, or across the inspectors that share a
+    /// counter ([`TracingInspector::share_recorded_bytes`]). `None` is no limit; the presets use
+    /// [`DEFAULT_MAX_RECORDED_BYTES`].
+    pub max_recorded_bytes: Option<usize>,
 }
 
 impl TracingInspectorConfig {
@@ -91,6 +107,7 @@ impl TracingInspectorConfig {
             exclude_precompile_calls: false,
             record_logs: true,
             record_immediate_bytes: true,
+            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
         }
     }
 
@@ -106,6 +123,7 @@ impl TracingInspectorConfig {
             record_logs: false,
             record_opcodes_filter: None,
             record_immediate_bytes: false,
+            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
         }
     }
 
@@ -123,6 +141,7 @@ impl TracingInspectorConfig {
             record_logs: false,
             record_opcodes_filter: None,
             record_immediate_bytes: false,
+            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
         }
     }
 
@@ -163,6 +182,7 @@ impl TracingInspectorConfig {
             record_logs: false,
             record_opcodes_filter: None,
             record_immediate_bytes: false,
+            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
         }
     }
 
@@ -259,6 +279,10 @@ impl TracingInspectorConfig {
         self.record_logs |= other.record_logs;
         self.record_opcodes_filter = self.record_opcodes_filter.or(other.record_opcodes_filter);
         self.record_immediate_bytes |= other.record_immediate_bytes;
+        self.max_recorded_bytes = match (self.max_recorded_bytes, other.max_recorded_bytes) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         self
     }
 
@@ -437,6 +461,30 @@ impl TraceStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TN(TN-0079): every preset carries the cap, and a merge keeps the tighter one.
+    #[test]
+    fn presets_cap_recorded_bytes() {
+        for config in [
+            TracingInspectorConfig::all(),
+            TracingInspectorConfig::none(),
+            TracingInspectorConfig::default_parity(),
+            TracingInspectorConfig::default_geth(),
+            TracingInspectorConfig::from_geth_config(&Default::default()),
+        ] {
+            assert_eq!(config.max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
+        }
+        assert_eq!(TracingInspectorConfig::default().max_recorded_bytes, None);
+
+        let mut tight = TracingInspectorConfig::none();
+        tight.max_recorded_bytes = Some(1);
+        let mut merged = TracingInspectorConfig::default_geth();
+        merged.merge(tight);
+        assert_eq!(merged.max_recorded_bytes, Some(1));
+        let mut unlimited = TracingInspectorConfig::default();
+        unlimited.merge(TracingInspectorConfig::default_geth());
+        assert_eq!(unlimited.max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
+    }
 
     #[test]
     fn test_parity_config() {

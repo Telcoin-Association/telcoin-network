@@ -28,8 +28,8 @@ use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{PipelineTarget, StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, NodePrimitivesProvider, StorageSettings, StorageSettingsCache,
-    TryIntoHistoricalStateProvider,
+    BlockBodyIndicesProvider, DBProvider, NodePrimitivesProvider, StorageSettings,
+    StorageSettingsCache, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
@@ -57,6 +57,14 @@ mod metrics;
 
 mod chain;
 pub use chain::*;
+
+// TN(TN-0113): storage v2 against v1 on the same generated chain.
+#[cfg(test)]
+mod tn_v2_tests;
+
+// TN(TN-0100): a timing harness for historical reads, storage v1 against v2.
+#[cfg(test)]
+mod tn_v2_read_bench;
 
 /// A common provider that fetches data from a database or static file.
 ///
@@ -122,6 +130,8 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         )
         .storage_settings()?
         .unwrap_or(legacy_settings);
+        // TN(TN-0122): new static-file jars carry checksums in a storage v2 datadir.
+        static_file_provider.set_jar_checksums(storage_settings.is_v2());
 
         Ok(Self {
             db,
@@ -186,6 +196,8 @@ impl<N: NodeTypesWithDB> StorageSettingsCache for ProviderFactory<N> {
 
     fn set_storage_settings_cache(&self, settings: StorageSettings) {
         *self.storage_settings.write() = settings;
+        // TN(TN-0122): new static-file jars carry checksums in a storage v2 datadir.
+        self.static_file_provider.set_jar_checksums(settings.is_v2());
     }
 }
 
@@ -337,7 +349,12 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// consistency. I.e. this MAY result in writes to the static files.
     #[instrument(err, skip(self))]
     pub fn check_consistency(&self) -> ProviderResult<(Option<u64>, Option<u64>)> {
-        let provider_ro = self.database_provider_ro()?;
+        let provider_ro = self
+            .database_provider_ro()?
+            // Healing can run long-lived read transactions (e.g., iterating changesets
+            // over millions of blocks). Disable the default timeout so MDBX doesn't
+            // kill the transaction mid-heal, which causes a crash loop on startup.
+            .disable_long_read_transaction_safety();
 
         // Step 1: heal file-level inconsistencies (no pruning)
         self.static_file_provider().check_file_consistency(&provider_ro)?;

@@ -20,23 +20,24 @@ use alloy_rpc_types_eth::{
 use futures::Future;
 use reth_errors::{ProviderError, RethError};
 use reth_evm::{
-    env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor,
-    InspectorFor, TransactionEnv, TxEnvFor,
+    block::BlockExecutor, env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm,
+    EvmEnvFor, HaltReasonFor, InspectorFor, TransactionEnv, TxEnvFor,
 };
 use reth_primitives_traits::{BlockBody, Recovered};
 use reth_revm::{
-    cancelled::CancelOnDrop,
     database::StateProviderDatabase,
     db::{bal::EvmDatabaseError, State},
 };
 use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
     cache::db::StateProviderTraitObjWrapper,
+    call_many,
     error::{AsEthApiError, FromEthApiError},
     simulate::{self, EthSimulateError},
-    EthApiError, StateCacheDb,
+    CallManyBudget, EthApiError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox};
+use reth_tasks::{cancel::is_cancelled, CancelOnDrop};
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Transaction},
@@ -96,9 +97,15 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let base_block =
                 self.recovered_block(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
             let mut parent = base_block.sealed_header().clone();
+            // TN(TN-0059): load the state of the block resolved above: resolving a tag such as
+            // `latest` again could return a newer block than `parent`.
+            let state_at = if block.is_pending() { block } else { parent.hash().into() };
 
-            self.spawn_with_state_at_block(block, move |this, mut db| {
+            self.spawn_with_state_at_block(state_at, move |this, mut db| {
                 let _permit = permit;
+                // TN(TN-0156): the request's calls share one gas budget across its blocks, as
+                // `eth_callMany`'s do.
+                let mut budget = CallManyBudget::new(this.call_gas_limit());
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
@@ -241,6 +248,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             builder,
                             calls,
                             default_gas_limit,
+                            &mut budget,
                             chain_id,
                             this.converter(),
                         )
@@ -261,6 +269,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             builder,
                             calls,
                             default_gas_limit,
+                            &mut budget,
                             chain_id,
                             this.converter(),
                         )
@@ -317,6 +326,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             if bundles.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into());
             }
+            // TN(TN-0057): the request shares one gas budget, as a block's transactions do.
+            let gas_budget = self.call_gas_limit();
+            call_many::check_call_count(
+                gas_budget,
+                bundles.iter().map(|bundle| bundle.transactions.len()).sum::<usize>(),
+            )
+            .map_err(Self::Error::from_eth_err)?;
 
             let permit = self
                 .acquire_owned_blocking_io()
@@ -366,6 +382,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             self.spawn_with_state_at_block(at, move |this, mut db| {
                 let _permit = permit;
+                let mut budget = CallManyBudget::new(gas_budget);
                 let mut all_results = Vec::with_capacity(bundles.len());
 
                 if replay_block_txs {
@@ -392,6 +409,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                     // transact all transactions in the bundle
                     for (tx_index, tx) in transactions.into_iter().enumerate() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
+
                         // Apply overrides, state overrides are only applied for the first tx in the
                         // request
                         let overrides =
@@ -415,6 +436,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                                 ))
                             },
                         )?;
+                        budget.charge(res.result.gas_used()).map_err(Self::Error::from_eth_err)?;
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {
@@ -772,6 +794,14 @@ pub trait Call:
             self.spawn_with_state_at_block(parent_block, move |this, mut db| {
                 let block_txs = block.transactions_recovered();
 
+                // apply pre-execution changes (e.g. EIP-4788 beacon root, EIP-2935 blockhashes)
+                RpcNodeCore::evm_config(&this)
+                    .executor_for_block(&mut db, block.sealed_block())
+                    .map_err(RethError::other)
+                    .map_err(Self::Error::from_eth_err)?
+                    .apply_pre_execution_changes()
+                    .map_err(Self::Error::from_eth_err)?;
+
                 // replay all transactions prior to the targeted transaction
                 this.replay_transactions_until(&mut db, evm_env.clone(), block_txs, *tx.tx_hash())?;
 
@@ -809,6 +839,9 @@ pub trait Call:
             if *tx.tx_hash() == target_tx_hash {
                 // reached the target transaction
                 break
+            }
+            if is_cancelled() {
+                return Err(EthApiError::InternalEthError.into())
             }
 
             let tx_env = self.evm_config().tx_env(tx);
@@ -924,7 +957,11 @@ pub trait Call:
             if tx_env.gas_price() > 0 {
                 // If gas price is specified, cap transaction gas limit with caller allowance
                 trace!(target: "rpc::eth::call", ?tx_env, "Applying gas limit cap with caller allowance");
-                let cap = self.caller_gas_allowance(db, &evm_env, &tx_env)?;
+                let mut cap = self.caller_gas_allowance(db, &evm_env, &tx_env)?;
+                // The allowance must not raise the already applied RPC gas cap.
+                if self.call_gas_limit() != 0 {
+                    cap = cap.min(tx_env.gas_limit());
+                }
                 // ensure we cap gas_limit to the block's
                 tx_env.set_gas_limit(cap.min(evm_env.block_env.gas_limit()));
             }

@@ -84,10 +84,16 @@ metas with `pwrite` (`FileExt::write_all_at`). `env::read_record` reads the meta
 (`read_exact_at`) at open step 5, before the file is mapped. Every later read and write, a
 commit's meta included (`Writer::copy_meta`), goes through the mapping. So an open reads, by
 `pread`, metas an earlier writer wrote through its mapping, perhaps a writer of this boot that
-crashed before any sync. The tests also damage files with `pwrite` and read them with `pread`
-while an environment may hold a mapping.
+crashed before any sync. With `EnvOptions::gap_fill` on, step 4's gap fill
+(`Writer::fill_gaps`) reads gap pages by `pread` (`PageFile::read_resident`) while the mapping
+holds them and writes the same bytes back by `pwrite` (`PageFile::rewrite`): it needs the `pread`
+to see what the mapping holds, and step 4's sync after it to write the pages the `pwrite` dirtied
+(a sync that left them unwritten would lose nothing: they hold the bytes the disk holds, but the
+fill would then save no write). The tests also damage files with `pwrite` and read them with
+`pread` while an environment may hold a mapping.
 
-**Linux, macOS.** One page cache: coherent.
+**Linux, macOS.** One page cache: coherent. macOS's `msync`s of `DataSync::Ranges` write the
+pages a `pwrite` dirtied inside their ranges (`a_gap_filled_scattered_commit_leaves_no_page_dirty`).
 
 ### Durable syncs of mapped pages
 
@@ -171,19 +177,40 @@ writes the dead writer's.
 
 **What it needs.** Advice that drops a file's clean cached pages, so later reads come from the
 device. A writer open gives it right after step 4's `fsync`, before it reads the metas or maps
-the file: a meta or a page a failed writeback left clean in the cache (its bytes never on the
-device, the error reported once to the writer that is gone) is then read from the device, where
-the open does not see the meta, or step 9's check finds the page old and falls back to the last
-sync.
+the file, when the boot record says the cache can be stale: a meta or a page a failed writeback
+left clean in the cache (its bytes never on the device, the error reported once to the writer
+that is gone) is then read from the device, where the open does not see the meta, or step 9's
+check finds the page old and falls back to the last sync. The record (`boot_record.rs`,
+`<path>.boot`) needs the host's boot id (`sys::boot_id`) and a file's device, inode and ctime
+(`fstat`); a port without a boot id gets a drop at every open.
 
-**Where.** `sys::drop_cached_pages`, called by `Env::open` at step 4. Without the advice the
-engine still works; it loses the fallback (README, "Known limit"), and
+**Where.** `sys::drop_cached_pages`, called by `Env::open` at step 4 when
+`boot_record::decide` says so; the record is written at step 10 (`Writer::mark_open`, synced) and
+at the close (`env::mark_clean`). Without the advice the engine still works; it loses the
+fallback (README, "Known limit"), and
 `a_reopen_after_a_lost_writeback_falls_back_to_the_last_sync` passes only through the disk
-model, which restores the device's bytes at the call whatever the OS does.
+model, which restores the device's bytes at the call whatever the OS does. A port that keeps the
+record must keep its ctime stable from the close's `fstat` on: the close takes it once the
+mappings are gone, since an unmap may move it (macOS's file systems do).
 
 **Linux, macOS.** Linux: `posix_fadvise(POSIX_FADV_DONTNEED)` over the whole file; the kernel
 keeps a dirty page, and one mapped by another process (none: the writer's lock excludes every
-other open). macOS: no such advice; a no-op.
+other open); the boot record is kept (`boot_record::KEPT`). macOS: no such advice; a no-op, and
+no record (in tests every host keeps it, as the disk model mirrors the drop).
+
+### Reads started ahead of the weak-head check
+
+**What it needs.** Advice that starts reading a byte range of a file into the page cache and
+returns without waiting. Open step 9's check of a weak head reads every page written since the
+last sync, on a cache step 4 dropped; advised ahead, the device reads a branch's children
+together instead of one fault at a time.
+
+**Where.** `sys::will_need`, called by `check::Ahead` from `check::check_since` (a writer open's
+and a read-only open's). Without it the check is correct and slower on a cold cache.
+
+**Linux, macOS.** Linux: `posix_fadvise(POSIX_FADV_WILLNEED)` through `rustix` (no `unsafe`);
+an error is ignored. macOS: a no-op (its cache is not dropped at open, so the check reads it
+warm).
 
 ### Growth with real blocks, and the trim at close
 
@@ -199,8 +226,8 @@ dies. With the blocks reserved at growth, a full disk is an `io::Error` at the g
 `fallocate` mode 0. macOS: `F_PREALLOCATE` (`F_ALLOCATECONTIG | F_ALLOCATEALL`, then
 `F_ALLOCATEALL` alone, from the physical end of file), a check that `fst_bytesalloc` covers the
 range (else `ENOSPC`), then `set_len`. Where the file system cannot preallocate (`EOPNOTSUPP` or
-`ENOSYS` on Linux, `ENOTSUP` on macOS), it falls back to a sparse `set_len`, so the file still
-works without the guarantee. The close trims the preallocated tail back
+`ENOSYS` on Linux, `ENOTSUP` on macOS), it falls back to a sparse `set_len`, with a warning once
+per process (`sparse_fallback`), so the file still works without the guarantee. The close trims the preallocated tail back
 (`Writer::trim_tail`, `PageFile::trim_to`: `set_len` to the pages in use rounded up to the OS
 page) while the mapping stays. The first growth of a reopened writer cuts a tail it did not
 preallocate the same way (`PageFile::distrust_tail`). Both are `ftruncate` of a mapped file,
@@ -261,6 +288,10 @@ weak meta is trusted, so a process crash recovers the last sync, as a reboot doe
 `sysctlbyname("kern.bootsessionuuid")`, each a UUID string (`the_host_boot_id_is_known_and_stable`).
 A boot time is not a safe substitute: a stepped clock moves it within a boot (safe: weak heads are
 then distrusted), and a host without a working clock can repeat it across boots (unsafe).
+The boot record (open step 4) reads the same id and needs the other half of the contract too: the
+id must not change within a boot. One that did would make a crash's "open" read as another boot's,
+and the open would keep a cache it must drop. An id that repeats across boots costs the record
+nothing: a new boot's cache holds nothing of the file, so keeping it is right either way.
 
 ### The OS page size and `msync` alignment
 
@@ -285,6 +316,24 @@ commit and slowed first writes into new space, so macOS gives no advice. A port 
 measurement (the regression bench), and `every_mapping_follows_the_readahead_option` must then
 follow it.
 
+### A read that does not wait for the disk (gap fill, performance only)
+
+**What it needs.** Nothing for correctness: `EnvOptions::gap_fill` is off by default, and a
+gap it fills keeps its bytes whichever way it was read. For speed, a read of the page cache that
+returns at once, short or with an error, when a page is not cached, without new `unsafe`.
+
+**Where.** `PageFile::read_cached` (no fallback arm: a port writes it), and
+`PageFile::advise_random_reads` at open when gap fill is on.
+
+**Linux.** `preadv2` with `RWF_NOWAIT` (since 4.14 for buffered reads), through `rustix` (a
+Linux-only dependency, `Cargo.toml`); a kernel or file system that refuses it (`EOPNOTSUPP`,
+`EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off with a warning, once, a fixed width and
+`GapFill::Auto` alike. `posix_fadvise(POSIX_FADV_RANDOM)` keeps the read a miss starts to the gap.
+**macOS.** No such read: a plain `pread` (a page not in memory costs a synchronous read), so gap
+fill there serves tests and measurement. A port without such a read does the same or refuses the
+option. `GapFill::Auto` needs nothing more of the OS: it times the fill and the data sync with
+`Instant` and chooses a width (`env/gap_auto.rs`), the same on every port.
+
 ### Errors
 
 The engine reads a few errno values. Each is a place to check on a new OS:
@@ -292,14 +341,18 @@ The engine reads a few errno values. Each is a place to check on a new OS:
 | where | errno | meaning |
 |---|---|---|
 | `file::mapped` | `ENOMEM` | a refused mapping (the writer's reservation, a read-only open's file, `Env::check`'s anonymous table of the state's pages: `check::Claims::every`) is `Error::OutOfMemory`, anything else `Error::Io` |
-| `sys::allocate_range` | Linux `EOPNOTSUPP`, `ENOSYS`; macOS `ENOTSUP` | no preallocation here: fall back to a sparse `set_len`. Every other error (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`) fails the growth |
+| `sys::allocate_range` | Linux `EOPNOTSUPP`, `ENOSYS`; macOS `ENOTSUP` | no preallocation here: fall back to a sparse `set_len`, with a warning once per process. Every other error (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`) fails the growth |
 | `sys::fsync_directory` | `EACCES` (open), `EINVAL`, `ENOTSUP`, `EOPNOTSUPP` (fsync) | skipped with a warning |
 | `sys::retry_interrupted` | `EINTR` (`ErrorKind::Interrupted`) | the call is issued again |
 | `sys::flock` | `EWOULDBLOCK` (`ErrorKind::WouldBlock`) | the lock is held: `Locked` |
 | `env::create` | `ELOOP`, `EISDIR` | `<path>.creating` is a symbolic link or not a regular file: refused, `InvalidInput` |
+| `boot_record::BootFile::write` | `ELOOP`, `EISDIR`, `ENXIO` | the boot record's path is a symbolic link, a directory or a FIFO: refused, `InvalidInput` |
+| `env::Writer::mark_open` | `EACCES`, `EPERM`, `EROFS` (`PermissionDenied`, `ReadOnlyFilesystem`), creating the boot record | no record: a warning, and every open drops the cached pages |
 
 The adapter crate `tn-lmdb-reth` reports an `Error::Io`'s OS code and names `libc::ENODATA`,
-`EACCES`, `EINVAL`, `ENOMEM` and `EIO` (`src/error.rs`). `libc` has no `ENODATA` for FreeBSD,
+`EACCES`, `EINVAL`, `ENOMEM` and `EIO` (`src/error.rs`). An error the engine names (the boot
+record's writes, a directory sync) keeps the OS error as its source (`sys::Context`), where the
+adapter finds the code. `libc` has no `ENODATA` for FreeBSD,
 OpenBSD or DragonFly, so that crate does not build there as it is.
 
 ### Open flags and file identity
@@ -340,8 +393,10 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `sys.rs` | `fsync_file` | `macos` / `not(macos)` | plain `libc::fsync` (retried on `EINTR`) / `File::sync_all` |
 | `sys.rs` | `fdatasync_file` | `macos` / `not(macos)` | `fsync_file` / `File::sync_data` |
 | `sys.rs` | `drop_cached_pages` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_DONTNEED)` over the file / a no-op |
-| `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback |
-| `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback |
+| `sys.rs` | `will_need` | `linux` / `not(linux)` | `posix_fadvise(POSIX_FADV_WILLNEED)` over a range (`rustix`) / a no-op |
+| `boot_record.rs` | `KEPT` | `cfg!(any(target_os = "linux", test))` | the boot record kept beside the file / none, every open drops (a no-op off Linux) |
+| `sys.rs` | `allocate_range` | `linux` | `fallocate` mode 0, sparse `set_len` fallback (warned once) |
+| `sys.rs` | `allocate_range` | `macos` | `F_PREALLOCATE` then `set_len`, sparse fallback (warned once) |
 | `env.rs` | `DataSync::Ranges` | `macos` | the variant exists on macOS only |
 | `env.rs` | `DataSync::File` | `cfg_attr(all(macos, not(test)))` | `allow(dead_code)`: only a test knob picks it on macOS |
 | `env.rs` | `EnvOptions::default` | `!cfg!(linux)` | `readahead` default: off (advise `MADV_RANDOM`) on Linux only |
@@ -352,22 +407,30 @@ falls into each `not(target_os = "macos")` arm, that is Linux's, unless the swit
 | `env.rs` | `Env::open` | `macos` | `msync_range(0..len)` of the new mapping (step 8) |
 | `file.rs` | `PageFile::msync_ranges` | `macos` | `MS_ASYNC` pass, then `MS_SYNC` pass |
 | `file.rs` | `PageFile::fdatasync_all` | `macos` | `msync(MS_SYNC)` of the whole file before the `fdatasync` |
+| `file.rs` | `PageFile::read_cached` | `linux` | `preadv2` with `RWF_NOWAIT` (`rustix`): only what the page cache holds |
+| `file.rs` | `PageFile::read_cached` | `macos` | a plain `pread` (`read_exact_at`) |
+| `file.rs` | `PageFile::advise_random_reads` | `linux` | `posix_fadvise(POSIX_FADV_RANDOM)` (`rustix`); nothing elsewhere |
+| `file.rs` | `Resident::{NotWhole, Unsupported}` | `cfg_attr(not(linux))` | `allow(dead_code)`: only Linux's read returns them |
+| `Cargo.toml` | `rustix` | `cfg(target_os = "linux")` | the dependency behind both `rustix` calls |
 
-`read_boot_id` and `allocate_range` have no fallback arm. Once the `compile_error!` is lifted for
-a new OS, the build fails at both: that is deliberate, so a port must write them. For
-`x86_64-unknown-freebsd`, `cargo check -p tn-lmdb --tests --target x86_64-unknown-freebsd`
-reports exactly these: the `compile_error!` and the two missing functions; the rest of the
-library and its tests type-check there.
+`read_boot_id`, `allocate_range` and `PageFile::read_cached` have no fallback arm. Once the
+`compile_error!` is lifted for a new OS, the build fails at all three: that is deliberate, so a
+port must write them. For `x86_64-unknown-freebsd`, `cargo check -p tn-lmdb --tests --target
+x86_64-unknown-freebsd` reports exactly these: the `compile_error!` and the three missing
+functions; the rest of the library and its tests type-check there.
 
 ### In tests
 
 | file | item | switch | what |
 |---|---|---|---|
+| `file.rs` | `refuses_nowait_reads` | `linux` / `not(linux)` | probes the temp dir with its own `preadv2(RWF_NOWAIT)` (`rustix`) / never refuses: the gap fill tests' expected fallback |
 | `file.rs` | `PageFile::dirty_os_pages` | `all(test, macos)` | counts modified pages with `mincore` (`MINCORE_MODIFIED`, `MINCORE_MODIFIED_OTHER`: Apple only) |
 | `file.rs` | `fdatasync_all_writes_every_page_dirtied_through_the_mapping` | `macos` | no dirty page after `fdatasync_all` |
 | `file.rs` | `a_failed_msync_of_ranges_poisons_the_file` | `macos` | `msync_ranges` (macOS only) keeps the poison rule |
 | `env/tests.rs` | `dirty_pages_form_one_range_or_take_one_fdatasync` | `macos` / `not(macos)` | the expected plan for a scattered commit |
 | `env/tests.rs` | `a_scattered_durable_commit_leaves_no_page_dirty` | `macos` | by `dirty_os_pages` |
+| `env/gap_fill_tests.rs` | `a_gap_filled_scattered_commit_leaves_no_page_dirty` | `macos` | by `dirty_os_pages`: the `msync`s write the gaps a `pwrite` dirtied |
+| `env/gap_fill_tests.rs` | `a_fill_rewrites_the_gaps_up_to_its_size_and_no_wider` | `macos` | two asserts by `dirty_os_pages`: the fill dirtied its gaps |
 | `env/tests.rs` | `a_writer_open_writes_the_pages_another_mapping_left_dirty` | `macos` | by `dirty_os_pages` |
 | `env/tests.rs` | `scattered_pages_msync_their_merged_ranges` | `macos` | `merged_ranges` |
 | `env/tests.rs` | `every_mapping_follows_the_readahead_option` | `cfg!(linux)` | the `readahead` default |

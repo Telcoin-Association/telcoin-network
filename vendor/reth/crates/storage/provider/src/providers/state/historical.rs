@@ -159,14 +159,10 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        let lookup_key = if self.provider.cached_storage_settings().use_hashed_state() {
-            storage_key.to_hashed()
-        } else {
-            debug_assert!(
-                storage_key.is_plain(),
-                "expected plain storage key when use_hashed_state is false"
-            );
-            storage_key.as_b256()
+        // TN(TN-0112): `StoragesHistory` is keyed by the plain slot in both storage layouts
+        // (upstream 815037e27). A hashed slot cannot be looked up: v2 stores no preimages.
+        let StorageSlotKey::Plain(lookup_key) = storage_key else {
+            return Err(ProviderError::UnsupportedProvider)
         };
 
         self.provider.with_rocksdb_tx(|rocks_tx_ref| {
@@ -185,6 +181,10 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
     ///
     /// Accepts a [`StorageSlotKey`]; the correct lookup key is derived internally
     /// based on the storage mode.
+    ///
+    /// TN(TN-0112): history and changesets are keyed by the plain slot in both storage layouts,
+    /// so only a [`StorageSlotKey::Plain`] resolves. v2's current state, `HashedStorages`, is
+    /// keyed by its keccak256 hash.
     fn storage_by_lookup_key(
         &self,
         address: Address,
@@ -193,15 +193,7 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
     where
         Provider: StorageSettingsCache + RocksDBProviderFactory + NodePrimitivesProvider,
     {
-        let lookup_key = if self.provider.cached_storage_settings().use_hashed_state() {
-            storage_key.to_hashed()
-        } else {
-            debug_assert!(
-                storage_key.is_plain(),
-                "expected plain storage key when use_hashed_state is false"
-            );
-            storage_key.as_b256()
-        };
+        let lookup_key = storage_key.as_b256();
 
         match self.storage_history_lookup(address, storage_key)? {
             HistoryInfo::NotYetWritten => Ok(None),
@@ -218,11 +210,12 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => {
                 if self.provider.cached_storage_settings().use_hashed_state() {
                     let hashed_address = alloy_primitives::keccak256(address);
+                    let hashed_slot = storage_key.to_hashed();
                     Ok(self
                         .tx()
                         .cursor_dup_read::<tables::HashedStorages>()?
-                        .seek_by_key_subkey(hashed_address, lookup_key)?
-                        .filter(|entry| entry.key == lookup_key)
+                        .seek_by_key_subkey(hashed_address, hashed_slot)?
+                        .filter(|entry| entry.key == hashed_slot)
                         .map(|entry| entry.value)
                         .or(Some(StorageValue::ZERO)))
                 } else {
@@ -515,15 +508,14 @@ impl<
         self.storage_by_lookup_key(address, StorageSlotKey::plain(storage_key))
     }
 
+    /// TN(TN-0112): unsupported in both storage layouts. History is keyed by the plain slot and
+    /// v2 stores no preimages, so a hashed slot cannot be found in it.
     fn storage_by_hashed_key(
         &self,
-        address: Address,
-        hashed_storage_key: StorageKey,
+        _address: Address,
+        _hashed_storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
-        if !self.provider.cached_storage_settings().use_hashed_state() {
-            return Err(ProviderError::UnsupportedProvider)
-        }
-        self.storage_by_lookup_key(address, StorageSlotKey::hashed(hashed_storage_key))
+        Err(ProviderError::UnsupportedProvider)
     }
 }
 

@@ -15,8 +15,9 @@ use reth_db::{
     ClientVersion,
 };
 use reth_node_core::args::DatabaseArgs;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
+use tn_lmdb_reth::RethTableStat;
 
 /// One table's raw rows: encoded keys and compressed values, in order.
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -608,16 +609,65 @@ fn a_migration_stopped_between_tables_migrates_again_at_the_next_open() {
     });
 }
 
-/// A migration stopped once its copy is verified and durable, before the rename (its commit
-/// point), migrates afresh at the next open.
+/// A migration stopped while it reads its copy back, or once the copy is verified and durable,
+/// before the rename (its commit point), migrates afresh at the next open.
 #[test]
 fn a_migration_stopped_before_its_commit_point_migrates_again_at_the_next_open() {
+    stop_then_reopen(Step::MidVerify, 0, assert_stopped_before_the_commit_point);
     stop_then_reopen(Step::BeforeRename, 0, assert_stopped_before_the_commit_point);
+}
+
+/// The read transaction timeout the long-read tests open with (`--db.read-transaction-timeout`
+/// in seconds, its least).
+const READ_TIMEOUT_SECS: u64 = 1;
+
+/// How long a long-read test holds the migration inside a read transaction: past
+/// [`READ_TIMEOUT_SECS`], with room for MDBX's timeout thread, which aborts a reader on its next
+/// wake after the deadline.
+const LONG_READ: Duration = Duration::from_secs(2);
+
+/// Migrate [`build_mdbx`]'s database at an open with `--db.read-transaction-timeout`
+/// [`READ_TIMEOUT_SECS`], held at the first pass of `hold`, inside one of the migration's long read
+/// transactions, for [`LONG_READ`], as a large table would hold it: the migration reads on past
+/// the timeout, and every table holds MDBX's rows.
+fn migrate_holding_a_long_read(hold: Step) {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let db_args =
+        DatabaseArgs { read_transaction_timeout: Some(READ_TIMEOUT_SECS), ..tn_lmdb_db_args() };
+
+    PAUSE_AT.set(Some((hold, LONG_READ)));
+    let db = open_tn_lmdb(&path, &db_args, version("2.0.0"))
+        .unwrap_or_else(|e| panic!("{hold:?}: the migration reads on past the timeout: {e:#}"));
+    assert_eq!(PAUSE_AT.get(), None, "{hold:?}: the migration was held");
+    assert_eq!(db.read_transaction_timeout(), Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "{hold:?}: every row, as MDBX held it");
+    assert!(exists(&path.join(MIGRATED_MARKER)), "{hold:?}: the migration finished");
+}
+
+/// The copy reads MDBX through one read transaction across every table, which on a large
+/// database lives past the read transaction timeout: it opts out of the timeout, so a copy held
+/// past it inside a table (after a bounded commit) reads the rest of its rows.
+#[test]
+fn the_copy_reads_mdbx_past_the_read_transaction_timeout() {
+    migrate_holding_a_long_read(Step::MidCopy);
+}
+
+/// The read-back of the copy reads tn-lmdb through one read transaction across every table,
+/// which lives as long as the copy: it opts out of the timeout, so a read-back held past it
+/// between two tables reads the rest.
+#[test]
+fn the_read_back_reads_tn_lmdb_past_the_read_transaction_timeout() {
+    migrate_holding_a_long_read(Step::MidVerify);
 }
 
 /// A migration stopped after its commit point (`tn-lmdb.dat` in place beside MDBX's files, no
 /// marker) is finished by the next open: MDBX's files and the temp directory are removed, the
-/// marker is written, and the migrated rows are intact.
+/// marker is written, and the migrated rows are intact. The temp directory holds the record of
+/// `mdbx.dat` the migration took before its commit point, and the unchanged file passes it.
 #[test]
 fn a_migration_stopped_after_its_commit_point_is_finished() {
     let marker = stop_then_reopen(Step::AfterRename, 0, |path| {
@@ -625,8 +675,474 @@ fn a_migration_stopped_after_its_commit_point_is_finished() {
             assert!(exists(&path.join(present)), "{present} is left as a kill leaves it");
         }
         assert!(!exists(&path.join(MIGRATED_MARKER)));
+        let recorded =
+            MdbxSource::read(&path.join(MIGRATING_DIR)).expect("read").expect("a record");
+        let now = MdbxSource::stat(&path.join(MDBX_DATA_FILE), recorded.last_txnid).expect("stat");
+        assert_eq!(recorded, now, "mdbx.dat is as recorded");
+        assert!(recorded.last_txnid > 0, "MDBX's last transaction id: {recorded:?}");
     });
     assert!(marker.contains("finished by a later open"), "{marker}");
+}
+
+/// How a test writes `mdbx.dat` behind a migration's back, as a build running reth on MDBX would:
+/// a byte appended (its length and modification time change), or the modification time alone
+/// moved (as a write that keeps the length would).
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Append,
+    Touch,
+}
+
+/// Make `change` to `mdbx`, an `mdbx.dat`.
+fn change_mdbx(mdbx: &Path, change: Change) {
+    use std::io::Write as _;
+    match change {
+        Change::Append => {
+            let mut file =
+                std::fs::OpenOptions::new().append(true).open(mdbx).expect("open to append");
+            file.write_all(b"x").expect("append");
+        }
+        Change::Touch => {
+            let file = std::fs::OpenOptions::new().write(true).open(mdbx).expect("open");
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            file.set_modified(later).expect("touch");
+        }
+    }
+}
+
+/// Between a migration's commit point and its version file, a build running reth on MDBX alone can
+/// open and advance `mdbx.dat`, which finishing the migration would then remove: the migration
+/// records the file's length and modification time before its commit point, and the open that
+/// finds the stopped migration refuses an `mdbx.dat` that differs, naming both files and keeping
+/// them, with the temp directory and its record. `db stats` refuses the directory as unfinished.
+/// Once resolved by hand (here `mdbx.dat` removed), the next open finishes the migration.
+#[test]
+fn mdbx_written_after_the_commit_point_is_refused() {
+    for change in [Change::Append, Change::Touch] {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        STOP_AT.set(Some(Step::AfterRename));
+        let err = open(&path).expect_err("the migration is stopped");
+        assert!(matches!(err.downcast_ref::<Killed>(), Some(Killed(Step::AfterRename))), "{err:#}");
+        let record = path.join(MIGRATING_DIR).join(MDBX_SOURCE_RECORD);
+        let recorded = std::fs::read_to_string(&record).expect("the record");
+        assert!(recorded.starts_with("len ") && recorded.contains("\nlast_txnid "), "{recorded}");
+
+        let mdbx = path.join(MDBX_DATA_FILE);
+        change_mdbx(&mdbx, change);
+        let written = std::fs::read(&mdbx).expect("mdbx.dat");
+        let tn_lmdb = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+
+        let err = open(&path).expect_err("mdbx.dat written after the commit point");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("was written since"), "{change:?}: says why: {msg}");
+        assert!(msg.contains("stopped after its commit point"), "{change:?}: {msg}");
+        for file in [MDBX_DATA_FILE, DATA_FILE] {
+            let named = msg.contains(&path.join(file).display().to_string());
+            assert!(named, "{change:?}: names {file}: {msg}");
+        }
+        assert_eq!(std::fs::read(&mdbx).expect("mdbx.dat"), written, "{change:?}: mdbx.dat kept");
+        let now = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+        assert!(now == tn_lmdb, "{change:?}: tn-lmdb.dat kept");
+        assert!(!exists(&path.join(MIGRATED_MARKER)), "{change:?}: no marker");
+        assert_eq!(std::fs::read_to_string(&record).expect("kept"), recorded, "{change:?}");
+        let stats = format!("{:#}", db_table_stats(&path).expect_err("unfinished"));
+        assert!(stats.contains("pending or unfinished"), "{change:?}: {stats}");
+
+        std::fs::remove_file(&mdbx).expect("resolved by hand");
+        let db = open(&path).expect("the next open finishes the migration");
+        let mut rows = raw_rows(&*db);
+        rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+        assert!(rows == expected, "{change:?}: every row, as MDBX held it");
+        let marker = std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker");
+        assert!(marker.contains("finished by a later open"), "{change:?}: {marker}");
+        assert!(!exists(&path.join(MIGRATING_DIR)), "{change:?}: the temp directory is gone");
+    }
+}
+
+/// Arm `run` to run at the first pass of [`Step::MidCopy`] of the next migration on this thread:
+/// after the copy's first commit, inside its read transaction of MDBX.
+fn run_mid_copy(run: impl FnOnce() + 'static) {
+    RUN_AT.set(Some((Step::MidCopy, Box::new(run))));
+}
+
+/// Assert that a migration of `path` failed with `err` because MDBX was written during its copy,
+/// before its commit point: the error says so and names `mdbx.dat`, and the migration left the
+/// directory as it found it, `mdbx.dat` holding `mdbx` and `mdbx.lck` still there.
+fn assert_written_during_the_copy(path: &Path, err: &eyre::Report, mdbx: &[u8], case: &str) {
+    assert!(RUN_AT.with_borrow(Option::is_none), "{case}: the write was made");
+    let msg = format!("{err:#}");
+    for says in [
+        "another process wrote the MDBX database during the migration",
+        "Stop that process, then start the node again",
+        "MDBX database is unchanged",
+    ] {
+        assert!(msg.contains(says), "{case}: says {says:?}: {msg}");
+    }
+    let named = msg.contains(&path.join(MDBX_DATA_FILE).display().to_string());
+    assert!(named, "{case}: names mdbx.dat: {msg}");
+    assert_untouched(path, mdbx, case);
+    assert!(exists(&path.join(MDBX_LOCK_FILE)), "{case}: mdbx.lck kept");
+}
+
+/// A process writing `mdbx.dat` while the migration copies it (a build running reth on MDBX on a
+/// second datadir naming the same `db/`) writes past the copy's snapshot: the migration takes the
+/// file's length and modification time when it opens MDBX and again at its commit point, and fails
+/// before the commit point on a difference, naming the file, with MDBX's files as that process
+/// left them and no `tn-lmdb.dat`. Once the writer has stopped, the next open migrates (after the
+/// touch: the appended byte leaves no MDBX file).
+#[test]
+fn mdbx_written_during_the_copy_fails_the_migration() {
+    for change in [Change::Append, Change::Touch] {
+        let case = format!("{change:?}");
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        let mdbx = path.join(MDBX_DATA_FILE);
+        let mut written = std::fs::read(&mdbx).expect("mdbx.dat");
+        if let Change::Append = change {
+            written.push(b'x');
+        }
+
+        let file = mdbx.clone();
+        run_mid_copy(move || change_mdbx(&file, change));
+        let err = open(&path).expect_err("mdbx.dat written during the copy");
+        assert_written_during_the_copy(&path, &err, &written, &case);
+
+        // An appended byte leaves no MDBX file to migrate.
+        if let Change::Touch = change {
+            let db =
+                open(&path).unwrap_or_else(|e| panic!("{case}: the next open migrates: {e:#}"));
+            let mut rows = raw_rows(&*db);
+            rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+            assert!(rows == expected, "{case}: every row, as MDBX held it");
+            assert!(!exists(&mdbx), "{case}: the migration finished");
+        }
+    }
+}
+
+/// The environment variable that makes [`mdbx_writer_process`] write: the database directory.
+const WRITER_DIR: &str = "TN_MIGRATE_TEST_MDBX_WRITER_DIR";
+
+/// The row [`mdbx_writer_process`] commits to `CanonicalHeaders`: a block number past the test
+/// database's.
+const WRITTEN_BLOCK: u64 = u64::MAX;
+
+/// Not a test of its own: the second process of [`no_other_process_opens_mdbx_during_the_copy`],
+/// which runs this test binary on it alone, since MDBX refuses a second environment on the same
+/// files in one process. With [`WRITER_DIR`] set it opens the MDBX database there read-write,
+/// commits [`WRITTEN_BLOCK`], and prints MDBX's last transaction ids before and after; without it,
+/// it does nothing.
+#[test]
+#[ignore = "the writer process of no_other_process_opens_mdbx_during_the_copy"]
+fn mdbx_writer_process() {
+    use reth_db::mdbx::DatabaseEnvKind;
+    let Some(dir) = std::env::var_os(WRITER_DIR) else { return };
+    let args = DatabaseArgs { page_size: Some(MDBX_PAGE_SIZE), ..temp_chain_db_args() };
+    let db = DatabaseEnv::open(Path::new(&dir), DatabaseEnvKind::RW, args.database_args())
+        .expect("open MDBX read-write");
+    let id = || mdbx_last_txnid(&db).expect("last txnid");
+    let first = id();
+    let tx = db.tx_mut().expect("tx_mut");
+    tx.put::<tables::CanonicalHeaders>(WRITTEN_BLOCK, Default::default()).expect("put");
+    tx.commit().expect("commit");
+    println!("mdbx-writer: {first} {}", id());
+}
+
+/// A command running `test`, an ignored test of this module, as a second process of this test
+/// binary, alone.
+fn test_process(test: &str) -> std::process::Command {
+    let (_, tests) = module_path!().split_once("::").expect("a crate path");
+    let mut command = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    command.args([&format!("{tests}::{test}"), "--exact", "--ignored"]).args([
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ]);
+    command
+}
+
+/// No other process opens MDBX while the migration copies it (a build running reth on MDBX on a
+/// second datadir naming the same `db/`): the migration's open is exclusive, so MDBX refuses that
+/// process's open, it commits nothing the copy would miss, and the migration completes with every
+/// row MDBX held.
+#[test]
+fn no_other_process_opens_mdbx_during_the_copy() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let writer = std::rc::Rc::new(std::cell::Cell::new(None));
+
+    let (dir, seen) = (path.clone(), writer.clone());
+    run_mid_copy(move || {
+        let out = test_process("mdbx_writer_process").env(WRITER_DIR, &dir).output();
+        seen.set(Some(out.expect("run the writer process")));
+    });
+    let db = open(&path).unwrap_or_else(|e| panic!("the migration completes: {e:#}"));
+    let out = writer.take().expect("the writer ran");
+    let output =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "MDBX refused the writer: {output}");
+    assert!(output.contains("open MDBX read-write"), "at its open: {output}");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "every row MDBX held, and no other");
+}
+
+/// The environment variable that makes [`mdbx_holder_process`] hold MDBX open: the database
+/// directory.
+const HOLDER_DIR: &str = "TN_MIGRATE_TEST_MDBX_HOLDER_DIR";
+
+/// How [`mdbx_holder_process`] opens MDBX: `ro` read-only, anything else read-write.
+const HOLDER_KIND: &str = "TN_MIGRATE_TEST_MDBX_HOLDER_KIND";
+
+/// Not a test of its own: the second process of
+/// [`an_mdbx_database_another_process_holds_open_is_refused`]. With [`HOLDER_DIR`] set it opens the
+/// MDBX database there as [`HOLDER_KIND`] says, prints `mdbx-holder: open`, and holds it,
+/// committing nothing, until its stdin is closed; without it, it does nothing.
+#[test]
+#[ignore = "the holder process of an_mdbx_database_another_process_holds_open_is_refused"]
+fn mdbx_holder_process() {
+    use reth_db::mdbx::DatabaseEnvKind;
+    use std::io::{Read as _, Write as _};
+    let Some(dir) = std::env::var_os(HOLDER_DIR) else { return };
+    let kind = match std::env::var(HOLDER_KIND).as_deref() {
+        Ok("ro") => DatabaseEnvKind::RO,
+        _ => DatabaseEnvKind::RW,
+    };
+    let args = DatabaseArgs { page_size: Some(MDBX_PAGE_SIZE), ..temp_chain_db_args() };
+    let db = DatabaseEnv::open(Path::new(&dir), kind, args.database_args()).expect("open MDBX");
+    println!("mdbx-holder: open");
+    std::io::stdout().flush().expect("flush");
+    std::io::stdin().read_to_end(&mut Vec::new()).expect("wait for the test");
+    drop(db);
+}
+
+/// [`mdbx_holder_process`], running: another process holding the MDBX database open, idle.
+/// Dropping it closes the holder's stdin, which ends it, and waits for it to exit.
+struct MdbxHolder {
+    /// The holder process.
+    child: std::process::Child,
+    /// Its stdout, read to its end before the wait, so the holder never writes to a closed pipe.
+    out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl MdbxHolder {
+    /// Start the holder on the MDBX database in `dir`, opened as `kind` (`rw` or `ro`), and wait
+    /// until it holds it open.
+    fn open(dir: &Path, kind: &str) -> Self {
+        use std::io::BufRead as _;
+        let mut child = test_process("mdbx_holder_process")
+            .env(HOLDER_DIR, dir)
+            .env(HOLDER_KIND, kind)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the holder process");
+        let mut out = std::io::BufReader::new(child.stdout.take().expect("its stdout"));
+        // The line follows libtest's `test <name> ...` on its line.
+        let mut seen = String::new();
+        while !seen.contains("mdbx-holder: open") {
+            let read = out.read_line(&mut seen).expect("the holder's output");
+            assert!(read > 0, "the holder ended before it opened MDBX: {seen}");
+        }
+        Self { child, out }
+    }
+}
+
+impl Drop for MdbxHolder {
+    fn drop(&mut self) {
+        use std::io::Read as _;
+        drop(self.child.stdin.take());
+        let _ = self.out.read_to_end(&mut Vec::new());
+        let _ = self.child.wait();
+    }
+}
+
+/// Another process holding the MDBX database open and committing nothing (a build running reth on
+/// MDBX on a second datadir naming the same `db/`, idle) leaves no trace in the record the
+/// migration takes, and would go on writing to the `mdbx.dat` the migration removes: the
+/// migration's exclusive open is refused with `MDBX_BUSY`, whether the holder opened MDBX
+/// read-write or read-only, and the error says to stop that process, with MDBX unchanged. Once the
+/// holder has stopped, the next open migrates.
+#[test]
+fn an_mdbx_database_another_process_holds_open_is_refused() {
+    for kind in ["rw", "ro"] {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        let holder = MdbxHolder::open(&path, kind);
+        let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+        let err = open(&path).expect_err("another process holds MDBX open");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(BUSY_HINT), "{kind}: says to stop the holder: {msg}");
+        assert!(msg.contains("MDBX database is unchanged"), "{kind}: {msg}");
+        assert_untouched(&path, &mdbx, kind);
+        assert!(exists(&path.join(MDBX_LOCK_FILE)), "{kind}: mdbx.lck kept");
+
+        drop(holder);
+        let db = open(&path)
+            .unwrap_or_else(|e| panic!("{kind}: migrates once the holder stopped: {e:#}"));
+        let mut rows = raw_rows(&*db);
+        rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+        assert!(rows == expected, "{kind}: every row, as MDBX held it");
+    }
+}
+
+/// The open reads the database directory's files under the directory's lock: a migration that
+/// another process (a second datadir naming the same `db/`) finishes between the open's first look
+/// and its lock is seen as finished, and the open goes on to the migrated database. Read before the
+/// lock, the files would say MDBX is still to migrate, and the migration would fail at its open of
+/// an `mdbx.dat` that is gone.
+#[test]
+fn a_migration_another_process_finishes_before_the_lock_is_seen_finished() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let dir = path.clone();
+    RUN_AT.set(Some((
+        Step::BeforeLock,
+        Box::new(move || {
+            let args = tn_lmdb_args(&tn_lmdb_db_args()).expect("the node's settings");
+            migrate_from_mdbx(&dir, args).expect("the other process migrates");
+        }),
+    )));
+    let db = open(&path).unwrap_or_else(|e| panic!("opens the migrated database: {e:#}"));
+    assert!(RUN_AT.with_borrow(Option::is_none), "the other migration ran");
+    assert!(!exists(&path.join(MDBX_DATA_FILE)), "MDBX is gone");
+    assert!(exists(&path.join(MIGRATED_MARKER)), "the marker is written");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "every row, as MDBX held it");
+}
+
+/// While `mdbx.dat` or the temp directory is in the database directory, the open holds an
+/// exclusive lock on the directory itself: a second process migrating the same directory (two
+/// datadirs naming one `db/`) is refused, naming the directory, and changes nothing; once the lock
+/// is released the open migrates.
+#[test]
+fn a_migration_is_refused_while_another_process_holds_the_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+    // Another process's lock: a second handle on the directory, as `flock` counts handles.
+    let held = std::fs::File::open(&path).expect("open the directory");
+    held.try_lock().expect("lock the directory");
+    let err = open(&path).expect_err("the directory is locked");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("another process is migrating this database"), "{msg}");
+    assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
+    assert_untouched(&path, &mdbx, "locked");
+
+    drop(held);
+    let mut rows = raw_rows(&*open(&path).expect("migrates once the lock is released"));
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert_eq!(rows, expected);
+}
+
+/// MDBX's `MDBX_WANNA_RECOVERY` on the read-only open (an environment stopped uncleanly under
+/// `safe-no-sync`) gets the hint to run the previous binary once and stop it cleanly, and its
+/// `MDBX_BUSY` (another process has the environment open) the hint to stop that process, each over
+/// the error as reth reports it; any other open error is left as it is.
+#[test]
+fn an_mdbx_open_refused_busy_or_for_recovery_gets_a_hint() {
+    let open_error = |e: MdbxError| {
+        eyre::Report::new(DatabaseError::Open(e.into()))
+            .wrap_err("Could not open database at path: db")
+    };
+    for (refusal, hint, other) in [
+        (MdbxError::WannaRecovery, WANNA_RECOVERY_HINT, BUSY_HINT),
+        (MdbxError::Busy, BUSY_HINT, WANNA_RECOVERY_HINT),
+    ] {
+        let msg = format!("{:#}", describe_mdbx_open_error(open_error(refusal)));
+        assert!(msg.contains(hint), "{msg}");
+        assert!(!msg.contains(other), "{msg}");
+        assert!(msg.contains("Could not open database at path: db"), "{msg}");
+    }
+    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::WannaRecovery)));
+    assert!(msg.contains("MDBX_WANNA_RECOVERY"), "MDBX's own text: {msg}");
+    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::Corrupted)));
+    for hint in [WANNA_RECOVERY_HINT, BUSY_HINT] {
+        assert!(!msg.contains(hint), "{msg}");
+    }
+    assert!(msg.contains("Could not open database at path: db"), "{msg}");
+}
+
+/// `migrate_reth_db` (behind `db migrate-execution`) migrates an MDBX database with the node's
+/// `--db.*` settings and returns the marker's text, without opening the database after (no client
+/// version is recorded); run again it has nothing to migrate, and the node's open after it is a
+/// normal one. On a directory with no database it creates nothing. A migration stopped after its
+/// commit point is finished, and the marker says so.
+#[test]
+fn migrate_reth_db_migrates_without_opening_the_database() {
+    use crate::env::database::{migrate_reth_db, TN_LMDB_DB_VERSION};
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let args = tn_lmdb_db_args();
+
+    let marker = migrate_reth_db(&path, &args).expect("migrates").expect("a migration ran");
+    assert!(marker.starts_with("migrated from MDBX to tn-lmdb: "), "{marker}");
+    assert_eq!(std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker"), marker);
+    for gone in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATING_DIR] {
+        assert!(!exists(&path.join(gone)), "{gone} is removed");
+    }
+    assert_eq!(reth_db::version::get_db_version(&path).expect("version"), TN_LMDB_DB_VERSION);
+    let read_only =
+        TnLmdbEnv::open(&path, TnLmdbEnvKind::RO, TnLmdbArgs::default()).expect("read-only");
+    assert_eq!(read_only.page_size(), TN_LMDB_PAGE_SIZE as u32, "the configured page size");
+    assert_eq!(raw_rows(&read_only), expected, "every row, and no client version recorded");
+    drop(read_only);
+    assert_eq!(migrate_reth_db(&path, &args).expect("a tn-lmdb database"), None);
+
+    let db = open(&path).expect("a normal open");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert_eq!(rows, expected);
+    drop(db);
+
+    let none = tmp.path().join("none");
+    assert_eq!(migrate_reth_db(&none, &args).expect("no database"), None);
+    assert!(!exists(&none), "nothing is created");
+
+    let path = tmp.path().join("stopped");
+    build_mdbx(&path);
+    STOP_AT.set(Some(Step::BeforeMarker));
+    let err = open(&path).expect_err("stopped before the marker");
+    assert!(matches!(err.downcast_ref::<Killed>(), Some(Killed(Step::BeforeMarker))), "{err:#}");
+    let marker = migrate_reth_db(&path, &args).expect("finishes").expect("a migration finished");
+    assert!(marker.contains("finished by a later open"), "{marker}");
+    assert!(!exists(&path.join(MIGRATING_DIR)), "the temp directory is gone");
+}
+
+/// The bytes of the pages reth's tables take in the tn-lmdb database `db` (the page size times
+/// each table's pages), the figures `db stats` reports on the tn-lmdb build.
+fn tn_lmdb_table_bytes(db: &TnLmdbEnv) -> u64 {
+    let pages: u64 = db.table_stats().expect("stats").iter().map(RethTableStat::pages).sum();
+    u64::from(db.page_size()) * pages
+}
+
+/// The quarter [`needed_bytes`] adds to MDBX's live bytes holds the test database's tables on
+/// tn-lmdb (at a different page size from MDBX's): its tables take at most the live bytes plus a
+/// quarter. The margin is unmeasured on a production database; this keeps it honest on the
+/// tables the tests build.
+#[test]
+fn the_migrated_tables_fit_the_headroom() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    build_mdbx(&path);
+    let live = mdbx_live(&path);
+    let db = open(&path).expect("the open migrates");
+    let used = tn_lmdb_table_bytes(&db);
+    println!(
+        "tn-lmdb's tables take {used} bytes of pages, MDBX's {live}: {:.3}",
+        used as f64 / live as f64
+    );
+    assert!(used <= live + live / 4, "tn-lmdb's tables take {used} bytes of pages, MDBX's {live}");
 }
 
 /// A migration stopped after it removed MDBX's files, before it wrote the marker, is finished by
@@ -989,6 +1505,71 @@ fn a_second_value_for_a_dup_subkey_fails_the_migration() {
     assert_untouched(&path, &mdbx, "a second value for a subkey");
 }
 
+/// An MDBX database that is not in storage layout v1, by reth's `storage_settings` row or TN's
+/// layout marker, or whose rows do not parse, is refused before the copy and left untouched: the
+/// migration moves the engine, never the layout. A v1 database with both rows migrates.
+#[test]
+fn an_mdbx_database_not_in_layout_v1_is_refused() {
+    use crate::env::layout::{RETH_SETTINGS_KEY, TN_LAYOUT_KEY};
+    use reth_db::table::Compress as _;
+
+    /// A refused case: its name, its `Metadata` rows, and the refusal's text.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a [u8])], &'a str);
+
+    // a `Metadata` row as MDBX stores it: the key's bytes, the value compressed
+    let row = |key: &str, value: &[u8]| (key.as_bytes().to_vec(), value.to_vec().compress());
+    let v1 = br#"{"storage_v2":false}"#.as_slice();
+    let v2 = br#"{"storage_v2":true}"#.as_slice();
+    let marker_v1 = br#"{"version":1,"layout":"v1"}"#.as_slice();
+    let refused: [Case<'_>; 5] = [
+        ("settings v2", &[(RETH_SETTINGS_KEY, v2)], "not in storage layout v1"),
+        (
+            "marker v2",
+            &[(RETH_SETTINGS_KEY, v1), (TN_LAYOUT_KEY, br#"{"version":1,"layout":"v2"}"#)],
+            "not in storage layout v1",
+        ),
+        (
+            "settings unparseable",
+            &[(RETH_SETTINGS_KEY, b"v2")],
+            "storage_settings row does not parse",
+        ),
+        ("marker unparseable", &[(TN_LAYOUT_KEY, b"{}")], "tn_storage_layout row does not parse"),
+        (
+            "marker of another version",
+            &[(TN_LAYOUT_KEY, br#"{"version":9,"layout":"v1"}"#)],
+            "format version 9",
+        ),
+    ];
+    for (case, metadata, expected) in refused {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let mut rows = mdbx_rows();
+        rows.insert(
+            tables::Metadata::NAME,
+            metadata.iter().map(|(key, value)| row(key, value)).collect(),
+        );
+        build_mdbx_with(&path, rows);
+        let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+        let err = open(&path).expect_err(case);
+        let msg = format!("{err:#}");
+        assert!(msg.contains(expected), "{case}: {msg}");
+        assert!(msg.contains("MDBX database is unchanged"), "{case}: {msg}");
+        assert_untouched(&path, &mdbx, case);
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let mut rows = mdbx_rows();
+    rows.insert(
+        tables::Metadata::NAME,
+        vec![row(RETH_SETTINGS_KEY, v1), row(TN_LAYOUT_KEY, marker_v1)],
+    );
+    build_mdbx_with(&path, rows);
+    open(&path).expect("a v1 database migrates");
+    assert!(!exists(&path.join(MDBX_DATA_FILE)), "migrated");
+}
+
 /// A value larger than tn-lmdb takes (16 MiB with a short key, the engine's limit; MDBX takes
 /// larger) fails the migration with the adapter's `MDBX_BAD_VALSIZE`, and leaves MDBX untouched.
 #[test]
@@ -1051,7 +1632,9 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 /// On demand: migrate a copy of a real reth database through `open_rw` with the default `--db.*`
 /// settings, and check every table's rows and their hash against the copy's MDBX. It prints the
 /// live bytes of the copy's tables and the free space the migration needs ([`needed_bytes`]), then
-/// the time, the sizes of `mdbx.dat` and `tn-lmdb.dat`, and each table's rows.
+/// the time, the sizes of `mdbx.dat` and `tn-lmdb.dat`, each table's rows, and the bytes of pages
+/// tn-lmdb's tables take against MDBX's live bytes, with their ratio (the measure of
+/// `needed_bytes`'s quarter margin).
 ///
 /// `TN_RETH_MIGRATE_SRC` names a reth database directory holding `mdbx.dat` (a stopped node's
 /// `<datadir>/db`). The test copies its `mdbx.dat` and `database.version` into a temp dir and
@@ -1061,7 +1644,7 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 ///
 /// ```text
 /// TN_RETH_MIGRATE_SRC=/path/to/datadir/db TMPDIR=/path/on/a/real/disk \
-///   cargo nextest run -p tn-reth --features tn-lmdb --run-ignored only --no-capture \
+///   cargo nextest run -p tn-reth --run-ignored only --no-capture \
 ///   -E 'test(migrates_a_copy_of_a_real_database)'
 /// ```
 ///
@@ -1130,5 +1713,11 @@ fn migrates_a_copy_of_a_real_database() {
     let rows: u64 = before.iter().map(|digest| digest.rows).sum();
     println!(
         "migrated {rows} rows in {elapsed:?}: mdbx.dat {mdbx_len} bytes, tn-lmdb.dat {tn_lmdb_len} bytes"
+    );
+    let used = tn_lmdb_table_bytes(&db);
+    println!(
+        "tn-lmdb's tables take {used} bytes of pages, MDBX's live pages {live} bytes: ratio {:.3} \
+         (needed_bytes allows 1.25)",
+        used as f64 / live as f64
     );
 }

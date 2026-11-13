@@ -72,8 +72,10 @@ impl NamedChain {
 
     /// Write this chain's bundled genesis committee to the datadir unless one is already there.
     ///
-    /// Callers run this after their startup checks pass, so a refused start leaves the datadir
-    /// as it was.
+    /// Callers run this after their startup checks pass, so a start they refuse writes no
+    /// committee file. `node` runs it after its execution database opens: the open refuses an
+    /// unfinished `db reset-execution` and a refused `--db.*` flag before it writes anything, but
+    /// an open that fails later may already have created or migrated the database.
     pub(crate) fn write_committee<P: TelcoinDirs>(self, tn_datadir: &P) -> eyre::Result<()> {
         match self {
             Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
@@ -354,6 +356,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             allow_faucet_on_chain: _, // Used above
         } = self;
 
+        check_instance_ports(instance, &reth, with_unused_ports)?;
         // set up reth node config for engine components
         let node_config =
             RethConfig::new(reth, instance, &tn_datadir, with_unused_ports, chain_spec);
@@ -361,12 +364,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
-        // the bundled committee is written only once every startup check above has passed
+        // create dbs to survive between sync state transitions
+        let reth_db = open_execution_database(&node_config, &tn_datadir)?;
+        // the bundled committee is written only once every startup check above and the database
+        // open have passed
         if let Some(chain) = named_chain {
             chain.write_committee(&tn_datadir)?;
         }
-        // create dbs to survive between sync state transitions
-        let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
             .with_state_export_keep(state_export_keep)
             // the two flags conflict, so at most one of them is set
@@ -379,6 +383,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
+}
+
+/// Open the node's reth execution database in `tn_datadir`, after refusing an unfinished
+/// `db reset-execution` there: one stopped between its moves leaves part of the execution database
+/// in its staging directory, and the open would create a database beside the rest.
+fn open_execution_database(
+    node_config: &RethConfig,
+    tn_datadir: &Path,
+) -> eyre::Result<tn_reth::RethDb> {
+    crate::db::refuse_interrupted_reset(tn_datadir)?;
+    tn_reth::RethEnv::new_database(node_config, tn_datadir.to_path_buf().reth_db_path())
 }
 
 /// Value parser for an opt-in flag that can also be set from an environment variable.
@@ -550,11 +565,65 @@ fn genesis_block_hash(genesis: Genesis) -> B256 {
     RethChainSpec::from(genesis).sealed_genesis_header().hash()
 }
 
+/// Refuse an `--instance` whose port shift leaves the port range.
+///
+/// reth's `adjust_instance_ports` moves the HTTP port down by `instance - 1` and the WebSocket
+/// port up by `2 * (instance - 1)` with plain `u16` arithmetic: a release build wraps (an HTTP
+/// port of 100 with instance 150 binds 65,387) and a build with overflow checks panics.
+/// `--with-unused-ports` zeroes both ports before the shift, so there only instance 1 fits.
+fn check_instance_ports(
+    instance: Option<u16>,
+    reth: &RethCommand,
+    with_unused_ports: bool,
+) -> eyre::Result<()> {
+    let Some(instance) = instance else { return Ok(()) };
+    let (http, ws) =
+        if with_unused_ports { (0, 0) } else { (reth.rpc.http_port, reth.rpc.ws_port) };
+    let shift = instance - 1;
+    if http.checked_sub(shift).is_none() {
+        eyre::bail!(
+            "--instance {instance} moves the HTTP RPC port {http} down by {shift}, below port 0; \
+             raise --http.port or lower --instance"
+        );
+    }
+    if ws.checked_add(shift * 2).is_none() {
+        eyre::bail!(
+            "--instance {instance} moves the WebSocket RPC port {ws} up by {}, above port 65535; \
+             lower --ws.port or --instance",
+            shift * 2
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
+
+    /// The node refuses to open its execution database while a `db reset-execution` there is
+    /// unfinished (an `execution-reset-*.partial` directory), and creates nothing; once the reset
+    /// directory has its final name, the node opens a new database.
+    #[test]
+    fn the_node_refuses_an_interrupted_reset_before_opening_its_database() -> eyre::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let datadir = tmp.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        std::fs::create_dir_all(partial.join("db"))?;
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config =
+            RethConfig::new(RethCommand::try_parse_from(["tn-reth"])?, None, &datadir, true, chain);
+
+        let err = open_execution_database(&config, &datadir).expect_err("an unfinished reset");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(!datadir.reth_db_path().try_exists()?, "no database is created");
+
+        std::fs::rename(&partial, datadir.join("execution-reset-20261109T000000Z"))?;
+        drop(open_execution_database(&config, &datadir)?);
+        assert!(datadir.reth_db_path().try_exists()?, "a finished reset: a new database");
+        Ok(())
+    }
 
     /// The removed observer flag is rejected and absent from both help views.
     #[test]
@@ -787,6 +856,28 @@ mod tests {
         assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
         let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
         assert!(matches!(absent, Ok(None)));
+    }
+
+    /// An instance whose shift would wrap a port is refused before the config is built; the
+    /// shifts that stay in range pass, and so does `--with-unused-ports` with instance 1.
+    #[test]
+    fn instance_port_shift_is_checked() -> eyre::Result<()> {
+        let parse = |args: &[&str]| NodeCommand::<NoArgs>::try_parse_from(args);
+        let low_http = parse(&["node", "--instance", "150", "--http.port", "100"])?;
+        let err = check_instance_ports(low_http.instance, &low_http.reth, false).unwrap_err();
+        assert!(err.to_string().contains("below port 0"), "{err}");
+
+        let high_ws = parse(&["node", "--instance", "200", "--ws.port", "65300"])?;
+        let err = check_instance_ports(high_ws.instance, &high_ws.reth, false).unwrap_err();
+        assert!(err.to_string().contains("above port 65535"), "{err}");
+
+        let fits = parse(&["node", "--instance", "101", "--http.port", "100"])?;
+        check_instance_ports(fits.instance, &fits.reth, false)?;
+        let defaults = parse(&["node", "--instance", "200"])?;
+        check_instance_ports(defaults.instance, &defaults.reth, false)?;
+        check_instance_ports(Some(1), &defaults.reth, true)?;
+        assert!(check_instance_ports(Some(2), &defaults.reth, true).is_err());
+        check_instance_ports(None, &defaults.reth, true)
     }
 
     /// Retention defaults to unlimited, accepts positive counts, and rejects zero.
@@ -1208,6 +1299,40 @@ mod tests {
         assert!(!dir.path().to_path_buf().reth_db_path().exists());
         assert!(!dir.path().to_path_buf().genesis_path().exists());
         assert_eq!(datadir_listing(dir.path())?, before);
+        Ok(())
+    }
+
+    /// A `node --chain mainnet` start refused by an unfinished `db reset-execution`, or by the
+    /// execution database open (a refused `--db.*` flag here), writes no `genesis/` committee
+    /// file and no database.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_refused_at_its_database_writes_no_committee() -> eyre::Result<()> {
+        // a build that carries the faucet mint is refused on mainnet before either refusal here
+        if FAUCET_ENABLED {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        let passphrase = || Some(zeroize::Zeroizing::new("mainnet test passphrase".to_owned()));
+        generate_keys(datadir, passphrase())?;
+        let tn_datadir = dir.path().to_path_buf();
+        let partial = tn_datadir.join("execution-reset-20261109T000000Z.partial");
+        std::fs::create_dir_all(partial.join("db"))?;
+
+        let err = run_mainnet_node(datadir, passphrase(), &[]).expect_err("an unfinished reset");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("did not finish"), "{msg}");
+        assert!(!tn_datadir.genesis_path().try_exists()?, "no committee file");
+        assert!(!tn_datadir.reth_db_path().try_exists()?, "no database");
+
+        std::fs::remove_dir_all(&partial)?;
+        let err = run_mainnet_node(datadir, passphrase(), &["--db.gap-fill", "65"])
+            .expect_err("a refused database flag");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--db.gap-fill"), "{msg}");
+        assert!(!tn_datadir.genesis_path().try_exists()?, "no committee file");
+        assert!(!tn_datadir.reth_db_path().try_exists()?, "no database");
         Ok(())
     }
 

@@ -6,18 +6,19 @@ possible but optional.
 
 - Base: imported from upstream `v1.11.3` (`d6324d63e27e`), synced to `v1.11.4`
   (`2ac58a25f561`). The current pin is always in `tn/upstream.toml`.
-- History: the import, the vendoring and both reduction passes were done on
-  `sls_tndb_b_vendor`, on top of the tndb-b work, and moved to a branch off `main` for review.
-  The local tags from that work (`reth-vendor-import-v1.11.3`, `reth-vendor-v1.11.3`,
-  `reth-reduction-start`, `reth-reduction-2-start`) are not in `main`'s history. The durable
-  record is `vendor.py diff` against the pin, plus CHANGES.md.
-- tndb-b: work in progress to replace MDBX as reth's database, on `sls_tndb_b_vendor`. It is not
-  on `main`, and it is not `tndb`, TN's consensus database in `crates/storage`.
+- History: the local tags of the vendoring work (`reth-vendor-import-v1.11.3`,
+  `reth-vendor-v1.11.3`, `reth-reduction-start`, `reth-reduction-2-start`; DECISIONS.md D8) are
+  not in `main`'s history. The durable record is `vendor.py diff` against the pin, plus
+  CHANGES.md.
+- tn-lmdb (called tndb-b until 2026-11-04): the engine that replaces MDBX as reth's database
+  (`crates/tn-lmdb`, through the adapter `crates/tn-lmdb-reth`). It is TN's default reth backend
+  since 2026-11-09; MDBX is the opt-in `mdbx` feature of `tn-reth`, kept until testnet has
+  resynced (DECISIONS.md D22). It is not `tndb`, TN's consensus database in `crates/storage`.
 - Carried: the reth crates in TN's dependency graph (57 after both reduction passes; 101 at
   import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.
-- What comes next (tndb-b, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.
+- What comes next (retiring MDBX, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.
 - Known issues left for separate changes: `tn/notes/open-issues.md`.
 - Agents and reviewers: CLAUDE.md is the short path through all of this (read order, where
   things are, fork-safety checks, tracking upstream).
@@ -32,8 +33,8 @@ vendor/reth/
   LICENSE-*         upstream's (MIT OR Apache-2.0)
   crates/...        upstream paths, e.g. crates/storage/db is upstream's crates/storage/db
   testing/...       testing/testing-utils (dev-only)
-  tn/               TN tooling: vendor.py, graph.py, cargo.sh, crates.txt, upstream.toml, and
-                    the tools' tests (test_*.py)
+  tn/               TN tooling: vendor.py, graph.py, lockfile.py, cargo.sh, crates.txt,
+                    upstream.toml, test-only.lock, and the tools' tests (test_*.py)
   tn/notes/         the usage map, the upstream-backport tracker and the open issues
   .config/          TN's nextest config for the nested workspace (upstream's is not carried)
   README.md CHANGES.md DECISIONS.md ROADMAP.md CLAUDE.md
@@ -70,7 +71,7 @@ Things that differ from the git dependency this replaced:
    later syncs harder to reason about.
 2. Add an entry to CHANGES.md: an id (`TN-NNNN`), the files, what changed and why, and whether
    it is worth offering upstream. CHANGES.md is the ledger. `vendor.py status` must list only
-   files that some entry accounts for.
+   files that some entry accounts for, which `vendor.py ledger` checks.
 3. Where an edit would surprise a reader of reth's code, leave a short comment that starts with
    `TN(TN-NNNN):`. Leave out cosmetic changes. They make every upstream sync conflict for
    nothing.
@@ -114,18 +115,23 @@ Run cargo in the nested workspace only through `cargo.sh`. A bare `cargo` there 
 rust-analyzer opened on `vendor/reth`) resolves without TN's revm-inspectors patch and writes that
 into the nested lockfile; the next `cargo.sh` run overwrites it.
 
-`cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
-git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a
-newer version of a crate TN also uses, cargo bumps it in the nested lockfile only. At v1.11.3 that
-happens for `libc` and `cargo_metadata`. TN's own lockfile is never touched. TN's root manifest
-patches revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch
-with `--config`, so reth's tests run against the code TN ships.
+`cargo.sh` seeds `vendor/reth/Cargo.lock` (git-ignored) on every run from TN's lockfile plus
+`tn/test-only.lock`, which pins the 72 packages only reth's tests need, and builds into
+`target/vendor-reth`. TN's own lockfile is never touched. TN's root manifest patches
+revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `vendor/reth/.cargo/config.toml` carries
+the same patch (TN-0080), so reth's tests run against the code TN ships.
 
-The packages only reth's tests need are resolved against crates.io on each run, so they are not
-pinned. `cargo.sh` sets `resolver.incompatible-rust-versions = "fallback"`, so they stay at
-versions that support the nested workspace's `rust-version` (1.88), below TN's toolchain pin.
-Pinning them is in `tn/notes/open-issues.md`. nextest reads `vendor/reth/.config/nextest.toml`
-here (TN's, with the same `default` and `ci` profiles as the root's), not the root's.
+`python3 -I vendor/reth/tn/lockfile.py check`, which the `test-vendor-reth` lane runs, fails when
+the nested workspace resolves a package neither file pins, or when the vendored crates' production
+dependencies resolve a version TN does not ship. A test-only package can cause the second by
+needing a newer shared crate: codspeed's nix 0.31.3 needs libc 0.2.186, so nix is pinned at 0.31.2
+and libc stays at TN's 0.2.183. `cargo_metadata` still differs (0.19.2 against TN's 0.18.1), but
+only reth's tests use it. When the check fails, `lockfile.py update` re-resolves and rewrites
+`tn/test-only.lock`; pin a package lower first with `cargo.sh update -p <pkg>@<version> --precise
+<older>`, and run `update` after each pin. `cargo.sh` sets `resolver.incompatible-rust-versions =
+"fallback"`, so new resolutions stay at versions that support the nested workspace's
+`rust-version` (1.88). nextest reads `vendor/reth/.config/nextest.toml` here (TN's, with the same
+`default` and `ci` profiles as the root's), not the root's.
 
 ## Taking changes from upstream
 
@@ -204,6 +210,10 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
   upstream and lists what differs. Right after the import it printed "identical".
 - `vendor.py check` reports workspace dependencies the vendored manifests use but the nested
   workspace does not define.
+- `vendor.py ledger` fails when a file `status` lists is not named by a CHANGES.md entry, or a
+  `TN(TN-NNNN)` comment cites an id with no entry. An entry names a file by its path from
+  `vendor/reth` (braces such as `src/{a.rs, b.rs}` expand) or from a crate it named earlier, or
+  names a whole directory. It needs the upstream clone, as `status` does, so CI does not run it.
 - `vendor.py status` also warns about files a `.gitignore` rule hides from git, which would
   otherwise drop out of the committed copy without anyone noticing. `sync`, `pick`, `add` and
   `remove` end with the same warning, and exit 1 when it lists files.
