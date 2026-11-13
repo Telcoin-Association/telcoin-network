@@ -1306,6 +1306,9 @@ where
             network_handle.inner_handle().unsubscribe(batch_topic).await?;
         }
 
+        // one ledger for all workers of the node; a new epoch empties it (issue #1794)
+        self.reported_batches.enter_epoch(consensus_config.committee().epoch());
+
         // spawn worker network
         WorkerNetwork::new(
             rx_event_stream,
@@ -1314,6 +1317,7 @@ where
             *worker_id,
             validator,
             self.consensus_chain.clone(),
+            self.reported_batches.clone(),
         )
         .spawn(&epoch_task_spawner);
 

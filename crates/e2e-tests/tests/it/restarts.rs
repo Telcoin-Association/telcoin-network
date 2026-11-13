@@ -38,17 +38,20 @@ use tn_types::{get_available_tcp_port, Address, Epoch, GenesisAccount, NodeMode,
 use tracing::{error, info};
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
+///
+/// Node 2 stays in `guard` for the whole phase, so every `Err` and every panic out of this
+/// function leaves it to the caller's `kill_all` or to the guard's `Drop`. Slot 2 is empty only
+/// between the deliberate stop and the restart. On success slot 2 holds the restarted node 2.
 fn run_restart_tests1(
     client_urls: &[String; 4],
-    child2: &mut Child,
+    guard: &mut ProcessGuard,
     bin: &'static TestBinary,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
     test: &str,
-) -> eyre::Result<Child> {
+) -> eyre::Result<()> {
     network_advancing(client_urls).inspect_err(|e| {
-        kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
 
@@ -83,12 +86,11 @@ fn run_restart_tests1(
     test_blocks_same(client_urls)?;
     // Try once more then fail test.
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
-        kill_child(child2);
         error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
     })?;
 
     info!(target: "restart-test", "killing child2...");
-    kill_child(child2);
+    stop_node2(guard)?;
     info!(target: "restart-test", "child2 dead :D waiting out downtime...");
     wait_for_downtime(client_urls, delay_secs)?;
 
@@ -102,55 +104,73 @@ fn run_restart_tests1(
     let metrics_port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
-    let mut child2 = start_validator_with_args(
-        2,
-        bin,
-        temp_path,
-        rpc_port2,
-        test,
-        2,
-        &["--metrics", &metrics_addr],
-    );
+    let child2 = restart_node2(guard, bin, temp_path, rpc_port2, test, &metrics_addr)?;
     let [_, _, restarted_node, _] = client_urls;
-    wait_for_restarted_rpc(&mut child2, restarted_node, test).inspect_err(|e| {
-        kill_child(&mut child2);
+    wait_for_restarted_rpc(child2, restarted_node, test).inspect_err(|e| {
         error!(target: "restart-test", ?e, "restarted node did not become RPC-ready");
     })?;
     // The new process's counter retains evidence of the follow/catch-up path even when the
     // transient CvvInactive mode ends before the first RPC poll. Short restarts need not sync.
     if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
         wait_for_restart_catch_up(restarted_node, &metrics_addr).inspect_err(|e| {
-            kill_child(&mut child2);
             error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests1");
         })?;
     }
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
-            kill_child(&mut child2);
             error!(target: "restart-test", ?e, "failed to get positive balance with retry in restart_tests1");
         })?;
     if 10 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
-        kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
     // Try once more then fail test.
     send_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
-        error!(target: "restart-test", ?e, "send and confirm nonce 1 failed - killing child2...");
-        kill_child(&mut child2);
+        error!(target: "restart-test", ?e, "send and confirm nonce 1 failed");
     })?;
 
     info!(target: "restart-test", "testing blocks same again in restart_tests1");
 
     test_blocks_same(client_urls).inspect_err(|e| {
-        error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
-        kill_child(&mut child2);
+        error!(target: "restart-test", ?e, "test blocks same failed");
     })?;
     wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
         error!(target: "restart-test", ?e, "restarted validator did not rejoin active consensus");
-        kill_child(&mut child2);
-    })?;
-    Ok(child2)
+    })
+}
+
+/// Take node 2 out of slot 2 of `guard`, then stop it gracefully.
+///
+/// The take comes first, so a reaped child never stays in a slot: `kill_all` and `Drop` signal
+/// raw pids, and the OS can reuse the pid of a reaped child. Nothing between the take and the
+/// stop can return early or panic.
+fn stop_node2(guard: &mut ProcessGuard) -> eyre::Result<()> {
+    let mut child2 = guard.take(2).ok_or_else(|| eyre::eyre!("missing child 2"))?;
+    kill_child(&mut child2);
+    Ok(())
+}
+
+/// Start node 2 again (run 2, with a metrics endpoint at `metrics_addr`) in slot 2 of `guard`,
+/// and return a reference to the new child. From here the guard stops it on every exit path.
+fn restart_node2<'a>(
+    guard: &'a mut ProcessGuard,
+    bin: &'static TestBinary,
+    temp_path: &Path,
+    rpc_port2: u16,
+    test: &str,
+    metrics_addr: &str,
+) -> eyre::Result<&'a mut Child> {
+    let child2 = start_validator_with_args(
+        2,
+        bin,
+        temp_path,
+        rpc_port2,
+        test,
+        2,
+        &["--metrics", metrics_addr],
+    );
+    guard.replace(2, child2);
+    guard.get_mut(2).ok_or_else(|| eyre::eyre!("missing restarted child 2"))
 }
 
 /// Wait for the restarted validator's RPC endpoint without spending the balance retry budget.
@@ -175,17 +195,19 @@ fn wait_for_restarted_rpc(child: &mut Child, node: &str, test: &str) -> eyre::Re
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
 /// The node misses a transfer while offline, then must apply it during catch-up after restarting.
+///
+/// Node 2 stays in `guard` as in [`run_restart_tests1`]: every `Err` and every panic leaves it to
+/// the caller's `kill_all` or to the guard's `Drop`. On success slot 2 holds the restarted node 2.
 fn run_restart_tests_lagged1(
     client_urls: &[String; 4],
-    child2: &mut Child,
+    guard: &mut ProcessGuard,
     bin: &'static TestBinary,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
     test: &str,
-) -> eyre::Result<Child> {
+) -> eyre::Result<()> {
     network_advancing(client_urls).inspect_err(|e| {
-        kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
 
@@ -196,7 +218,6 @@ fn run_restart_tests_lagged1(
     test_blocks_same(client_urls)?;
     // Try once more then fail test.
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
-        kill_child(child2);
         error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
     })?;
 
@@ -204,16 +225,14 @@ fn run_restart_tests_lagged1(
     // restarted node serves its first balance query.
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
-            kill_child(child2);
             error!(target: "restart-test", ?e, "failed to get balance before shutdown");
         })?;
     if 10 * WEI_PER_TEL != bal {
-        kill_child(child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
 
     info!(target: "restart-test", "killing child2...");
-    kill_child(child2);
+    stop_node2(guard)?;
     info!(target: "restart-test", "child2 dead :D waiting out downtime...");
     wait_for_downtime(client_urls, delay_secs)?;
 
@@ -236,41 +255,22 @@ fn run_restart_tests_lagged1(
     let metrics_port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
-    let mut child2 = start_validator_with_args(
-        2,
-        bin,
-        temp_path,
-        rpc_port2,
-        test,
-        2,
-        &["--metrics", &metrics_addr],
-    );
+    restart_node2(guard, bin, temp_path, rpc_port2, test, &metrics_addr)?;
     // Require state sync and a return to active consensus, even if catch-up finished before RPC
     // became available. Gate on the delayed downtime for parity with run_restart_tests1.
-    let rejoined = || -> eyre::Result<()> {
-        if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-            wait_for_restart_catch_up(&client_urls[2], &metrics_addr).inspect_err(|e| {
-                error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
-            })?;
-        }
-        let bal =
-            get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
-        if expected != bal {
-            error!(target: "restart-test", "{expected} != {bal} - returning error!");
-            return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
-        }
-        wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
-            error!(target: "restart-test", ?e, "lagged validator did not rejoin active consensus");
-        })
-    };
-    // The caller only owns child2 on success, so every failure must stop it here.
-    match rejoined() {
-        Ok(()) => Ok(child2),
-        Err(e) => {
-            kill_child(&mut child2);
-            Err(e)
-        }
+    if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
+        wait_for_restart_catch_up(&client_urls[2], &metrics_addr).inspect_err(|e| {
+            error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
+        })?;
     }
+    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
+    if expected != bal {
+        error!(target: "restart-test", "{expected} != {bal} - returning error!");
+        return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
+    }
+    wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "lagged validator did not rejoin active consensus");
+    })
 }
 
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
@@ -344,12 +344,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
 fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
     // Nodes 0/1/3 stay live (index 2 is the killed one).
-    let peer_height = || {
-        [&client_urls[0], &client_urls[1], &client_urls[3]]
-            .into_iter()
-            .filter_map(|url| get_latest_consensus_header_number(url).ok())
-            .max()
-    };
+    let peer_height = || peer_consensus_height(client_urls);
 
     let start_height = peer_height();
     let start = Instant::now();
@@ -387,6 +382,15 @@ fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<(
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// The highest consensus header number that the peers 0/1/3 report, or `None` if none answers.
+/// Index 2 is the node the restart tests stop.
+fn peer_consensus_height(client_urls: &[String; 4]) -> Option<u64> {
+    [&client_urls[0], &client_urls[1], &client_urls[3]]
+        .into_iter()
+        .filter_map(|url| get_latest_consensus_header_number(url).ok())
+        .max()
 }
 
 /// Garbage-collection depth (DAG rounds) used for the delayed restart tests. Lowering it from the
@@ -471,7 +475,25 @@ fn test_restart_catch_up_requires_active_cvv() {
     });
 }
 
-fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
+/// How [`do_restarts`] stops the committee between phase 1 and the cold restart of phase 2.
+#[derive(Clone, Copy, Debug)]
+enum Phase1Stop {
+    /// One `kill_all` stops all four nodes in parallel. Phase 2 restarts four nodes that stopped
+    /// together.
+    Together,
+    /// Node 2 stops first, and 0/1/3 commit at least one more consensus header before they stop.
+    /// Phase 2 then cold-restarts a committee with one member behind (inside the GC window) and
+    /// asserts that node 2 reaches the consensus height its peers had at the stop.
+    Node2First,
+}
+
+/// Run the restart scenario. Phase 1 stops node 2, waits out `delay` seconds and restarts it
+/// (`lagged`: node 2 misses a transfer while it is down). Then all four nodes stop, as `stop`
+/// says, and phase 2 restarts all four from their datadirs.
+///
+/// All four validators stay in one [`ProcessGuard`] for both phases, so no exit from phase 1 (an
+/// `Err` or a panic) leaves a validator process running.
+fn do_restarts(delay: u64, lagged: bool, stop: Phase1Stop, test: &str) -> eyre::Result<()> {
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
@@ -505,14 +527,12 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         guard.push(start_validator(i, bin, &temp_path, rpc_port, test, 0));
     }
 
-    // Take child2 out of guard for restart testing
-    let mut child2 = guard.take(2).expect("missing child 2");
-
+    // Node 2 stays in the guard for all of phase 1, so the guard stops it on every exit path.
     info!(target: "restart-test", "Running restart tests 1");
     let res1 = if lagged {
         run_restart_tests_lagged1(
             &client_urls,
-            &mut child2,
+            &mut guard,
             bin,
             &temp_path,
             rpc_ports[2],
@@ -520,22 +540,45 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
             test,
         )
     } else {
-        run_restart_tests1(&client_urls, &mut child2, bin, &temp_path, rpc_ports[2], delay, test)
+        run_restart_tests1(&client_urls, &mut guard, bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
+    let res1 = match stop {
+        // The restarted node 2 stays in slot 2: `kill_all` below stops all four nodes in parallel
+        // under one wait.
+        Phase1Stop::Together => res1,
+        // On success, stop the restarted node 2 alone first, so 0/1/3 commit past it before
+        // `kill_all` stops them. `stop_node2` takes it out of its slot first, so `kill_all` below
+        // does not signal its reaped pid.
+        Phase1Stop::Node2First => res1.and_then(|()| stop_node2(&mut guard)),
+    };
     let is_ok = res1.is_ok();
-    let assert_str = match res1 {
-        Ok(mut child2_restarted) => {
-            kill_child(&mut child2_restarted);
-            "".to_string()
-        }
-        Err(err) => {
+    let assert_str = res1.map_or_else(
+        |err| {
             tracing::error!(target: "restart-test", "Got error: {err}");
             err.to_string()
-        }
+        },
+        |()| String::new(),
+    );
+
+    // `Node2First`: wait until the peers commit at least one more consensus header while node 2
+    // is down (`min_round_gap = 1`), then keep their height. Phase 2 asserts node 2 reaches it.
+    let node2_catch_up_height = match stop {
+        Phase1Stop::Together => None,
+        Phase1Stop::Node2First => is_ok
+            .then(|| {
+                wait_for_downtime(&client_urls, 2)?;
+                peer_consensus_height(&client_urls)
+                    .ok_or_else(|| Report::msg("no peer reported a consensus height"))
+            })
+            .transpose()?,
     };
 
-    // Kill all remaining children (child2 slot is already None from take)
+    // Stop every node gracefully, so phase 2 restarts from a clean shutdown. With `Together` this
+    // stops all four, and phase 2 restarts four nodes that stopped together. With `Node2First` it
+    // stops 0/1/3 after node 2, and phase 2 starts with node 2 behind. After a phase 1 error slot 2
+    // still holds node 2 (the original or the restarted process), so this stops it too, unless
+    // phase 1 failed while node 2 was down and its slot was empty.
     guard.kill_all();
 
     // Make sure we shutdown nodes even if an error in first testing.
@@ -555,11 +598,16 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     }
 
     info!(target: "restart-test", "Running restart tests 2");
-    let res2 = run_restart_tests2(&client_urls);
+    let res2 = run_restart_tests2(&client_urls).and_then(|()| {
+        // `Node2First`: node 2 restarted behind its peers and must reach their height at the stop.
+        node2_catch_up_height
+            .map_or(Ok(()), |height| wait_for_consensus_height(&client_urls[2], height))
+    });
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
-    // guard.drop() handles final cleanup
-    res2
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    res2.inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
@@ -567,7 +615,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(2, false, "restarts")
+    do_restarts(2, false, Phase1Stop::Together, "restarts")
 }
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
@@ -578,6 +626,15 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
         || Ok(get_block_number(node).map(|n| n >= target_block).unwrap_or(false)),
     )?;
     Ok(())
+}
+
+/// Wait for `node` to reach at least consensus height `height`, polling for up to 60 seconds.
+fn wait_for_consensus_height(node: &str, height: u64) -> eyre::Result<()> {
+    wait_until_blocking(
+        Duration::from_secs(60),
+        &format!("node {node} to reach consensus height {height}"),
+        || Ok(get_latest_consensus_header_number(node).is_ok_and(|n| n >= height)),
+    )
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -655,17 +712,19 @@ fn test_restarts_observer() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
-    // Guard cleanup handles all process shutdown on drop
-    run_observer_tests(&client_urls, &obs_url)
+    // Success-path teardown: SIGKILL and reap after the last assert. On `Err` the guard drops
+    // into the graceful `kill_all`, so the nodes still stop cleanly and their logs stay complete.
+    run_observer_tests(&client_urls, &obs_url).inspect(|_| guard.finish())
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
-/// the consensus chain.
+/// the consensus chain. Phase 1 ends with node 2 stopped first, so phase 2 cold-restarts the
+/// committee with node 2 behind and checks that it catches up.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, "restarts_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, Phase1Stop::Node2First, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -674,7 +733,7 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, Phase1Stop::Together, "restarts_lagged_delayed")
 }
 
 /// The epoch whose close every validator stops inside in

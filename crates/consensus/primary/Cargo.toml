@@ -14,6 +14,7 @@ edition = "2021"
 eyre = { workspace = true }
 backoff = { workspace = true }
 futures = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 rand_chacha = { workspace = true }
@@ -53,6 +54,7 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
+tn-network-libp2p = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 

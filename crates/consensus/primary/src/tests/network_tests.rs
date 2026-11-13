@@ -3,17 +3,19 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
+        gossip_author_to_strike,
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
-        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
-        PrimaryNetworkHandle, PrimarySyncLedgers, ProbeWalk, RequestHandler, RequestVoteResult,
-        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
+        try_admit_epoch_record, try_admit_shed, GossipSlots, MissingCertificatesRequest,
+        PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, PrimarySyncLedgers, ProbeWalk,
+        RequestHandler, RequestVoteResult, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_GOSSIP_PER_PEER,
         MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
@@ -30,8 +32,8 @@ use tn_config::{ConsensusConfig, KeyConfig, Parameters, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
-        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, GossipVerdict, IntoResponse as _, MessageId,
+        NetworkCommand, NetworkEvent, NetworkResponseMessage, NetworkResult,
     },
     GossipMessage, PeerId, Penalty, StreamError, TopicHash,
 };
@@ -1498,6 +1500,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_a, chain_id, PeerId::random()),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject epoch-A event");
@@ -1524,6 +1527,7 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
             message: epoch_vote_gossip(vote_gap, chain_id, PeerId::random()),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject gap event");
@@ -1683,6 +1687,293 @@ async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
         "recast with a different digest at the same round must fail closed"
+    );
+
+    Ok(())
+}
+
+/// Test setup for a vote this node cast before a restart: a header from the last authority and a
+/// durable vote info for it, with the in-memory `auth_last_vote` guard empty (fresh handler).
+fn seed_stored_vote(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+) -> eyre::Result<Header> {
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let stored = VoteInfo {
+        epoch: header.epoch(),
+        round: header.round(),
+        vote_digest: header.digest().into(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&committee.last_authority().id(), &stored)?;
+    Ok(header)
+}
+
+/// A repeated vote request for a header this node voted for before a restart is recast under the
+/// author lock, and the recast vote stays in the author's guard. Later repeats are served from the
+/// guard, so a burst of copies of one header signs at most once (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_fills_author_guard() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let request_vote = || handler.vote(peer, header.clone(), vec![]);
+
+    assert!(
+        !handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a fresh handler holds the stored vote only on disk"
+    );
+    let first = request_vote().await;
+    assert_matches!(first, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "the recast vote must stay in the author's guard"
+    );
+
+    // from here on only memory can answer a repeat: a recast needs the stored digest to match
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+    let second = request_vote().await;
+    assert_matches!(second, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+    let third = request_vote().await;
+    assert_matches!(third, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+
+    Ok(())
+}
+
+/// The recast of a stored vote waits for the author lock, like every other vote request from that
+/// author, so parallel copies of one header queue on the lock instead of each signing at once
+/// (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_waits_for_author_lock() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let held = handler.lock_author_vote(&author_id).await;
+    assert!(held.is_some(), "every committee member has a vote lock");
+    let mut recast = std::pin::pin!(handler.vote(peer, header.clone(), vec![]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut recast).await.is_err(),
+        "the recast must not answer while another request from the author holds its lock"
+    );
+
+    drop(held);
+    let res = recast.await;
+    assert_matches!(res, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    Ok(())
+}
+
+/// Write `vote_digest` as this node's stored vote for the author of `header` at the header's epoch
+/// and round.
+///
+/// With a digest other than the header's, a repeat of a header this node voted for can only be
+/// answered from memory: a recast needs the stored digest to match, and a new evaluation refuses a
+/// second digest for the round.
+fn store_vote_digest(
+    committee: &CommitteeFixture<MemDatabase>,
+    header: &Header,
+    vote_digest: VoteDigest,
+) -> eyre::Result<()> {
+    let stored = VoteInfo { epoch: header.epoch(), round: header.round(), vote_digest };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(header.author(), &stored)?;
+    Ok(())
+}
+
+/// A header from the last authority at round 1 whose execution block the test handler knows, so
+/// a vote request for it completes.
+fn votable_header(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+    created_at: u64,
+) -> Header {
+    committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(created_at)
+        .build()
+}
+
+/// A recast vote is answered from memory after the same author's headers for the same round and
+/// for an older round were refused in between. Each refusal keeps the decision entry but used to
+/// drop the vote cached in it, so every second request signed again (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_stale_headers() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+    // whole seconds, so the digests differ with or without sub-second timestamps
+    let header_at = |round, created_at| {
+        author.header_builder_at_round(&committee.committee(), round).created_at(created_at).build()
+    };
+
+    // a vote this node cast for the round-2 header before a restart
+    let header = header_at(2, 2);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the stored vote must be recast, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    for (stale, what) in [(header_at(2, 3), "same round"), (header_at(1, 1), "older round")] {
+        let res = handler.vote(peer, stale, vec![]).await;
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+            "a different header for the {what} must still be refused"
+        );
+        assert!(
+            handler.author_guard_holds_vote(&author_id, header.digest()).await,
+            "refusing a header for the {what} must keep the cached vote"
+        );
+    }
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after the same author's header that fails validation, with no
+/// penalty and no retry, was refused in between. The refusal replaces the decision entry, which
+/// used to hold the only cached copy of the vote (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_refused_header() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // two epochs ahead: not stale, and not the recoverable next-epoch race
+    let refused = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .epoch(2)
+        .build();
+    let err = handler.vote(peer, refused, vec![]).await.expect_err("an epoch-2 header is invalid");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal carries no penalty");
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a refused header from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after a request from the same author was dropped while it was
+/// evaluated, as the network layer drops it when the requester cancels (issue #1836). The decision
+/// entry is put back before the evaluation awaits, and the vote is kept apart from it, so each
+/// covers the other here.
+#[tokio::test]
+async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // a newer header waiting for an execution block that never comes; polled once, then dropped
+    let waiting = author
+        .header_builder_at_round(&committee.committee(), 2)
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .build();
+    assert!(
+        handler.vote(peer, waiting, vec![]).now_or_never().is_none(),
+        "the newer header's request must be waiting when it is dropped"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a dropped request from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A recast leaves a decision on a newer header of the author in place, so a different header for
+/// that newer slot is still refused early once the older header's vote was recast.
+#[tokio::test]
+async fn test_vote_recast_keeps_newer_decision() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let header = votable_header(&committee, &parent, 1);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let epoch_two = |created_at| {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(created_at)
+            .epoch(2)
+            .build()
+    };
+
+    let newer = handler.vote(peer, epoch_two(1), vec![]).await;
+    assert_matches!(
+        newer,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }))
+    );
+    let recast = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(recast, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    let sibling = handler.vote(peer, epoch_two(2), vec![]).await;
+    assert_matches!(
+        sibling,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "the recast must not move the author's decision entry back to the older header"
     );
 
     Ok(())
@@ -3453,6 +3744,63 @@ async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> e
     Ok(())
 }
 
+/// A result for the previous epoch is dropped while that epoch's record has no certificate
+/// (issue #1796). After a boundary the node stores its own closed record uncertified until the
+/// epoch votes complete, and in that window the #1771 bound was `None`: f+1 signers of the previous
+/// committee could pin the watch to any number. Now the result is dropped before the signature
+/// check and the record collector is asked for the certificate. Without the fix the first batch
+/// publishes `(1, u64::MAX)`, so the first assertion fails and the real `(1, 5)` is dropped as old.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_dropped_without_certified_record() -> eyre::Result<()>
+{
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The node's own closed record of epoch 1, stored without a certificate.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+
+    // A quorum of the epoch-1 committee signs a far-future number while the record is uncertified.
+    let far_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, u64::MAX, far_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a previous-epoch result must not publish while the epoch record is uncertified",
+    );
+    assert!(
+        *consensus_bus.requested_missing_epoch().borrow() >= 1,
+        "the dropped result must ask the record collector for the previous epoch",
+    );
+
+    // Once the certificate is stored the certified bound applies and the real final output
+    // publishes.
+    certify_epoch_record(&handler, &committee, &record).await;
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "the previous epoch's final output publishes once its record is certified",
+    );
+    Ok(())
+}
+
 /// The same validator gossiping a result repeatedly must be counted once. Replaying one
 /// signer more times than the quorum must not publish; only adding the remaining *distinct*
 /// signers may.
@@ -3764,8 +4112,15 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
     let failed: HashSet<(BlsPublicKey, Epoch)> =
         [(peers[0], 7), (peers[1], 7), (peers[2], 6)].into_iter().collect();
 
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &failed, 7, None, false, &mut rng);
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
 
     // Same set, no drops.
     assert_eq!(
@@ -3923,6 +4278,7 @@ fn test_order_probe_peers_puts_last_server_first() {
         let ordered = crate::network::order_probe_peers(
             peers.clone(),
             &none_failed,
+            &HashMap::new(),
             7,
             Some(preferred),
             false,
@@ -3938,6 +4294,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let ordered = crate::network::order_probe_peers(
         peers.clone(),
         &failed,
+        &HashMap::new(),
         7,
         Some(peers[0]),
         false,
@@ -3951,6 +4308,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let ordered = crate::network::order_probe_peers(
         peers.clone(),
         &stale,
+        &HashMap::new(),
         7,
         Some(peers[0]),
         false,
@@ -3963,13 +4321,21 @@ fn test_order_probe_peers_puts_last_server_first() {
     let with_stranger = crate::network::order_probe_peers(
         peers.clone(),
         &none_failed,
+        &HashMap::new(),
         7,
         Some(stranger),
         false,
         &mut rng.clone(),
     );
-    let without =
-        crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, false, &mut rng);
+    let without = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
     assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
     assert_eq!(
         with_stranger.into_iter().collect::<BTreeSet<_>>(),
@@ -4135,6 +4501,350 @@ fn test_import_fault_is_peer_caused_whitelist() {
         PackError::LocalEpochMismatch { local: 1, found: 2 }
     ))
     .is_none());
+}
+
+/// Encode `cert` as primary gossip on the primary topic, as the network layer delivers it.
+fn encode_certificate_gossip(cert: tn_types::Certificate) -> GossipMessage {
+    let data = tn_types::encode(&PrimaryGossip::Certificate(Box::new(cert)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A validation ticket that reports to a fresh channel, and the receiver for its verdict.
+fn gossip_ticket(
+    id: &str,
+) -> (
+    GossipValidation<PrimaryRequest, PrimaryResponse>,
+    tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    (GossipValidation::new(MessageId::from(id.as_bytes().to_vec()), PeerId::random(), tx), rx)
+}
+
+/// Whether the next command on `verdicts` reports `expected` for a held gossip message.
+async fn next_verdict_is(
+    verdicts: &mut tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    expected: GossipVerdict,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), verdicts.recv()).await.ok().flatten().is_some_and(
+        |command| {
+            matches!(
+                command,
+                NetworkCommand::ReportGossipValidation { verdict, .. } if verdict == expected
+            )
+        },
+    )
+}
+
+/// A certificate whose aggregate signature does not verify against the committee is an author
+/// content fault with a fatal penalty, and its ticket reports Reject (#1772).
+#[tokio::test]
+async fn invalid_certificate_signature_rejects_and_charges_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, mut verdicts) = gossip_ticket("bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a bad aggregate must report Reject"
+    );
+}
+
+/// The signed author of a certificate whose aggregate fails takes a fatal penalty, which the peer
+/// manager waives for committee keys. The strike in the verification slots is the cost: the
+/// author gets no slot during its cooldown, and another author still gets one (#1772).
+#[tokio::test]
+async fn invalid_certificate_author_is_cooled_down() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("bad-aggregate-cooldown");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+
+    // process_gossip strikes the author on this fault.
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    let author = other.last_authority().primary_public_key();
+    let honest = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, honest, "the fixture committee has more than one authority");
+    slots.strike(author);
+    assert!(slots.take(Some(author), None).is_none(), "a struck author must be cooled down");
+    assert!(slots.take(Some(honest), None).is_some(), "another author must still get a slot");
+}
+
+/// A certificate that verifies reports Accept and frees its verification slot before the
+/// downstream certificate work (#1772).
+#[tokio::test]
+async fn valid_certificate_accepts_before_downstream() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+    let slots = GossipSlots::new(1);
+    let (validation, mut verdicts) = gossip_ticket("valid");
+    let mut pending =
+        PendingGossip::new(validation, slots.take(None, None).expect("free shared slot"));
+    assert!(slots.take(None, None).is_none(), "the shared bucket holds one message");
+
+    // Only the verdict and the slot are checked; the downstream result is not part of the fix.
+    let _ = handler.process_gossip_with(&msg, &mut pending).await;
+    assert!(!pending.is_pending(), "a verified certificate must get a verdict");
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "a verified certificate must report Accept"
+    );
+    assert!(
+        slots.take(None, None).is_some(),
+        "the verdict must free the slot while the message is still held"
+    );
+}
+
+/// A replay of a certificate this node already verified is ignored before the aggregate check:
+/// the handler returns `Ok(())` with no verdict, and the dropped ticket reports Ignore, so the
+/// replay is not forwarded (#1772).
+#[tokio::test]
+async fn replayed_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+
+    // First delivery: the aggregate verifies and the ticket reports Accept. The digest is recorded
+    // before the accept, so the downstream result does not matter here.
+    let (validation, mut verdicts) = gossip_ticket("first-delivery");
+    let mut first = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let _ = handler.process_gossip_with(&msg, &mut first).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "the first delivery of a valid certificate must report Accept"
+    );
+    drop(first);
+
+    // Second delivery of the same frame: the known-certificate check returns before the verify.
+    let (validation, mut verdicts2) = gossip_ticket("replay");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "a replay of a known certificate is not a fault"
+    );
+    assert!(pending.is_pending(), "a replay must not get a verdict from the handler");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts2, GossipVerdict::Ignore).await,
+        "a replay must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A certificate for an epoch with no known committee cannot be verified: the handler returns
+/// `Ok(())`, so no peer is charged, and the dropped ticket reports Ignore (#1772).
+#[tokio::test]
+async fn unknown_committee_certificate_ignores_without_penalty() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    let future =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(5).build();
+    let cert = future.certificate(&future.header_from_last_authority());
+    assert_eq!(cert.epoch(), 5, "the certificate must be for an epoch the handler does not know");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("unknown-committee");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an unknown committee is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "unverifiable gossip must not get Accept");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "a ticket dropped without a verdict must report Ignore"
+    );
+}
+
+/// A certificate for an earlier epoch is ignored before any verification: the handler returns
+/// `Ok(())` with the ticket pending, so no peer is charged, and the dropped ticket reports
+/// Ignore. Its aggregate does not verify, so a verify would have returned an error (#1772).
+#[tokio::test]
+async fn earlier_epoch_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types_at_epoch(temp_dir.path(), 1).await;
+    // A second committee at epoch 0 signs with keys that the handler's committee does not hold.
+    let earlier = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let cert = earlier.certificate(&earlier.header_from_last_authority());
+    assert_eq!(cert.epoch(), 0, "the certificate must be for an earlier epoch than the handler's");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("earlier-epoch");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an earlier-epoch certificate is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "an earlier-epoch certificate must not get a verdict");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "an earlier-epoch certificate must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A consensus result with a bad signature from a committee key is an author content fault of
+/// the strike class. Its penalty stays Mild, its ticket reports Reject, and the author's own
+/// delivery strikes the author (#1772).
+#[tokio::test]
+async fn forged_consensus_result_strikes_its_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let auth = committee.first_authority();
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let key = key_config.public_key();
+    // The committee key signs another hash, so the signature does not cover the gossiped result.
+    let other_hash = ConsensusHeaderDigest::from(B256::random());
+    let signed = ConsensusResult::digest_data(epoch, round, number, other_hash);
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(signed)));
+    let result = ConsensusResult { epoch, round, number, hash, validator: key, signature };
+    let topic =
+        TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    let (validation, mut verdicts) = gossip_ticket("forged-consensus-result");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a forged consensus result must strike: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Mild)),
+        "a forged consensus result keeps its mild penalty: {err:?}"
+    );
+    assert_eq!(gossip_author_to_strike(&err, true, Some(key), Some(key)), Some(key));
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    slots.strike(key);
+    assert!(slots.take(Some(key), None).is_none(), "a struck author must be cooled down");
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a forged consensus result must report Reject"
+    );
+}
+
+/// A relayed forged certificate strikes no one, because any peer that once held the frame can
+/// deliver it again. The author's own delivery of the same frame strikes the author (#1772,
+/// GHSA-vw36).
+#[tokio::test]
+async fn relayed_forged_certificate_does_not_strike_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("relayed-bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a bad aggregate must strike: {err:?}");
+
+    let author = other.last_authority().primary_public_key();
+    let relayer = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, relayer, "the fixture committee has more than one authority");
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    // relayed: the frame is rejected, but no one is struck
+    assert_eq!(gossip_author_to_strike(&err, true, Some(author), Some(relayer)), None);
+    assert!(slots.take(Some(author), None).is_some(), "a relayed frame must not strike its author");
+    // own delivery: the author is struck
+    let struck = gossip_author_to_strike(&err, true, Some(author), Some(author));
+    assert_eq!(struck, Some(author));
+    struck.into_iter().for_each(|a| slots.strike(a));
+    assert!(slots.take(Some(author), None).is_none(), "the author's own delivery must strike it");
+}
+
+/// With MAX_PENDING_GOSSIP_PER_PEER messages from one author in verification, the next message
+/// from that author is not admitted and its ticket reports Ignore. Another author still gets a
+/// slot, and the author's slots free when its messages settle (#1772).
+#[tokio::test]
+async fn gossip_slots_cap_per_author() {
+    let author_a = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([1; 32])).public();
+    let author_b = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([2; 32])).public();
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+
+    // Hold every slot for author A.
+    let held: Vec<PendingGossip> = (0..MAX_PENDING_GOSSIP_PER_PEER)
+        .map(|i| {
+            let (validation, _verdicts) = gossip_ticket(&format!("held-{i}"));
+            slots.admit(validation, Some(author_a), None).expect("author A is under the cap")
+        })
+        .collect();
+
+    // The next message from author A is over the cap: no slot, and its ticket reports Ignore.
+    let (validation, mut verdicts) = gossip_ticket("over-cap");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_none(),
+        "author A must not get a slot past the cap"
+    );
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "over-cap gossip must report Ignore"
+    );
+
+    // Another author has its own slots.
+    let (validation, _verdicts) = gossip_ticket("author-b");
+    assert!(
+        slots.admit(validation, Some(author_b), None).is_some(),
+        "author B must still get a slot"
+    );
+
+    // Settled messages free their slots for author A.
+    drop(held);
+    let (validation, _verdicts) = gossip_ticket("after-release");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_some(),
+        "author A must get a slot once its held messages settle"
+    );
 }
 
 // ---- bench5 f1-commit-lag ----

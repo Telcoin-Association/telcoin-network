@@ -1,5 +1,6 @@
 //! Tests for the explicit gossipsub frame limits (issue #1655), the cap on message ids per
-//! `IHAVE` (issue #1700) and the rejection of the unsigned `key` field (issue #1699).
+//! `IHAVE` (issue #1700), the rejection of the unsigned `key` field (issue #1699) and the
+//! validation window for deferred verdicts (issue #1772).
 
 use super::*;
 use eyre::eyre;
@@ -556,6 +557,26 @@ fn test_gossipsub_config_pins_ihave_id_cap() -> Result<(), ConfigBuilderError> {
     assert_eq!(config.history_gossip(), 3);
     // the longest topic the node uses is within the topic bound
     assert!(longest_topic().len() <= GOSSIP_TOPIC_BOUND);
+    Ok(())
+}
+
+/// The gossipsub validation window covers a deferred verdict (issue #1772): the history length
+/// reaches the gossipsub config, `history_gossip` keeps the library default and the heartbeat
+/// stays at 1 s.
+#[test]
+fn test_gossipsub_history_length_covers_deferred_verdicts() -> Result<(), ConfigBuilderError> {
+    let config = gossipsub_config(TEST_CHAIN_ID)?;
+
+    // an unvalidated message stays in the message cache for this many heartbeats
+    assert_eq!(config.history_length(), GOSSIP_HISTORY_LENGTH);
+
+    // pinned value: a change here must be a reviewed decision
+    assert_eq!(GOSSIP_HISTORY_LENGTH, 12);
+
+    // one IHAVE still lists the ids of the last three heartbeats
+    assert_eq!(config.history_gossip(), 3);
+    // 12 heartbeats at 1 s give a window of about 12 s
+    assert_eq!(config.heartbeat_interval(), Duration::from_secs(1));
     Ok(())
 }
 

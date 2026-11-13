@@ -2,6 +2,7 @@
 use super::{
     error::{WorkerNetworkError, WorkerNetworkResult},
     handle::WorkerNetworkHandle,
+    ledger::{QuotaCheck, ReportedBatchLedger},
     message::WorkerGossip,
 };
 use crate::{
@@ -28,7 +29,7 @@ use tn_types::{
     ensure, now, try_decode, Batch, BatchValidation, BatchValidationError, BlsPublicKey, Database,
     Epoch, SealedBatch, WorkerId, B256,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 /// Total timeout for sending all batches over a stream.
@@ -56,6 +57,39 @@ pub(crate) const SEND_STREAM_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// oldest one, and a later repeat of the dropped digest is validated again.
 pub(crate) const REJECTED_BATCH_DIGESTS_CAPACITY: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1023);
+
+/// Maximum number of uncommitted batches of one committee key that this node keeps in
+/// [`NodeBatchesCache`] through the report path and the gossip prefetch (issue #1794).
+///
+/// The value is the product of two protocol ceilings, [`tn_types::MAX_GC_DEPTH`] (50 rounds) and
+/// [`tn_types::MAX_HEADER_NUM_OF_BATCHES`] (10 batches per header): the DAG references at most
+/// that many batches of one author, because one header references at most 10 batches and a
+/// certificate older than the garbage-collection depth leaves the DAG. These are the same two
+/// ceilings the consensus-pack reader derives its reconstruction bound from
+/// (`Parameters::validate` in `crates/config/src/node.rs`). The unit test
+/// `reporter_quota_matches_protocol_ceilings` ties the literal to the ceilings.
+///
+/// A [`ReportedBatchLedger`] holds the stored batches of each key that are not yet committed. A
+/// commit frees the entries of its batches. An entry that is older than the commit horizon ages
+/// out when its key is at the bound, so batches that are never committed (a seal that failed, a
+/// reporter restart, a failed eviction, a late store of a committed batch) do not lock an honest
+/// key out. One ledger is shared by all workers of the node, so the bound is one per key for the
+/// whole node. The reports and gossip prefetches of one key that are in flight at the same time
+/// can each pass the check before any of them is counted, so the stored batches of a key can
+/// pass the bound by at most that number.
+///
+/// Without this bound, one committee key (exempt from peer scoring) can store distinct valid
+/// batches on every peer until the disk is full: the batch beneficiary is not validated, so every
+/// copy of the same signed transactions gets a fresh digest, and rows leave the cache only when a
+/// commit evicts them or the epoch closes.
+pub const MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER: usize = 500;
+
+/// How long the report path waits for the primary to acknowledge a reported batch.
+///
+/// The report task runs to its end, also when the network layer cancels the request, so the
+/// cancel no longer bounds this wait. The limit matches the request timeout of the worker
+/// request-response behaviour (`request_response::Config::default()` in libp2p, 10 seconds).
+pub(super) const REPORT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether a batch validation failure proves that the batch body itself is invalid.
 ///
@@ -171,6 +205,19 @@ pub struct RequestHandler<DB> {
     /// into a later epoch. It is shared across clones through `Arc` and holds at most
     /// [`REJECTED_BATCH_DIGESTS_CAPACITY`] digests.
     rejected_batches: Arc<Mutex<LruCache<B256, ()>>>,
+    /// The batches that this node stored for each committee key, through the report path or the
+    /// gossip prefetch, and that are not yet committed (issue #1794).
+    ///
+    /// [`Self::process_report_batch`] and the gossip prefetch check the bound of the key before
+    /// the validation (see [`Self::check_reporter_quota`]) and count the digest only after the
+    /// store write succeeds. The node builds one ledger per epoch and shares it with every
+    /// worker, so the bound is one per key for the whole node: the uncommitted batches that the
+    /// committee keys can store take at most committee size times
+    /// [`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER`] times the maximum batch size on disk,
+    /// plus the in-flight overshoot (see the constant). The ledger is in memory only: a process
+    /// restart starts it empty while the rows survive, so after a restart a key can store up to
+    /// the bound again.
+    reported_batches: ReportedBatchLedger,
 }
 
 impl<DB> RequestHandler<DB>
@@ -183,6 +230,7 @@ where
         validator: Arc<dyn BatchValidation>,
         consensus_config: ConsensusConfig<DB>,
         network_handle: WorkerNetworkHandle,
+        reported_batches: ReportedBatchLedger,
     ) -> Self {
         let metrics = WorkerMetrics::new_for_worker(id);
         Self {
@@ -194,6 +242,7 @@ where
             in_flight_prefetch: Arc::new(Mutex::new(HashSet::new())),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GOSSIP_PREFETCHES)),
             rejected_batches: Arc::new(Mutex::new(LruCache::new(REJECTED_BATCH_DIGESTS_CAPACITY))),
+            reported_batches,
         }
     }
 
@@ -208,6 +257,37 @@ where
         }
     }
 
+    /// Validate `sealed_batch` on the blocking thread pool of the runtime, and record a failure.
+    ///
+    /// `validate_batch` is synchronous and recovers signers on the rayon pool, so an inline call
+    /// parks the tokio worker thread that runs the caller until the recovery ends. A committee
+    /// peer, which is exempt from peer scoring, could hold the worker threads that also serve
+    /// honest reports, batch sync and the vote path (issue #1795). On the blocking pool the
+    /// recovery parks a blocking thread instead.
+    ///
+    /// The report task holds its per-peer slot and its serve permit until the validation and
+    /// the acknowledgement end, also when the network layer cancels the request, because the
+    /// cancel only skips the reply (see [`Self::run_report_to_completion`]). The prefetch task
+    /// holds its permit across this await. So the validations in flight stay bounded by
+    /// `MAX_PENDING_REQUESTS_PER_PEER` for each committee key plus the prefetch cap, and the
+    /// bookkeeping of the handler (the failure count, the rejected digest, the cache insert and
+    /// the report to the primary) always runs.
+    ///
+    /// A validation failure is recorded (see [`Self::record_validation_failure`]) and returned.
+    /// A validation task that does not complete (the runtime is shutting down) is an internal
+    /// error, and nothing is recorded for it.
+    async fn validate_batch_blocking(&self, sealed_batch: SealedBatch) -> WorkerNetworkResult<()> {
+        let digest = sealed_batch.digest();
+        let validator = self.validator.clone();
+        tokio::task::spawn_blocking(move || validator.validate_batch(sealed_batch))
+            .await
+            .map_err(|e| {
+                WorkerNetworkError::Internal(format!("batch validation task failed: {e}"))
+            })?
+            .inspect_err(|err| self.record_validation_failure(digest, err))
+            .map_err(WorkerNetworkError::from)
+    }
+
     /// Process gossip from the committee.
     ///
     /// Workers gossip a batch digest once it is accepted so that peers which consume individual
@@ -215,7 +295,14 @@ where
     /// prefetch the body into `NodeBatchesCache` before the vote path needs it. Observers do not
     /// subscribe to this topic (issue #960): they receive batch bodies inside the verified
     /// consensus output and epoch packs they already download (`crates/state-sync`).
-    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
+    ///
+    /// `author` is the committee key that published the gossip. A prefetched batch counts against
+    /// its bound of uncommitted stored batches (issue #1794).
+    pub(super) async fn process_gossip(
+        &self,
+        msg: &GossipMessage,
+        author: Option<&BlsPublicKey>,
+    ) -> WorkerNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, source: _, sequence_number: _, topic } = msg;
 
@@ -239,7 +326,8 @@ where
                 ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
                 // Gossip normally arrives before the batch is committed, so only the cache is
                 // checked. A late gossip for a batch that is already committed and evicted
-                // refetches it and caches it again until the epoch ends, at most once per digest.
+                // refetches it and caches it again, at most once per digest, and the copy counts
+                // against the bound of the author until it ages out (see `ReportedBatchLedger`).
                 // `WorkerNetwork` holds the consensus chain and could pass it into this call, as
                 // it already does for sync streams, to also check the pack with
                 // `ConsensusChain::contains_current_batch`. That check is left out because it
@@ -248,6 +336,15 @@ where
                     get_batch_local_cache(batch_hash, self.consensus_config.node_storage(),),
                     Ok(Some(_))
                 ) {
+                    // The author pays for the prefetch: a key at its bound of uncommitted stored
+                    // batches gets no prefetch and no penalty (issue #1794). Gossip on this topic
+                    // always has a resolved author; without one the prefetch is skipped.
+                    let Some(author) = author else {
+                        return Ok(());
+                    };
+                    if self.check_reporter_quota(author, batch_hash).is_err() {
+                        return Ok(());
+                    }
                     // Deduplicate and cap gossip-triggered prefetches before fanning
                     // out a fetch. A Byzantine committee author can gossip many
                     // distinct (possibly forged) digests; without this gate each one
@@ -275,7 +372,8 @@ where
                     match self.network_handle.request_batches(&mut missing, None).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
-                                self.validate_and_cache_prefetched_batch(digest, batch)?;
+                                self.validate_and_cache_prefetched_batch(digest, batch, author)
+                                    .await?;
                             }
                         }
                         Err(e) => {
@@ -308,10 +406,17 @@ where
     /// A batch for a future epoch is discarded rather than cached: the cache is
     /// cleared on epoch boundaries and storing it would let a rogue validator waste
     /// disk on batches that can never be used.
-    fn validate_and_cache_prefetched_batch(
+    ///
+    /// A stored batch counts against the bound of uncommitted stored batches of `author`, the
+    /// committee key that gossiped the digest, like a reported batch counts against its reporter
+    /// (issue #1794). The caller checks the bound before the fetch.
+    ///
+    /// Validation runs off the tokio worker thread (see [`Self::validate_batch_blocking`]).
+    async fn validate_and_cache_prefetched_batch(
         &self,
         digest: &B256,
         batch: &Batch,
+        author: &BlsPublicKey,
     ) -> WorkerNetworkResult<()> {
         if batch.epoch != self.consensus_config.epoch() {
             debug!(
@@ -335,10 +440,7 @@ where
             // validating it again, like any other invalid body
             Err(WorkerNetworkError::RejectedBatchRepeat(*digest))
         } else {
-            self.validator
-                .validate_batch(batch.clone().seal(*digest))
-                .inspect_err(|err| self.record_validation_failure(*digest, err))
-                .map_err(WorkerNetworkError::from)
+            self.validate_batch_blocking(batch.clone().seal(*digest)).await
         };
         if let Err(err) = verdict {
             warn!(
@@ -352,7 +454,10 @@ where
 
         self.consensus_config.node_storage().insert::<NodeBatchesCache>(digest, batch).map_err(
             |e| WorkerNetworkError::Internal(format!("failed to write to batch store: {e}")),
-        )
+        )?;
+        // count the stored batch against the bound of the gossip author (issue #1794)
+        self.reported_batches.record(author, *digest);
+        Ok(())
     }
 
     /// Process a new reported batch.
@@ -384,8 +489,19 @@ where
     /// Without these checks, any committee member (through a bug or on purpose) can make every
     /// peer redo full validation for each repeat it sends, and a database write for each repeat
     /// of a valid batch, with no penalty, because committee members are exempt from peer
-    /// scoring. The checks cover exact repeats only. They do not limit a flood of distinct
-    /// batches.
+    /// scoring. The checks cover exact repeats only. Distinct batches are bounded per committee
+    /// key for the whole node: a key with [`MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER`]
+    /// stored batches that are not yet committed gets a retryable refusal until a commit frees
+    /// some of them or they age out (issue #1794, see [`Self::check_reporter_quota`]). A batch
+    /// is counted only after it is stored. The validator also covers a resend of the same
+    /// transactions under a new digest: a transaction hash that failed signer recovery in this
+    /// epoch fails the batch before any recovery, and a verified hash skips recovery (issue
+    /// #1795).
+    ///
+    /// Validation runs on the blocking thread pool of the runtime, not on the tokio worker
+    /// thread that serves the report (see [`Self::validate_batch_blocking`]). The
+    /// acknowledgement from the primary waits at most [`REPORT_ACK_TIMEOUT`]; a timeout is an
+    /// internal error with no penalty.
     pub(super) async fn process_report_batch(
         &self,
         peer: &BlsPublicKey,
@@ -425,16 +541,91 @@ where
             // in this epoch is refused without validating it again
             let already_rejected = self.rejected_batches.lock().contains(&digest);
             ensure!(!already_rejected, WorkerNetworkError::RejectedBatchRepeat(digest));
-            self.validate_and_cache_reported_batch(sealed_batch)?;
+            // check the bound of uncommitted stored batches of the reporter before the validation
+            // and the store write (issue #1794). The digest is counted only after the store write,
+            // and before the acknowledgement wait, so a cancel or a timeout cannot skip the count.
+            self.check_reporter_quota(peer, digest)?;
+            self.validate_and_cache_reported_batch(sealed_batch).await?;
+            self.reported_batches.record(peer, digest);
         }
 
-        // notify primary for payload store
-        client
-            .report_others_batch(WorkerOthersBatchMessage::new(digest, self.id))
-            .await
-            .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
+        // notify primary for payload store; the cancel of the request does not bound this
+        // wait, so it has its own limit (a local fault, so no penalty)
+        tokio::time::timeout(
+            REPORT_ACK_TIMEOUT,
+            client.report_others_batch(WorkerOthersBatchMessage::new(digest, self.id)),
+        )
+        .await
+        .map_err(|_elapsed| {
+            WorkerNetworkError::Internal(format!(
+                "primary did not acknowledge reported batch {digest} within {REPORT_ACK_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Check the bound of uncommitted stored batches of the committee key `peer` for `digest`
+    /// (issue #1794).
+    ///
+    /// Nothing is counted here. The caller counts the digest in `reported_batches` only after
+    /// the store write succeeds, so a batch that fails validation or is not stored consumes no
+    /// quota. A digest that is already counted is admitted at no cost. A key at the bound first
+    /// loses its aged digests (see [`ReportedBatchLedger`]), and this call deletes their rows
+    /// from [`NodeBatchesCache`] after the ledger lock is released. A failed delete is logged,
+    /// and the row then stays until the epoch ends.
+    ///
+    /// Returns [`WorkerNetworkError::ReporterOverQuota`] when the key is still at the bound. The
+    /// requester gets a retryable response and the key gets no penalty: the quota frees when a
+    /// commit frees the batches of the key or when they age out.
+    fn check_reporter_quota(&self, peer: &BlsPublicKey, digest: B256) -> WorkerNetworkResult<()> {
+        match self.reported_batches.check(peer, &digest) {
+            QuotaCheck::Admit { aged } => {
+                let store = self.consensus_config.node_storage();
+                aged.iter().for_each(|aged_digest| {
+                    store.remove::<NodeBatchesCache>(aged_digest).unwrap_or_else(|e| {
+                        warn!(
+                            target: "worker:network",
+                            %peer,
+                            ?aged_digest,
+                            %e,
+                            "failed to delete an aged uncommitted batch from the batch store"
+                        )
+                    });
+                });
+                Ok(())
+            }
+            QuotaCheck::OverQuota => {
+                debug!(
+                    target: "worker:network",
+                    %peer,
+                    ?digest,
+                    bound = MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER,
+                    "refusing a batch: the committee key is at its bound of uncommitted stored batches"
+                );
+                self.metrics.record_batch_report_over_quota();
+                Err(WorkerNetworkError::ReporterOverQuota { peer: Box::new(*peer), digest })
+            }
+        }
+    }
+
+    /// Run a batch report to its end, then say whether its reply may still be sent.
+    ///
+    /// The report runs to its end, also when the network layer cancels the request, so the
+    /// per-peer slot and the serve permit that the caller holds cover the blocking validation,
+    /// the bookkeeping of the handler and the acknowledgement. The cancel only skips the reply:
+    /// the flag is `true` when no cancel arrived, and `false` when a cancel arrived or the
+    /// network layer dropped the sender.
+    pub(super) async fn run_report_to_completion(
+        &self,
+        peer: &BlsPublicKey,
+        sealed_batch: SealedBatch,
+        mut cancel: oneshot::Receiver<()>,
+    ) -> (WorkerNetworkResult<()>, bool) {
+        let res = self.process_report_batch(peer, sealed_batch).await;
+        let reply = matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        (res, reply)
     }
 
     /// Validate a reported batch, then cache it with the time it was received.
@@ -442,16 +633,15 @@ where
     /// A validation failure is recorded in metrics and returned, and the batch is not
     /// cached. When the failure is a body fault (see [`is_body_fault`]), the digest is also
     /// kept in `rejected_batches`, so [`Self::process_report_batch`] refuses a repeat of it for
-    /// the rest of the epoch without validating it again (issue #1774).
-    fn validate_and_cache_reported_batch(
+    /// the rest of the epoch without validating it again (issue #1774). Validation runs off the
+    /// tokio worker thread (see [`Self::validate_batch_blocking`]).
+    async fn validate_and_cache_reported_batch(
         &self,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         // validate batch - record a failure, and keep the digest of a body fault
         let digest = sealed_batch.digest();
-        self.validator
-            .validate_batch(sealed_batch.clone())
-            .inspect_err(|err| self.record_validation_failure(digest, err))?;
+        self.validate_batch_blocking(sealed_batch.clone()).await?;
 
         let (mut batch, _) = sealed_batch.split();
 
@@ -570,8 +760,9 @@ where
     pub async fn pub_process_gossip_for_test(
         &self,
         msg: &GossipMessage,
+        author: Option<&BlsPublicKey>,
     ) -> WorkerNetworkResult<()> {
-        self.process_gossip(msg).await
+        self.process_gossip(msg, author).await
     }
 
     /// Publicly available for tests.
@@ -586,12 +777,55 @@ where
 
     /// Publicly available for tests.
     /// See [Self::validate_and_cache_prefetched_batch].
-    pub fn pub_validate_and_cache_prefetched_batch(
+    pub async fn pub_validate_and_cache_prefetched_batch(
         &self,
         digest: &B256,
         batch: &Batch,
+        author: &BlsPublicKey,
     ) -> WorkerNetworkResult<()> {
-        self.validate_and_cache_prefetched_batch(digest, batch)
+        self.validate_and_cache_prefetched_batch(digest, batch, author).await
+    }
+
+    /// Publicly available for tests.
+    /// Run an admitted report the way the report task of the worker network does: the task
+    /// holds `report_slot` until the report ends, also when `cancel` fires, and the flag says
+    /// whether a reply would be sent. See [Self::run_report_to_completion].
+    pub async fn pub_run_admitted_report(
+        &self,
+        peer: &BlsPublicKey,
+        sealed_batch: SealedBatch,
+        cancel: oneshot::Receiver<()>,
+        report_slot: tn_network_libp2p::PeerSlot,
+    ) -> (WorkerNetworkResult<()>, bool) {
+        let _report_slot = report_slot;
+        self.run_report_to_completion(peer, sealed_batch, cancel).await
+    }
+
+    /// Publicly available for tests.
+    /// Whether `digest` is in the per-epoch set of rejected reported batch digests.
+    pub fn pub_is_rejected_batch(&self, digest: &B256) -> bool {
+        self.rejected_batches.lock().contains(digest)
+    }
+
+    /// Publicly available for tests.
+    /// The node-wide ledger of uncommitted stored batches (issue #1794).
+    pub fn pub_reported_batches(&self) -> &ReportedBatchLedger {
+        &self.reported_batches
+    }
+}
+
+#[cfg(test)]
+mod reporter_quota_tests {
+    use super::MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER;
+    use tn_types::{MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES};
+
+    /// The bound is the product of the two protocol ceilings. A change to either ceiling must
+    /// re-derive the bound (issue #1794).
+    #[test]
+    fn reporter_quota_matches_protocol_ceilings() {
+        let derived = usize::try_from(MAX_GC_DEPTH)
+            .map_or(0, |depth| depth.saturating_mul(MAX_HEADER_NUM_OF_BATCHES));
+        assert_eq!(MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER, derived);
     }
 }
 

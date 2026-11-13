@@ -160,12 +160,18 @@ The reason for the rejection decides only which peer, if any, loses reputation.
 
 If the accountable identity has not resolved — a peer can be connected and relaying before its node record arrives — the node skips the penalty entirely rather than charging whichever peer happens to be in hand.
 The same skip covers an anonymous message, a frame delivered by a peer other than its author, and the case where this node's committee view lags a neighbour's.
-Accepted messages carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
+Messages that pass the network-layer checks carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
+A certificate whose aggregate signature fails is such a fault: the primary reports Reject and charges the author a fatal penalty.
+Every author these topics admit holds a committee slot, and the peer manager exempts committee keys from penalties, so the penalty is recorded with `outcome=exempt`.
+The cost the author pays is local: the primary ignores that author's gossip for 10 seconds after the strike, doubling with each further strike in the epoch up to 160 seconds (#1772).
+The primary strikes an author only for a fatal author fault on a frame that the author delivered itself.
+A forged frame that another peer relays is rejected and not forwarded, but it strikes no one, which is the rule the network layer applies for GHSA-vw36.
+A consensus result with a bad signature also strikes its author.
 
 ## Validation configuration
 
 Gossipsub runs with strict validation mode, manual message validation, and a one-second heartbeat interval.
-Manual validation is what allows the allowlist check to run before a message is re-propagated: the node reports accept or reject explicitly, and a rejected message is never forwarded.
+Manual validation is what allows the allowlist check and the primary's signature check to run before a message is re-propagated: the node reports accept, reject or ignore explicitly, and only an accepted message is forwarded.
 
 Gossipsub's own peer scoring is deliberately left disabled.
 The peer manager is the authoritative reputation system, and running gossipsub scoring alongside it would double-count the same misbehavior — once as a gossipsub score decay and again as a peer-manager penalty — with two sets of thresholds that could disagree about when to disconnect.
@@ -175,6 +181,37 @@ Keeping scoring off has two consequences inside the library.
 Upstream gossipsub removes an expired `IWANT` promise only from the scoring branch of its heartbeat, so a peer that advertises ids with `IHAVE` and never delivers would grow the promise map without bound.
 Upstream also skips an advertised id while any peer holds a pending promise for it, so one peer's unanswered promise, renewed with each `IHAVE` at no cost, would suppress the `IWANT` to every other advertiser of that id.
 The node therefore carries `patches/libp2p-gossipsub`, which expires promises on every heartbeat, applies the broken-promise penalty only while scoring is active, and skips an advertised id only when the advertising peer itself already holds a pending promise for it; `patches/libp2p-gossipsub/PATCH.md` records the patch and its retirement criteria.
+
+## Deferred validation (#1772)
+
+Gossipsub holds each message until the node reports a verdict.
+With a history length of 12 and a 1 second heartbeat, a held message stays reportable for about 12 seconds.
+A deferred verdict can land after the primary's epoch gap.
+In a gap the primary event queue holds the epoch votes (#1786) and the newest consensus result of each author, so this window covers the verdicts of the gossip held through the gap.
+Certificate gossip that arrives in a gap, and a consensus result that a newer result of its author replaces there, is shed, its ticket reports Ignore, and this node does not relay it.
+The author's flood publish and the committee dials still deliver it to the committee.
+The network layer admits a message first: it checks the size and that the author is an authorized publisher for the topic.
+An admitted message goes to the application with a validation ticket, and the network layer does not accept it yet.
+The primary verifies the signature before it reports a verdict, with at most 4 messages per peer in verification at once.
+The cap is keyed by the author, or by the relayer when the author has not resolved, and gossip with neither identity shares one bucket with the same cap.
+The primary reports Accept right after the signature check passes, and only then does gossipsub forward the message.
+A failed check reports Reject: a bad aggregate signature on a certificate, a bad signature on a consensus result or an epoch vote, a malformed payload, or a message on the wrong topic.
+The author of a rejected message is charged the penalty, which is fatal for a failed aggregate signature.
+Committee authors are exempt from peer-manager penalties, so a fatal author fault on a frame that the author delivered itself puts the author's gossip on a local cooldown instead: 10 seconds, doubling per strike up to 160 seconds, cleared at the epoch change.
+A consensus result with a bad signature also puts its author on the cooldown.
+A forged frame that another peer relays is rejected and not forwarded, but it strikes no one, which is the rule the network layer applies for GHSA-vw36.
+Gossip that the primary cannot verify, such as a certificate for an epoch with no known committee, reports Ignore.
+A certificate for an earlier epoch reports Ignore before any verification, is not forwarded and charges no one.
+Observers and ExEx get earlier-epoch certificates through epoch-pack sync.
+A certificate for the next epoch that fails against the provisional committee also reports Ignore.
+A certificate that this node already holds or verified recently, or one below its garbage-collection round, is recognized before the aggregate check, so a replayed certificate frame reports Ignore without a verification and is not forwarded.
+This known-certificate check applies to current-epoch certificates.
+Duplicate consensus results and epoch votes, stale consensus results and messages over the per-peer cap also report Ignore.
+Certificate gossip that arrives in the epoch gap, and a consensus result replaced there by a newer result of its author, also reports Ignore, and this node does not relay it.
+Ignore drops the message without a penalty.
+A ticket dropped without a verdict reports Ignore, so no message is forwarded by default.
+The verdict frees the verification slot, so downstream work on verified gossip is not bounded by the cap.
+The worker accepts batch gossip when it receives it, because its check fetches the batch over the network and can take longer than the validation window.
 
 ## Topic re-validation in the application layer
 

@@ -441,6 +441,7 @@ jobs:
         # queue and force a rebuild of everything behind it. See etc/ci-lanes.sh.
         env:
           NEXTEST_PROFILE: ci
+          TMPDIR: /dev/shm
         run: ./etc/ci-lanes.sh test-default
 
   # Adiri feature lane: the adiri-gated suites only compile under the adiri features, so

@@ -129,7 +129,7 @@ fn primary_event_hold(event: &NetworkEvent<Req, Res>, epoch: Option<Epoch>) -> O
 /// swarm forwards only gossip that an authorized publisher signed, so forwarded gossip on this
 /// topic has an author. The policy does not check the vote signature, so the epoch window also
 /// limits the shares of one author: one share for each epoch of the window.
-fn epoch_vote_weight(gossip: &GossipPayload, epoch: Option<Epoch>) -> Option<GapWeight> {
+fn epoch_vote_weight(gossip: &GossipPayload<Req, Res>, epoch: Option<Epoch>) -> Option<GapWeight> {
     let message = &gossip.message;
     let source =
         message.source.filter(|_| message.topic.as_str().starts_with(EPOCH_VOTE_TOPIC_PREFIX))?;
@@ -174,7 +174,7 @@ fn epoch_vote_weight(gossip: &GossipPayload, epoch: Option<Epoch>) -> Option<Gap
 ///
 /// The topic prefix has no chain id, as for the votes: the swarm subscribes only to the topics of
 /// this chain.
-fn consensus_output_weight(gossip: &GossipPayload) -> Option<GapWeight> {
+fn consensus_output_weight(gossip: &GossipPayload<Req, Res>) -> Option<GapWeight> {
     let message = &gossip.message;
     let source = message
         .source
@@ -203,7 +203,9 @@ mod tests {
     use std::collections::HashMap;
     use tn_config::LibP2pConfig;
     use tn_network_libp2p::{
-        types::{GossipPayload, NetworkEvent},
+        types::{
+            GossipPayload, GossipValidation, GossipVerdict, MessageId, NetworkCommand, NetworkEvent,
+        },
         GossipMessage, PeerId, TopicHash,
     };
     use tn_types::{
@@ -284,8 +286,18 @@ mod tests {
         (votes, outputs)
     }
 
-    /// A gossip event on `topic` from `source` with `data`.
+    /// A gossip event on `topic` from `source` with `data` and a detached validation ticket.
     fn gossip_with(topic: String, source: Option<PeerId>, data: Vec<u8>) -> NetworkEvent<Req, Res> {
+        gossip_with_ticket(topic, source, data, GossipValidation::detached())
+    }
+
+    /// A gossip event on `topic` from `source` with `data` and the validation ticket `validation`.
+    fn gossip_with_ticket(
+        topic: String,
+        source: Option<PeerId>,
+        data: Vec<u8>,
+        validation: GossipValidation<Req, Res>,
+    ) -> NetworkEvent<Req, Res> {
         NetworkEvent::Gossip(Box::new(GossipPayload {
             message: GossipMessage {
                 source,
@@ -295,6 +307,7 @@ mod tests {
             },
             relayer: None,
             author: None,
+            validation,
         }))
     }
 
@@ -321,6 +334,30 @@ mod tests {
         });
         assert_eq!(outcome(&channel, output), Some(TrySendOutcome::Queued));
         assert_eq!(outcome(&channel, vote), Some(TrySendOutcome::Queued));
+    }
+
+    /// Certificate gossip that arrives in a gap is shed. The shed event drops its validation
+    /// ticket, and the ticket reports `Ignore`, so gossipsub does not forward the message from this
+    /// node (#1772).
+    #[test]
+    fn gap_sheds_certificate_gossip_and_its_ticket_reports_ignore() {
+        let channel = primary_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let ticket =
+            GossipValidation::new(MessageId::from(b"certificate".to_vec()), PeerId::random(), tx);
+        let data = encode(&PrimaryGossip::Certificate(Box::default()));
+        let certificate = gossip_with_ticket(
+            LibP2pConfig::primary_topic(0),
+            Some(PeerId::random()),
+            data,
+            ticket,
+        );
+
+        assert_eq!(outcome(&channel, certificate), Some(TrySendOutcome::Unsubscribed));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::ReportGossipValidation { verdict: GossipVerdict::Ignore, .. })
+        ));
     }
 
     /// One author holds at most two copies of its vote for one epoch in a gap. Its vote for the

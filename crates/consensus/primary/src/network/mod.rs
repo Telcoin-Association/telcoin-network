@@ -7,10 +7,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -33,12 +33,12 @@ use tn_network_libp2p::{
     error::NetworkError,
     read_frame,
     types::{
-        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, IntoResponse as _, NetworkCommand, NetworkEvent,
+        NetworkHandle, NetworkResponseMessage, NetworkResult,
     },
-    write_frame, AdmissionShed, DenyReason, GossipMessage, HoldBudget, HoldLease, PeerSlot,
-    PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel,
-    ServiceClass, Stream, StreamError, SyncFrame, SyncFrameError,
+    write_frame, AdmissionShed, DenyReason, HoldBudget, HoldLease, PeerSlot, PeerSlots, PeerTier,
+    Penalty, PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass,
+    Stream, StreamError, SyncFrame, SyncFrameError,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -152,6 +152,236 @@ pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
 /// Prevents a single malicious peer from filling all global slots.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
+/// Maximum number of gossip messages from a single peer in signature verification at once
+/// (#1772).
+///
+/// The honest peak per author is one certificate per round plus a consensus result and an
+/// epoch vote. Four leaves headroom for a burst after a reconnect.
+pub const MAX_PENDING_GOSSIP_PER_PEER: usize = 4;
+
+/// How long this node ignores gossip from an author after its first strike in an epoch (#1772).
+///
+/// A strike is a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]), for
+/// example a certificate whose aggregate signature fails. It counts only for a frame that the
+/// author delivered itself while the ticket was pending (see [`gossip_author_to_strike`]). A
+/// forged certificate is dropped at the first hop and honest nodes never relay it, so the
+/// forger's own delivery is still struck. The gossipsub envelope is signed, so the author is
+/// accountable. Each further strike in the epoch doubles the hold, up to
+/// [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+///
+/// The peer manager exempts committee keys from every penalty (`docs/src/network/peers.md`, test
+/// `committee_members_are_exempt_from_all_penalties`). The `Fatal` is then recorded with
+/// `outcome=exempt`, and this local cooldown is the cost that the author pays. The slots are
+/// rebuilt with the primary network each epoch, which clears the strikes.
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_BASE: Duration = Duration::from_secs(10);
+
+/// Upper bound on the gossip cooldown of an author after repeated strikes in one epoch (#1772).
+///
+/// See [`GOSSIP_AUTHOR_COOLDOWN_BASE`].
+pub(crate) const GOSSIP_AUTHOR_COOLDOWN_MAX: Duration = Duration::from_secs(160);
+
+/// Guard for one gossip message in signature verification (#1772).
+///
+/// It holds a per-peer slot, or a permit from the shared bucket for gossip whose author and
+/// relayer are both unresolved. Dropping the guard frees the slot.
+pub(crate) enum GossipSlot {
+    /// A slot keyed by the author, or by the relayer when the author is unresolved.
+    Peer {
+        /// The per-peer slot. It frees on drop.
+        ///
+        /// Boxed: the slot is far larger than the shared permit (clippy `large_enum_variant`).
+        _slot: Box<PeerSlot>,
+    },
+    /// A permit from the shared bucket for gossip with no resolved author or relayer.
+    Shared {
+        /// The shared permit. It returns to the bucket on drop.
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+/// Per-peer bound on gossip in signature verification (#1772).
+///
+/// A message takes a slot keyed by its author when the author is resolved, else by its relayer.
+/// Gossip with neither identity resolved shares one bucket with the same cap.
+///
+/// An author struck for a fault of the strike class
+/// ([`PrimaryNetworkError::strikes_gossip_author`]) gets no slot for a cooldown that starts at
+/// [`GOSSIP_AUTHOR_COOLDOWN_BASE`] and doubles per strike up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+/// The strike applies only to a frame that the author delivered itself while the ticket was
+/// pending (see [`gossip_author_to_strike`]).
+#[derive(Clone, Debug)]
+pub(crate) struct GossipSlots {
+    /// Slots keyed by the author or relayer BLS key.
+    peers: PeerSlots,
+    /// Shared bucket for gossip whose author and relayer are both unresolved.
+    unresolved: Arc<Semaphore>,
+    /// Cooldowns of struck authors. The slots are rebuilt each epoch, which clears them.
+    cooldowns: Arc<Mutex<HashMap<BlsPublicKey, AuthorCooldown>>>,
+}
+
+/// The gossip cooldown of one struck author in this epoch (#1772).
+#[derive(Clone, Copy, Debug)]
+struct AuthorCooldown {
+    /// Strikes against the author in this epoch.
+    strikes: u32,
+    /// The author's gossip gets no slot until this instant.
+    until: Instant,
+}
+
+impl GossipSlots {
+    /// Create the slots with `cap` messages per peer and `cap` messages in the shared bucket.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            peers: PeerSlots::new(cap),
+            unresolved: Arc::new(Semaphore::new(cap)),
+            cooldowns: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Take a slot for gossip from `author`, else `relayer`, else the shared bucket.
+    ///
+    /// Returns `None` when that peer or the shared bucket is at the cap, or when `author` is in a
+    /// cooldown.
+    pub(crate) fn take(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<GossipSlot> {
+        self.take_at(author, relayer, Instant::now())
+    }
+
+    /// [`Self::take`] at the instant `now`.
+    fn take_at(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+        now: Instant,
+    ) -> Option<GossipSlot> {
+        let cooling = author
+            .and_then(|a| self.cooldowns.lock().get(&a).copied())
+            .is_some_and(|c| c.until > now);
+        if cooling {
+            return None;
+        }
+        author.or(relayer).map_or_else(
+            || {
+                Arc::clone(&self.unresolved)
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| GossipSlot::Shared { _permit: permit })
+            },
+            |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: Box::new(slot) }),
+        )
+    }
+
+    /// Strike `author` for a fault of the strike class on its own delivery (#1772).
+    ///
+    /// The caller picks the author with [`gossip_author_to_strike`]: the fault is one where
+    /// [`PrimaryNetworkError::strikes_gossip_author`] holds, and the author delivered the frame
+    /// itself while the ticket was pending.
+    ///
+    /// Its gossip gets no slot for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubled for each earlier
+    /// strike in this epoch, up to [`GOSSIP_AUTHOR_COOLDOWN_MAX`].
+    pub(crate) fn strike(&self, author: BlsPublicKey) {
+        self.strike_at(author, Instant::now())
+    }
+
+    /// [`Self::strike`] at the instant `now`.
+    fn strike_at(&self, author: BlsPublicKey, now: Instant) {
+        let mut guard = self.cooldowns.lock();
+        let strikes = guard.get(&author).map_or(1, |c| c.strikes.saturating_add(1));
+        let hold = GOSSIP_AUTHOR_COOLDOWN_BASE
+            .saturating_mul(1u32 << strikes.saturating_sub(1).min(4))
+            .min(GOSSIP_AUTHOR_COOLDOWN_MAX);
+        guard.insert(author, AuthorCooldown { strikes, until: now + hold });
+    }
+
+    /// The end of the cooldown of `author`, if it was struck in this epoch.
+    #[cfg(test)]
+    pub(crate) fn cooldown_until(&self, author: &BlsPublicKey) -> Option<Instant> {
+        self.cooldowns.lock().get(author).map(|c| c.until)
+    }
+
+    /// Admit one gossip message for signature verification.
+    ///
+    /// Returns `None` when no slot is free. The ticket then drops and reports `Ignore`.
+    pub(crate) fn admit(
+        &self,
+        validation: GossipValidation<Req, Res>,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<PendingGossip> {
+        self.take(author, relayer).map(|slot| PendingGossip::new(validation, slot))
+    }
+}
+
+/// The author that a failed gossip message strikes, if any (#1772).
+///
+/// This is the same by-author rule that the network layer applies on its reject path
+/// (GHSA-vw36): any peer that once held the frame can deliver it again. The author is struck
+/// only for a fault of the strike class ([`PrimaryNetworkError::strikes_gossip_author`]) on a
+/// frame that the author delivered itself while the ticket was pending. A relayed forged frame
+/// is still rejected and never forwarded, but it strikes no one. A frame whose ticket was
+/// already settled (a fault after Accept) strikes no one.
+pub(crate) fn gossip_author_to_strike(
+    e: &PrimaryNetworkError,
+    was_pending: bool,
+    author: Option<BlsPublicKey>,
+    relayer: Option<BlsPublicKey>,
+) -> Option<BlsPublicKey> {
+    author.filter(|a| was_pending && relayer == Some(*a) && e.strikes_gossip_author())
+}
+
+/// One gossip message in signature verification: its verdict ticket and its slot (#1772).
+pub(crate) struct PendingGossip {
+    /// The deferred verdict ticket for gossipsub.
+    validation: GossipValidation<Req, Res>,
+    /// The verification slot. The first verdict frees it, so downstream work does not hold it.
+    slot: Option<GossipSlot>,
+}
+
+impl PendingGossip {
+    /// Pair a ticket with the slot it was admitted under.
+    pub(crate) fn new(validation: GossipValidation<Req, Res>, slot: GossipSlot) -> Self {
+        Self { validation, slot: Some(slot) }
+    }
+
+    /// A message with no ticket to report and no slot, for direct handler calls in tests.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self { validation: GossipValidation::detached(), slot: None }
+    }
+
+    /// Free the slot and report `Accept`, so gossipsub forwards the message.
+    ///
+    /// Call it right after the signature check and before any downstream work.
+    pub(crate) async fn accept(&mut self) {
+        drop(self.slot.take());
+        self.validation.accept().await;
+    }
+
+    /// Free the slot and report `Reject`, so gossipsub drops the message as invalid.
+    pub(crate) async fn reject(&mut self) {
+        drop(self.slot.take());
+        self.validation.reject().await;
+    }
+
+    /// Whether the ticket still waits for a verdict.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.validation.is_pending()
+    }
+
+    /// Settle the ticket after the handler failed with `e`.
+    ///
+    /// An author content fault reports `Reject` while the ticket is pending. Any other error
+    /// drops the ticket, which reports `Ignore`.
+    pub(crate) async fn settle_error(mut self, e: &crate::error::PrimaryNetworkError) {
+        if e.is_author_content_fault() && self.is_pending() {
+            self.reject().await;
+        }
+    }
+}
+
 /// Maximum number of concurrent shed tasks for denied inbound sync streams.
 ///
 /// A denied stream still gets a short-lived task that writes a `Deny` frame:
@@ -175,11 +405,12 @@ pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 /// log line.
 const MAX_PEER_ERROR_LEN: usize = 256;
 
-/// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
-/// request frame is written. A peer that negotiated the sync protocol but does not
-/// answer (a pre-cutover node that registered the protocol but reads the stream on
-/// the legacy digest path) trips this and is cached unsyncable this epoch, so the
-/// probe moves on to the next peer.
+/// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack or
+/// consensus-output request frame is written. A peer that negotiated the sync protocol but
+/// does not answer (a pre-cutover node that registered the protocol but reads the stream on
+/// the legacy digest path) trips this, and the probe is a failed one: the peer is marked for
+/// the fetched epoch, so later walks of that epoch probe it last, and the probe moves on to
+/// the next peer.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Overall bound on reading a streamed missing-certificates response, on top of the
@@ -208,6 +439,26 @@ const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// so a peer cannot sit on an opening permit for most of the window at no cost
 /// (GHSA-vr4r-x9mm-6x9g). Committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
 const PUBLIC_SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long after its request write a requester ranks a [`DenyReason::Busy`] first frame as a
+/// prompt `Busy` (GHSA-2fh9-q846-r7vw). An honest responder decides `Busy` at once when it cannot
+/// serve, so its answer usually arrives within about one round trip. Without this bound a peer
+/// could wait for almost all of [`SYNC_ACK_TIMEOUT`] on every probe, answer `Busy`, and keep the
+/// busy rank, ahead of every peer that answered late.
+///
+/// A `Busy` that arrives later ranks with the failure-marked peers on the later walks of the
+/// epoch ([`BusyAnswer::Late`]), but it is not a failed probe: the peer keeps its preference and
+/// its rate bound. One second does not cover every honest answer: the window starts at the
+/// requester's own write into a lazily opened stream, so it also spans the round trip, queueing
+/// behind this requester's own bulk streams on the same connection, loss recovery and the
+/// responder's event loop. An honest `Busy` that arrives late therefore costs its server only its
+/// place in the probe order.
+///
+/// The same window bounds the other answers that leave no failure mark: a protocol rejection, a
+/// clean close or a reset on the first read of a consensus-output exchange, and a rejection of
+/// a partial epoch-pack request, count as "does not serve this" only within it, and later as a
+/// failed probe (`late_no_answer`).
+const SYNC_BUSY_DENY_WINDOW: Duration = PUBLIC_SYNC_REQUEST_READ_TIMEOUT;
 
 /// Fixed, size-independent wall-clock cap on one public-tier epoch-pack serve.
 ///
@@ -338,32 +589,70 @@ const MAX_SYNC_REQUEST_FRAME_SIZE: usize = 4 * 1024 * 1024;
 /// each slow peer costs that at most once per epoch.
 pub(crate) const SYNC_PREFERENCE_EXPLORE_EVERY: u64 = 16;
 
-/// How many distinct peers one probe walk must see cut at the target rate before the requester
-/// concludes that its own link, not the peers, is below the target (Gap 4 of #1787). The walk
-/// stops its target pass at that cut, reads the rest of the walk at the floor, and sets
-/// `PrimaryNetworkHandle::floor_only_this_epoch`, so every later walk of the node epoch reads
-/// every peer at the floor. One cut is one slow peer; two in one walk are the requester's own
-/// link.
+/// How many distinct staked peers one probe walk must see cut at the target rate before the
+/// requester concludes that its own link, not the peers, is below the target (Gap 4 of #1787).
+/// The walk stops its target pass at that cut, reads the rest of the walk at the floor, and sets
+/// the floor-only verdict (`LinkSpeed::floor_only_until`) for `FLOOR_ONLY_TTL`, so the later
+/// walks in that time read every peer at the floor. One cut is one slow peer; two in one walk
+/// are the requester's own link.
 ///
-/// A committee-tier requester reads the cut peers at the floor first and then the peers not yet
-/// probed. The cost is about two target-cut probes, around one `SYNC_RATE_WINDOW` each on a
-/// slow link, once per node epoch, after which the requester syncs at the floor as the parent
-/// always did. A public-tier requester reads only the peers not yet probed at the floor. It does
-/// not probe again a peer that this walk cut, because the responder's hold budget refuses that
-/// probe with `Deny(Busy)` for about five times the cut's hold. It reads that peer at the floor
-/// in a later walk (`PrimaryNetworkHandle::walk_with_floor_fallback`).
+/// Only a cut of a staked peer counts (`PrimaryNetworkHandle::staked_peers`, the current and
+/// the next committee), so identities that cost nothing cannot make the verdict
+/// (GHSA-h352-9822-hjqg). A cut of any other peer still marks that peer slow for the epoch and
+/// still gets the floor re-probe of `walk_with_floor_fallback`.
+///
+/// After the stop, a committee-tier requester reads the peers not yet probed at the floor first
+/// and then the cut peers. The cost is about two target-cut probes, around one
+/// `SYNC_RATE_WINDOW` each on a slow link, once per `FLOOR_ONLY_TTL`. A public-tier requester
+/// reads only the peers not yet probed at the floor. It does not probe again a peer that this
+/// walk cut, because the responder's hold budget refuses that probe with `Deny(Busy)` for about
+/// five times the cut's hold. It reads that peer at the floor in a later walk
+/// (`PrimaryNetworkHandle::walk_with_floor_fallback`).
 const LINK_BELOW_TARGET_CUTS: usize = 2;
+
+/// How long a floor-only verdict lasts (`LinkSpeed::floor_only_until`, GHSA-h352-9822-hjqg).
+///
+/// The verdict does not last for the node epoch. When it ends, the next walk reads fresh peers
+/// at the target again, and two staked cuts in one walk set it again. Ten minutes is twenty
+/// `SYNC_RATE_WINDOW`s, so a node whose link is really below the target pays about two
+/// target-cut windows in twenty (10%) to check it again, and a wrong verdict lasts at most ten
+/// minutes. A serve at the target ends the verdict at once (`LinkSpeed::note_target_serve`).
+const FLOOR_ONLY_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How recent a serve at the target must be to block a floor-only verdict
+/// (`LinkSpeed::conclude_below_target`, GHSA-h352-9822-hjqg).
+///
+/// A peer that served this node at the target rate shows that the link can carry the target, so
+/// cuts in a later walk inside this window are slow peers, not a slow link. The window has the
+/// length of `FLOOR_ONLY_TTL`: a serve that ends a verdict also blocks a new one for the same
+/// time.
+const FLOOR_ONLY_EVIDENCE_WINDOW: Duration = FLOOR_ONLY_TTL;
+
+/// When a peer's [`DenyReason::Busy`] answer to a probe arrived, measured from the request
+/// write against [`SYNC_BUSY_DENY_WINDOW`] (GHSA-2fh9-q846-r7vw). `epoch_sync_busy` keeps the
+/// worse answer per (peer, epoch), so a later prompt `Busy` does not lift a late one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BusyAnswer {
+    /// Within the window: the peer ranks after the fresh peers and before the marked ones.
+    Prompt,
+    /// After the window: the peer ranks with the failure-marked peers, with no failure mark.
+    Late,
+}
 
 /// The outcome of an epoch-pack fetch attempt over the typed sync protocol.
 enum EpochPackAttempt {
     /// The peer served and the pack was imported into the consensus chain.
     Imported,
     /// The peer did not answer the sync exchange; cache it unsyncable this epoch
-    /// and skip it on later probes (it must upgrade to be syncable again).
+    /// and skip it on later probes (it must upgrade to be syncable again). For a partial
+    /// request this is only a rejection within `SYNC_BUSY_DENY_WINDOW`, and it caches nothing; a
+    /// later rejection of a partial request is `Failed`.
     Unsupported,
-    /// The responder is serving this key or the key's hold budget is spent; retry later,
-    /// with no failure mark.
-    Busy,
+    /// The responder is serving this key or the key's hold budget is spent; retry later. No
+    /// failure mark, but the peer is marked busy for the epoch with the [`BusyAnswer`], so later
+    /// walks of that epoch probe it after every fresh peer, and after every peer that answered
+    /// in time when it answered late.
+    Busy(BusyAnswer),
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
 }
@@ -379,14 +668,18 @@ enum EpochPackAttempt {
 enum ConsensusOutputAttempt {
     /// The peer served a header-hash-verified output.
     Fetched(ConsensusOutput),
-    /// The peer did not answer the sync exchange. Unlike a full-pack `Unsupported`
+    /// The peer rejected the protocol, or closed or reset the stream, within
+    /// `SYNC_BUSY_DENY_WINDOW` of the request write. Unlike a full-pack `Unsupported`
     /// this is NOT cached unsyncable, because a peer that speaks `/tn-primary-sync`
     /// but cannot decode this newer `ConsensusOutput` variant still serves full epoch
-    /// packs and must not be hidden from the full-pack path.
+    /// packs and must not be hidden from the full-pack path. The same answer after the window
+    /// is `Failed`.
     Unsupported,
-    /// The responder is serving this key or the key's hold budget is spent; retry later,
-    /// with no failure mark.
-    Busy,
+    /// The responder is serving this key or the key's hold budget is spent; retry later. No
+    /// failure mark, but the peer is marked busy for the epoch with the [`BusyAnswer`], so later
+    /// walks of that epoch probe it after every fresh peer, and after every peer that answered
+    /// in time when it answered late.
+    Busy(BusyAnswer),
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
 }
@@ -453,11 +746,12 @@ enum WalkOutcome<T> {
         /// order; `walk_with_floor_fallback` probes them again at the floor.
         cut_at_target: Vec<BlsPublicKey>,
     },
-    /// The pass stopped at the second distinct peer the reader cut at the target
-    /// (`LINK_BELOW_TARGET_CUTS`): two peers below the target in one walk mean the requester's
-    /// own link is below it, so no further peer was read at the target (Gap 4 of #1787).
+    /// The pass stopped at the second distinct staked peer the reader cut at the target
+    /// (`LINK_BELOW_TARGET_CUTS`): two staked peers below the target in one walk mean the
+    /// requester's own link is below it, so no further peer was read at the target (Gap 4 of
+    /// #1787, GHSA-h352-9822-hjqg).
     LinkBelowTarget {
-        /// The peers cut at the target, in probe order.
+        /// The peers cut at the target, staked or not, in probe order.
         cut_at_target: Vec<BlsPublicKey>,
         /// The peers of the plan past the second cut, not probed in this pass, in plan order.
         unprobed: Vec<BlsPublicKey>,
@@ -468,10 +762,10 @@ enum WalkOutcome<T> {
 enum WalkStop<T> {
     /// A peer served.
     Served(T),
-    /// A second distinct peer was cut at the target; `next` indexes the first plan entry not
-    /// probed.
+    /// A second distinct staked peer was cut at the target; `next` indexes the first plan entry
+    /// not probed.
     LinkBelowTarget {
-        /// The peers cut at the target, in probe order.
+        /// The peers cut at the target, staked or not, in probe order.
         cut_at_target: Vec<BlsPublicKey>,
         /// Index into the plan of the first entry not probed.
         next: usize,
@@ -747,8 +1041,9 @@ impl ServeGrant {
 
 /// Why a sync serve was refused. Each refusal answers `Deny` on the wire with the reason that
 /// [`Self::deny_reason`] gives: a full pool answers [`DenyReason::AtCapacity`], and the per-key
-/// serve cap and the hold budget answer [`DenyReason::Busy`]. A requester treats `Busy` as
-/// "retry later" and does not mark the server as failed. Only a late opening is charged.
+/// serve cap and the hold budget answer [`DenyReason::Busy`]. A requester treats a prompt
+/// `Busy` as "retry later" and does not mark the server as failed; a `Busy` that arrives after
+/// `SYNC_BUSY_DENY_WINDOW` is a failed probe. Only a late opening is charged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServeRefusal {
     /// No pool permit of the class that the peer may take is free.
@@ -1139,8 +1434,8 @@ fn opening_read_bound(tier: PeerTier) -> Duration {
 /// pool answers [`DenyReason::AtCapacity`], and the per-key serve cap or the hold budget answers
 /// [`DenyReason::Busy`]. An honest peer gets it when the public share of a class is full or its
 /// own key must wait, and it no longer holds a serve grant. The late charge is sent once the stream
-/// holds no serve grant: after the serve for an admitted request, before the deny for a refused
-/// one.
+/// holds no serve grant: after the serve for an admitted request, and after the deny for a
+/// refused one, so the deny is not held back while the charge waits on the command channel.
 pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
     mut stream: S,
     admission: SyncAdmission,
@@ -1201,16 +1496,18 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
         }
         SyncOpening::AtCapacity(class, refusal) => {
             debug!(target: "primary::network", %peer, ?class, ?refusal, ?tier, "sync serve refused");
-            // a refusal is free only when the request was prompt; the refused stream holds no
-            // serve permit, so the charge goes out before the deny
+            // the deny goes out first: the charge waits for room on the swarm command channel,
+            // and a requester ranks a `Busy` that reaches it late behind the peers that answered
+            // in time (GHSA-2fh9-q846-r7vw). the refused stream holds no serve permit either way
+            write_control_frame_and_close(&mut stream, SyncFrame::Deny(refusal.deny_reason()))
+                .await;
+            // a refusal is free only when the request was prompt
             if late {
                 warn!(
                     target: "primary::network", %peer, ?tier, ?elapsed, "late sync request opening"
                 );
                 charge_public_peer(&network_handle, peer, tier).await;
             }
-            write_control_frame_and_close(&mut stream, SyncFrame::Deny(refusal.deny_reason()))
-                .await;
         }
         SyncOpening::Admitted { request, class, grant } => {
             let outcome = ServeHoldLimit::of(tier, class).run(serve(stream, request)).await;
@@ -1337,6 +1634,46 @@ impl SyncPreference {
     }
 }
 
+/// What this node knows about the speed of its own sync link (GHSA-h352-9822-hjqg): when a peer
+/// last served it at the target rate, and until when the walks read every peer at the floor.
+#[derive(Debug, Default)]
+struct LinkSpeed {
+    /// When a peer last served a full pack, a partial pack or a verified consensus output at the
+    /// target rate ([`SyncServeSpeed::Target`]). It shows that the link can carry the target.
+    last_target_serve: Option<tokio::time::Instant>,
+    /// The floor-only verdict: until this instant the walks plan every peer at the floor and
+    /// read nothing at the target. `None` when no verdict holds.
+    floor_only_until: Option<tokio::time::Instant>,
+}
+
+impl LinkSpeed {
+    /// Whether the floor-only verdict holds at `now`.
+    fn floor_only(&self, now: tokio::time::Instant) -> bool {
+        self.floor_only_until.is_some_and(|until| now < until)
+    }
+
+    /// Record a serve at the target rate at `now`. The serve shows that the link can carry the
+    /// target, so a floor-only verdict ends at once.
+    fn note_target_serve(&mut self, now: tokio::time::Instant) {
+        self.last_target_serve = Some(now);
+        self.floor_only_until = None;
+    }
+
+    /// Conclude from the staked target cuts of one walk that the link is below the target, and
+    /// set the floor-only verdict until `FLOOR_ONLY_TTL` after `now`. A serve at the target
+    /// inside `FLOOR_ONLY_EVIDENCE_WINDOW` before `now` contradicts the cuts, so no verdict is
+    /// set. Returns whether the verdict was set.
+    fn conclude_below_target(&mut self, now: tokio::time::Instant) -> bool {
+        let contradicted = self.last_target_serve.is_some_and(|served| {
+            now.saturating_duration_since(served) < FLOOR_ONLY_EVIDENCE_WINDOW
+        });
+        if !contradicted {
+            self.floor_only_until = now.checked_add(FLOOR_ONLY_TTL);
+        }
+        self.floor_only(now)
+    }
+}
+
 /// What a probe walk read from the preference slot when it started (#1787), threaded through
 /// the `probe_*` functions to [`PrimaryNetworkHandle::record_sync_served`].
 #[derive(Clone, Copy, Debug)]
@@ -1379,6 +1716,14 @@ pub struct PrimaryNetworkHandle {
     /// [`Self::clear_sync_capability`], so it holds at most one mark per peer for each epoch
     /// probed within one node epoch.
     epoch_sync_failed: Arc<Mutex<HashSet<(BlsPublicKey, Epoch)>>>,
+    /// The (peer, epoch) pairs where the peer answered `Busy` to a probe for that epoch, with
+    /// when the answer came ([`BusyAnswer`], GHSA-2fh9-q846-r7vw). `order_probe_peers` sorts a
+    /// prompt answer after every fresh peer and before every failure-marked peer, and a late one
+    /// with the failure-marked peers. Neither is a failure mark: `probe_bound` and the
+    /// preference ignore this map. A serve at the target clears the pair and rotation clears the
+    /// map, so it holds at most one entry per peer for each epoch probed in one node epoch, like
+    /// `epoch_sync_failed`.
+    epoch_sync_busy: Arc<Mutex<HashMap<(BlsPublicKey, Epoch), BusyAnswer>>>,
     /// The probe-first preference ([`SyncPreference`]): the last peer that served a full pack, a
     /// partial pack or a verified consensus output at the target rate, behind a generation
     /// fence.
@@ -1402,11 +1747,23 @@ pub struct PrimaryNetworkHandle {
     /// Count of the probe walks started on this handle and its clones: the counter behind
     /// `exploration_walk` (#1787).
     probe_walks: Arc<AtomicU64>,
-    /// Whether this node's own link was found below the target rate in this node epoch (Gap 4
-    /// of #1787): one probe walk saw `LINK_BELOW_TARGET_CUTS` distinct peers cut at the target.
-    /// While set, `walk_with_floor_fallback` plans every peer at the floor and reads nothing at
-    /// the target. Reset at rotation by [`Self::clear_sync_capability`].
-    floor_only_this_epoch: Arc<AtomicBool>,
+    /// The speed of this node's own link ([`LinkSpeed`], Gap 4 of #1787): the last serve at the
+    /// target rate and the floor-only verdict.
+    ///
+    /// One probe walk that sees `LINK_BELOW_TARGET_CUTS` distinct staked peers cut at the target
+    /// sets the verdict for `FLOOR_ONLY_TTL`, unless a peer served at the target inside
+    /// `FLOOR_ONLY_EVIDENCE_WINDOW` (GHSA-h352-9822-hjqg). While it holds,
+    /// `walk_with_floor_fallback` plans every peer at the floor and reads nothing at the target.
+    /// A serve at the target ends it ([`Self::record_sync_served`]), and so does rotation
+    /// ([`Self::clear_sync_capability`]).
+    link_speed: Arc<Mutex<LinkSpeed>>,
+    /// The staked identities: the keys of the current and the next committee.
+    ///
+    /// `PrimaryNetwork::new` sets it at each epoch, from the same keys that give a requester the
+    /// committee tier (`ReservedPeers`). Only a target cut of a peer in this set counts toward
+    /// `LINK_BELOW_TARGET_CUTS`, so identities that are not staked cannot set the floor-only
+    /// verdict (GHSA-h352-9822-hjqg). It is empty until the first set, so no cut counts.
+    staked_peers: Arc<Mutex<HashSet<BlsPublicKey>>>,
     /// The tier that a responder's admission gives this node as a requester ([`PeerTier`]).
     ///
     /// `PrimaryNetwork::new` sets it at each epoch from this node's own BLS key and the current
@@ -1430,9 +1787,11 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            epoch_sync_busy: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1446,9 +1805,11 @@ impl PrimaryNetworkHandle {
             chain_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            epoch_sync_busy: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1460,9 +1821,11 @@ impl PrimaryNetworkHandle {
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashSet::new())),
+            epoch_sync_busy: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(SyncPreference::default())),
             probe_walks: Arc::new(AtomicU64::new(0)),
-            floor_only_this_epoch: Arc::new(AtomicBool::new(false)),
+            link_speed: Arc::new(Mutex::new(LinkSpeed::default())),
+            staked_peers: Arc::new(Mutex::new(HashSet::new())),
             requester_tier: Arc::new(Mutex::new(PeerTier::Committee)),
         }
     }
@@ -1478,8 +1841,26 @@ impl PrimaryNetworkHandle {
         *self.requester_tier.lock()
     }
 
-    /// Clear the per-peer epoch-pack sync-capability cache, the per-(peer, epoch) failure
-    /// marks, the probe-first preference and the floor-only flag.
+    /// Set the staked identities, the keys of the current and the next committee
+    /// (`staked_peers`). `PrimaryNetwork::new` calls it at each epoch.
+    pub(crate) fn set_staked_peers(&self, peers: HashSet<BlsPublicKey>) {
+        *self.staked_peers.lock() = peers;
+    }
+
+    /// Whether `peer` is a staked identity (`staked_peers`), so its target cut counts toward
+    /// `LINK_BELOW_TARGET_CUTS`.
+    fn is_staked(&self, peer: &BlsPublicKey) -> bool {
+        self.staked_peers.lock().contains(peer)
+    }
+
+    /// Whether the floor-only verdict holds now (`link_speed`), so the walks read every peer at
+    /// the floor.
+    fn floor_only(&self) -> bool {
+        self.link_speed.lock().floor_only(tokio::time::Instant::now())
+    }
+
+    /// Clear the per-peer epoch-pack sync-capability cache, the per-(peer, epoch) failure and
+    /// busy marks, the probe-first preference and the floor-only verdict.
     ///
     /// Called at each epoch boundary: committees rotate and binaries are upgraded there, so a
     /// peer that did not answer the sync protocol last epoch is re-probed for it this epoch.
@@ -1487,14 +1868,16 @@ impl PrimaryNetworkHandle {
     /// (`SyncPreference::displace`), so a serve in flight at the clear, whose walk read the old
     /// generation when it started, does not re-install its peer in the new epoch (#1787).
     /// Within the epoch the holder-last exploration order (`exploration_walk`) displaces a
-    /// holder that serves at exactly the target rate. The floor-only flag
-    /// (`floor_only_this_epoch`) is reset, so the new epoch's walks read fresh peers at the
-    /// target again until two distinct peers are cut at the target in one walk.
+    /// holder that serves at exactly the target rate. The floor-only verdict (`link_speed`) ends,
+    /// so the new epoch's walks read fresh peers at the target again until two distinct staked
+    /// peers are cut at the target in one walk. The last serve at the target is kept: it is
+    /// evidence about this node's link, not about the epoch.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
+        self.epoch_sync_busy.lock().clear();
         self.last_sync_server.lock().displace(None);
-        self.floor_only_this_epoch.store(false, Ordering::Relaxed);
+        self.link_speed.lock().floor_only_until = None;
     }
 
     /// Record that `peer` served a full pack, a partial pack or a verified consensus output for
@@ -1510,9 +1893,14 @@ impl PrimaryNetworkHandle {
     /// back. The preference lasts until another peer takes it, until `peer` fails a probe
     /// (`forget_sync_server`), or until rotation (`clear_sync_capability`), so a peer that
     /// served once and then stalls does not stay at the front of every later walk.
+    ///
+    /// The serve shows that this node's link carries the target, so it ends a floor-only verdict
+    /// and blocks a new one for `FLOOR_ONLY_EVIDENCE_WINDOW` ([`LinkSpeed`], GHSA-h352-9822-hjqg).
     pub(crate) fn record_sync_served(&self, peer: BlsPublicKey, epoch: Epoch, walk: ProbeWalk) {
         self.sync_capability.lock().insert(peer, true);
         self.epoch_sync_failed.lock().remove(&(peer, epoch));
+        self.epoch_sync_busy.lock().remove(&(peer, epoch));
+        self.link_speed.lock().note_target_serve(tokio::time::Instant::now());
         let mut preference = self.last_sync_server.lock();
         if walk.explore {
             preference.displace(Some(peer));
@@ -1542,6 +1930,24 @@ impl PrimaryNetworkHandle {
         self.sync_capability.lock().insert(peer, true);
         self.epoch_sync_failed.lock().insert((peer, epoch));
         self.forget_sync_server(peer);
+    }
+
+    /// Record that `peer` answered `Busy` to a probe for `epoch`, and when ([`BusyAnswer`],
+    /// GHSA-2fh9-q846-r7vw).
+    ///
+    /// A `Busy` is not a failure, so the peer keeps its capability, its preference and its rate
+    /// bound. It sorts after every fresh peer on the later walks of `epoch`
+    /// (`order_probe_peers`), and with the failure-marked peers when the answer was late. The
+    /// worse answer is kept: an attacker that alternates late and prompt answers would otherwise
+    /// regain the prompt rank on every other walk. A prompt `Busy` still costs a walk its open,
+    /// a request write that the peer can stall for up to `SYNC_REQUEST_WRITE_TIMEOUT`, and up to
+    /// `SYNC_BUSY_DENY_WINDOW`.
+    pub(crate) fn mark_sync_busy(&self, peer: BlsPublicKey, epoch: Epoch, answer: BusyAnswer) {
+        self.epoch_sync_busy
+            .lock()
+            .entry((peer, epoch))
+            .and_modify(|kept| *kept = (*kept).max(answer))
+            .or_insert(answer);
     }
 
     /// The rate bound a probe of `peer` for `epoch` reads at (#1787): the floor when `peer` is
@@ -1787,10 +2193,12 @@ impl PrimaryNetworkHandle {
     /// time, and returns the first VERIFIED output, otherwise `Err` (the caller retries).
     /// The open is lazy, so a successful open proves nothing: the first read carries the
     /// capability signal (`tn_network_libp2p::is_unsupported_protocol`), and a peer is cached
-    /// `true` once its first sync frame decodes. A peer that does not answer is NOT cached (an
-    /// ambiguous `Unsupported`; see `ConsensusOutputAttempt`). A
-    /// peer that streams a well-formed but wrong-hash output is penalized (Severe) and skipped,
-    /// so the probe falls through to the next peer instead of wedging the caller's retry loop.
+    /// `true` once its first sync frame decodes. A peer that rejects the protocol, or closes or
+    /// resets the stream, within `SYNC_BUSY_DENY_WINDOW` is NOT cached (an ambiguous
+    /// `Unsupported`; see `ConsensusOutputAttempt`); a later one, or one that sends no first
+    /// frame within `SYNC_ACK_TIMEOUT`, is marked for the epoch. A peer that streams a well-formed
+    /// but wrong-hash output is penalized (Severe) and skipped, so the probe falls through to
+    /// the next peer instead of wedging the caller's retry loop.
     pub async fn request_consensus_output(
         &self,
         number: u64,
@@ -1828,6 +2236,7 @@ impl PrimaryNetworkHandle {
         let peers = order_probe_peers(
             peers,
             &self.epoch_sync_failed.lock(),
+            &self.epoch_sync_busy.lock(),
             epoch,
             preferred,
             walk.explore,
@@ -1845,15 +2254,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Probe `peer` once for the consensus output `request` names, reading it at `bound`, and
-    /// classify the exchange for `walk_probes` (#1787).
-    ///
-    /// A serve records the peer by its measured speed for `request.epoch` on `walk`
-    /// (`record_sync_served` or `record_sync_served_slowly`) and is `Served`. A peer that does
-    /// not answer is NOT cached (an ambiguous `Unsupported`; see `ConsensusOutputAttempt`) and
-    /// is `Missed`. A busy peer (`Busy`) is `Missed` with no failure mark, so it keeps its
-    /// preference. A failed exchange marks the peer for the epoch (`mark_sync_failed`) and is
-    /// `CutAtTarget` when the reader cut the peer for falling below the target bound, else
-    /// `Missed`.
+    /// classify the exchange for `walk_probes` (#1787, `settle_consensus_output_probe`).
     async fn probe_consensus_output(
         &self,
         peer: BlsPublicKey,
@@ -1864,9 +2265,43 @@ impl PrimaryNetworkHandle {
         let ConsensusOutputSyncRequest { number, epoch, .. } = request;
         let meter = SyncServeMeter::default();
         let started = tokio::time::Instant::now();
-        match self.sync_consensus_output_from_peer(peer, request, bound, meter.clone()).await {
+        let attempt =
+            self.sync_consensus_output_from_peer(peer, request, bound, meter.clone()).await;
+        self.settle_consensus_output_probe(
+            peer,
+            (number, epoch),
+            walk,
+            attempt,
+            &meter,
+            started.elapsed(),
+        )
+    }
+
+    /// Classify one finished consensus-output exchange against `peer` for `walk_probes`, and
+    /// record what the exchange shows about the peer (`probe_consensus_output`).
+    ///
+    /// `target` holds the requested number and its epoch; `meter` and `elapsed` measure the
+    /// exchange. A serve records the peer by its measured speed for the epoch on `walk`
+    /// (`record_sync_served` or `record_sync_served_slowly`) and is `Served`. A peer that
+    /// rejected or closed the stream within `SYNC_BUSY_DENY_WINDOW` is NOT cached (an ambiguous
+    /// `Unsupported`; see `ConsensusOutputAttempt`) and is `Missed`. A `Busy` is `Missed` with
+    /// no failure mark, so the peer keeps its preference, but the peer is marked busy for the
+    /// epoch with when it answered (`mark_sync_busy`). A failed exchange, which includes a first
+    /// frame that never comes and a late rejection, close or reset (`late_no_answer`), marks
+    /// the peer for the epoch (`mark_sync_failed`) and is `CutAtTarget` when the reader cut the
+    /// peer for falling below the target bound, else `Missed`.
+    fn settle_consensus_output_probe(
+        &self,
+        peer: BlsPublicKey,
+        target: (u64, Epoch),
+        walk: ProbeWalk,
+        attempt: ConsensusOutputAttempt,
+        meter: &SyncServeMeter,
+        elapsed: Duration,
+    ) -> ProbeVerdict<ConsensusOutput> {
+        let (number, epoch) = target;
+        match attempt {
             ConsensusOutputAttempt::Fetched(output) => {
-                let elapsed = started.elapsed();
                 let speed = meter.speed(elapsed);
                 match speed {
                     SyncServeSpeed::Target => self.record_sync_served(peer, epoch, walk),
@@ -1897,13 +2332,17 @@ impl PrimaryNetworkHandle {
                 );
                 ProbeVerdict::Missed
             }
-            ConsensusOutputAttempt::Busy => {
+            ConsensusOutputAttempt::Busy(answer) => {
                 // the peer is serving this key or its hold budget is spent: retry later. No
-                // failure mark; the preference and the capability stay as they are.
+                // failure mark; the preference and the capability stay as they are, but later
+                // walks of this epoch probe it after every fresh peer, and a late answer with the
+                // failure-marked peers
+                self.mark_sync_busy(peer, epoch, answer);
                 debug!(
                     target: "primary::network",
                     %peer,
                     number,
+                    ?answer,
                     "sync server busy, retry later; skipping this probe"
                 );
                 ProbeVerdict::Missed
@@ -1930,14 +2369,16 @@ impl PrimaryNetworkHandle {
     }
 
     /// Walk `plan` one peer at a time, reading each peer at its planned bound, and stop at the
-    /// first peer that serves, so no peer past it is probed, or at the second distinct peer the
-    /// reader cuts at the target (`LINK_BELOW_TARGET_CUTS`), so no further peer is read at a
-    /// bound this node's own link cannot meet (#1787).
+    /// first peer that serves, so no peer past it is probed, or at the second distinct staked
+    /// peer (`is_staked`) the reader cuts at the target (`LINK_BELOW_TARGET_CUTS`), so no further
+    /// peer is read at a bound this node's own link cannot meet (#1787). A cut of a peer that is
+    /// not staked never counts (GHSA-h352-9822-hjqg).
     ///
     /// A peer cached unsyncable (`is_known_unsyncable`) is skipped. The check runs as the walk
     /// reaches the peer, so a peer that an earlier probe in the same walk cached unsyncable is
     /// skipped too. Returns the served value, the peers the reader cut at the target in probe
-    /// order, or, after the second cut, those peers plus the peers of the plan not yet probed.
+    /// order, or, after the second staked cut, those peers plus the peers of the plan not yet
+    /// probed.
     async fn walk_probes<T, F, Fut>(
         &self,
         plan: Vec<(BlsPublicKey, SyncRateBound)>,
@@ -1957,7 +2398,7 @@ impl PrimaryNetworkHandle {
                 })
             })
             // `Err` short-circuits the fold: a serve, so no peer past it is probed, or the
-            // second distinct peer cut at the target, so the rest of the plan is left for a
+            // second distinct staked peer cut at the target, so the rest of the plan is left for a
             // floor pass. `Ok` carries the peers cut at the target so far, in probe order.
             .try_fold(Vec::new(), |cut: Vec<BlsPublicKey>, (index, cut_peer)| {
                 let cut_at_target: Vec<BlsPublicKey> = cut
@@ -1965,7 +2406,10 @@ impl PrimaryNetworkHandle {
                     .filter(|earlier| Some(*earlier) != cut_peer)
                     .chain(cut_peer)
                     .collect();
-                futures::future::ready(if cut_at_target.len() < LINK_BELOW_TARGET_CUTS {
+                // only the cut of a staked peer counts toward the link verdict, so identities
+                // that cost nothing cannot stop the target pass (GHSA-h352-9822-hjqg)
+                let staked_cuts = cut_at_target.iter().filter(|peer| self.is_staked(peer)).count();
+                futures::future::ready(if staked_cuts < LINK_BELOW_TARGET_CUTS {
                     Ok(cut_at_target)
                 } else {
                     Err(WalkStop::LinkBelowTarget { cut_at_target, next: index + 1 })
@@ -1999,18 +2443,21 @@ impl PrimaryNetworkHandle {
     /// times the cut's hold. The cut peer keeps its (peer, `epoch`) mark, so a later walk reads it
     /// at the floor. One cut with no serve therefore ends the walk with `None`.
     ///
-    /// Two distinct peers cut at the target in one pass mean this node's own link, not the
-    /// peers, is below the target (Gap 4 of #1787): pass 1 stops at the second cut
-    /// (`LINK_BELOW_TARGET_CUTS`), the rest of this walk is read at the floor, and
-    /// `floor_only_this_epoch` is set, so every later walk of this node epoch plans every peer at
-    /// the floor and reads nothing at the target. A `Committee` requester reads the cut peers and
-    /// then the peers not yet probed; a `Public` requester reads only the peers not yet probed.
-    /// The flag is reset at rotation (`clear_sync_capability`). A slow requester therefore pays
-    /// about two target-cut probes, around one `SYNC_RATE_WINDOW` each, once per node epoch, and
-    /// then syncs at the floor as the parent always did. A floor read that completes at the
-    /// target speed takes the preference and one that does not is marked slow, as for any serve
-    /// (`probe_consensus_output`, `probe_epoch_pack`). Returns the first served value, or `None`
-    /// when no pass serves.
+    /// Two distinct staked peers cut at the target in one pass mean this node's own link, not
+    /// the peers, is below the target (Gap 4 of #1787): pass 1 stops at the second staked cut
+    /// (`LINK_BELOW_TARGET_CUTS`) and the rest of this walk is read at the floor. A cut of a peer
+    /// that is not staked never counts, so identities that cost nothing cannot stop the pass
+    /// (GHSA-h352-9822-hjqg). The stop sets the floor-only verdict for `FLOOR_ONLY_TTL`, unless
+    /// a peer served at the target inside `FLOOR_ONLY_EVIDENCE_WINDOW` (`LinkSpeed`). While the
+    /// verdict holds, every walk plans every peer at the floor and reads nothing at the target.
+    /// A `Committee` requester reads the peers not yet probed and then the cut peers, so the
+    /// peers that just cut it are read last; a `Public` requester reads only the peers not yet
+    /// probed. A serve at the target and rotation (`clear_sync_capability`) end the verdict. A
+    /// slow requester therefore pays about two target-cut probes, around one `SYNC_RATE_WINDOW`
+    /// each, once per `FLOOR_ONLY_TTL`, and syncs at the floor in between. A floor read that
+    /// completes at the target speed takes the preference and one that does not is marked slow,
+    /// as for any serve (`probe_consensus_output`, `probe_epoch_pack`). Returns the first served
+    /// value, or `None` when no pass serves.
     async fn walk_with_floor_fallback<T, F, Fut>(
         &self,
         peers: Vec<BlsPublicKey>,
@@ -2021,7 +2468,7 @@ impl PrimaryNetworkHandle {
         F: Fn(BlsPublicKey, SyncRateBound) -> Fut,
         Fut: Future<Output = ProbeVerdict<T>>,
     {
-        let floor_only = self.floor_only_this_epoch.load(Ordering::Relaxed);
+        let floor_only = self.floor_only();
         let requester_tier = self.requester_tier();
         let plan = peers
             .into_iter()
@@ -2057,17 +2504,23 @@ impl PrimaryNetworkHandle {
                 }
             },
             WalkOutcome::LinkBelowTarget { cut_at_target, unprobed } => {
-                self.floor_only_this_epoch.store(true, Ordering::Relaxed);
+                let verdict =
+                    self.link_speed.lock().conclude_below_target(tokio::time::Instant::now());
                 info!(
                     target: "primary::network",
                     epoch,
                     cut = cut_at_target.len(),
                     unprobed = unprobed.len(),
-                    "two peers cut at the target rate in one walk, so this node's link is below \
-                     the target; reading every peer at the floor for the rest of the epoch"
+                    floor_only = verdict,
+                    "two staked peers cut at the target rate in one walk, so this node's link is \
+                     below the target; reading the rest of the walk at the floor"
                 );
+                // the peers not yet probed come first, so the peers that just cut this walk
+                // cannot hold the front of its floor pass (GHSA-h352-9822-hjqg)
+                let fresh: Vec<BlsPublicKey> =
+                    unprobed.into_iter().filter(|peer| !cut_at_target.contains(peer)).collect();
                 let rest: Vec<BlsPublicKey> = match requester_tier {
-                    PeerTier::Committee => cut_at_target.into_iter().chain(unprobed).collect(),
+                    PeerTier::Committee => fresh.into_iter().chain(cut_at_target).collect(),
                     PeerTier::Public => {
                         debug!(
                             target: "primary::network",
@@ -2076,7 +2529,7 @@ impl PrimaryNetworkHandle {
                             "public requester skips the same-walk floor re-probe of the peers \
                              this walk cut; they keep their slow marks"
                         );
-                        unprobed.into_iter().filter(|peer| !cut_at_target.contains(peer)).collect()
+                        fresh
                     }
                 };
                 self.walk_floor_pass(rest, &probe).await
@@ -2119,14 +2572,16 @@ impl PrimaryNetworkHandle {
     /// opening frame, read the `Ack`, then stream-decode and header-hash-verify the output.
     ///
     /// `Err(ConsensusOutputAttempt::Unsupported)` means the peer did not answer the
-    /// protocol: it rejected `/tn-primary-sync`, or it never `Ack`ed (e.g. a peer that
-    /// speaks `/tn-primary-sync` but cannot decode the newer `ConsensusOutput` variant and
-    /// shut the stream). The open is lazy and proves nothing about the peer: a peer without
-    /// the protocol fails the first read with an error that
-    /// `tn_network_libp2p::is_unsupported_protocol` recognises (an open that fails with
-    /// `UpgradeFailed` means the same). `Err(ConsensusOutputAttempt::Busy)` means the peer is
-    /// serving this key or the key's hold budget is spent, so the caller retries later with
-    /// no failure mark. `Err(ConsensusOutputAttempt::Failed(_))` means a transient or
+    /// protocol: it rejected `/tn-primary-sync`, or it closed or reset the stream with no `Ack`
+    /// (e.g. a peer that speaks `/tn-primary-sync` but cannot decode the newer
+    /// `ConsensusOutput` variant and shut the stream), within `SYNC_BUSY_DENY_WINDOW` of the
+    /// request write; the same answer later is `Failed` (`late_no_answer`). The open is lazy and
+    /// proves nothing about the peer: a peer without the protocol fails the first read with an
+    /// error that `tn_network_libp2p::is_unsupported_protocol` recognises (an open that fails
+    /// with `UpgradeFailed` means the same). `Err(ConsensusOutputAttempt::Busy)` means the peer
+    /// is serving this key or the key's hold budget is spent, so the caller retries later with
+    /// no failure mark; it carries whether the answer came within `SYNC_BUSY_DENY_WINDOW`.
+    /// `Err(ConsensusOutputAttempt::Failed(_))` means a transient or
     /// exchange-level error (including a decode/verification failure, which is also
     /// penalized). A transport I/O error during the open (`UpgradeIo`) is transient rather
     /// than a protocol mismatch, so it maps to `Failed`. `Ok` is always a header-hash-verified
@@ -2147,14 +2602,30 @@ impl PrimaryNetworkHandle {
         // signal. An `UpgradeFailed` here still means the peer lacks the protocol ->
         // Unsupported; a transient upgrade I/O error or any other open error is not proof
         // the peer lacks sync -> try next.
-        let mut stream =
-            self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
-                () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
-                    ConsensusOutputAttempt::Unsupported
-                }
-                () => ConsensusOutputAttempt::Failed(e),
-            })?;
+        let stream = self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
+            () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
+                ConsensusOutputAttempt::Unsupported
+            }
+            () => ConsensusOutputAttempt::Failed(e),
+        })?;
+        self.consensus_output_exchange_on(stream, peer, request, bound, meter).await
+    }
 
+    /// The consensus-output exchange of [`Self::try_sync_consensus_output_exchange`] on an opened
+    /// `stream`: write the request, read and classify the first frame, then stream-decode and
+    /// verify the output. Generic over the stream so tests can drive it with a scripted
+    /// responder; production passes the libp2p stream.
+    async fn consensus_output_exchange_on<S>(
+        &self,
+        mut stream: S,
+        peer: BlsPublicKey,
+        request: ConsensusOutputSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
+    ) -> Result<ConsensusOutput, ConsensusOutputAttempt>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // write the request in the opening frame, bounded by `SYNC_REQUEST_WRITE_TIMEOUT`.
         // The lazy open sends the protocol proposal with this frame, so a peer without the
         // protocol fails the first read below, not this write. A write failure or a write
@@ -2168,13 +2639,23 @@ impl PrimaryNetworkHandle {
                 "failed to write consensus output sync request frame: {e}"
             )))
         })?;
+        // the prompt-`Busy` window (`SYNC_BUSY_DENY_WINDOW`) starts once the request is written
+        let waiting = tokio::time::Instant::now();
 
         // read the responder's first frame. This read carries the capability signal: a
         // peer without the protocol fails it with an error that `is_unsupported_protocol`
-        // recognises -> Unsupported (no penalty). A timeout (outer `Err`) means no `Ack` ->
-        // a peer that speaks sync but does not serve this variant, so try the next peer. A
-        // clean close on the read (inner `Err`) is the same Unsupported signal; any other
-        // read error is transient -> Failed. A decoded frame proves the peer speaks sync.
+        // recognises -> Unsupported (no penalty). A timeout (outer `Err`) means no first frame
+        // within `SYNC_ACK_TIMEOUT` -> Failed, so the peer is marked for the epoch and sorts
+        // last on later walks (GHSA-2fh9-q846-r7vw); it does not only lose the preference. A
+        // clean close or a reset on the read (inner `Err`) is the same Unsupported signal; any
+        // other read error is transient -> Failed. The rejection, the close and the reset count
+        // as a signal only within `SYNC_BUSY_DENY_WINDOW`: later they are Failed like silence
+        // (`late_no_answer`), or a peer could hold every probe for most of `SYNC_ACK_TIMEOUT`,
+        // then close, and stay unmarked. A decoded frame proves the peer speaks sync.
+        let unanswered = |e: &std::io::Error| {
+            late_no_answer(waiting.elapsed(), e)
+                .map_or(ConsensusOutputAttempt::Unsupported, ConsensusOutputAttempt::Failed)
+        };
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
@@ -2186,7 +2667,11 @@ impl PrimaryNetworkHandle {
             ),
         )
         .await
-        .map_err(|_elapsed| ConsensusOutputAttempt::Unsupported)?
+        .map_err(|_elapsed| {
+            ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(
+                "timed out reading consensus output sync ack frame".to_string(),
+            ))
+        })?
         .map_err(|e| match () {
             () if tn_network_libp2p::is_unsupported_protocol(&e) => {
                 debug!(
@@ -2195,7 +2680,7 @@ impl PrimaryNetworkHandle {
                     number = request.number,
                     "peer rejected the sync protocol on the first read"
                 );
-                ConsensusOutputAttempt::Unsupported
+                unanswered(&e)
             }
             () if matches!(
                 e.kind(),
@@ -2204,7 +2689,7 @@ impl PrimaryNetworkHandle {
                     | std::io::ErrorKind::BrokenPipe
             ) =>
             {
-                ConsensusOutputAttempt::Unsupported
+                unanswered(&e)
             }
             () => ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
                 "failed to read consensus output sync ack frame: {e}"
@@ -2246,8 +2731,12 @@ impl PrimaryNetworkHandle {
                     }
                 }
             }
-            // sync-capable, but serving this key or out of hold budget: retry later
-            SyncFrame::Deny(DenyReason::Busy) => Err(ConsensusOutputAttempt::Busy),
+            // sync-capable, but serving this key or out of hold budget: retry later. A late
+            // `Busy` ranks with the failure-marked peers, so a peer cannot answer `Busy` near the
+            // end of `SYNC_ACK_TIMEOUT` and keep the busy rank (`busy_answer`)
+            SyncFrame::Deny(DenyReason::Busy) => {
+                Err(ConsensusOutputAttempt::Busy(busy_answer(waiting.elapsed())))
+            }
             // sync-capable, but shedding load or lacking the output: try next peer
             SyncFrame::Deny(reason @ (DenyReason::AtCapacity | DenyReason::Unavailable)) => {
                 Err(ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
@@ -2442,6 +2931,7 @@ impl PrimaryNetworkHandle {
         let peers = order_probe_peers(
             peers,
             &self.epoch_sync_failed.lock(),
+            &self.epoch_sync_busy.lock(),
             epoch,
             preferred,
             walk.explore,
@@ -2463,10 +2953,11 @@ impl PrimaryNetworkHandle {
     ///
     /// An import records the peer by its measured speed for `sync.epoch` on `walk`
     /// (`record_sync_served` or `record_sync_served_slowly`) and is `Served`. A peer that does
-    /// not answer is cached unsyncable only for a full pack and is `Missed`. A busy peer
-    /// (`Busy`) is `Missed` with no failure mark, so it keeps its preference. A failed exchange
-    /// marks the peer for the epoch (`mark_sync_failed`) and is `CutAtTarget` when the reader
-    /// cut the peer for falling below the target bound, else `Missed`.
+    /// not answer is cached unsyncable only for a full pack and is `Missed`. A `Busy` is `Missed`
+    /// with no failure mark, so the peer keeps its preference, but the peer is marked busy for
+    /// the epoch with when it answered (`mark_sync_busy`). A failed exchange marks the peer for
+    /// the epoch (`mark_sync_failed`) and is `CutAtTarget` when the reader cut the peer for
+    /// falling below the target bound, else `Missed`.
     async fn probe_epoch_pack(
         &self,
         peer: BlsPublicKey,
@@ -2542,13 +3033,17 @@ impl PrimaryNetworkHandle {
                 );
                 ProbeVerdict::Missed
             }
-            EpochPackAttempt::Busy => {
+            EpochPackAttempt::Busy(answer) => {
                 // the peer is serving this key or its hold budget is spent: retry later. No
-                // failure mark; the preference and the capability stay as they are.
+                // failure mark; the preference and the capability stay as they are, but later
+                // walks of this epoch probe it after every fresh peer, and a late answer with the
+                // failure-marked peers
+                self.mark_sync_busy(peer, epoch, answer);
                 debug!(
                     target: "primary::network",
                     %peer,
                     epoch,
+                    ?answer,
                     "sync server busy, retry later; skipping this probe"
                 );
                 ProbeVerdict::Missed
@@ -2605,12 +3100,15 @@ impl PrimaryNetworkHandle {
     /// protocol fails the first read with an error that
     /// `tn_network_libp2p::is_unsupported_protocol` recognises (an open that fails with
     /// `UpgradeFailed` means the same). For a full pack the caller caches the peer unsyncable
-    /// and skips it on later probes this epoch. `Err(EpochPackAttempt::Busy)` means the peer
-    /// is serving this key or the key's hold budget is spent, so the caller retries later
-    /// with no failure mark. `Err(EpochPackAttempt::Failed(_))` means a transient or
-    /// exchange-level error, so the caller keeps the peer sync-capable and tries the next
-    /// peer. A transport I/O error during the open (`UpgradeIo`) is transient rather than a
-    /// protocol mismatch, so it maps to `Failed` instead of poisoning the capability cache.
+    /// and skips it on later probes this epoch. For a partial request only a rejection within
+    /// `SYNC_BUSY_DENY_WINDOW` is `Unsupported`; a later one is `Failed` (`late_no_answer`).
+    /// `Err(EpochPackAttempt::Busy)` means the peer is serving this key or the key's hold
+    /// budget is spent, so the caller retries later with no failure mark; it carries whether the
+    /// answer came within `SYNC_BUSY_DENY_WINDOW`. `Err(EpochPackAttempt::Failed(_))`
+    /// means a transient or exchange-level error, so the caller keeps the peer sync-capable and
+    /// tries the next peer. A transport I/O error during the open (`UpgradeIo`) is transient
+    /// rather than a protocol mismatch, so it maps to `Failed` instead of poisoning the
+    /// capability cache.
     ///
     /// `bound` is the rate the reader (`sync_codec::sync_pack_reader`) holds the peer to and
     /// `meter` counts the bytes it delivers, so the walk can judge the serve's rate.
@@ -2621,6 +3119,37 @@ impl PrimaryNetworkHandle {
         bound: SyncRateBound,
         meter: SyncServeMeter,
     ) -> Result<(), EpochPackAttempt> {
+        // open the sync stream, flattening the command-channel and stream-open
+        // results. The open is lazy: it returns before the peer confirms the protocol, so a
+        // successful open proves nothing about the peer and the first read below carries
+        // the capability signal. An `UpgradeFailed` here still means the peer lacks the
+        // protocol -> Unsupported (penalty-exempt, cached unsyncable this epoch). A
+        // transient upgrade I/O error or any other open error is not proof the peer lacks
+        // sync -> try next peer.
+        let stream = self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
+            () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
+                EpochPackAttempt::Unsupported
+            }
+            () => EpochPackAttempt::Failed(e),
+        })?;
+        self.epoch_pack_exchange_on(stream, peer, sync, bound, meter).await
+    }
+
+    /// The epoch-pack exchange of [`Self::try_sync_epoch_pack_exchange`] on an opened `stream`:
+    /// write the request, read and classify the first frame, then stream the pack into the
+    /// consensus chain. Generic over the stream so tests can drive it with a scripted
+    /// responder; production passes the libp2p stream.
+    async fn epoch_pack_exchange_on<S>(
+        &self,
+        mut stream: S,
+        peer: BlsPublicKey,
+        sync: EpochPackSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
+    ) -> Result<(), EpochPackAttempt>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let EpochPackSyncRequest {
             epoch,
             last_consensus_number,
@@ -2629,21 +3158,6 @@ impl PrimaryNetworkHandle {
             consensus_chain,
             record_timeout,
         } = sync;
-        // open the sync stream, flattening the command-channel and stream-open
-        // results. The open is lazy: it returns before the peer confirms the protocol, so a
-        // successful open proves nothing about the peer and the first read below carries
-        // the capability signal. An `UpgradeFailed` here still means the peer lacks the
-        // protocol -> Unsupported (penalty-exempt, cached unsyncable this epoch). A
-        // transient upgrade I/O error or any other open error is not proof the peer lacks
-        // sync -> try next peer.
-        let mut stream =
-            self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
-                () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
-                    EpochPackAttempt::Unsupported
-                }
-                () => EpochPackAttempt::Failed(e),
-            })?;
-
         // write the request in the opening frame, bounded by `SYNC_REQUEST_WRITE_TIMEOUT`.
         // The lazy open sends the protocol proposal with this frame, so a peer without the
         // protocol fails the first read below, not this write. A write failure or a write
@@ -2662,6 +3176,8 @@ impl PrimaryNetworkHandle {
                 "failed to write epoch pack sync request frame: {e}"
             )))
         })?;
+        // the prompt-`Busy` window (`SYNC_BUSY_DENY_WINDOW`) starts once the request is written
+        let waiting = tokio::time::Instant::now();
 
         // read the responder's first frame. This read carries the capability signal: a
         // peer without the protocol fails it with an error that `is_unsupported_protocol`
@@ -2670,8 +3186,12 @@ impl PrimaryNetworkHandle {
         // a transient exchange failure, not a capability signal, so it maps to `Failed`
         // (try the next peer, keep the peer sync-capable) rather than `Unsupported`, which
         // for a full pack would cache the peer unsyncable for the whole epoch with no
-        // fallback (#739 completed the sync-only cutover). A decoded frame proves the peer
-        // speaks sync.
+        // fallback (#739 completed the sync-only cutover). A rejection of a partial request
+        // that comes later than `SYNC_BUSY_DENY_WINDOW` is Failed too (`late_no_answer`): a
+        // partial `Unsupported` leaves no mark, so a peer could otherwise hold every partial probe
+        // for most of `SYNC_ACK_TIMEOUT` and stay unmarked. A full-pack rejection stays
+        // Unsupported at any time, because it caches the peer unsyncable and every walk skips it
+        // until rotation. A decoded frame proves the peer speaks sync.
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
@@ -2696,7 +3216,9 @@ impl PrimaryNetworkHandle {
                     epoch,
                     "peer rejected the sync protocol on the first read"
                 );
-                EpochPackAttempt::Unsupported
+                last_consensus_number
+                    .and_then(|_| late_no_answer(waiting.elapsed(), &e))
+                    .map_or(EpochPackAttempt::Unsupported, EpochPackAttempt::Failed)
             } else {
                 EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
                     "failed to read epoch pack sync ack frame: {e}"
@@ -2770,8 +3292,12 @@ impl PrimaryNetworkHandle {
                     }
                 }
             }
-            // sync-capable, but serving this key or out of hold budget: retry later
-            SyncFrame::Deny(DenyReason::Busy) => Err(EpochPackAttempt::Busy),
+            // sync-capable, but serving this key or out of hold budget: retry later. A late
+            // `Busy` ranks with the failure-marked peers, so a peer cannot answer `Busy` near the
+            // end of `SYNC_ACK_TIMEOUT` and keep the busy rank (`busy_answer`)
+            SyncFrame::Deny(DenyReason::Busy) => {
+                Err(EpochPackAttempt::Busy(busy_answer(waiting.elapsed())))
+            }
             // sync-capable, but shedding load or lacking the pack: try next peer
             SyncFrame::Deny(reason @ (DenyReason::AtCapacity | DenyReason::Unavailable)) => {
                 Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
@@ -2993,27 +3519,72 @@ where
 /// preference; once a probe to it fails it also sorts behind every fresh peer for the rest of
 /// the epoch. The holder-last exploration order means a holder cannot keep the front of every
 /// walk by being the only unmarked peer: an exploration walk reaches the marked peers before it.
+///
+/// A peer in `busy` for `epoch` answered `Busy` to an earlier probe for that epoch
+/// (GHSA-2fh9-q846-r7vw). After a prompt answer ([`BusyAnswer::Prompt`]) it ranks between the
+/// fresh and the failure-marked peers, so a peer that answers `Busy` on every retry is probed
+/// only after every fresh peer. After a late answer ([`BusyAnswer::Late`]) it ranks with the
+/// failure-marked peers, in their shuffled order: not ahead of them, because honest servers are
+/// often among them (every serve to a requester whose own link is below the target marks the
+/// server), and a late-`Busy` peer ahead of them would cost every such walk its full answer
+/// time. A mark in `failed` outranks a busy mark. So the groups are fresh (0), prompt busy (1),
+/// and failed or late busy (2).
 fn order_probe_peers(
     mut peers: Vec<BlsPublicKey>,
     failed: &HashSet<(BlsPublicKey, Epoch)>,
+    busy: &HashMap<(BlsPublicKey, Epoch), BusyAnswer>,
     epoch: Epoch,
     preferred: Option<BlsPublicKey>,
     explore: bool,
     rng: &mut impl Rng,
 ) -> Vec<BlsPublicKey> {
     peers.shuffle(rng);
-    // `sort_by_key` is stable and `false < true`. On an ordinary walk the groups come out as
-    // fresh preferred, fresh, marked preferred, marked; on an exploration walk as fresh, marked,
-    // preferred, each keeping its shuffled order.
+    // `sort_by_key` is stable. The rank is 0 for a fresh peer, 1 for a peer that answered a
+    // prompt `Busy` and 2 for a failure-marked peer or one that answered `Busy` late. On an
+    // ordinary walk the groups come out as fresh preferred, fresh, busy preferred, busy, marked
+    // preferred, marked; on an exploration walk as fresh, busy, marked, preferred, each keeping
+    // its shuffled order.
     peers.sort_by_key(|p| {
-        let (marked, held) = (failed.contains(&(*p, epoch)), Some(*p) == preferred);
+        let pair = (*p, epoch);
+        let rank: u8 = match busy.get(&pair) {
+            _ if failed.contains(&pair) => 2,
+            Some(BusyAnswer::Late) => 2,
+            Some(BusyAnswer::Prompt) => 1,
+            None => 0,
+        };
+        let held = u8::from(Some(*p) == preferred);
         if explore {
-            (held, marked)
+            (held, rank)
         } else {
-            (marked, !held)
+            (rank, 1 - held)
         }
     });
     peers
+}
+
+/// Classify a [`DenyReason::Busy`] first frame that arrived `waited` after the requester wrote
+/// its request (GHSA-2fh9-q846-r7vw): prompt within `SYNC_BUSY_DENY_WINDOW`, late after it.
+fn busy_answer(waited: Duration) -> BusyAnswer {
+    if waited > SYNC_BUSY_DENY_WINDOW {
+        BusyAnswer::Late
+    } else {
+        BusyAnswer::Prompt
+    }
+}
+
+/// Classify a protocol rejection, a clean close or a reset `e` on the first read of a sync
+/// exchange that came `waited` after the requester wrote its request (GHSA-2fh9-q846-r7vw).
+/// `None` within `SYNC_BUSY_DENY_WINDOW`: the caller keeps it as the capability signal it is
+/// for an honest peer, which rejects at once or closes as soon as it fails to decode the
+/// request. Past the window: the error that makes the probe `Failed`, so the peer is marked for
+/// the epoch like a peer that sends no first frame.
+fn late_no_answer(waited: Duration, e: &std::io::Error) -> Option<NetworkError> {
+    (waited > SYNC_BUSY_DENY_WINDOW).then(|| {
+        NetworkError::RPCRetryable(format!(
+            "peer closed or rejected the sync stream after {waited:?}, past the \
+             {SYNC_BUSY_DENY_WINDOW:?} window: {e}"
+        ))
+    })
 }
 
 /// Handle inter-node communication between primaries.
@@ -3043,6 +3614,9 @@ pub struct PrimaryNetwork<DB, Events> {
     /// is held only while its request is served.
     /// Built once per node ([`PrimarySyncLedgers`]), so its books survive epoch changes.
     sync_serve: SyncServePools,
+    /// Per-peer cap on gossip in signature verification, at [`MAX_PENDING_GOSSIP_PER_PEER`]
+    /// (#1772). A slot is held from admission until the handler's verdict.
+    gossip_slots: GossipSlots,
     /// BLS keys of the current and the next committee, captured when the network is built for
     /// the epoch. A peer in this set may take the committee reserve of every sync budget.
     reserved_peers: ReservedPeers,
@@ -3092,11 +3666,15 @@ where
         // the current and the next committee may take the reserve of every sync budget
         let committee_keys = consensus_config.committee().bls_keys();
         let next_keys = consensus_config.next_committee_keys().iter().copied();
-        let reserved_peers = ReservedPeers::new(committee_keys.into_iter().chain(next_keys));
+        let staked: HashSet<BlsPublicKey> = committee_keys.into_iter().chain(next_keys).collect();
+        let reserved_peers = ReservedPeers::new(staked.iter().copied());
         // this node's tier at a responder follows the same rule, so the probe walks know
         // whether a same-walk floor re-probe of a peer cut at the target can be admitted
         let own_key = consensus_config.key_config().primary_public_key();
         network_handle.set_requester_tier(reserved_peers.tier(&own_key));
+        // only a target cut of a staked peer counts toward the floor-only verdict
+        // (GHSA-h352-9822-hjqg)
+        network_handle.set_staked_peers(staked);
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
@@ -3113,6 +3691,7 @@ where
             consensus_chain,
             sync_admission,
             sync_serve,
+            gossip_slots: GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER),
             reserved_peers,
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
@@ -3164,7 +3743,7 @@ where
                 }
             },
             NetworkEvent::Gossip(gossip) => {
-                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
+                self.process_gossip(*gossip);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -3305,38 +3884,83 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(
-        &self,
-        msg: GossipMessage,
-        relayer: Option<BlsPublicKey>,
-        author: Option<BlsPublicKey>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let relayer_label =
-            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
-        let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
-        // spawn task to process gossip
-        self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg).await {
-                warn!(target: "primary::network", ?e, "process_gossip");
-                // Charge the accountable peer, and only once its BLS identity has resolved. A
-                // content-determined fault (malformed payload / mis-topic) is the message
-                // author's: the network layer forwarded it after a shallow check, so an honest
-                // relayer could not have screened it, and banning the relayer lets a Byzantine
-                // author partition the mesh (issues #801/#819). Every other fault is the relaying
-                // peer's, as before. `zip` skips the penalty when that peer is unresolved or the
-                // error carries no penalty.
-                let charged = if e.is_author_content_fault() { author } else { relayer };
-                if let Some((peer, penalty)) = charged.zip((&e).into()) {
-                    network_handle.report_penalty(peer, penalty).await;
-                }
-                Err(e.into())
-            } else {
-                Ok(())
-            }
-        });
+    ///
+    /// Each message first takes a verification slot keyed by its author, else its relayer, else
+    /// one shared bucket for gossip with neither identity resolved, at
+    /// [`MAX_PENDING_GOSSIP_PER_PEER`] per key (#1772). With no free slot the message is not
+    /// processed: its ticket drops and reports `Ignore`, and no peer is charged. The slot is held
+    /// only through decode, the committee lookup and the signature check, and the handler frees it
+    /// at the verdict. Downstream work on verified gossip is not bounded here. That is safe because
+    /// only signed messages from committee members, and certificates signed by a quorum of the
+    /// committee, reach it.
+    ///
+    /// A fault of the strike class on a frame that the author delivered itself also strikes the
+    /// author in [`GossipSlots`] (see [`gossip_author_to_strike`]): that author's
+    /// gossip is ignored for [`GOSSIP_AUTHOR_COOLDOWN_BASE`], doubling per strike up to
+    /// [`GOSSIP_AUTHOR_COOLDOWN_MAX`], because the peer manager exempts committee keys from
+    /// penalties and the cooldown is the cost the author pays.
+    fn process_gossip(&self, gossip: GossipPayload<Req, Res>) {
+        let GossipPayload { message: msg, relayer, author, validation } = gossip;
+        self.gossip_slots.admit(validation, author, relayer).map_or_else(
+            || {
+                debug!(
+                    target: "primary::network",
+                    ?author,
+                    ?relayer,
+                    "gossip verification slots exhausted, ignoring"
+                );
+            },
+            |mut pending| {
+                // clone for spawned tasks
+                let request_handler = self.request_handler.clone();
+                let network_handle = self.network_handle.clone();
+                let gossip_slots = self.gossip_slots.clone();
+                let relayer_label = relayer
+                    .as_ref()
+                    .map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+                let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
+                // spawn task to process gossip
+                self.task_spawner.spawn_task(task_name, async move {
+                    if let Err(e) = request_handler.process_gossip_with(&msg, &mut pending).await {
+                        warn!(target: "primary::network", ?e, "process_gossip");
+                        // Read before the settle, which consumes the ticket.
+                        let was_pending = pending.is_pending();
+                        // Report Reject for an author content fault while the ticket is pending.
+                        // Any other error drops the ticket, which reports Ignore (#1772).
+                        pending.settle_error(&e).await;
+                        // The peer manager exempts committee keys from every penalty, so a fault
+                        // of the strike class on the author's own delivery also cools down the
+                        // author's gossip here. A relayed frame strikes no one (GHSA-vw36).
+                        gossip_author_to_strike(&e, was_pending, author, relayer)
+                            .into_iter()
+                            .for_each(|struck| {
+                                gossip_slots.strike(struck);
+                                debug!(
+                                    target: "primary::network",
+                                    author = %struck,
+                                    "author content fault on the author's own delivery, cooling down the author's gossip"
+                                );
+                            });
+                        // Charge the accountable peer, and only once its BLS identity has resolved.
+                        // A content-determined fault (malformed payload /
+                        // mis-topic) is the message author's: the network
+                        // layer forwarded it after a shallow check, so an honest
+                        // relayer could not have screened it, and banning the relayer lets a
+                        // Byzantine author partition the mesh (issues
+                        // #801/#819). Every other fault is the relaying
+                        // peer's, as before. `zip` skips the penalty when that peer is unresolved
+                        // or the error carries no penalty.
+                        let charged = if e.is_author_content_fault() { author } else { relayer };
+                        if let Some((peer, penalty)) = charged.zip(Option::<Penalty>::from(&e)) {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                        Err(e.into())
+                    } else {
+                        Ok(())
+                    }
+                });
+            },
+        );
     }
 
     /// Process an inbound sync stream.
@@ -3553,16 +4177,18 @@ mod clip_peer_error_tests {
 #[cfg(test)]
 mod sync_admission_tests {
     use super::{
-        admit_and_serve_sync_stream, opening_read_bound, try_admit_opening, write_frame,
-        DenyReason, OpeningAdmission, PrimaryNetworkError, PrimaryNetworkHandle, Req, Res,
-        ServeGrant, ServeHoldLimit, ServeRefusal, SyncClass, SyncFrame, SyncOpening,
-        SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
-        COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
-        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
+        admit_and_serve_sync_stream, gossip_author_to_strike, opening_read_bound,
+        try_admit_opening, write_frame, DenyReason, GossipSlots, OpeningAdmission,
+        PrimaryNetworkError, PrimaryNetworkHandle, Req, Res, ServeGrant, ServeHoldLimit,
+        ServeRefusal, SyncClass, SyncFrame, SyncOpening, SyncServeOutcome, SyncServePools,
+        COMMITTEE_RESERVED_OPENING_READS, COMMITTEE_RESERVED_SYNC_STREAMS,
+        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONCURRENT_OPENING_READS, MAX_PENDING_GOSSIP_PER_PEER,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
         PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, PUBLIC_OPENING_HOLD_BUDGET, PUBLIC_OPENING_HOLD_WINDOW,
         PUBLIC_SYNC_REQUEST_READ_TIMEOUT, PUBLIC_SYNC_SERVES_PER_PEER,
         PUBLIC_SYNC_SERVE_HOLD_WINDOW, PUBLIC_SYNC_SERVE_TIMEOUT, SYNC_REQUEST_READ_TIMEOUT,
     };
+    use crate::error::CertManagerError;
     use futures::{io::Cursor, AsyncRead, AsyncWrite, StreamExt as _};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
@@ -3574,13 +4200,15 @@ mod sync_admission_tests {
             Arc,
         },
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tn_network_libp2p::{
         types::NetworkCommand, PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers,
         ReservedPool,
     };
-    use tn_types::{BlsKeypair, BlsPublicKey};
+    use tn_types::{
+        error::CertificateError, BlsKeypair, BlsPublicKey, ConsensusHeaderDigest, HeaderDigest,
+    };
     use tokio::{sync::mpsc, task::JoinHandle};
 
     /// Every serve class.
@@ -4019,6 +4647,61 @@ mod sync_admission_tests {
         assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
+    /// A struck author gets no gossip slot during its cooldown, the hold doubles per strike, and
+    /// it stops at the cap. Other authors are not affected (#1772).
+    #[test]
+    fn gossip_author_cooldown_ignores_struck_author() {
+        let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        slots.strike_at(key(1), t0);
+        assert!(slots.take_at(Some(key(1)), None, t0).is_none());
+        // a resolved relayer does not give a struck author a slot
+        assert!(slots.take_at(Some(key(1)), Some(key(2)), t0).is_none());
+        assert!(slots.take_at(Some(key(2)), None, t0).is_some());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(9)).is_none());
+        // the first hold is over
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(10)).is_some());
+        // the second strike holds for 20 s
+        slots.strike_at(key(1), t0 + s(10));
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(29)).is_none());
+        assert!(slots.take_at(Some(key(1)), None, t0 + s(30)).is_some());
+        // more strikes stop at the cap
+        (0..5).for_each(|_| slots.strike_at(key(1), t0 + s(30)));
+        assert_eq!(slots.cooldown_until(&key(1)), Some(t0 + s(30) + s(160)));
+    }
+
+    /// Only the author's own delivery of a pending frame strikes the author, and only for a fault
+    /// of the strike class. A relayed frame, an unresolved relayer and a settled ticket strike no
+    /// one (#1772, GHSA-vw36).
+    #[test]
+    fn gossip_author_strike_needs_own_pending_delivery() {
+        let (author, relayer) = (key(40), key(41));
+        let strike = |e: &PrimaryNetworkError, was_pending: bool, from: Option<BlsPublicKey>| {
+            gossip_author_to_strike(e, was_pending, Some(author), from)
+        };
+        let forged = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::InvalidSignature,
+        ));
+        // own delivery
+        assert_eq!(strike(&forged, true, Some(author)), Some(author));
+        // relayed
+        assert_eq!(strike(&forged, true, Some(relayer)), None);
+        // unresolved relayer
+        assert_eq!(strike(&forged, true, None), None);
+        // already settled
+        assert_eq!(strike(&forged, false, Some(author)), None);
+        // a consensus result with a bad signature strikes, though its penalty is mild
+        let forged_result =
+            PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default());
+        assert_eq!(strike(&forged_result, true, Some(author)), Some(author));
+        // a mild certificate fault does not strike
+        let too_old = PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::TooOld(HeaderDigest::default(), 1, 2),
+        ));
+        assert_eq!(strike(&too_old, true, Some(author)), None);
+    }
+
     /// Silent streams hold only the opening-read budget, and only until the opening read for
     /// their tier times out (one second for a public peer, five for the committee peer). The
     /// serve pools stay whole, each stream frees its opening permit and its peer slot at its own
@@ -4414,6 +5097,55 @@ mod sync_admission_tests {
         assert!(next.is_some());
         next.into_iter().for_each(ServeGrant::release);
         assert!(commands.try_recv().is_err());
+    }
+
+    /// A late opening that is refused gets its `Deny` before its charge (GHSA-2fh9-q846-r7vw).
+    /// With the swarm command channel full, the `Deny(Busy)` is already on the wire while the
+    /// charge waits for room, and the charge follows once there is room. A requester ranks a
+    /// `Busy` that reaches it late behind the peers that answered in time, so the charge must not
+    /// hold the answer back.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_late_opening_is_denied_before_it_is_charged() {
+        let (committee, public, filler) = (key(16), key(160), key(161));
+        let (responder, mut commands) = Responder::new(committee);
+        let pools = &responder.pools;
+        // the key holds its one serve slot, so its next request is refused at the per-key cap
+        let first = admitted_grant(serve_step(pools, &public, PeerTier::Public, epoch_pack()));
+        assert!(first.is_some());
+        // fill the command channel, so a charge has to wait for room
+        let mut filled = 0;
+        while tokio::time::timeout(
+            Duration::ZERO,
+            responder.handle.report_penalty(filler, Penalty::Mild),
+        )
+        .await
+        .is_ok()
+        {
+            filled += 1;
+        }
+        assert!(filled > 0);
+        // the request arrives in the second half of the public opening window, so it is charged
+        let late = PUBLIC_SYNC_REQUEST_READ_TIMEOUT / 2 + Duration::from_millis(100);
+        let wire = encoded(SyncFrame::Req(missing_certificates())).await;
+        let stream = DelayedStream::new(late, wire);
+        let written = stream.written();
+        let task = responder.open_stream(public, stream, completed_serve(responder.served.clone()));
+        settle().await;
+        tokio::time::advance(late).await;
+        settle().await;
+        let answer = written.lock().map(|bytes| bytes.clone()).unwrap_or_default();
+        assert_eq!(answer, encoded(SyncFrame::Deny(DenyReason::Busy)).await);
+        assert!(task.as_ref().is_some_and(|task| !task.is_finished()), "the charge must wait");
+        // once the channel has room, the charge goes out and the task ends
+        let fillers = std::iter::from_fn(|| commands.try_recv().ok()).take(filled);
+        assert_eq!(fillers.map(mild_penalty_peer).collect::<Vec<_>>(), vec![Some(filler); filled]);
+        settle().await;
+        let charged: Vec<_> =
+            std::iter::from_fn(|| commands.try_recv().ok()).map(mild_penalty_peer).collect();
+        assert_eq!(charged, vec![Some(public)]);
+        assert!(task.is_some_and(|task| task.is_finished()));
+        assert!(!responder.served.load(Ordering::SeqCst));
+        first.into_iter().for_each(ServeGrant::release);
     }
 
     /// A full serve pool answers `Deny(AtCapacity)`, while the per-key serve cap and the hold
@@ -4949,13 +5681,351 @@ mod sync_request_write_tests {
 #[cfg(test)]
 mod sync_busy_deny_tests {
     use super::{
-        EpochPackAttempt, NetworkError, PrimaryNetworkHandle, ProbeVerdict, ProbeWalk,
-        SyncServeMeter,
+        busy_answer, order_probe_peers, write_frame, BusyAnswer, ConsensusOutputAttempt,
+        ConsensusOutputSyncRequest, DenyReason, EpochPackAttempt, EpochPackSyncRequest, HashMap,
+        HashSet, NetworkError, PrimaryNetworkHandle, PrimarySyncRequest, ProbeVerdict, ProbeWalk,
+        SyncFrame, SyncRateBound, SyncServeMeter, MAX_SYNC_REQUEST_FRAME_SIZE, SYNC_ACK_TIMEOUT,
+        SYNC_BUSY_DENY_WINDOW,
     };
+    use futures::{io::Cursor, AsyncRead, AsyncWrite};
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::time::Duration;
-    use tn_types::{BlsKeypair, BlsPublicKey};
+    use std::{
+        future::Future as _,
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tn_network_libp2p::unsupported_protocol_error;
+    use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+    use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::{BlsKeypair, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochRecord};
     use tokio::sync::mpsc;
+
+    /// The epoch the scripted exchanges fetch.
+    const EPOCH: Epoch = 3;
+
+    /// A first-frame answer that counts as prompt.
+    const PROMPT: Duration = Duration::from_millis(10);
+
+    /// What a scripted responder does once its delay has passed.
+    enum Answer {
+        /// Send these bytes, then end the stream.
+        Bytes(Vec<u8>),
+        /// End the stream (a clean close).
+        Close,
+        /// Fail the read with this error.
+        Fail(io::Error),
+        /// Never answer.
+        Silent,
+    }
+
+    /// A responder as the requester sees it: writes, flushes and the close succeed at once, and
+    /// a read waits until `delay` after the stream was made, then gives the scripted answer.
+    struct ScriptedResponder {
+        /// The wait before the answer.
+        delay: Pin<Box<tokio::time::Sleep>>,
+        /// The answer, taken by the first read after the delay.
+        answer: Option<Answer>,
+        /// The bytes still to read.
+        wire: Cursor<Vec<u8>>,
+    }
+
+    impl ScriptedResponder {
+        /// A responder that gives `answer` once `delay` has passed.
+        fn new(answer: Answer, delay: Duration) -> Self {
+            Self {
+                delay: Box::pin(tokio::time::sleep(delay)),
+                answer: Some(answer),
+                wire: Cursor::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AsyncRead for ScriptedResponder {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            std::task::ready!(this.delay.as_mut().poll(cx));
+            match this.answer.take() {
+                Some(Answer::Bytes(bytes)) => this.wire = Cursor::new(bytes),
+                Some(Answer::Fail(e)) => return Poll::Ready(Err(e)),
+                Some(Answer::Silent) => {
+                    this.answer = Some(Answer::Silent);
+                    return Poll::Pending;
+                }
+                Some(Answer::Close) | None => {}
+            }
+            Pin::new(&mut this.wire).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ScriptedResponder {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A consensus chain for `EPOCH`'s committee in `dir`; the scripted exchanges never reach
+    /// it, but the requests carry it.
+    async fn chain(dir: &TempDir) -> ConsensusChain {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let built = ConsensusChain::new_for_test(dir.path().to_owned(), fixture.committee()).await;
+        built.expect("a test consensus chain")
+    }
+
+    /// The wire bytes of a `Deny(Busy)` first frame.
+    async fn encoded_busy() -> Vec<u8> {
+        let (mut wire, mut encode_buffer, mut compressed_buffer) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let frame = SyncFrame::<PrimarySyncRequest>::Deny(DenyReason::Busy);
+        let written = write_frame(
+            &mut wire,
+            &frame,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            MAX_SYNC_REQUEST_FRAME_SIZE,
+        )
+        .await;
+        assert!(written.is_ok());
+        wire
+    }
+
+    /// The name of a consensus-output attempt, for assertions.
+    fn output_kind(attempt: &ConsensusOutputAttempt) -> &'static str {
+        match attempt {
+            ConsensusOutputAttempt::Fetched(_) => "fetched",
+            ConsensusOutputAttempt::Unsupported => "unsupported",
+            ConsensusOutputAttempt::Busy(_) => "busy",
+            ConsensusOutputAttempt::Failed(_) => "failed",
+        }
+    }
+
+    /// The name of an epoch-pack attempt, for assertions.
+    fn pack_kind(attempt: &EpochPackAttempt) -> &'static str {
+        match attempt {
+            EpochPackAttempt::Imported => "imported",
+            EpochPackAttempt::Unsupported => "unsupported",
+            EpochPackAttempt::Busy(_) => "busy",
+            EpochPackAttempt::Failed(_) => "failed",
+        }
+    }
+
+    /// A handle on which `peer` is the preferred sync server.
+    fn handle_preferring(peer: BlsPublicKey) -> PrimaryNetworkHandle {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = PrimaryNetworkHandle::new_for_test(sender);
+        handle.record_sync_served(peer, EPOCH, walk(&handle));
+        handle
+    }
+
+    /// Run the consensus-output exchange for `EPOCH` against a responder that gives `answer`
+    /// `after` the request write, settle it on `handle` for `peer`, and return the attempt's
+    /// name.
+    async fn probe_output(
+        handle: &PrimaryNetworkHandle,
+        peer: BlsPublicKey,
+        answer: Answer,
+        after: Duration,
+    ) -> &'static str {
+        let dir = TempDir::new().expect("a temp dir");
+        let consensus_chain = chain(&dir).await;
+        let request = ConsensusOutputSyncRequest {
+            number: 1,
+            epoch: EPOCH,
+            expected_hash: ConsensusHeaderDigest::default(),
+            consensus_chain: &consensus_chain,
+        };
+        let meter = SyncServeMeter::default();
+        let stream = ScriptedResponder::new(answer, after);
+        let attempt = handle
+            .consensus_output_exchange_on(
+                stream,
+                peer,
+                request,
+                SyncRateBound::Target,
+                meter.clone(),
+            )
+            .await
+            .map_or_else(|attempt| attempt, ConsensusOutputAttempt::Fetched);
+        let kind = output_kind(&attempt);
+        let verdict = handle.settle_consensus_output_probe(
+            peer,
+            (1, EPOCH),
+            walk(handle),
+            attempt,
+            &meter,
+            after,
+        );
+        assert!(matches!(verdict, ProbeVerdict::Missed));
+        kind
+    }
+
+    /// Run the epoch-pack exchange for `EPOCH`, partial when `partial`, against a responder that
+    /// gives `answer` `after` the request write, settle it on `handle` for `peer`, and return
+    /// the attempt's name.
+    async fn probe_pack(
+        handle: &PrimaryNetworkHandle,
+        peer: BlsPublicKey,
+        partial: bool,
+        answer: Answer,
+        after: Duration,
+    ) -> &'static str {
+        let dir = TempDir::new().expect("a temp dir");
+        let consensus_chain = chain(&dir).await;
+        let record = EpochRecord::default();
+        let last_consensus_number = partial.then_some(5);
+        let sync = EpochPackSyncRequest {
+            epoch: EPOCH,
+            last_consensus_number,
+            epoch_record: &record,
+            previous_epoch: &record,
+            consensus_chain: &consensus_chain,
+            record_timeout: SYNC_ACK_TIMEOUT,
+        };
+        let meter = SyncServeMeter::default();
+        let stream = ScriptedResponder::new(answer, after);
+        let attempt = handle
+            .epoch_pack_exchange_on(stream, peer, sync, SyncRateBound::Target, meter.clone())
+            .await
+            .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported);
+        let kind = pack_kind(&attempt);
+        let target = (EPOCH, last_consensus_number);
+        let verdict =
+            handle.settle_epoch_pack_probe(peer, target, walk(handle), attempt, &meter, after);
+        assert!(matches!(verdict, ProbeVerdict::Missed));
+        kind
+    }
+
+    /// Order `peer` for the next ordinary walk of `EPOCH` on `handle` between a fresh peer and a
+    /// failure-marked peer, with no preference, shuffled from `seed`.
+    fn next_walk(
+        handle: &PrimaryNetworkHandle,
+        peer: BlsPublicKey,
+        seed: u64,
+    ) -> Vec<BlsPublicKey> {
+        let (fresh, marked) = (key(90), key(91));
+        let mut failed = handle.epoch_sync_failed.lock().clone();
+        failed.insert((marked, EPOCH));
+        order_probe_peers(
+            vec![marked, peer, fresh],
+            &failed,
+            &handle.epoch_sync_busy.lock(),
+            EPOCH,
+            None,
+            false,
+            &mut StdRng::seed_from_u64(seed),
+        )
+    }
+
+    /// True when `peer` ranks with the failure-marked peers on the next walk of `EPOCH`: behind
+    /// the fresh peer on every shuffle, and behind the marked peer on some.
+    fn ranks_last(handle: &PrimaryNetworkHandle, peer: BlsPublicKey) -> bool {
+        let walks: Vec<_> = (0..32).map(|seed| next_walk(handle, peer, seed)).collect();
+        walks.iter().all(|order| order.first() == Some(&key(90)))
+            && walks.iter().any(|order| order.last() == Some(&peer))
+    }
+
+    /// True when `peer` ranks ahead of the failure-marked peers on the next walk of `EPOCH`,
+    /// on every shuffle.
+    fn ranks_ahead(handle: &PrimaryNetworkHandle, peer: BlsPublicKey) -> bool {
+        (0..32).all(|seed| next_walk(handle, peer, seed).last() == Some(&key(91)))
+    }
+
+    /// The consensus-output exchange keeps a prompt rejection, close or reset as the
+    /// capability signal it is for an honest peer: `Unsupported`, no mark, nothing cached, only
+    /// the preference is lost. The same answer after `SYNC_BUSY_DENY_WINDOW` is a failed probe
+    /// that marks the peer for the epoch, so a peer cannot hold every probe for most of
+    /// `SYNC_ACK_TIMEOUT` and then close to stay among the fresh peers (GHSA-2fh9-q846-r7vw).
+    #[tokio::test(start_paused = true)]
+    async fn consensus_output_late_close_reset_or_rejection_is_a_failed_probe() {
+        let late = SYNC_BUSY_DENY_WINDOW + Duration::from_millis(1);
+        let answers: [fn() -> Answer; 3] = [
+            || Answer::Close,
+            || Answer::Fail(io::Error::from(io::ErrorKind::ConnectionReset)),
+            || Answer::Fail(unsupported_protocol_error()),
+        ];
+        for (index, answer) in answers.into_iter().enumerate() {
+            let peer = key(index as u64 + 1);
+            let handle = handle_preferring(peer);
+            assert_eq!(probe_output(&handle, peer, answer(), PROMPT).await, "unsupported");
+            assert!(!handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+            assert_eq!(handle.last_sync_server.lock().peer, None);
+            assert!(ranks_ahead(&handle, peer), "a prompt answer {index} must leave no mark");
+
+            let handle = handle_preferring(peer);
+            assert_eq!(probe_output(&handle, peer, answer(), late).await, "failed");
+            assert!(handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+            assert_eq!(handle.last_sync_server.lock().peer, None);
+            assert!(ranks_last(&handle, peer), "a late answer {index} must mark the peer");
+        }
+    }
+
+    /// A consensus-output responder that sends nothing until `SYNC_ACK_TIMEOUT` is a failed
+    /// probe, and the peer ranks with the failure-marked peers on the next walk.
+    #[tokio::test(start_paused = true)]
+    async fn consensus_output_silence_is_a_failed_probe() {
+        let peer = key(4);
+        let handle = handle_preferring(peer);
+        assert_eq!(probe_output(&handle, peer, Answer::Silent, SYNC_ACK_TIMEOUT).await, "failed");
+        assert!(handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+        assert!(ranks_last(&handle, peer));
+    }
+
+    /// On the epoch-pack exchange only a rejection is `Unsupported`. A full-pack rejection
+    /// stays `Unsupported` at any time and caches the peer unsyncable, so every walk skips it
+    /// until rotation. A rejection of a partial request caches nothing, so it is `Unsupported`
+    /// only within `SYNC_BUSY_DENY_WINDOW` and a failed probe that marks the peer after it. A
+    /// close and silence are failed probes at any time, as before.
+    #[tokio::test(start_paused = true)]
+    async fn epoch_pack_late_partial_rejection_is_a_failed_probe() {
+        let late = SYNC_BUSY_DENY_WINDOW + Duration::from_millis(1);
+        let peer = key(5);
+        let rejected = || Answer::Fail(unsupported_protocol_error());
+
+        let handle = handle_preferring(peer);
+        assert_eq!(probe_pack(&handle, peer, true, rejected(), PROMPT).await, "unsupported");
+        assert!(!handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+        assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+        assert!(ranks_ahead(&handle, peer));
+
+        let handle = handle_preferring(peer);
+        assert_eq!(probe_pack(&handle, peer, true, rejected(), late).await, "failed");
+        assert!(handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+        assert_eq!(handle.last_sync_server.lock().peer, None);
+        assert!(ranks_last(&handle, peer));
+
+        for after in [PROMPT, late] {
+            let handle = handle_preferring(peer);
+            assert_eq!(probe_pack(&handle, peer, false, rejected(), after).await, "unsupported");
+            assert_eq!(handle.sync_capability.lock().get(&peer), Some(&false));
+            assert!(handle.is_known_unsyncable(&peer));
+        }
+
+        for (answer, after) in
+            [(Answer::Close, PROMPT), (Answer::Close, late), (Answer::Silent, SYNC_ACK_TIMEOUT)]
+        {
+            let handle = handle_preferring(peer);
+            assert_eq!(probe_pack(&handle, peer, true, answer, after).await, "failed");
+            assert!(ranks_last(&handle, peer));
+        }
+    }
 
     /// A deterministic BLS public key for `seed`.
     fn key(seed: u64) -> BlsPublicKey {
@@ -4982,12 +6052,13 @@ mod sync_busy_deny_tests {
             peer,
             (3, None),
             walk(&handle),
-            EpochPackAttempt::Busy,
+            EpochPackAttempt::Busy(BusyAnswer::Prompt),
             &meter,
             Duration::ZERO,
         );
         assert!(matches!(busy, ProbeVerdict::Missed));
         assert!(!handle.epoch_sync_failed.lock().contains(&(peer, 3)));
+        assert_eq!(handle.epoch_sync_busy.lock().get(&(peer, 3)), Some(&BusyAnswer::Prompt));
         assert_eq!(handle.last_sync_server.lock().peer, Some(peer));
         assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
 
@@ -5003,6 +6074,175 @@ mod sync_busy_deny_tests {
         assert!(handle.epoch_sync_failed.lock().contains(&(peer, 3)));
         assert_eq!(handle.last_sync_server.lock().peer, None);
     }
+
+    /// A `Busy` is prompt within `SYNC_BUSY_DENY_WINDOW` of the request write and late just past
+    /// it (GHSA-2fh9-q846-r7vw).
+    #[test]
+    fn busy_deny_is_prompt_only_within_the_window() {
+        assert_eq!(busy_answer(Duration::ZERO), BusyAnswer::Prompt);
+        assert_eq!(busy_answer(SYNC_BUSY_DENY_WINDOW), BusyAnswer::Prompt);
+        assert_eq!(busy_answer(SYNC_BUSY_DENY_WINDOW + Duration::from_millis(1)), BusyAnswer::Late);
+        assert_eq!(busy_answer(SYNC_ACK_TIMEOUT - Duration::from_millis(100)), BusyAnswer::Late);
+    }
+
+    /// A `Busy` sent just inside `SYNC_ACK_TIMEOUT` settles with a late busy mark and no failure
+    /// mark: the peer keeps its preference and its rate bound, and ranks with the
+    /// failure-marked peers on the next walk of the epoch.
+    #[test]
+    fn late_busy_epoch_pack_probe_ranks_the_peer_with_the_marked_peers() {
+        let peer = key(1);
+        let handle = handle_preferring(peer);
+        let attempt =
+            EpochPackAttempt::Busy(busy_answer(SYNC_ACK_TIMEOUT - Duration::from_millis(100)));
+
+        let verdict = handle.settle_epoch_pack_probe(
+            peer,
+            (EPOCH, None),
+            walk(&handle),
+            attempt,
+            &SyncServeMeter::default(),
+            Duration::ZERO,
+        );
+        assert!(matches!(verdict, ProbeVerdict::Missed));
+        assert!(!handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+        assert_eq!(handle.epoch_sync_busy.lock().get(&(peer, EPOCH)), Some(&BusyAnswer::Late));
+        assert_eq!(handle.last_sync_server.lock().peer, Some(peer));
+        assert_eq!(handle.probe_bound(peer, EPOCH), SyncRateBound::Target);
+        assert!(ranks_last(&handle, peer));
+    }
+
+    /// A serve for the epoch clears the busy mark for that epoch only, a prompt or a late one.
+    #[test]
+    fn a_serve_clears_the_busy_mark() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = PrimaryNetworkHandle::new_for_test(sender);
+        let peer = key(1);
+        handle.mark_sync_busy(peer, 3, BusyAnswer::Late);
+        handle.mark_sync_busy(peer, 4, BusyAnswer::Prompt);
+        handle.record_sync_served(peer, 3, walk(&handle));
+        assert!(!handle.epoch_sync_busy.lock().contains_key(&(peer, 3)));
+        assert!(handle.epoch_sync_busy.lock().contains_key(&(peer, 4)));
+    }
+
+    /// The worse `Busy` answer is kept for the (peer, epoch): a later prompt answer does not lift
+    /// a late one, so a peer that alternates late and prompt answers cannot regain the prompt
+    /// rank. A serve at the target and rotation clear the mark.
+    #[test]
+    fn a_late_busy_mark_holds_until_a_serve_or_rotation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = PrimaryNetworkHandle::new_for_test(sender);
+        let (peer, other) = (key(1), key(2));
+        handle.mark_sync_busy(peer, EPOCH, BusyAnswer::Late);
+        handle.mark_sync_busy(peer, EPOCH, BusyAnswer::Prompt);
+        handle.mark_sync_busy(other, EPOCH, BusyAnswer::Prompt);
+        handle.mark_sync_busy(other, EPOCH, BusyAnswer::Late);
+        assert_eq!(handle.epoch_sync_busy.lock().get(&(peer, EPOCH)), Some(&BusyAnswer::Late));
+        assert_eq!(handle.epoch_sync_busy.lock().get(&(other, EPOCH)), Some(&BusyAnswer::Late));
+        assert!(ranks_last(&handle, peer));
+
+        handle.record_sync_served(peer, EPOCH, walk(&handle));
+        assert!(!handle.epoch_sync_busy.lock().contains_key(&(peer, EPOCH)));
+        handle.clear_sync_capability();
+        assert!(handle.epoch_sync_busy.lock().is_empty());
+    }
+
+    /// Both exchanges classify a `Deny(Busy)` by when it arrives. A prompt one marks the peer
+    /// busy, so the next walk probes it after the fresh peers and before the failure-marked
+    /// ones. A late one ranks it with the failure-marked peers. Neither is a failure: the peer
+    /// keeps its preference and its rate bound (GHSA-2fh9-q846-r7vw).
+    #[tokio::test(start_paused = true)]
+    async fn both_exchanges_rank_a_busy_peer_by_when_it_answered() {
+        let busy = encoded_busy().await;
+        let late = SYNC_BUSY_DENY_WINDOW + Duration::from_millis(1);
+        let peer = key(6);
+        for (after, expected) in [(PROMPT, BusyAnswer::Prompt), (late, BusyAnswer::Late)] {
+            let output = handle_preferring(peer);
+            let kind = probe_output(&output, peer, Answer::Bytes(busy.clone()), after).await;
+            let pack = handle_preferring(peer);
+            let pack_kind =
+                probe_pack(&pack, peer, false, Answer::Bytes(busy.clone()), after).await;
+            assert_eq!((kind, pack_kind), ("busy", "busy"));
+            for handle in [output, pack] {
+                assert_eq!(handle.epoch_sync_busy.lock().get(&(peer, EPOCH)), Some(&expected));
+                assert!(!handle.epoch_sync_failed.lock().contains(&(peer, EPOCH)));
+                assert_eq!(handle.last_sync_server.lock().peer, Some(peer));
+                assert_eq!(handle.probe_bound(peer, EPOCH), SyncRateBound::Target);
+                match expected {
+                    BusyAnswer::Prompt => {
+                        assert_eq!(next_walk(&handle, peer, 11), vec![key(90), peer, key(91)]);
+                        assert!(ranks_ahead(&handle, peer));
+                    }
+                    BusyAnswer::Late => assert!(ranks_last(&handle, peer)),
+                }
+            }
+        }
+    }
+
+    /// The order of a walk does not depend on the shuffle where the ranks decide it: a prompt
+    /// busy peer goes after a fresh peer, a failure mark outranks a busy mark, a late busy peer
+    /// goes after a prompt busy one, and a busy mark for another epoch does not count. A late
+    /// busy peer shares the rank of the failure-marked peers, so the shuffle orders the two.
+    #[test]
+    fn order_probe_peers_ranks_busy_answers_by_epoch_and_lateness() {
+        let (fresh, prompt, late, failed_peer, both, other_epoch) =
+            (key(1), key(2), key(3), key(4), key(5), key(6));
+        let failed = HashSet::from([(failed_peer, EPOCH), (both, EPOCH)]);
+        let busy = HashMap::from([
+            ((prompt, EPOCH), BusyAnswer::Prompt),
+            ((late, EPOCH), BusyAnswer::Late),
+            ((both, EPOCH), BusyAnswer::Prompt),
+            ((other_epoch, EPOCH + 1), BusyAnswer::Late),
+        ]);
+        let order = |peers: Vec<BlsPublicKey>, seed: u64| {
+            order_probe_peers(
+                peers,
+                &failed,
+                &busy,
+                EPOCH,
+                None,
+                false,
+                &mut StdRng::seed_from_u64(seed),
+            )
+        };
+        for seed in 0..16 {
+            assert_eq!(order(vec![prompt, fresh], seed), vec![fresh, prompt]);
+            assert_eq!(order(vec![both, prompt], seed), vec![prompt, both]);
+            assert_eq!(order(vec![late, prompt], seed), vec![prompt, late]);
+            assert_eq!(order(vec![late, fresh], seed), vec![fresh, late]);
+            assert_eq!(order(vec![prompt, other_epoch], seed), vec![other_epoch, prompt]);
+        }
+        let late_first = (0..64).filter(|&seed| order(vec![failed_peer, late], seed)[0] == late);
+        let count = late_first.count();
+        assert!(count > 0 && count < 64, "a late busy peer must share the failed rank: {count}");
+    }
+
+    /// A busy peer sorts after every fresh peer and before every failure-marked peer, on an
+    /// ordinary walk and on an exploration walk; a failure mark outranks a busy mark, and a busy
+    /// mark for another epoch does not count.
+    #[test]
+    fn order_probe_peers_puts_a_busy_peer_between_fresh_and_failed() {
+        let (fresh, busy_peer, failed_peer, both) = (key(1), key(2), key(3), key(4));
+        let failed = HashSet::from([(failed_peer, 3), (both, 3)]);
+        let busy = HashMap::from([
+            ((busy_peer, 3), BusyAnswer::Prompt),
+            ((both, 3), BusyAnswer::Prompt),
+            ((fresh, 4), BusyAnswer::Prompt),
+        ]);
+        [false, true].into_iter().for_each(|explore| {
+            let ordered = order_probe_peers(
+                vec![both, failed_peer, busy_peer, fresh],
+                &failed,
+                &busy,
+                3,
+                None,
+                explore,
+                &mut StdRng::seed_from_u64(7),
+            );
+            assert_eq!(ordered.first(), Some(&fresh));
+            assert_eq!(ordered.get(1), Some(&busy_peer));
+            assert_eq!(ordered.len(), 4);
+        });
+    }
 }
 
 /// Tests of the preferred sync server bookkeeping (GHSA-qf73-5cfc-3jgc): the last peer that
@@ -5011,10 +6251,11 @@ mod sync_busy_deny_tests {
 mod sync_server_preference_tests {
     use super::{
         order_probe_peers, PeerTier, PrimaryNetworkHandle, ProbeVerdict, ProbeWalk, SyncRateBound,
+        FLOOR_ONLY_TTL,
     };
     use parking_lot::Mutex;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::{collections::HashSet, sync::atomic::Ordering};
+    use std::collections::{HashMap, HashSet};
     use tn_types::{BlsKeypair, BlsPublicKey, Epoch};
     use tokio::sync::mpsc;
 
@@ -5045,9 +6286,21 @@ mod sync_server_preference_tests {
         handle.last_sync_server.lock().peer
     }
 
-    /// Whether `handle` reads every peer at the floor for the rest of the epoch.
+    /// Whether the floor-only verdict holds on `handle` now, so its walks read every peer at the
+    /// floor.
     fn floor_only(handle: &PrimaryNetworkHandle) -> bool {
-        handle.floor_only_this_epoch.load(Ordering::Relaxed)
+        handle.floor_only()
+    }
+
+    /// Set the floor-only verdict on `handle` for `FLOOR_ONLY_TTL` from now.
+    fn set_floor_only(handle: &PrimaryNetworkHandle) {
+        handle.link_speed.lock().floor_only_until =
+            tokio::time::Instant::now().checked_add(FLOOR_ONLY_TTL);
+    }
+
+    /// Mark `peers` as staked on `handle`.
+    fn stake(handle: &PrimaryNetworkHandle, peers: &[BlsPublicKey]) {
+        handle.set_staked_peers(peers.iter().copied().collect());
     }
 
     /// The scripted verdict of one probe for the `walk_with_floor_fallback` tests: a probe
@@ -5127,6 +6380,7 @@ mod sync_server_preference_tests {
         let with_preference = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             0,
             Some(preferred),
             false,
@@ -5139,6 +6393,7 @@ mod sync_server_preference_tests {
         let without = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             0,
             None,
             false,
@@ -5147,6 +6402,7 @@ mod sync_server_preference_tests {
         let shuffle_only = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             0,
             None,
             false,
@@ -5192,6 +6448,7 @@ mod sync_server_preference_tests {
         let ordered = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             3,
             Some(slow),
             false,
@@ -5220,26 +6477,34 @@ mod sync_server_preference_tests {
         let on_three = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             3,
             held,
             false,
             &mut StdRng::seed_from_u64(7),
         );
-        let on_four =
-            order_probe_peers(peers, &failed, 4, held, false, &mut StdRng::seed_from_u64(7));
+        let on_four = order_probe_peers(
+            peers,
+            &failed,
+            &HashMap::new(),
+            4,
+            held,
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
         assert_eq!(on_three.last(), Some(&peer));
         assert_eq!(on_four.first(), Some(&peer));
     }
 
     /// Rotation drops the probe-first preference with the capability cache and the marks, bumps
-    /// the slot's generation and resets the floor-only flag (#1787).
+    /// the slot's generation and ends the floor-only verdict (#1787).
     #[test]
     fn clear_sync_capability_drops_the_preference() {
         let handle = handle();
         let (served, slow) = (key(1), key(2));
         handle.record_sync_served(served, 3, walk(&handle));
         handle.record_sync_served_slowly(slow, 3);
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        set_floor_only(&handle);
         let before = handle.last_sync_server.lock().generation;
         handle.clear_sync_capability();
         assert_eq!(preferred(&handle), None);
@@ -5286,12 +6551,12 @@ mod sync_server_preference_tests {
         assert_eq!(preferred(&handle), Some(peer));
     }
 
-    /// Rotation resets the floor-only flag, so the new epoch reads fresh peers at the target
+    /// Rotation ends the floor-only verdict, so the new epoch reads fresh peers at the target
     /// again (#1787, Gap 4).
     #[test]
-    fn clear_sync_capability_resets_the_floor_only_flag() {
+    fn clear_sync_capability_ends_the_floor_only_verdict() {
         let handle = handle();
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
+        set_floor_only(&handle);
         assert!(floor_only(&handle));
         handle.clear_sync_capability();
         assert!(!floor_only(&handle));
@@ -5319,13 +6584,21 @@ mod sync_server_preference_tests {
         let exploring = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             0,
             Some(holder),
             true,
             &mut StdRng::seed_from_u64(7),
         );
-        let unpreferred =
-            order_probe_peers(peers, &failed, 0, None, false, &mut StdRng::seed_from_u64(7));
+        let unpreferred = order_probe_peers(
+            peers,
+            &failed,
+            &HashMap::new(),
+            0,
+            None,
+            false,
+            &mut StdRng::seed_from_u64(7),
+        );
         let others_then_holder: Vec<BlsPublicKey> =
             unpreferred.into_iter().filter(|p| *p != holder).chain(Some(holder)).collect();
         assert_eq!(exploring, others_then_holder);
@@ -5343,6 +6616,7 @@ mod sync_server_preference_tests {
         let exploring = order_probe_peers(
             peers.clone(),
             &failed,
+            &HashMap::new(),
             3,
             Some(holder),
             true,
@@ -5353,6 +6627,7 @@ mod sync_server_preference_tests {
         let ordinary = order_probe_peers(
             peers,
             &failed,
+            &HashMap::new(),
             3,
             Some(holder),
             false,
@@ -5374,7 +6649,7 @@ mod sync_server_preference_tests {
             calls,
             vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (a, SyncRateBound::Floor),]
         );
-        assert!(!floor_only(&handle), "one cut must not set the floor-only flag");
+        assert!(!floor_only(&handle), "one cut must not set the floor-only verdict");
     }
 
     /// A public-tier requester does not probe again at the floor, in the same walk, a peer that
@@ -5390,16 +6665,17 @@ mod sync_server_preference_tests {
         assert_eq!(served, None);
         assert!(!calls.contains(&(a, SyncRateBound::Floor)), "a cut peer must not be re-probed");
         assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
-        assert!(!floor_only(&handle), "one cut must not set the floor-only flag");
+        assert!(!floor_only(&handle), "one cut must not set the floor-only verdict");
     }
 
-    /// After two cuts in one walk, a public-tier requester still reads the peers not yet probed
-    /// at the floor, but not the two peers that the walk cut (#1787, GHSA-jr9x).
+    /// After two staked cuts in one walk, a public-tier requester still reads the peers not yet
+    /// probed at the floor, but not the two peers that the walk cut (#1787, GHSA-jr9x).
     #[tokio::test]
     async fn public_requester_still_reads_unprobed_peers_at_the_floor() {
         let handle = handle();
         handle.set_requester_tier(PeerTier::Public);
         let (a, b, c) = (key(1), key(2), key(3));
+        stake(&handle, &[a, b]);
         let serves =
             [(a, SyncRateBound::Floor), (b, SyncRateBound::Floor), (c, SyncRateBound::Floor)];
         let (served, calls) = scripted_walk(&handle, vec![a, b, c], 0, &serves, &[a, b]).await;
@@ -5410,7 +6686,7 @@ mod sync_server_preference_tests {
         );
         assert!(!calls.contains(&(a, SyncRateBound::Floor)), "a cut peer must not be re-probed");
         assert!(!calls.contains(&(b, SyncRateBound::Floor)), "a cut peer must not be re-probed");
-        assert!(floor_only(&handle), "two cuts in one walk must set the floor-only flag");
+        assert!(floor_only(&handle), "two staked cuts in one walk must set the floor-only verdict");
     }
 
     /// The first serve ends the walk: no peer past it is probed and no floor pass runs, even
@@ -5449,15 +6725,112 @@ mod sync_server_preference_tests {
         assert_eq!(calls, vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target)]);
     }
 
-    /// Two distinct peers cut at the target in one walk stop the target pass there: the rest of
-    /// the walk (the cut peers, then the peers not yet probed) is read at the floor, and the
-    /// handle reads every peer at the floor for the rest of the epoch (#1787, Gap 4).
+    /// Two distinct staked peers cut at the target in one walk stop the target pass there: the
+    /// rest of the walk (the peers not yet probed, then the cut peers) is read at the floor, and
+    /// the handle reads every peer at the floor for `FLOOR_ONLY_TTL` (#1787, Gap 4,
+    /// GHSA-h352-9822-hjqg).
     #[tokio::test]
     async fn walk_with_floor_fallback_stops_the_target_pass_at_the_second_cut() {
         let handle = handle();
         let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
         let (served, calls) =
             scripted_walk(&handle, vec![a, b, c, d], 0, &[(c, SyncRateBound::Floor)], &[a, b])
+                .await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (c, SyncRateBound::Floor)]
+        );
+        assert!(floor_only(&handle), "two staked cuts in one walk must set the floor-only verdict");
+    }
+
+    /// While the floor-only verdict holds, the next walk plans every peer at the floor and reads
+    /// nothing at the target, a fresh peer included (#1787, Gap 4).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_plans_every_peer_at_the_floor_once_the_link_is_slow() {
+        let handle = handle();
+        set_floor_only(&handle);
+        let (a, b) = (key(1), key(2));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b], 0, &[(b, SyncRateBound::Floor)], &[a]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(a, SyncRateBound::Floor), (b, SyncRateBound::Floor)]);
+    }
+
+    /// A target cut of a peer that is not staked never counts toward the link verdict, so two
+    /// such cuts do not stop the target pass and set no verdict (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_ignores_cuts_of_peers_that_are_not_staked() {
+        let handle = handle();
+        let (a, b, c) = (key(1), key(2), key(3));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c], 0, &[(c, SyncRateBound::Target)], &[a, b]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![
+                (a, SyncRateBound::Target),
+                (b, SyncRateBound::Target),
+                (c, SyncRateBound::Target)
+            ]
+        );
+        assert!(!floor_only(&handle), "cuts of peers that are not staked must not set the verdict");
+    }
+
+    /// A serve at the target inside `FLOOR_ONLY_EVIDENCE_WINDOW` contradicts two staked cuts:
+    /// the walk still reads its rest at the floor, but no verdict is set (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn a_recent_target_serve_blocks_the_floor_only_verdict() {
+        let handle = handle();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
+        handle.record_sync_served(d, 0, walk(&handle));
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c], 0, &[(c, SyncRateBound::Floor)], &[a, b]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(
+            calls,
+            vec![(a, SyncRateBound::Target), (b, SyncRateBound::Target), (c, SyncRateBound::Floor)]
+        );
+        assert!(!floor_only(&handle), "a recent serve at the target must block the verdict");
+    }
+
+    /// The floor-only verdict ends `FLOOR_ONLY_TTL` after it is set, so a later walk reads at
+    /// the target again, and a serve at the target ends a verdict at once
+    /// (GHSA-h352-9822-hjqg).
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_only_verdict_expires_and_a_target_serve_ends_it() {
+        let handle = handle();
+        let (a, b, c) = (key(1), key(2), key(3));
+        stake(&handle, &[a, b]);
+        let (served, _) = scripted_walk(&handle, vec![a, b], 0, &[], &[a, b]).await;
+        assert_eq!(served, None);
+        assert!(floor_only(&handle), "two staked cuts must set the verdict");
+
+        tokio::time::advance(FLOOR_ONLY_TTL).await;
+        assert!(!floor_only(&handle), "the verdict must end after FLOOR_ONLY_TTL");
+        let (served, calls) =
+            scripted_walk(&handle, vec![c], 0, &[(c, SyncRateBound::Target)], &[]).await;
+        assert_eq!(served, Some(()));
+        assert_eq!(calls, vec![(c, SyncRateBound::Target)]);
+
+        scripted_walk(&handle, vec![a, b], 0, &[], &[a, b]).await;
+        assert!(floor_only(&handle), "two staked cuts must set the verdict again");
+        handle.record_sync_served(c, 0, walk(&handle));
+        assert!(!floor_only(&handle), "a serve at the target must end the verdict");
+    }
+
+    /// After a stop at the second staked cut, a `Committee` requester reads the peers not yet
+    /// probed before the cut peers, so the peers that just cut the walk are read last
+    /// (GHSA-h352-9822-hjqg).
+    #[tokio::test]
+    async fn walk_with_floor_fallback_reads_the_cut_peers_last_after_a_link_stop() {
+        let handle = handle();
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        stake(&handle, &[a, b]);
+        let (served, calls) =
+            scripted_walk(&handle, vec![a, b, c, d], 0, &[(b, SyncRateBound::Floor)], &[a, b])
                 .await;
         assert_eq!(served, Some(()));
         assert_eq!(
@@ -5465,24 +6838,11 @@ mod sync_server_preference_tests {
             vec![
                 (a, SyncRateBound::Target),
                 (b, SyncRateBound::Target),
+                (c, SyncRateBound::Floor),
+                (d, SyncRateBound::Floor),
                 (a, SyncRateBound::Floor),
                 (b, SyncRateBound::Floor),
-                (c, SyncRateBound::Floor),
             ]
         );
-        assert!(floor_only(&handle), "two cuts in one walk must set the floor-only flag");
-    }
-
-    /// Once the floor-only flag is set, the next walk plans every peer at the floor and reads
-    /// nothing at the target, a fresh peer included (#1787, Gap 4).
-    #[tokio::test]
-    async fn walk_with_floor_fallback_plans_every_peer_at_the_floor_once_the_link_is_slow() {
-        let handle = handle();
-        handle.floor_only_this_epoch.store(true, Ordering::Relaxed);
-        let (a, b) = (key(1), key(2));
-        let (served, calls) =
-            scripted_walk(&handle, vec![a, b], 0, &[(b, SyncRateBound::Floor)], &[a]).await;
-        assert_eq!(served, Some(()));
-        assert_eq!(calls, vec![(a, SyncRateBound::Floor), (b, SyncRateBound::Floor)]);
     }
 }

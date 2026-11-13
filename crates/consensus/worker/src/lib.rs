@@ -7,7 +7,7 @@ mod network;
 mod worker;
 pub use crate::metrics::WorkerMetrics;
 pub use network::{
-    WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
+    ReportedBatchLedger, WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
     MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS, MAX_CONCURRENT_GOSSIP_PREFETCHES,
     MAX_PENDING_REQUESTS_PER_PEER,
 };
@@ -16,7 +16,7 @@ pub mod quorum_waiter;
 pub use crate::{
     network::{
         error::WorkerNetworkError,
-        handler::RequestHandler,
+        handler::{RequestHandler, MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER},
         message::{WorkerGossip, WorkerRPCError},
     },
     worker::{new_worker, Worker, CHANNEL_CAPACITY},
