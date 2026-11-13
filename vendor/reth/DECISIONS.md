@@ -222,7 +222,7 @@ it as a wrapper around `DebugInspector` in a TN-owned file, and keeps `debug.rs`
 upstream's version so the next sync swaps the wrapper for `JsInspector::with_interrupt`.
 
 Correction, 2026-11-04: the port first claimed it needed no Boa change because Boa's loop and
-recursion limits bound the work inside one callback. They don't (review finding T1-2). Boa counts
+recursion limits bound the work inside one callback. They don't. Boa counts
 loop iterations per call frame, 200,000 each, so a callback that calls a looping function from a
 loop runs as long as its script says, and Boa 0.21 has no time limit. The interrupt is read only
 between hooks: it stops a trace after the running callback returns, and never stops `setup` or

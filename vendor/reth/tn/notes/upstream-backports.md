@@ -79,15 +79,15 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8760eb000 | TN-0066 | `trace_get` selects the frame whose `traceAddress` equals the list (was a flat index into `trace_transaction`) | upstream test |
 | 3dd806a43 | TN-0067 | `trace_replayTransaction` returns `transactionHash` with the traces, the shape `trace_replayBlockTransactions` already used | upstream test |
 | e3d7f0952 | TN-0068 | `trace_replayTransaction` answers `null` for an unknown transaction (was `-32001`), like `trace_transaction` | upstream test |
-| d8d704cf7 | TN-0069 | `trace_callMany` with no block runs on `latest`, not `pending` (review R9) | upstream test |
+| d8d704cf7 | TN-0069 | `trace_callMany` with no block runs on `latest`, not `pending` | upstream test |
 | 074bf32ef | TN-0070 | `trace_filter` with no `fromBlock` starts at the latest block, not genesis, so an empty filter no longer fails the range check | upstream test |
 | 6d117042f | TN-0071 | `trace_replayBlockTransactions` fills `vmTrace.code` as the single-transaction replay does; adapted to revm-inspectors 0.34 (no `into_trace_results_with_state_parts`) | upstream test |
 | 4e1a5574e | TN-0072 | `trace_replayBlockTransactions` fails with `-32001` on an unknown block instead of answering `null` | upstream smoke test |
-| 0c8b1c187 | TN-0073 | transactions a parked insertion promotes to pending are announced to the pool's listeners (review R20) | upstream tests |
-| 0a1d3e761 | TN-0074 | the validation job channel holds two jobs per worker instead of one (review R21); applied in `build_with_tasks`, the vendored path | upstream test, adapted |
-| fe01db183 | TN-0075 | validation submitters send into the bounded channel without a producer mutex; a cancelled submit no longer leaks `inflight_validation_jobs` (review R21); hand port, no `spawn` in this copy | upstream tests |
+| 0c8b1c187 | TN-0073 | transactions a parked insertion promotes to pending are announced to the pool's listeners | upstream tests |
+| 0a1d3e761 | TN-0074 | the validation job channel holds two jobs per worker instead of one; applied in `build_with_tasks`, the vendored path | upstream test, adapted |
+| fe01db183 | TN-0075 | validation submitters send into the bounded channel without a producer mutex; a cancelled submit no longer leaks `inflight_validation_jobs`; hand port, no `spawn` in this copy | upstream tests |
 | 43a7452b0 | TN-0076 | the `eth_getLogs` retry range in `QueryExceedsMaxResults` ends before the block that overflowed the limit (TN-0058 follow-up) | upstream test; TN-0058 test asserts the new bound |
-| 8f5efd2b3 | TN-0081 | `TrieWalker::new` returns its first read's error instead of panicking the state root computation (review R15); roots unchanged | upstream tests; trie suites |
+| 8f5efd2b3 | TN-0081 | `TrieWalker::new` returns its first read's error instead of panicking the state root computation; roots unchanged | upstream tests; trie suites |
 | 345fbbbfd, 75c327ee5, 0720dcd37, 0a21d223a | TN-0102 to TN-0105 | trie overlay cursors skip the database seek on exact overlay hits (`seek_exact`, then `seek` and the hashed post-state cursor), forward in-memory seeks take a fast path, and the state root reuses its storage cursors across accounts. Performance on the state-root path under TN's output overlay | reth-trie, reth-trie-db, tn-reth `trie_overlay`; exec-bench chain differential 0 mismatches; database trie seeks about halved, storage cursor opens 1.89M to 640 per 320 roots |
 | 8572c88fe | TN-0140 | **consensus fix**: the trie node iterator no longer skips hashed entries between a seek prefix and a deeper stored branch, which gave a wrong incremental state root. Changes the computed root where the old code was wrong; adiri needs a replay check before it deploys (TN-0140) | upstream test fails without the fix; reth-trie, reth-trie-db, `trie_overlay`; format-freeze block hashes unchanged |
 | 8d97ab63c, 1b09bf5a2, 3fba6ad70 | TN-0141 | `StoredNibblesSubKey` encodes to a stack `[u8; 65]` (one allocation less per storage-trie seek and write, same bytes); the storage-root span is trace-level and records its root lazily. Performance on the state-root path | upstream tests (array equals `to_compact` at every length); trie and db-api suites; format-freeze writer bytes unchanged |
@@ -105,7 +105,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 | sha | subject | crate | why it matters to TN | status |
 |---|---|---|---|---|
-| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (review finding T2-1; also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | described in `open-issues.md` |
+| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | described in `open-issues.md` |
 
 ### High (correctness, not security)
 
@@ -177,17 +177,17 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
   `debug_executionWitness*` keep their tracing permit until their thread ends (TN-0036, TN-0038),
   and a dropped request stops its long loops (TN-0049).
 - **`trace_filter` replays bounded by its permits (TN-0077, 2026-11-09).** The filter's two
-  permits now also bound the blocks it replays at once (review R10); before, a chunk of up to
+  permits now also bound the blocks it replays at once; before, a chunk of up to
   `--rpc.max-tracing-requests` blocks traced in parallel on unpermitted blocking threads.
 - **Raw `debug_traceBlock` bounded like callMany (TN-0078, 2026-11-09).** The caller's header
-  and transactions are bounded by the call count and gas budget of TN-0057 (review R3); stored
+  and transactions are bounded by the call count and gas budget of TN-0057; stored
   blocks keep their chain-enforced bounds.
 - **A cap on recorded trace steps (TN-0079, 2026-11-09).** The carried revm-inspectors'
   `TracingInspector` stops a transaction whose recorded steps pass 160 MiB (`trace too large`,
-  `-32603`), shared across the inspectors of one request (review R4). Upstream caps nothing as of
+  `-32603`), shared across the inspectors of one request. Upstream caps nothing as of
   0.44.3; re-port on every revm-inspectors upgrade (`patches/revm-inspectors/PATCH.md`).
 - **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
-  returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
+  returns empty code for a hash the `Bytecodes` table lacks; roots unchanged for a
   healthy database.
 - **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
-  files and an empty database writes the MDBX half instead of failing forever (review R17).
+  files and an empty database writes the MDBX half instead of failing forever.
