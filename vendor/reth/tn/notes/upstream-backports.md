@@ -97,6 +97,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8572c88fe | TN-0140 | **consensus fix**: the trie node iterator no longer skips hashed entries between a seek prefix and a deeper stored branch, which gave a wrong incremental state root. Changes the computed root where the old code was wrong; adiri needs a replay check before it deploys (TN-0140) | upstream test fails without the fix; reth-trie, reth-trie-db, `trie_overlay`; format-freeze block hashes unchanged |
 | 8d97ab63c, 1b09bf5a2, 3fba6ad70 | TN-0141 | `StoredNibblesSubKey` encodes to a stack `[u8; 65]` (one allocation less per storage-trie seek and write, same bytes); the storage-root span is trace-level and records its root lazily. Performance on the state-root path | upstream tests (array equals `to_compact` at every length); trie and db-api suites; format-freeze writer bytes unchanged |
 | 3fa855645 | TN-0142 | test only: `hash_builder_state_roundtrip` draws `HashBuilderState` from per-field strategies, not the arbitrary interop whose buffer ran out (about one aborted run in ten with `--features arbitrary`); the `state.rs` half, `e2e-test-utils` is not vendored | 50 runs in a row; reth-trie-common suite |
+| 7bf9241fe | TN-0159 | `check_consistency` runs its heal outside the read transaction timeout: a long heal at startup no longer fails each start (both backends time out a read transaction after five minutes) | tn-reth startup tests; reth-provider suite |
 
 ## Open
 
@@ -114,9 +115,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### High (correctness, not security)
 
-| sha | subject | crate | why it matters to TN | pick |
-|---|---|---|---|---|
-| 7bf9241fe | disable read-tx timeout during check_consistency | provider | TN runs `check_consistency` at startup; a long heal on an archive DB can hit the read-transaction timeout and crash-loop. Both backends: tn-lmdb marks a read transaction past the same five-minute default (`TnLmdbArgs::read_transaction_timeout`), and its later calls fail as MDBX's do. | 1 import-only conflict; likely clean after 294e21507 |
+None open (7bf9241fe applied as TN-0159).
 
 ### Medium
 

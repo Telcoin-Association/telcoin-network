@@ -61,7 +61,7 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077 to TN-0079 |
 | transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0041 to TN-0043, TN-0073 to TN-0075 |
 | RPC and CLI fixes backported after v1.11.4 | TN-0039, TN-0040, TN-0044, TN-0047 to TN-0051, TN-0059, TN-0060, TN-0062 to TN-0072 |
-| storage and static-file backports | TN-0023, TN-0052, TN-0106 to TN-0109 |
+| storage and static-file backports | TN-0023, TN-0052, TN-0106 to TN-0109, TN-0159 |
 | trie backports | TN-0081, TN-0102 to TN-0105, TN-0140, TN-0141 |
 | execution and storage fixes | TN-0082, TN-0083 |
 | storage v2 without RocksDB (history and tx hashes in the database, plain-slot keys, v2 genesis, tests) | TN-0100, TN-0110 to TN-0113, TN-0115, TN-0116 |

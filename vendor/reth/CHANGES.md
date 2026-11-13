@@ -1116,6 +1116,19 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the attribute. No non-test code changes. *Tests*: the roundtrip passes 50 runs in a row (it
   failed 1 to 2 runs in 20 before); reth-trie-common suite. *Upstream*: n/a (upstream commit).
 
+- **TN-0159** — Backport 7bf9241fe: `ProviderFactory::check_consistency` takes its read-only
+  provider out of the read transaction timeout. *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/database/mod.rs` (`check_consistency` calls
+  `disable_long_read_transaction_safety` on its provider; `DBProvider` joins the imports). Applied
+  with `vendor.py pick`; the one conflict was the import list, which TN had already cut.
+  *Why*: TN runs `check_consistency` at every start (`crates/tn-reth/src/env/mod.rs`). A heal over
+  a large datadir can hold that transaction past the five-minute default, and both backends then
+  fail its later reads (tn-lmdb's `TnLmdbArgs::read_transaction_timeout` copies MDBX's), so the
+  start fails the same way each time. The opt-out changes no byte read or written: it only stops
+  the timer for that one transaction (tn-lmdb-reth `TnLmdbTx::disable_long_read_transaction_safety`),
+  so it cannot change a block, a root or a stored row. *Tests*: tn-reth startup tests; reth-provider
+  suite. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

@@ -131,14 +131,14 @@ RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-fac
 the `EitherWriter`/`EitherReader` parameters remain. Removing them changes compiled storage code,
 so it waits for the storage work (DECISIONS.md D15; ROADMAP.md, "RocksDB step B").
 
-## Three upstream storage fixes wait for their own change
+## Two upstream storage fixes wait for their own change
 
-Upstream 7bf9241fe (no read-transaction timeout during `check_consistency`) and 294e21507 (heal a
-finalized or safe block number ahead of the highest header) are provider fixes, generic over the
-database, so they reach tn-lmdb and MDBX alike. 5fc3a81d3 (a sync period for MDBX's
-`safe-no-sync`) concerns only the opt-in `mdbx` build, which retires with MDBX (ROADMAP.md,
-Phase 3). They change startup healing and durability, not execution; each is on the storage path,
-so it takes its own change with the fork checks (CLAUDE.md, "Fork safety").
+Upstream 294e21507 (heal a finalized or safe block number ahead of the highest header) is a
+provider fix, generic over the database, so it reaches tn-lmdb and MDBX alike. 5fc3a81d3 (a sync
+period for MDBX's `safe-no-sync`) concerns only the opt-in `mdbx` build, which retires with MDBX
+(ROADMAP.md, Phase 3). They change startup healing and durability, not execution; each is on the
+storage path, so it takes its own change with the fork checks (CLAUDE.md, "Fork safety").
+7bf9241fe (no read-transaction timeout during `check_consistency`) is applied (TN-0159).
 `upstream-backports.md` has the verdicts.
 
 ## The revm-inspectors patch
