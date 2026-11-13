@@ -116,6 +116,10 @@ to the fixed 0.23.46, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
 The 2026-10-15 lockfile update from rustls 0.23.45 to 0.23.46 also addresses
 RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349,
 which the required advisory gate detected in the carried transport closure.
+The 2026-11-13 lockfile update from `quinn-udp` 0.5.14 to the fixed 0.5.16 addresses
+RUSTSEC-2026-0538 (a truncated datagram can keep the single-`recvmsg` receive loop busy on
+Apple platforms, the BSDs and illumos), which the gate detected in the same closure; it
+changes only that package's version and checksum.
 The committed evidence snapshots below describe the earlier qualification;
 CI captures fresh source and advisory evidence for the current lockfile.
 The scoped updated transport scan has no findings. The workspace scan exits
