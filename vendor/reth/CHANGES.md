@@ -1446,13 +1446,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
   resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
   written. A database with any checkpoint but not the Headers one is still refused.
+  The resume holds for storage v1 only, where the header is genesis's one static-file row (the
+  transactions and receipts segments get only a block range, which the resumed path sets again).
+  Under storage v2 genesis also commits block 0 of both changeset segments to static files, and
+  the resumed `insert_genesis_state` fails appending it again (`UnexpectedStaticFileBlockNumber`)
+  at every start. TN's node never reaches the resume in either layout: `layout::settle`
+  (`crates/tn-reth/src/env/layout.rs`), the only path to `init_genesis_with_settings`, runs
+  first; it removes the static files of a creation stopped inside genesis's commit (TN's marker,
+  no `storage_settings` row, static files holding only genesis), so genesis writes them from
+  scratch, and refuses any other static files beside a database with no chain.
   *Storage path*: yes (`db-common` holds genesis init). The data written is unchanged: the same
   header, state, trie and checkpoints as a clean first launch, since the resumed path is the
   ordinary write path minus the header append. A datadir that already has chain data never
   reaches it (its checkpoints exist). No manifest or feature change.
-  *Tests*: `init_genesis_resumes_after_a_torn_first_launch` (header in static files, MDBX
-  transaction dropped; init succeeds and writes the checkpoints; the next init is the ordinary
-  skip), `init_genesis_refuses_a_partly_written_database`.
+  *Tests*: `init_genesis_resumes_after_a_torn_first_launch` (storage v1: header in static files,
+  MDBX transaction dropped; init succeeds and writes the checkpoints; the next init is the
+  ordinary skip), `init_genesis_refuses_a_partly_written_database`; TN's heal is
+  `a_creation_stopped_inside_genesis_is_created_again` and
+  `static_files_past_genesis_or_without_the_marker_stay_refused` (`layout.rs`).
   *Upstream*: candidate.
 
 - **TN-0084** — The ledger check reads only an entry's *Files* sentence, and the attested run runs it.
