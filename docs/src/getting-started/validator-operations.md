@@ -126,6 +126,7 @@ Without that backup there is no safe way back for a validator.
 Upgrade every node in place first: since #1788 this release and the previous one cannot peer, so a mixed committee stalls.
 Once every node runs this release, an existing datadir moves to layout v2 only by rebuilding its execution database from genesis.
 With the node stopped, `telcoin-network db reset-execution --datadir <datadir>` shows what it would move, and with `--force` it moves `db/`, `static_files/` and any `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`; the next start re-executes the chain from genesis.
+The rebuild replays epoch 0 from the node's own consensus packs, so the command refuses, moving nothing, a datadir bootstrapped with `db load-state`, which holds consensus only from the restored epoch on; such a node rebuilds as a new one, with `consensus-db/` moved aside as well.
 It renames and never deletes, so moving those entries back (after moving the new ones out) undoes it.
 An observer can rebuild in place.
 On a five-validator committee with a quorum of four, one validator out for a whole rebuild leaves no margin, so a validator syncs an observer on this release in a fresh datadir instead, stops it cleanly at the tip, and copies its `db/` and `static_files/` into the validator's datadir after `db reset-execution --force` (never its `consensus-db/` or keys); the validator is down only for the swap.
