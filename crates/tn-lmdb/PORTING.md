@@ -346,9 +346,13 @@ The engine reads a few errno values. Each is a place to check on a new OS:
 | `sys::retry_interrupted` | `EINTR` (`ErrorKind::Interrupted`) | the call is issued again |
 | `sys::flock` | `EWOULDBLOCK` (`ErrorKind::WouldBlock`) | the lock is held: `Locked` |
 | `env::create` | `ELOOP`, `EISDIR` | `<path>.creating` is a symbolic link or not a regular file: refused, `InvalidInput` |
+| `boot_record::BootFile::write` | `ELOOP`, `EISDIR`, `ENXIO` | the boot record's path is a symbolic link, a directory or a FIFO: refused, `InvalidInput` |
+| `env::Writer::mark_open` | `EACCES`, `EPERM`, `EROFS` (`PermissionDenied`, `ReadOnlyFilesystem`), creating the boot record | no record: a warning, and every open drops the cached pages |
 
 The adapter crate `tn-lmdb-reth` reports an `Error::Io`'s OS code and names `libc::ENODATA`,
-`EACCES`, `EINVAL`, `ENOMEM` and `EIO` (`src/error.rs`). `libc` has no `ENODATA` for FreeBSD,
+`EACCES`, `EINVAL`, `ENOMEM` and `EIO` (`src/error.rs`). An error the engine names (the boot
+record's writes, a directory sync) keeps the OS error as its source (`sys::Context`), where the
+adapter finds the code. `libc` has no `ENODATA` for FreeBSD,
 OpenBSD or DragonFly, so that crate does not build there as it is.
 
 ### Open flags and file identity

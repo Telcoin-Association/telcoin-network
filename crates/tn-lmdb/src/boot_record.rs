@@ -293,7 +293,8 @@ impl BootFile {
     /// Write `record` over the record's file, creating it if `created` says it is missing; with
     /// `durable`, sync it, and the directory too when it was created. Never through a symbolic
     /// link; a file there that is not a regular file is refused, [`io::ErrorKind::InvalidInput`]
-    /// naming it. Every error names the file.
+    /// naming it. Every error names the file, and keeps the OS error as its source
+    /// ([`sys::Context`]), so the caller still finds its code.
     pub(crate) fn write(
         &self,
         record: &BootRecord,
@@ -301,7 +302,7 @@ impl BootFile {
         durable: bool,
     ) -> io::Result<()> {
         let named = |e: io::Error| {
-            io::Error::new(e.kind(), format!("the boot record {}: {e}", self.path.display()))
+            sys::Context::wrap(format!("the boot record {}", self.path.display()), e)
         };
         let refused = || {
             io::Error::new(
@@ -506,5 +507,29 @@ mod tests {
         assert!(matches!(boot_file.read(), Found::Unusable), "a FIFO, read without blocking");
         let e = boot_file.write(&record, false, true).expect_err("a FIFO, without blocking");
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+    }
+
+    /// A write the OS refuses fails with the OS error under the file's name: the original error
+    /// is its source, so a caller that walks the sources for the code (the reth adapter, which
+    /// reports it) finds `EACCES`, not a bare kind.
+    #[test]
+    fn a_refused_write_keeps_the_os_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::with_prefix("tn_lmdb_boot").expect("temp dir");
+        let (path, meta) = meta_of(&dir);
+        let boot_file = BootFile::beside(&path).expect("kept in tests");
+        let record = BootRecord::new(State::Open, [3; 16], &meta);
+        boot_file.write(&record, true, false).expect("create");
+        let read_only = std::fs::Permissions::from_mode(0o444);
+        std::fs::set_permissions(boot_file.path(), read_only).expect("chmod");
+        // A process that writes a read-only file anyway (root): nothing to check.
+        if OpenOptions::new().write(true).open(boot_file.path()).is_ok() {
+            return;
+        }
+        let e = boot_file.write(&record, false, true).expect_err("a read-only record");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("db.boot"), "names the file: {e}");
+        let source = std::error::Error::source(&e).and_then(|s| s.downcast_ref::<io::Error>());
+        assert_eq!(source.and_then(io::Error::raw_os_error), Some(libc::EACCES), "{e:?}");
     }
 }

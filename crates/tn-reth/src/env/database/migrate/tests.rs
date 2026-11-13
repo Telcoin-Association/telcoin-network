@@ -829,13 +829,13 @@ const WRITER_DIR: &str = "TN_MIGRATE_TEST_MDBX_WRITER_DIR";
 /// database's.
 const WRITTEN_BLOCK: u64 = u64::MAX;
 
-/// Not a test of its own: the second process of
-/// [`an_mdbx_commit_during_the_copy_fails_the_migration`], which runs this test binary on it alone,
-/// since MDBX refuses a second environment on the same files in one process (`EAGAIN`). With
-/// [`WRITER_DIR`] set it opens the MDBX database there read-write, commits [`WRITTEN_BLOCK`], and
-/// prints MDBX's last transaction ids before and after; without it, it does nothing.
+/// Not a test of its own: the second process of [`no_other_process_opens_mdbx_during_the_copy`],
+/// which runs this test binary on it alone, since MDBX refuses a second environment on the same
+/// files in one process. With [`WRITER_DIR`] set it opens the MDBX database there read-write,
+/// commits [`WRITTEN_BLOCK`], and prints MDBX's last transaction ids before and after; without it,
+/// it does nothing.
 #[test]
-#[ignore = "the writer process of an_mdbx_commit_during_the_copy_fails_the_migration"]
+#[ignore = "the writer process of no_other_process_opens_mdbx_during_the_copy"]
 fn mdbx_writer_process() {
     use reth_db::mdbx::DatabaseEnvKind;
     let Some(dir) = std::env::var_os(WRITER_DIR) else { return };
@@ -850,62 +850,172 @@ fn mdbx_writer_process() {
     println!("mdbx-writer: {first} {}", id());
 }
 
-/// A commit to MDBX during the copy, by another process on the same files (a build running reth on
-/// MDBX on a second datadir naming the same `db/`), advances MDBX's last transaction id; here the
-/// test then puts `mdbx.dat`'s modification time back, so the file's stat is as the migration found
-/// it (as on a filesystem with coarse timestamps). The migration reads the last transaction id
-/// again at its commit point, while the source is still open, and fails on the difference, naming
-/// both ids, with MDBX's files as the write left them. The next open migrates the written row too.
+/// A command running `test`, an ignored test of this module, as a second process of this test
+/// binary, alone.
+fn test_process(test: &str) -> std::process::Command {
+    let (_, tests) = module_path!().split_once("::").expect("a crate path");
+    let mut command = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    command.args([&format!("{tests}::{test}"), "--exact", "--ignored"]).args([
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ]);
+    command
+}
+
+/// No other process opens MDBX while the migration copies it (a build running reth on MDBX on a
+/// second datadir naming the same `db/`): the migration's open is exclusive, so MDBX refuses that
+/// process's open, it commits nothing the copy would miss, and the migration completes with every
+/// row MDBX held.
 #[test]
-fn an_mdbx_commit_during_the_copy_fails_the_migration() {
+fn no_other_process_opens_mdbx_during_the_copy() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    build_mdbx(&path);
-    let mdbx = path.join(MDBX_DATA_FILE);
-    let before = std::fs::metadata(&mdbx).expect("stat");
-    let (len, modified) = (before.len(), before.modified().expect("mtime"));
-    // The writer's transaction ids before and after its commit, and `mdbx.dat` as it left it.
-    let wrote = std::rc::Rc::new(std::cell::Cell::new(None));
+    let expected = build_mdbx(&path);
+    let writer = std::rc::Rc::new(std::cell::Cell::new(None));
 
-    let (dir, file, seen) = (path.clone(), mdbx.clone(), wrote.clone());
+    let (dir, seen) = (path.clone(), writer.clone());
     run_mid_copy(move || {
-        let (_, tests) = module_path!().split_once("::").expect("a crate path");
-        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args([&format!("{tests}::mdbx_writer_process"), "--exact", "--ignored"])
-            .args(["--nocapture", "--test-threads", "1"])
-            .env(WRITER_DIR, &dir)
-            .output()
-            .expect("run the writer process");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "the writer: {stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // the output follows libtest's `test <name> ...` on its line
-        let line = stdout.lines().find_map(|line| Some(line.split_once("mdbx-writer: ")?.1));
-        let ids = line.and_then(|ids| ids.split_once(' '));
-        let (first, last) = ids.unwrap_or_else(|| panic!("the writer's ids: {stdout}"));
-        let (first, last) = (first.parse::<u64>().expect("id"), last.parse::<u64>().expect("id"));
-        let handle = std::fs::OpenOptions::new().write(true).open(&file).expect("open");
-        handle.set_modified(modified).expect("put the modification time back");
-        seen.set(Some((first, last, std::fs::read(&file).expect("mdbx.dat"))));
+        let out = test_process("mdbx_writer_process").env(WRITER_DIR, &dir).output();
+        seen.set(Some(out.expect("run the writer process")));
     });
-    let err = open(&path).expect_err("MDBX committed to during the copy");
-    let (first, last, written) = wrote.take().expect("the writer ran");
-    assert!(last > first, "the write committed: transaction {first} to {last}");
-    let now = std::fs::metadata(&mdbx).expect("stat");
-    assert_eq!(now.len(), len, "the commit kept mdbx.dat's length");
-    assert_eq!(now.modified().expect("mtime"), modified, "and its modification time");
-    assert_written_during_the_copy(&path, &err, &written, "a commit");
-    let msg = format!("{err:#}");
-    for id in [first, last] {
-        assert!(msg.contains(&format!("MDBX transaction {id}")), "names transaction {id}: {msg}");
-    }
+    let db = open(&path).unwrap_or_else(|e| panic!("the migration completes: {e:#}"));
+    let out = writer.take().expect("the writer ran");
+    let output =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "MDBX refused the writer: {output}");
+    assert!(output.contains("open MDBX read-write"), "at its open: {output}");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "every row MDBX held, and no other");
+}
 
-    let db = open(&path).unwrap_or_else(|e| panic!("the next open migrates: {e:#}"));
-    let row = db.tx().expect("tx").get::<tables::CanonicalHeaders>(WRITTEN_BLOCK).expect("get");
-    assert_eq!(row, Some(Default::default()), "the row committed during the copy is migrated");
+/// The environment variable that makes [`mdbx_holder_process`] hold MDBX open: the database
+/// directory.
+const HOLDER_DIR: &str = "TN_MIGRATE_TEST_MDBX_HOLDER_DIR";
+
+/// How [`mdbx_holder_process`] opens MDBX: `ro` read-only, anything else read-write.
+const HOLDER_KIND: &str = "TN_MIGRATE_TEST_MDBX_HOLDER_KIND";
+
+/// Not a test of its own: the second process of
+/// [`an_mdbx_database_another_process_holds_open_is_refused`]. With [`HOLDER_DIR`] set it opens the
+/// MDBX database there as [`HOLDER_KIND`] says, prints `mdbx-holder: open`, and holds it,
+/// committing nothing, until its stdin is closed; without it, it does nothing.
+#[test]
+#[ignore = "the holder process of an_mdbx_database_another_process_holds_open_is_refused"]
+fn mdbx_holder_process() {
+    use reth_db::mdbx::DatabaseEnvKind;
+    use std::io::{Read as _, Write as _};
+    let Some(dir) = std::env::var_os(HOLDER_DIR) else { return };
+    let kind = match std::env::var(HOLDER_KIND).as_deref() {
+        Ok("ro") => DatabaseEnvKind::RO,
+        _ => DatabaseEnvKind::RW,
+    };
+    let args = DatabaseArgs { page_size: Some(MDBX_PAGE_SIZE), ..temp_chain_db_args() };
+    let db = DatabaseEnv::open(Path::new(&dir), kind, args.database_args()).expect("open MDBX");
+    println!("mdbx-holder: open");
+    std::io::stdout().flush().expect("flush");
+    std::io::stdin().read_to_end(&mut Vec::new()).expect("wait for the test");
+    drop(db);
+}
+
+/// [`mdbx_holder_process`], running: another process holding the MDBX database open, idle.
+/// Dropping it closes the holder's stdin, which ends it, and waits for it to exit.
+struct MdbxHolder {
+    /// The holder process.
+    child: std::process::Child,
+    /// Its stdout, read to its end before the wait, so the holder never writes to a closed pipe.
+    out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl MdbxHolder {
+    /// Start the holder on the MDBX database in `dir`, opened as `kind` (`rw` or `ro`), and wait
+    /// until it holds it open.
+    fn open(dir: &Path, kind: &str) -> Self {
+        use std::io::BufRead as _;
+        let mut child = test_process("mdbx_holder_process")
+            .env(HOLDER_DIR, dir)
+            .env(HOLDER_KIND, kind)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the holder process");
+        let mut out = std::io::BufReader::new(child.stdout.take().expect("its stdout"));
+        // The line follows libtest's `test <name> ...` on its line.
+        let mut seen = String::new();
+        while !seen.contains("mdbx-holder: open") {
+            let read = out.read_line(&mut seen).expect("the holder's output");
+            assert!(read > 0, "the holder ended before it opened MDBX: {seen}");
+        }
+        Self { child, out }
+    }
+}
+
+impl Drop for MdbxHolder {
+    fn drop(&mut self) {
+        use std::io::Read as _;
+        drop(self.child.stdin.take());
+        let _ = self.out.read_to_end(&mut Vec::new());
+        let _ = self.child.wait();
+    }
+}
+
+/// Another process holding the MDBX database open and committing nothing (a build running reth on
+/// MDBX on a second datadir naming the same `db/`, idle) leaves no trace in the record the
+/// migration takes, and would go on writing to the `mdbx.dat` the migration removes: the
+/// migration's exclusive open is refused with `MDBX_BUSY`, whether the holder opened MDBX
+/// read-write or read-only, and the error says to stop that process, with MDBX unchanged. Once the
+/// holder has stopped, the next open migrates.
+#[test]
+fn an_mdbx_database_another_process_holds_open_is_refused() {
+    for kind in ["rw", "ro"] {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let expected = build_mdbx(&path);
+        let holder = MdbxHolder::open(&path, kind);
+        let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+
+        let err = open(&path).expect_err("another process holds MDBX open");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(BUSY_HINT), "{kind}: says to stop the holder: {msg}");
+        assert!(msg.contains("MDBX database is unchanged"), "{kind}: {msg}");
+        assert_untouched(&path, &mdbx, kind);
+        assert!(exists(&path.join(MDBX_LOCK_FILE)), "{kind}: mdbx.lck kept");
+
+        drop(holder);
+        let db = open(&path)
+            .unwrap_or_else(|e| panic!("{kind}: migrates once the holder stopped: {e:#}"));
+        let mut rows = raw_rows(&*db);
+        rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+        assert!(rows == expected, "{kind}: every row, as MDBX held it");
+    }
+}
+
+/// The open reads the database directory's files under the directory's lock: a migration that
+/// another process (a second datadir naming the same `db/`) finishes between the open's first look
+/// and its lock is seen as finished, and the open goes on to the migrated database. Read before the
+/// lock, the files would say MDBX is still to migrate, and the migration would fail at its open of
+/// an `mdbx.dat` that is gone.
+#[test]
+fn a_migration_another_process_finishes_before_the_lock_is_seen_finished() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+    let dir = path.clone();
+    RUN_AT.set(Some((
+        Step::BeforeLock,
+        Box::new(move || {
+            let args = tn_lmdb_args(&tn_lmdb_db_args()).expect("the node's settings");
+            migrate_from_mdbx(&dir, args).expect("the other process migrates");
+        }),
+    )));
+    let db = open(&path).unwrap_or_else(|e| panic!("opens the migrated database: {e:#}"));
+    assert!(RUN_AT.with_borrow(Option::is_none), "the other migration ran");
+    assert!(!exists(&path.join(MDBX_DATA_FILE)), "MDBX is gone");
+    assert!(exists(&path.join(MIGRATED_MARKER)), "the marker is written");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "every row, as MDBX held it");
 }
 
 /// While `mdbx.dat` or the temp directory is in the database directory, the open holds an
@@ -935,20 +1045,30 @@ fn a_migration_is_refused_while_another_process_holds_the_directory() {
 }
 
 /// MDBX's `MDBX_WANNA_RECOVERY` on the read-only open (an environment stopped uncleanly under
-/// `safe-no-sync`) gets the hint to run the previous binary once and stop it cleanly, over the
-/// error as reth reports it; any other open error is left as it is.
+/// `safe-no-sync`) gets the hint to run the previous binary once and stop it cleanly, and its
+/// `MDBX_BUSY` (another process has the environment open) the hint to stop that process, each over
+/// the error as reth reports it; any other open error is left as it is.
 #[test]
-fn an_mdbx_open_refused_for_recovery_gets_a_hint() {
+fn an_mdbx_open_refused_busy_or_for_recovery_gets_a_hint() {
     let open_error = |e: MdbxError| {
         eyre::Report::new(DatabaseError::Open(e.into()))
             .wrap_err("Could not open database at path: db")
     };
+    for (refusal, hint, other) in [
+        (MdbxError::WannaRecovery, WANNA_RECOVERY_HINT, BUSY_HINT),
+        (MdbxError::Busy, BUSY_HINT, WANNA_RECOVERY_HINT),
+    ] {
+        let msg = format!("{:#}", describe_mdbx_open_error(open_error(refusal)));
+        assert!(msg.contains(hint), "{msg}");
+        assert!(!msg.contains(other), "{msg}");
+        assert!(msg.contains("Could not open database at path: db"), "{msg}");
+    }
     let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::WannaRecovery)));
-    assert!(msg.contains(WANNA_RECOVERY_HINT), "{msg}");
-    assert!(msg.contains("Could not open database at path: db"), "{msg}");
     assert!(msg.contains("MDBX_WANNA_RECOVERY"), "MDBX's own text: {msg}");
-    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::Busy)));
-    assert!(!msg.contains(WANNA_RECOVERY_HINT), "{msg}");
+    let msg = format!("{:#}", describe_mdbx_open_error(open_error(MdbxError::Corrupted)));
+    for hint in [WANNA_RECOVERY_HINT, BUSY_HINT] {
+        assert!(!msg.contains(hint), "{msg}");
+    }
     assert!(msg.contains("Could not open database at path: db"), "{msg}");
 }
 

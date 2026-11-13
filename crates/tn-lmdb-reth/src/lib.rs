@@ -193,7 +193,12 @@
 //!   `Bytecode`, say) is `DatabaseError::Decode` at a `get` or a cursor's read, where reth's
 //!   decoders panic on it (`from_compact` expects its input well formed) and MDBX's backend lets
 //!   the panic through. The decode runs under a panic catch (`tx::guarded`), which costs nothing on
-//!   a value that decodes; `a_damaged_value_is_a_decode_error_not_a_panic` pins it.
+//!   a value that decodes; `a_damaged_value_is_a_decode_error_not_a_panic` pins it. The process's
+//!   panic hook still runs first, at every read of the row: the default hook prints the panic's
+//!   message and where it panicked (in reth's decoder) to stderr, and a backtrace under
+//!   `RUST_BACKTRACE`, naming neither the table nor the key. The catch then logs an `error` naming
+//!   the table, the stored key in hex and the panic's message. This crate installs no hook; a build
+//!   with `panic = "abort"` would abort at the panic instead.
 //!
 //! The data:
 //! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for

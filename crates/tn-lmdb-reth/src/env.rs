@@ -591,7 +591,10 @@ impl TnLmdbEnv {
     /// table whose layout is an engine dup table as one (`DupLayout::options`, resolved at the
     /// file's page size), every other table as a plain one. A table the file holds in the other
     /// form (or a dup table with other options) is the engine's `TableKind`, `MDBX_INCOMPATIBLE`
-    /// as [`DatabaseError::CreateTable`].
+    /// as [`DatabaseError::CreateTable`]. A dup-sort table's layout is recorded (the
+    /// `TnLmdbRethLayout` table) as the call creates the table, never for one the file already
+    /// holds: its row, if any, is the one [`TnLmdbEnv::open`] compared, and a table without one was
+    /// written before the record, with a layout this call cannot know.
     pub fn create_tables_for<TS: TableSet>(&mut self) -> Result<(), DatabaseError> {
         let mut txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
         let create_error = |e: tn_lmdb::Error| DatabaseError::CreateTable(error::info(&e));
@@ -601,12 +604,13 @@ impl TnLmdbEnv {
             let name = info.name();
             let layout = self.tables.layout(name);
             let options = self.tables.options(layout).map_err(create_error)?;
+            let held = txn.open_table(name).map_err(create_error)?.is_some();
             let table = match options {
                 Some(options) => txn.create_dup_table(name, options),
                 None => txn.create_table(name),
             }
             .map_err(create_error)?;
-            if let Some(layout) = layout {
+            if let Some(layout) = layout.filter(|_| !held) {
                 txn.put(&records, name.as_bytes(), &layout_record(layout)).map_err(create_error)?;
             }
             created.push((name, self.tables.entry(&txn, table)?));

@@ -791,7 +791,7 @@ macro_rules! pair {
 /// value is `DatabaseError::Decode` ([`guarded`]).
 fn plain<T: Table>(entry: Option<Entry<'_>>) -> PairResult<T> {
     let Some((key, value)) = entry else { return Ok(None) };
-    guarded(|| Ok(Some((T::Key::decode(key)?, T::Value::decompress(value)?))))
+    guarded::<T, _>(key, || Ok(Some((T::Key::decode(key)?, T::Value::decompress(value)?))))
 }
 
 /// The row of dup-sort table `T` read as its stored key and its full value ([`Rows::dup_row`]),
@@ -800,7 +800,7 @@ fn plain<T: Table>(entry: Option<Entry<'_>>) -> PairResult<T> {
 fn dup_decoded<T: Table>(dup: DupLayout, row: Option<Entry<'_>>) -> PairResult<T> {
     let Some((key, value)) = row else { return Ok(None) };
     let (key_part, _) = dup.split(key).ok_or(DatabaseError::Decode)?;
-    guarded(|| Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?))))
+    guarded::<T, _>(key, || Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?))))
 }
 
 /// The value of the row of dup-sort table `T` read as its stored key and its full value
@@ -808,7 +808,8 @@ fn dup_decoded<T: Table>(dup: DupLayout, row: Option<Entry<'_>>) -> PairResult<T
 /// ([`guarded`]).
 #[inline(always)]
 fn dup_value_of<T: Table>(row: Option<Entry<'_>>) -> ValueOnlyResult<T> {
-    guarded(|| row.map(|(_, value)| T::Value::decompress(value)).transpose())
+    let Some((key, value)) = row else { return Ok(None) };
+    guarded::<T, _>(key, || T::Value::decompress(value).map(Some))
 }
 
 impl Rows {

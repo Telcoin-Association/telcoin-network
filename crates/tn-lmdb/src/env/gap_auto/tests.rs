@@ -651,3 +651,15 @@ fn the_chooser_costs_microseconds_per_step() {
     );
     assert!(per(of_ns + choose_ns + observe_ns) < 1_000.0, "under 1 ms a step");
 }
+
+/// The cheapest width is one of those given, whatever their costs: a NaN cost counts as infinite
+/// (else a choice of nothing but NaN costs would be `u32::MAX`, a width past `MAX_GAP_FILL`), and
+/// a tie goes to the smaller width.
+#[test]
+fn the_cheapest_width_is_always_one_given() {
+    assert_eq!(cheapest(CANDIDATES.into_iter(), |_| f64::NAN), (0, f64::INFINITY));
+    assert_eq!(cheapest(CANDIDATES.into_iter(), |_| f64::INFINITY), (0, f64::INFINITY));
+    let cost = |width: u32| if width == 0 { f64::NAN } else { 1.0 + f64::from(width) };
+    assert_eq!(cheapest(CANDIDATES.into_iter(), cost), (1, 2.0));
+    assert_eq!(cheapest(beside(MAX_GAP_FILL).into_iter().flatten(), |_| f64::NAN).0, 32);
+}
