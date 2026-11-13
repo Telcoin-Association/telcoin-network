@@ -20,8 +20,10 @@
 //!    `--metrics`. A global tracing subscriber is installed too (`init_test_tracing`: errors to
 //!    stdout unless `RUST_LOG` says otherwise), as the node installs reth's tracer at startup.
 //!    Without a global dispatcher every `trace`-level span of reth-trie's walk takes tracing's
-//!    `log` fallback, which cost about 9% of the state root; with one they are disabled at their
-//!    call sites, as on a node. Numbers from before the subscriber are not like for like.
+//!    `log` fallback, which took 9% of the state root's CPU samples (about 57 ms an output) in a
+//!    samply profile of the peak profile (Mac M1 Max, storage v2, at 2ef5c7f90, 2026-11-10); with
+//!    one they are disabled at their call sites, as on a node. Numbers from before the subscriber
+//!    are not like for like.
 //! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend, storage layout
 //!    and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE` and reth's storage
 //!    layout `LAYOUT` ([`StorageLayout`]): both are fixed when the datadir is created, so the base,
