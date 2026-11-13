@@ -2221,3 +2221,17 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   writer commits and keeps the dictionaries), `test_jars_without_a_dictionary_read_back`,
   `test_checksummed_jar_refuses_dictionary_zstd`. *Upstream*: maybe (upstream no longer writes
   dictionary jars).
+
+- **TN-0149** — A NippyJar writer refuses a checksummed jar that names dictionary zstd before it
+  creates any file. *Kind*: fix. *Files*: `crates/storage/nippy-jar/src/{lib.rs, writer.rs,
+  tn_dictionary_tests.rs}`.
+  *Why*: a checksummed jar (version 2, TN-0120) naming dictionary zstd was refused only by `load`
+  (`UnsupportedCompression`). `NippyJarWriter::new` opened it, appended rows and committed, and
+  every later load refused the jar, so its rows could never be read again. `load`'s check is now
+  `NippyJar::check_compression`, and `NippyJarWriter::new` runs it first, with the same error.
+  `save_to_writer` still writes such a configuration: it writes no rows, and the load tests make
+  their refused configurations with it. *Can reach execution or storage*: no. The provider's
+  `create_jar` gives headers jars LZ4 and other segments no compressor, and TN never trains a
+  dictionary, so no jar TN writes is refused and no jar, `.conf` or digest changes.
+  *Tests*: `test_checksummed_jar_refuses_dictionary_zstd` (the writer's refusal, and no file
+  created; it fails without the writer's check). *Upstream*: no (TN-0120's checksummed format is TN's).

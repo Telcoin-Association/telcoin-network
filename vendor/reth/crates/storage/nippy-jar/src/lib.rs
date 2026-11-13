@@ -356,15 +356,21 @@ impl<H: NippyJarHeader> NippyJar<H> {
         if jar.version != NIPPY_JAR_VERSION && jar.version != NIPPY_JAR_VERSION_CHECKSUMS {
             return Err(NippyJarError::UnsupportedVersion(jar.version))
         }
-        // TN(TN-0120): a checksummed jar may not name dictionary zstd: its dictionaries live in
-        // the configuration, which every commit rewrites. Only upstream's format (version 1)
-        // carries them (TN-0146 makes that path write and reopen correctly).
-        if jar.has_checksums() &&
-            matches!(&jar.compressor, Some(Compressors::Zstd(zstd)) if zstd.use_dict)
+        jar.check_compression()?;
+        Ok(jar)
+    }
+
+    /// TN(TN-0120): a checksummed jar may not name dictionary zstd: its dictionaries live in the
+    /// configuration, which every commit rewrites. Only upstream's format (version 1) carries
+    /// them (TN-0146 makes that path write and reopen correctly). Checked at load and, TN(TN-0149),
+    /// when a writer opens the jar, so no row is written that a load would then refuse.
+    pub(crate) fn check_compression(&self) -> Result<(), NippyJarError> {
+        if self.has_checksums() &&
+            matches!(&self.compressor, Some(Compressors::Zstd(zstd)) if zstd.use_dict)
         {
             return Err(NippyJarError::UnsupportedCompression)
         }
-        Ok(jar)
+        Ok(())
     }
 
     /// Returns the path for the data file

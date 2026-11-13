@@ -57,6 +57,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     ///
     /// It will **always** attempt to heal any inconsistent state when called.
     pub fn new(jar: NippyJar<H>) -> Result<Self, NippyJarError> {
+        // TN(TN-0149): a compressor `load` refuses is refused before any file is created.
+        jar.check_compression()?;
         // TN(TN-0132): a jar whose configuration counts rows has no file to create: one missing
         // is damage, not a new jar.
         if jar.rows > 0 {
