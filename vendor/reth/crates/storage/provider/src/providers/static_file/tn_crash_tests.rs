@@ -2,7 +2,7 @@
 //! through `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens
 //! as the state before it or after it, and files shorter than their committed configuration, or
 //! a jar missing between two others, are refused. TN(TN-0138): a failed sync of a segment commit
-//! writes no configuration.
+//! writes no configuration. TN(TN-0150): a rotation stopped before the next jar has its files.
 
 use super::{
     manager::StaticFileWriter,
@@ -216,6 +216,105 @@ fn rotation_after_an_empty_offsets_file() {
         assert_accounts(&provider, 3, 4);
         for path in &next {
             assert_eq!(load(path).rows() as u64, if path == &next[0] { 2 } else { 2 * CHANGES });
+        }
+    }
+}
+
+/// TN(TN-0150): a rotation writes the next jar's configuration before its data and offsets files.
+/// A rotation whose configuration cannot be written (a directory where its temporary file goes)
+/// leaves no file of the next jar; one stopped after the configuration, or after the data file
+/// too, leaves a jar the next start does not list. In each case the next start opens and the
+/// next persist writes the jar, in both formats, for a block segment and a changeset segment.
+/// Fails if the files come first: the stray data file has no configuration and no start loads it.
+#[test]
+fn rotation_stopped_before_the_next_jar_has_its_files() {
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_storage_api::HeaderProvider;
+
+    let header = |number: u64| Header { number, ..Default::default() };
+    let hash = |number: u64| B256::with_last_byte(number as u8 + 1);
+    for checksums in [false, true] {
+        // The next jar's files left: none (its configuration write failed), the configuration,
+        // the configuration and the data file.
+        for kept in [None, Some(&["conf"][..]), Some(&["conf", ""])] {
+            let case = format!("checksums {checksums}, kept {kept:?}");
+            let (dir, _) = create_test_static_files_dir();
+            let provider = provider(dir.path(), checksums, 2);
+            let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
+            for number in 0..2 {
+                headers.append_header(&header(number), &hash(number)).unwrap();
+            }
+            headers.commit().unwrap();
+            drop(headers);
+            write_accounts(&provider, 0..2, 2);
+            let next = [StaticFileSegment::Headers, ACCOUNTS]
+                .map(|segment| provider.directory().join(segment.filename(&(2..=3).into())));
+            let blockers = next.clone().map(|path| path.with_extension("tmp"));
+            if kept.is_none() {
+                for blocker in &blockers {
+                    std::fs::create_dir(blocker).unwrap();
+                }
+            }
+
+            // The rotation opens the next jar.
+            let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
+            let rotated = headers.append_header(&header(2), &hash(2));
+            assert_eq!(rotated.is_ok(), kept.is_some(), "{case}");
+            drop(headers);
+            let mut accounts = provider.latest_writer(ACCOUNTS).unwrap();
+            let rotated = accounts.append_account_changeset(account_changes(2), 2);
+            assert_eq!(rotated.is_ok(), kept.is_some(), "{case}");
+            drop(accounts);
+            drop(provider);
+            for path in &next {
+                for ext in ["", "off", "conf", "csoff"] {
+                    let file = if ext.is_empty() { path.clone() } else { path.with_extension(ext) };
+                    match kept {
+                        None => assert!(!file.exists(), "{case}: {}", file.display()),
+                        Some(kept) if !kept.contains(&ext) && file.exists() => {
+                            std::fs::remove_file(file).unwrap()
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            for blocker in blockers.iter().filter(|blocker| blocker.exists()) {
+                std::fs::remove_dir(blocker).unwrap();
+            }
+
+            let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+            assert_eq!(
+                provider.get_highest_static_file_block(StaticFileSegment::Headers),
+                Some(1),
+                "{case}"
+            );
+            let mut headers = provider.latest_writer(StaticFileSegment::Headers).unwrap();
+            for number in 2..4 {
+                headers.append_header(&header(number), &hash(number)).unwrap();
+            }
+            headers.commit().unwrap();
+            drop(headers);
+            let mut accounts = provider.latest_writer(ACCOUNTS).unwrap();
+            for block in 2..4 {
+                accounts.append_account_changeset(account_changes(block), block).unwrap();
+            }
+            accounts.commit().unwrap();
+            drop(accounts);
+            drop(provider);
+
+            let provider = super::tn_checksum_tests::provider(dir.path(), checksums, 2);
+            for number in 0..4 {
+                assert_eq!(provider.header_by_number(number).unwrap(), Some(header(number)));
+            }
+            assert_accounts(&provider, 3, 4);
+            for path in &next {
+                assert_eq!(
+                    load(path).rows() as u64,
+                    if path == &next[0] { 2 } else { 2 * CHANGES },
+                    "{case}"
+                );
+            }
         }
     }
 }

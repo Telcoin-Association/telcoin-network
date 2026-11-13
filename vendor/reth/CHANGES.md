@@ -1993,9 +1993,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs, error.rs}`
   (`NippyJarChecker::reset_files`, `DataReader::new`, `NippyJarError::EmptyOffsetsFile`, tests),
   `crates/storage/provider/src/providers/static_file/tn_crash_tests.rs`.
-  *Why*: a rotation creates the next jar's data and offsets files, writes the 9-byte offsets
-  header without a sync and then the jar's configuration (rows 0) durably. A power loss there can
-  leave the configuration and an empty or torn offsets file (ext4's delayed allocation keeps the
+  *Why*: a rotation writes the next jar's configuration (rows 0) durably and creates its data and
+  offsets files, the 9-byte offsets header without a sync (the configuration came last until
+  TN-0150). A power loss there can leave the configuration and an empty or torn offsets file (ext4's delayed allocation keeps the
   size at 0). The next persist reopens that jar, the heal maps the offsets file and
   `DataReader::new` indexed byte 0 of an empty map: a panic at every start, until someone deleted
   the files by hand. A configuration that counts no rows commits nothing, so whatever the files
@@ -2367,3 +2367,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   dictionary, so no jar TN writes is refused and no jar, `.conf` or digest changes.
   *Tests*: `test_checksummed_jar_refuses_dictionary_zstd` (the writer's refusal, and no file
   created; it fails without the writer's check). *Upstream*: no (TN-0120's checksummed format is TN's).
+
+- **TN-0150** — A new NippyJar's configuration is written before its data and offsets files, so a
+  creation stopped at any point leaves a datadir the next start opens. *Kind*: fix (static-file
+  crash safety). *Files*: `crates/storage/nippy-jar/src/writer.rs` (`create_or_open_files`,
+  `NippyJarWriter::new`), `crates/storage/provider/src/providers/static_file/tn_crash_tests.rs`.
+  *Why*: `NippyJarWriter::new` created a new jar's data and offsets files and only then wrote its
+  configuration (rows 0). Jars are found by their data file (`iter_static_files` loads the
+  `.conf` beside each extension-less name), so a kill or power loss in between, at every
+  rotation to a new file and at genesis, left a data file with no configuration: every later
+  start failed in `iter_static_files`, before `layout::settle` or `check_consistency` ran, until
+  someone removed the files by hand. `create_or_open_files` now writes the configuration first,
+  then creates the files and syncs their directory (the configuration's own directory sync made
+  them durable before, when it came last). A creation stopped after the configuration leaves a
+  configuration no listing sees, or one beside a data file; a new jar's header has no block
+  range, so the start does not index it either, and the next persist creates the jar again
+  (TN-0131 resets a jar without rows). This also replaces a stopped deletion's leftover
+  configuration (TN-0132) before a data file appears beside it. *Can reach execution or
+  storage*: storage, but no byte changes: the configuration, data and offsets files hold what
+  they held, and only the order of their creation moves, plus one directory sync per new jar.
+  Nothing a reader or the consistency check sees depends on the order: both find jars through
+  their data file and index only jars with a block range. A datadir an older build wrote opens
+  as before. *Tests*: `rotation_stopped_before_the_next_jar_has_its_files` (headers and account
+  changesets, both versions: a rotation whose configuration write fails leaves no file of the
+  next jar, and one stopped after the configuration, or after the data file too, opens; the next
+  persist writes the jar and every block reads; it fails with the old order, on the stray data
+  file). *Upstream*: yes (upstream's order).

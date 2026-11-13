@@ -6,7 +6,6 @@ use crate::{
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
 };
 use zstd::{bulk::Compressor, zstd_safe};
 
@@ -69,13 +68,9 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
             }
         }
 
-        let (data_file, offsets_file, is_created) =
-            Self::create_or_open_files(jar.data_path(), &jar.offsets_path())?;
+        let (data_file, offsets_file, is_created) = Self::create_or_open_files(&jar)?;
 
         let (jar, data_file, offsets_file) = if is_created {
-            // Makes sure we don't have dangling data and offset files when we just created the file
-            jar.freeze_config()?;
-
             (jar, BufWriter::new(data_file), BufWriter::new(offsets_file))
         } else {
             // If we are opening a previously created jar, we need to check its consistency, and
@@ -150,11 +145,18 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         self.jar
     }
 
-    fn create_or_open_files(
-        data: &Path,
-        offsets: &Path,
-    ) -> Result<(File, File, bool), NippyJarError> {
+    fn create_or_open_files(jar: &NippyJar<H>) -> Result<(File, File, bool), NippyJarError> {
+        let (data, offsets) = (jar.data_path(), &jar.offsets_path());
         let is_created = !data.exists() || !offsets.exists();
+
+        // TN(TN-0150): a new jar's configuration (no rows) is written before its files exist.
+        // Jars are found by their data file (`iter_static_files`), which loads the configuration
+        // beside it, so a creation stopped at any point leaves a configuration no listing sees, or
+        // a jar without rows, which the next open resets (`NippyJarChecker`). Written after the
+        // files, a stop in between left a data file with no configuration, which no start loads.
+        if is_created {
+            jar.freeze_config()?;
+        }
 
         if !data.exists() {
             // File::create is write-only (no reading possible)
@@ -188,6 +190,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
             offsets_file.write_all(&buf)?;
             offsets_file.seek(SeekFrom::End(0))?;
+
+            // TN(TN-0150): the new files' directory entries are durable before the writer
+            // returns, as the configuration's directory sync made them when it came last.
+            if let Some(dir) = data.parent() {
+                reth_fs_util::fsync_file(&File::open(dir)?)?;
+            }
         }
 
         Ok((data_file, offsets_file, is_created))
@@ -537,7 +545,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Returns the path to the data file for the associated [`NippyJar`].
     #[cfg(test)]
-    pub fn data_path(&self) -> &Path {
+    pub fn data_path(&self) -> &std::path::Path {
         self.jar.data_path()
     }
 
