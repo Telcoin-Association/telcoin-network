@@ -31,7 +31,7 @@ stack overflow).
 and `vmTrace`), copying the whole stack at each step unless the stack is disabled and memory when
 it is enabled, and nothing counted steps or bytes; geth's `limit` option is ignored. Under a 50M
 gas cap a call with a 1,000-word stack looping on cheap opcodes recorded tens of GB before the
-response was built, and the node was OOM-killed (TN review R4). Whatever the preset, it also
+response was built, and the node was OOM-killed. Whatever the preset, it also
 keeps a trace of every call and create, with a fresh copy of the call's input, the init code and
 the output, so a contract looping on `STATICCALL` with 16 KiB of calldata did the same through
 `callTracer` and the parity `trace_*` methods, which record no steps.

@@ -134,8 +134,7 @@ cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --
 # The vendored reth's own invariants: every TN change to the copy is named by a ledger entry,
 # the copy matches the upstream pin plus the ledger, and the manifests stay inside the carried
 # crate set. They need the upstream clone (~/.cache/tn-vendor/reth, cloned on first use), which
-# CI does not have; the attested run makes the claim the ledger otherwise only asserts
-# (vendored reth review R29).
+# CI does not have; the attested run makes the claim the ledger otherwise only asserts.
 python3 -I vendor/reth/tn/vendor.py status > /dev/null
 python3 -I vendor/reth/tn/vendor.py ledger
 python3 -I vendor/reth/tn/vendor.py check

@@ -481,8 +481,8 @@ where
             }
 
             // TN(TN-0077): a block trace runs on a blocking thread of its own, so the chunk
-            // replays as many blocks at once as the request holds permits, not the whole chunk
-            // (review R10). The stream keeps the blocks' order.
+            // replays as many blocks at once as the request holds permits, not the whole chunk.
+            // The stream keeps the blocks' order.
             #[allow(clippy::iter_with_drain)]
             let block_traces: Vec<_> = futures::stream::iter(block_traces.drain(..))
                 .buffered(TRACE_FILTER_PERMITS as usize)

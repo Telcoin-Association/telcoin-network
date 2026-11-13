@@ -154,7 +154,7 @@ where
                     // TN(TN-0083): the commit below finalizes the static files before the MDBX
                     // transaction, so a first launch that crashed between the two leaves the
                     // genesis header in static files and nothing in the database, and every
-                    // restart failed here until the operator deleted the datadir (review R17).
+                    // restart failed here until the operator deleted the datadir.
                     // With no stage checkpoint at all the database is empty, so the launch
                     // resumes: `insert_genesis_header` keeps the header already there. Storage v1
                     // only: under v2 genesis also committed block 0 of the changeset segments,

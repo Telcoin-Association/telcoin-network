@@ -560,7 +560,7 @@ FILES_SENTENCE = re.compile(r"\*Files\*:(.*?)(?=\n\s*\*[A-Z][A-Za-z ]*\*:|\Z)", 
 def ledger_paths(text, crates):
     """Map every path the ledger's entries name to the ids of the entries that name it.
 
-    Only the entry's *Files* sentence names paths (TN-0084, review R28): a backticked token
+    Only the entry's *Files* sentence names paths (TN-0084): a backticked token
     elsewhere in the entry is prose. A path token may wrap across lines and use `{a,b}`
     alternatives. It is written from vendor/reth (`crates/...`, `testing/...`), or from a crate
     the same sentence named earlier (`tests/it/startup.rs` after

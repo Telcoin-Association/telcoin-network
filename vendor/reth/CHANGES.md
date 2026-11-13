@@ -660,7 +660,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: the handler resolved the parent header from the request's block tag, then passed the tag
   again to `spawn_with_state_at_block`, which resolved `latest` a second time. On TN's block rate
   the simulated chain could be built on header N over the state of N+1: `NonceTooLow` under
-  `validation: true`, and block numbers that describe a chain that never existed (review R8). The
+  `validation: true`, and block numbers that describe a chain that never existed. The
   state is now loaded by the resolved block's hash; `pending` still goes through the pending state.
   RPC only.
   *Tests*: none added; upstream has none (the race needs the tip to move between two reads). The
@@ -672,7 +672,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: tokio's `poll_recv_many` returns zero items for a limit of 0 without registering a waker,
   so the pool's transaction batcher returned `Pending` forever and every `eth_sendRawTransaction`
   queued on a oneshot that never answered. TN parses reth's `TxPoolArgs` unchanged
-  (`tn-reth/src/cli.rs`), so the value reached TN's pool (review R13). The flag now takes 1 or
+  (`tn-reth/src/cli.rs`), so the value reached TN's pool. The flag now takes 1 or
   more; the default (and every running node) is unchanged. Pool plumbing only.
   *Tests*: upstream's `txpool_max_batch_size_must_be_nonzero`. *Upstream*: n/a (upstream commit).
 
@@ -684,7 +684,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: `prepare_call_env` first clamps an omitted gas limit to the RPC cap, then, for a priced
   call, replaces it with the caller's allowance clamped only to the block gas limit, so an operator
   cap below the block limit did not hold for `eth_call`, `eth_estimateGas`, `eth_createAccessList`
-  and the trace calls (review R24). The allowance is now clamped to the cap as well. TN's defaults
+  and the trace calls. The allowance is now clamped to the cap as well. TN's defaults
   (cap 50M above the 30M block limit) were unaffected; a lower `--rpc.gascap` now means what it
   says. RPC only.
   *Tests*: upstream's `call_allowance_respects_rpc_gas_cap`; TN-0057's `call_many_budget_tests`.
@@ -698,7 +698,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: the binary search finds the block in which the sender's nonce passed the requested value,
   then the handler mapped "no matching transaction in that block" onto the same `HeaderNotFound`
   error as a missing block. A nonce can move without a transaction from the sender: EIP-7702
-  authorizations, and on TN contract creations and the system-call sender (review R22). An
+  authorizations, and on TN contract creations and the system-call sender. An
   existing block with no match is now `null`; a block the provider cannot read is still the
   header error. The vendored `TransactionInfo` has no `block_timestamp` field, so that line of
   upstream's change is not taken. RPC only.
@@ -714,7 +714,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: `debug_trace*` answered a missing block or transaction with -32001 (`ResourceNotFound`,
   reth's code for `eth` lookups) where geth and the execution-apis tests use -32000; tracing
   genesis failed with "block not found" for the zero parent hash instead of saying why.
-  Prerequisite of 5d6634a6f (`debug_traceCall`, review R26), which uses these variants. Error
+  Prerequisite of 5d6634a6f (`debug_traceCall`), which uses these variants. Error
   codes and messages only; RPC only.
   *Tests*: upstream's `tracing_lookup_errors_use_call_execution_failed_code`; the `debug` doc
   pages (`debug_traceBlockByNumber`, `ByHash`, `debug_traceTransaction`) now state -32000.
@@ -726,7 +726,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   test `trace_call_out_of_range_block_error` on the permit fixture of `trace_permit_tests`).
   *Why*: the two `debug_traceCall` paths resolved their block through the `eth` helpers and so
   answered an unknown block with `eth`'s -32001 while the other `debug_trace*` methods, after
-  TN-0064, use geth's -32000 (review R26). The `HeaderNotFound` for the requested block is now
+  TN-0064, use geth's -32000. The `HeaderNotFound` for the requested block is now
   mapped to `TracingBlockNotFound`; TN-0049's cancellation wrapper stays around the call. Error
   code only; RPC only.
   *Tests*: upstream's `trace_call_out_of_range_block_error`, with `eth_call` checked for -32001
@@ -741,7 +741,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the vendored mock provider resolves blocks after TN-0036).
   *Why*: `trace_get` took the list as a single flat index into `trace_transaction`'s output and
   answered `null` for any other list length, where OpenEthereum, Erigon and Nethermind read it as
-  the frame's path in the call tree (review R26). It now returns the frame whose `traceAddress`
+  the frame's path in the call tree. It now returns the frame whose `traceAddress`
   equals the list, `[]` being the top-level call, and `null` when no frame has that path. Clients
   that passed `["0x0"]` for the root now get its first child; `docs/src/rpc-methods/trace/trace_get.md`
   describes the path semantics. RPC only.
@@ -755,7 +755,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `replay_transaction_includes_transaction_hash` in the `tests` module without its RPC-cache seeding,
   as TN-0066).
   *Why*: `trace_replayTransaction` returned the bare trace results, where the other Parity-style
-  clients and `trace_replayBlockTransactions` wrap them with `transactionHash` (review R26). The
+  clients and `trace_replayBlockTransactions` wrap them with `transactionHash`. The
   result now has the same shape as one entry of a block replay, so a client can tell which
   transaction a replay belongs to; `docs/src/rpc-methods/trace/trace_replaytransaction.md` shows
   the field. RPC only.
@@ -772,7 +772,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/rpc/rpc-builder/tests/it/http.rs` (the `trace` smoke test expects `null`).
   *Why*: a replay of a transaction the node does not know failed with `-32001` and
   `transaction not found`, where `trace_transaction` and `trace_get` answer `null` for the same
-  miss (review R26). It now answers `null` too, as upstream and the other Parity-style clients
+  miss. It now answers `null` too, as upstream and the other Parity-style clients
   do; `docs/src/rpc-methods/trace/trace_replaytransaction.md` records the change. RPC only.
   *Tests*: upstream's `replay_missing_transaction_returns_null` (with and without trace types, over
   the RPC module) and the updated `rpc-builder` smoke test. *Upstream*: n/a (upstream commit).
@@ -783,7 +783,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`trace_call_many`; upstream's test `trace_call_many_defaults_to_latest` in the `tests` module,
   its imports inside the test as the module's other tests keep them).
   *Why*: an omitted block parameter selected `pending`, where `trace_call`, `eth_call` and the
-  other Parity-style clients default to `latest` (review R9). A `pending` the client names still
+  other Parity-style clients default to `latest`. A `pending` the client names still
   selects the pending block. `docs/src/rpc-methods/trace/trace_callmany.md` records the default.
   RPC only.
   *Tests*: upstream's `trace_call_many_defaults_to_latest` (an omitted block equals `latest` and
@@ -798,7 +798,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   one-permit guard deadlocks the direct call).
   *Why*: an omitted `fromBlock` meant genesis, so a filter that set neither bound asked for the
   whole chain and failed the `--rpc.max-trace-filter-blocks` range check on any chain longer than
-  the limit (review R26). Both bounds now default to the latest block, as upstream and the other
+  the limit. Both bounds now default to the latest block, as upstream and the other
   Parity-style clients have it; a filter with only `toBlock` below the latest block fails with
   `-32602` (`fromBlock cannot be greater than toBlock`). `docs/src/rpc-methods/trace/trace_filter.md`
   records the defaults. RPC only.
@@ -812,8 +812,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `replay_block_vmtrace_includes_root_and_callcode_bytecode` in the `tests` module without its
   RPC-cache seeding, as TN-0066).
   *Why*: a block replay with `vmTrace` left `code` empty in every frame, where
-  `trace_replayTransaction` of the same transaction filled it from the pre-state database (review
-  R26). Upstream fixes it with revm-inspectors' `into_trace_results_with_state_parts`, which
+  `trace_replayTransaction` of the same transaction filled it from the pre-state database.
+  Upstream fixes it with revm-inspectors' `into_trace_results_with_state_parts`, which
   exists from 0.44 and not in the vendored 0.34 series (`patches/revm-inspectors` carries 0.34.3).
   The vendored code uses the existing `into_trace_results_with_state` instead, which wants an
   owned `ResultAndState`, so the `vmTrace` path clones the transaction's state changes; requests
@@ -829,7 +829,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   taking its TN-0038 permit, so a miss costs no permit), `crates/rpc/rpc-builder/tests/it/http.rs`
   (upstream's smoke-test change; the vendored test already expected an error).
   *Why*: a replay of a block the node does not know answered `null`, where `trace_block` and the
-  `debug` block tracers fail (review R26). It now fails with `-32001` and a `block not found`
+  `debug` block tracers fail. It now fails with `-32001` and a `block not found`
   message, as upstream does; `docs/src/rpc-methods/trace/trace_replayblocktransactions.md`
   records it. RPC only.
   *Tests*: the `rpc-builder` trace smoke tests (`test_call_trace_functions_*`) expect the error;
@@ -848,7 +848,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   transaction then rechecks its sender's others against that state, so lower-nonce transactions
   can become pending while the inserted one stays parked. Those promotions were dropped on the
   floor: no pending-transaction listener, full-transaction listener or event stream heard of them
-  until some later pool maintenance (review R20). They are now sent as their own notifications,
+  until some later pool maintenance. They are now sent as their own notifications,
   once, subject to the usual propagation filter. Pool notifications only: block validity and
   what a worker proposes do not change.
   *Tests*: upstream's `queued_insertion_notifies_older_promotions`,
@@ -862,8 +862,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   this path), `crates/transaction-pool/src/validate/task.rs` (a test-only `max_capacity` accessor
   on `ValidationJobSender`; upstream's `spawn`, which the commit changes, is not in this copy).
   *Why*: the channel from submitters to the validation workers held one job, so with several
-  workers each handoff waited for a producer to refill it and the workers idled between jobs
-  (review R21). The channel now holds two jobs per worker (`2 * (additional_tasks + 1)`), as
+  workers each handoff waited for a producer to refill it and the workers idled between jobs.
+  The channel now holds two jobs per worker (`2 * (additional_tasks + 1)`), as
   upstream has it. Upstream made the change in `TransactionValidationTaskExecutor::spawn`,
   added after v1.11.4; the vendored path that spawns the workers is
   `EthTransactionValidatorBuilder::build_with_tasks`, which `tn-reth` calls, so the change lands
@@ -885,7 +885,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the mutex; the TN-0074 test reads the capacity directly).
   *Why*: every submitter took one async mutex before sending into the job channel, so the
   TN-0041 parallel workers rarely had more than one queued job, and a submit cancelled while it
-  waited for channel space never decremented `inflight_validation_jobs` (review R21). The mpsc
+  waited for channel space never decremented `inflight_validation_jobs`. The mpsc
   channel is multi-producer and bounded, so it gives the same backpressure without the lock;
   the gauge is decremented when the send future ends, however it ends. Pool admission
   throughput and a metric only: what is admitted does not change.
@@ -923,7 +923,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   that first read (a reader slot the 5-minute timeout killed, a damaged page) panicked the
   engine's blocking thread inside the state root computation instead of returning an error the
   engine can classify; reached once per state root and per account storage root, and from the
-  snapshot import (review R15). The error now propagates as `DatabaseError`.
+  snapshot import. The error now propagates as `DatabaseError`.
   *Execution path*: yes (`crates/trie`), and the change can not alter a root: every root the old
   code computed, the new code computes identically; the only new behaviour is an error where the
   old code panicked. No manifest or feature change (`graph.py diff` clean).
@@ -1214,7 +1214,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `async fn` body, before the blocking-IO permit (TN-0037) and the gas budget (TN-0046) applied.
   jsonrpsee polls that body on the runtime that started the server, which on a TN node is the
   runtime consensus runs on; a 15 MB request holds about 100k minimal transactions, seconds of
-  recovery per request, and nothing capped the count (review R1). The count is now checked first,
+  recovery per request, and nothing capped the count. The count is now checked first,
   against the most transactions the bundle's gas limit can hold (`call_gas_limit / 21_000`, 2,380
   at the default cap; TN-0046 would refuse the first one over anyway), and decoding, recovery and
   the blob-gas check moved into the blocking closure, after the permit, so the work runs on
@@ -1234,7 +1234,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: jsonrpsee defaults to unlimited batches and reth never set a limit, and reth's IPC server
   parses batches itself with no limit at all. One 15 MB batch queued about 100k calls on one
   connection, each holding its parsed parameters while waiting on a permit, and made every
-  per-request cost (filters, listeners) cheap to repeat (review R27). TN's `RpcServerArgs`
+  per-request cost (filters, listeners) cheap to repeat. TN's `RpcServerArgs`
   (`tn-reth/src/rpc_server_args.rs`) exposes the flag with the same default. A batch over the
   limit is refused whole with jsonrpsee's error -32010. RPC transport only.
   *Tests*: `can_set_max_batch_requests` (IPC: two calls pass at a limit of two, three are refused);
@@ -1262,7 +1262,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   so connection limits did not bound them, and each one can carry a filter near the request size
   limit. Every pending-transaction filter and every `newPendingTransactions` subscription also
   registered a pool listener that every pool insertion walks with a `try_send`, with no bound on
-  their number (review R2). The node now refuses the filter past `--rpc.max-active-filters`
+  their number. The node now refuses the filter past `--rpc.max-active-filters`
   (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
   TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
@@ -1281,7 +1281,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: each of the three ran any number of calls in one blocking task with only
   `prepare_call_env`'s per-call gas cap: no call count, no cumulative gas, and cancellation only
   between calls, so a 15 MB request of about 100k calls to a loop contract ran about 5e12 gas on
-  one thread, the shape TN-0046 closed for `eth_callBundle` (review R6). Each request now refuses,
+  one thread, the shape TN-0046 closed for `eth_callBundle`. Each request now refuses,
   before taking a permit or reading state, more calls than its gas cap can hold at the intrinsic
   21,000 each (2,380 at the default cap), and charges every call's gas used against one budget of
   `--rpc.gascap`, failing the request once it is exceeded. A call is charged after it ran, so a
@@ -1304,7 +1304,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   blocks) before reading a single receipt, with the 20,000-log cap applying only in the receipt
   phase. An empty filter matches every bloom and most TN blocks carry no logs, so a 100,000-block
   request over quiet history never tripped the cap and held about 53 to 78 MB of sealed headers
-  per request, up to 256 requests at once (review R5). The scan now reads one 1,000-header window,
+  per request, up to 256 requests at once. The scan now reads one 1,000-header window,
   fetches that window's receipts, appends the logs and checks the cap before the next window,
   as upstream does: memory is one window, the cap can end the query after the first window, and
   a dropped request stops at the next one. Parallel receipt fetching is decided per window (at
@@ -1324,7 +1324,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `Semaphore::new` panicked while the RPC server was built. TN flattens this struct into its own
   `RpcServerArgs`, so the flag reaches TN unchanged; TN's own permit flags
   (`--rpc.max-tracing-requests`, at least 2, and `--rpc.proof-permits`) got the same bounds in
-  `tn-reth/src/rpc_server_args.rs` (review R14). RPC configuration only.
+  `tn-reth/src/rpc_server_args.rs`. RPC configuration only.
   *Tests*: tn-reth's `permit_flags_are_bounded` parses all three flags through TN's CLI.
   *Upstream*: yes.
 
@@ -1334,8 +1334,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: the filter took two tracing permits and then traced every block of a chunk at once,
   up to `--rpc.max-tracing-requests` blocks, each in a blocking task of its own without a
   permit. The permits bounded the number of requests, not the replays: about half the permit
-  count in requests, each replaying up to the permit count in blocks, could run at once (review
-  R10). The chunk's traces now go through an ordered stream buffered to the two permits the
+  count in requests, each replaying up to the permit count in blocks, could run at once. The
+  chunk's traces now go through an ordered stream buffered to the two permits the
   request holds, so a `trace_filter` request occupies two tracing threads, as the permits say.
   Same traces in the same order; the chunking by `--rpc.max-tracing-requests` still bounds the
   blocks fetched at once. RPC only.
@@ -1352,7 +1352,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   transactions under it: a header with `gas_limit` `u64::MAX` and no base fee let a legacy
   transaction with gas price 0 and a gas limit of 2^63 loop until it ended, under a tracing
   permit the request held the whole time, and the cancel check of TN-0049 runs only between
-  transactions (review R3). The signer recovery of up to the body-size limit in transactions
+  transactions. The signer recovery of up to the body-size limit in transactions
   ran inline in the async handler as well. The raw block is now bounded as the callMany
   methods are (TN-0057): its transaction count may not exceed what `--rpc.gascap` can hold
   (`check_call_count`, before the signer recovery), and its transactions share one
@@ -1384,7 +1384,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   trace is serialized. Under the 50M gas cap a call with a 1,000-word stack looping on cheap
   opcodes recorded tens of GB before any response was built, and the node was OOM-killed; a mined
   30M-gas transaction of that shape made every `debug_traceTransaction` or
-  `trace_replayTransaction(vmTrace)` of it the same bomb (review R4). The inspector now counts the
+  `trace_replayTransaction(vmTrace)` of it the same bomb. The inspector now counts the
   bytes its steps hold (the step, its stack snapshot, a fresh memory copy, return data, immediate
   bytes, the pushed values `step_end` records) and, past `max_recorded_bytes`, ends the
   transaction the way TN-0017's interrupt does: the context error becomes `EVMError::Custom`
@@ -1439,7 +1439,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the `Bytecodes` table does not hold. On a node whose datadir lost such a row (a torn write, a
   partial snapshot), every call to that contract ran as a no-op and the node committed a root
   the other validators do not; peers then rejected its execution result, and its own logs showed
-  no database error (review R12). The lookup now fails with `BytecodeNotFound` unless the hash is
+  no database error. The lookup now fails with `BytecodeNotFound` unless the hash is
   the empty code's (`KECCAK256_EMPTY`), which revm resolves without a lookup anyway, so the block
   fails on the node that lost the row.
   *Execution path*: yes (`crates/revm`, every block and every RPC call). The change can not alter
@@ -1457,7 +1457,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: genesis initialization writes the genesis header to static files and everything else to
   MDBX, and the commit finalizes the static files before the MDBX transaction. A crash between the
   two left `block_hash(0)` set with no Headers checkpoint, and every restart returned
-  `UninitializedDatabase` until the operator deleted the datadir (review R17). When the database
+  `UninitializedDatabase` until the operator deleted the datadir. When the database
   holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
   resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
   written. A database with any checkpoint but not the Headers one is still refused.
@@ -1488,11 +1488,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: `ledger_paths` took any backticked token of an entry that started with `crates/` as a
   path and treated every token as a possible directory, so the prose "`crates/engine`" in
   TN-0019 and "`crates/revm`" in TN-0049 covered every file of two vendored crates, one of them
-  on the execution path, and a future edit there needed no entry to pass (review R28). Paths now
+  on the execution path, and a future edit there needed no entry to pass. Paths now
   come from the *Files* sentence only, and a token names a directory only with a trailing slash;
   the two prose tokens are reworded, and TN-0014's *Files* sentence names the stub it changed.
   Neither `etc/ci-lanes.sh test-vendor-reth` nor `etc/test-and-attest.sh` ran `vendor.py status`,
-  `ledger` or `check`, so the ledger invariant was a manual claim (review R29); the attested run
+  `ledger` or `check`, so the ledger invariant was a manual claim; the attested run
   now runs the three (they need the upstream clone, which CI lacks).
   *Tests*: `test_prose_tokens_and_bare_directories_name_nothing`; the existing ledger tests, with
   the directory token in `test_paths_expand_wrap_and_resolve_against_the_entry_crate` given its
@@ -1506,7 +1506,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   dependency requirement in the vendored manifest (`0.34.2`) matches the patch crate's version
   (0.34.3). A sync to any 0.35 to 0.44.1 makes cargo print "patch was not used" and link the
   registry crate, and the `revm-inspectors-patch` CI job, which tests the patch crate standalone,
-  stays green (review R30). The check the `test-vendor-reth` lane runs now reads the nested
+  stays green. The check the `test-vendor-reth` lane runs now reads the nested
   resolve and TN's `Cargo.lock` and fails when the crate has a registry or git source. TN-0080
   fixed the nested lane's own fallback to the registry; TN-0079's reth-side tests also fail to
   compile against the registry crate.

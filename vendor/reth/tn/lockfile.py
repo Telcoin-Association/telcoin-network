@@ -116,7 +116,7 @@ def drift(metadata, root_text):
     return sorted(out)
 
 
-# TN-0085 (review R30): the carried patch (patches/revm-inspectors) must be what both workspaces
+# TN-0085: the carried patch (patches/revm-inspectors) must be what both workspaces
 # resolve. A `[patch]` entry drops out silently when the dependency requirement stops matching the
 # patch crate's version (a sync to 0.35 up to 0.44.1 would), and the registry crate links instead.
 PATCHED = ("revm-inspectors",)

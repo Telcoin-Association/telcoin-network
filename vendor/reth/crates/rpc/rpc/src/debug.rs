@@ -211,7 +211,7 @@ where
 
         // TN(TN-0078): the header and the transactions come from the caller, so nothing the
         // chain enforced bounds them: a header with a huge gas limit and no base fee lets a
-        // transaction with a huge gas limit run until it ends (review R3). The block is bounded
+        // transaction with a huge gas limit run until it ends. The block is bounded
         // as a `debug_traceCallMany` request is: a call count the gas cap can hold, which also
         // bounds the signer recovery below, and one gas budget across its transactions.
         let gas_budget = self.eth_api().call_gas_limit();

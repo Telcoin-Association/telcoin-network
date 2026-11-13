@@ -150,7 +150,7 @@ impl<DB: EvmStateProvider> DatabaseRef for StateProviderDatabase<DB> {
     /// Retrieves the bytecode associated with a given code hash.
     ///
     /// Returns `Ok` with the bytecode if found. TN(TN-0082): a row missing for any code hash
-    /// but the empty code's is an error, not empty code (review R12). A node whose database
+    /// but the empty code's is an error, not empty code. A node whose database
     /// lost the row would otherwise run every call to that contract as a no-op and commit a
     /// root the other validators do not; the block fails instead.
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
