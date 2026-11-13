@@ -624,9 +624,13 @@ impl SnapshotRestorer {
     ///   any of the above commits, so pinned state reads below `B` are refused for the life of this
     ///   datadir (`read_only_state_db` in `env/mod.rs`).
     ///
-    /// Static files are committed BEFORE the database provider: the refuse-non-empty check in
-    /// [`open`](Self::open) keys on the Headers static-file height, so committing static files
-    /// first means a crash mid-scaffold leaves a datadir the next `open` correctly rejects.
+    /// Static files are committed BEFORE the database provider, as a persist commits them: a
+    /// crash between the two leaves static files at `B` beside a database still at genesis (every
+    /// stage checkpoint at 0, the `Finish` one [`open`](Self::open) reads included). The next
+    /// start's consistency check (`check_consistency` in `RethEnv::new`) prunes static files ahead
+    /// of the database's checkpoints, so the next `open` finds a genesis-only datadir and the
+    /// restore runs again, rewriting the floor marker. The other order would leave the database
+    /// ahead of the static files, which that check cannot heal and the start refuses.
     pub fn import_chain_scaffold(
         &self,
         window: &[SealedHeader],
@@ -850,7 +854,8 @@ impl SnapshotRestorer {
             provider_rw.save_stage_checkpoint(stage, StageCheckpoint::new(b))?;
         }
 
-        // static files first (see the refuse-non-empty rationale in the doc comment), then the db
+        // static files first, then the db: a crash between them is healed at the next start (see
+        // the doc comment)
         sf.commit()?;
         provider_rw.commit()?;
 
