@@ -41,11 +41,11 @@
 #
 #   fmt-clippy       fmt and the clippy passes, the release graph and every target under
 #                    --all-features and without `mdbx`, under the nightly pin
-#   build-tests      the rocksdb guard, then the four test lanes with `--build-only`, under the
-#                    stable pin that builds releases: the same build of the workspace test
-#                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
-#                    2026-10-29
-#   carried-patches  the library tests of the three carried patch crates, which sit outside
+#   build-tests      the rocksdb guard, then the three test lanes CI runs (default, adiri,
+#                    vendored reth) with `--build-only`, under the stable pin that builds
+#                    releases: the same build of the workspace test binaries that failed in
+#                    cache-deps.yaml and durable-e2e.yaml on 2026-10-29
+#   carried-patches  the library tests of the four carried patch crates, which sit outside
 #                    the workspace and which an advisory fix can touch too
 #
 # The workspace tests are compiled, not run. A test that fails on main therefore still

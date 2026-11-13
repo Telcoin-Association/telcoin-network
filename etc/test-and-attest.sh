@@ -113,9 +113,9 @@ fi
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and the four unit-test lanes. These live in etc/ci-lanes.sh because
-# .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
-# `merge_group` against main + this PR. One definition, so the queue cannot end up
+# fmt, clippy and the three test lanes CI runs (ci-lanes.sh's `test-mdbx` is run by hand). These
+# live in etc/ci-lanes.sh because .github/workflows/pr.yaml runs the very same file, on
+# `pull_request` and again on `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
 ./etc/ci-lanes.sh fmt
 ./etc/ci-lanes.sh clippy

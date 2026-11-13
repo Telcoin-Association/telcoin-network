@@ -4,7 +4,7 @@
 #
 # Two callers run these, and the point of this file is that they cannot drift apart:
 #
-#   etc/test-and-attest.sh     a maintainer runs every lane locally, plus the e2e suites,
+#   etc/test-and-attest.sh     a maintainer runs the lanes of `all` locally, plus the e2e suites,
 #                              then attests the HEAD commit hash on adiri.
 #   .github/workflows/pr.yaml  runs them on `pull_request` (for PRs no maintainer has
 #                              attested) and on `merge_group` (for every PR, against
@@ -15,7 +15,7 @@
 # the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
 # exists only because nextest has no other way to build a lane without running it.
 #
-# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes with
+# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes of `all` with
 # `--build-only` after every push to main that the merge queue did not make. A
 # security-advisory merge reaches main without either pr.yaml event, so that workflow is
 # what says such a commit still compiles. It reports after the fact and gates nothing.

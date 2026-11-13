@@ -3,7 +3,7 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the four test lanes, the two guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the three test lanes CI runs (`test-default`, `test-adiri`, `test-vendor-reth`; `test-default` includes the backend gate), the archive-mode and RocksDB guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
 The e2e suites it runs are the `#[ignore]`d tests of `e2e-tests` on the default (tn-lmdb) node binary, then `make test-e2e-reth-migration` (a committee on the MDBX build, each validator restarted onto the default binary) and `make test-e2e-resync` (a validator rebuilt in layout v2 with `db reset-execution`); both skip, passing, under the generic selection, which sets neither their marker nor the previous binary.
 The nightly `durable-e2e.yaml` runs the restart, epoch and sigkill suites and the same two; the rolling-upgrade suite (`make test-upgrade`) stays manual.
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
@@ -40,11 +40,11 @@ Three consequences worth remembering:
   ejects the PR. `pr.yaml` triggers on both events, and `CI Success` is the only required
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
-- **The maintainer and draft skips cover the four test lanes only, and never apply in the queue.**
+- **The maintainer and draft skips cover the three test lanes only, and never apply in the queue.**
   On a pull request, `ci-scope` skips `test`, `adiri-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
   `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
   In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
-  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the four test lanes only, and only when `ci-scope` asked for it.
+  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of those three test lanes only, and only when `ci-scope` asked for it.
 - **The attestation is checked on the pull request only, never in the queue.** GitHub
   creates the merge group's commit seconds before CI starts, so no local run could have
   covered it and nothing can attest it; a lane that demanded one would hang the queue until
@@ -95,7 +95,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and the three `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` or `vendor/reth/tn/test-only.lock` and no manifest names one, builds the test binaries of the four test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and the three `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` or `vendor/reth/tn/test-only.lock` and no manifest names one, builds the test binaries of the three test lanes CI runs under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -191,7 +191,7 @@ Nothing stops either route beforehand.
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for the three clippy passes, the release graph and every target under `--all-features` and under every feature but `mdbx`, under the nightly pin) and `test-cache` (dependencies for the four test lanes: default, adiri and mdbx features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for the three clippy passes, the release graph and every target under `--all-features` and under every feature but `mdbx`, under the nightly pin) and `test-cache` (dependencies for the three test lanes CI runs: the default and adiri features, and the nested vendor/reth workspace with js-tracer, under the stable pin; nothing warms the hand-run `test-mdbx` lane).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
 rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
