@@ -147,7 +147,7 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
 /// source, so a caller that walks the sources (as the reth adapter does for an error's code)
 /// still finds the OS error code, which the wrapping `io::Error` itself no longer carries.
 #[derive(Debug)]
-struct Context {
+pub(crate) struct Context {
     /// What was being done.
     what: String,
     /// The error it met.
@@ -157,7 +157,7 @@ struct Context {
 impl Context {
     /// `source`, as an `io::Error` of its kind that says it happened while doing `what`.
     #[cold]
-    fn wrap(what: String, source: io::Error) -> io::Error {
+    pub(crate) fn wrap(what: String, source: io::Error) -> io::Error {
         io::Error::new(source.kind(), Context { what, source })
     }
 }
