@@ -12,8 +12,8 @@
 3. the module docs at the top of the file.
 
 **Three files are too big to read whole:**
-- `consensus_pack.rs` is 15.4k lines;
-- `consensus.rs` and `epoch_records.rs` are about 6k each.
+- `consensus_pack.rs` is 17.1k lines;
+- `consensus.rs` and `epoch_records.rs` are about 7.6k and 6.3k.
 
 Each starts with a "Where things are" list. Grep for the symbol, read with an offset and limit,
 and remember that everything after `mod test` is tests (more than half of `consensus_pack.rs`).
@@ -162,7 +162,7 @@ and remember that everything after `mod test` is tests (more than half of `conse
   that describes it.
 
 ## Testing
-- **Storage tests:** `cargo test --release -p tn-storage --lib` (about 750 tests, seconds in
+- **Storage tests:** `cargo test --release -p tn-storage --lib` (about 830 tests, seconds in
   release). One test: add `-- <path::to::test> --exact`.
 - **Lanes:** `./etc/ci-lanes.sh clippy` (default and `--all-features`) and
   `./etc/ci-lanes.sh test-default` (nextest, the workspace).
