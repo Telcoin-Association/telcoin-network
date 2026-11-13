@@ -62,27 +62,23 @@ pub(super) fn loopback_listeners_with_remote_peers<'a>(
     listeners: impl IntoIterator<Item = (String, &'a Multiaddr)>,
     mut peers: impl Iterator<Item = &'a Multiaddr>,
 ) -> Vec<(String, Multiaddr, Multiaddr)> {
-    peers
-        .any(|peer| !is_loopback(peer))
-        .then(|| {
-            listeners
-                .into_iter()
-                .filter(|(_, listener)| is_loopback(listener))
-                .map(|(env_var, listener)| {
-                    let suggested = listener
-                        .iter()
-                        .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
-                        .map(|protocol| match protocol {
-                            Protocol::Ip4(_) => Protocol::Ip4(Ipv4Addr::UNSPECIFIED),
-                            Protocol::Ip6(_) => Protocol::Ip6(Ipv6Addr::UNSPECIFIED),
-                            other => other,
-                        })
-                        .collect();
-                    (env_var, listener.clone(), suggested)
+    let remote_peer = peers.any(|peer| !is_loopback(peer));
+    listeners
+        .into_iter()
+        .filter(|(_, listener)| remote_peer && is_loopback(listener))
+        .map(|(env_var, listener)| {
+            let suggested = listener
+                .iter()
+                .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
+                .map(|protocol| match protocol {
+                    Protocol::Ip4(_) => Protocol::Ip4(Ipv4Addr::UNSPECIFIED),
+                    Protocol::Ip6(_) => Protocol::Ip6(Ipv6Addr::UNSPECIFIED),
+                    other => other,
                 })
-                .collect()
+                .collect();
+            (env_var, listener.clone(), suggested)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Resolve a mapping once, serially, without DNS names in records or background refresh tasks.
