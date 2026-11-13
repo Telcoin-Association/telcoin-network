@@ -428,6 +428,44 @@ fn failed_panicked_and_claimed_tasks_leave_the_root_to_the_walk() {
     assert_eq!(tasks.failures.lock().0, 1, "the panic is counted as a failure");
 }
 
+/// Every failed task counts once in `tn_reth.parallel_state_root_task_failures_total` under its
+/// reason; a task that finishes or is claimed counts nothing.
+#[test]
+fn failed_tasks_are_counted_by_reason() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut targets: Vec<_> = (1..=6).map(|i| (key(9, i), Default::default())).collect();
+        targets.sort_unstable_by_key(|(address, _)| *address);
+        let tasks = StorageRootTasks::new(targets, StorageSplits::default());
+        let slots = &tasks.slots;
+        tasks.run(&slots[0], || panic!("a task panics"));
+        tasks.run(&slots[1], || Err(TaskError::TipMoved { walk: Some(1), task: Some(2) }));
+        tasks.run(&slots[2], || Err(TaskError::TipMoved { walk: Some(1), task: None }));
+        tasks.run(&slots[3], || Err(DatabaseError::Other("a read fails".into()).into()));
+        tasks.run(&slots[4], || Ok((key(9, 7), 1, Default::default())));
+        assert!(tasks.storage_root(slots[5].hashed_address).is_none(), "the walk claims it");
+        tasks.run(&slots[5], || unreachable!("a claimed task must not run"));
+        assert_eq!(tasks.failures.lock().0, 4, "the block's log line counts the same failures");
+    });
+    let snapshot = snapshotter.snapshot().into_vec();
+    let counted = |reason: &str| {
+        snapshot.iter().find_map(|(k, _, _, value)| {
+            (k.key().name() == "tn_reth.parallel_state_root_task_failures_total"
+                && k.key().labels().any(|l| l.key() == "reason" && l.value() == reason))
+            .then_some(value)
+        })
+    };
+    for (reason, expected) in [("panicked", 1), ("tip_moved", 2), ("database", 1)] {
+        let value = counted(reason);
+        assert!(
+            matches!(value, Some(DebugValue::Counter(n)) if *n == expected),
+            "{reason}: {value:?}"
+        );
+    }
+    assert!(counted("provider").is_none(), "no provider failure was recorded");
+}
+
 /// A parallel result, from the walk on one thread (`composed: false`) or the split.
 fn parallel(result: (B256, TrieUpdates), composed: bool) -> ParallelRoot {
     ParallelRoot { result, composed, storage_composed: 0 }

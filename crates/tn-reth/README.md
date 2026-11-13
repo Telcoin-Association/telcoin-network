@@ -106,6 +106,13 @@ split block while the trie is small), `stored_root_node` and `mismatch` (a sampl
 split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
 the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
 expected, `stored_root_node` and `mismatch` are alerts.
+`tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
+storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
+part to the serial computation, on this node only; the block also logs the first error. It is the
+one per-node difference the parallel paths have, so read it first when one node parts from its
+peers. `provider`, `database` and `panicked` cost the block time; `tip_moved` (a task's transaction
+saw another finalized block than the walk's: something wrote the state or trie tables while an
+output's blocks were built) is an alert, as the node has no such writer.
 
 Off switches, read once at the first block from the node's environment:
 `TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the

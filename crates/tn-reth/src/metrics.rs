@@ -16,7 +16,10 @@
 //! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
 //! counts blocks whose split account walk ran on one thread instead, and a sixth,
 //! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
-//! storage tries whose split storage root was not used.
+//! storage tries whose split storage root was not used. A seventh,
+//! `tn_reth.parallel_state_root_task_failures_total` (labeled by `reason`, see
+//! [`ParallelRootTaskFailure`]), counts the parallel state-root tasks that failed and left their
+//! part to the serial computation.
 //!
 //! Six histograms in the same group time the stages of each block built, one sample per block
 //! each: `tn_reth.block_signer_recovery_seconds` (per batch, ahead of the build: in the bytes
@@ -139,6 +142,7 @@ pub(crate) fn init() {
     register_invalid_tx_skip_series();
     register_account_walk_fallback_series();
     register_storage_walk_fallback_series();
+    register_parallel_root_task_failure_series();
     register_retired_pool_handoff_series();
 }
 
@@ -561,6 +565,65 @@ fn register_storage_walk_fallback_series() {
 /// test.
 pub(crate) fn record_storage_walk_fallback(reason: StorageWalkFallback) {
     metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for parallel state-root work (a storage-root task, a walk helper, an account
+/// subtrie or a storage piece) that failed and left its part to the serial computation
+/// (`env/output_overlay/parallel.rs`), kept next to its only emission helper so the registration
+/// in [`register_parallel_root_task_failure_series`] and the increment in
+/// [`record_parallel_root_task_failure`] cannot drift apart. One series per
+/// [`ParallelRootTaskFailure`].
+const PARALLEL_ROOT_TASK_FAILURES: &str = "tn_reth.parallel_state_root_task_failures_total";
+
+/// Why a piece of a block's parallel state-root work failed. Labels
+/// [`PARALLEL_ROOT_TASK_FAILURES`]; counted once per failed task, helper, subtrie or piece.
+///
+/// A failure costs time, not correctness: the block computes that part serially, on this node
+/// only. It is the one place a node's parallel work differs from its peers'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParallelRootTaskFailure {
+    /// Opening the task's read-only transaction failed.
+    Provider,
+    /// A database read failed.
+    Database,
+    /// The task's transaction saw another finalized block than the walk's: something wrote the
+    /// state or trie tables while an output's blocks were built. Alert on any nonzero value: the
+    /// node has no such writer (`parallel.rs`'s module docs), and a writer that did not advance
+    /// the finalized block would go unseen.
+    TipMoved,
+    /// The task panicked.
+    Panicked,
+}
+
+impl ParallelRootTaskFailure {
+    /// Every variant, for zero-registration in [`register_parallel_root_task_failure_series`].
+    /// Extend it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::Provider, Self::Database, Self::TipMoved, Self::Panicked];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Database => "database",
+            Self::TipMoved => "tip_moved",
+            Self::Panicked => "panicked",
+        }
+    }
+}
+
+/// Register one parallel-root task failure series per [`ParallelRootTaskFailure`] at zero.
+/// Called from [`init`], for the reasons given there.
+fn register_parallel_root_task_failure_series() {
+    ParallelRootTaskFailure::ALL.iter().for_each(|reason| {
+        metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one failed piece of parallel state-root work, labeled by [`ParallelRootTaskFailure`].
+/// Called on the failure path only. The macro path re-resolves the recorder on every call,
+/// keeping the series observable from a unit test.
+pub(crate) fn record_parallel_root_task_failure(reason: ParallelRootTaskFailure) {
+    metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(1);
 }
 
 /// Counter names for the retired-worker pool handoff, kept next to their only emission sites so
@@ -1486,6 +1549,43 @@ mod tests {
             assert!(
                 matches!(
                     reason_series(&snapshot, ACCOUNT_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
+    }
+
+    /// [`register_parallel_root_task_failure_series`] registers one series per
+    /// [`ParallelRootTaskFailure`] at zero, and a recorded failure moves only its own reason's.
+    #[test]
+    fn test_parallel_root_task_failures_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_parallel_root_task_failure_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == ParallelRootTaskFailure::TipMoved { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
                     DebugValue::Counter(n) if *n == expected
                 ),
                 "reason {} must read {expected}",

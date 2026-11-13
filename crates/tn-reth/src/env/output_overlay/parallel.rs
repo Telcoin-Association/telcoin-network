@@ -75,8 +75,10 @@
 //! building two outputs' blocks at once, or any other writer of the state or trie tables during an
 //! output. Each task therefore checks its transaction's tip against the walk's: the finalized
 //! block number (`ChainState`), which every persist advances in the same transaction as the state
-//! it writes. On a mismatch the task fails and the walk computes that root on its own transaction.
-//! A writer that changed state without advancing that marker would not be caught.
+//! it writes. On a mismatch the task fails and the walk computes that root on its own transaction;
+//! the failure is logged at error and counted in `tn_reth.parallel_state_root_task_failures_total`
+//! as `tip_moved` (alert on any nonzero value). A writer that changed state without advancing that
+//! marker would not be caught.
 //!
 //! # Checks
 //!
@@ -93,11 +95,12 @@
 //! so every node checks the same blocks. A repeatable bug in a parallel path then gives every node
 //! running the same code the same root: the serial one on a checked block, the same wrong one on an
 //! unchecked block. (A per-node count would split such nodes by their counts' phase.) The one
-//! per-node difference left is a task that fails (logged): its part goes to the serial
-//! computation on that node only. The pool's thread count is no such difference: it changes which
-//! thread computes a part, not how, so a node whose pool runs one thread runs the same parallel
-//! code (on the calling thread and that one pool thread) and composes the same roots as its peers;
-//! only the off switches compute serially.
+//! per-node difference left is a task that fails (logged, and counted by reason in
+//! `tn_reth.parallel_state_root_task_failures_total`): its part goes to the serial computation on
+//! that node only. The pool's thread count is no such difference: it changes which thread computes
+//! a part, not how, so a node whose pool runs one thread runs the same parallel code (on the
+//! calling thread and that one pool thread) and composes the same roots as its peers; only the off
+//! switches compute serially.
 //!
 //! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and the
 //! unchecked blocks the same bug hit carry it on every node running this code. The response is
@@ -130,8 +133,8 @@ use super::{
     OutputTrieOverlay,
 };
 use crate::metrics::{
-    record_account_walk_fallback, record_storage_walk_fallback, AccountWalkFallback,
-    StorageWalkFallback, RETH_METRICS,
+    record_account_walk_fallback, record_parallel_root_task_failure, record_storage_walk_fallback,
+    AccountWalkFallback, ParallelRootTaskFailure, StorageWalkFallback, RETH_METRICS,
 };
 use parking_lot::{Condvar, Mutex};
 use reth_db::{tables, transaction::DbTx, DatabaseError};
@@ -582,6 +585,17 @@ pub(super) enum TaskError {
 }
 
 impl TaskError {
+    /// The `reason` this failure is counted under in
+    /// `tn_reth.parallel_state_root_task_failures_total`.
+    const fn reason(&self) -> ParallelRootTaskFailure {
+        match self {
+            Self::Provider(_) => ParallelRootTaskFailure::Provider,
+            Self::Database(_) => ParallelRootTaskFailure::Database,
+            Self::TipMoved { .. } => ParallelRootTaskFailure::TipMoved,
+            Self::Panicked => ParallelRootTaskFailure::Panicked,
+        }
+    }
+
     /// The error of a computation on the walk's own transaction (a database read: the walk's
     /// threads never see the other variants).
     fn into_provider(self) -> ProviderError {
@@ -667,8 +681,10 @@ impl StorageRootTasks {
         slot.finished.notify_all();
     }
 
-    /// Count a failed task, keeping the first failure for the log.
+    /// Count a failed task, in the block's log line (keeping the first failure for it) and in
+    /// `tn_reth.parallel_state_root_task_failures_total` by reason.
     fn record_failure(&self, error: TaskError) {
+        record_parallel_root_task_failure(error.reason());
         let mut failures = self.failures.lock();
         failures.0 += 1;
         failures.1.get_or_insert(error);
