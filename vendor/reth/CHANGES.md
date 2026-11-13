@@ -2367,3 +2367,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   dictionary, so no jar TN writes is refused and no jar, `.conf` or digest changes.
   *Tests*: `test_checksummed_jar_refuses_dictionary_zstd` (the writer's refusal, and no file
   created; it fails without the writer's check). *Upstream*: no (TN-0120's checksummed format is TN's).
+
+- **TN-0155** — A log filter names at most 1,000 addresses and 1,000 values in each topic
+  position. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`MAX_FILTER_VALUES_PER_POSITION`,
+  `check_filter_size`, called by `eth_newFilter` and by `EthFilter::logs_for_filter`, which
+  serves `eth_getLogs`, `EngineEthFilter::logs` and `eth_getFilterLogs`;
+  `EthFilterError::TooManyFilterValues`, -32602 like the other query limits; tests
+  `oversized_log_filters_are_refused`, `oversized_log_subscriptions_are_refused`),
+  `crates/rpc/rpc/src/eth/pubsub.rs` (`subscribe` rejects a `logs` subscription over the limit
+  before it accepts it).
+  *Why*: TN-0056 bounds how many filters are installed, not their size. A filter's address set
+  and its four topic sets took any number of values, so one 15 MB `eth_newFilter` kept about
+  11 MB of sets and the 1,000 installed filters about 11 GB, for as long as a client polled them.
+  A `logs` subscription kept such a filter outside that cap for the life of its connection (up
+  to 1,024 per WS or IPC connection), and every `eth_getLogs` and filter poll built a bloom of
+  about 256 bytes per value. The limit is geth's (`--rpc.logquerylimit`, default 1,000, which
+  geth applies to `eth_newFilter`, `eth_getLogs` and `logs` subscriptions), so a filter geth
+  accepts is accepted here. A filter now keeps at most about 0.3 MB of sets, about 300 MB at the
+  default 1,000 filters. Upstream reth has no such limit. *Can reach execution or storage*: no.
+  RPC only: the check runs before a filter is installed, queried or subscribed, and nothing on
+  the block execution or storage path calls it.
+  *Tests*: `oversized_log_filters_are_refused` (1,001 addresses, or 1,001 values in the fourth
+  topic position, are refused by all three entry points and install nothing; 1,000 in every
+  position installs), `oversized_log_subscriptions_are_refused` (refused before acceptance,
+  accepted at the limit); `active_filters_are_bounded` and the other filter tests unchanged.
+  Mutation-checked: `check_filter_size` accepting every filter (both fail). *Upstream*: yes.

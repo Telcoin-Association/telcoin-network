@@ -26,7 +26,7 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | `eth_getTransactionBySenderAndNonce` | `null` when the sender's nonce moved without a transaction of theirs in the block (a contract creation, or a system call) |
 | `eth_sendRawTransactionSync` | Guarded by `--rpc.txfeecap` like `eth_sendRawTransaction` |
 | `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks`. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
-| `eth_subscribe`, `eth_unsubscribe` | WebSocket and IPC only |
+| `eth_subscribe`, `eth_unsubscribe` | WebSocket and IPC only. A `logs` subscription's filter takes the same size limit as `eth_getLogs`: at most 1,000 addresses and 1,000 values per topic position |
 
 These are registered but cannot do useful work on Telcoin Network:
 

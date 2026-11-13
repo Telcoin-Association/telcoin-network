@@ -16,8 +16,8 @@ Creates a filter object, based on filter options, to notify when the state chang
 
 * `fromBlock`: `QUANTITY|TAG` - (optional, default: `"latest"`) Hexadecimal of a block number, or `"latest"` for the last mined block, `"safe"` for the latest safe block, `"finalized"` for the latest finalized block, or  `"earliest"` for not yet mined transactions.
 * `toBlock`: `QUANTITY|TAG` - (optional, default: `"latest"`) Hexadecimal of a block number, or `"latest"` for the last mined block, `"safe"` for the latest safe block, `"finalized"` for the latest finalized block, or  `"earliest"` for not yet mined transactions.
-* `address`: `DATA|Array`, 20 Bytes - (optional) Contract address or a list of addresses from which logs should originate.
-* `topics`: `Array of DATA`, - (optional) Array of 32 Bytes `DATA` topics. Topics are order-dependent. Each topic can also be an array of DATA with "or" options.
+* `address`: `DATA|Array`, 20 Bytes - (optional) Contract address or a list of at most 1,000 addresses from which logs should originate.
+* `topics`: `Array of DATA`, - (optional) Array of 32 Bytes `DATA` topics. Topics are order-dependent. Each topic can also be an array of DATA with "or" options, at most 1,000 per position.
 
 #### Returns
 
