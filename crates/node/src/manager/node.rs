@@ -1074,6 +1074,26 @@ where
                 on_chain_workers,
             )
             .await?;
+        // A loopback listener cannot dial remote bootstrap peers, so such a node finds no peers.
+        endpoints::loopback_listeners_with_remote_peers(
+            std::iter::once(("PRIMARY_LISTENER_MULTIADDR".to_owned(), &primary_address)).chain(
+                worker_addresses
+                    .iter()
+                    .map(|(id, address)| (endpoints::worker_listener_env_var(*id), address)),
+            ),
+            self.bootstrap_servers
+                .values()
+                .flat_map(|server| std::iter::once(&server.primary).chain(&server.workers))
+                .map(|peer| &peer.network_address),
+        )
+        .into_iter()
+        .for_each(|(env_var, listener, suggested)| {
+            warn!(
+                target: "epoch-manager",
+                %listener,
+                "this listener binds a loopback IP, so its dials cannot reach the remote bootstrap peers and the node will find no peers; set {env_var}={suggested} to bind every interface (the advertised address does not change; docs/src/network/transport.md)"
+            );
+        });
         let primary_network_handle = self
             .primary_network_handle
             .as_ref()
@@ -1631,11 +1651,7 @@ where
                         let worker_id = worker.worker_id;
                         let key = key_config.worker_network_public_key(worker_id);
                         let mapping = network_config.endpoints().workers().get(&worker_id);
-                        let env_var = if worker_id == DEFAULT_WORKER_ID {
-                            "WORKER_LISTENER_MULTIADDR".to_owned()
-                        } else {
-                            format!("WORKER_{worker_id}_LISTENER_MULTIADDR")
-                        };
+                        let env_var = endpoints::worker_listener_env_var(worker_id);
                         let listener = Self::parse_listener_address_for_swarm(
                             &env_var,
                             key.clone(),

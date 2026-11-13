@@ -118,3 +118,69 @@ async fn mappings_reject_excess_and_foreign_identities() -> eyre::Result<()> {
     assert!(resolve_advertised(Some(&foreign), fallback, &key).await.is_err());
     Ok(())
 }
+
+/// Worker 0 keeps the unnumbered override variable; higher workers name their id.
+#[test]
+fn worker_listener_env_vars_name_the_worker() {
+    assert_eq!(worker_listener_env_var(DEFAULT_WORKER_ID), "WORKER_LISTENER_MULTIADDR");
+    assert_eq!(worker_listener_env_var(1), "WORKER_1_LISTENER_MULTIADDR");
+}
+
+/// A loopback listener with a remote bootstrap peer is reported with a wildcard bind on the same
+/// port and family; a local network, and listeners that already reach other hosts, report nothing.
+#[test]
+fn loopback_listeners_are_reported_only_with_remote_peers() -> eyre::Result<()> {
+    let key: NetworkPublicKey = NetworkKeypair::ed25519_from_bytes([28; 32])?.public().into();
+    let primary: Multiaddr = "/ip4/127.0.0.1/udp/59120/quic-v1"
+        .parse::<Multiaddr>()?
+        .with_p2p(key.into())
+        .map_err(|_| eyre!("invalid fixture suffix"))?;
+    let worker: Multiaddr = "/ip6/::1/udp/38329/quic-v1".parse()?;
+    let listeners = || {
+        [
+            ("PRIMARY_LISTENER_MULTIADDR".to_owned(), &primary),
+            ("WORKER_LISTENER_MULTIADDR".to_owned(), &worker),
+        ]
+    };
+    let local: Vec<Multiaddr> = vec![
+        "/ip4/127.0.0.1/udp/49590/quic-v1".parse()?,
+        "/ip4/127.0.0.2/udp/49594/quic-v1".parse()?,
+        "/ip6/::1/udp/49598/quic-v1".parse()?,
+    ];
+    let public: Multiaddr = "/ip4/192.0.2.10/udp/49590/quic-v1".parse()?;
+    let dns: Multiaddr = "/dns4/bootstrap.example.com/udp/49590/quic-v1".parse()?;
+
+    // an observer generated with keytool's defaults, joining a public network
+    let reported = loopback_listeners_with_remote_peers(listeners(), local.iter().chain([&public]));
+    assert_eq!(
+        reported,
+        vec![
+            (
+                "PRIMARY_LISTENER_MULTIADDR".to_owned(),
+                primary.clone(),
+                "/ip4/0.0.0.0/udp/59120/quic-v1".parse()?
+            ),
+            (
+                "WORKER_LISTENER_MULTIADDR".to_owned(),
+                worker.clone(),
+                "/ip6/::/udp/38329/quic-v1".parse()?
+            ),
+        ]
+    );
+    // a DNS bootstrap host may resolve anywhere, so it counts as remote
+    assert_eq!(loopback_listeners_with_remote_peers(listeners(), [&dns].into_iter()).len(), 2);
+    // a local test network: every peer is on loopback
+    assert!(loopback_listeners_with_remote_peers(listeners(), local.iter()).is_empty());
+    // no bootstrap peers at all
+    assert!(loopback_listeners_with_remote_peers(listeners(), std::iter::empty()).is_empty());
+    // validators and overridden observers: wildcard and public listeners reach remote peers
+    let wildcard: Multiaddr = "/ip4/0.0.0.0/udp/59120/quic-v1".parse()?;
+    let unspecified_v6: Multiaddr = "/ip6/::/udp/38329/quic-v1".parse()?;
+    let reachable = [
+        ("PRIMARY_LISTENER_MULTIADDR".to_owned(), &wildcard),
+        ("WORKER_LISTENER_MULTIADDR".to_owned(), &public),
+        ("WORKER_1_LISTENER_MULTIADDR".to_owned(), &unspecified_v6),
+    ];
+    assert!(loopback_listeners_with_remote_peers(reachable, [&public].into_iter()).is_empty());
+    Ok(())
+}
