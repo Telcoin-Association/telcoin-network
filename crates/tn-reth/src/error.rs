@@ -46,7 +46,8 @@ pub enum TnRethError {
     ReplayReceiptsMissing(u64),
     /// A block built again without the execution cache, after a checked cache hit was stale,
     /// saw a stale hit too. Impossible by construction (the rebuild reads no cache): a bug in
-    /// `RethEnv::build_block_from_batch_payload`. Carries the block's parent hash.
+    /// `RethEnv::build_recovered_block`, the build behind every block-building entry point.
+    /// Carries the block's parent hash.
     #[error("execution cache: the uncached rebuild of a block on parent {0} saw a stale hit")]
     ExecutionCacheStaleOnRebuild(alloy::primitives::B256),
     /// Failed to recover a transaction's signer from its signature.

@@ -123,7 +123,9 @@ It takes about 160 MiB, a fixed size with no setting.
 - On the peak profile with layout v2, it served 81% of account reads and 82% of storage reads. A 2.5 GiB cache served 84% and 85%.
 - On a Mac M1 Max (peak profile, layout v2) it cut execution from 186.6 ms to 138.7 ms per output.
 - 160 MiB is small next to the validator minimum of 32 GB.
-- `tn_reth.exec_cache_stale_hits_total` counts any value the cache served that a check found stale. It should stay 0. Report anything else as a bug.
+- `tn_reth.exec_cache_stale_hits_total` counts any value the cache served that a check found stale. The node checks one hit of each kind (account, slot, code) in 256 against the database. The count should stay 0.
+- On a stale value the node drops the cache and builds that block again without it, so that block is right and the node keeps running. The unchecked values it served before may already have put the node on another state than its peers. Compare the node's recent block hashes with a peer's before you trust it, and report it as a bug.
+- Each node checks its own sample of hits, so a 0 on other nodes does not clear one that counted a stale value.
 
 ## Linux and macOS
 

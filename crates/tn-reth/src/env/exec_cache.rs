@@ -78,9 +78,15 @@
 //!
 //! TN builds its own blocks, so no payload's state root catches a stale hit: it would fork the
 //! chain. In production one hit of each kind in [`CHECK_ONE_HIT_IN`] is re-read from the parent
-//! state. A differing value is logged with its key and both values, counted
-//! (`tn_reth.exec_cache_stale_hits_total`), and makes `build_block_from_batch_payload` drop the
-//! whole cache and build the block again without one, so the block is right and the node goes on.
+//! state. The sample follows the cache's own hit counters, which start at zero with each cache, so
+//! each node checks other hits than its peers. A differing value is logged with its key and both
+//! values, counted (`tn_reth.exec_cache_stale_hits_total`), and makes `build_recovered_block` (the
+//! build behind `build_block_from_batch_payload` and `build_block_from_recovered_payload`) drop
+//! the whole cache and build the block again without one, so that block is right and the node goes
+//! on. Unchecked stale hits of earlier blocks may already have given the node another state than
+//! its peers': a nonzero count is a bug to report, and the node's recent block hashes are to be
+//! compared with a peer's before it is trusted. A zero count on one node says nothing about
+//! another.
 //! With `TN_EXEC_CACHE_SHADOW=1` (test builds; the default in tn-reth's unit tests) every hit is
 //! checked and a stale one panics.
 //!

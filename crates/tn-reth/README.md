@@ -40,6 +40,14 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
   twice the TTL, so a flood of peer batches can switch a deferral off but never re-arm one.
   Duplicates across workers stay tolerated at execution; this only stops this node from packing a
   copy of what a peer is already proposing.
+- Execution cache (`src/env/exec_cache.rs`): block execution reads accounts, slots and code
+  through a cross-block cache of the values at the last built block. One hit of each kind in 256
+  is re-read from the parent state; a stale one is logged, counted in
+  `tn_reth_exec_cache_stale_hits_total` (alert on any nonzero value), and the block is built again
+  without the cache, so that block is right and the node goes on. Unchecked stale hits of earlier
+  blocks may already have put the node on another state than its peers': compare its recent block
+  hashes with a peer's before trusting it, and report it. The sample follows each node's own cache,
+  so nodes check different hits, and a zero on one node says nothing about another.
 
 ### Block-building timings
 
