@@ -2164,6 +2164,41 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   refusal (the account lookup then reports a corrupted changeset). *Upstream*: no (TN-0124's
   search is TN's).
 
+- **TN-0138** — A static-file segment commit syncs its data, offsets and `.csoff` files at once.
+  *Kind*: performance (storage commit path).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, lib.rs}` (new `NippyJarWriter::sync_jobs`
+  returning `DataSync` and `OffsetsSync`, the two halves of `sync_all` over disjoint parts of the
+  writer; `sync_data`, `commit_offsets` and the unsynced offsets write run through them),
+  `crates/storage/provider/src/providers/static_file/writer.rs` (`StaticFileProviderRW::sync_all`
+  and `sync_at_once`; a test-only `fail_syncs` fault hook),
+  `.../static_file/{sync_stats.rs, manager.rs}` (`SegmentSyncStats::files_sync`; test
+  `sync_stats_record_each_phase_per_segment`), `.../static_file/tn_crash_tests.rs` (tests).
+  *Why*: under storage v2 a light persist (one block an output) waits on the static files, and
+  each segment's commit ran its `.csoff`, data and offsets `fsync`s one after another before its
+  `.conf` (quaker, slow drive state: about 7-9 ms of a 24-26 ms segment sync; about 1.2 ms an
+  `fsync` on a network disk). Their order never mattered: the configuration bounds what a reopen
+  keeps (the heal cuts every file back to it), and it is written only once `sync_all` returns, so
+  only all three being durable before it does. `sync_all` now runs them on scoped threads
+  (`std::thread::scope`, the last on the calling thread, no new dependency) through the same
+  `fsync_file` helper (TN-0117), joins all of them, and returns an error if any failed: the first
+  in the old serial order (`.csoff`, data, offsets), which is the one the serial code returned.
+  So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
+  sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
+  header only after its sync succeeded, as before. A failed call has run the other syncs too (the
+  serial code stopped at the first failure), which leaves only bytes past the configuration that
+  the heal or a retried sync already handles. `commit` (prune, unwind, rotation) keeps its serial
+  syncs. The per-file timings now overlap, so `files_sync` times the span of the three, and TN's
+  persist bench reads `sf_sync` from it. It cannot reach execution: the bytes written and the
+  `.conf` rule are unchanged; only when the three syncs run changes. *Tests*:
+  `a_failed_sync_leaves_the_configuration_unwritten` (each of the three syncs failed, both
+  formats: the call returns that error after every file was written, the `.conf` is the last
+  commit's, a reopen heals back to it and the blocks append again, a retried sync commits them)
+  and `failed_syncs_return_the_first_in_the_serial_order` (a changeset and a block segment), both
+  through the fault hook; `sync_stats_record_each_phase_per_segment` (the span holds each sync);
+  the TN-0130 to TN-0137 crash and checksum tests unchanged. Mutation-checked: the error dropped
+  (both fail), the last error returned (the order test fails). *Upstream*: maybe; it keeps
+  upstream's crash semantics.
+
 - **TN-0139** — `StateRoot` can take an account's storage root from a `StorageRootSource` instead
   of computing it. *Kind*: feature (state root performance).
   *Files*: `crates/trie/trie/src/trie.rs` (trait `StorageRootSource`; `StateRoot`'s field
@@ -2200,6 +2235,66 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   and fails. *Can reach execution or storage*: no (vendoring tooling only).
   *Upstream*: no (TN's tooling).
 
+- **TN-0144** — A changeset jar's `.csoff` lookups answer from a bounded in-memory cache of the
+  records, read a chunk at a time. *Kind*: performance (storage v2 historical reads).
+  *Files*: `crates/static-file/types/src/changeset_offsets.rs` (`ChangesetOffsetCache`,
+  `CHANGESET_OFFSET_CACHE_BYTES`; `ChangesetOffsetReader`: `with_cache`, `read_chunk`, `get`, a
+  `Debug` without the cache's chunks; tests), `.../types/src/lib.rs` (the exports).
+  *Why*: under storage v2 every historical account or storage read that resolves to a changeset
+  looks up its block's `.csoff` record, and `ChangesetOffsetReader::get` read each one with its
+  own 16 or 20 B `pread`: 0.46 us of a 0.8 us changeset lookup on a Mac (TN-0100's harness,
+  `sf step csoff`). A lookup now reads its record's whole chunk of 64 records (one `pread` of at
+  most 1280 B) into a cache and answers the chunk's later lookups from memory while it stays
+  cached. The cache is one for the process (`ChangesetOffsetCache::shared`, which
+  `ChangesetOffsetReader::new` uses), shared by every changeset jar of both changeset segments
+  and every snapshot of them, and fixed in size: sets of 8 chunks, each behind its own lock, a
+  full set evicting its least recently used chunk.
+  *Bound*: at most `CHANGESET_OFFSET_CACHE_BYTES` = 4 MiB of records in all (409 sets of 8 chunks
+  of 1280 B; plain records' chunks are 1 KiB), plus about 60 B of bookkeeping a chunk (~4.2 MiB),
+  whatever the chain's length or the number of jars and snapshots: the records of about 105k
+  blocks of both segments. Chosen from the costs (Mac): a cached lookup saves 0.46 us; a miss
+  reads a chunk, and at 64 records that costs about one record's `pread` (alloc and `pread` of
+  1280 B 0.48-0.61 us against 0.43-0.52 us for 20 B; 5 KiB was 0.61 us), so a working set
+  larger than the cache, such as random reads over a long history, runs at about the speed of
+  reading each record from the file, and the cache's size only sets how much history answers at
+  the cached rate: recent history and repeated lookups, which TN-0100's harness measures (its
+  2,400 blocks are 96 KiB of records). An earlier version kept every chunk a reader touched for
+  as long as its jar was cached, which for sealed jars is the process's life: 40 B a block of
+  history read, about 400 MB for random reads over 10M blocks. Caching only the jar being
+  appended to was not taken: a persist reloads that jar, so its cache would start empty every
+  persist, and after a rotation recent history is in a sealed jar.
+  *Correctness*: a chunk is keyed by its reader's process-unique id (never reused) and its index.
+  Each reader is one jar snapshot with a fixed length, so a chunk never changes while its reader
+  lives; an append, prune, truncation, heal or rotation loads a new reader, which never meets an
+  older reader's chunks, and a dropped reader's chunks are never used again and age out first.
+  The stored bytes are kept, and each lookup verifies its record's checksum (TN-0121) as when it
+  read it from the file, whether its chunk was cached or read again after an eviction. Chunks
+  cover only the records below the header's length that the file held at the open (a length
+  past the file, a damaged header, caches nothing past it; TN-0134), and a record outside them,
+  or in a chunk that could not be read, is read alone as before, with the same errors. Nothing
+  is sized by the header's length: the cache's size is fixed when it is made.
+  Measured (Mac, TN-0100 harness): with 256-record chunks kept for the jar's life (2 runs
+  against 4), `sf step csoff` p50 0.46 -> 0.04 us, account changeset lookup p50 0.79-0.83 ->
+  0.33-0.38 us, unchanged in the remap phase too (a jar reloaded every 32 reads); with the
+  bounded cache (2 runs, against 2 of the version before): `sf step csoff` p50 0.04 us in
+  every v2 phase (cold, warm, remap, busy, busy+holder), account changeset lookup p50 0.33-0.38
+  us (0.38-0.46 before). *Can reach execution or storage*: it reads the same records, so
+  a block's offsets are the ones the file holds; it writes nothing.
+  *Tests*: `test_chunked_lookups_match_the_file` (both formats, three chunks with a short last
+  one, every record twice; a damaged record fails its checksum while its chunk's other records
+  answer; a header length past the file answers the file's records and fails past them),
+  `test_cache_stays_within_its_bound` (distinct lookups over three files of both formats stay
+  within the cache's capacity, which is at most the bytes asked for, and each answers its own
+  file's record; the shared cache is within `CHANGESET_OFFSET_CACHE_BYTES`),
+  `test_lookup_after_eviction_rereads_and_verifies` (a record damaged while its chunk is cached
+  answers from the cache; a later reader in the same set reads it from the file; after the
+  chunk is evicted, the lookup reads it again and fails its checksum, or without checksums
+  answers what the file holds). Mutation-checked: the record's place in its chunk shifted by one
+  (six fail); no eviction, every chunk kept as the earlier
+  version did (both new tests fail); the key without the reader's id (the eviction test fails);
+  a chunk read on a miss decoded without its checksum (the eviction test and three others
+  fail). *Upstream*: no (upstream reads each record with a `pread`).
+
 - **TN-0146** — NippyJar's dictionary zstd writes with its dictionaries, and a reopened writer
   commits. *Kind*: fix (upstream bug). *Files*: `crates/storage/nippy-jar/src/{compression/zstd.rs,
   compression/mod.rs, writer.rs, lib.rs, tn_dictionary_tests.rs}`.
@@ -2221,6 +2316,43 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   writer commits and keeps the dictionaries), `test_jars_without_a_dictionary_read_back`,
   `test_checksummed_jar_refuses_dictionary_zstd`. *Upstream*: maybe (upstream no longer writes
   dictionary jars).
+
+- **TN-0148** — The static-file jar cache hands readers an `Arc` of the jar, so a persist that
+  grows a segment never waits for the readers of its current jar. *Kind*: performance (storage
+  commit path under RPC load).
+  *Files*: `crates/storage/provider/src/providers/static_file/mod.rs` (`LoadedJarRef` is a struct
+  holding an `Arc<LoadedJar>`, no longer the `DashMap` shard's read guard; `LoadedJar::lease`,
+  `extending`, `release`), `.../static_file/manager.rs` (the cache holds `Arc<LoadedJar>`;
+  `get_or_create_jar_provider`, `prepare_index_update`, `update_index`, `initialize_index`,
+  `remove_cached_provider`, `delete_jar`; tests).
+  *Why*: a provider held the cache's shard read guard for its whole life, and `update_index`'s
+  insert of the new jar waited for every holder of that shard (TN-0101 took this wait out of the
+  index lock, not out of the commit). Any reader of a segment's current jar (a range walk, a
+  changeset walk, a logs query) so stalled the persist's `commit_sf` for its hold time: on quaker
+  with 4 history readers `commit_sf` 0.89 ms (v1) -> 2.41 ms (v2). Readers now clone the jar's
+  `Arc` and drop the shard lock at once; a growing persist replaces the cached jar under a brief
+  entry lock and returns, and readers of the old jar keep their snapshot, whose files only grew.
+  A jar taken out of the cache without its segment growing (a prune or unwind replacing it, the
+  writer's open replacing the jar of the file holding the tip, a stale jar above the new range,
+  `remove_cached_provider`, `delete_jar`, `initialize_index`) still waits for its readers, as the shard lock made it wait: a prune cuts rows in place and
+  the next append writes new rows there, under a reader's mapping. Every snapshot of a file loaded
+  while its segment only grew shares one lease (`Arc<()>`), so that wait covers readers of
+  snapshots a growing persist already replaced; it polls the lease's count every 50 us, after the
+  index lock is dropped (those readers may need it), and only these paths take it. The writer's
+  open is the frequent one: it commits and re-indexes the segment at its tip without growing it,
+  on the first persist after a start and on every rotation to a new file, so that persist waits
+  as long as a reader holds a snapshot of the tip's file (as every persist did before).
+  `delete_jar` now loads the deleted jar's configuration from its file. *Can reach execution or
+  storage*: it changes which jar snapshot a reader holds and when a commit waits for readers,
+  not what is written or read for a block: a reader still sees the rows its index lookup named.
+  *Tests*: `growing_commit_does_not_wait_for_a_reader_of_the_jar` (a growing commit returns while
+  a reader holds the current jar, which keeps its rows),
+  `pruning_commit_waits_for_readers_of_every_earlier_snapshot` (a prune after a growing commit
+  waits for a reader of the jar before it, then the pruned block appends again), the TN-0101
+  cache tests unchanged (`growing_commit_waits_for_jar_readers_outside_the_index_lock`'s doc
+  updated). Mutation-checked: the growing replace waiting for its readers (the first fails); the
+  grown jar given a fresh lease (the second fails). *Upstream*: maybe; upstream's cache is the
+  same.
 
 - **TN-0149** — A NippyJar writer refuses a checksummed jar that names dictionary zstd before it
   creates any file. *Kind*: fix. *Files*: `crates/storage/nippy-jar/src/{lib.rs, writer.rs,

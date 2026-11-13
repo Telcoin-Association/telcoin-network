@@ -22,7 +22,7 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, instrument};
 
@@ -195,6 +195,47 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
     }
 }
 
+/// One sync of [`StaticFileProviderRW::sync_all`], with the phase it is timed as.
+type SyncJob<'a> = (SyncPhase, Box<dyn FnOnce() -> ProviderResult<()> + Send + 'a>);
+
+/// TN(TN-0138): runs `jobs` at once, the last on this thread and each other one on a scoped
+/// thread of its own, and returns once all have ended, with each one's result and time in the
+/// order given. A thread that cannot be started is its job's error (the job does not run). A job
+/// that panics resumes its panic here once the others have ended.
+fn sync_at_once(jobs: Vec<SyncJob<'_>>) -> Vec<(SyncPhase, ProviderResult<Duration>)> {
+    fn timed(job: Box<dyn FnOnce() -> ProviderResult<()> + Send + '_>) -> ProviderResult<Duration> {
+        let start = Instant::now();
+        job().map(|()| start.elapsed())
+    }
+
+    std::thread::scope(|scope| {
+        let mut jobs = jobs.into_iter();
+        let here = jobs.next_back();
+        let spawned: Vec<_> = jobs
+            .map(|(phase, job)| {
+                let thread = std::thread::Builder::new()
+                    .name("sf-sync".to_owned())
+                    .spawn_scoped(scope, move || timed(job));
+                (phase, thread)
+            })
+            .collect();
+        let here = here.map(|(phase, job)| (phase, timed(job)));
+        spawned
+            .into_iter()
+            .map(|(phase, thread)| {
+                let result = match thread {
+                    Ok(thread) => {
+                        thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    }
+                    Err(err) => Err(ProviderError::other(err)),
+                };
+                (phase, result)
+            })
+            .chain(here)
+            .collect()
+    })
+}
+
 /// Mutable reference to a [`StaticFileProviderRW`] behind a [`RwLockWriteGuard`].
 #[derive(Debug)]
 pub struct StaticFileProviderRWRefMut<'a, N>(
@@ -244,6 +285,9 @@ pub struct StaticFileProviderRW<N> {
     changeset_offsets: Option<ChangesetOffsetWriter>,
     /// Current block's changeset offset being written.
     current_changeset_offset: Option<ChangesetOffset>,
+    /// TN(TN-0138): test-only fault injection, the syncs of [`Self::sync_all`] that fail.
+    #[cfg(test)]
+    pub(crate) fail_syncs: Vec<SyncPhase>,
 }
 
 impl<N: NodePrimitives> StaticFileProviderRW<N> {
@@ -271,6 +315,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             index_pending: false,
             changeset_offsets: None,
             current_changeset_offset: None,
+            #[cfg(test)]
+            fail_syncs: Vec::new(),
         };
 
         // Run NippyJar healing BEFORE setting up changeset sidecar
@@ -579,33 +625,98 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// configuration and mark the writer as clean.
     ///
     /// Returns an error if prune is queued (use [`Self::commit`] instead).
+    ///
+    /// TN(TN-0138): the `.csoff`, data and offsets syncs run at once (`sync_at_once`), each on
+    /// its own thread. Only that all three are durable before the configuration matters, not
+    /// their order: the configuration bounds what a reopen keeps (the heal cuts any file back to
+    /// it), and it is written only after this returns `Ok`. This returns once all three have
+    /// ended; if any failed, the error is the first in the order they ran one after another
+    /// before (`.csoff`, data, offsets), the error that order returned.
     pub fn sync_all(&mut self) -> ProviderResult<()> {
         if self.prune_on_commit.is_some() {
             return Err(StaticFileWriterError::FinalizeWithPruneQueued.into());
         }
 
-        // Write the final block's offset and sync the sidecar for changeset segments
+        // Write the final block's offset for changeset segments
         self.flush_current_changeset_offset()?;
-        if let Some(writer) = &mut self.changeset_offsets {
-            let start = Instant::now();
-            writer.sync().map_err(ProviderError::other)?;
-            let elapsed = start.elapsed();
-            // Update the header with the actual number of offsets written
-            self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
-            self.record_sync(SyncPhase::Csoff, elapsed);
-        }
 
-        if self.writer.is_dirty() {
+        let mut jobs: Vec<SyncJob<'_>> = Vec::with_capacity(3);
+        let dirty = self.writer.is_dirty();
+        let (data, offsets) = self.writer.sync_jobs();
+        if let Some(writer) = &mut self.changeset_offsets {
+            jobs.push((
+                SyncPhase::Csoff,
+                Box::new(move || writer.sync().map_err(ProviderError::other)),
+            ));
+        }
+        if dirty {
             // TN(TN-0119): `NippyJarWriter::sync_all`'s two halves, timed apart.
-            let start = Instant::now();
-            self.writer.sync_data().map_err(ProviderError::other)?;
-            self.record_sync(SyncPhase::Data, start.elapsed());
-            let start = Instant::now();
-            self.writer.commit_offsets().map_err(ProviderError::other)?;
-            self.record_sync(SyncPhase::Offsets, start.elapsed());
+            jobs.push((
+                SyncPhase::Data,
+                Box::new(move || data.run().map_err(ProviderError::other)),
+            ));
+            jobs.push((
+                SyncPhase::Offsets,
+                Box::new(move || offsets.run().map_err(ProviderError::other)),
+            ));
+        }
+        let ran = !jobs.is_empty();
+        let start = Instant::now();
+        let results = sync_at_once(jobs);
+        let files = start.elapsed();
+        #[cfg(test)]
+        let results = self.inject_sync_faults(results);
+
+        let mut first_error = None;
+        for (phase, result) in results {
+            match result {
+                Ok(elapsed) => {
+                    if phase == SyncPhase::Csoff &&
+                        let Some(writer) = &self.changeset_offsets
+                    {
+                        // Update the header with the actual number of offsets written
+                        self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
+                    }
+                    self.record_sync(phase, elapsed);
+                }
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        if ran {
+            self.record_sync(SyncPhase::Files, files);
         }
         self.synced = true;
         Ok(())
+    }
+
+    /// The results of [`Self::sync_all`]'s syncs with the phases in `fail_syncs` failed, as if
+    /// their `fsync` had returned an error after the write; a phase that failed already keeps its
+    /// own error.
+    #[cfg(test)]
+    fn inject_sync_faults(
+        &self,
+        results: Vec<(SyncPhase, ProviderResult<Duration>)>,
+    ) -> Vec<(SyncPhase, ProviderResult<Duration>)> {
+        results
+            .into_iter()
+            .map(|(phase, result)| {
+                let result = if self.fail_syncs.contains(&phase) {
+                    result.and_then(|_| {
+                        Err(ProviderError::other(std::io::Error::other(format!(
+                            "injected {phase:?} sync fault"
+                        ))))
+                    })
+                } else {
+                    result
+                };
+                (phase, result)
+            })
+            .collect()
     }
 
     /// Syncs all data like [`Self::sync_all`], then writes the configuration to disk, leaving

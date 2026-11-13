@@ -37,11 +37,37 @@ mod writer_tests;
 use reth_nippy_jar::NippyJar;
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
-use std::{io, ops::Deref, sync::Arc};
+use std::{io, marker::PhantomData, ops::Deref, sync::Arc};
 
-/// Alias type for each specific `NippyJar`.
-type LoadedJarRef<'a> =
-    reth_primitives_traits::dashmap::mapref::one::Ref<'a, (u64, StaticFileSegment), LoadedJar>;
+/// A cached `NippyJar`, as a reader holds it.
+///
+/// TN(TN-0148): a clone of the cache's `Arc`, not the cache's shard lock (upstream holds the
+/// `DashMap` shard's read guard for the reader's whole life), so a persist that replaces the jar
+/// never waits for its readers while the segment grows; they keep reading the snapshot they got.
+/// The lifetime stays, so the providers built on it keep upstream's signatures.
+#[derive(Debug)]
+pub struct LoadedJarRef<'a> {
+    jar: Arc<LoadedJar>,
+    _cache: PhantomData<&'a LoadedJar>,
+}
+
+impl LoadedJarRef<'_> {
+    const fn new(jar: Arc<LoadedJar>) -> Self {
+        Self { jar, _cache: PhantomData }
+    }
+
+    /// The jar, as the shard guard's `value` gave it.
+    fn value(&self) -> &LoadedJar {
+        &self.jar
+    }
+}
+
+impl Deref for LoadedJarRef<'_> {
+    type Target = LoadedJar;
+    fn deref(&self) -> &Self::Target {
+        &self.jar
+    }
+}
 
 /// Helper type to reuse an associated static file mmap handle on created cursors.
 #[derive(Debug)]
@@ -49,6 +75,10 @@ pub struct LoadedJar {
     jar: NippyJar<SegmentHeader>,
     mmap_handle: Arc<reth_nippy_jar::DataReader>,
     csoff_reader: Option<ChangesetOffsetReader>,
+    /// TN(TN-0148): shared by every snapshot of one file's jar loaded while its segment only
+    /// grew; a fresh one when it shrank or stayed. Its count tells when no snapshot of the file
+    /// from before a shrink is left ([`LoadedJar::release`]).
+    lease: Arc<()>,
 }
 
 impl LoadedJar {
@@ -71,7 +101,7 @@ impl LoadedJar {
                     None
                 };
 
-                Ok(Self { jar, mmap_handle, csoff_reader })
+                Ok(Self { jar, mmap_handle, csoff_reader, lease: Arc::new(()) })
             }
             Err(e) => Err(ProviderError::other(e)),
         }
@@ -94,6 +124,32 @@ impl LoadedJar {
     /// Returns a reference to the cached changeset offset reader.
     const fn csoff_reader(&self) -> Option<&ChangesetOffsetReader> {
         self.csoff_reader.as_ref()
+    }
+
+    /// TN(TN-0148): makes this jar a later snapshot of `older`'s file, which it extends: the
+    /// segment grew, so every row `older` names is still in the files.
+    fn extending(mut self, older: &Self) -> Self {
+        self.lease = Arc::clone(&older.lease);
+        self
+    }
+
+    /// TN(TN-0148): drops the cache's handle on a jar taken out of the cache without its segment
+    /// growing, then waits until no reader holds it or any earlier snapshot of its file, as
+    /// replacing or removing it in upstream's shard-locked cache waited for its readers. A prune
+    /// cuts rows from the files in place, and the next append writes new rows where they were, so
+    /// a reader of an older snapshot could read those as the rows its offsets name. Waits by
+    /// polling, as long as readers hold a snapshot of the file. Every index update that does not
+    /// grow its segment takes this path: a prune or an unwind, and the writer's open (the first
+    /// persist after a start, and every rotation to a new file), whose commit re-indexes the
+    /// segment at its tip and so replaces the jar of the file holding the tip; so do a stale jar
+    /// above a new range, a re-initialization and a removal of a cached jar. Never call it while
+    /// holding a provider of the same file: it would wait forever, as upstream deadlocks.
+    fn release(jar: Arc<Self>) {
+        let lease = Arc::clone(&jar.lease);
+        drop(jar);
+        while Arc::strong_count(&lease) > 1 {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
     }
 }
 
