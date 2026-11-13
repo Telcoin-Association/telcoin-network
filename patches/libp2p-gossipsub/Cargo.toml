@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-gossipsub"
-version = "0.50.0"
+version = "0.50.1"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Age Manning <Age@AgeManning.com>"]
