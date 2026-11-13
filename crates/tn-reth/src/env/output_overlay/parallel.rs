@@ -107,7 +107,12 @@
 //! network-wide, not local: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
 //! or only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
 //! `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning
-//! them off on one node only parts it from its peers on the next block the bug hits.
+//! them off on one node only parts it from its peers on the next block the bug hits. Turning them
+//! off stops the bug; it repairs no trie node an unchecked block already persisted (the comparison
+//! covers the trie updates too, so a bug can be in them). Every later root, serial ones included,
+//! is computed over those nodes, so the nodes keep agreeing while a block's root may not be the
+//! root of its state. A snapshot restore (`snapshot.rs`) finds it: it rebuilds the trie from the
+//! hashed state and fails when that root differs from the snapshot block's header.
 //!
 //! With `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every
 //! such block is compared and a difference panics: the shadow runs of the exec bench compare every

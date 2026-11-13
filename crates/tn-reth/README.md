@@ -107,7 +107,12 @@ the parallel code computed a wrong root, and the unchecked blocks the same bug h
 node running this code: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`, or
 only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
 `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning them off
-on one node only parts it from its peers on the next block the bug hits.
+on one node only parts it from its peers on the next block the bug hits. Turning them off stops the
+bug; it repairs no trie node an unchecked block already persisted (the check compares the trie
+updates too, so a bug can be in them). Every later root, serial ones included, is computed over
+those nodes, so the nodes keep agreeing while a block's root may not be the root of its state. A
+snapshot restore (`src/snapshot.rs`) finds it: it rebuilds the trie from the hashed state and fails
+when that root differs from the snapshot block's header.
 `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
 ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
 split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
