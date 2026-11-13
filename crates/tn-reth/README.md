@@ -931,6 +931,14 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
   committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
   validator out leaves no margin, so validators take the swap below.
 
+  A validator rebuilt in place keeps the votes and proposals it made in the epoch it was in: they
+  are in `consensus-db/`, which the reset leaves, and the rebuild's closes of the epochs before
+  it keep them (a close removes only the votes and proposals of the epoch it closes and older
+  ones; each close that keeps some logs `keeping that epoch's votes and proposals` with the
+  epoch). When the node is back in that epoch they keep it from voting twice in a round or
+  proposing a second header for one, as after a restart, so it needs no wait before its start,
+  unlike a fresh datadir (Rollback below).
+
   A record of the node's own that a bad execution wrote stops every rebuild on this release. A
   node that forked (its execution diverged, and it built and stored its own record for that
   epoch, which no quorum certified) still holds that record after the reset. The rebuild, on a

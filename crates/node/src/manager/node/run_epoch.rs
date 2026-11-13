@@ -251,7 +251,7 @@ where
                 // that left no durable record 0 would trip the epoch-0 guard above on every
                 // restart (peers cannot backfill epoch 0), bricking the node
                 self.write_epoch_record(committee.epoch(), engine).await?;
-                self.clear_consensus_db_for_next_epoch()?;
+                self.clear_consensus_db_for_next_epoch(committee.epoch())?;
                 return Ok(RunEpochMode::NewEpoch);
             }
             // Only wait for consensus that was actually forwarded to the engine.
@@ -651,7 +651,7 @@ where
 
         // clear tables
         if clear_tables_for_next_epoch {
-            self.clear_consensus_db_for_next_epoch()?;
+            self.clear_consensus_db_for_next_epoch(epoch)?;
         }
         // An epoch task that saw a store refuse a write (a failed durability barrier) ends the
         // epoch the way a mode change does. Running another epoch on a store the node can no
