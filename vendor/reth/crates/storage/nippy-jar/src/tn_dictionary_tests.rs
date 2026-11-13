@@ -142,7 +142,9 @@ fn test_jars_without_a_dictionary_read_back() {
 }
 
 /// A checksummed jar still refuses dictionary zstd: its dictionaries would live in the
-/// configuration, which every commit rewrites, and no jar TN writes uses them.
+/// configuration, which every commit rewrites, and no jar TN writes uses them. `load` refuses
+/// such a configuration, and a writer refuses such a jar before it creates any file, so no row
+/// is written that `load` would then never read.
 #[test]
 fn test_checksummed_jar_refuses_dictionary_zstd() {
     let rows = values(4, 50);
@@ -153,4 +155,9 @@ fn test_checksummed_jar_refuses_dictionary_zstd() {
         NippyJar::<()>::load_from_reader(&config[..]),
         Err(NippyJarError::UnsupportedCompression)
     ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dictionary_jar(&dir.path().join("jar"), &rows).with_checksums();
+    assert!(matches!(NippyJarWriter::new(jar), Err(NippyJarError::UnsupportedCompression)));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no file is created");
 }

@@ -72,8 +72,10 @@ impl NamedChain {
 
     /// Write this chain's bundled genesis committee to the datadir unless one is already there.
     ///
-    /// Callers run this after their startup checks pass, so a refused start leaves the datadir
-    /// as it was.
+    /// Callers run this after their startup checks pass, so a start they refuse writes no
+    /// committee file. `node` runs it after its execution database opens: the open refuses an
+    /// unfinished `db reset-execution` and a refused `--db.*` flag before it writes anything, but
+    /// an open that fails later may already have created or migrated the database.
     pub(crate) fn write_committee<P: TelcoinDirs>(self, tn_datadir: &P) -> eyre::Result<()> {
         match self {
             Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
@@ -362,12 +364,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
-        // the bundled committee is written only once every startup check above has passed
+        // create dbs to survive between sync state transitions
+        let reth_db = open_execution_database(&node_config, &tn_datadir)?;
+        // the bundled committee is written only once every startup check above and the database
+        // open have passed
         if let Some(chain) = named_chain {
             chain.write_committee(&tn_datadir)?;
         }
-        // create dbs to survive between sync state transitions
-        let reth_db = open_execution_database(&node_config, &tn_datadir)?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
             .with_state_export_keep(state_export_keep)
             // the two flags conflict, so at most one of them is set
@@ -1296,6 +1299,40 @@ mod tests {
         assert!(!dir.path().to_path_buf().reth_db_path().exists());
         assert!(!dir.path().to_path_buf().genesis_path().exists());
         assert_eq!(datadir_listing(dir.path())?, before);
+        Ok(())
+    }
+
+    /// A `node --chain mainnet` start refused by an unfinished `db reset-execution`, or by the
+    /// execution database open (a refused `--db.*` flag here), writes no `genesis/` committee
+    /// file and no database.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_refused_at_its_database_writes_no_committee() -> eyre::Result<()> {
+        // a build that carries the faucet mint is refused on mainnet before either refusal here
+        if FAUCET_ENABLED {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        let passphrase = || Some(zeroize::Zeroizing::new("mainnet test passphrase".to_owned()));
+        generate_keys(datadir, passphrase())?;
+        let tn_datadir = dir.path().to_path_buf();
+        let partial = tn_datadir.join("execution-reset-20261109T000000Z.partial");
+        std::fs::create_dir_all(partial.join("db"))?;
+
+        let err = run_mainnet_node(datadir, passphrase(), &[]).expect_err("an unfinished reset");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("did not finish"), "{msg}");
+        assert!(!tn_datadir.genesis_path().try_exists()?, "no committee file");
+        assert!(!tn_datadir.reth_db_path().try_exists()?, "no database");
+
+        std::fs::remove_dir_all(&partial)?;
+        let err = run_mainnet_node(datadir, passphrase(), &["--db.gap-fill", "65"])
+            .expect_err("a refused database flag");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--db.gap-fill"), "{msg}");
+        assert!(!tn_datadir.genesis_path().try_exists()?, "no committee file");
+        assert!(!tn_datadir.reth_db_path().try_exists()?, "no database");
         Ok(())
     }
 
