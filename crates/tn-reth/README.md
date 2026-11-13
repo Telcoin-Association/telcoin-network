@@ -629,11 +629,15 @@ one of reth's: its rows are not copied (reth does not read them either).
   row is decoded) into a new tn-lmdb file built in `db/tn-lmdb-migrating/`, with the node's `--db.*`
   settings (`--db.page-size`, `--db.max-size` and `--db.growth-step`). Before anything of MDBX's is
   touched it checks each table's rows against MDBX's count, a read-back hash of each table against
-  the copy, and the synced file against the engine's full check. It takes a record of `mdbx.dat`
-  when it opens MDBX (MDBX's last transaction id, and the file's length and modification time),
-  and takes it again once the copy is checked, the id while MDBX is still open: a difference means
-  another process wrote MDBX during the migration (an MDBX build on a second datadir naming the
-  same `db/`), whose writes the copy misses, so the migration fails, leaving MDBX as that process
+  the copy, and the synced file against the engine's full check. It opens MDBX read-only and
+  exclusively (`MDBX_EXCLUSIVE`): while another process has the MDBX database open (an MDBX build
+  on a second datadir naming the same `db/`, writing or idle), MDBX refuses the open with
+  `MDBX_BUSY` and the migration does not start, and while the migration copies, MDBX refuses any
+  other process's open. It takes a record of `mdbx.dat` when it opens MDBX (MDBX's last
+  transaction id, and the file's length and modification time), and takes it again once the copy
+  is checked, the id while MDBX is still open: a difference means something wrote MDBX during the
+  migration past the exclusive open (a write to the file itself, or a process MDBX's file locks do
+  not reach), and the copy misses those writes, so the migration fails, leaving MDBX as the write
   left it. Then it writes the record to `db/tn-lmdb-migrating/mdbx-source`, renames the file to
   `db/tn-lmdb.dat` (the commit point),
   records the tn-lmdb version in `db/database.version` (the rollback tripwire, above), checks
@@ -642,7 +646,9 @@ one of reth's: its rows are not copied (reth does not read them either).
   temp directory. reth's static files are not touched. While `mdbx.dat` or the temp directory is
   there, the open holds an exclusive `flock` on `db/` itself (two datadirs can name one `db/`, and
   the datadir lock is one datadir's), so a second process migrating or finishing the same
-  directory is refused with "another process is migrating this database". The copy needs no case
+  directory is refused with "another process is migrating this database"; the open looks at
+  `db/`'s files under that lock, so a migration another process finished just before is seen as
+  finished. The copy needs no case
   of its own for the dup-sort tables'
   forms: MDBX walks a key's values in subkey order, so each row is an
   append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
@@ -693,10 +699,11 @@ one of reth's: its rows are not copied (reth does not read them either).
   |---|---|---|
   | less free space than the migration needs | the copy is built beside MDBX | free space, then start again |
   | `db/` locked by another process's migration ("another process is migrating this database") | two datadirs name one `db/`, and one node is migrating or finishing it | wait for it to finish, then start again |
+  | an MDBX database another process has open, which MDBX refuses the migration's exclusive open with `MDBX_BUSY` ("another process has the MDBX database open") | two datadirs name one `db/`, and an MDBX build runs on the other, committing or idle; the migration would remove the `mdbx.dat` it writes to | MDBX is unchanged: stop that process, then start again |
   | an MDBX database MDBX refuses to open read-only with `MDBX_WANNA_RECOVERY` (stopped uncleanly under `--db.sync-mode safe-no-sync`) | a read-only open does not recover it; the error says what to do | MDBX is unchanged: start the previous binary (the one that ran reth on MDBX) once and stop it cleanly, then start this build |
   | a row tn-lmdb cannot store: a second value for a dup-sort subkey (`MDBX_KEYEXIST`), or a value over 16 MiB (`MDBX_BAD_VALSIZE`) | tn-lmdb stores one value per subkey and values up to 16 MiB; reth writes neither | MDBX is unchanged: run the MDBX build, and report the error |
   | a copy that fails its checks (a short read, a read-back mismatch, the engine's check) | the copy would lose or change rows | as above |
-  | an `mdbx.dat` whose last transaction id, length or modification time after the copy differs from the migration's record of it at the open ("another process wrote the MDBX database during the migration") | another process (an MDBX build on a second datadir naming the same `db/`) wrote MDBX while it was copied, and the copy misses those writes | MDBX is as that process left it: stop that process, then start again |
+  | an `mdbx.dat` whose last transaction id, length or modification time after the copy differs from the migration's record of it at the open ("another process wrote the MDBX database during the migration") | something wrote MDBX while it was copied, past the exclusive open (a write to the file itself, or a process MDBX's file locks do not reach), and the copy misses those writes | MDBX is as that write left it: stop the writer, then start again |
   | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
   | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or modification time from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | as above; both files are kept |

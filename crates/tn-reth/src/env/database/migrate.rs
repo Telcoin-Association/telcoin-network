@@ -34,19 +34,25 @@
 //! The datadir lock is one datadir's, and two datadirs can name one database directory, so while
 //! `mdbx.dat` or the temp directory is there the open also locks the database directory itself
 //! (an exclusive `flock` on the directory, [`lock_db_dir`], held until it returns): a second
-//! process migrating or finishing the same files is refused.
+//! process migrating or finishing the same files is refused. The open reads the directory's files
+//! under that lock, so a migration another process finishes just before it is seen as finished. A
+//! build running reth on MDBX takes neither lock; the migration's exclusive open of MDBX (step 2)
+//! keeps such a process out.
 //!
 //! **Steps.**
 //! 1. Remove a stopped migration's temp directory.
-//! 2. Open MDBX read-only ([`open_mdbx_read_only`]), with the node's read transaction timeout as
-//!    tn-lmdb takes it (`--db.read-transaction-timeout`); an environment stopped uncleanly under
-//!    `--db.sync-mode safe-no-sync` is refused by MDBX with `MDBX_WANNA_RECOVERY`, and the error
-//!    says to run the previous binary once and stop it cleanly. Take the record of the source
-//!    ([`MdbxSource`]): MDBX's last transaction id, and `mdbx.dat`'s length and modification time,
-//!    as the open finds them. Sum the live bytes of reth's tables in it: their branch, leaf and
-//!    overflow pages times the page size, as `db stats` reports them on the MDBX build
-//!    ([`mdbx_live_bytes`]). Warn of any named database in it that is not one of reth's tables: its
-//!    rows are not copied (reth does not read them either).
+//! 2. Open MDBX read-only and exclusively ([`open_mdbx_read_only`]), with the node's read
+//!    transaction timeout as tn-lmdb takes it (`--db.read-transaction-timeout`). While another
+//!    process has the environment open (a build running reth on MDBX on a second datadir naming the
+//!    same directory, writing or idle), MDBX refuses the open with `MDBX_BUSY`, and the error says
+//!    to stop that process; while the migration holds it open, MDBX refuses any other process's
+//!    open. An environment stopped uncleanly under `--db.sync-mode safe-no-sync` is refused by MDBX
+//!    with `MDBX_WANNA_RECOVERY`, and the error says to run the previous binary once and stop it
+//!    cleanly. Take the record of the source ([`MdbxSource`]): MDBX's last transaction id, and
+//!    `mdbx.dat`'s length and modification time, as the open finds them. Sum the live bytes of
+//!    reth's tables in it: their branch, leaf and overflow pages times the page size, as `db stats`
+//!    reports them on the MDBX build ([`mdbx_live_bytes`]). Warn of any named database in it that
+//!    is not one of reth's tables: its rows are not copied (reth does not read them either).
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
@@ -68,14 +74,14 @@
 //! 7. Close the tn-lmdb file, and check that nothing wrote MDBX while it was copied: MDBX's last
 //!    transaction id, read again from the source while it is still open, then (once it is closed)
 //!    `mdbx.dat`'s length and modification time must equal the record of step 2. A difference means
-//!    another process wrote the MDBX database during the migration (a build running reth on MDBX on
-//!    a second datadir naming the same directory, which takes neither this datadir's lock nor the
-//!    directory's), and the copy misses those writes: the migration fails, before its commit point.
-//!    Write the record in the temp directory ([`MDBX_SOURCE_RECORD`], fsynced), fsync the temp
-//!    directory, and rename its `tn-lmdb.dat` into the database directory: the commit point. Then
-//!    fsync the database directory, and record tn-lmdb's version in reth's `database.version`
-//!    (`TN_LMDB_DB_VERSION`, the rollback tripwire), so a build running reth on MDBX alone refuses
-//!    the directory from here on and never advances the `mdbx.dat` that step 8 removes.
+//!    something wrote the MDBX database during the migration past the exclusive open (a write to
+//!    the file itself, or a process MDBX's file locks do not reach), and the copy misses those
+//!    writes: the migration fails, before its commit point. Write the record in the temp directory
+//!    ([`MDBX_SOURCE_RECORD`], fsynced), fsync the temp directory, and rename its `tn-lmdb.dat`
+//!    into the database directory: the commit point. Then fsync the database directory, and record
+//!    tn-lmdb's version in reth's `database.version` (`TN_LMDB_DB_VERSION`, the rollback tripwire),
+//!    so a build running reth on MDBX alone refuses the directory from here on and never advances
+//!    the `mdbx.dat` that step 8 removes.
 //! 8. Fsync the database directory again (a later open finishing a stopped migration starts here,
 //!    and the rename must be durable before MDBX goes), then remove MDBX's `mdbx.lck`, then
 //!    `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a migration unfinished), and fsync
@@ -158,6 +164,9 @@ const HEADROOM_FLOOR: u64 = 1 << 30;
 /// (`PAUSE_AT`), or act on the directory as another process would (`RUN_AT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
+    /// After the open saw whether the database directory needs its lock, before it takes it and
+    /// reads the directory's files.
+    BeforeLock,
     /// After a commit of the copy: rows are in the temp directory's file.
     MidCopy,
     /// After the read-back checked a table, inside its read transaction of the copy.
@@ -276,12 +285,16 @@ fn take_fault(fault: CopyFault) -> bool {
 /// stopped migration's temp directory. `args` are the settings the node opens tn-lmdb with: a
 /// migrated file takes their page size, reservation and growth step.
 pub(super) fn migrate_from_mdbx(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
-    let mdbx = file_exists(&path.join(MDBX_DATA_FILE))?;
+    let mdbx_file = path.join(MDBX_DATA_FILE);
+    let pending = file_exists(&mdbx_file)? || file_exists(&path.join(MIGRATING_DIR))?;
+    step(Step::BeforeLock)?;
+    // Held until this returns: a migration, a finish or a refusal runs alone on the directory.
+    let _lock = pending.then(|| lock_db_dir(path)).transpose()?;
+    // Read under the lock: another process's migration of the same files may have finished, or
+    // moved on a step, between the check above and the lock.
+    let mdbx = pending && file_exists(&mdbx_file)?;
     let tn_lmdb = file_exists(&path.join(DATA_FILE))?;
     let marker = file_exists(&path.join(MIGRATED_MARKER))?;
-    // Held until this returns: a migration, a finish or a refusal runs alone on the directory.
-    let _lock =
-        (mdbx || file_exists(&path.join(MIGRATING_DIR))?).then(|| lock_db_dir(path)).transpose()?;
     match (mdbx, tn_lmdb, marker) {
         (true, _, true) => Err(written_after_migration(path)),
         (true, false, false) => migrate(path, args),
@@ -550,10 +563,16 @@ fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Open the MDBX database in `path` read-only, for the copy, with a hint on MDBX's
-/// `MDBX_WANNA_RECOVERY` refusal ([`describe_mdbx_open_error`]). Its read transactions take the
+/// Open the MDBX database in `path` read-only, for the copy, with a hint on MDBX's `MDBX_BUSY` and
+/// `MDBX_WANNA_RECOVERY` refusals ([`describe_mdbx_open_error`]). Its read transactions take the
 /// node's read transaction timeout as tn-lmdb's do (`read_transaction_timeout`, `None` for none):
 /// the copy's read, which lives as long as the copy, opts out of it.
+///
+/// The open is exclusive (`MDBX_EXCLUSIVE`): MDBX refuses it with `MDBX_BUSY` while another
+/// process has the environment open, read-write or read-only, committing or idle, and refuses
+/// another process's open while the returned environment is open. A process holding MDBX open
+/// without committing leaves no trace in the record the migration takes ([`MdbxSource`]), and
+/// would keep writing to the `mdbx.dat` that [`finish`] removes.
 fn open_mdbx_read_only(
     path: &Path,
     read_transaction_timeout: Option<std::time::Duration>,
@@ -562,7 +581,9 @@ fn open_mdbx_read_only(
         Some(limit) => MaxReadTransactionDuration::Set(limit),
         None => MaxReadTransactionDuration::Unbounded,
     };
-    let args = DatabaseArguments::default().with_max_read_transaction_duration(Some(limit));
+    let args = DatabaseArguments::default()
+        .with_max_read_transaction_duration(Some(limit))
+        .with_exclusive(Some(true));
     reth_db::mdbx::open_db_read_only(path, args).map_err(describe_mdbx_open_error).wrap_err_with(
         || {
             let mdbx = path.join(MDBX_DATA_FILE);
@@ -578,15 +599,27 @@ const WANNA_RECOVERY_HINT: &str =
      the one that ran reth on MDBX, once and stop it cleanly, then start this build; MDBX is \
      unchanged";
 
-/// The error of an MDBX open, `err`, with [`WANNA_RECOVERY_HINT`] when MDBX refused with
-/// `MDBX_WANNA_RECOVERY` (an environment stopped uncleanly under `safe-no-sync`, whose recovery
-/// needs a read-write open by a build that runs reth on MDBX); any other error as it is.
+/// The hint [`describe_mdbx_open_error`] adds to MDBX's `MDBX_BUSY`.
+const BUSY_HINT: &str =
+    "another process has the MDBX database open (MDBX_BUSY: a build running reth on MDBX, on a \
+     second datadir naming the same directory?): the migration opens it exclusively, so that no \
+     process writes it during the copy or keeps it open while the migration removes it. Stop that \
+     process, then start this build; MDBX is unchanged";
+
+/// The error of an MDBX open, `err`, with [`BUSY_HINT`] when MDBX refused with `MDBX_BUSY` (another
+/// process has the environment open, and the open is exclusive), or [`WANNA_RECOVERY_HINT`] when it
+/// refused with `MDBX_WANNA_RECOVERY` (an environment stopped uncleanly under `safe-no-sync`, whose
+/// recovery needs a read-write open by a build that runs reth on MDBX); any other error as it is.
 fn describe_mdbx_open_error(err: eyre::Report) -> eyre::Report {
-    let wanna_recovery = MdbxError::WannaRecovery.to_err_code();
-    let needs_recovery = err.chain().any(|e| {
-        matches!(e.downcast_ref::<DatabaseError>(), Some(DatabaseError::Open(info)) if info.code == wanna_recovery)
-    });
-    if needs_recovery {
+    let refused_with = |code: MdbxError| {
+        let code = code.to_err_code();
+        err.chain().any(|e| {
+            matches!(e.downcast_ref::<DatabaseError>(), Some(DatabaseError::Open(info)) if info.code == code)
+        })
+    };
+    if refused_with(MdbxError::Busy) {
+        err.wrap_err(BUSY_HINT)
+    } else if refused_with(MdbxError::WannaRecovery) {
         err.wrap_err(WANNA_RECOVERY_HINT)
     } else {
         err
