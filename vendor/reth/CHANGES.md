@@ -2393,3 +2393,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   next jar, and one stopped after the configuration, or after the data file too, opens; the next
   persist writes the jar and every block reads; it fails with the old order, on the stray data
   file). *Upstream*: yes (upstream's order).
+
+- **TN-0151** — The changeset counts load each jar through TN-0135's format check and count a
+  segment's last file. *Kind*: fix. *Files*:
+  `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
+  (`account_changeset_count`, `storage_changeset_count`; test).
+  *Why*: the two counts loaded a jar's configuration with `NippyJar::load`, outside `load_jar`,
+  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at every other load,
+  was counted with its own record size instead of refused. They also named each file by the
+  blocks its configuration holds (the range `iter_static_files` lists), not by its fixed range,
+  so a segment's last file, which holds fewer blocks than its range until it fills, was never
+  found and its changes were left out of the count (upstream's line). *Can reach execution or
+  storage*: no. They only read and count, and no TN crate calls them (they back reth's
+  `StatsReader::count_entries` and the `*_changeset_count` provider methods); no byte written or
+  read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
+  refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
+  off and for the segment still checked; it fails without either change). *Upstream*: the file
+  name, yes; the format check, no (TN-0135 is TN's).
