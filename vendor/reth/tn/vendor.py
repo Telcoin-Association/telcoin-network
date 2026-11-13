@@ -614,6 +614,16 @@ def ledger_problems(rows, text, crates, code_files):
     return unnamed, undefined
 
 
+def duplicate_ids(text):
+    """The ids the ledger's `text` defines more than once, as {id: number of entries}. Two
+    branches that each take the next free id define it twice; the set of defined ids that
+    `ledger_problems` reads would hide that."""
+    counts = {}
+    for m in LEDGER_ENTRY.finditer(text):
+        counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    return {tn: n for tn, n in sorted(counts.items()) if n > 1}
+
+
 def workspace_dep_names(manifest_text):
     names, section = set(), None
     for line in manifest_text.splitlines():
@@ -689,16 +699,20 @@ def cmd_ledger(args):
         rows = classify(base, crates)
     code = {rel: (read(VENDOR, rel) or b"").decode(errors="replace")
             for rel in scope_files(VENDOR, crates)}
-    unnamed, undefined = ledger_problems(rows, CHANGES_MD.read_text(), crates, code)
+    text = CHANGES_MD.read_text()
+    unnamed, undefined = ledger_problems(rows, text, crates, code)
+    duplicated = duplicate_ids(text)
     for k, rel in unnamed:
         print(f"not in CHANGES.md: {k:9} {rel}")
     for tn, rels in sorted(undefined.items()):
         print(f"no CHANGES.md entry for {tn}: {', '.join(rels)}")
-    if unnamed or undefined:
+    for tn, n in duplicated.items():
+        print(f"CHANGES.md defines {tn} in {n} entries")
+    if unnamed or undefined or duplicated:
         print("\nname each file in an entry's *Files* line (from vendor/reth, or from a crate the "
-              "entry named before it), and give each id an entry")
+              "entry named before it), give each id an entry, and give each entry its own id")
         return 1
-    print(f"ledger: CHANGES.md names all {len(rows)} changed files and defines every TN id")
+    print(f"ledger: CHANGES.md names all {len(rows)} changed files and defines every TN id once")
     return 0
 
 

@@ -2188,3 +2188,14 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   fall back to the walk) and `tests/it/trie_overlay.rs` (the parallel root against reth's
   merged-input oracle). Mutation-checked: the tip check removed, the tasks' prefix set emptied.
   *Upstream*: no (TN's overlay and task model).
+
+- **TN-0143** — The ledger check fails when two entries define the same id.
+  *Kind*: tooling.
+  *Files*: `tn/vendor.py` (`duplicate_ids`, `cmd_ledger`), `tn/test_vendor.py`
+  (`test_reports_unnamed_files_and_undefined_ids`, `test_duplicate_ids_counts_entries_per_id`).
+  *Why*: `ledger_problems` reads the defined ids as a set, so a ledger in which two branches each
+  took the next free id passed: every file was named and every id defined, but one id meant two
+  changes. Merging sls_reth_vendor2 found eleven such ids by hand (TN-0038 to TN-0045 and TN-0050
+  to TN-0052) and renumbered one side's. `vendor.py ledger` now prints each id with its entry count
+  and fails. *Can reach execution or storage*: no (vendoring tooling only).
+  *Upstream*: no (TN's tooling).

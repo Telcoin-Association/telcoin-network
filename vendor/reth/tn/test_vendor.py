@@ -312,6 +312,23 @@ class Ledger(Fixture):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("names all 2 changed files", out.stdout)
 
+        # two branches that each took the next free id: every file is named and every id is
+        # defined, but one id now means two changes
+        write(r.tn / "vendor/reth", {"CHANGES.md": entry("TN-0001", f"`{LIMITS_SRC}`")
+                                     + entry("TN-0002", "`crates/foo/src/plain.rs`")
+                                     + "## Another section\n\n"
+                                     + entry("TN-0001", "`crates/foo/src/plain.rs`")})
+        out = r.vendor("ledger")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("CHANGES.md defines TN-0001 in 2 entries", out.stdout)
+        self.assertNotIn("TN-0002 in", out.stdout)
+
+    def test_duplicate_ids_counts_entries_per_id(self):
+        text = ("## Section\n\n" + entry("TN-0001", "`a`") + entry("TN-0002", "`b`")
+                + "## Other\n\n" + entry("TN-0001", "`c`") + entry("TN-0001", "`d`"))
+        self.assertEqual(vendor.duplicate_ids(text), {"TN-0001": 3})
+        self.assertEqual(vendor.duplicate_ids(entry("TN-0001", "`a`")), {})
+
 
 if __name__ == "__main__":
     unittest.main()
