@@ -563,7 +563,13 @@ impl DataReader {
         let offsets_file_size = self.offset_file.metadata()?.len() as usize;
 
         if offsets_file_size > 1 {
-            let from = offsets_file_size - self.offset_size as usize * (index + 1);
+            // TN(TN-0152): offsets start after the file's first byte (the offset size). A file too
+            // short for the offset asked for (a damaged version-1 file the heal keeps) is an
+            // error, not an underflow or a read of that byte.
+            let from = offsets_file_size
+                .checked_sub(self.offset_size as usize * (index + 1))
+                .filter(|from| *from >= 1)
+                .ok_or(NippyJarError::OffsetOutOfBounds { index })?;
 
             self.offset_at(from)
         } else {
@@ -1810,6 +1816,33 @@ mod tests {
                 let values = cursor.row_by_number(row).unwrap().unwrap();
                 assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
             }
+        }
+    }
+
+    /// TN(TN-0152): a plain jar's offsets file cut to 2 to 8 bytes (its offset size and less than
+    /// one offset) is an error at the writer's open: the heal counts no rows in it and then reads
+    /// its final offset, which starts before the file's second byte. It underflowed (a panic with
+    /// overflow checks), or for 8 bytes read the offset size as part of the offset.
+    #[test]
+    fn test_offsets_file_shorter_than_one_offset_is_an_error() {
+        let (col1, col2) = test_data(Some(15));
+        for len in 2..=8 {
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, false);
+            let offsets = jar.path().with_extension(OFFSETS_FILE_EXTENSION);
+            OpenOptions::new().write(true).open(offsets).unwrap().set_len(len).unwrap();
+            let reader = DataReader::new(jar.path()).unwrap();
+            assert!(
+                matches!(
+                    reader.reverse_offset(0),
+                    Err(NippyJarError::OffsetOutOfBounds { index: 0 })
+                ),
+                "{len}"
+            );
+            drop(reader);
+            let err = NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap())
+                .unwrap_err();
+            assert!(matches!(err, NippyJarError::OffsetOutOfBounds { index: 0 }), "{len}: {err}");
         }
     }
 

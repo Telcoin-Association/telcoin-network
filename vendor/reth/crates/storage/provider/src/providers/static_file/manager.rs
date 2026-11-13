@@ -2936,16 +2936,19 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::AccountChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let data_path =
-                    self.path.join(StaticFileSegment::AccountChangeSets.filename(block_range));
+            for (_, header) in changeset_segments {
+                // TN(TN-0151): a file is named by its fixed range, not by the blocks it holds
+                // (fewer in a segment's last file, which was never counted).
+                let data_path = self.path.join(
+                    StaticFileSegment::AccountChangeSets.filename(&header.expected_block_range()),
+                );
                 let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
                     // TN(TN-0121): the jar's configuration says whether its records carry
-                    // checksums.
-                    let checksums = NippyJar::<SegmentHeader>::load(&data_path)
-                        .map_err(ProviderError::other)?
+                    // checksums. TN(TN-0151): loaded through TN-0135's format check.
+                    let checksums = self
+                        .load_jar(StaticFileSegment::AccountChangeSets, &data_path)?
                         .has_checksums();
                     let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;
@@ -3130,16 +3133,19 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
         if let Some(changeset_segments) = static_files.get(StaticFileSegment::StorageChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let data_path =
-                    self.path.join(StaticFileSegment::StorageChangeSets.filename(block_range));
+            for (_, header) in changeset_segments {
+                // TN(TN-0151): a file is named by its fixed range, not by the blocks it holds
+                // (fewer in a segment's last file, which was never counted).
+                let data_path = self.path.join(
+                    StaticFileSegment::StorageChangeSets.filename(&header.expected_block_range()),
+                );
                 let csoff_path = data_path.with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
                     // TN(TN-0121): the jar's configuration says whether its records carry
-                    // checksums.
-                    let checksums = NippyJar::<SegmentHeader>::load(&data_path)
-                        .map_err(ProviderError::other)?
+                    // checksums. TN(TN-0151): loaded through TN-0135's format check.
+                    let checksums = self
+                        .load_jar(StaticFileSegment::StorageChangeSets, &data_path)?
                         .has_checksums();
                     let reader = ChangesetOffsetReader::new(&csoff_path, len, checksums)
                         .map_err(ProviderError::other)?;

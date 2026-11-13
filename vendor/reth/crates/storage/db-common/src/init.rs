@@ -156,7 +156,10 @@ where
                     // genesis header in static files and nothing in the database, and every
                     // restart failed here until the operator deleted the datadir (review R17).
                     // With no stage checkpoint at all the database is empty, so the launch
-                    // resumes: `insert_genesis_header` keeps the header already there.
+                    // resumes: `insert_genesis_header` keeps the header already there. Storage v1
+                    // only: under v2 genesis also committed block 0 of the changeset segments,
+                    // which the resumed `insert_genesis_state` fails to append again. TN's
+                    // `layout::settle` removes such a genesis, or refuses the datadir, first.
                     if database_is_empty(factory)? {
                         warn!(target: "reth::storage", "Genesis header found on static files with an empty database; resuming an interrupted first launch.");
                     } else {
@@ -732,8 +735,8 @@ mod tests {
         assert_eq!(genesis_hash, HOLESKY_GENESIS_HASH);
     }
 
-    /// TN(TN-0083): a first launch that committed the genesis header to static files but not
-    /// to the database resumes instead of failing on every restart.
+    /// TN(TN-0083): a storage-v1 first launch that committed the genesis header to static files
+    /// but not to the database resumes instead of failing on every restart.
     #[test]
     fn init_genesis_resumes_after_a_torn_first_launch() {
         let factory = create_test_provider_factory_with_chain_spec(SEPOLIA.clone());

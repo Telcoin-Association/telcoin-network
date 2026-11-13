@@ -463,7 +463,7 @@ fn is_unchecked_jar(err: &ProviderError) -> bool {
 /// that has none, at every load: one written without checksums (a storage-v2 datadir from before
 /// them), and a checksummed jar whose configuration's version became 1 (its trailer dropped), which
 /// would otherwise read its values with their checksums appended. A provider with checksums off
-/// reads the unchecked jars.
+/// reads the unchecked jars. TN(TN-0151): the changeset counts (`db stats`) refuse them too.
 #[test]
 fn storage_v2_refuses_jars_without_checksums() {
     // Written without checksums, opened with them.
@@ -477,9 +477,13 @@ fn storage_v2_refuses_jars_without_checksums() {
     assert!(is_unchecked_jar(&opened.header_by_number(0).unwrap_err()));
     let err = opened.latest_writer(StaticFileSegment::StorageChangeSets).map(drop).unwrap_err();
     assert!(is_unchecked_jar(&err), "{err}");
+    assert!(is_unchecked_jar(&opened.account_changeset_count().unwrap_err()));
+    assert!(is_unchecked_jar(&opened.storage_changeset_count().unwrap_err()));
     drop(opened);
     let read_only = provider_ro(dir.path());
     assert_eq!(read_only.account_block_changeset(0).unwrap(), account_changes(0));
+    assert_eq!(read_only.account_changeset_count().unwrap() as u64, 3 * CHANGES);
+    assert_eq!(read_only.storage_changeset_count().unwrap() as u64, 3 * CHANGES);
     drop(read_only);
 
     // A checksummed jar whose configuration says version 1.
@@ -499,7 +503,9 @@ fn storage_v2_refuses_jars_without_checksums() {
     let err = reopened.get_storage_before_block(0, address(0, 0), slot(3)).unwrap_err();
     assert!(is_unchecked_jar(&err), "{err}");
     assert!(is_unchecked_jar(&reopened.storage_changeset(1).unwrap_err()));
+    assert!(is_unchecked_jar(&reopened.storage_changeset_count().unwrap_err()));
     assert_eq!(reopened.account_block_changeset(1).unwrap(), account_changes(1));
+    assert_eq!(reopened.account_changeset_count().unwrap() as u64, 3 * CHANGES);
 }
 
 /// A range read that meets a row missing inside a jar's own range is an error, not a shorter

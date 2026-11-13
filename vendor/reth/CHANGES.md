@@ -1461,13 +1461,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
   resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
   written. A database with any checkpoint but not the Headers one is still refused.
+  The resume holds for storage v1 only, where the header is genesis's one static-file row (the
+  transactions and receipts segments get only a block range, which the resumed path sets again).
+  Under storage v2 genesis also commits block 0 of both changeset segments to static files, and
+  the resumed `insert_genesis_state` fails appending it again (`UnexpectedStaticFileBlockNumber`)
+  at every start. TN's node never reaches the resume in either layout: `layout::settle`
+  (`crates/tn-reth/src/env/layout.rs`), the only path to `init_genesis_with_settings`, runs
+  first; it removes the static files of a creation stopped inside genesis's commit (TN's marker,
+  no `storage_settings` row, static files holding only genesis), so genesis writes them from
+  scratch, and refuses any other static files beside a database with no chain.
   *Storage path*: yes (`db-common` holds genesis init). The data written is unchanged: the same
   header, state, trie and checkpoints as a clean first launch, since the resumed path is the
   ordinary write path minus the header append. A datadir that already has chain data never
   reaches it (its checkpoints exist). No manifest or feature change.
-  *Tests*: `init_genesis_resumes_after_a_torn_first_launch` (header in static files, MDBX
-  transaction dropped; init succeeds and writes the checkpoints; the next init is the ordinary
-  skip), `init_genesis_refuses_a_partly_written_database`.
+  *Tests*: `init_genesis_resumes_after_a_torn_first_launch` (storage v1: header in static files,
+  MDBX transaction dropped; init succeeds and writes the checkpoints; the next init is the
+  ordinary skip), `init_genesis_refuses_a_partly_written_database`; TN's heal is
+  `a_creation_stopped_inside_genesis_is_created_again` and
+  `static_files_past_genesis_or_without_the_marker_stay_refused` (`layout.rs`).
   *Upstream*: candidate.
 
 - **TN-0084** — The ledger check reads only an entry's *Files* sentence, and the attested run runs it.
@@ -2008,9 +2019,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs, error.rs}`
   (`NippyJarChecker::reset_files`, `DataReader::new`, `NippyJarError::EmptyOffsetsFile`, tests),
   `crates/storage/provider/src/providers/static_file/tn_crash_tests.rs`.
-  *Why*: a rotation creates the next jar's data and offsets files, writes the 9-byte offsets
-  header without a sync and then the jar's configuration (rows 0) durably. A power loss there can
-  leave the configuration and an empty or torn offsets file (ext4's delayed allocation keeps the
+  *Why*: a rotation writes the next jar's configuration (rows 0) durably and creates its data and
+  offsets files, the 9-byte offsets header without a sync (the configuration came last until
+  TN-0150). A power loss there can leave the configuration and an empty or torn offsets file (ext4's delayed allocation keeps the
   size at 0). The next persist reopens that jar, the heal maps the offsets file and
   `DataReader::new` indexed byte 0 of an empty map: a panic at every start, until someone deleted
   the files by hand. A configuration that counts no rows commits nothing, so whatever the files
@@ -2382,6 +2393,67 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   dictionary, so no jar TN writes is refused and no jar, `.conf` or digest changes.
   *Tests*: `test_checksummed_jar_refuses_dictionary_zstd` (the writer's refusal, and no file
   created; it fails without the writer's check). *Upstream*: no (TN-0120's checksummed format is TN's).
+
+- **TN-0150** — A new NippyJar's configuration is written before its data and offsets files, so a
+  creation stopped at any point leaves a datadir the next start opens. *Kind*: fix (static-file
+  crash safety). *Files*: `crates/storage/nippy-jar/src/writer.rs` (`create_or_open_files`,
+  `NippyJarWriter::new`), `crates/storage/provider/src/providers/static_file/tn_crash_tests.rs`.
+  *Why*: `NippyJarWriter::new` created a new jar's data and offsets files and only then wrote its
+  configuration (rows 0). Jars are found by their data file (`iter_static_files` loads the
+  `.conf` beside each extension-less name), so a kill or power loss in between, at every
+  rotation to a new file and at genesis, left a data file with no configuration: every later
+  start failed in `iter_static_files`, before `layout::settle` or `check_consistency` ran, until
+  someone removed the files by hand. `create_or_open_files` now writes the configuration first,
+  then creates the files and syncs their directory (the configuration's own directory sync made
+  them durable before, when it came last). A creation stopped after the configuration leaves a
+  configuration no listing sees, or one beside a data file; a new jar's header has no block
+  range, so the start does not index it either, and the next persist creates the jar again
+  (TN-0131 resets a jar without rows). This also replaces a stopped deletion's leftover
+  configuration (TN-0132) before a data file appears beside it. *Can reach execution or
+  storage*: storage, but no byte changes: the configuration, data and offsets files hold what
+  they held, and only the order of their creation moves, plus one directory sync per new jar.
+  Nothing a reader or the consistency check sees depends on the order: both find jars through
+  their data file and index only jars with a block range. A datadir an older build wrote opens
+  as before. *Tests*: `rotation_stopped_before_the_next_jar_has_its_files` (headers and account
+  changesets, both versions: a rotation whose configuration write fails leaves no file of the
+  next jar, and one stopped after the configuration, or after the data file too, opens; the next
+  persist writes the jar and every block reads; it fails with the old order, on the stray data
+  file). *Upstream*: yes (upstream's order).
+
+- **TN-0151** — The changeset counts load each jar through TN-0135's format check and count a
+  segment's last file. *Kind*: fix. *Files*:
+  `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
+  (`account_changeset_count`, `storage_changeset_count`; test).
+  *Why*: the two counts loaded a jar's configuration with `NippyJar::load`, outside `load_jar`,
+  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at every other load,
+  was counted with its own record size instead of refused. They also named each file by the
+  blocks its configuration holds (the range `iter_static_files` lists), not by its fixed range,
+  so a segment's last file, which holds fewer blocks than its range until it fills, was never
+  found and its changes were left out of the count (upstream's line). *Can reach execution or
+  storage*: no. They only read and count, and no TN crate calls them (they back reth's
+  `StatsReader::count_entries` and the `*_changeset_count` provider methods); no byte written or
+  read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
+  refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
+  off and for the segment still checked; it fails without either change). *Upstream*: the file
+  name, yes; the format check, no (TN-0135 is TN's).
+
+- **TN-0152** — `DataReader::reverse_offset` refuses a position before an offsets file's second
+  byte. *Kind*: fix. *Files*: `crates/storage/nippy-jar/src/lib.rs` (`reverse_offset`, test).
+  *Why*: the position of the offset `index` places from the end was the file size less
+  `offset_size * (index + 1)`, unchecked. A version-1 jar whose offsets file was cut to 2 to 8
+  bytes (damage: the offset size and less than one offset) reaches it from the plain heal, which
+  counts no rows in such a file and then reads its final offset: below 8 bytes the subtraction
+  underflowed (a panic with overflow checks, a wrapped position and `OffsetOutOfBounds` in a
+  release build), and at 8 bytes the offset size was read as the first byte of the offset, whose
+  value the heal then cut the data file to. Each is now `OffsetOutOfBounds` for that index; the
+  heal has already written a configuration with no rows by then (upstream's heal, which TN-0130
+  keeps for version 1), so the next open resets that jar (TN-0131), as before. *Can reach
+  execution or storage*: no byte changes for an intact jar. An offsets file holds its size byte
+  and whole offsets, and every position read from one is past that byte, so each read computes
+  the position it did; a version-2 jar refuses a short offsets file before this point
+  (`CommittedRowsMissing`, TN-0130). *Tests*: `test_offsets_file_shorter_than_one_offset_is_an_error`
+  (a plain jar's offsets cut to each of 2 to 8 bytes: the reader and the writer's open return
+  the error; it panics without the change). *Upstream*: yes (upstream's arithmetic).
 
 - **TN-0153** — TN-0079's trace cap also counts calls: each call's and create's trace, its input
   or init code, and its output.
