@@ -4,6 +4,10 @@
 # crc32fast. The test lanes in pr.yaml run on `ubuntu-latest` (x86_64), where that path is
 # not compiled, so this is the only run of the kernel in CI.
 #
+# The job tests tn-lmdb's copy only, and first checks that the two files hold the same code, so
+# that run covers the tn-storage copy too (building tn-storage would add reth-libmdbx and the
+# rest of its dependencies to a cold build).
+#
 # Not a required check: `CI Success` stays the only one, and this job is not in its needs
 # list (.github/ACTIONS.md, "aarch64 CRC kernel"). A red run here still shows on the pull
 # request. No dependency cache: tn-lmdb and its test dependencies build from cold in about a
@@ -58,6 +62,18 @@ jobs:
           submodules: false
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Check the two CRC files hold the same code
+        # Drops the lines the copies may differ in (crates/tn-lmdb/src/crc.rs's module docs say
+        # which): every comment line, and the `allow(dead_code)` and `#[inline]` attribute lines.
+        # Everything else, the unit tests included, must match line for line.
+        run: |
+          set -euo pipefail
+          code() {
+            grep -vE '^[[:space:]]*//' "$1" |
+              grep -vxE '[[:space:]]*#\[(cfg_attr\(not\(test\), allow\(dead_code\)\)|inline)\]'
+          }
+          diff -u <(code crates/storage/src/archive/crc.rs) <(code crates/tn-lmdb/src/crc.rs)
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
