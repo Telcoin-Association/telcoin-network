@@ -365,8 +365,10 @@ impl AutoGap {
         choice
     }
 
-    /// Make `width` the choice: hold it [`HOLD`] steps, and explore around it soon.
+    /// Make `width`, one of [`CANDIDATES`], the choice: hold it [`HOLD`] steps, and explore around
+    /// it soon.
     fn take(&mut self, width: u32) {
+        debug_assert!(CANDIDATES.contains(&width), "the choice {width} is not a candidate");
         self.choice = width;
         self.hold = HOLD;
         self.interval = PROBE_EVERY;
@@ -511,11 +513,14 @@ impl AutoGap {
     }
 }
 
-/// The cheapest of `widths` by `cost`, and its cost; the smaller width on a tie.
+/// The cheapest of `widths` by `cost`, and its cost; the smaller width on a tie. A NaN cost counts
+/// as infinite, so the answer is one of `widths` whenever there is one (every caller's are
+/// [`CANDIDATES`], which [`AutoGap::take`] keeps the choice to).
 fn cheapest(widths: impl Iterator<Item = u32>, cost: impl Fn(u32) -> f64) -> (u32, f64) {
     let mut best = (u32::MAX, f64::INFINITY);
     for width in widths {
         let time = cost(width);
+        let time = if time.is_nan() { f64::INFINITY } else { time };
         if time < best.1 || (time == best.1 && width < best.0) {
             best = (width, time);
         }
