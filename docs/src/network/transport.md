@@ -93,13 +93,27 @@ Do not append a `/p2p/` component: the tool derives it from the network public k
 When either flag is omitted, the address defaults to `/ip4/127.0.0.1/udp/PORT/quic-v1` on a free port, which is useful only for local test networks.
 The result is written to the node's info file and is the address advertised to peers.
 
+A node that binds that default cannot reach another host.
+A QUIC dial leaves from its listener's UDP socket, and a socket bound to a loopback IP cannot send to any other address, so every dial to a public peer times out and the node finds no peers.
+At startup the node logs a warning naming the variable to set when a listener binds a loopback IP while a bootstrap peer is elsewhere.
+
 Two environment variables override the address a node **binds** at runtime: `PRIMARY_LISTENER_MULTIADDR` and `WORKER_LISTENER_MULTIADDR`.
 Each is read once, when its swarm first starts listening, and the node appends the `/p2p/` component the same way key generation does.
-`WORKER_LISTENER_MULTIADDR` applies to worker 0 only.
-Higher worker ids always bind their configured address, because one variable cannot name several distinct listeners.
+`WORKER_LISTENER_MULTIADDR` applies to worker 0 only; worker N above 0 reads `WORKER_N_LISTENER_MULTIADDR`.
 
 These variables change only what the node binds.
 The external address advertised to peers still comes from the node's info file, so an override that does not match what was generated makes the node reachable at one address and discoverable at another.
+
+An observer generated with the default addresses joins a public network by binding every interface on its generated ports, which `grep -o 'udp/[0-9]*' DATADIR/node-info.yaml` lists (the primary's first, then worker 0's):
+
+```bash
+PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/PRIMARY_PORT/quic-v1 \
+WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/WORKER_PORT/quic-v1 \
+telcoin-network node --chain adiri --datadir DATADIR
+```
+
+Its advertised address stays the generated loopback one, so peers cannot dial it, and it needs none to: its own outbound connections are enough.
+Binding 0.0.0.0 accepts inbound QUIC on those ports wherever a firewall allows it, so a firewall that drops inbound UDP keeps the observer outbound-only.
 
 ## Listener settings and bootstrap peers
 
