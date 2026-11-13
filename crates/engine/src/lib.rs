@@ -461,6 +461,54 @@ pub(crate) fn duration_ms(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The engine's queued-output path, for benches: [`ExecutorEngine`] starts each output's signer
+/// recovery on a blocking job when it queues the output, and executes the output with the job's
+/// result once the outputs ahead of it have executed.
+#[cfg(feature = "test-utils")]
+pub mod test_utils {
+    use crate::{
+        metrics::ENGINE_METRICS, payload_builder::execute_consensus_output_with_signers,
+        recovery::RecoveryHandle, TnEngineError,
+    };
+    use tn_reth::payload::BuildArguments;
+    use tn_types::{
+        gas_accumulator::GasAccumulator, repack_monitor::RepackMonitor, ConsensusOutput,
+        EngineUpdate, SealedHeader, TaskSpawner,
+    };
+    use tokio::sync::mpsc;
+
+    /// A queued output's signer recovery, running on a blocking job.
+    #[derive(Debug)]
+    pub struct QueuedRecovery(RecoveryHandle);
+
+    impl QueuedRecovery {
+        /// Start recovering `output`'s signers on a blocking job spawned on `task_spawner`, as
+        /// the engine does when it queues the output. Must be called within a tokio runtime.
+        pub fn spawn(output: &ConsensusOutput, task_spawner: &TaskSpawner) -> Self {
+            Self(RecoveryHandle::spawn(output, task_spawner, &ENGINE_METRICS))
+        }
+    }
+
+    /// [`crate::execute_consensus_output`] with the signers of `recovery`, the job started when
+    /// the output was queued: the build waits for the job before its first block. Must run on a
+    /// blocking thread.
+    pub fn execute_queued_output(
+        args: BuildArguments,
+        recovery: QueuedRecovery,
+        gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
+        engine_update_tx: mpsc::Sender<EngineUpdate>,
+    ) -> Result<SealedHeader, TnEngineError> {
+        execute_consensus_output_with_signers(
+            args,
+            Some(recovery.0),
+            gas_accumulator,
+            repack_monitor,
+            engine_update_tx,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

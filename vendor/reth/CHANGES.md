@@ -1101,6 +1101,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   reth-trie and reth-trie-db suites; the format-freeze writer test (the `StoragesTrie` rows of its
   fixtures are unchanged). *Upstream*: n/a (upstream commits).
 
+- **TN-0142** — Backport 3fa855645 (its `hash_builder/state.rs` half; the other file,
+  `crates/e2e-test-utils`, is not vendored): `HashBuilderState`'s codec roundtrip proptest builds
+  the state from per-field strategies. *Kind*: backport (test only).
+  *Files*: `crates/trie/common/src/hash_builder/state.rs` (`hash_builder_state_roundtrip` takes
+  `key`, `value`, `stack`, the three mask lists and `stored_in_database` from proptest strategies
+  and also checks that decoding consumes the whole buffer; the struct drops
+  `reth_codecs::add_arbitrary_tests(compact)`, keeping `derive(arbitrary::Arbitrary)`). Applied
+  cleanly with `vendor.py pick`.
+  *Why*: with `--features arbitrary` the test drew the state through
+  `proptest_arbitrary_interop::arb`, whose fixed byte buffer runs out on the variable-length
+  fields, so about one run in ten aborted with "initial arbitrary call failed" before the codec
+  was checked; the generated `HashBuilderStateTests::proptest` drew it the same way and goes with
+  the attribute. No non-test code changes. *Tests*: the roundtrip passes 50 runs in a row (it
+  failed 1 to 2 runs in 20 before); reth-trie-common suite. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
