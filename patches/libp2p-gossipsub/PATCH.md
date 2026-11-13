@@ -1,6 +1,6 @@
 # Carried patch: libp2p-gossipsub
 
-This is the production source of `libp2p-gossipsub` 0.50.0 with a promise-expiry fix, a per-peer promise filter and an outbound upgrade that reports a lazily negotiated protocol rejection as unsupported.
+This is the production source of `libp2p-gossipsub` 0.50.1 with a promise-expiry fix, a per-peer promise filter and an outbound upgrade that reports a lazily negotiated protocol rejection as unsupported.
 The root `[patch.crates-io]` selects this copy for the existing libp2p 0.57.0 stack.
 The crate is excluded from the workspace, like the carried libp2p-quic and
 libp2p-connection-limits patches, to preserve upstream lints and style. The
@@ -9,12 +9,12 @@ libp2p-connection-limits patches, to preserve upstream lints and style. The
 
 ## Provenance
 
-- Published crate: `libp2p-gossipsub` 0.50.0.
-- crates.io archive checksum from the original root `Cargo.lock`:
-  `1b625461b45e5b36facf07ff3585b831bcaf26cab8907ac8f47d1e8e999999e0`.
-- Published VCS revision: `7171dce2f90c05ba7892d4ba926abb1881db27c7`, path
+- Published crate: `libp2p-gossipsub` 0.50.1.
+- crates.io archive checksum, from the crates.io index and the downloaded archive:
+  `6c28d7256540bd1a5df45cf6d7a7d8c58e913ad63ccfaa2f97983ec077b2794a`.
+- Published VCS revision: `f2244686b3ad217d6cb62e5703e6d7fa90e20d99`, path
   `protocols/gossipsub`, from the archive's `.cargo_vcs_info.json`.
-- Original `src/behaviour.rs` SHA-256: `17e54f69957af01b02f19036ec5f5b02cea36d319b782042df6b8e8c539df462`.
+- Original `src/behaviour.rs` SHA-256: `bb0f541325fda4b5191904d5ee36875fe139654eaa13b05e1f47b95e37305036`.
 - Original `src/gossip_promises.rs` SHA-256: `7b6132b9a61ccee78654b09a405c95898f4d3fe551d102ec7f9f877a96cb6990`.
 - Original `src/behaviour/tests/gossip.rs` SHA-256: `2c5685d3513ed174e83b809432bfa3ea91c426173aac0707a014406d49a454ed`.
 - Original `src/protocol.rs` SHA-256: `3d3796536850af98cba80710fb26f66224eee6f4d1bfc7d05a84215ebe28074c`.
@@ -23,6 +23,15 @@ libp2p-connection-limits patches, to preserve upstream lints and style. The
   The removed `mod tests` block's five codec tests need the rust-libp2p workspace-only `quickcheck` dev-dependency, which the published manifest does not carry.
   Upstream's `tests/smoke.rs` needs the workspace-only `libp2p-swarm-test` crate and is not carried either.
   Every carried file keeps its MIT copyright and permission notice.
+- The copy moved from 0.50.0 (archive SHA-256
+  `1b625461b45e5b36facf07ff3585b831bcaf26cab8907ac8f47d1e8e999999e0`, revision
+  `7171dce2f90c05ba7892d4ba926abb1881db27c7`) to 0.50.1 on 2026-11-13 for RUSTSEC-2026-0534
+  (GHSA-vrx6-jcp8-vm7m): `handle_prune` recorded a backoff for every topic a PRUNE named,
+  including topics the node never joined, so a peer could grow that state without bound.
+  0.50.1 differs from 0.50.0 only by skipping PRUNE entries for topics outside the mesh (nine
+  lines in `handle_prune`, before the `remove_peer_from_mesh` call that records the backoff)
+  and its version. The five changes above re-applied with line offsets only, and the other
+  `src/` files match the 0.50.1 archive byte for byte.
 - Runtime dependencies, versions and features match the published manifest. The root
   lockfile changes only this crate's source and checksum, selecting the path package
   without moving any dependency version. There is no separate patch lockfile.
@@ -78,8 +87,8 @@ As of 2026-10-31, upstream master at
 [`c449090f49b5ae2338e8f0727be98e0a739ba135`](https://github.com/libp2p/rust-libp2p/blob/c449090f49b5ae2338e8f0727be98e0a739ba135/protocols/gossipsub/src/behaviour.rs)
 still calls `get_broken_promises()` only inside the `PeerScoreState::Active` branch of
 `apply_iwant_penalties`, so unanswered promises still never expire while peer scoring
-is disabled. The published 0.50.0 keys the `handle_ihave` promise filter on the message
-id alone.
+is disabled. The published 0.50.0 and 0.50.1 key the `handle_ihave` promise filter on the
+message id alone, and 0.50.1 leaves `apply_iwant_penalties` unchanged.
 No public upstream issue or PR for this expiry, or released version containing it, was
 found. Upstream submission and its released version remain tracked in
 GHSA-779j-phh4-5v67; this patch does not assign an unannounced release number or claim

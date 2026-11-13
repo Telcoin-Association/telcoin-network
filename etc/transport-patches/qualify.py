@@ -75,7 +75,7 @@ libp2p-core = "={core}"
 libp2p-identity = {{ version = "={identity}", features = ["ed25519", "rand"] }}
 tokio = {{ version = "=1.53.0", features = ["macros", "rt-multi-thread", "time"] }}
 quinn = {{ version = "=0.11.9", default-features = false }}
-quinn-proto = {{ version = "=0.11.18", default-features = false }}
+quinn-proto = {{ version = "=0.11.19", default-features = false }}
 rustls = {{ version = "={rustls}", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "ring", "std", "tls12"] }}
 aws-lc-rs = {{ version = "={stack['aws-lc-rs']}", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }}
 aws-lc-sys = {{ version = "={stack['aws-lc-sys']}", default-features = false, features = ["prebuilt-nasm"] }}

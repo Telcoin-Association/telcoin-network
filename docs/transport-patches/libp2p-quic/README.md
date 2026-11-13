@@ -100,10 +100,10 @@ This proves a path coverage gap in both tools. The gate closes it for the
 carried versions: `advisories.py` audits a registry-form copy of the node
 lockfile in which the recorded path packages carry the registry source, so
 cargo-audit matches advisories against `libp2p-quic` 0.14.0 and `quinn-proto`
-0.11.18 by name and version. The same rewrite of the path control must report
+0.11.19 by name and version. The same rewrite of the path control must report
 RUSTSEC-2024-0373, or the gate fails. The source-neutral manual match checks
 the advisory's package and affected/fixed ranges against actual resolution and
-the carried diff. The node resolves the carried path `quinn-proto` 0.11.18
+the carried diff. The node resolves the carried path `quinn-proto` 0.11.19
 ([companion record](../quinn-proto/README.md)), which is outside the affected
 range (fixed in 0.11.7). The vendored diff delegates Retry to Quinn and carries
 no Quinn backport. That advisory therefore does not apply to this carried
@@ -116,6 +116,16 @@ to the fixed 0.23.46, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
 The 2026-10-15 lockfile update from rustls 0.23.45 to 0.23.46 also addresses
 RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349,
 which the required advisory gate detected in the carried transport closure.
+The 2026-11-13 lockfile update from `quinn-udp` 0.5.14 to the fixed 0.5.16 addresses
+RUSTSEC-2026-0538 (a truncated datagram can keep the single-`recvmsg` receive loop busy on
+Apple platforms, the BSDs and illumos), which the gate detected in the same closure; it
+changes only that package's version and checksum. The same day the registry-form scan matched
+RUSTSEC-2026-0523 and RUSTSEC-2026-0524 against the carried `quinn-proto` 0.11.18; the
+companion moved to the fixed published 0.11.19 ([companion record](../quinn-proto/README.md)).
+RUSTSEC-2026-0525 (a remote panic when the peer identity cannot be read after the QUIC
+handshake) names `libp2p-quic` but is fixed in 0.13.1: the carried 0.14.0 is outside its range,
+and its `Connecting::remote_peer_id` returns a `PROTOCOL_VIOLATION` connection error for each of
+those failures instead of panicking, so it needs no change.
 The committed evidence snapshots below describe the earlier qualification;
 CI captures fresh source and advisory evidence for the current lockfile.
 The scoped updated transport scan has no findings. The workspace scan exits

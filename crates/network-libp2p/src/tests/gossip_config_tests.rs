@@ -34,7 +34,7 @@ type OpenRequests = mpsc::UnboundedReceiver<oneshot::Sender<Stream>>;
 /// The test side of [`OpenRequests`].
 type SubstreamOpener = mpsc::UnboundedSender<oneshot::Sender<Stream>>;
 
-/// Signing prefix gossipsub 0.50.0 puts before the signed message bytes (`protocol.rs` line 47).
+/// Signing prefix gossipsub 0.50.1 puts before the signed message bytes (`protocol.rs` line 47).
 const SIGNING_PREFIX: &[u8] = b"libp2p-pubsub:";
 
 /// Encode `value` as an unsigned LEB128 varint (protobuf varints and the frame length prefix).
@@ -349,7 +349,7 @@ fn listen_address<E>(event: SwarmEvent<E>) -> future::Ready<Option<Multiaddr>> {
     })
 }
 
-/// On the wire, through the gossipsub 0.50.0 handler and codec, a frame that breaks a limit
+/// On the wire, through the gossipsub 0.50.1 handler and codec, a frame that breaks a limit
 /// closes its substream and delivers none of its entries, and frames at the limits are
 /// delivered in full.
 ///
@@ -480,7 +480,7 @@ async fn test_gossip_frame_limits_on_the_wire() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A sequence number like the ones gossipsub 0.50.0 publishes: a Unix time in nanoseconds
+/// A sequence number like the ones gossipsub 0.50.1 publishes: a Unix time in nanoseconds
 /// (19 digits).
 const NANOSECOND_SEQNO: u64 = 1_760_000_000_000_000_000;
 
@@ -709,7 +709,7 @@ async fn raw_gossip_pair(
     Ok((opener, delivered_rx, sender_key))
 }
 
-/// On the wire, through the gossipsub 0.50.0 handler and codec, an `IHAVE` at the cap keeps its
+/// On the wire, through the gossipsub 0.50.1 handler and codec, an `IHAVE` at the cap keeps its
 /// substream open, and one more id closes the substream.
 ///
 /// The ids are at the id bound and the topic is at the topic bound. A sentinel publish frame

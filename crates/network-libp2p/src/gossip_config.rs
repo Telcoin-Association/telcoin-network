@@ -21,7 +21,7 @@ mod gossip_config_tests;
 
 /// Upper bound, in bytes, on everything one honest publish frame carries besides its payload.
 ///
-/// gossipsub 0.50.0 encodes one `RpcOut` per frame, so an honest frame holds one `Message` in
+/// gossipsub 0.50.1 encodes one `RpcOut` per frame, so an honest frame holds one `Message` in
 /// one `Rpc.publish` entry. With an ed25519 identity the framing is: frame length varint (3),
 /// publish tag and length (3), `from` peer id (2 + 38), `data` tag and length (3), `seqno`
 /// (2 + 8), `topic` (3 + topic bytes), `signature` (2 + 64) and `key` (2 + 36, sent only when the
@@ -38,7 +38,7 @@ pub(crate) const GOSSIP_PUBLISH_ENVELOPE_BOUND: usize = 512;
 
 /// Byte limit on the control and subscription fields of one frame.
 ///
-/// Equal to the gossipsub 0.50.0 default (16 KiB). It is set explicitly so that a library
+/// Equal to the gossipsub 0.50.1 default (16 KiB). It is set explicitly so that a library
 /// upgrade cannot change it, and because it sizes [`GOSSIP_FRAME_BOUND`]. The limit applies to
 /// the control frames the node sends too, such as its own `IHAVE` gossip.
 /// [`GOSSIP_MAX_IHAVE_IDS`] keeps those frames under it.
@@ -80,7 +80,7 @@ pub(crate) const GOSSIP_MAX_TRANSMIT_SIZE: usize = GOSSIP_FRAME_BOUND + GOSSIP_R
 
 /// The gossipsub `max_publish_messages`: the publish entries accepted in one frame.
 ///
-/// An honest peer sends one entry per frame (gossipsub 0.50.0 encodes one `RpcOut` per frame).
+/// An honest peer sends one entry per frame (gossipsub 0.50.1 encodes one `RpcOut` per frame).
 /// The codec default of 500 lets one frame force 500 signature checks; 8 caps that work at 8
 /// checks per frame and leaves room for a future sender that batches a few entries. This is
 /// not a rate bound. Per-peer and per-topic rate budgets are separate work.
@@ -88,7 +88,7 @@ pub(crate) const GOSSIP_MAX_PUBLISH_PER_FRAME: usize = 8;
 
 /// Upper bound, in bytes, on one gossip message id.
 ///
-/// The node uses the gossipsub 0.50.0 default message id (`config.rs` lines 526-539): the base58
+/// The node uses the gossipsub 0.50.1 default message id (`config.rs` lines 526-539): the base58
 /// source peer id followed by the decimal sequence number. A peer id is at most 44 bytes (an
 /// identity multihash of a key of up to 42 bytes), which is at most 60 base58 characters. A
 /// `u64` sequence number is at most 20 digits. An ed25519 source with a nanosecond sequence
@@ -110,9 +110,9 @@ const GOSSIP_IHAVE_FRAMING_BOUND: usize = 8;
 
 /// The gossipsub `max_control_messages_sent`: the message ids the node puts in one `IHAVE`.
 ///
-/// Each heartbeat, gossipsub 0.50.0 sends one `IHAVE` for each topic in its mesh and fanout to
+/// Each heartbeat, gossipsub 0.50.1 sends one `IHAVE` for each topic in its mesh and fanout to
 /// subscribed peers outside that topic's mesh or fanout set, except explicit peers (`behaviour.rs`
-/// `emit_gossip`, lines 2788-2861). The `IHAVE` holds the validated ids of the last three
+/// `emit_gossip`, lines 2797-2870). The `IHAVE` holds the validated ids of the last three
 /// heartbeats (`history_gossip`) and has no byte cap. With the library default of 5000 ids, one
 /// busy topic is enough: about 225 ids of 71 bytes on a 15-byte topic pass
 /// [`GOSSIP_CONTROL_SIZE`], and the receiver closes the stream (issue #1700).
@@ -120,7 +120,7 @@ const GOSSIP_IHAVE_FRAMING_BOUND: usize = 8;
 /// The cap is the largest id count whose `IHAVE` fits in [`GOSSIP_CONTROL_SIZE`] with ids of
 /// [`GOSSIP_MESSAGE_ID_BOUND`] bytes on a topic of [`GOSSIP_TOPIC_BOUND`] bytes. Each id costs its
 /// bytes plus a tag and a one-byte length (2). Above the cap, gossipsub sends each peer a
-/// different random subset of the ids (lines 2840-2846). Gossip coverage drops, but the streams
+/// different random subset of the ids (lines 2849-2855). Gossip coverage drops, but the streams
 /// stay open. The same setting caps the ids the node asks one peer for with `IWANT` in one
 /// heartbeat (lines 1412-1435), so an `IWANT` for ids within the bound fits under the limit too.
 /// The cap changes only the frames this node sends. Peers on other versions need no change.
@@ -201,7 +201,7 @@ const fn larger(a: usize, b: usize) -> usize {
 
 /// Build the gossipsub configuration for a consensus network on `chain_id`.
 ///
-/// Order of the limits in the resolved libp2p-gossipsub 0.50.0 (with asynchronous-codec 0.7.0
+/// Order of the limits in the resolved libp2p-gossipsub 0.50.1 (with asynchronous-codec 0.7.0
 /// as the frame reader). A version bump must re-check this order and the bounds above.
 ///
 /// 1. Codec frame gate (`protocol.rs` `validate_rpc_limits`, lines 295-347, called first in
@@ -216,15 +216,15 @@ const fn larger(a: usize, b: usize) -> usize {
 /// 4. Signature check of each entry (`ValidationMode::Strict`, `protocol.rs` line 460). A bad
 ///    signature drops that entry only; the stream stays open.
 /// 5. Behaviour checks in `handle_received_message`: the inbound transform (`behaviour.rs` line
-///    1932, `RejectGossipKey` for the consensus network), then message validity (line 1979), then
-///    the duplicate cache (line 1983), then the subscribed-topic check (line 2020). A transform
+///    1941, `RejectGossipKey` for the consensus network), then message validity (line 1988), then
+///    the duplicate cache (line 1992), then the subscribed-topic check (line 2029). A transform
 ///    error drops the message before the other checks, so it does not reach either cache.
 /// 6. `verify_gossip` in this crate: the [`MAX_GOSSIP_MESSAGE_SIZE`] payload check and the
 ///    publisher checks. That check is a separate control and stays in place.
 ///
 /// Send side: the node's peers apply the same codec gate to the frames the node sends. The
-/// `IHAVE` gossip (`behaviour.rs` `emit_gossip`, lines 2788-2861) has no byte cap of its own, so
-/// [`GOSSIP_MAX_IHAVE_IDS`] caps its id count (truncation at lines 2840-2846).
+/// `IHAVE` gossip (`behaviour.rs` `emit_gossip`, lines 2797-2870) has no byte cap of its own, so
+/// [`GOSSIP_MAX_IHAVE_IDS`] caps its id count (truncation at lines 2849-2855).
 pub fn gossipsub_config(chain_id: u64) -> Result<gossipsub::Config, ConfigBuilderError> {
     gossipsub::ConfigBuilder::default()
         // explicitly set default
