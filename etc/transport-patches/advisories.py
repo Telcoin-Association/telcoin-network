@@ -143,7 +143,7 @@ def main():
             raise RuntimeError("advisory range changed; review the control before proceeding")
         summary.update({"database_revision": database_revision, "advisory": ADVISORY,
                         "advisory_sha256": sha256(advisory_file), "affected_control": "0.11.6",
-                        "carried_quinn_proto": "0.11.18", "carried_applicability": "not affected: >= 0.11.7"})
+                        "carried_quinn_proto": "0.11.19", "carried_applicability": "not affected: >= 0.11.7"})
         source, download = crate("quinn-proto", "0.11.6", output)
         if download["sha256"] != "ba92fb39ec7ad06ca2582c0ca834dfeadcaf06ddfc8e635c80aa7e1c05315fdd":
             raise RuntimeError("affected control archive differs from the recorded published source")
@@ -187,7 +187,7 @@ def main():
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
         stack = {package["name"]: package["version"] for package in lock["package"]
                  if package["name"] in {"libp2p-quic", "libp2p-tls", "quinn", "quinn-proto", "rustls"}}
-        if stack.get("quinn-proto") != "0.11.18":
+        if stack.get("quinn-proto") != "0.11.19":
             raise RuntimeError("carried quinn-proto changed; reassess applicability")
         summary["carried_stack"] = stack
         result, receipt = run([args.audit, "audit", "--no-fetch", "--db", str(args.database),

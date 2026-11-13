@@ -12,7 +12,7 @@ SOURCES = runpy.run_path(str(Path(__file__).with_name("sources.py")))
 class AdvisoryScope(unittest.TestCase):
     def test_only_recorded_proto_source_is_allowed(self):
         root = Path("/recorded-node")
-        package = {"name": "quinn-proto", "version": "0.11.18", "source": None,
+        package = {"name": "quinn-proto", "version": "0.11.19", "source": None,
                    "manifest_path": str(root / "patches/quinn-proto/Cargo.toml")}
         SOURCES["validate_sources"]([package], root, True)
         for changed in ({**package, "version": "0.11.6"},
@@ -27,7 +27,7 @@ class AdvisoryScope(unittest.TestCase):
         normalize = SOURCES["normalized_packages"]
         packages = [{"name": "libp2p-quic", "version": "0.14.0", "source": None,
                      "id": "path-quic", "dependencies": ["path-proto"]},
-                    {"name": "quinn-proto", "version": "0.11.18", "source": None,
+                    {"name": "quinn-proto", "version": "0.11.19", "source": None,
                      "id": "path-proto", "dependencies": ["crypto"]}]
         stock = [{**packages[0], "id": "registry-quic", "source": "registry+test",
                   "dependencies": ["registry-proto"]},

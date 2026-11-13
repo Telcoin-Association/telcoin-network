@@ -1,9 +1,11 @@
 # Carried patch: quinn-proto incoming observations
 
-This is the published quinn-proto 0.11.18 source, including both upstream licenses.
+This is the published quinn-proto 0.11.19 source, including both upstream licenses.
 Its registry archive SHA-256 is
-`a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc`.
-The upstream revision is `eaec0db4bcb698f76df736d89938743c88a2ad5f`.
+`0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe`.
+The upstream revision is `8192ed399a26a6e8f0aba43d10ec8badaa5b905e`.
+It moved from 0.11.18 to 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524; Telcoin's diff
+is unchanged apart from line offsets (see the maintenance record).
 The normalized registry Cargo.toml, dependencies, features and crypto providers are preserved.
 The standalone test lockfile is independent of the production workspace lockfile.
 

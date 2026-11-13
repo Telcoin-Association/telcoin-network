@@ -649,7 +649,7 @@ mod tests {
     /// Ignore produces no accepted connection; failed Retry returns the genuine Incoming.
     ///
     /// The shipped listener cannot reach Refuse/Ignore from an unvalidated Incoming under
-    /// Quinn 0.11.18: unvalidated implies may_retry. These API cases protect the dependency
+    /// Quinn 0.11.19: unvalidated implies may_retry. These API cases protect the dependency
     /// contract without claiming that unreachable listener counters fire.
     #[tokio::test]
     async fn real_retry_and_ignore_outcomes_without_accept() -> Result<(), Error> {
