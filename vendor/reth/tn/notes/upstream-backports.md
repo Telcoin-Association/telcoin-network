@@ -184,7 +184,8 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
   blocks keep their chain-enforced bounds.
 - **A cap on recorded trace steps (TN-0079, 2026-11-09).** The carried revm-inspectors'
   `TracingInspector` stops a transaction whose recorded steps pass 160 MiB (`trace too large`,
-  `-32603`), shared across the inspectors of one request (review R4). Upstream caps nothing as of
+  `-32603`), shared across the inspectors of one request (review R4). Since TN-0153
+  (2026-11-13) the cap also counts every call's trace with its input, init code and output. Upstream caps nothing as of
   0.44.3; re-port on every revm-inspectors upgrade (`patches/revm-inspectors/PATCH.md`).
 - **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
   returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a

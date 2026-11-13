@@ -120,9 +120,9 @@ If the team decides to drop JavaScript tracers for good:
    [README](README.md#feature-flags) feature table, the test's `cfg(feature = "js-tracer")` branch
    (keep its refusal check), this file, and the note about it on the
    [`debug_traceTransaction`](../../docs/src/rpc-methods/debug/debug_tracetransaction.md) page.
-   Remove the two `js-tracer` runs from `lane_test_vendor_reth` in `etc/ci-lanes.sh`, and
-   consider retiring `patches/revm-inspectors`, which matters only to JavaScript tracers (its
-   PATCH.md lists what to delete).
+   Remove the two `js-tracer` runs from `lane_test_vendor_reth` in `etc/ci-lanes.sh`. Keep
+   `patches/revm-inspectors`: its recursion limit then no longer matters, but its trace cap
+   (TN-0079, TN-0153) applies to every build (its PATCH.md, "Retirement", says when it can go).
 2. In `vendor/reth`, as a ledgered change (`CHANGES.md`): delete `js_tracer_interrupt.rs`, the
    `js-tracer` code in `crates/rpc/rpc/src/debug.rs` and
    `crates/rpc/rpc-eth-types/src/error/mod.rs`, and the `js-tracer` features of reth-rpc,
