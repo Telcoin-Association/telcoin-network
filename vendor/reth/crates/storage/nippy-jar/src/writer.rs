@@ -1,12 +1,14 @@
 use crate::{
-    compression::Compression, value_checksum, ColumnResult, NippyJar, NippyJarChecker,
-    NippyJarError, NippyJarHeader, CHECKSUM_SIZE,
+    compression::{Compression, Compressors},
+    value_checksum, ColumnResult, NippyJar, NippyJarChecker, NippyJarError, NippyJarHeader,
+    CHECKSUM_SIZE,
 };
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
+use zstd::{bulk::Compressor, zstd_safe};
 
 /// Size of one offset in bytes.
 pub(crate) const OFFSET_SIZE_BYTES: u8 = 8;
@@ -38,6 +40,8 @@ pub struct NippyJarWriter<H: NippyJarHeader = ()> {
     offsets_file: BufWriter<File>,
     /// Temporary buffer to reuse when compressing data.
     tmp_buf: Vec<u8>,
+    /// TN(TN-0146): the compressors of a dictionary zstd jar, kept for the writer's life.
+    dictionary_compressors: Option<DictionaryCompressors>,
     /// Used to find the maximum uncompressed size of a row in a jar.
     uncompressed_row_size: usize,
     /// Partial offset list which hasn't been flushed to disk.
@@ -83,11 +87,13 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
             (jar, data_file.expect("qed"), offsets_file.expect("qed"))
         };
 
+        let dictionary_compressors = DictionaryCompressors::new(&jar)?;
         let mut writer = Self {
             jar,
             data_file,
             offsets_file,
             tmp_buf: Vec::with_capacity(1_000_000),
+            dictionary_compressors,
             uncompressed_row_size: 0,
             offsets: Vec::with_capacity(1_000_000),
             column: 0,
@@ -252,7 +258,10 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// Writes column to data file. If it's the last column of the row, call `finalize_row()`
     fn write_column(&mut self, value: &[u8]) -> Result<usize, NippyJarError> {
         self.uncompressed_row_size += value.len();
-        let (stored, len) = if let Some(compression) = &self.jar.compressor {
+        let (stored, len) = if let Some(compressors) = &mut self.dictionary_compressors {
+            let stored = compressors.compress(self.column, value, &mut self.tmp_buf)?;
+            (stored, stored.len())
+        } else if let Some(compression) = &self.jar.compressor {
             let before = self.tmp_buf.len();
             let len = compression.compress_to(value, &mut self.tmp_buf)?;
             (&self.tmp_buf[before..before + len], len)
@@ -558,5 +567,45 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     #[cfg(any(test, feature = "test-utils"))]
     pub const fn jar(&self) -> &NippyJar<H> {
         &self.jar
+    }
+}
+
+/// TN(TN-0146): the compressors of a dictionary zstd jar, one per column from the configuration's
+/// dictionaries. Made once per writer: a context per value would cost more than compressing a
+/// small value. The writer used to compress every value without the dictionaries the cursor
+/// decompresses with.
+struct DictionaryCompressors(Vec<Compressor<'static>>);
+
+impl std::fmt::Debug for DictionaryCompressors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DictionaryCompressors").field(&self.0.len()).finish()
+    }
+}
+
+impl DictionaryCompressors {
+    /// The compressors of `jar` if it compresses with dictionaries.
+    fn new<H: NippyJarHeader>(jar: &NippyJar<H>) -> Result<Option<Self>, NippyJarError> {
+        let Some(Compressors::Zstd(zstd)) = jar.compressor() else { return Ok(None) };
+        if !zstd.use_dict {
+            return Ok(None)
+        }
+        let compressors = zstd.compressors()?.ok_or(NippyJarError::CompressorNotReady)?;
+        if compressors.len() != jar.columns {
+            return Err(NippyJarError::ColumnLenMismatch(jar.columns, compressors.len()))
+        }
+        Ok(Some(Self(compressors)))
+    }
+
+    /// Replaces `buf` with `value` compressed with `column`'s dictionary and returns it.
+    fn compress<'b>(
+        &mut self,
+        column: usize,
+        value: &[u8],
+        buf: &'b mut Vec<u8>,
+    ) -> Result<&'b [u8], NippyJarError> {
+        buf.clear();
+        buf.reserve(zstd_safe::compress_bound(value.len()));
+        self.0[column].compress_to_buffer(value, buf)?;
+        Ok(buf)
     }
 }

@@ -30,8 +30,9 @@ pub trait Compression: Serialize + for<'a> Deserialize<'a> {
         true
     }
 
-    #[cfg(test)]
     /// If required, prepares compression algorithm with an early pass on the data.
+    ///
+    /// TN(TN-0146): no longer test-only (dictionary training).
     fn prepare_compression(
         &mut self,
         _columns: Vec<impl IntoIterator<Item = Vec<u8>>>,
@@ -98,7 +99,6 @@ impl Compression for Compressors {
         }
     }
 
-    #[cfg(test)]
     fn prepare_compression(
         &mut self,
         columns: Vec<impl IntoIterator<Item = Vec<u8>>>,
