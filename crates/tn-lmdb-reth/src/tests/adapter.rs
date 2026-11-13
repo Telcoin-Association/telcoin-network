@@ -170,10 +170,11 @@ fn a_long_reader_warning_is_due_first_then_once_per_interval() {
     assert!(!warning_due(secs(65), secs(5), minute), "a time before the last warning");
 }
 
-/// Keeps the text of each `WARN` event emitted on the thread it is the default subscriber of.
-struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+/// Keeps the text of each event at its level emitted on the thread it is the default subscriber
+/// of.
+struct LogCapture(tracing::Level, Arc<parking_lot::Mutex<Vec<String>>>);
 
-impl tracing::Subscriber for WarnCapture {
+impl tracing::Subscriber for LogCapture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -183,12 +184,12 @@ impl tracing::Subscriber for WarnCapture {
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        if *event.metadata().level() == tracing::Level::WARN {
+        if *event.metadata().level() == self.0 {
             let mut text = String::new();
             event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
                 text += &format!("{}={value:?} ", field.name());
             });
-            self.0.lock().push(text);
+            self.1.lock().push(text);
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
@@ -206,7 +207,8 @@ fn a_long_reader_warns_after_a_commit_at_most_once_per_interval() {
     };
     let warnings = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let count = || warnings.lock().len();
-    tracing::subscriber::with_default(WarnCapture(Arc::clone(&warnings)), || {
+    let capture = LogCapture(tracing::Level::WARN, Arc::clone(&warnings));
+    tracing::subscriber::with_default(capture, || {
         db.set_long_reader_limits(AGE, Duration::from_secs(3600));
         let reader = db.tx().unwrap();
         put(&db, 1);
@@ -708,33 +710,50 @@ fn a_file_whose_recorded_layout_differs_is_refused_at_open() {
 /// A damaged value (a truncated `Bytecode`, put through the raw table) is `DatabaseError::Decode`
 /// at a typed `get` and at a typed cursor's reads, in a read-only and a write transaction, where
 /// reth's `Decompress` panics on it (`Bytecode::from_compact` expects its length prefix): the
-/// crate docs' differences from MDBX, whose backend lets the panic through. The row stays, raw,
-/// and the transaction goes on.
+/// crate docs' differences from MDBX, whose backend lets the panic through. Each read logs one
+/// error naming the table, the key in hex and the panic's message (the panic hook names neither).
+/// The row stays, raw, and the transaction goes on.
 #[test]
 fn a_damaged_value_is_a_decode_error_not_a_panic() {
-    fn decode<V: std::fmt::Debug>(result: Result<Option<V>, DatabaseError>) {
+    type Logged = parking_lot::Mutex<Vec<String>>;
+    fn decode<V: std::fmt::Debug>(errors: &Logged, result: Result<Option<V>, DatabaseError>) {
         assert!(matches!(result, Err(DatabaseError::Decode)), "{result:?}");
+        let logged = std::mem::take(&mut *errors.lock());
+        assert_eq!(logged.len(), 1, "one error per read: {logged:?}");
+        let key: String = KEY.iter().map(|byte| format!("{byte:02x}")).collect();
+        for names in ["table=\"Bytecodes\"".to_string(), format!("key={key}"), "panic=".into()] {
+            assert!(logged[0].contains(&names), "names {names}: {logged:?}");
+        }
     }
+    const KEY: [u8; 32] = {
+        let mut key = [0; 32];
+        key[31] = 1;
+        key
+    };
     let (_dir, db) = create_test_db(TnLmdbEnvKind::RW);
-    let key = B256::with_last_byte(1);
+    let key = B256::from(KEY);
     let raw = |tx: &<TnLmdbEnv as Database>::TXMut| {
         tx.put::<RawTable<Bytecodes>>(RawKey::new(key), RawValue::from_vec(vec![0, 0]))
     };
     db.update(|tx| raw(tx)).unwrap().unwrap();
-    let tx = db.tx().unwrap();
-    decode(tx.get::<Bytecodes>(key));
-    let mut c = tx.cursor_read::<Bytecodes>().unwrap();
-    decode(c.first());
-    decode(c.seek_exact(key));
-    decode(c.walk(None).unwrap().next().transpose());
-    drop(c);
-    drop(tx);
-    let tx = db.tx_mut().unwrap();
-    decode(tx.get::<Bytecodes>(key));
-    decode(tx.cursor_write::<Bytecodes>().unwrap().last());
-    assert_eq!(tx.entries::<Bytecodes>().unwrap(), 1);
-    raw(&tx).unwrap();
-    tx.commit().unwrap();
+    let errors = Arc::new(Logged::default());
+    let capture = LogCapture(tracing::Level::ERROR, Arc::clone(&errors));
+    tracing::subscriber::with_default(capture, || {
+        let tx = db.tx().unwrap();
+        decode(&errors, tx.get::<Bytecodes>(key));
+        let mut c = tx.cursor_read::<Bytecodes>().unwrap();
+        decode(&errors, c.first());
+        decode(&errors, c.seek_exact(key));
+        decode(&errors, c.walk(None).unwrap().next().transpose());
+        drop(c);
+        drop(tx);
+        let tx = db.tx_mut().unwrap();
+        decode(&errors, tx.get::<Bytecodes>(key));
+        decode(&errors, tx.cursor_write::<Bytecodes>().unwrap().last());
+        assert_eq!(tx.entries::<Bytecodes>().unwrap(), 1);
+        raw(&tx).unwrap();
+        tx.commit().unwrap();
+    });
 }
 
 #[test]
