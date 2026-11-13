@@ -1481,6 +1481,7 @@ mod tests {
 #[cfg(test)]
 mod recorded_bytes_tests {
     use super::*;
+    use alloy_rpc_types_trace::geth::GethDebugBuiltInTracerType;
     use revm::{
         context::TxEnv,
         context_interface::result::EVMError,
@@ -1491,19 +1492,12 @@ mod recorded_bytes_tests {
     };
     use revm_inspectors::tracing::DEFAULT_MAX_RECORDED_BYTES;
 
-    #[test]
-    fn struct_logger_stops_a_trace_past_the_recorded_bytes_cap() {
-        let mut inspector = DebugInspector::new(GethDebugTracingOptions::default()).unwrap();
-        let DebugInspector::Default(tracing, _) = &mut inspector else {
-            panic!("default options select the struct logger")
-        };
-        assert_eq!(tracing.config().max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
-        tracing.config_mut().max_recorded_bytes = Some(64 << 10);
-
-        // a contract that loops until it runs out of gas: JUMPDEST; PUSH1 0; JUMP
+    /// Runs `inspector` over a call to a contract running `code`, which must end with the
+    /// cap's error at a 64 KiB cap, and checks that the RPC returns that error as `-32603`.
+    fn assert_stops_at_the_cap(inspector: DebugInspector, code: &'static [u8]) {
         let target = Address::with_last_byte(0xaa);
         let mut db = CacheDB::<EmptyDB>::default();
-        let code = Bytecode::new_raw(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56]));
+        let code = Bytecode::new_raw(Bytes::from_static(code));
         db.insert_account_info(target, AccountInfo::default().with_code(code));
         let mut evm = revm::Context::mainnet().with_db(db).build_mainnet_with_inspector(inspector);
         let err = match evm.inspect_tx(TxEnv {
@@ -1518,6 +1512,45 @@ mod recorded_bytes_tests {
         let rpc_err: jsonrpsee_types::error::ErrorObject<'static> =
             EthApiError::EvmCustom(err).into();
         assert_eq!(rpc_err.code(), jsonrpsee_types::error::INTERNAL_ERROR_CODE);
+    }
+
+    #[test]
+    fn struct_logger_stops_a_trace_past_the_recorded_bytes_cap() {
+        let mut inspector = DebugInspector::new(GethDebugTracingOptions::default()).unwrap();
+        let DebugInspector::Default(tracing, _) = &mut inspector else {
+            panic!("default options select the struct logger")
+        };
+        assert_eq!(tracing.config().max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
+        tracing.config_mut().max_recorded_bytes = Some(64 << 10);
+
+        // a contract that loops until it runs out of gas: JUMPDEST; PUSH1 0; JUMP
+        assert_stops_at_the_cap(inspector, &[0x5b, 0x60, 0x00, 0x56]);
+    }
+
+    /// TN(TN-0153): the call tracer records no steps; its calls' input counts.
+    #[test]
+    fn call_tracer_stops_a_trace_past_the_recorded_bytes_cap() {
+        let mut inspector = DebugInspector::new(GethDebugTracingOptions {
+            tracer: Some(GethDebugBuiltInTracerType::CallTracer.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let DebugInspector::CallTracer(tracing, _) = &mut inspector else {
+            panic!("the options select the call tracer")
+        };
+        assert_eq!(tracing.config().max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
+        tracing.config_mut().max_recorded_bytes = Some(64 << 10);
+
+        // a contract that STATICCALLs 0x..bb with 16 KiB of calldata until it runs out of gas:
+        // JUMPDEST; retLen 0; retOffset 0; PUSH2 0x4000; argsOffset 0; PUSH1 0xbb; GAS;
+        // STATICCALL; POP; PUSH1 0; JUMP
+        assert_stops_at_the_cap(
+            inspector,
+            &[
+                0x5b, 0x60, 0x00, 0x60, 0x00, 0x61, 0x40, 0x00, 0x60, 0x00, 0x60, 0xbb, 0x5a, 0xfa,
+                0x50, 0x60, 0x00, 0x56,
+            ],
+        );
     }
 }
 

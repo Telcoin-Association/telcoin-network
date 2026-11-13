@@ -1381,8 +1381,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
   `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request; the sites that
   build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
-  and `trace_filter`, and `trace_callMany`) share a counter. Call, prestate and 4byte tracers
-  record no steps and are unaffected. The cap lives in the patched crate rather than a wrapper
+  and `trace_filter`, and `trace_callMany`) share a counter. It counted steps only: the call
+  traces every preset records, with each call's input, init code and output, stayed uncounted
+  until TN-0153, so the call, prestate and parity tracers were still unbounded (the 4byte tracer
+  is not a `TracingInspector`). The cap lives in the patched crate rather than a wrapper
   because the recording happens inside `TracingInspector`, which reth constructs at a dozen sites
   and `DebugInspector` wraps privately. RPC only.
   *Tests*: in the patched crate `steps_count_their_bytes`,
@@ -2367,3 +2369,46 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   dictionary, so no jar TN writes is refused and no jar, `.conf` or digest changes.
   *Tests*: `test_checksummed_jar_refuses_dictionary_zstd` (the writer's refusal, and no file
   created; it fails without the writer's check). *Upstream*: no (TN-0120's checksummed format is TN's).
+
+- **TN-0153** — TN-0079's trace cap also counts calls: each call's and create's trace, its input
+  or init code, and its output.
+  *Kind*: fix (TN-owned, in the carried revm-inspectors).
+  *Files*: `patches/revm-inspectors/src/tracing/mod.rs` (`charge`, split out of `record_bytes`;
+  `trace_too_large`; the charges in `Inspector::call` and `create` and in
+  `fill_trace_on_call_end`, which now takes the context; tests),
+  `patches/revm-inspectors/src/tracing/config.rs` (the cap's docs),
+  `patches/revm-inspectors/PATCH.md` (also its scope, which said the patch matters only to
+  JavaScript tracers) and `upstream.diff`; `crates/rpc/rpc/src/debug.rs` (test
+  `call_tracer_stops_a_trace_past_the_recorded_bytes_cap`, sharing a helper with TN-0079's test).
+  *Why*: TN-0079 counted opcode steps only. Whatever the preset, `TracingInspector` keeps a
+  trace for every call and create, with a fresh copy of the call's input (`input_data`), the
+  init code and the output. A contract looping on `STATICCALL` with 16 KiB of calldata, about
+  130 gas a call, made one `callTracer` call at the 50M gas cap hold 6.4 GiB (6.96 GB peak RSS)
+  with nothing counted; `flatCallTracer`, `prestateTracer`, every parity `trace_*` method and the
+  struct logger's call traces did the same. `call` and `create` now charge the trace's node
+  (384 bytes) and the input or init code before the copy is made, and the end of a call or
+  create charges its output. Past the cap the call or create is not made: the hook returns the
+  `FatalExternalError` outcome TN-0017's interrupt returns, with the `trace too large` context
+  error, which revm takes before it hands the outcome to the calling frame and returns as
+  `EVMError::Custom` (`-32603`), as for steps. The refused call's trace is still pushed, without
+  its input, because revm runs `call_end` for that outcome too; past the cap an output is not
+  kept. Logs and storage changes stay uncounted; gas bounds them (8 gas a byte of log data, 100
+  gas or more a storage change). Answers: tracers that return each call's input and output
+  (`callTracer`, `flatCallTracer`, parity's `trace`) serialize them in hex, twice what the trace
+  holds, so a trace they take past the cap could not have been returned either; the nodes alone
+  pass 160 MiB only past 52M gas (120 gas or more a call), beyond the call gas cap and a 30M-gas
+  batch. Tracers that return no call input or output (the struct logger, `prestateTracer`,
+  parity's `stateDiff` or `vmTrace` alone) now refuse a transaction whose calls copy more than
+  160 MiB; they used to answer it after holding all of it. *Can reach execution or storage*: no.
+  revm-inspectors runs only for RPC tracing, block execution runs none of its inspectors, and
+  the change in `vendor/reth` is a test. Cost: one relaxed atomic add per call frame, on the
+  tracing path only.
+  *Tests*: in the patched crate `calls_count_their_bytes` (under the default cap a call trace
+  completes and counts exactly its nodes, input and output),
+  `calldata_past_the_cap_halts_the_transaction`, `output_past_the_cap_halts_the_transaction`,
+  `init_code_past_the_cap_halts_the_transaction` and
+  `transaction_input_past_the_cap_halts_before_it_runs` (each under the call tracer's and
+  parity's presets at a 64 KiB cap; all five fail without the charges); in reth
+  `call_tracer_stops_a_trace_past_the_recorded_bytes_cap` (through `DebugInspector`, and the
+  error maps to `-32603`).
+  *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.

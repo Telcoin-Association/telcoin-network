@@ -8,10 +8,12 @@ use alloy_rpc_types_trace::{
 };
 use revm::bytecode::opcode::OpCode;
 
-/// TN(TN-0079): the default for [`TracingInspectorConfig::max_recorded_bytes`], 160 MiB:
-/// reth's default `--rpc.max-response-size`. A trace whose steps alone hold more than that
-/// serializes to a response the limit refuses, so stopping at it changes no answer a
-/// default node could give; it only stops the memory growing first.
+/// TN(TN-0079, TN-0153): the default for [`TracingInspectorConfig::max_recorded_bytes`],
+/// 160 MiB: reth's default `--rpc.max-response-size`. Steps serialize to more bytes than the
+/// trace holds for them, and so do calls' input and output (in hex) for the tracers that return
+/// them, so for those a trace past the cap could not be returned anyway. A tracer that returns
+/// no call input or output (the struct logger, `prestateTracer`) refuses a transaction whose
+/// calls copy more than the cap, although its response would fit.
 pub const DEFAULT_MAX_RECORDED_BYTES: usize = 160 << 20;
 
 /// 256 bits each marking whether an opcode should be included into steps trace or not.
@@ -82,11 +84,13 @@ pub struct TracingInspectorConfig {
     pub record_logs: bool,
     /// Whether to record immediate bytes for opcodes.
     pub record_immediate_bytes: bool,
-    /// TN(TN-0079): the most bytes the recorded steps may hold (their stack and memory
-    /// snapshots, return data, immediate bytes and the step itself) before the transaction
-    /// halts with a `trace too large` error. Counted per inspector, or across the inspectors
-    /// that share a counter ([`TracingInspector::share_recorded_bytes`]). `None` is no limit;
-    /// the presets use [`DEFAULT_MAX_RECORDED_BYTES`].
+    /// TN(TN-0079, TN-0153): the most bytes the trace may hold before the transaction halts
+    /// with a `trace too large` error: every call's and create's trace with its input or init
+    /// code and its output (TN-0153), and the recorded steps with their stack and memory
+    /// snapshots, return data and immediate bytes (TN-0079). Logs and storage changes are not
+    /// counted; gas bounds them. Counted per inspector, or across the inspectors that share a
+    /// counter ([`TracingInspector::share_recorded_bytes`]). `None` is no limit; the presets use
+    /// [`DEFAULT_MAX_RECORDED_BYTES`].
     pub max_recorded_bytes: Option<usize>,
 }
 
