@@ -2234,3 +2234,30 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   to TN-0052) and renumbered one side's. `vendor.py ledger` now prints each id with its entry count
   and fails. *Can reach execution or storage*: no (vendoring tooling only).
   *Upstream*: no (TN's tooling).
+
+- **TN-0144** — A changeset jar's `.csoff` lookups answer from an in-memory copy of the records,
+  read a chunk at a time. *Kind*: performance (storage v2 historical reads).
+  *Files*: `crates/static-file/types/src/changeset_offsets.rs` (`ChangesetOffsetReader`: chunk
+  slots, `read_chunk`, `get`, a `Debug` that counts the chunks read; test).
+  *Why*: under storage v2 every historical account or storage read that resolves to a changeset
+  looks up its block's `.csoff` record, and `ChangesetOffsetReader::get` read each one with its
+  own 16 or 20 B `pread`: 0.46 us of a 0.8 us changeset lookup on a Mac (TN-0100's harness,
+  `sf step csoff`). The reader now keeps one `OnceLock` slot a chunk of 256 records: a lookup
+  reads its record's whole chunk on the chunk's first use (one `pread` of at most 5 KiB) and
+  answers the chunk's later lookups from memory. Each reader is one jar snapshot with a fixed
+  length, so a chunk never changes once read; a persist loads a new reader that starts empty,
+  so nothing read before a truncation can be served after it. The stored bytes are kept, and
+  each lookup verifies its record's checksum (TN-0121) as when it read it from the file. The
+  slots cover only the records below the header's length that the file held at the open (a
+  length past the file, a damaged header, sizes nothing; TN-0134), and a record outside them, or
+  in a chunk that could not be read, is read alone as before, with the same errors. A touched
+  chunk stays in memory while its jar is cached: at most 20 B a block of a jar, 10 MiB for a
+  full 500k-block changeset jar. Measured (Mac, TN-0100 harness, 2 runs against 4): `sf step
+  csoff` p50 0.46 -> 0.04 us, account changeset lookup p50 0.79-0.83 -> 0.33-0.38 us, unchanged
+  in the remap phase too (a jar reloaded every 32 reads). *Can reach execution or storage*: it
+  reads the same records, so a block's offsets are the ones the file holds; it writes nothing.
+  *Tests*: `test_chunked_lookups_match_the_file` (both formats, three chunks with a short last
+  one, every record twice; a damaged record fails its checksum while its chunk's other records
+  answer; a header length past the file answers the file's records and fails past them).
+  Mutation-checked: the record's place in its chunk shifted by one (fails); the length bound
+  dropped (panics). *Upstream*: no (upstream reads each record with a `pread`).

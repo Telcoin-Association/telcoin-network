@@ -16,6 +16,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 /// Size of a record without a checksum.
@@ -246,8 +247,10 @@ impl ChangesetOffsetWriter {
     }
 }
 
+/// TN(TN-0144): the records of one chunk of [`ChangesetOffsetReader`]'s in-memory copy.
+const CHUNK_RECORDS: u64 = 256;
+
 /// Reader for changeset offsets with O(1) random access.
-#[derive(Debug)]
 pub struct ChangesetOffsetReader {
     file: File,
     /// Cached file length in records.
@@ -256,6 +259,13 @@ pub struct ChangesetOffsetReader {
     checksums: bool,
     /// The sidecar's path, for checksum errors.
     path: PathBuf,
+    /// TN(TN-0144): the records read so far, as stored (checksums included), one slot a chunk of
+    /// [`CHUNK_RECORDS`]. [`Self::get`] reads a record's whole chunk on its first lookup and
+    /// answers the chunk's later lookups from memory, instead of one `pread` a lookup. It covers
+    /// the records below `len` that the file held at the open; the rest are read one at a time.
+    chunks: Box<[OnceLock<Box<[u8]>>]>,
+    /// TN(TN-0144): the records `chunks` covers.
+    chunked_len: u64,
 }
 
 impl ChangesetOffsetReader {
@@ -268,22 +278,58 @@ impl ChangesetOffsetReader {
     pub fn new(path: impl AsRef<Path>, len: u64, checksums: bool) -> io::Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
-        Ok(Self { file, len, checksums, path: path.to_path_buf() })
+        // TN(TN-0144): one chunk slot for every chunk of records the file holds below `len`, so
+        // a `len` past the file (a damaged header) sizes nothing by itself.
+        let file_records = file.metadata()?.len() / changeset_offset_record_size(checksums);
+        let chunked_len = len.min(file_records);
+        let chunks = (0..chunked_len.div_ceil(CHUNK_RECORDS)).map(|_| OnceLock::new()).collect();
+        Ok(Self { file, len, checksums, path: path.to_path_buf(), chunks, chunked_len })
     }
 
     /// Reads a single changeset offset by block index.
     /// Returns None if index is out of bounds.
+    ///
+    /// TN(TN-0144): from the in-memory copy of the record's chunk, read on the chunk's first
+    /// lookup. The record's checksum is verified on every lookup, as when each lookup read it from
+    /// the file. A chunk that cannot be read is not kept, and the record is then read alone.
     pub fn get(&self, block_index: u64) -> io::Result<Option<ChangesetOffset>> {
         if block_index >= self.len {
             return Ok(None);
         }
 
         let record_size = changeset_offset_record_size(self.checksums) as usize;
+        if block_index < self.chunked_len {
+            let slot = &self.chunks[(block_index / CHUNK_RECORDS) as usize];
+            let chunk = match slot.get() {
+                Some(chunk) => Some(chunk),
+                None => self
+                    .read_chunk(block_index / CHUNK_RECORDS)
+                    .ok()
+                    .map(|chunk| slot.get_or_init(|| chunk)),
+            };
+            if let Some(chunk) = chunk {
+                let at = (block_index % CHUNK_RECORDS) as usize * record_size;
+                let record = &chunk[at..at + record_size];
+                return decode_record(record, block_index, self.checksums, &self.path).map(Some);
+            }
+        }
+
         let byte_pos = block_index * record_size as u64;
         let mut buf = [0u8; CHECKSUMMED_RECORD_SIZE];
         self.file.read_exact_at(&mut buf[..record_size], byte_pos)?;
 
         decode_record(&buf, block_index, self.checksums, &self.path).map(Some)
+    }
+
+    /// TN(TN-0144): the stored records of chunk `chunk`, up to [`CHUNK_RECORDS`] of them, in one
+    /// read; the last chunk ends at `chunked_len`.
+    fn read_chunk(&self, chunk: u64) -> io::Result<Box<[u8]>> {
+        let record_size = changeset_offset_record_size(self.checksums);
+        let start = chunk * CHUNK_RECORDS;
+        let records = (self.chunked_len - start).min(CHUNK_RECORDS);
+        let mut buf = vec![0u8; (records * record_size) as usize].into_boxed_slice();
+        self.file.read_exact_at(&mut buf, start * record_size)?;
+        Ok(buf)
     }
 
     /// Reads a range of changeset offsets.
@@ -329,6 +375,20 @@ impl ChangesetOffsetReader {
     }
 }
 
+/// TN(TN-0144): the in-memory chunks by count, not by their bytes.
+impl core::fmt::Debug for ChangesetOffsetReader {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChangesetOffsetReader")
+            .field("file", &self.file)
+            .field("len", &self.len)
+            .field("checksums", &self.checksums)
+            .field("path", &self.path)
+            .field("chunked_len", &self.chunked_len)
+            .field("chunks_read", &self.chunks.iter().filter(|chunk| chunk.get().is_some()).count())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +400,64 @@ mod tests {
         for index in [0, 1, 499_999, u32::MAX as u64] {
             assert_ne!(record_seed(index), record_seed(index + (1 << 32)));
             assert_ne!(record_seed(index), record_seed(index + (1 << 48)));
+        }
+    }
+
+    /// TN(TN-0144): lookups answer from the in-memory chunks exactly as from the file, across
+    /// chunk boundaries and a short last chunk, in both formats; a record damaged before its chunk
+    /// is read fails its checksum on every lookup, the chunk's other records still answer; a
+    /// `len` past the file answers the records the file holds and fails past them.
+    #[test]
+    fn test_chunked_lookups_match_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.csoff");
+        let records = 2 * CHUNK_RECORDS + 7;
+        let expected: Vec<_> = (0..records).map(|i| ChangesetOffset::new(i * 3, i % 5)).collect();
+        for checksums in [false, true] {
+            let mut writer = ChangesetOffsetWriter::new(&path, 0, checksums).unwrap();
+            writer.append_many(&expected).unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+
+            let reader = ChangesetOffsetReader::new(&path, records, checksums).unwrap();
+            assert_eq!(reader.chunks.len(), 3);
+            for _ in 0..2 {
+                for (i, offset) in expected.iter().enumerate().rev() {
+                    assert_eq!(reader.get(i as u64).unwrap().as_ref(), Some(offset), "record {i}");
+                }
+            }
+            assert!(reader.chunks.iter().all(|chunk| chunk.get().is_some()));
+            assert_eq!(reader.get(records).unwrap(), None);
+
+            // A damaged record, before its chunk is read.
+            let damaged = CHUNK_RECORDS + 3;
+            let record_size = changeset_offset_record_size(checksums);
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all_at(&[0xff], damaged * record_size + 1).unwrap();
+            let reader = ChangesetOffsetReader::new(&path, records, checksums).unwrap();
+            for _ in 0..2 {
+                let got = reader.get(damaged);
+                if checksums {
+                    let err = got.unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+                } else {
+                    assert_ne!(got.unwrap().as_ref(), Some(&expected[damaged as usize]));
+                }
+                assert_eq!(
+                    reader.get(damaged + 1).unwrap().as_ref(),
+                    Some(&expected[damaged as usize + 1])
+                );
+            }
+
+            // A length past the file.
+            let reader = ChangesetOffsetReader::new(&path, records + 10, checksums).unwrap();
+            assert_eq!(
+                reader.get(records - 1).unwrap().as_ref(),
+                Some(&expected[records as usize - 1])
+            );
+            let err = reader.get(records).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+            std::fs::remove_file(&path).unwrap();
         }
     }
 
