@@ -3,7 +3,7 @@
 > [!NOTE]
 > Served only when `trace` is named in `--http.api` or `--ws.api`; see [Enabling Namespaces](../enabling-namespaces.md).
 
-Returns the Parity-style traces in a block range whose sender or receiver matches the filter, much as `eth_getLogs` does for logs. The node keeps no index of trace addresses: it re-executes every transaction in every block of the range and applies the address filter to the traces afterwards, so a narrow address filter does not make a request cheaper. A request holds two permits from the tracing permit pool and traces up to `--rpc.max-tracing-requests` blocks at a time.
+Returns the Parity-style traces in a block range whose sender or receiver matches the filter, much as `eth_getLogs` does for logs. The node keeps no index of trace addresses: it re-executes every transaction in every block of the range and applies the address filter to the traces afterwards, so a narrow address filter does not make a request cheaper. A request holds two permits from the tracing permit pool and replays two blocks at a time; it reads the range's blocks `--rpc.max-tracing-requests` at a time.
 
 `toBlock` minus `fromBlock` may be at most `--rpc.max-trace-filter-blocks` (default 100). A wider range fails with `-32602` and the message `Block range too large; currently limited to <limit> blocks`, with the configured limit. Both bounds default to the latest block, so a request that sets neither traces the latest block only, and one that sets only a `toBlock` below the latest block has a `fromBlock` greater than its `toBlock`.
 

@@ -2320,6 +2320,8 @@ mod tests {
         let first = eth_filter.new_block_filter().await.expect("first filter");
         eth_filter.new_block_filter().await.expect("second filter");
         let err = eth_filter.new_block_filter().await.expect_err("third filter");
+        // jsonrpsee's server-busy code, the one the filter docs name
+        assert_eq!(err.code(), -32009);
         assert_eq!(err.message(), "too many active filters, the limit is 2");
         assert!(eth_filter.uninstall_filter(first).await.expect("uninstall"));
         eth_filter.new_block_filter().await.expect("a slot is free again");

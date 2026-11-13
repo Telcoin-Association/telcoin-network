@@ -1236,7 +1236,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/node/core/src/args/txpool.rs` (fills the new pool field with its default),
   `crates/rpc/rpc/src/eth/filter.rs` (`install_filter` refuses at the cap; the pending-transaction
   filters take their pool listener through the fallible methods; `EthFilterError::TooManyActiveFilters`
-  and `TooManyTransactionListeners`, both -32604 server-busy; test `active_filters_are_bounded`),
+  and `TooManyTransactionListeners`, both -32009 server-busy; test `active_filters_are_bounded`),
   `crates/rpc/rpc/src/eth/pubsub.rs` (`newPendingTransactions` subscriptions take their listener
   the same way and fail with the same error), `crates/transaction-pool/src/config.rs`
   (`PoolConfig::max_rpc_tx_listeners`, `MAX_RPC_TX_LISTENERS` 1,024), `crates/transaction-pool/src/traits.rs`
@@ -1252,8 +1252,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   their number (review R2). The node now refuses the filter past `--rpc.max-active-filters`
   (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
-  TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones never count against the
-  cap or get refused. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
+  TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
+  are counted, so they take slots of the cap. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
   constant. RPC and pool-listener registration only: pool admission and ordering are unchanged.
   *Tests*: `active_filters_are_bounded`, `rpc_listeners_are_bounded`; the rest of the filter,
   pubsub and pool tests. *Upstream*: yes.
@@ -2424,3 +2424,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   after it is refused), `cap_lowers_a_gas_limit_to_what_is_left`; TN-0057's tests unchanged.
   Mutation-checked: an unlimited budget in `simulate_v1` (both simulate tests fail).
   *Upstream*: no (upstream has b8116b42b).
+
+- **TN-0157** — TN-0056's comments and ledger text say what the code does. *Kind*: fix (docs).
+  *Files*: `crates/transaction-pool/src/config.rs` (`PoolConfig::max_rpc_tx_listeners`'s doc),
+  `crates/rpc/rpc/src/eth/filter.rs` (`active_filters_are_bounded` asserts the error code), the
+  TN-0056 entry above.
+  *Why*: TN-0056 said the node's own pool listeners never count against
+  `max_rpc_tx_listeners`; they are never refused, but the cap counts every listener on the pool's
+  list, so they take its slots (`rpc_listeners_are_bounded` shows it). It also named the
+  server-busy error -32604; `ErrorCode::ServerIsBusy` is jsonrpsee's -32009, and the test now
+  pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
+  storage*: no; a doc comment and a test assertion.
+  *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
