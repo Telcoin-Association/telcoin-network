@@ -138,8 +138,12 @@ impl LoadedJar {
     /// replacing or removing it in upstream's shard-locked cache waited for its readers. A prune
     /// cuts rows from the files in place, and the next append writes new rows where they were, so
     /// a reader of an older snapshot could read those as the rows its offsets name. Waits by
-    /// polling (rare: only a prune, an unwind or a re-initialization takes this path). Never call
-    /// it while holding a provider of the same file: it would wait forever, as upstream deadlocks.
+    /// polling, as long as readers hold a snapshot of the file. Every index update that does not
+    /// grow its segment takes this path: a prune or an unwind, and the writer's open (the first
+    /// persist after a start, and every rotation to a new file), whose commit re-indexes the
+    /// segment at its tip and so replaces the jar of the file holding the tip; so do a stale jar
+    /// above a new range, a re-initialization and a removal of a cached jar. Never call it while
+    /// holding a provider of the same file: it would wait forever, as upstream deadlocks.
     fn release(jar: Arc<Self>) {
         let lease = Arc::clone(&jar.lease);
         drop(jar);

@@ -2310,13 +2310,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   with 4 history readers `commit_sf` 0.89 ms (v1) -> 2.41 ms (v2). Readers now clone the jar's
   `Arc` and drop the shard lock at once; a growing persist replaces the cached jar under a brief
   entry lock and returns, and readers of the old jar keep their snapshot, whose files only grew.
-  A jar taken out of the cache without its segment growing (a prune or unwind replacing it, a
-  stale jar above the new range, `remove_cached_provider`, `delete_jar`, `initialize_index`)
-  still waits for its readers, as the shard lock made it wait: a prune cuts rows in place and
+  A jar taken out of the cache without its segment growing (a prune or unwind replacing it, the
+  writer's open replacing the jar of the file holding the tip, a stale jar above the new range,
+  `remove_cached_provider`, `delete_jar`, `initialize_index`) still waits for its readers, as the shard lock made it wait: a prune cuts rows in place and
   the next append writes new rows there, under a reader's mapping. Every snapshot of a file loaded
   while its segment only grew shares one lease (`Arc<()>`), so that wait covers readers of
   snapshots a growing persist already replaced; it polls the lease's count every 50 us, after the
-  index lock is dropped (those readers may need it), and only these rare paths take it.
+  index lock is dropped (those readers may need it), and only these paths take it. The writer's
+  open is the frequent one: it commits and re-indexes the segment at its tip without growing it,
+  on the first persist after a start and on every rotation to a new file, so that persist waits
+  as long as a reader holds a snapshot of the tip's file (as every persist did before).
   `delete_jar` now loads the deleted jar's configuration from its file. *Can reach execution or
   storage*: it changes which jar snapshot a reader holds and when a commit waits for readers,
   not what is written or read for a block: a reader still sees the rows its index lookup named.
