@@ -2410,3 +2410,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
   off and for the segment still checked; it fails without either change). *Upstream*: the file
   name, yes; the format check, no (TN-0135 is TN's).
+
+- **TN-0152** — `DataReader::reverse_offset` refuses a position before an offsets file's second
+  byte. *Kind*: fix. *Files*: `crates/storage/nippy-jar/src/lib.rs` (`reverse_offset`, test).
+  *Why*: the position of the offset `index` places from the end was the file size less
+  `offset_size * (index + 1)`, unchecked. A version-1 jar whose offsets file was cut to 2 to 8
+  bytes (damage: the offset size and less than one offset) reaches it from the plain heal, which
+  counts no rows in such a file and then reads its final offset: below 8 bytes the subtraction
+  underflowed (a panic with overflow checks, a wrapped position and `OffsetOutOfBounds` in a
+  release build), and at 8 bytes the offset size was read as the first byte of the offset, whose
+  value the heal then cut the data file to. Each is now `OffsetOutOfBounds` for that index; the
+  heal has already written a configuration with no rows by then (upstream's heal, which TN-0130
+  keeps for version 1), so the next open resets that jar (TN-0131), as before. *Can reach
+  execution or storage*: no byte changes for an intact jar. An offsets file holds its size byte
+  and whole offsets, and every position read from one is past that byte, so each read computes
+  the position it did; a version-2 jar refuses a short offsets file before this point
+  (`CommittedRowsMissing`, TN-0130). *Tests*: `test_offsets_file_shorter_than_one_offset_is_an_error`
+  (a plain jar's offsets cut to each of 2 to 8 bytes: the reader and the writer's open return
+  the error; it panics without the change). *Upstream*: yes (upstream's arithmetic).
