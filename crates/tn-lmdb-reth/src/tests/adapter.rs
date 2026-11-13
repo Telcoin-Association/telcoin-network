@@ -657,7 +657,8 @@ fn a_file_whose_table_form_disagrees_is_refused_at_open() {
 /// key width and `packed_max`, no subkey width, no composite split): an open compares each row
 /// with this build's layout and refuses a difference with `MDBX_INCOMPATIBLE`, read-write and
 /// read-only, naming the table and both layouts. The file's own layout put back opens with the
-/// rows, and so does a file without the row (one written before the record).
+/// rows, and so does a file without the row (one written before the record), which a later
+/// `create_tables` leaves without it: the call records the layout of a table it creates only.
 #[test]
 fn a_file_whose_recorded_layout_differs_is_refused_at_open() {
     use tn_lmdb::ReadTxn;
@@ -705,6 +706,11 @@ fn a_file_whose_recorded_layout_differs_is_refused_at_open() {
     opens();
     record(&|txn, table| assert!(txn.delete(table, name).unwrap()));
     opens();
+    let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, TnLmdbArgs::default()).unwrap();
+    db.create_tables().unwrap();
+    drop(db);
+    record(&|txn, table| assert_eq!(txn.get(table, name).unwrap(), None, "no row stamped"));
+    record(&|txn, table| assert!(txn.get(table, b"HashedStorages").unwrap().is_some()));
 }
 
 /// A damaged value (a truncated `Bytecode`, put through the raw table) is `DatabaseError::Decode`
