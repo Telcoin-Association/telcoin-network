@@ -14,7 +14,8 @@ permission, or operator trust classification.
 
 ## Provisioning
 
-Use the same shape as `committee.yaml`'s `bootstrap_servers`, with an explicit
+Use the same shape as a bootstrap servers entry (`chain-configs/*/bootstrap_servers.yaml`,
+or the `bootstrap_servers` of a ceremony's `committee.yaml`), with an explicit
 `workers` list indexed by worker ID. Include every launch validator, including
 the local validator, and every on-chain worker. Keep primary, worker 0 and
 worker 1 keys distinct. A two-worker entry looks like this:
@@ -33,10 +34,12 @@ committee_peers:
 ```
 
 Replace the placeholders and documentation addresses with operator-provided
-keys and reachable addresses. Repeat the entry for every validator. The
-genesis committee's bootstrap inventory can be copied as a starting point,
-but verify that it contains every launch validator and that its endpoints and
-worker count are current. An empty or absent `committee_peers` map preserves
+keys and reachable addresses. Repeat the entry for every validator. A genesis
+ceremony's `committee.yaml` lists the genesis validators as bootstrap servers,
+and that inventory can be copied as a starting point, but verify that it
+contains every launch validator and that its endpoints and worker count are
+current. The built-in bootstrap lists name bootstrap servers, not validators,
+so they are no starting point. An empty or absent `committee_peers` map preserves
 discovery-based startup for existing deployments. It does not qualify a
 hub-independent Closed launch.
 
@@ -57,9 +60,10 @@ a spare worker before governance raises the count.
 ## Selection, union and conflicts
 
 Bootstrap selection is unchanged: a CLI override takes precedence over
-`bootstrap_peers` in `network-config`, which takes precedence over the genesis
-bootstrap set. A selected empty map falls back to genesis; a selected nonempty
-map replaces genesis in full.
+`bootstrap_peers` in `network-config`, which takes precedence over the default
+set (the built-in list for `--chain`, else the genesis committee file's). A
+selected empty map falls back to the default; a selected nonempty map replaces
+it in full.
 
 After that selection, startup installs bootstrap hints and then committee
 hints on the primary and every worker. Unrelated bootstrap and trusted peers

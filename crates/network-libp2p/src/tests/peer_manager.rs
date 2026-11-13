@@ -602,8 +602,8 @@ fn launch_peer_info(peer: &tn_types::P2pNode) -> NetworkInfo {
 /// Seeding preserves unrelated bootstrap/trusted peers and survives committee rotation.
 #[tokio::test]
 async fn committee_seeding_unions_bootstrap_and_trusted_peers() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let mut entries = peers.into_iter();
     let (seed_key, seed) = entries.next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let (bootstrap_key, bootstrap) =
@@ -641,8 +641,8 @@ async fn committee_seeding_unions_bootstrap_and_trusted_peers() -> eyre::Result<
 /// A configured stub that contradicts the inventory rejects the whole seed batch.
 #[tokio::test]
 async fn committee_seeding_rejects_conflicting_configured_stub_atomically() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let other = peers.values().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
     let mut manager = create_test_peer_manager(None);
@@ -662,8 +662,8 @@ async fn committee_seeding_rejects_conflicting_configured_stub_atomically() -> e
 /// A restored record under a key outside the inventory cannot stop seeding.
 #[tokio::test]
 async fn committee_seeding_drops_planted_restored_record() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let (outside_key, _) = peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
     let mut manager = create_test_peer_manager(None);
@@ -685,8 +685,8 @@ async fn committee_seeding_drops_planted_restored_record() -> eyre::Result<()> {
 /// A stale restored record under an inventory key gives way to the launch bindings.
 #[tokio::test]
 async fn committee_seeding_replaces_stale_restored_record() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let (other_key, other) =
         peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
@@ -713,8 +713,8 @@ async fn committee_seeding_replaces_stale_restored_record() -> eyre::Result<()> 
 /// Seeding preserves a restored record's signed metadata and rejects older relayed records.
 #[tokio::test]
 async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let mut manager = create_test_peer_manager(None);
     let mut restored = launch_peer_info(&peer.primary);
@@ -747,8 +747,8 @@ async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> 
 /// Discovery cannot silently re-key or move a seeded launch validator.
 #[tokio::test]
 async fn committee_seeding_keeps_identity_and_address_fixed() -> eyre::Result<()> {
-    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-    let peers = committee.bootstrap_servers();
+    let peers: std::collections::BTreeMap<tn_types::BlsPublicKey, tn_types::BootstrapServer> =
+        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let (other_key, other) =
         peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;

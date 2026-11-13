@@ -94,7 +94,8 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Bootstrap dial hints as a YAML or JSON map keyed by BLS public key.
     ///
     /// Replaces network-config bootstrap_peers for this process only. A nonempty map replaces
-    /// all genesis seeds; an explicit '{}' selects the genesis fallback. Each entry contains
+    /// the chain's default bootstrap servers (built into the binary for --chain, else the
+    /// genesis committee file's); an explicit '{}' selects that default. Each entry contains
     /// primary and workers (a list). Committee membership still comes from chain state.
     #[arg(long, value_name = "MAP", value_parser = parse_bootstrap_peers, allow_hyphen_values = true)]
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
@@ -642,8 +643,7 @@ mod tests {
     /// The CLI accepts the same multi-worker map as network-config, in YAML or JSON form.
     #[test]
     fn bootstrap_peers_cli_parses_yaml_and_json() -> eyre::Result<()> {
-        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let mut peers = committee.bootstrap_servers();
+        let mut peers = parse_bootstrap_peers(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
         assert!(!peers.is_empty());
         peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
         [serde_yaml::to_string(&peers)?, serde_json::to_string(&peers)?].into_iter().try_for_each(
@@ -672,8 +672,7 @@ mod tests {
     /// Invalid keys and empty worker lists fail at argument parsing, before node startup.
     #[test]
     fn bootstrap_peers_cli_rejects_invalid_entries() -> eyre::Result<()> {
-        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let mut peers = committee.bootstrap_servers();
+        let mut peers = parse_bootstrap_peers(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
         peers.values_mut().for_each(|server| server.workers.clear());
         ["{invalid-key: {}}".to_owned(), serde_yaml::to_string(&peers)?].into_iter().for_each(
             |raw| {
@@ -720,8 +719,7 @@ mod tests {
     /// A map read from `--bootstrap-peers-file` equals the same content passed inline.
     #[test]
     fn bootstrap_peers_file_matches_inline_map() -> eyre::Result<()> {
-        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let peers = committee.bootstrap_servers();
+        let peers = parse_bootstrap_peers(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
         assert!(!peers.is_empty());
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bootstrap-peers.yaml");
@@ -794,8 +792,7 @@ mod tests {
     fn bootstrap_peers_file_accepts_non_utf8_path() -> eyre::Result<()> {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
 
-        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let peers = committee.bootstrap_servers();
+        let peers = parse_bootstrap_peers(tn_types::MAINNET_BOOTSTRAP_SERVERS)?;
         assert!(!peers.is_empty());
         let raw = serde_yaml::to_string(&peers)?;
         let dir = tempfile::tempdir()?;

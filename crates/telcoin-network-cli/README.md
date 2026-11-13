@@ -357,7 +357,7 @@ telcoin-network node \
 | Flag                     | Default        | Description                                                                                                                                                                                         |
 | ------------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--chain`                | none           | Join a named network (`adiri`, `test-net`, `mainnet`)                                                                                                                                               |
-| `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the genesis fallback                                                                        |
+| `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the default set (built in for `--chain`, else the genesis committee file's)                |
 | `--bootstrap-peers-file` | none           | Read the `--bootstrap-peers` map from a file (same format; checked at argument parsing). Conflicts with `--bootstrap-peers`. A relative path resolves from the working directory, `/` under systemd |
 | `--instance`             | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup)                                                                                                      |
 | `--metrics`              | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                                                                                                                            |
@@ -445,7 +445,7 @@ Complete tree after the node has run:
     worker.seed                   #   worker network key seed
   genesis/                        # chain genesis data
     genesis.yaml                  #   EVM genesis block
-    committee.yaml                #   committee membership + bootstrap peers
+    committee.yaml                #   committee membership (+ bootstrap peers without --chain)
   db/                             # execution layer database (reth): tn-lmdb.dat (mdbx.dat
                                   #   in a build with the legacy `mdbx` feature); the default
                                   #   build moves an MDBX database onto tn-lmdb at its first

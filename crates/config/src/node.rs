@@ -3,11 +3,12 @@
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs, GOVERNANCE_SAFE_ADDRESS};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write, time::Duration};
+use std::{collections::BTreeMap, fs::File, io::Write, time::Duration};
 use tn_types::{
-    get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
-    NetworkPublicKey, WorkerId, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS,
-    TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, BootstrapServer,
+    Genesis, NetworkPublicKey, WorkerId, MAINNET_BOOTSTRAP_SERVERS, MAINNET_COMMITTEE,
+    MAINNET_GENESIS, MAINNET_PARAMETERS, TESTNET_BOOTSTRAP_SERVERS, TESTNET_COMMITTEE,
+    TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
 use tracing::info;
 
@@ -42,6 +43,15 @@ pub struct Config {
     #[serde(default)]
     pub exex_critical: bool,
 
+    /// The bootstrap servers built into the binary for a named chain, set by
+    /// [`Config::load_adiri`] and [`Config::load_mainnet`].
+    ///
+    /// `None` for a network loaded from the datadir: such a node takes its bootstrap servers from
+    /// the genesis committee file. Either set is the default that `network-config`'s
+    /// `bootstrap_peers` and the `--bootstrap-peers` flag replace.
+    #[serde(skip)]
+    pub bootstrap_servers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+
     /// Reference to the apps version string.
     #[serde(skip)]
     pub version: &'static str,
@@ -63,6 +73,7 @@ impl Config {
             parameters: Default::default(),
             genesis,
             exex_critical: false,
+            bootstrap_servers: None,
             version: "UNKNOWN",
         }
     }
@@ -82,7 +93,14 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info, parameters, genesis, exex_critical: false, version })
+        Ok(Config {
+            node_info,
+            parameters,
+            genesis,
+            exex_critical: false,
+            bootstrap_servers: None,
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -94,11 +112,18 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            exex_critical: false,
+            bootstrap_servers: None,
+            version,
+        })
     }
 
-    /// Load the bundled adiri (testnet) config: node info from the datadir, parameters and
-    /// genesis compiled in.
+    /// Load the bundled adiri (testnet) config: node info from the datadir, parameters, genesis
+    /// and bootstrap servers compiled in.
     ///
     /// Writes nothing to the datadir. Call [`Config::write_adiri_committee`] once the caller has
     /// decided to use this config, so a start refused after the load leaves the datadir as it was.
@@ -109,12 +134,20 @@ impl Config {
             serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(TESTNET_GENESIS).expect("bad adiri genesis yaml data");
+        let bootstrap_servers = Some(parse_bootstrap_servers("adiri", TESTNET_BOOTSTRAP_SERVERS)?);
 
-        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            exex_critical: false,
+            bootstrap_servers,
+            version,
+        })
     }
 
-    /// Load the bundled mainnet config: node info from the datadir, parameters and genesis
-    /// compiled in.
+    /// Load the bundled mainnet config: node info from the datadir, parameters, genesis and
+    /// bootstrap servers compiled in.
     ///
     /// Writes nothing to the datadir. Call [`Config::write_mainnet_committee`] once the caller
     /// has decided to use this config, so a start refused after the load leaves the datadir as it
@@ -129,8 +162,17 @@ impl Config {
             serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(MAINNET_GENESIS).expect("bad adiri genesis yaml data");
+        let bootstrap_servers =
+            Some(parse_bootstrap_servers("mainnet", MAINNET_BOOTSTRAP_SERVERS)?);
 
-        Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            exex_critical: false,
+            bootstrap_servers,
+            version,
+        })
     }
 
     /// Write the bundled adiri (testnet) genesis committee to `genesis/committee.yaml` unless
@@ -577,6 +619,18 @@ fn write_committee_if_missing<P: TelcoinDirs>(
     Ok(())
 }
 
+/// Parse `chain`'s bundled bootstrap servers file (`chain-configs/*/bootstrap_servers.yaml`).
+///
+/// The text is compiled into the binary, so a failure here is a build defect; it is returned
+/// rather than panicking so the node stops with the chain's name and the reason.
+pub fn parse_bootstrap_servers(
+    chain: &str,
+    yaml: &str,
+) -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
+    serde_yaml::from_str(yaml)
+        .map_err(|e| eyre::eyre!("the bootstrap servers built in for {chain} do not parse: {e}"))
+}
+
 #[cfg(test)]
 mod test {
     use super::Parameters;
@@ -995,5 +1049,134 @@ mod test {
              128: peers prune the certificate rounds a rejoining validator rebuilds its DAG from, \
              so a gc_depth above 64 refuses to start"
         );
+    }
+
+    /// Each bundled bootstrap servers file parses, lists servers, names no BLS key twice, and
+    /// passes the node's startup checks on bootstrap entries: every address ends with the
+    /// `/p2p/` identity of its network key, and no network key serves two BLS keys. The adiri
+    /// servers are public: a loopback address there would dial nothing outside the host.
+    #[test]
+    fn bundled_bootstrap_servers_are_dialable() -> eyre::Result<()> {
+        use libp2p::multiaddr::Protocol;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{
+            BlsKeypair, Multiaddr, NetworkKeypair, P2pNode, MAINNET_BOOTSTRAP_SERVERS,
+            TESTNET_BOOTSTRAP_SERVERS,
+        };
+
+        for (chain, yaml, public) in [
+            ("adiri", TESTNET_BOOTSTRAP_SERVERS, true),
+            ("mainnet", MAINNET_BOOTSTRAP_SERVERS, false),
+        ] {
+            let servers = super::parse_bootstrap_servers(chain, yaml)?;
+            assert!(!servers.is_empty(), "{chain}: no bootstrap servers");
+            // a repeated key decodes last-wins (into a map and into serde_yaml's own Mapping), so
+            // count the file's top-level entries as written
+            let entries = serde::Deserializer::deserialize_map(
+                serde_yaml::Deserializer::from_str(yaml),
+                CountEntries,
+            )?;
+            assert_eq!(entries, servers.len(), "{chain}: a BLS key is listed twice");
+
+            servers
+                .iter()
+                .flat_map(|(key, server)| {
+                    std::iter::once(&server.primary)
+                        .chain(&server.workers)
+                        .map(move |node| (key, node))
+                })
+                .for_each(|(key, node)| {
+                    let address = &node.network_address;
+                    assert!(
+                        matches!(address.iter().last(), Some(Protocol::P2p(_))),
+                        "{chain}: {key}: {address} has no /p2p/<peer id>"
+                    );
+                    assert!(
+                        address.iter().any(|protocol| matches!(protocol, Protocol::QuicV1)),
+                        "{chain}: {key}: {address} is not a QUIC address"
+                    );
+                    let loopback = address.iter().any(|protocol| match protocol {
+                        Protocol::Ip4(ip) => ip.is_loopback(),
+                        Protocol::Ip6(ip) => ip.is_loopback(),
+                        _ => false,
+                    });
+                    assert!(
+                        !(public && loopback),
+                        "{chain}: {key}: {address} is a loopback address"
+                    );
+                });
+
+            // the same check the node runs on its selected bootstrap set before any network starts
+            let endpoint = || {
+                P2pNode::from((
+                    NetworkKeypair::generate_ed25519().public().into(),
+                    Multiaddr::empty(),
+                ))
+            };
+            let local = *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public();
+            crate::NetworkConfig::default()
+                .validate_trusted_nodes(&servers, 1, &local, &endpoint(), &[endpoint()])
+                .map_err(|e| eyre::eyre!("{chain}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Counts a YAML map's entries as written, duplicates included.
+    struct CountEntries;
+
+    impl<'de> serde::de::Visitor<'de> for CountEntries {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<usize, A::Error> {
+            use serde::de::IgnoredAny;
+            let mut entries = 0;
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                entries += 1;
+            }
+            Ok(entries)
+        }
+    }
+
+    /// The entry count sees a repeated key that the map decode drops.
+    #[test]
+    fn count_entries_sees_repeated_keys() -> eyre::Result<()> {
+        let count = |yaml| {
+            serde::Deserializer::deserialize_map(
+                serde_yaml::Deserializer::from_str(yaml),
+                CountEntries,
+            )
+        };
+        assert_eq!(count("a: 1\nb: 2\n")?, 2);
+        assert_eq!(count("a: 1\na: 2\n")?, 2);
+        Ok(())
+    }
+
+    /// A named chain's config carries its bundled bootstrap servers; a datadir config carries
+    /// none, so the node falls back to its genesis committee file.
+    #[test]
+    fn named_chain_configs_carry_bundled_bootstrap_servers() -> eyre::Result<()> {
+        use crate::{NodeInfo, TelcoinDirs as _};
+        use tn_types::{MAINNET_BOOTSTRAP_SERVERS, TESTNET_BOOTSTRAP_SERVERS};
+
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_path_buf();
+        Config::write_to_path(datadir.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)?;
+        let adiri = Config::load_adiri(&datadir, "test")?;
+        assert_eq!(
+            adiri.bootstrap_servers,
+            Some(super::parse_bootstrap_servers("adiri", TESTNET_BOOTSTRAP_SERVERS)?)
+        );
+        let mainnet = Config::load_mainnet(&datadir, "test")?;
+        assert_eq!(
+            mainnet.bootstrap_servers,
+            Some(super::parse_bootstrap_servers("mainnet", MAINNET_BOOTSTRAP_SERVERS)?)
+        );
+        assert_eq!(Config::load_or_default(&datadir, "test")?.bootstrap_servers, None);
+        assert_eq!(Config::default_for_test().bootstrap_servers, None);
+        Ok(())
     }
 }

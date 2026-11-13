@@ -354,8 +354,11 @@ struct CommitteeInner {
     /// The validity threshold (f+1)
     /// Derived from the authorities, never serialized.
     validity_threshold: VotingPower,
-    /// The bootstrap servers to initially join a network (probably the initial committee).
-    /// Note, not included in partial eq since they are not relevand to overall committee equality.
+    /// Bootstrap servers read from a genesis committee file, used to join a network started
+    /// from that file. A node on a named chain (`--chain`) dials the list built in for that
+    /// chain instead (`chain-configs/*/bootstrap_servers.yaml`), and the built-in committee files
+    /// carry none. Dial hints only: not part of equality, and an imported pack's copy is the
+    /// serving peer's.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
     /// The number of workers every validator in this committee runs.
     ///
@@ -507,9 +510,11 @@ const COMMITTEE_FIELD_NAMES: [&str; COMMITTEE_FIELDS_V1] =
 /// and attributes the removed derive had.
 ///
 /// The epoch gate is binary-only. Human-readable formats name their fields, so a committee file
-/// written by any build loads on any other: `num_workers` defaults when absent (as in every
-/// `chain-configs/*/committee.yaml` today), and each [`BootstrapServer`] still accepts the legacy
-/// `worker:` key through its own deserializer. Both are covered by the tests below.
+/// written by any build loads on any other: `num_workers` defaults to one when absent,
+/// `bootstrap_servers` to an empty map (the built-in `chain-configs/*/committee.yaml` files carry
+/// none; their servers are in `bootstrap_servers.yaml`), and each [`BootstrapServer`] still
+/// accepts the legacy `worker:` key through its own deserializer. All three are covered by the
+/// tests below.
 #[derive(Deserialize)]
 #[serde(rename = "CommitteeInner")]
 struct CommitteeInnerHr {
@@ -517,7 +522,8 @@ struct CommitteeInnerHr {
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// The epoch number of this committee.
     epoch: Epoch,
-    /// The bootstrap servers to initially join a network.
+    /// The bootstrap servers to initially join a network; absent in a file that lists none.
+    #[serde(default)]
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
     /// The number of workers every validator in this committee runs.
     #[serde(default = "default_num_workers")]
@@ -2266,6 +2272,48 @@ mod tests {
         let decoded: Committee = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(decoded.number_of_workers(), 2);
         assert_eq!(decoded.with_num_workers(std::num::NonZeroUsize::MIN).number_of_workers(), 1);
+    }
+
+    /// A committee file without `bootstrap_servers` (the built-in chain-config files) loads with
+    /// none, keeps its authorities, and still encodes in the binary layout of its epoch.
+    #[test]
+    fn committee_yaml_without_bootstrap_servers_loads_empty() {
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(1)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee =
+            Committee::new(authorities, 0, bootstrap_servers, std::num::NonZeroUsize::MIN);
+
+        let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
+        let map = yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");
+        assert!(map.remove(&serde_yaml::Value::String("bootstrap_servers".to_string())).is_some());
+        let decoded: Committee = serde_yaml::from_value(yaml_value).expect("deserialize");
+        assert!(decoded.bootstrap_servers().is_empty());
+        assert_eq!(decoded, committee, "bootstrap servers are not part of committee equality");
+        assert_eq!(decoded.bls_keys(), committee.bls_keys());
+        let bytes = encode(&decoded);
+        let round_trip: Committee = try_decode(&bytes).expect("binary round trip");
+        assert_eq!(round_trip, decoded);
+        assert!(round_trip.bootstrap_servers().is_empty());
+    }
+
+    /// The bundled committee files carry no bootstrap servers, so a `--chain` committee written
+    /// to a datadir has a single source for them: `bootstrap_servers.yaml`.
+    #[test]
+    fn bundled_committee_files_carry_no_bootstrap_servers() {
+        [crate::TESTNET_COMMITTEE, crate::MAINNET_COMMITTEE].into_iter().for_each(|yaml| {
+            let committee: Committee = serde_yaml::from_str(yaml).expect("bundled committee");
+            assert!(committee.size() >= 4);
+            assert!(committee.bootstrap_servers().is_empty());
+        });
     }
 
     #[test]
