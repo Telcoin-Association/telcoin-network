@@ -690,7 +690,7 @@ mod tests {
             "crash window must leave the headers static file durably at 2"
         );
         // the committed tip reads from the `Finish` checkpoint, so it stays at 1 although the
-        // headers static file is at 2 (review R16); the provider's own `last_block_number`
+        // headers static file is at 2; the provider's own `last_block_number`
         // resolves through that static file and would say 2 here
         assert_eq!(env1.last_block_number()?, 1, "the committed tip must ignore the torn header");
         // the MDBX-side oracle is the Headers stage checkpoint: it is exactly what

@@ -151,7 +151,7 @@ impl RethEnv {
         // PROPAGATE: the public last_block_number()/last_finalized_block_number() wrappers
         // unwrap_or(0) and would misdiagnose a failed read as tip=0 here. The tip is the
         // `Finish` checkpoint, from the same MDBX snapshot as the marker; the Headers static
-        // file can be a block ahead of MDBX during a commit (review R16).
+        // file can be a block ahead of MDBX during a commit.
         let provider = self.inner.blockchain_provider.database_provider_ro()?;
         let tip = provider.best_block_number()?;
         // None = never finalized (fresh genesis). Some(0) is unreachable in production (the

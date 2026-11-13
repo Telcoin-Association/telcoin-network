@@ -991,7 +991,7 @@ impl TxPool for WorkerTxPool {
         // transactions admitted during the build from a bounded broadcast channel and drops
         // what it missed when it lags; a sender's nonce N can then be dropped while N+1 is
         // yielded as independent, and the builder, which does not execute, would pack N+1
-        // without N (vendored reth review R7). The next build sees the newcomers anyway.
+        // without N. The next build sees the newcomers anyway.
         inner.no_updates();
         BestTxns { inner }
     }
@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     /// A build sees the pending set as of its start: a transaction admitted after the iterator
-    /// was created, even a child of one it holds, is left to the next build (review R7).
+    /// was created, even a child of one it holds, is left to the next build.
     #[tokio::test]
     async fn best_transactions_ignore_admissions_after_the_build_started() {
         let tmp_dir = TempDir::new().unwrap();
