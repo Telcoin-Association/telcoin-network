@@ -55,7 +55,9 @@ A JavaScript tracer is code the RPC caller supplies, and the node runs it on RPC
   client disconnected, until the trace finished or the node ran out of memory (upstream reth
   #27543). Now an expired request returns an error at once, and an expired or abandoned trace
   stops at the first EVM step after the running callback returns. `setup` and `result` run outside
-  the EVM steps, so nothing stops them.
+  the EVM steps, so nothing stops them. The node sets no upper bound on `timeout`, as geth sets
+  none: a client that asks for hours keeps its trace running, and holding its tracing permit,
+  until the trace ends or, once the client disconnects, until it stops as an abandoned trace does.
 
 What bounds the cost is the number of threads. Each `debug_trace*` request holds a tracing permit
 (`--rpc.max-tracing-requests`) until its trace ends, even after it times out or the client leaves
