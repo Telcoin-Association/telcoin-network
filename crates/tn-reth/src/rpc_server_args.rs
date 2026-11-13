@@ -178,7 +178,8 @@ pub struct RpcServerArgs {
     ///
     /// Filters outlive the connection that made them and are removed only when uninstalled or
     /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored
-    /// TN-0056).
+    /// TN-0056). Each log filter names at most 1,000 addresses and 1,000 values per topic
+    /// position (vendored TN-0155).
     #[arg(long = "rpc.max-active-filters", value_name = "COUNT", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), default_value_t = constants::DEFAULT_MAX_ACTIVE_FILTERS)]
     pub rpc_max_active_filters: usize,
 

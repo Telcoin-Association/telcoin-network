@@ -89,6 +89,22 @@ const MAX_HEADERS_RANGE: u64 = 1_000; // with ~530bytes per header this is ~500k
 // decision independent of how a range is split.
 const _: () = assert!(CACHED_MODE_BLOCK_THRESHOLD <= MAX_HEADERS_RANGE);
 
+/// TN(TN-0155): the most addresses a client's log filter may name, and the most values it may
+/// list in one topic position; geth's default `--rpc.logquerylimit`. An installed filter or a
+/// `logs` subscription keeps its sets as long as it lives, so this bounds each one to about
+/// 0.3 MB.
+pub const MAX_FILTER_VALUES_PER_POSITION: usize = 1_000;
+
+/// TN(TN-0155): refuses a client's log filter with more than [`MAX_FILTER_VALUES_PER_POSITION`]
+/// addresses, or more than that many values in one topic position.
+pub(crate) fn check_filter_size(filter: &Filter) -> Result<(), EthFilterError> {
+    let max = MAX_FILTER_VALUES_PER_POSITION;
+    if filter.address.len() > max || filter.topics.iter().any(|topic| topic.len() > max) {
+        return Err(EthFilterError::TooManyFilterValues(max))
+    }
+    Ok(())
+}
+
 /// Minimum number of bloom matching blocks in a header window for fetching their receipts in
 /// parallel
 const PARALLEL_PROCESSING_THRESHOLD: usize = 1000;
@@ -337,6 +353,8 @@ where
         filter: Filter,
         limits: QueryLimits,
     ) -> Result<Vec<Log>, EthFilterError> {
+        // TN(TN-0155): `eth_getLogs` and `EngineEthFilter::logs` take the client's filter here.
+        check_filter_size(&filter)?;
         self.inner.clone().logs_for_filter(filter, limits).await
     }
 }
@@ -349,6 +367,7 @@ where
     /// Handler for `eth_newFilter`
     async fn new_filter(&self, filter: Filter) -> RpcResult<FilterId> {
         trace!(target: "rpc::eth", "Serving eth_newFilter");
+        check_filter_size(&filter)?;
         self.inner
             .install_filter(FilterKind::<RpcTransaction<Eth::NetworkTypes>>::Log(Box::new(filter)))
             .await
@@ -1006,6 +1025,10 @@ pub enum EthFilterError {
     /// TN(TN-0056): the pool holds as many RPC transaction listeners as it allows.
     #[error("too many pending transaction listeners")]
     TooManyTransactionListeners,
+    /// TN(TN-0155): a log filter names too many addresses, or too many values in one topic
+    /// position.
+    #[error("too many addresses or topics in one filter position, the limit is {0}")]
+    TooManyFilterValues(usize),
 }
 
 impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
@@ -1022,7 +1045,8 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
             err @ (EthFilterError::InvalidBlockRangeParams |
             EthFilterError::QueryExceedsMaxBlocks(_) |
             EthFilterError::QueryExceedsMaxResults { .. } |
-            EthFilterError::BlockRangeExceedsHead) => {
+            EthFilterError::BlockRangeExceedsHead |
+            EthFilterError::TooManyFilterValues(_)) => {
                 rpc_error_with_code(jsonrpsee::types::error::INVALID_PARAMS_CODE, err.to_string())
             }
             err @ (EthFilterError::TooManyActiveFilters(_) |
@@ -2296,9 +2320,110 @@ mod tests {
         let first = eth_filter.new_block_filter().await.expect("first filter");
         eth_filter.new_block_filter().await.expect("second filter");
         let err = eth_filter.new_block_filter().await.expect_err("third filter");
+        // jsonrpsee's server-busy code, the one the filter docs name
+        assert_eq!(err.code(), -32009);
         assert_eq!(err.message(), "too many active filters, the limit is 2");
         assert!(eth_filter.uninstall_filter(first).await.expect("uninstall"));
         eth_filter.new_block_filter().await.expect("a slot is free again");
+    }
+
+    /// TN(TN-0155): a log filter with `addresses` addresses and `topics` values in each of the
+    /// four topic positions, all distinct.
+    fn sized_filter(addresses: usize, topics: usize) -> Filter {
+        let values = |n: usize, tag: u8| -> Vec<alloy_primitives::B256> {
+            (0..n as u64)
+                .map(|i| {
+                    let mut value = alloy_primitives::B256::left_padding_from(&i.to_be_bytes());
+                    value[0] = tag;
+                    value
+                })
+                .collect()
+        };
+        Filter::new()
+            .address(
+                (0..addresses as u64)
+                    .map(|i| alloy_primitives::Address::left_padding_from(&i.to_be_bytes()))
+                    .collect::<Vec<_>>(),
+            )
+            .event_signature(values(topics, 0))
+            .topic1(values(topics, 1))
+            .topic2(values(topics, 2))
+            .topic3(values(topics, 3))
+    }
+
+    /// TN(TN-0155): `eth_newFilter`, `eth_getLogs` and `EngineEthFilter::logs` refuse a filter
+    /// with more than 1,000 addresses or values in one topic position, and `eth_newFilter`
+    /// installs one with 1,000 in every position.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_log_filters_are_refused() {
+        use reth_rpc_eth_api::EthFilterApiServer;
+
+        let provider = MockEthProvider::default();
+        // installing a filter records the chain tip
+        provider.add_header(FixedBytes::random(), alloy_consensus::Header::default());
+        let eth_filter = super::EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let max = MAX_FILTER_VALUES_PER_POSITION;
+        assert_eq!(max, 1_000);
+        let message = "too many addresses or topics in one filter position, the limit is 1000";
+
+        let mut one_topic_too_many = sized_filter(max, max);
+        one_topic_too_many.topics[3] = sized_filter(0, max + 1).topics[3].clone();
+        for oversized in [sized_filter(max + 1, 0), one_topic_too_many] {
+            let err = EthFilterApiServer::new_filter(&eth_filter, oversized.clone())
+                .await
+                .expect_err("eth_newFilter refuses it");
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            assert_eq!(err.message(), message);
+
+            let err = EthFilterApiServer::logs(&eth_filter, oversized.clone())
+                .await
+                .expect_err("eth_getLogs refuses it");
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            assert_eq!(err.message(), message);
+
+            let err = EngineEthFilter::logs(&eth_filter, oversized, QueryLimits::no_limits())
+                .await
+                .expect_err("the engine's eth_getLogs refuses it");
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        }
+        assert!(eth_filter.active_filters().inner.lock().await.is_empty());
+
+        EthFilterApiServer::new_filter(&eth_filter, sized_filter(max, max))
+            .await
+            .expect("1,000 values in every position are allowed");
+    }
+
+    /// TN(TN-0155): `eth_subscribe("logs")` refuses a filter over the size limit before it
+    /// accepts the subscription, and accepts one at the limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_log_subscriptions_are_refused() {
+        use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
+
+        let module =
+            crate::eth::EthPubSub::new(build_test_eth_api(MockEthProvider::default())).into_rpc();
+        let max = MAX_FILTER_VALUES_PER_POSITION;
+
+        let err = module
+            .subscribe_unbounded("eth_subscribe", ("logs", sized_filter(max + 1, 0)))
+            .await
+            .expect_err("an oversized logs subscription is refused");
+        let jsonrpsee::MethodsError::JsonRpc(err) = err else {
+            panic!("expected a JSON-RPC error, got {err:?}")
+        };
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert_eq!(
+            err.message(),
+            "too many addresses or topics in one filter position, the limit is 1000"
+        );
+
+        module
+            .subscribe_unbounded("eth_subscribe", ("logs", sized_filter(max, max)))
+            .await
+            .expect("a logs subscription at the limit is accepted");
     }
 
     #[tokio::test(flavor = "multi_thread")]

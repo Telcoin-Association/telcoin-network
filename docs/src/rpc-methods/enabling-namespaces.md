@@ -12,7 +12,7 @@ A Telcoin Network node serves JSON-RPC over three transports, and each transport
 
 Subscriptions (`eth_subscribe`) need a WebSocket or IPC connection.
 
-A node that runs more than one worker starts one RPC server per worker. Worker 0 uses the ports and IPC path above; every other worker binds its own derived ports and IPC path, which the node logs at startup (`worker rpc endpoints resolved`). Every worker's server serves the same namespace selection and applies the same `--http.corsdomain` and `--ws.origins` lists as worker 0.
+A node that runs more than one worker starts one RPC server per worker. Worker 0 uses the ports and IPC path above; every other worker binds its own derived ports and IPC path, which the node logs at startup (`worker rpc endpoints resolved`). Every worker's server serves the same namespace selection and applies the same CORS and origin lists as worker 0. When HTTP and WebSocket share a port, worker 0 serves both on one server with one list (`--ws.origins`, or `--http.corsdomain` when only that is set; two different lists are refused at startup), and every other worker applies that list to both its HTTP and its WebSocket server.
 
 ## Choosing namespaces
 

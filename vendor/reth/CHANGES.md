@@ -1249,7 +1249,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/node/core/src/args/txpool.rs` (fills the new pool field with its default),
   `crates/rpc/rpc/src/eth/filter.rs` (`install_filter` refuses at the cap; the pending-transaction
   filters take their pool listener through the fallible methods; `EthFilterError::TooManyActiveFilters`
-  and `TooManyTransactionListeners`, both -32604 server-busy; test `active_filters_are_bounded`),
+  and `TooManyTransactionListeners`, both -32009 server-busy; test `active_filters_are_bounded`),
   `crates/rpc/rpc/src/eth/pubsub.rs` (`newPendingTransactions` subscriptions take their listener
   the same way and fail with the same error), `crates/transaction-pool/src/config.rs`
   (`PoolConfig::max_rpc_tx_listeners`, `MAX_RPC_TX_LISTENERS` 1,024), `crates/transaction-pool/src/traits.rs`
@@ -1265,8 +1265,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   their number (review R2). The node now refuses the filter past `--rpc.max-active-filters`
   (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
-  TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones never count against the
-  cap or get refused. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
+  TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
+  are counted, so they take slots of the cap. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
   constant. RPC and pool-listener registration only: pool admission and ordering are unchanged.
   *Tests*: `active_filters_are_bounded`, `rpc_listeners_are_bounded`; the rest of the filter,
   pubsub and pool tests. *Upstream*: yes.
@@ -2425,3 +2425,72 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `call_tracer_stops_a_trace_past_the_recorded_bytes_cap` (through `DebugInspector`, and the
   error maps to `-32603`).
   *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.
+
+- **TN-0155** — A log filter names at most 1,000 addresses and 1,000 values in each topic
+  position. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`MAX_FILTER_VALUES_PER_POSITION`,
+  `check_filter_size`, called by `eth_newFilter` and by `EthFilter::logs_for_filter`, which
+  serves `eth_getLogs`, `EngineEthFilter::logs` and `eth_getFilterLogs`;
+  `EthFilterError::TooManyFilterValues`, -32602 like the other query limits; tests
+  `oversized_log_filters_are_refused`, `oversized_log_subscriptions_are_refused`),
+  `crates/rpc/rpc/src/eth/pubsub.rs` (`subscribe` rejects a `logs` subscription over the limit
+  before it accepts it).
+  *Why*: TN-0056 bounds how many filters are installed, not their size. A filter's address set
+  and its four topic sets took any number of values, so one 15 MB `eth_newFilter` kept about
+  11 MB of sets and the 1,000 installed filters about 11 GB, for as long as a client polled them.
+  A `logs` subscription kept such a filter outside that cap for the life of its connection (up
+  to 1,024 per WS or IPC connection), and every `eth_getLogs` and filter poll built a bloom of
+  about 256 bytes per value. The limit is geth's (`--rpc.logquerylimit`, default 1,000, which
+  geth applies to `eth_newFilter`, `eth_getLogs` and `logs` subscriptions), so a filter geth
+  accepts is accepted here. A filter now keeps at most about 0.3 MB of sets, about 300 MB at the
+  default 1,000 filters. Upstream reth has no such limit. *Can reach execution or storage*: no.
+  RPC only: the check runs before a filter is installed, queried or subscribed, and nothing on
+  the block execution or storage path calls it.
+  *Tests*: `oversized_log_filters_are_refused` (1,001 addresses, or 1,001 values in the fourth
+  topic position, are refused by all three entry points and install nothing; 1,000 in every
+  position installs), `oversized_log_subscriptions_are_refused` (refused before acceptance,
+  accepted at the limit); `active_filters_are_bounded` and the other filter tests unchanged.
+  Mutation-checked: `check_filter_size` accepting every filter (both fail). *Upstream*: yes.
+
+- **TN-0156** — `eth_simulateV1` shares one gas budget of `--rpc.gascap` across all its
+  blocks. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/call_many.rs` (`CallManyBudget::cap`, test
+  `cap_lowers_a_gas_limit_to_what_is_left`), `crates/rpc/rpc-eth-types/src/simulate.rs`
+  (`execute_transactions` takes the budget: before each call it refuses the request when less
+  than 21,000 gas is left and lowers the call's gas limit, given or default, to what is left;
+  after the call it charges the gas used), `crates/rpc/rpc-eth-api/src/helpers/call.rs`
+  (`simulate_v1` makes one budget per request), `crates/rpc/rpc/src/eth/helpers/call.rs`
+  (tests `simulated_blocks_share_the_gas_budget`, `a_simulated_call_runs_with_at_most_the_budget`).
+  *Why*: TN-0057 bounded `eth_callMany` and the trace and debug variants as one request, but
+  `eth_simulateV1`, in the same default `eth` namespace, could run 256 blocks
+  (`--rpc.max-simulate-blocks`) with any number of calls each, and a call's own `gas` was bounded
+  only by its block's gas limit, which a block override may raise to the call cap: about 1.3e10
+  gas per request on one blocking thread, with cancellation only between calls. Upstream fixed
+  it in b8116b42b (#24387, after v1.11.4); the pick does not apply to this base (its Amsterdam
+  gas split needs a newer revm and alloy-evm), so this takes its rule: a call runs with at most
+  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request now
+  uses at most `--rpc.gascap` gas in all (50M by default), the budget `eth_callMany` has, and
+  fails with the same -32602 error (`request exceeds the gas budget of <cap>`). Requests that
+  stay under the budget get the same results, except a call whose gas limit, given or default,
+  exceeded what was left, which now runs with less gas. How the default is chosen (the block's
+  gas split among the calls without `gas`, capped at the call cap) is unchanged. *Can reach execution or storage*: no.
+  RPC only: simulated blocks are built on a throwaway state with no state root and are never
+  stored, and nothing on the block execution or storage path calls `execute_transactions`.
+  *Tests*: `simulated_blocks_share_the_gas_budget` (three one-transfer blocks pass a 63,000
+  budget, the third is refused under 50,000), `a_simulated_call_runs_with_at_most_the_budget` (a
+  looping call with `gas` 1,000,000 under a 100,000 budget uses 100,000 and fails, and a transfer
+  after it is refused), `cap_lowers_a_gas_limit_to_what_is_left`; TN-0057's tests unchanged.
+  Mutation-checked: an unlimited budget in `simulate_v1` (both simulate tests fail).
+  *Upstream*: no (upstream has b8116b42b).
+
+- **TN-0157** — TN-0056's comments and ledger text say what the code does. *Kind*: fix (docs).
+  *Files*: `crates/transaction-pool/src/config.rs` (`PoolConfig::max_rpc_tx_listeners`'s doc),
+  `crates/rpc/rpc/src/eth/filter.rs` (`active_filters_are_bounded` asserts the error code), the
+  TN-0056 entry above.
+  *Why*: TN-0056 said the node's own pool listeners never count against
+  `max_rpc_tx_listeners`; they are never refused, but the cap counts every listener on the pool's
+  list, so they take its slots (`rpc_listeners_are_bounded` shows it). It also named the
+  server-busy error -32604; `ErrorCode::ServerIsBusy` is jsonrpsee's -32009, and the test now
+  pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
+  storage*: no; a doc comment and a test assertion.
+  *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.

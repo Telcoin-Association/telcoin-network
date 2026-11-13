@@ -68,8 +68,8 @@ pub struct PoolConfig {
     /// Bound on number of new transactions from `reth_network::TransactionsManager` to buffer.
     pub new_tx_listener_buffer_size: usize,
     /// TN(TN-0056): bound on the pending-hash listeners and on the new-transaction listeners the
-    /// RPC layer may register (each is walked on every insertion); the node's own listeners do
-    /// not count against it.
+    /// RPC layer may register (each is walked on every insertion). The node's own listeners are
+    /// never refused, but they are counted, so they take slots of this bound.
     pub max_rpc_tx_listeners: usize,
     /// How many new pending transactions to buffer and send iterators in progress.
     pub max_new_pending_txs_notifications: usize,

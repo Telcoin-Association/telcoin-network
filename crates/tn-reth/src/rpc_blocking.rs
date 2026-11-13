@@ -8,8 +8,8 @@
 //!
 //! [`RpcTaskSpawner`] sends the blocking work to a separate runtime's pool instead, and passes
 //! every other spawn to the spawner it wraps unchanged. The runtime is created once per process
-//! and never dropped: RPC servers are rebuilt at epoch boundaries, and a tokio runtime cannot be
-//! dropped from async code.
+//! and shared by every worker's RPC server, each built once when its worker first starts and
+//! kept across epochs. It is never dropped: a tokio runtime cannot be dropped from async code.
 
 use futures::future::BoxFuture;
 use parking_lot::Mutex;

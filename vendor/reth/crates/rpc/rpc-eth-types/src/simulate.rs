@@ -2,7 +2,7 @@
 
 use crate::{
     error::{api::FromEthApiError, FromEvmError, ToRpcError},
-    EthApiError,
+    CallManyBudget, EthApiError,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction as _};
 use alloy_eips::eip2718::WithEncoded;
@@ -14,6 +14,7 @@ use alloy_rpc_types_eth::{
     BlockTransactionsKind,
 };
 use jsonrpsee_types::ErrorObject;
+use reth_chainspec::MIN_TRANSACTION_GAS;
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
     Evm, HaltReasonFor,
@@ -210,12 +211,15 @@ pub fn apply_precompile_overrides(
 ///
 /// Returns all executed transactions and the result of the execution.
 ///
+/// TN(TN-0156): every call is charged to `budget`, the request's budget across all its blocks.
+///
 /// [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
 #[expect(clippy::type_complexity)]
 pub fn execute_transactions<S, T>(
     mut builder: S,
     calls: Vec<RpcTxReq<T::Network>>,
     default_gas_limit: u64,
+    budget: &mut CallManyBudget,
     chain_id: u64,
     converter: &T,
 ) -> Result<
@@ -232,15 +236,22 @@ where
     builder.apply_pre_execution_changes()?;
 
     let mut results = Vec::with_capacity(calls.len());
-    for call in calls {
+    for mut call in calls {
         if is_cancelled() {
             return Err(EthApiError::InternalEthError)
+        }
+        // TN(TN-0156): a call runs with at most the gas the earlier calls left (upstream
+        // b8116b42b's rule, and geth's), and the request fails once that cannot pay for a
+        // transfer.
+        budget.check(MIN_TRANSACTION_GAS)?;
+        if let Some(gas_limit) = call.as_ref().gas_limit() {
+            call.as_mut().set_gas_limit(budget.cap(gas_limit));
         }
         // Resolve transaction, populate missing fields and enforce calls
         // correctness.
         let tx = resolve_transaction(
             call,
-            default_gas_limit,
+            budget.cap(default_gas_limit),
             builder.evm().block().basefee(),
             chain_id,
             builder.evm_mut().db_mut(),
@@ -250,8 +261,9 @@ where
         // The effect for a layer-2 execution client is that it does not charge L1 cost.
         let tx = WithEncoded::new(Default::default(), tx);
 
-        builder
+        let gas_used = builder
             .execute_transaction_with_result_closure(tx, |result| results.push(result.clone()))?;
+        budget.charge(gas_used)?;
     }
 
     // Pass noop provider to skip state root calculations.

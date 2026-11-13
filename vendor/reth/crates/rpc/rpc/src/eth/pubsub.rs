@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::eth::filter::check_filter_size;
 use alloy_primitives::TxHash;
 use alloy_rpc_types_eth::{
     pubsub::{Params, PubSubSyncStatus, SubscriptionKind, SyncStatusMetadata},
@@ -236,6 +237,14 @@ where
         kind: SubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
+        // TN(TN-0155): a `logs` subscription keeps its filter for the life of the connection, so
+        // it takes `eth_newFilter`'s size limit, refused before the subscription is accepted.
+        if let (SubscriptionKind::Logs, Some(Params::Logs(filter))) = (&kind, &params) &&
+            let Err(err) = check_filter_size(filter)
+        {
+            pending.reject(err).await;
+            return Ok(())
+        }
         let sink = pending.accept().await?;
         let pubsub = self.clone();
         self.inner.subscription_task_spawner.spawn_task(Box::pin(async move {

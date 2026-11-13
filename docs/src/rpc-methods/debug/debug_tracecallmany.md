@@ -10,7 +10,7 @@
 
 Runs bundles of calls in sequence on one block's state, without creating transactions, and returns a trace for every call. Each call sees the state changes of the calls before it, across bundles. Each bundle after the first runs with the block number one higher and the timestamp 12 seconds later than the bundle before it.
 
-When all of the block's transactions are replayed (the default), the bundles run on the state after the block. With a smaller `transactionIndex` the node starts from the block's parent state and replays that many of the block's transactions first; this path does not apply the block's pre-transaction system calls.
+When all of the block's transactions are replayed (the default), the bundles run on the state after the block. With a smaller `transactionIndex` the node starts from the block's parent state, runs the block's pre-transaction system calls (EIP-4788 beacon root, EIP-2935 block hashes), and replays that many of the block's transactions first.
 
 The request shares a gas budget of `--rpc.gascap` across all its calls. A request with more calls than the budget can hold at 21,000 gas each is refused before any runs, and the request fails once the gas its calls used exceeds the budget.
 

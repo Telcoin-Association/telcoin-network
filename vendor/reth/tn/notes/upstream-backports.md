@@ -161,6 +161,14 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 - **IPC hardening** (95bdbe747, ed9bb9d43, c3d46f3d0) sits on a later codec refactor. Take it at
   the next sync, or default validators to `--ipcdisable`.
 - **estimateGas cap** (2bd45d119) needs `rpc-eth-types/settings.rs`, which TN doesn't carry.
+- **`eth_simulateV1` request gas budget** (b8116b42b, #24387): `vendor.py pick` leaves four
+  conflicts in `rpc-eth-api/src/helpers/call.rs` and `rpc-eth-types/src/simulate.rs`, and
+  upstream's side needs APIs the pinned revm-context 13 and alloy-evm 0.27 lack
+  (`enable_amsterdam_eip8037`, a gas output from `execute_transaction_with_result_closure`). It
+  also changes the default gas of a call without `gas` to the block's remaining gas. TN-0156
+  takes its budget rule instead (each call capped at what is left of `--rpc.gascap`), through
+  TN-0057's `CallManyBudget`, and keeps the default split. The next sync brings upstream's
+  version: drop TN-0156 then.
 - **Trie storage-deletion fixes** (cb7fc64c7, 8617e42f9, 839b84027) are tied to upstream's removal
   of storage-wipe markers (c9b466c13).
 - Many trie and storage fixes target code TN doesn't run: proof v2, ArenaParallelSparseTrie,
