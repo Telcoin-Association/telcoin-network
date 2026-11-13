@@ -4,69 +4,27 @@ Where the vendored reth goes next, in the order that makes each step cheap and s
 `tn/notes/usage-map.md` first: it records what TN actually uses from each crate and where. Status
 markers: **[done]**, **[next]**, **[later]**.
 
-## Status (2026-11-05, the PR to `main`)
+## Status
 
-- The vendoring moved from `sls_tndb_b_vendor`, where it sat on top of the tndb-b storage work, to
-  its own branch off `main` (D8). Nothing from tndb-b is included.
-- The ledger runs TN-0001 to TN-0085. A review on 2026-11-01 found nothing Critical and nothing
-  that can split validators. Its fixes: TN-0034 to TN-0037, `patches/revm-inspectors` (Boa's
-  recursion limit), a test that pins storage v1, WebSocket origin checks on every worker's server,
-  and tooling fixes. A second review on 2026-11-08 (`tasks/review-vendor-reth-2026-11-08.md`)
-  found nothing that can split validators either; its fixes are TN-0054 to TN-0085 and the TN-side
-  commits beside them. What both left open is in `tn/notes/open-issues.md`.
-- CI now runs reth's own tests for the vendored crates and the `js-tracer` build (lane
+- reth v1.11.4, cut from 101 crates to 57 plus `reth-testing-utils` (Phases 1, 2 and 6 and
+  reduction pass 2 below). RocksDB is gone (TN-0014). The ledger runs TN-0001 to TN-0149
+  (CHANGES.md; CLAUDE.md maps the ids by area).
+- tn-lmdb is the default reth database, and storage layout v2 the default for new datadirs
+  (DECISIONS.md D22). Phase 3 lists what is left before MDBX retires.
+- CI runs reth's own tests for the vendored crates and the `js-tracer` build (lane
   `test-vendor-reth`, job `vendor-reth-test`) and the patched crate's tests (job
   `revm-inspectors-patch`).
-- `make test-upgrade` runs `main`'s binary and this one side by side: rolling in-place upgrade,
-  re-execution from genesis on both binaries, a rollback, and identical block hash, `stateRoot`
-  and `receiptsRoot` on every node. Run it against the deployed release before rolling out a
-  change to the execution or storage path (CLAUDE.md, "Fork safety").
-
-## Status (2026-10-31, on `sls_tndb_b_vendor`)
-
-Commit ids and the tndb-b counts below are from that branch, not from `main`'s history.
-
-- 101 reth crates were vendored at v1.11.3; 57 remain after reduction Phases 1, 2, 4 (TN-0012), 6a, 6b
-  and the second pass (TN-0025 to TN-0033, tag `reth-reduction-2-start`). Synced to v1.11.4.
-  RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work (D15). The ledger
-  runs TN-0001 to TN-0033.
-- Security backports applied (TN-0015 to TN-0019, D17): WebSocket origin check, JS-tracer
-  timeout/interrupt (ported to revm-inspectors 0.34, D16), txpool sender-id growth, and RPC
-  blocking-work limits. Everything else upstream is tracked in `tn/notes/upstream-backports.md`.
-- Correctness backports: txpool nonce order (TN-0022) and six static-file fixes (TN-0023: jar
-  cache races, empty-genesis recovery, nippy-jar torn tails, read errors). Upstream fixes to MDBX
-  code are tracked for the tndb-b work. The replacement price bump rounds up (TN-0024; pool
-  admission only, so no fork risk against nodes without it).
-- Second reduction pass done (TN-0025 to TN-0033, D20): 6 reth crates and 19 third-party packages
-  left the node graph (890 to 865 packages, the same in the tndb-b build), with no behavior change.
-  See "Reduction pass 2" below for what was cut, what was left and why.
-- Build cost: reth-node-core no longer rebuilds on every TN commit and libgit2 is no longer
-  compiled (TN-0020); jemalloc, which no TN binary installs, is no longer compiled (D19). Three
-  native C builds left the graph.
-- Phase 6b done (TN-0021): about 2.3k lines of unreachable RPC code removed.
-- `tn/notes/usage-map.md` was regenerated for the 63-crate tree on 2026-10-31 and updated for the
-  57-crate tree after the second pass.
-- Verified 2026-10-31. Backport head `f093532ca`: nextest 3719 passed, 0 failed, 90 skipped;
-  `make test-restarts` 8/8; `make test-epochs` 11/11. Final head `c8a527384`: the same counts,
-  plus the nested workspace check, both clippy lanes, fmt and the RocksDB gate. nextest's LEAK
-  flags differ from run to run (5 tests on one run, 1 on another, none twice); each flagged test
-  reran clean. TN-0022/23 head `1af59b607`: nextest 3719 passed (and 3744 with
-  `tn-reth/tndb-b`), restarts 8/8, epochs 11/11, `make test-sigkill` 7/7, CI-flags check
-  (default and tndb-b), clippy, fmt, the RocksDB gate, and the nested tests for nippy-jar,
-  provider, txpool and db (db with two threads; see README). Second-pass head `95614334f`:
-  nextest 3719 passed (and 3744 with `tn-reth/tndb-b`), no LEAK flags on either run, restarts
-  8/8, epochs 11/11, `make test-sigkill` 7/7, CI-flags check (default and tndb-b), clippy (both
-  lanes), fmt, the RocksDB gate, the archive-mode guard, and the nested tests for every changed
-  crate (485 passed).
-- Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
-  elsewhere.
-- `js-tracer` is opt-in at build time (D21): the default build no longer compiles boa (35
-  packages; 830 left, 832 with tndb-b). Whether to remove it entirely is up to a team review;
-  `crates/tn-reth/js-tracer.md` covers both.
-- Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
-  directly; touches consensus-critical execution code, so coordinate with whoever is changing
-  `tn-reth/src/env` and `evm`), the Phase 2 follow-up (now worth little for build cost, see
-  Phase 2).
+- `make test-upgrade` runs the previous release's binary (`make build-e2e-bin-prev
+  TN_PREV_REF=<release>`) and this one side by side: rolling in-place upgrade, re-execution from
+  genesis on both binaries, a rollback, and identical block hash, `stateRoot` and `receiptsRoot`
+  on every node. Run it against the deployed release before rolling out a change to the
+  execution or storage path (CLAUDE.md, "Fork safety").
+- Known issues left open: `tn/notes/open-issues.md`. Upstream fixes not yet applied:
+  `tn/notes/upstream-backports.md`.
+- Next, roughly by value: Phase 3's remaining steps once testnet has resynced, Phase 5 (txpool,
+  needs TN design input), Phase 4 (alloy/revm directly; touches consensus-critical execution
+  code, so coordinate with whoever is changing `tn-reth/src/env` and `evm`), the Phase 2
+  follow-up (worth little for build cost, see Phase 2).
 
 ## Ground rules for every step
 
@@ -92,70 +50,21 @@ resolves to the same third-party versions and features as the git dependency did
 
 ## Phase 1: drop the node-builder and node-ethereum layers [done]
 
-Done 2026-10-30: 24 reth crates and 9 third-party crates left the graph (CHANGES.md TN-0004,
-TN-0005). The numbered steps below are kept as a record. One correction to the plan:
-`DefaultEthPayloadTypes` is not dead, because `traits.rs` tests use it as a fixture, so it
-stayed.
-
-TN never uses reth's node builder. It assembles provider, EVM, pool and RPC itself. It still
-depends on `reth-node-builder` (for re-exports only) and `reth-node-ethereum` (for two types).
-Those two pull in engine-tree, engine-service, engine-local, exex, downloaders, stages, era*,
-payload builders, node-ethstats, consensus-debug-client, invalid-block-hooks, node-events and
-node-metrics.
-
-1. In `crates/tn-reth`, import from where the items live: `NodeConfig` and
-   `RethTransactionPoolConfig` from `reth-node-core`, the node types from
-   `reth-node-types`/`reth-node-api`, `PayloadTypes`/`BuiltPayload` from
-   `reth-payload-primitives`, the `DEFAULT_*` constants from `reth-engine-primitives`.
-2. `EthEngineTypes` comes from `reth-ethereum-engine-primitives`, and `EthPayloadAttributes` is
-   alloy's `PayloadAttributes`. Delete the dead `DefaultEthPayloadTypes` and the dead
-   re-exports listed in the usage map.
-3. `reth-node-ethereum` enables revm `secp256k1`, `blst`, `c-kzg` and `memory_limit`, and
-   forwards `asm-keccak`/`keccak-cache-global`. Enable these where TN depends on revm, then
-   prove with `graph.py diff` that nothing third-party lost a feature.
-4. `js-tracer` is already set on `reth-rpc` and `reth-rpc-eth-types`. Drop the forwarding
-   through node-builder.
-5. `vendor.py remove` every crate that left the graph, and delete their root `Cargo.toml`
-   entries.
-
-`reth-engine-local` stays: `reth-node-core` depends on it. It is a Phase 2 item, together
-with `reth-rpc-engine-api`, which `reth-rpc` and `reth-rpc-builder` depend on.
+Done 2026-10-30 (CHANGES.md TN-0004, TN-0005): 24 reth crates and 9 third-party crates left the
+graph. TN never used reth's node builder; it assembles provider, EVM, pool and RPC itself.
+`crates/tn-reth/Cargo.toml` now sets the revm features `reth-node-ethereum` used to (`secp256k1`,
+`blst`, `c-kzg`, `memory_limit`, `asm-keccak`, and `keccak-cache-global` through reth-node-core;
+`tn/notes/usage-map.md`, last section). `DefaultEthPayloadTypes` stayed: `traits.rs` tests use it
+as a fixture.
 
 ## Phase 2: the Ethereum p2p and node-config stack [done]
 
-Done 2026-10-30 as planned below (CHANGES.md TN-0006 to TN-0009): 10 reth crates and 27
-third-party crates left the graph. One surprise: `reth-rpc` needed `reth-chain-state`'s `serde`
-feature without declaring it, and got it only through reth-network (TN-0007). The follow-up
-(a TN-owned config struct replacing `NodeConfig`) is still open.
+Done 2026-10-30 (CHANGES.md TN-0006 to TN-0009): 10 reth crates and 27 third-party crates left
+the graph, the devp2p stack among them. One surprise: `reth-rpc` needed `reth-chain-state`'s
+`serde` feature without declaring it, and got it only through reth-network (TN-0007).
 
-After Phase 1, `reth-node-core` holds the devp2p stack in the graph. It is reached from
-`tn-reth`, `reth-rpc-builder` (for `RpcServerArgs`) and `reth-node-api`; the RPC crates need
-`reth-node-api` only for re-exports. TN's own uses are type-only: a dummy key, `NetworkArgs`
-enums, stub `NetworkInfo`/`Peers` impls for the `net_` namespace, `BlockHashNumber`,
-`NatResolver::None`. Of `NodeConfig`, `tn-reth` reads only `chain`, `datadir()`, `rpc`, `txpool`,
-`db` and `pruning`. A simulation of the cuts below on the Phase 1 graph removes 10 reth crates
-(node-api, basic-payload-builder, network, discv4, discv5, dns-discovery, ecies, eth-wire,
-net-nat, engine-local) and 17 third-party ones (hickory DNS, discv5, a second libp2p-identity,
-...).
-
-- **2a** (TN-0006): take `reth-node-api` out of `reth-rpc` and `reth-rpc-eth-api`. Remove the
-  blanket `RpcNodeCore` impl over `FullNodeComponents` and the `EthApiFor`-style aliases, and
-  import the rest from `reth-primitives-traits` and `reth-payload-primitives`.
-- **2b**: slim the vendored `reth-node-core`. Drop `NodeConfig::network` and `args/network.rs`
-  (`NetworkArgs`, `DiscoveryArgs`), the `RethNetworkConfig` trait, the tip-from-network helpers
-  (`max_block`, `lookup_or_fetch_tip`, `fetch_tip_from_network`, `utils.rs`'s header fetchers)
-  and `dev_mining_mode` (the only `reth-engine-local` use). Keep the port-adjusting helpers for
-  RPC only. `tn-reth/src/cli.rs` stops pinning network values.
-- **2c**: `tn-reth` drops `reth-network`, `reth-discv4` and `reth-eth-wire`. The stub key comes
-  from `secp256k1`, `BlockHashNumber` becomes alloy's `BlockNumHash`, and `DisconnectReason`
-  comes from where `reth-network-api`'s `Peers` trait takes it. `vendor.py remove` the crates
-  that leave.
-
-Keep `reth-network-api` (small, and the `EthApi` bounds need its traits) and
-`reth-network-p2p`/`reth-eth-wire-types` (the pool and network-api use them). A TN-owned config
-struct replacing `NodeConfig` altogether is the follow-up. It would also let `reth-rpc-builder`
-take its server arguments from a small struct instead of `reth-node-core`.
-
+Open follow-up: a TN-owned config struct replacing `NodeConfig`, which would also let
+`reth-rpc-builder` take its server arguments from a small struct instead of `reth-node-core`.
 Measured 2026-10-31 after TN-0020: dropping reth-node-core would take out only nine small
 pure-Rust packages (derive_builder and its two helper crates, dirs, dirs-sys, option-ext,
 shellexpand, vergen-lib, and node-core itself). That is little build cost against a rewrite of
@@ -207,8 +116,8 @@ RocksDB work:
 - `EitherWriter`/`EitherReader` (`either_writer.rs`) still have the `RocksBatchArg`/`RocksTxRefArg`
   parameters, typed `()`, and `storage_v2` routing in `StorageSettings` (reth-db-api
   `models/metadata.rs`).
-- `check_consistency()` returns a RocksDB unwind target (always `None`), which TN logs in
-  `env/mod.rs`. `DatadirArgs::rocksdb_path` and `ChainPath`'s RocksDB directory live in
+- `check_consistency()` returns a RocksDB unwind target (always `None`); TN's startup refuses
+  any unwind target it returns (`env/mod.rs`). `DatadirArgs::rocksdb_path` and `ChainPath`'s RocksDB directory live in
   reth-node-core (`args/datadir_args.rs`, `dirs.rs`), and TN sets `rocksdb_path: None` in
   `dirs.rs`, `genesis.rs` and `snapshot.rs`.
 
@@ -229,7 +138,8 @@ CHANGES.md and DECISIONS.md should remain).
   traits.
 - `reth-evm-ethereum` contributes three items. TN pins all forks at genesis, so a TN-owned
   `revm_spec` and receipt builder are small.
-- `reth-metrics` in six TN crates becomes `metrics` plus `metrics-derive` (mechanical).
+- `reth-metrics` in nine TN crates (tn-reth included) becomes `metrics` plus `metrics-derive`
+  (mechanical).
 - [done, TN-0012] `reth-primitives` became `reth-primitives-traits` plus `reth-ethereum-primitives`;
   `tn-types` now owns the `Block`/`BlockBody`/`SealedBlock` aliases. Going further (TN-owned
   `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.
@@ -245,51 +155,28 @@ rules.
 
 ## Phase 6: RPC surface [done]
 
-6a done 2026-10-30 (CHANGES.md TN-0010, TN-0011): the engine-API auth server, `EngineEthApi`,
-`ValidationApi` and `TestingApi` are gone, and with them `reth-rpc-engine-api`,
-`reth-payload-builder` and `reth-consensus-common`. `reth-rpc-layer` stays: the main server uses
-its `CompressionLayer` and optional JWT layer. 6b done 2026-10-31 (TN-0021): `admin`, `miner`,
-`otterscan`, `reth` and `txpool` are removed, together with the unused anvil, hardhat, engine,
-testing and validation traits. An upstream change to a deleted file merges as "left deleted";
-only rpc-builder's registry arms and the two `lib.rs` files can conflict. `mev` went later
-(TN-0033). `eth_callBundle` stays in the `eth` namespace: TN's epoch-fee adapter
-(`tn-reth/src/rpc_bundle.rs`) wraps reth's `EthBundle`.
+Done 2026-10-30 and 2026-10-31 (CHANGES.md TN-0010, TN-0011, TN-0021, TN-0033): the engine-API
+auth server, `EngineEthApi`, `ValidationApi`, `TestingApi` and the `admin`, `miner`,
+`otterscan`, `reth`, `txpool` and `mev` namespaces are gone, and with them
+`reth-rpc-engine-api`, `reth-payload-builder` and `reth-consensus-common`. TN serves only `eth`,
+`net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in `tn-reth/src/cli.rs`) plus its own
+`tn` namespace. What stayed, and why:
 
-TN serves only `eth`, `net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in
-`tn-reth/src/cli.rs`) plus its own `tn` namespace, and overrides seven methods. The vendored
-`reth-rpc` also carries `admin`, `engine` (`EngineEthApi`, the `EngineApi` re-export), `miner`,
-`otterscan`, `reth`, `testing`, `txpool` and `validation` (flashbots `ValidationApi`, which
-`tn-reth/src/traits.rs` says must never be registered), and `reth-rpc-builder` carries the JWT
-auth server for the engine API. After Phase 2 these are the only reasons for
-`reth-rpc-engine-api` and `reth-payload-builder` (both reached only through `reth-rpc`),
-`reth-consensus-common` (`validation.rs`, `testing.rs`) and probably `reth-rpc-layer` (auth;
-check that `CompressionLayer` is not used by the main server first).
+- `reth-rpc-layer`: the main server uses its `CompressionLayer` and optional JWT layer.
+- `eth_callBundle`, in the `eth` namespace: TN's epoch-fee adapter (`tn-reth/src/rpc_bundle.rs`)
+  wraps reth's `EthBundle`.
+- `RethRpcModule` (`reth-rpc-server-types`) keeps the removed names: operators' `--http.api`
+  lists are validated against it (`validate_rpc_modules`). Shrink it only if nothing parses them.
 
-Plan: remove the unserved modules from `reth-rpc` and their registration arms from
-`reth-rpc-builder` (the `RethRpcModule` match in `lib.rs`), remove `rpc-builder`'s `auth`
-module, then `vendor.py remove` what leaves. `RethRpcModule` itself lives in
-`reth-rpc-server-types`. Shrink it only if nothing parses the removed names, because operators'
-`--http.api` lists are validated against it (`validate_rpc_modules`). Verify with
-`tn-reth`'s `env/rpc/tests` (namespace tests) and the e2e RPC tests.
+At a sync, an upstream change to a deleted file merges as "left deleted"; only rpc-builder's
+registry arms and the two `lib.rs` files can conflict.
 
 ## Reduction pass 2 [done]
 
-Done 2026-10-31 (tag `reth-reduction-2-start` before it; DECISIONS.md D20). Method: list the
-third-party packages reachable only through vendored crates (74 at the start), then, per
-vendored crate and per dependency edge, what would leave the graph if it went. Cut, one commit
-each, each with an empty third-party `graph.py diff` or an explained one:
-
-- TN-0025: node-core's build script without vergen (7 build-time packages).
-- TN-0026/27: tracing-futures and the docs-only aquamarine proc macro (5).
-- TN-0028: db-common keeps `init_genesis`; the state-dump import and `DbTool` go, and with them
-  reth-etl, boyer-moore-magiclen and debug-helper.
-- TN-0029: reth's own OTLP exporters and `TraceArgs`; reth-tracing-otlp and the OTel log
-  appender. TN wires its own OpenTelemetry layers.
-- TN-0030: the reth.toml loaders; toml and three helpers.
-- TN-0031: network-api keeps `NetworkInfo`/`PeersInfo`; reth-network-p2p, reth-network-types and
-  reth-net-banlist go. TN now enables alloy `rand` itself (it was coming from network-types).
-- TN-0032: engine-primitives without the engine-API message types; reth-payload-builder-primitives.
-- TN-0033: the unreachable `mev` namespace server.
+Done 2026-10-31 (DECISIONS.md D20; CHANGES.md TN-0025 to TN-0033). Method: list the third-party
+packages reachable only through vendored crates, then, per vendored crate and per dependency
+edge, what would leave the graph if it went; each cut one commit with an empty third-party
+`graph.py diff` or an explained one.
 
 Left, with the reason:
 

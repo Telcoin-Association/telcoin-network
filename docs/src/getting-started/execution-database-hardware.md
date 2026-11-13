@@ -7,6 +7,7 @@ Every figure here is measured, on the setup named beside it.
 Most come from the execution benchmark, which runs generated transfer and contract load through the node's execution path with durable commits.
 Its **peak** profile puts 20 batches of 30M gas in each consensus output (about 11,700 transactions).
 Its **busy** profile puts 8 batches of 15M gas in each output.
+The benchmark is `tn-engine`'s `exec_bench` test (`crates/engine/tests/exec_bench/main.rs` lists its knobs); `etc/reth-exec-bench.sh` runs it, and peak and busy are that script's `peak` and `busy` profiles.
 
 ## Disk
 
@@ -38,6 +39,7 @@ During commits on the 20,000-IOPS disk the node wrote about 90 MiB/s in writes o
 The tables above ran with gap fill off and one state-root thread.
 The tables below ran with the node's defaults on Linux (`--db.gap-fill auto`, parallel state roots), measured on 2026-11-12.
 Setup: a GCP c3-highcpu-8 (8 vCPU, 16 GB) with the datadir on a 200 GB Hyperdisk Balanced data disk (ext4), storage layout v2, durable commits, outputs run back to back.
+The benchmark was built from commit `6886de251` with the gap fill `auto` chooser of `b3623540f`, and run with `TN_EXEC_BENCH_LAYOUT=v2` and `TN_EXEC_BENCH_GAP_FILL=auto` (and `TN_EXEC_BENCH_OUTPUTS=150` at peak): the 800 MiB/s rows through `etc/reth-exec-bench.sh`'s `busy` and `peak` profiles, two rounds each, as the after side of a comparison with `6886de251`; the 300 MiB/s row as two direct runs of the same build.
 Each cell is the mean of two runs of 300 busy or 150 peak outputs. The two runs of every cell agreed within 5%, except the 40,000-IOPS busy pair's time per output (512 and 460 ms, explained below).
 
 Mean time per consensus output and in its commit:

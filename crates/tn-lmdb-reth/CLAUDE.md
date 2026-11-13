@@ -170,7 +170,7 @@ drive's fast speed (the runs where MDBX's time for that row is lowest) or under
 the file grew, and a meta `msync`; a change to tn-lmdb's commit path that adds one is the engine's
 cost, whatever the drive does.
 
-## On a reth upgrade (including storage v2)
+## On a reth upgrade
 
 reth's database interface leaks MDBX's behaviour, so a new reth version is checked against it,
 not assumed:
@@ -179,9 +179,9 @@ not assumed:
    as now (its module docs: the tests of `reth-db`'s `implementation/mdbx/mod.rs` and the named
    one of its `cursor.rs`, only the constructor swapped, random values fixed, a documented
    deviation asserting this crate's behaviour), and run them. Update the reth version in the
-   crate docs' first line, the README's and this file's, and the checkout path above. Every reth
-   crate the adapter uses (`reth-trie-common` included) comes from the root `Cargo.toml`'s
-   `[workspace.dependencies]`, so the workspace's tag bump moves them all.
+   crate docs' first line, the README's and this file's. Every reth crate the adapter uses
+   (`reth-trie-common` included) is a path dependency on `vendor/reth` in the root `Cargo.toml`,
+   so the vendored copy's sync (`vendor.py sync <tag>`, `vendor/reth/CLAUDE.md`) moves them all.
 2. **Re-run the differential test,** default and heavy, random and pinned, and read the skip
    counts by class:
    ```text
@@ -210,8 +210,10 @@ not assumed:
    rows are refused), a removed one leaves its row unused, and a changed key or subkey width, or
    a dup-sort flag, is a format change (`dup_layouts_match_reths_encodings` catches an encoding
    change).
-5. **Storage v2** moves some tables out of MDBX. Those go to the tn-storage toolkit (such as
-   `HdxIndex` for the transaction-hash index), never RocksDB: a project decision. When TN moves to
-   storage v2, port the adapter to v2's database API as part of that move.
+5. **Storage v2** is the default layout on this adapter, without RocksDB: the history indices and
+   the transaction-hash index stay in database tables (vendor/reth `CHANGES.md` TN-0110 to
+   TN-0112), change sets and senders are in static files. A reth version that moves another table
+   out of the database is a format change for TN (`crates/tn-reth/src/env/layout.rs`,
+   `TN_LAYOUT_VERSION`), never a move to RocksDB (vendor/reth `DECISIONS.md` D14).
 6. **If a hot path changed** (reth's cursor or transaction code, or this crate's), re-run
    `tn_lmdb_reth_vs_mdbx` under the Linux gate rule above (and the README's "Linux run (the gate)").

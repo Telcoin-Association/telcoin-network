@@ -6,16 +6,14 @@ possible but optional.
 
 - Base: imported from upstream `v1.11.3` (`d6324d63e27e`), synced to `v1.11.4`
   (`2ac58a25f561`). The current pin is always in `tn/upstream.toml`.
-- History: the import, the vendoring and both reduction passes were done on
-  `sls_tndb_b_vendor`, on top of the tndb-b work, and moved to a branch off `main` for review.
-  The local tags from that work (`reth-vendor-import-v1.11.3`, `reth-vendor-v1.11.3`,
-  `reth-reduction-start`, `reth-reduction-2-start`) are not in `main`'s history. The durable
-  record is `vendor.py diff` against the pin, plus CHANGES.md.
+- History: the local tags of the vendoring work (`reth-vendor-import-v1.11.3`,
+  `reth-vendor-v1.11.3`, `reth-reduction-start`, `reth-reduction-2-start`; DECISIONS.md D8) are
+  not in `main`'s history. The durable record is `vendor.py diff` against the pin, plus
+  CHANGES.md.
 - tn-lmdb (called tndb-b until 2026-11-04): the engine that replaces MDBX as reth's database
-  (`crates/tn-lmdb`, through the adapter `crates/tn-lmdb-reth`), merged with this vendoring
-  (f88cb29d6). It is TN's default reth backend since 2026-11-09; MDBX is the opt-in `mdbx`
-  feature of `tn-reth`, kept until testnet has resynced (DECISIONS.md D22). It is not `tndb`, TN's
-  consensus database in `crates/storage`.
+  (`crates/tn-lmdb`, through the adapter `crates/tn-lmdb-reth`). It is TN's default reth backend
+  since 2026-11-09; MDBX is the opt-in `mdbx` feature of `tn-reth`, kept until testnet has
+  resynced (DECISIONS.md D22). It is not `tndb`, TN's consensus database in `crates/storage`.
 - Carried: the reth crates in TN's dependency graph (57 after both reduction passes; 101 at
   import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.

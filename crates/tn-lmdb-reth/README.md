@@ -16,8 +16,8 @@ appends and verified, with `TnLmdbEnv::sync` and `TnLmdbEnv::check`, before MDBX
 `tn-reth`'s README ("Database backend") covers the open path, the backend guard, the migration
 and how reth's `--db.*` flags map onto `TnLmdbArgs`. The adapter's comparison against MDBX on
 reth's database benches (below) passed its Linux gate on 2026-10-26, on an earlier engine format
-with every dup-sort table composite; it has not been rerun on the current layout. On a reth upgrade
-(storage v2 included), follow the checklist in `CLAUDE.md` ("On a reth upgrade").
+with every dup-sort table composite; it has not been rerun on the current layout. On a reth upgrade,
+follow the checklist in `CLAUDE.md` ("On a reth upgrade").
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
 of every dup call, the error codes, every difference from MDBX, and the differential and crash

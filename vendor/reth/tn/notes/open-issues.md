@@ -1,9 +1,8 @@
-# Open issues: known, not fixed in the vendoring PR
+# Open issues: known, left for their own changes
 
-The PR that brought `vendor/reth` onto `main` fixed what its reviews found that was small and
-safe to change before the testnet upgrade. The items below are known and deliberately left for
-their own changes, because each is too large for that PR or needs other owners. None of them lets
-two validators on the same release execute a block differently. The first one is fixed now
+The items below are known and deliberately left for their own changes, because each is too large
+to fix in passing or needs other owners. None of them lets two validators on the same release
+execute a block differently. The first one is fixed now
 (TN-0140); the fix changes the state root of any block where the old code was wrong, so it ships
 with a coordinated upgrade.
 
@@ -39,7 +38,7 @@ rebuilt root `0x6b94…`) and passes with the one-line fix.
 - Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
   history already contains such a block), after `graph.py` and `make test-upgrade`.
 
-## The pool re-admits a nonce from a batch that reached quorum (review finding T2-1)
+## The pool re-admits a nonce from a batch that reached quorum
 
 After a batch reaches quorum, the batch builder advances each sender's nonce optimistically and
 removes the batched transactions from the pool (`crates/batch-builder/src/batch.rs`,
@@ -65,13 +64,13 @@ unpaid tip. Skipped copies add nothing to `gas_used`, so the base fee does not r
   `retry_forwarded` (`txn_pool.rs`), and a quorum batch whose header never commits. A canonical
   update for an earlier block that touches the sender also lowers the tracked nonce again
   (`txpool.rs`), so a complete fix makes that update monotonic. Needs the batch-builder owners.
-- Design notes from the 2026-11-08 review, for the TN half (`tasks/t2-1-plan.md`):
-  - R11, the RPC-visible symptom: with two of a sender's batches in flight (nonces k and k+1
+- Design notes for the TN half:
+  - The RPC-visible symptom: with two of a sender's batches in flight (nonces k and k+1
     certified, tracked nonce k+2), the canonical update for the first batch overwrites the
     tracked nonce to k+1; `get_highest_consecutive_transaction_by_sender` then stops at the gap
     and `eth_getTransactionCount(pending)` falls back to the on-chain k+1 until the second batch
     executes. A wallet that signs k+1 again in that round produces a duplicate the pool admits
-    and execution skips for free, the T2-1 mechanism. The floor/clamp design (tracked nonce
+    and execution skips for free, the mechanism above. The floor/clamp design (tracked nonce
     monotonic while a quorum batch is unexecuted) covers it; a narrower stop-gap in TN's wrapper
     iterates from the pool's lowest nonce for the sender when it is above the tracked one.
   - With `enforce_tracked_nonce` on, a sender whose only transactions were orphaned keeps an
@@ -132,11 +131,15 @@ RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-fac
 the `EitherWriter`/`EitherReader` parameters remain. Removing them changes compiled storage code,
 so it waits for the storage work (DECISIONS.md D15; ROADMAP.md, "RocksDB step B").
 
-## MDBX fixes belong to the storage work
+## Three upstream storage fixes wait for their own change
 
-Upstream MDBX fixes (7bf9241fe, 294e21507, 5fc3a81d3 in `upstream-backports.md`) are tracked for
-the tn-lmdb owners (tndb-b until 2026-11-04), who replace MDBX as the reth database (ROADMAP.md,
-Phase 3; tn-lmdb is the default backend since 2026-11-09, DECISIONS.md D22).
+Upstream 7bf9241fe (no read-transaction timeout during `check_consistency`) and 294e21507 (heal a
+finalized or safe block number ahead of the highest header) are provider fixes, generic over the
+database, so they reach tn-lmdb and MDBX alike. 5fc3a81d3 (a sync period for MDBX's
+`safe-no-sync`) concerns only the opt-in `mdbx` build, which retires with MDBX (ROADMAP.md,
+Phase 3). They change startup healing and durability, not execution; each is on the storage path,
+so it takes its own change with the fork checks (CLAUDE.md, "Fork safety").
+`upstream-backports.md` has the verdicts.
 
 ## The revm-inspectors patch
 
@@ -144,29 +147,17 @@ Phase 3; tn-lmdb is the default backend since 2026-11-09, DECISIONS.md D22).
 (0.34.3): Boa's recursion limit, which retires when TN's reth moves to a release with upstream's
 fix (0.44.2 or later), and the cap on recorded trace steps (TN-0079), which upstream lacks as of
 0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
-resolves the registry crate instead of the patch (TN-0085, review R30), and the nested test lane
-now really builds against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
+resolves the registry crate instead of the patch (TN-0085), and the nested test lane builds
+against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
 details.
 
 ## CI build time with the vendored crates
 
-rust-cache does not save path packages inside the repository, so every test lane now rebuilds the
-57 vendored crates, which the git dependency had cached, and `vendor-reth-test` compiles reth
-four ways. None of this has been timed on a GitHub runner. Before queueing the PR, a dispatch of
-`main-compiles.yaml` on the branch times the builds; caching the vendored crates would need
-sccache or a different cache layout.
+rust-cache does not save path packages inside the repository, so every test lane rebuilds the 57
+vendored crates, which the git dependency had cached, and `vendor-reth-test` compiles reth four
+ways. Caching the vendored crates would need sccache or a different cache layout.
 
 ## The upstream survey is from 2026-11-06
 
 `upstream-backports.md` surveyed upstream `main` up to `44a74f9ea`. The next survey starts there
 (CLAUDE.md, "Tracking upstream reth").
-
-## Branches that carry tndb-b [closed 2026-11-09]
-
-The tndb-b work (renamed tn-lmdb on 2026-11-04) was written against an earlier copy of this
-vendoring on another branch. `main`'s vendoring (#1768) was merged into it (f88cb29d6), not
-rebased, and `sls_storage_v2` builds on that merge. The merge re-added its workspace
-dependencies (`reth-db-api`, `reth-storage-errors`, `reth-trie-common`) to the root `Cargo.toml`,
-kept `patches/revm-inspectors` and the nested workspace's patch for it (since TN-0080 the
-`[patch.crates-io]` entry in `vendor/reth/.cargo/config.toml`), and took the union of both sides'
-CI lanes. tn-lmdb is the default reth backend there (DECISIONS.md D22).

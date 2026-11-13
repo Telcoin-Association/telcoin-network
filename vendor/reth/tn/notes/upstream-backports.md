@@ -25,13 +25,18 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 - non-critical task panics are ignored by TN's `TaskManager`, and `panic` is the default
   `unwind`;
 - TN's base fee never goes below `MIN_PROTOCOL_BASE_FEE` (7 wei);
-- TN runs storage v1 (`StorageSettings::base()`) and never prunes: headers, transactions and
-  receipts are in static files; senders, change sets and history indices are in MDBX
-  (`provider/src/either_writer.rs`). Until 2026-11-04 this line said receipts were in MDBX; the
-  verdicts below that rest on it (1b20c9bfc, 6bd6bf28a) were rechecked by the 2026-11-01 review
-  and still hold;
-- the tndb-b work replaces MDBX and RocksDB, so fixes to those paths are tracked for its owners.
-  Static-file fixes are in scope here.
+- TN never prunes (`RethConfig::ensure_archive_mode`). The only prune checkpoints it writes are
+  a snapshot restore's availability markers (`AccountHistory`, `StorageHistory` at the restored
+  block, `crates/tn-reth/src/snapshot.rs`);
+- reth's database is tn-lmdb by default, MDBX only in the opt-in `mdbx` build (DECISIONS.md
+  D22). A new datadir on tn-lmdb is storage v2: headers, transactions, receipts, senders and
+  change sets in static files (checksummed, TN-0120 to TN-0122), history indices and the
+  transaction-hash index in the database (TN-0110, TN-0111). A datadir created before, or on the
+  `mdbx` build, stays v1: senders, change sets and history indices in the database
+  (`provider/src/either_writer.rs`; `crates/tn-reth/src/env/layout.rs`);
+- RocksDB is gone (TN-0014). An MDBX-only fix matters to the `mdbx` build until MDBX retires
+  (ROADMAP.md, Phase 3); a provider fix generic over the database reaches both. Static-file
+  fixes are in scope here.
 
 ## Applied
 
@@ -79,15 +84,15 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8760eb000 | TN-0066 | `trace_get` selects the frame whose `traceAddress` equals the list (was a flat index into `trace_transaction`) | upstream test |
 | 3dd806a43 | TN-0067 | `trace_replayTransaction` returns `transactionHash` with the traces, the shape `trace_replayBlockTransactions` already used | upstream test |
 | e3d7f0952 | TN-0068 | `trace_replayTransaction` answers `null` for an unknown transaction (was `-32001`), like `trace_transaction` | upstream test |
-| d8d704cf7 | TN-0069 | `trace_callMany` with no block runs on `latest`, not `pending` (review R9) | upstream test |
+| d8d704cf7 | TN-0069 | `trace_callMany` with no block runs on `latest`, not `pending` | upstream test |
 | 074bf32ef | TN-0070 | `trace_filter` with no `fromBlock` starts at the latest block, not genesis, so an empty filter no longer fails the range check | upstream test |
 | 6d117042f | TN-0071 | `trace_replayBlockTransactions` fills `vmTrace.code` as the single-transaction replay does; adapted to revm-inspectors 0.34 (no `into_trace_results_with_state_parts`) | upstream test |
 | 4e1a5574e | TN-0072 | `trace_replayBlockTransactions` fails with `-32001` on an unknown block instead of answering `null` | upstream smoke test |
-| 0c8b1c187 | TN-0073 | transactions a parked insertion promotes to pending are announced to the pool's listeners (review R20) | upstream tests |
-| 0a1d3e761 | TN-0074 | the validation job channel holds two jobs per worker instead of one (review R21); applied in `build_with_tasks`, the vendored path | upstream test, adapted |
-| fe01db183 | TN-0075 | validation submitters send into the bounded channel without a producer mutex; a cancelled submit no longer leaks `inflight_validation_jobs` (review R21); hand port, no `spawn` in this copy | upstream tests |
+| 0c8b1c187 | TN-0073 | transactions a parked insertion promotes to pending are announced to the pool's listeners | upstream tests |
+| 0a1d3e761 | TN-0074 | the validation job channel holds two jobs per worker instead of one; applied in `build_with_tasks`, the vendored path | upstream test, adapted |
+| fe01db183 | TN-0075 | validation submitters send into the bounded channel without a producer mutex; a cancelled submit no longer leaks `inflight_validation_jobs`; hand port, no `spawn` in this copy | upstream tests |
 | 43a7452b0 | TN-0076 | the `eth_getLogs` retry range in `QueryExceedsMaxResults` ends before the block that overflowed the limit (TN-0058 follow-up) | upstream test; TN-0058 test asserts the new bound |
-| 8f5efd2b3 | TN-0081 | `TrieWalker::new` returns its first read's error instead of panicking the state root computation (review R15); roots unchanged | upstream tests; trie suites |
+| 8f5efd2b3 | TN-0081 | `TrieWalker::new` returns its first read's error instead of panicking the state root computation; roots unchanged | upstream tests; trie suites |
 | 345fbbbfd, 75c327ee5, 0720dcd37, 0a21d223a | TN-0102 to TN-0105 | trie overlay cursors skip the database seek on exact overlay hits (`seek_exact`, then `seek` and the hashed post-state cursor), forward in-memory seeks take a fast path, and the state root reuses its storage cursors across accounts. Performance on the state-root path under TN's output overlay | reth-trie, reth-trie-db, tn-reth `trie_overlay`; exec-bench chain differential 0 mismatches; database trie seeks about halved, storage cursor opens 1.89M to 640 per 320 roots |
 | 8572c88fe | TN-0140 | **consensus fix**: the trie node iterator no longer skips hashed entries between a seek prefix and a deeper stored branch, which gave a wrong incremental state root. Changes the computed root where the old code was wrong; adiri needs a replay check before it deploys (TN-0140) | upstream test fails without the fix; reth-trie, reth-trie-db, `trie_overlay`; format-freeze block hashes unchanged |
 | 8d97ab63c, 1b09bf5a2, 3fba6ad70 | TN-0141 | `StoredNibblesSubKey` encodes to a stack `[u8; 65]` (one allocation less per storage-trie seek and write, same bytes); the storage-root span is trace-level and records its root lazily. Performance on the state-root path | upstream tests (array equals `to_compact` at every length); trie and db-api suites; format-freeze writer bytes unchanged |
@@ -105,20 +110,20 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 | sha | subject | crate | why it matters to TN | status |
 |---|---|---|---|---|
-| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (review finding T2-1; also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | described in `open-issues.md` |
+| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | described in `open-issues.md` |
 
 ### High (correctness, not security)
 
 | sha | subject | crate | why it matters to TN | pick |
 |---|---|---|---|---|
-| 7bf9241fe | disable read-tx timeout during check_consistency | provider | TN runs `check_consistency` at startup; a long heal on an archive DB can hit the MDBX reader timeout and crash-loop. **MDBX: for the tndb-b owners.** | 1 import-only conflict; likely clean after 294e21507 |
+| 7bf9241fe | disable read-tx timeout during check_consistency | provider | TN runs `check_consistency` at startup; a long heal on an archive DB can hit the read-transaction timeout and crash-loop. Both backends: tn-lmdb marks a read transaction past the same five-minute default (`TnLmdbArgs::read_transaction_timeout`), and its later calls fail as MDBX's do. | 1 import-only conflict; likely clean after 294e21507 |
 
 ### Medium
 
 | sha | subject | crate | why | pick |
 |---|---|---|---|---|
-| 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
-| 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
+| 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. In `ProviderFactory`, generic over the database, so both backends. | clean |
+| 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. reth-db's MDBX code only: the `mdbx` build. tn-lmdb bounds `safe-no-sync` with its own period (`SAFE_NO_SYNC_PERIOD`, `crates/tn-reth/src/env/database.rs`). | test-only |
 
 ### Low
 
@@ -129,10 +134,15 @@ None left.
 fd1c9982c (implicit simulate gas cap; Amsterdam/EIP-8037 only), 7b3432d95 (`eth_simulateV1`
 timestamp overflow in `sanitize_chain`, which TN's v1.11 simulate code predates), 0eeb8c5ef
 (eth/68 packing; devp2p, not vendored), a9b6969e7 (init-state OOM; TN does not use reth's
-state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check; senders
-and changesets are in MDBX under storage v1, and receipts are in static files but TN never prunes,
-so the checkpoints it reads are unset),
-6bd6bf28a (receipts static-file sizing; node-builder and receipts-in-static-files only),
+state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check: a
+segment's coverage becomes the higher of its static-file tip and its prune checkpoint. Rechecked
+for storage v2 on 2026-11-13: TN never prunes, so the Receipts and SenderRecovery checkpoints are
+unset; the restore's `AccountHistory`/`StorageHistory` markers are at the restored block, and on
+v2 the restore advances both changeset segments to that block (`snapshot.rs`, "advancing
+changeset segments"), so the higher of the two is the static-file tip in both layouts and the
+check does what it did),
+6bd6bf28a (receipts static-file sizing from the prune distance; node-builder, which TN does not
+carry, and pruned receipts only, in either layout),
 00f9bd2a9 (`tx_hash()` instead of `trie_hash()`; equal for Ethereum transaction types, so it only
 saves a re-hash),
 db17c899c (`reth db migrate-v2`; TN has no reth CLI), adfcad70c (edits a pruned-anchor check
@@ -177,18 +187,18 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
   `debug_executionWitness*` keep their tracing permit until their thread ends (TN-0036, TN-0038),
   and a dropped request stops its long loops (TN-0049).
 - **`trace_filter` replays bounded by its permits (TN-0077, 2026-11-09).** The filter's two
-  permits now also bound the blocks it replays at once (review R10); before, a chunk of up to
+  permits now also bound the blocks it replays at once; before, a chunk of up to
   `--rpc.max-tracing-requests` blocks traced in parallel on unpermitted blocking threads.
 - **Raw `debug_traceBlock` bounded like callMany (TN-0078, 2026-11-09).** The caller's header
-  and transactions are bounded by the call count and gas budget of TN-0057 (review R3); stored
+  and transactions are bounded by the call count and gas budget of TN-0057; stored
   blocks keep their chain-enforced bounds.
 - **A cap on recorded trace steps (TN-0079, 2026-11-09).** The carried revm-inspectors'
   `TracingInspector` stops a transaction whose recorded steps pass 160 MiB (`trace too large`,
-  `-32603`), shared across the inspectors of one request (review R4). Since TN-0153
-  (2026-11-13) the cap also counts every call's trace with its input, init code and output. Upstream caps nothing as of
+  `-32603`), shared across the inspectors of one request. Since TN-0153 (2026-11-13) it also
+  counts every call's trace with its input, init code and output. Upstream caps nothing as of
   0.44.3; re-port on every revm-inspectors upgrade (`patches/revm-inspectors/PATCH.md`).
 - **A missing bytecode row fails the block (TN-0082, 2026-11-10).** `code_by_hash_ref` no longer
-  returns empty code for a hash the `Bytecodes` table lacks (review R12); roots unchanged for a
+  returns empty code for a hash the `Bytecodes` table lacks; roots unchanged for a
   healthy database.
 - **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
-  files and an empty database writes the MDBX half instead of failing forever (review R17).
+  files and an empty database writes the MDBX half instead of failing forever.
