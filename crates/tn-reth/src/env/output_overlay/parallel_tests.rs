@@ -401,6 +401,107 @@ fn every_node_checks_the_same_blocks() {
     assert_eq!(checked[1], expected[2..], "the node that joined at block {joined}");
 }
 
+/// TN-0140's shape (upstream's `inserted_leaf_before_deeper_stored_branch_is_included`) through
+/// TN's state-root path: a block inserts a slot between a storage extension's prefix and the
+/// stored branch below it. The block's root, serial, on every parallel walk and in shadow mode,
+/// equals a rebuild from the hashed state with no stored trie node, both when the earlier block's
+/// trie nodes are persisted and when they are in the output's overlay. With the trie node
+/// iterator's old skip condition (`key.starts_with(&seek_prefix)`) the inserted slot is never
+/// visited and both serial roots differ from the rebuild.
+#[tokio::test]
+async fn inserted_slot_before_a_deeper_stored_branch_matches_a_rebuild() -> eyre::Result<()> {
+    use reth_trie::{
+        hashed_cursor::HashedPostStateCursorFactory, trie_cursor::noop::NoopTrieCursorFactory,
+        Nibbles, StateRoot,
+    };
+    use reth_trie_db::DatabaseHashedCursorFactory;
+
+    /// A hashed slot key starting with `prefix`, zeros after.
+    fn slot_at(prefix: &[u8]) -> B256 {
+        let mut bytes = [0; 32];
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        B256::from(bytes)
+    }
+    /// The root of the database's hashed state under `blocks`, from no stored trie node.
+    fn rebuilt(fixture: &Fixture, blocks: &[&HashedPostState]) -> eyre::Result<B256> {
+        let provider = fixture.env.blockchain_provider().database_provider_ro()?;
+        let mut state = HashedPostState::default();
+        blocks.iter().for_each(|block| state.extend_ref(block));
+        let state = state.into_sorted();
+        let hashed = DatabaseHashedCursorFactory::new(provider.tx_ref());
+        Ok(StateRoot::new(
+            NoopTrieCursorFactory::default(),
+            HashedPostStateCursorFactory::new(hashed, &state),
+        )
+        .root()?)
+    }
+
+    let address = B256::repeat_byte(0xaa);
+    let block = |slots: &[B256]| {
+        HashedPostState::default().with_accounts([(address, contract(1))]).with_storages([(
+            address,
+            HashedStorage::from_iter(false, slots.iter().map(|slot| (*slot, U256::from(1)))),
+        )])
+    };
+    // Under nibble 1 every old slot starts 1, 0, a: an extension from [1] to the branch at
+    // [1, 0, a]. The inserted slot (1, 0, 0, ..) sits between them.
+    let first = block(&[
+        slot_at(&[0x00]),
+        slot_at(&[0x0f, 0x00]),
+        slot_at(&[0x0f, 0x10]),
+        slot_at(&[0x10, 0xa0, 0x00]),
+        slot_at(&[0x10, 0xa0, 0x01]),
+        slot_at(&[0x10, 0xa0, 0x10]),
+        slot_at(&[0x10, 0xa1]),
+    ]);
+    let second = block(&[slot_at(&[0x10, 0x00])]);
+
+    // The first block's root and the stored nodes it leaves: the branch at [1, 0, a] and no node
+    // above it under nibble 1.
+    let first_root = |fixture: &Fixture| -> eyre::Result<B256> {
+        let provider = fixture.env.blockchain_provider().database_provider_ro()?;
+        let (root, updates) =
+            OutputTrieOverlay::new().layered_root_with_updates(provider.tx_ref(), first.clone())?;
+        let nodes = &updates.storage_tries[&address].storage_nodes;
+        assert!(nodes.contains_key(&Nibbles::from_nibbles([1, 0, 0xa])), "the deeper branch");
+        for path in [&[1][..], &[1, 0]] {
+            assert!(!nodes.contains_key(&Nibbles::from_nibbles(path)), "no node at {path:?}");
+        }
+        assert_eq!(root, rebuilt(fixture, &[&first])?, "the rebuild agrees on the first block");
+        Ok(root)
+    };
+
+    // The first block's nodes in the output's overlay.
+    let fixture = Fixture::new()?;
+    first_root(&fixture)?;
+    {
+        let provider = fixture.env.blockchain_provider().database_provider_ro()?;
+        let tx = provider.tx_ref();
+        let mut overlay = OutputTrieOverlay::new();
+        let (_, updates) = overlay.layered_root_with_updates(tx, first.clone())?;
+        overlay.extend_from_block(&ComputedTrieData::without_trie_input(
+            Arc::new(first.clone().into_sorted()),
+            Arc::new(updates.into_sorted()),
+        ));
+        let (root, _) = overlay.layered_root_with_updates(tx, second.clone())?;
+        assert_eq!(root, rebuilt(&fixture, &[&first, &second])?, "overlay: serial root");
+    }
+    fixture.check_output(&[first.clone(), second.clone()])?;
+
+    // The first block's nodes persisted.
+    let mut fixture = Fixture::new()?;
+    let root = first_root(&fixture)?;
+    fixture.persist(std::slice::from_ref(&first))?;
+    assert_eq!(rebuilt(&fixture, &[])?, root, "the rebuild agrees on the persisted block");
+    let provider = fixture.env.blockchain_provider().database_provider_ro()?;
+    let (root, _) =
+        OutputTrieOverlay::new().layered_root_with_updates(provider.tx_ref(), second.clone())?;
+    drop(provider);
+    assert_eq!(root, rebuilt(&fixture, &[&second])?, "persisted: serial root");
+    fixture.check_output(&[second])?;
+    Ok(())
+}
+
 /// A task that fails or panics leaves its account to the walk, and a task the walk claimed
 /// before it started does nothing.
 #[test]
