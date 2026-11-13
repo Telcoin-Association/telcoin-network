@@ -136,6 +136,16 @@ database on tn-lmdb), migrates its reth database and follows the chain. The targ
 `TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the tn-lmdb build.
 `make test-e2e-resync` uses the same two binaries.
 
+Neither runs a real `v0.16.0-adiri` binary as the previous one. Their MDBX binary is this tree
+built with the `mdbx` feature, which keeps the consensus database in tndb and records the storage
+layout marker like the default build, so the consensus-database migration from MDBX and the marker
+recording of a pre-marker datadir, both part of the upgrade from `v0.16.0-adiri`, are covered by
+unit tests only (`tn-storage`'s `test_migrate_from_mdbx_*`, `tn-reth`'s
+`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`). `make test-e2e-resync
+TN_RESYNC_BIN_PREV=...` takes another previous binary, but `v0.16.0-adiri` and this tree do not
+peer since #1788, so that run fails at the upgrade (see the Makefile comment above
+`TN_RESYNC_BIN_PREV`, and the tn-reth README's "Upgrading a testnet node").
+
 The node binary of every other e2e target (`make build-e2e-bin`) runs its reth database on
 tn-lmdb, the default backend, so `make test-restarts`, `make test-epochs` and `make test-sigkill`
 are the crash and restart cycles for that engine. MDBX is the legacy backend, kept until testnet

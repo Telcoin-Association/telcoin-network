@@ -886,6 +886,16 @@ migrated both databases but could not resolve its peers, and stalled. So a mixed
 work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
 nodes in place first (they keep v1), and rebuild in the new layout only after that.
 
+**What runs this upgrade.** No automated lane starts from `v0.16.0-adiri`. The e2e lanes'
+previous binary (`make test-e2e-reth-migration`, `make test-e2e-resync`) is this tree's `mdbx`
+build, which already keeps the consensus database in tndb and records the layout marker, so step 1
+and the marker recording of a datadir from before the marker never run there. Unit tests cover
+both: `tn-storage`'s `test_migrate_from_mdbx_*` and
+`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`. The one run on real `v0.16.0-adiri` datadirs is the manual e2e run above: the restarted validator
+migrated both databases and recorded the marker, then could not peer. No lane, and no make target,
+upgrades a whole committee from `v0.16.0-adiri` (every node stopped, then started together on this
+release); rehearse that by hand before upgrading testnet.
+
 **Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
 and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
 the backup is the only way back to `v0.16.0-adiri` (see Rollback).

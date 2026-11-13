@@ -124,6 +124,7 @@ To go back, stop the node and restore the backup of the whole datadir taken, wit
 Without that backup there is no safe way back for a validator.
 
 Upgrade every node in place first: since #1788 this release and the previous one cannot peer, so a mixed committee stalls.
+No automated test upgrades a committee from `v0.16.0-adiri`: the e2e upgrade tests start from this release's own MDBX build, and the one run on real `v0.16.0-adiri` datadirs upgraded a single validator, which migrated both databases and then could not peer; rehearse the whole-committee upgrade, every node stopped and then started on this release, on a test network first.
 Once every node runs this release, an existing datadir moves to layout v2 only by rebuilding its execution database from genesis.
 With the node stopped, `telcoin-network db reset-execution --datadir <datadir>` shows what it would move, and with `--force` it moves `db/`, `static_files/` and any `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`; the next start re-executes the chain from genesis.
 The rebuild replays epoch 0 from the node's own consensus packs, so the command refuses, moving nothing, a datadir bootstrapped with `db load-state`, which holds consensus only from the restored epoch on; such a node rebuilds as a new one, with `consensus-db/` moved aside as well.
