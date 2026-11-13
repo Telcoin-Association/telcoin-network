@@ -2235,32 +2235,65 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   and fails. *Can reach execution or storage*: no (vendoring tooling only).
   *Upstream*: no (TN's tooling).
 
-- **TN-0144** — A changeset jar's `.csoff` lookups answer from an in-memory copy of the records,
-  read a chunk at a time. *Kind*: performance (storage v2 historical reads).
-  *Files*: `crates/static-file/types/src/changeset_offsets.rs` (`ChangesetOffsetReader`: chunk
-  slots, `read_chunk`, `get`, a `Debug` that counts the chunks read; test).
+- **TN-0144** — A changeset jar's `.csoff` lookups answer from a bounded in-memory cache of the
+  records, read a chunk at a time. *Kind*: performance (storage v2 historical reads).
+  *Files*: `crates/static-file/types/src/changeset_offsets.rs` (`ChangesetOffsetCache`,
+  `CHANGESET_OFFSET_CACHE_BYTES`; `ChangesetOffsetReader`: `with_cache`, `read_chunk`, `get`, a
+  `Debug` without the cache's chunks; tests), `.../types/src/lib.rs` (the exports).
   *Why*: under storage v2 every historical account or storage read that resolves to a changeset
   looks up its block's `.csoff` record, and `ChangesetOffsetReader::get` read each one with its
   own 16 or 20 B `pread`: 0.46 us of a 0.8 us changeset lookup on a Mac (TN-0100's harness,
-  `sf step csoff`). The reader now keeps one `OnceLock` slot a chunk of 256 records: a lookup
-  reads its record's whole chunk on the chunk's first use (one `pread` of at most 5 KiB) and
-  answers the chunk's later lookups from memory. Each reader is one jar snapshot with a fixed
-  length, so a chunk never changes once read; a persist loads a new reader that starts empty,
-  so nothing read before a truncation can be served after it. The stored bytes are kept, and
-  each lookup verifies its record's checksum (TN-0121) as when it read it from the file. The
-  slots cover only the records below the header's length that the file held at the open (a
-  length past the file, a damaged header, sizes nothing; TN-0134), and a record outside them, or
-  in a chunk that could not be read, is read alone as before, with the same errors. A touched
-  chunk stays in memory while its jar is cached: at most 20 B a block of a jar, 10 MiB for a
-  full 500k-block changeset jar. Measured (Mac, TN-0100 harness, 2 runs against 4): `sf step
-  csoff` p50 0.46 -> 0.04 us, account changeset lookup p50 0.79-0.83 -> 0.33-0.38 us, unchanged
-  in the remap phase too (a jar reloaded every 32 reads). *Can reach execution or storage*: it
-  reads the same records, so a block's offsets are the ones the file holds; it writes nothing.
+  `sf step csoff`). A lookup now reads its record's whole chunk of 64 records (one `pread` of at
+  most 1280 B) into a cache and answers the chunk's later lookups from memory while it stays
+  cached. The cache is one for the process (`ChangesetOffsetCache::shared`, which
+  `ChangesetOffsetReader::new` uses), shared by every changeset jar of both changeset segments
+  and every snapshot of them, and fixed in size: sets of 8 chunks, each behind its own lock, a
+  full set evicting its least recently used chunk.
+  *Bound*: at most `CHANGESET_OFFSET_CACHE_BYTES` = 4 MiB of records in all (409 sets of 8 chunks
+  of 1280 B; plain records' chunks are 1 KiB), plus about 60 B of bookkeeping a chunk (~4.2 MiB),
+  whatever the chain's length or the number of jars and snapshots: the records of about 105k
+  blocks of both segments. Chosen from the costs (Mac): a cached lookup saves 0.46 us; a miss
+  reads a chunk, and at 64 records that costs about one record's `pread` (alloc and `pread` of
+  1280 B 0.48-0.61 us against 0.43-0.52 us for 20 B; 5 KiB was 0.61 us), so a working set
+  larger than the cache, such as random reads over a long history, runs at about the speed of
+  reading each record from the file, and the cache's size only sets how much history answers at
+  the cached rate: recent history and repeated lookups, which TN-0100's harness measures (its
+  2,400 blocks are 96 KiB of records). An earlier version kept every chunk a reader touched for
+  as long as its jar was cached, which for sealed jars is the process's life: 40 B a block of
+  history read, about 400 MB for random reads over 10M blocks. Caching only the jar being
+  appended to was not taken: a persist reloads that jar, so its cache would start empty every
+  persist, and after a rotation recent history is in a sealed jar.
+  *Correctness*: a chunk is keyed by its reader's process-unique id (never reused) and its index.
+  Each reader is one jar snapshot with a fixed length, so a chunk never changes while its reader
+  lives; an append, prune, truncation, heal or rotation loads a new reader, which never meets an
+  older reader's chunks, and a dropped reader's chunks are never used again and age out first.
+  The stored bytes are kept, and each lookup verifies its record's checksum (TN-0121) as when it
+  read it from the file, whether its chunk was cached or read again after an eviction. Chunks
+  cover only the records below the header's length that the file held at the open (a length
+  past the file, a damaged header, caches nothing past it; TN-0134), and a record outside them,
+  or in a chunk that could not be read, is read alone as before, with the same errors. Nothing
+  is sized by the header's length: the cache's size is fixed when it is made.
+  Measured (Mac, TN-0100 harness): with 256-record chunks kept for the jar's life (2 runs
+  against 4), `sf step csoff` p50 0.46 -> 0.04 us, account changeset lookup p50 0.79-0.83 ->
+  0.33-0.38 us, unchanged in the remap phase too (a jar reloaded every 32 reads); with the
+  bounded cache (2 runs, against 2 of the version before): `sf step csoff` p50 0.04 us in
+  every v2 phase (cold, warm, remap, busy, busy+holder), account changeset lookup p50 0.33-0.38
+  us (0.38-0.46 before). *Can reach execution or storage*: it reads the same records, so
+  a block's offsets are the ones the file holds; it writes nothing.
   *Tests*: `test_chunked_lookups_match_the_file` (both formats, three chunks with a short last
   one, every record twice; a damaged record fails its checksum while its chunk's other records
-  answer; a header length past the file answers the file's records and fails past them).
-  Mutation-checked: the record's place in its chunk shifted by one (fails); the length bound
-  dropped (panics). *Upstream*: no (upstream reads each record with a `pread`).
+  answer; a header length past the file answers the file's records and fails past them),
+  `test_cache_stays_within_its_bound` (distinct lookups over three files of both formats stay
+  within the cache's capacity, which is at most the bytes asked for, and each answers its own
+  file's record; the shared cache is within `CHANGESET_OFFSET_CACHE_BYTES`),
+  `test_lookup_after_eviction_rereads_and_verifies` (a record damaged while its chunk is cached
+  answers from the cache; a later reader in the same set reads it from the file; after the
+  chunk is evicted, the lookup reads it again and fails its checksum, or without checksums
+  answers what the file holds). Mutation-checked: the record's place in its chunk shifted by one
+  (six fail); no eviction, every chunk kept as the earlier
+  version did (both new tests fail); the key without the reader's id (the eviction test fails);
+  a chunk read on a miss decoded without its checksum (the eviction test and three others
+  fail). *Upstream*: no (upstream reads each record with a `pread`).
 
 - **TN-0148** — The static-file jar cache hands readers an `Arc` of the jar, so a persist that
   grows a segment never waits for the readers of its current jar. *Kind*: performance (storage

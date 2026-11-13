@@ -19,8 +19,8 @@ mod segment;
 mod changeset_offsets;
 #[cfg(all(feature = "std", unix))]
 pub use changeset_offsets::{
-    changeset_offset_record_size, ChangesetOffsetChecksumMismatch, ChangesetOffsetReader,
-    ChangesetOffsetWriter,
+    changeset_offset_record_size, ChangesetOffsetCache, ChangesetOffsetChecksumMismatch,
+    ChangesetOffsetReader, ChangesetOffsetWriter, CHANGESET_OFFSET_CACHE_BYTES,
 };
 
 use alloy_primitives::BlockNumber;

@@ -16,7 +16,10 @@ use std::{
     io::{self, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+    },
 };
 
 /// Size of a record without a checksum.
@@ -247,8 +250,157 @@ impl ChangesetOffsetWriter {
     }
 }
 
-/// TN(TN-0144): the records of one chunk of [`ChangesetOffsetReader`]'s in-memory copy.
-const CHUNK_RECORDS: u64 = 256;
+/// TN(TN-0144): the records of one chunk of [`ChangesetOffsetCache`], 1280 B with checksums.
+///
+/// A miss reads the whole chunk, and at this size that costs about one record's `pread` (Mac:
+/// 0.48-0.61 us against 0.43-0.52 us), so a working set larger than the cache reads as fast as
+/// reading every record from the file did.
+const CHUNK_RECORDS: u64 = 64;
+
+/// TN(TN-0144): the bytes of `.csoff` records [`ChangesetOffsetCache::shared`] keeps in memory, for
+/// every changeset jar of the process together (both changeset segments, every file, every
+/// snapshot): the records of about 105k blocks of both segments.
+pub const CHANGESET_OFFSET_CACHE_BYTES: usize = 4 << 20;
+
+/// TN(TN-0144): the chunks of one [`ChangesetOffsetCache`] set.
+const CACHE_WAYS: usize = 8;
+
+/// TN(TN-0144): the process-unique id of the next [`ChangesetOffsetReader`]; never reused, so a
+/// new reader never meets the chunks of one it replaced.
+static NEXT_READER_ID: AtomicU64 = AtomicU64::new(0);
+
+/// TN(TN-0144): a fixed-size, set-associative cache of `.csoff` record chunks, shared by every
+/// [`ChangesetOffsetReader`].
+///
+/// A chunk is keyed by its reader's id and its index, so a reader only ever sees chunks it read
+/// itself: each reader is one jar snapshot of fixed length, and an append, prune, truncation,
+/// heal or rotation loads a new reader, which starts with nothing cached. A key maps to one of the
+/// sets; a full set evicts its least recently used chunk. A chunk keeps its records as stored,
+/// checksums included, and every lookup verifies its record, whether the chunk was cached or just
+/// read again after an eviction. The chunks of a dropped reader are never used again, so their
+/// sets evict them first.
+pub struct ChangesetOffsetCache {
+    sets: Box<[Mutex<CacheSet>]>,
+}
+
+/// TN(TN-0144): the chunks of one set, at most [`CACHE_WAYS`].
+#[derive(Default)]
+struct CacheSet {
+    chunks: Vec<CachedChunk>,
+    /// The use count of the set, which stamps a chunk on every use.
+    clock: u64,
+}
+
+/// TN(TN-0144): one chunk of one reader.
+struct CachedChunk {
+    reader: u64,
+    chunk: u64,
+    /// The set's clock at the chunk's last use.
+    used: u64,
+    /// The chunk's records, as stored.
+    records: Box<[u8]>,
+}
+
+impl ChangesetOffsetCache {
+    /// A cache of at most `bytes` of records (at least one set), in chunks of [`CHUNK_RECORDS`]
+    /// checksummed records.
+    pub fn new(bytes: usize) -> Self {
+        let chunk_bytes = CHUNK_RECORDS as usize * CHECKSUMMED_RECORD_SIZE;
+        let sets = (bytes / chunk_bytes / CACHE_WAYS).max(1);
+        Self { sets: (0..sets).map(|_| Mutex::default()).collect() }
+    }
+
+    /// The process's cache of [`CHANGESET_OFFSET_CACHE_BYTES`], which
+    /// [`ChangesetOffsetReader::new`] uses.
+    pub fn shared() -> &'static Arc<Self> {
+        static SHARED: OnceLock<Arc<ChangesetOffsetCache>> = OnceLock::new();
+        SHARED.get_or_init(|| Arc::new(Self::new(CHANGESET_OFFSET_CACHE_BYTES)))
+    }
+
+    /// The most bytes of records the cache holds.
+    pub fn capacity_bytes(&self) -> usize {
+        self.sets.len() * CACHE_WAYS * CHUNK_RECORDS as usize * CHECKSUMMED_RECORD_SIZE
+    }
+
+    /// The bytes of records the cache holds now.
+    pub fn cached_bytes(&self) -> usize {
+        self.sets
+            .iter()
+            .map(|set| {
+                Self::lock(set).chunks.iter().map(|chunk| chunk.records.len()).sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn lock(set: &Mutex<CacheSet>) -> MutexGuard<'_, CacheSet> {
+        // A set is consistent between any two of its statements, so a panic elsewhere while
+        // holding it leaves nothing to repair.
+        set.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, reader: u64, chunk: u64) -> &Mutex<CacheSet> {
+        let hash = (reader.rotate_left(32) ^ chunk).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &self.sets[((hash >> 32) % self.sets.len() as u64) as usize]
+    }
+
+    /// Copies the bytes at `at` of the reader's chunk into `record`, if the chunk is cached.
+    fn get(&self, reader: u64, chunk: u64, at: usize, record: &mut [u8]) -> bool {
+        let mut set = Self::lock(self.set(reader, chunk));
+        set.clock += 1;
+        let clock = set.clock;
+        let Some(cached) =
+            set.chunks.iter_mut().find(|cached| cached.reader == reader && cached.chunk == chunk)
+        else {
+            return false
+        };
+        cached.used = clock;
+        record.copy_from_slice(&cached.records[at..at + record.len()]);
+        true
+    }
+
+    /// Caches the reader's chunk, evicting its set's least recently used chunk when the set is
+    /// full, and copies the bytes at `at` into `record`. A chunk another lookup cached meanwhile
+    /// is kept and answers instead.
+    fn insert(&self, reader: u64, chunk: u64, records: Box<[u8]>, at: usize, record: &mut [u8]) {
+        let mut set = Self::lock(self.set(reader, chunk));
+        set.clock += 1;
+        let used = set.clock;
+        let slot = match set
+            .chunks
+            .iter()
+            .position(|cached| cached.reader == reader && cached.chunk == chunk)
+        {
+            Some(slot) => slot,
+            None if set.chunks.len() < CACHE_WAYS => {
+                set.chunks.push(CachedChunk { reader, chunk, used, records });
+                set.chunks.len() - 1
+            }
+            None => {
+                let (slot, _) =
+                    set.chunks.iter().enumerate().min_by_key(|(_, cached)| cached.used).unwrap();
+                set.chunks[slot] = CachedChunk { reader, chunk, used, records };
+                slot
+            }
+        };
+        let cached = &mut set.chunks[slot];
+        cached.used = used;
+        record.copy_from_slice(&cached.records[at..at + record.len()]);
+    }
+
+    #[cfg(test)]
+    fn contains(&self, reader: u64, chunk: u64) -> bool {
+        Self::lock(self.set(reader, chunk))
+            .chunks
+            .iter()
+            .any(|cached| cached.reader == reader && cached.chunk == chunk)
+    }
+}
+
+impl core::fmt::Debug for ChangesetOffsetCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChangesetOffsetCache").field("sets", &self.sets.len()).finish()
+    }
+}
 
 /// Reader for changeset offsets with O(1) random access.
 pub struct ChangesetOffsetReader {
@@ -259,12 +411,14 @@ pub struct ChangesetOffsetReader {
     checksums: bool,
     /// The sidecar's path, for checksum errors.
     path: PathBuf,
-    /// TN(TN-0144): the records read so far, as stored (checksums included), one slot a chunk of
-    /// [`CHUNK_RECORDS`]. [`Self::get`] reads a record's whole chunk on its first lookup and
-    /// answers the chunk's later lookups from memory, instead of one `pread` a lookup. It covers
-    /// the records below `len` that the file held at the open; the rest are read one at a time.
-    chunks: Box<[OnceLock<Box<[u8]>>]>,
-    /// TN(TN-0144): the records `chunks` covers.
+    /// TN(TN-0144): the cache [`Self::get`] reads a record's whole chunk into on the chunk's first
+    /// lookup, and answers the chunk's later lookups from while it stays cached, instead of one
+    /// `pread` a lookup.
+    cache: Arc<ChangesetOffsetCache>,
+    /// TN(TN-0144): this reader's key in `cache`.
+    id: u64,
+    /// TN(TN-0144): the records the chunks cover: those below `len` that the file held at the
+    /// open; the rest are read one at a time.
     chunked_len: u64,
 }
 
@@ -275,47 +429,55 @@ impl ChangesetOffsetReader {
     /// beyond this length are ignored. This ensures we only read committed data.
     ///
     /// TN(TN-0121): `checksums` is the jar's [`changeset_offset_record_size`] format.
+    /// TN(TN-0144): lookups go through [`ChangesetOffsetCache::shared`].
     pub fn new(path: impl AsRef<Path>, len: u64, checksums: bool) -> io::Result<Self> {
+        Self::with_cache(path, len, checksums, Arc::clone(ChangesetOffsetCache::shared()))
+    }
+
+    /// TN(TN-0144): [`Self::new`], with its lookups through `cache`.
+    pub fn with_cache(
+        path: impl AsRef<Path>,
+        len: u64,
+        checksums: bool,
+        cache: Arc<ChangesetOffsetCache>,
+    ) -> io::Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
-        // TN(TN-0144): one chunk slot for every chunk of records the file holds below `len`, so
-        // a `len` past the file (a damaged header) sizes nothing by itself.
+        // TN(TN-0144): chunks cover only the records the file holds below `len`, so a `len` past
+        // the file (a damaged header) caches nothing past it.
         let file_records = file.metadata()?.len() / changeset_offset_record_size(checksums);
         let chunked_len = len.min(file_records);
-        let chunks = (0..chunked_len.div_ceil(CHUNK_RECORDS)).map(|_| OnceLock::new()).collect();
-        Ok(Self { file, len, checksums, path: path.to_path_buf(), chunks, chunked_len })
+        let id = NEXT_READER_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(Self { file, len, checksums, path: path.to_path_buf(), cache, id, chunked_len })
     }
 
     /// Reads a single changeset offset by block index.
     /// Returns None if index is out of bounds.
     ///
-    /// TN(TN-0144): from the in-memory copy of the record's chunk, read on the chunk's first
-    /// lookup. The record's checksum is verified on every lookup, as when each lookup read it from
-    /// the file. A chunk that cannot be read is not kept, and the record is then read alone.
+    /// TN(TN-0144): from the cached copy of the record's chunk, read into the cache on a miss. The
+    /// record's checksum is verified on every lookup, as when each lookup read it from the file. A
+    /// chunk that cannot be read is not cached, and the record is then read alone.
     pub fn get(&self, block_index: u64) -> io::Result<Option<ChangesetOffset>> {
         if block_index >= self.len {
             return Ok(None);
         }
 
         let record_size = changeset_offset_record_size(self.checksums) as usize;
+        let mut buf = [0u8; CHECKSUMMED_RECORD_SIZE];
         if block_index < self.chunked_len {
-            let slot = &self.chunks[(block_index / CHUNK_RECORDS) as usize];
-            let chunk = match slot.get() {
-                Some(chunk) => Some(chunk),
-                None => self
-                    .read_chunk(block_index / CHUNK_RECORDS)
-                    .ok()
-                    .map(|chunk| slot.get_or_init(|| chunk)),
-            };
-            if let Some(chunk) = chunk {
-                let at = (block_index % CHUNK_RECORDS) as usize * record_size;
-                let record = &chunk[at..at + record_size];
-                return decode_record(record, block_index, self.checksums, &self.path).map(Some);
+            let chunk = block_index / CHUNK_RECORDS;
+            let at = (block_index % CHUNK_RECORDS) as usize * record_size;
+            let record = &mut buf[..record_size];
+            let found = self.cache.get(self.id, chunk, at, record) ||
+                self.read_chunk(chunk)
+                    .map(|records| self.cache.insert(self.id, chunk, records, at, record))
+                    .is_ok();
+            if found {
+                return decode_record(&buf, block_index, self.checksums, &self.path).map(Some);
             }
         }
 
         let byte_pos = block_index * record_size as u64;
-        let mut buf = [0u8; CHECKSUMMED_RECORD_SIZE];
         self.file.read_exact_at(&mut buf[..record_size], byte_pos)?;
 
         decode_record(&buf, block_index, self.checksums, &self.path).map(Some)
@@ -375,7 +537,7 @@ impl ChangesetOffsetReader {
     }
 }
 
-/// TN(TN-0144): the in-memory chunks by count, not by their bytes.
+/// TN(TN-0144): the cache by its sets, not by its chunks.
 impl core::fmt::Debug for ChangesetOffsetReader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ChangesetOffsetReader")
@@ -383,8 +545,9 @@ impl core::fmt::Debug for ChangesetOffsetReader {
             .field("len", &self.len)
             .field("checksums", &self.checksums)
             .field("path", &self.path)
+            .field("cache", &self.cache)
+            .field("id", &self.id)
             .field("chunked_len", &self.chunked_len)
-            .field("chunks_read", &self.chunks.iter().filter(|chunk| chunk.get().is_some()).count())
             .finish()
     }
 }
@@ -419,14 +582,17 @@ mod tests {
             writer.sync().unwrap();
             drop(writer);
 
-            let reader = ChangesetOffsetReader::new(&path, records, checksums).unwrap();
-            assert_eq!(reader.chunks.len(), 3);
+            let cache = Arc::new(ChangesetOffsetCache::new(1 << 20));
+            let reader =
+                ChangesetOffsetReader::with_cache(&path, records, checksums, Arc::clone(&cache))
+                    .unwrap();
             for _ in 0..2 {
                 for (i, offset) in expected.iter().enumerate().rev() {
                     assert_eq!(reader.get(i as u64).unwrap().as_ref(), Some(offset), "record {i}");
                 }
             }
-            assert!(reader.chunks.iter().all(|chunk| chunk.get().is_some()));
+            assert!((0..3).all(|chunk| cache.contains(reader.id, chunk)));
+            assert!(!cache.contains(reader.id, 3));
             assert_eq!(reader.get(records).unwrap(), None);
 
             // A damaged record, before its chunk is read.
@@ -457,6 +623,120 @@ mod tests {
             );
             let err = reader.get(records).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// TN(TN-0144): many distinct lookups over three files (both formats, as both changeset
+    /// segments' jars) keep the cache within its bound, whose capacity is at most the bytes asked
+    /// for, while every lookup answers its own file's record; the shared cache is within
+    /// [`CHANGESET_OFFSET_CACHE_BYTES`].
+    #[test]
+    fn test_cache_stays_within_its_bound() {
+        assert!(ChangesetOffsetCache::shared().capacity_bytes() <= CHANGESET_OFFSET_CACHE_BYTES);
+        let dir = tempdir().unwrap();
+        let records = 200 * CHUNK_RECORDS;
+        // Each file its own records, so a lookup answered from the other's chunk fails.
+        let expected = |file: u64| -> Vec<_> {
+            (0..records).map(|i| ChangesetOffset::new(i * 3 + file, i % 5)).collect()
+        };
+        let bytes = 4 * CACHE_WAYS * CHUNK_RECORDS as usize * CHECKSUMMED_RECORD_SIZE;
+        let cache = Arc::new(ChangesetOffsetCache::new(bytes + 100));
+        assert_eq!(cache.capacity_bytes(), bytes);
+        let readers: Vec<_> = [(0, false), (1, true), (2, true)]
+            .into_iter()
+            .map(|(file, checksums)| {
+                let path = dir.path().join(format!("{file}.csoff"));
+                let mut writer = ChangesetOffsetWriter::new(&path, 0, checksums).unwrap();
+                let expected = expected(file);
+                writer.append_many(&expected).unwrap();
+                writer.sync().unwrap();
+                let reader = ChangesetOffsetReader::with_cache(
+                    &path,
+                    records,
+                    checksums,
+                    Arc::clone(&cache),
+                )
+                .unwrap();
+                (reader, expected)
+            })
+            .collect();
+        let mut most = 0;
+        for step in [1, 7, 61] {
+            for i in (0..records).step_by(step) {
+                for (reader, expected) in &readers {
+                    assert_eq!(reader.get(i).unwrap().as_ref(), Some(&expected[i as usize]));
+                }
+                most = most.max(cache.cached_bytes());
+            }
+        }
+        assert!(most <= cache.capacity_bytes(), "{most} > {}", cache.capacity_bytes());
+        assert!(most > cache.capacity_bytes() / 2, "{most}");
+    }
+
+    /// TN(TN-0144): a lookup in a chunk the cache evicted reads the chunk again and verifies its
+    /// record: a record damaged while its chunk was cached answers from the cache, and after the
+    /// eviction fails its checksum (or, without checksums, answers what the file now holds),
+    /// while the chunk's other records answer. A later reader of the file reads it from the file,
+    /// not from the earlier reader's chunk in the same set.
+    #[test]
+    fn test_lookup_after_eviction_rereads_and_verifies() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.csoff");
+        let records = (CACHE_WAYS as u64 + 2) * CHUNK_RECORDS;
+        let expected: Vec<_> = (0..records).map(|i| ChangesetOffset::new(i * 3, i % 5)).collect();
+        for checksums in [false, true] {
+            let mut writer = ChangesetOffsetWriter::new(&path, 0, checksums).unwrap();
+            writer.append_many(&expected).unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+            // One set: the chunks of `CACHE_WAYS` other lookups evict the first.
+            let cache = Arc::new(ChangesetOffsetCache::new(0));
+            let reader =
+                ChangesetOffsetReader::with_cache(&path, records, checksums, Arc::clone(&cache))
+                    .unwrap();
+            assert_eq!(reader.get(0).unwrap().as_ref(), Some(&expected[0]));
+
+            let damaged = 5;
+            // The damaged record as read from the file: a checksum error, or without checksums
+            // its changed offset.
+            let assert_damaged = |got: io::Result<Option<ChangesetOffset>>| {
+                if checksums {
+                    let err = got.unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+                    let mismatch = err
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<ChangesetOffsetChecksumMismatch>())
+                        .unwrap();
+                    assert_eq!(mismatch.index, damaged);
+                } else {
+                    let got = got.unwrap().unwrap();
+                    assert_ne!(got, expected[damaged as usize]);
+                    assert_eq!(got.num_changes(), expected[damaged as usize].num_changes());
+                }
+            };
+            let record_size = changeset_offset_record_size(checksums);
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all_at(&[0xff], damaged * record_size + 1).unwrap();
+            assert_eq!(reader.get(damaged).unwrap().as_ref(), Some(&expected[damaged as usize]));
+            // A later snapshot of the file, in the same set, never meets the first's chunk.
+            let later =
+                ChangesetOffsetReader::with_cache(&path, records, checksums, Arc::clone(&cache))
+                    .unwrap();
+            assert_damaged(later.get(damaged));
+            assert_eq!(reader.get(damaged).unwrap().as_ref(), Some(&expected[damaged as usize]));
+            drop(later);
+
+            for chunk in 1..=CACHE_WAYS as u64 {
+                let i = chunk * CHUNK_RECORDS;
+                assert_eq!(reader.get(i).unwrap().as_ref(), Some(&expected[i as usize]));
+            }
+            assert!(!cache.contains(reader.id, 0));
+            for _ in 0..2 {
+                assert_damaged(reader.get(damaged));
+                assert_eq!(reader.get(0).unwrap().as_ref(), Some(&expected[0]));
+            }
+            assert!(cache.contains(reader.id, 0));
             std::fs::remove_file(&path).unwrap();
         }
     }
