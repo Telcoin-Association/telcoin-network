@@ -1973,9 +1973,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         .await?;
     }
 
-    // allow heartbeat to trigger peer pruning - increased to give libp2p time to
-    // stabilize internal connection state and avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+    // wait until target counts every committee peer; heartbeat pruning keeps the count at or
+    // below max_peers
+    let committee_size = other_peers.len();
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(9), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == committee_size)
+    })
+    .await?;
 
     // check that target has limited peers
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -2025,9 +2030,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect to target
     peer2.dial_by_bls(target_peer_bls).await?;
 
-    // give time for connection to establish and libp2p state to stabilize
-    // target should be at max capacity
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until target counts peer2; target is then at its peer target
+    wait_until(Duration::from_secs(5), "target accepts peer2", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() > committee_size)
+    })
+    .await?;
 
     // spawn nvv that goes through px
     let NetworkPeer {
@@ -2058,9 +2065,27 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect nvv to target (which already has too many peers)
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // allow time for kademlia records to propagate and libp2p connection state to
-    // stabilize after disconnection - increased to avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // wait until target prunes nvv as an excess peer and nvv reaches the mesh through the peers
+    // that target exchanged; an empty nvv peer set does not count, because nvv starts empty
+    let nvv_bls = *nvv_config.config().primary_bls_key();
+    let nvv_handle = &nvv;
+    wait_until(
+        Duration::from_secs(15),
+        "target prunes nvv and nvv reaches exchanged peers",
+        move || async move {
+            let target_drops_nvv = !target_handle.connected_peers().await?.contains(&nvv_bls);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|nvv_peers| {
+                    target_drops_nvv
+                        && !nvv_peers.contains(&target_peer_id)
+                        && !nvv_peers.is_empty()
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
@@ -2476,7 +2501,10 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
 /// Every signed endpoint gets a fresh QUIC window, and the caller survives intermediate timeouts.
 #[tokio::test]
 async fn serial_dial_reaches_last_live_signed_address() -> eyre::Result<()> {
-    let mut settings = NetworkConfig::default();
+    // A 4 s QUIC handshake window keeps the serial fallback over three silent endpoints at about
+    // 12 s, not 30 s, and still longer than the 10 s libp2p default connection timeout.
+    let mut settings: NetworkConfig =
+        serde_yaml::from_str("quic_config: {handshake_timeout: {secs: 4, nanos: 0}}")?;
     settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     // A legacy or explicitly short peer timeout must not race the transport's fallback sequence.
     settings.peer_config_mut().dial_timeout = Duration::from_millis(1);
@@ -3231,8 +3259,12 @@ async fn test_get_kad_records() -> eyre::Result<()> {
             .await?;
     }
 
-    // Allow time for heartbeats to happen
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // Check connected peers on target - should be limited based on config
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -3267,16 +3299,39 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     )
     .await?;
 
-    // give time for connection to establish
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait for the connection to establish
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(3), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
 
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
 
-    // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // wait until nvv dials every committee peer that kad found
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|peer| peer.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to target and every committee peer",
+        move || async move {
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    connected.contains(&target_peer_id)
+                        && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // assert nvv is connected with other peers
     let connected = nvv.connected_peer_ids().await?;
@@ -4429,7 +4484,12 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         .await?;
     }
 
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // spawn the 6th non-validator peer
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -4452,13 +4512,41 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         target_peer_addr.clone(),
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    let nvv_handle = &nvv;
+    wait_until(Duration::from_secs(3), "nvv connects to target", move || async move {
+        Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
+    })
+    .await?;
 
     // ask the network to locate every committee member via kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // wait until nvv dials every committee peer that kad found and resolves target's rpc; the
+    // records of the other peers must be in place before the asserts check that they carry none
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|p| p.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    let target_rpc = &rpc;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to every committee peer and resolves target rpc",
+        move || async move {
+            let target_rpc_known =
+                nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    target_rpc_known && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // snapshot the advertised RPCs known on the NVV; only the target advertised
     let mut all = nvv.get_all_validator_rpcs().await?;
@@ -4562,7 +4650,12 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         .await?;
     }
 
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target counts every committee peer
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(3), "target counts every committee peer", move || async move {
+        Ok(target_handle.connected_peer_ids().await?.len() == num_network_peers - 1)
+    })
+    .await?;
 
     // spawn the 6th non-validator peer
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -4586,8 +4679,12 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         Ok(nvv_handle.connected_peers().await?.contains(&target_peer_bls))
     })
     .await?;
-    // let target's self-advertised push land while the nvv's committee set is still empty
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // wait until target's self-advertised push lands while the nvv's committee set is still empty
+    let target_rpc = &rpc;
+    wait_until(Duration::from_secs(3), "nvv caches target's pushed rpc", move || async move {
+        Ok(nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc))
+    })
+    .await?;
     // the push must be admitted for the pinned key NOW, while no committee slot is seeded;
     // without this check the stub re-discovery after `update_committees` recovers the record
     // from the nvv's own kad store and masks a regression of the pinned-key admission
@@ -4607,7 +4704,31 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
     nvv.find_authorities(authorities.clone()).await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // wait until nvv dials every committee peer that kad found and resolves target's rpc; the
+    // records of the other peers must be in place before the asserts check that they carry none
+    let committee_ids: Vec<PeerId> = committee
+        .iter()
+        .map(|p| p.config.config().node_info.primary_network_key().clone().into())
+        .collect();
+    let committee_ids = &committee_ids;
+    let target_rpc = &rpc;
+    wait_until(
+        Duration::from_secs(15),
+        "nvv connects to every committee peer and resolves target rpc",
+        move || async move {
+            let target_rpc_known =
+                nvv_handle.get_validator_rpc(target_peer_bls).await?.as_ref() == Some(target_rpc);
+            nvv_handle
+                .connected_peer_ids()
+                .await
+                .map(|connected| {
+                    target_rpc_known && committee_ids.iter().all(|id| connected.contains(id))
+                })
+                .map_err(eyre::Report::from)
+        },
+    )
+    .await?;
 
     // snapshot the advertised RPCs known on the NVV; only the target advertised
     let mut all = nvv.get_all_validator_rpcs().await?;

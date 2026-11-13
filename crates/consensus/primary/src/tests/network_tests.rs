@@ -15,7 +15,7 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
@@ -1687,6 +1687,293 @@ async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
         "recast with a different digest at the same round must fail closed"
+    );
+
+    Ok(())
+}
+
+/// Test setup for a vote this node cast before a restart: a header from the last authority and a
+/// durable vote info for it, with the in-memory `auth_last_vote` guard empty (fresh handler).
+fn seed_stored_vote(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+) -> eyre::Result<Header> {
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let stored = VoteInfo {
+        epoch: header.epoch(),
+        round: header.round(),
+        vote_digest: header.digest().into(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&committee.last_authority().id(), &stored)?;
+    Ok(header)
+}
+
+/// A repeated vote request for a header this node voted for before a restart is recast under the
+/// author lock, and the recast vote stays in the author's guard. Later repeats are served from the
+/// guard, so a burst of copies of one header signs at most once (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_fills_author_guard() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let request_vote = || handler.vote(peer, header.clone(), vec![]);
+
+    assert!(
+        !handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a fresh handler holds the stored vote only on disk"
+    );
+    let first = request_vote().await;
+    assert_matches!(first, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "the recast vote must stay in the author's guard"
+    );
+
+    // from here on only memory can answer a repeat: a recast needs the stored digest to match
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+    let second = request_vote().await;
+    assert_matches!(second, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+    let third = request_vote().await;
+    assert_matches!(third, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+
+    Ok(())
+}
+
+/// The recast of a stored vote waits for the author lock, like every other vote request from that
+/// author, so parallel copies of one header queue on the lock instead of each signing at once
+/// (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_waits_for_author_lock() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let held = handler.lock_author_vote(&author_id).await;
+    assert!(held.is_some(), "every committee member has a vote lock");
+    let mut recast = std::pin::pin!(handler.vote(peer, header.clone(), vec![]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut recast).await.is_err(),
+        "the recast must not answer while another request from the author holds its lock"
+    );
+
+    drop(held);
+    let res = recast.await;
+    assert_matches!(res, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    Ok(())
+}
+
+/// Write `vote_digest` as this node's stored vote for the author of `header` at the header's epoch
+/// and round.
+///
+/// With a digest other than the header's, a repeat of a header this node voted for can only be
+/// answered from memory: a recast needs the stored digest to match, and a new evaluation refuses a
+/// second digest for the round.
+fn store_vote_digest(
+    committee: &CommitteeFixture<MemDatabase>,
+    header: &Header,
+    vote_digest: VoteDigest,
+) -> eyre::Result<()> {
+    let stored = VoteInfo { epoch: header.epoch(), round: header.round(), vote_digest };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(header.author(), &stored)?;
+    Ok(())
+}
+
+/// A header from the last authority at round 1 whose execution block the test handler knows, so
+/// a vote request for it completes.
+fn votable_header(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+    created_at: u64,
+) -> Header {
+    committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(created_at)
+        .build()
+}
+
+/// A recast vote is answered from memory after the same author's headers for the same round and
+/// for an older round were refused in between. Each refusal keeps the decision entry but used to
+/// drop the vote cached in it, so every second request signed again (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_stale_headers() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+    // whole seconds, so the digests differ with or without sub-second timestamps
+    let header_at = |round, created_at| {
+        author.header_builder_at_round(&committee.committee(), round).created_at(created_at).build()
+    };
+
+    // a vote this node cast for the round-2 header before a restart
+    let header = header_at(2, 2);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the stored vote must be recast, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    for (stale, what) in [(header_at(2, 3), "same round"), (header_at(1, 1), "older round")] {
+        let res = handler.vote(peer, stale, vec![]).await;
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+            "a different header for the {what} must still be refused"
+        );
+        assert!(
+            handler.author_guard_holds_vote(&author_id, header.digest()).await,
+            "refusing a header for the {what} must keep the cached vote"
+        );
+    }
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after the same author's header that fails validation, with no
+/// penalty and no retry, was refused in between. The refusal replaces the decision entry, which
+/// used to hold the only cached copy of the vote (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_refused_header() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // two epochs ahead: not stale, and not the recoverable next-epoch race
+    let refused = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .epoch(2)
+        .build();
+    let err = handler.vote(peer, refused, vec![]).await.expect_err("an epoch-2 header is invalid");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal carries no penalty");
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a refused header from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after a request from the same author was dropped while it was
+/// evaluated, as the network layer drops it when the requester cancels (issue #1836). The decision
+/// entry is put back before the evaluation awaits, and the vote is kept apart from it, so each
+/// covers the other here.
+#[tokio::test]
+async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // a newer header waiting for an execution block that never comes; polled once, then dropped
+    let waiting = author
+        .header_builder_at_round(&committee.committee(), 2)
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .build();
+    assert!(
+        handler.vote(peer, waiting, vec![]).now_or_never().is_none(),
+        "the newer header's request must be waiting when it is dropped"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a dropped request from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A recast leaves a decision on a newer header of the author in place, so a different header for
+/// that newer slot is still refused early once the older header's vote was recast.
+#[tokio::test]
+async fn test_vote_recast_keeps_newer_decision() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let header = votable_header(&committee, &parent, 1);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let epoch_two = |created_at| {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(created_at)
+            .epoch(2)
+            .build()
+    };
+
+    let newer = handler.vote(peer, epoch_two(1), vec![]).await;
+    assert_matches!(
+        newer,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }))
+    );
+    let recast = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(recast, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    let sibling = handler.vote(peer, epoch_two(2), vec![]).await;
+    assert_matches!(
+        sibling,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "the recast must not move the author's decision entry back to the older header"
     );
 
     Ok(())

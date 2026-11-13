@@ -19,7 +19,8 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    Certificate, Database, Hash as _, HeaderDigest, Round, TnReceiver, TnSender as _,
+    Certificate, Database, Hash as _, HeaderDigest, Round, SignatureVerificationState, TnReceiver,
+    TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -92,8 +93,22 @@ where
                 return Err(CertManagerError::UnverifiedSignature(digest));
             }
 
+            // a fetch response can carry certificates this node stored since it sent the request,
+            // and a faulty responder can add any: a stored certificate was accepted with its stored
+            // copy, so it is neither accepted nor forwarded again. a copy stored outside this
+            // manager (the catching-up gossip path) unlocked nothing, so its children still are
+            if self.keep_stored_copy(&cert)? {
+                let unlocked = self.pending.update_pending(cert.round(), digest)?;
+                if !unlocked.is_empty() {
+                    self.accept_verified_certificates(unlocked).await?;
+                }
+                continue;
+            }
+
             // check pending status
             if self.pending.is_pending(&digest) {
+                // the copy accepted later is the one stored, attached and served
+                self.pending.replace_with_direct_copy(cert);
                 // track error for caller that at least one cert is pending
                 // and continue processing other certs
                 result = Err(CertManagerError::Pending(digest));
@@ -132,6 +147,32 @@ where
             .set(self.pending.num_pending() as f64);
 
         result
+    }
+
+    /// Whether `cert` is already stored.
+    ///
+    /// A stored copy is replaced only by a copy verified directly, and only if it was not verified
+    /// directly itself, so a fetch response never writes signature bytes this node has not
+    /// checked over a stored copy, and a copy it can attach and serve without another check
+    /// replaces one it would have to check first.
+    fn keep_stored_copy(&self, cert: &Certificate) -> CertManagerResult<bool> {
+        let store = self.config.node_storage();
+        if !matches!(
+            cert.signature_verification_state(),
+            SignatureVerificationState::VerifiedDirectly(_)
+        ) {
+            return Ok(store.contains(&cert.digest())?);
+        }
+        let Some(stored) = store.read(cert.digest())? else {
+            return Ok(false);
+        };
+        if !matches!(
+            stored.signature_verification_state(),
+            SignatureVerificationState::VerifiedDirectly(_) | SignatureVerificationState::Genesis
+        ) {
+            store.write(cert.clone())?;
+        }
+        Ok(true)
     }
 
     /// Check that certificate's parents are in storage. Returns the digests of any parents that are

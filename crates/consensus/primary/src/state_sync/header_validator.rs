@@ -267,11 +267,19 @@ where
             return Ok(Vec::new());
         }
 
+        self.identify_unknown_certificates(header.parents().iter()).await
+    }
+
+    /// Filter certificate digests that do not exist in storage or pending state.
+    ///
+    /// Returns the unknown digests, in the order given.
+    pub(super) async fn identify_unknown_certificates<'a>(
+        &self,
+        digests: impl Iterator<Item = &'a HeaderDigest> + Clone,
+    ) -> HeaderResult<Vec<HeaderDigest>> {
         // check database
-        let existence = self.config.node_storage().multi_contains(header.parents().iter())?;
-        let unknown: Vec<_> = header
-            .parents()
-            .iter()
+        let existence = self.config.node_storage().multi_contains(digests.clone())?;
+        let unknown: Vec<_> = digests
             .zip(existence.iter())
             .filter_map(|(digest, exists)| if *exists { None } else { Some(*digest) })
             .collect();

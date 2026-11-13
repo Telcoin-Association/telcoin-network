@@ -11,7 +11,7 @@ use alloy::{
     primitives::{address, U256},
 };
 use reth_chainspec::ChainSpec;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// test genesis
 ///
@@ -53,9 +53,11 @@ pub fn test_genesis_at(timestamp: u64) -> Genesis {
         ),
     ];
     // use testnet pre-compiles
-    let precompiles: Genesis =
-        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
-    let genesis = genesis.extend_accounts(precompiles.alloc);
+    // parse the embedded yaml once per process: test fixtures call this hundreds of times
+    static PRECOMPILES: LazyLock<Genesis> = LazyLock::new(|| {
+        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data")
+    });
+    let genesis = genesis.extend_accounts(PRECOMPILES.alloc.clone());
     // overwrite any conflicting accounts with specified values
     genesis.extend_accounts(default_factory_accounts)
 }

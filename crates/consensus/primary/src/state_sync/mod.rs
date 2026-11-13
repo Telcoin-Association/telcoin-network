@@ -16,6 +16,7 @@ mod header_validator;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
+pub(crate) use cert_validator::verify_stored_certificate;
 
 #[cfg(test)]
 #[path = "../tests/certificate_processing_tests.rs"]
@@ -118,5 +119,15 @@ where
         header: &Header,
     ) -> HeaderResult<Vec<HeaderDigest>> {
         self.header_validator.identify_unkown_parents(header).await
+    }
+
+    /// Filter certificate digests that do not exist in storage or pending state.
+    ///
+    /// Returns the unknown digests, in the order given.
+    pub(crate) async fn identify_unknown_certificates<'a>(
+        &self,
+        digests: impl Iterator<Item = &'a HeaderDigest> + Clone,
+    ) -> HeaderResult<Vec<HeaderDigest>> {
+        self.header_validator.identify_unknown_certificates(digests).await
     }
 }

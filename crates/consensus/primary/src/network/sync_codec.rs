@@ -18,7 +18,8 @@
 use crate::error::PrimaryNetworkResult;
 use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
-    AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
+    AsyncWriteExt as _, FutureExt as _, Stream, StreamExt as _, TryFutureExt as _,
+    TryStreamExt as _,
 };
 use std::{
     sync::{
@@ -689,7 +690,7 @@ where
 /// targeting [`SYNC_CERT_BATCH_TARGET_SIZE`]), and ends with [`SyncFrame::End`].
 ///
 /// Unlike the legacy request-response reply there is no aggregate cap declared by
-/// the requester: the responder streams until `certs` is exhausted, its iterator
+/// the requester: the responder streams until `certs` is exhausted, the stream
 /// stops yielding (the streaming collector's processing-time limit), or the honest
 /// byte cap [`MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES`] is reached. Each frame write
 /// is bounded by `buffer_timeout` so a peer that stops reading cannot pin the
@@ -706,7 +707,7 @@ pub(crate) async fn send_sync_certificates_over_stream<S, I>(
 ) -> PrimaryNetworkResult<()>
 where
     S: FuturesAsyncWrite + Unpin + Send,
-    I: IntoIterator<Item = PrimaryNetworkResult<Certificate>>,
+    I: Stream<Item = PrimaryNetworkResult<Certificate>>,
 {
     let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
@@ -733,7 +734,7 @@ where
     // time-bounded collector past what it will send (at the cost of one boundary read).
     // A storage error yielded by `certs` short-circuits the fold and propagates so the
     // caller signals `SyncFrame::Err`.
-    futures::stream::iter(certs)
+    certs
         .map(|cert| {
             cert.and_then(|cert| encoded_size(&cert).map(|size| (size, cert)).map_err(Into::into))
         })
@@ -1458,7 +1459,7 @@ mod tests {
         let mut wire = Vec::new();
         send_sync_certificates_over_stream(
             &mut wire,
-            certs.into_iter().map(Ok),
+            futures::stream::iter(certs.into_iter().map(Ok)),
             Duration::from_secs(5),
         )
         .await

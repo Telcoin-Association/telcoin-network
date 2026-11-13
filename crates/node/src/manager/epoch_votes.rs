@@ -1027,7 +1027,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         // The cert must exist and verify: a corrupted aggregate (duplicate self-signature)
         // fails verify_with_cert and is never stored
@@ -1144,7 +1148,11 @@ mod epoch_vote_collector_tests {
 
         // Wait for collector to aggregate and store.
         // After reaching quorum the collector waits up to 1s for more votes before aggregating.
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         // Verify cert IS stored for the correct epoch hash
         // Quorum is kp1 (self-sign) + kp3 + kp4 = 3 >= 3
@@ -1251,7 +1259,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
@@ -1347,7 +1359,11 @@ mod epoch_vote_collector_tests {
 
         // Quorum (3 of 4) reached without a fourth vote: collector waits its 1s straggler
         // window before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
