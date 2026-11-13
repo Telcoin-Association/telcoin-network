@@ -115,7 +115,10 @@ enum DbSubcommand {
     /// re-executing the chain, in the storage layout new datadirs get. Moves `db`,
     /// `static_files` and `restored-state-floor` into `execution-reset-<UTC time>` under the
     /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
-    /// and config stay. The node MUST be stopped. Dry-run by default; pass `--force` to apply.
+    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
+    /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
+    /// rebuild replays epoch 0 from the node's own packs. Dry-run by default; pass `--force` to
+    /// apply.
     ResetExecution(DbResetExecutionArgs),
 }
 
@@ -170,6 +173,8 @@ impl DbMigrateExecutionArgs {
         // Refuse while a live node holds the datadir, and hold it so a node cannot start while
         // the database moves; released when this returns.
         let _pid_lock = PidLock::acquire(&datadir)?;
+        // an unfinished `db reset-execution` may hold `db/` in its staging directory
+        refuse_interrupted_reset(&datadir)?;
         let db = datadir.reth_db_path();
         match migrate_reth_db(&db, &self.db)? {
             Some(marker) => print!("the reth database at {}: {marker}", db.display()),
@@ -213,11 +218,14 @@ impl DbCommand {
                 let _pid_lock = DB_TABLE_STATS_NEEDS_STOPPED_NODE
                     .then(|| PidLock::acquire(&datadir))
                     .transpose()?;
+                // what an unfinished `db reset-execution` moved is not the datadir's state
+                refuse_interrupted_reset(&datadir)?;
                 print_stats(&datadir, &mut std::io::stdout())?;
             }
             DbSubcommand::Check => {
                 let _pid_lock =
                     DB_CHECK_NEEDS_STOPPED_NODE.then(|| PidLock::acquire(&datadir)).transpose()?;
+                refuse_interrupted_reset(&datadir)?;
                 let report = db_check(&datadir.reth_db_path())?;
                 println!("{}", check_summary(&report));
                 println!();
@@ -1854,6 +1862,30 @@ mod tests {
         .execute(datadir)
         .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+    }
+
+    /// `db stats`, `db check` and `db migrate-execution` refuse a datadir holding an unfinished
+    /// `db reset-execution`, rather than report on (or migrate) a datadir whose `db/` the reset may
+    /// have moved into its staging directory.
+    #[test]
+    fn db_execution_commands_refuse_an_interrupted_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let partial = datadir.join("execution-reset-20261109T000000Z.partial");
+        fs::create_dir_all(partial.join("db")).unwrap();
+        for command in [
+            super::DbSubcommand::Stats,
+            super::DbSubcommand::Check,
+            super::DbSubcommand::MigrateExecution(super::DbMigrateExecutionArgs {
+                db: Default::default(),
+            }),
+        ] {
+            let name = format!("{command:?}");
+            let err = super::DbCommand { command }
+                .execute(datadir.clone())
+                .expect_err("an unfinished reset");
+            assert!(format!("{err:#}").contains("did not finish"), "{name}: {err:#}");
+        }
     }
 
     /// `db load-state` refuses a datadir holding an unfinished `db reset-execution` (an

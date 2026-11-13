@@ -12,6 +12,10 @@
 //! ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding half an
 //! execution database. Running the command again finishes an interrupted reset into the same
 //! directory.
+//!
+//! The rebuild replays epoch 0 from the node's own consensus packs first, so the command refuses a
+//! datadir whose consensus database holds a later epoch's pack and none for epoch 0
+//! ([`refuse_consensus_without_epoch_zero`]), as a datadir bootstrapped with `db load-state` does.
 
 use eyre::{bail, eyre, WrapErr as _};
 use std::{
@@ -19,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_config::PidLock;
+use tn_config::{PidLock, TelcoinDirs as _};
 use tn_storage::disk::fsync_directory;
 
 /// The prefix of the directories a reset moves the execution database into.
@@ -67,19 +71,62 @@ fn partial_resets(datadir: &Path) -> eyre::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Refuse to start a node on `datadir` while an execution reset there is unfinished: the datadir
-/// may hold part of the old execution database beside nothing, and the node would open it.
+/// Refuse to start a node, or to run a `db` command on the execution database, on `datadir` while
+/// an execution reset there is unfinished: the datadir may hold part of the old execution database
+/// beside nothing, and the node would open it.
 pub(crate) fn refuse_interrupted_reset(datadir: &Path) -> eyre::Result<()> {
     if let Some(partial) = partial_resets(datadir)?.first() {
         bail!(
             "an execution reset of {} did not finish: {} holds part of the execution database. \
-             Run `telcoin-network db reset-execution --force` to finish it (or move its entries \
-             back into the datadir to undo it), then start the node",
+             Run `telcoin-network db reset-execution --force` to finish it, or move its entries \
+             back into the datadir to undo it",
             datadir.display(),
             partial.display(),
         );
     }
     Ok(())
+}
+
+/// The epoch of a consensus pack directory named `name` (`epoch-N`), or of one an interrupted
+/// install moved aside (`epoch-N.replaced`, which the node's next start puts back when `epoch-N`
+/// is missing).
+fn pack_epoch(name: &str) -> Option<u32> {
+    let name = name.strip_suffix(".replaced").unwrap_or(name);
+    name.strip_prefix("epoch-")?.parse().ok()
+}
+
+/// Refuse a datadir whose consensus database holds a pack of a later epoch and none for epoch 0.
+/// After a reset the node replays epoch 0 from its own packs, and it fetches no pack below the
+/// epoch its consensus database is at, so it would fail at that replay on every start. A datadir
+/// bootstrapped with `db load-state` is one: it holds consensus only from the restored epoch on. A
+/// datadir with no pack at all starts as a new node does and syncs from genesis, so it passes.
+fn refuse_consensus_without_epoch_zero(datadir: &Path) -> eyre::Result<()> {
+    let epochs = datadir.to_path_buf().epochs_db_path();
+    if !exists(&epochs)? {
+        return Ok(());
+    }
+    let mut lowest: Option<u32> = None;
+    for entry in fs::read_dir(&epochs)
+        .wrap_err_with(|| format!("failed to list the epoch packs in {}", epochs.display()))?
+    {
+        let entry = entry
+            .wrap_err_with(|| format!("failed to list the epoch packs in {}", epochs.display()))?;
+        if let Some(epoch) = pack_epoch(&entry.file_name().to_string_lossy()) {
+            lowest = Some(lowest.map_or(epoch, |lowest| lowest.min(epoch)));
+        }
+    }
+    match lowest {
+        Some(lowest) if lowest > 0 => bail!(
+            "{} cannot rebuild its execution database from genesis: its consensus database holds \
+             epoch packs from epoch {lowest} on and none for epoch 0 (a datadir bootstrapped with \
+             `db load-state` holds consensus only from the restored epoch on), and the rebuild \
+             replays epoch 0 from this datadir's packs. To rebuild it, move `consensus-db` aside \
+             first, so the node syncs from genesis as a new one does (a validator then stays \
+             stopped until the network has closed the epoch it was in)",
+            datadir.display(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// The UTC time `secs` after the Unix epoch, as `YYYYMMDDTHHMMSSZ`.
@@ -112,12 +159,15 @@ pub(crate) struct ResetPlan {
 }
 
 /// Move `datadir`'s execution database aside (with `force`), or report what would move (without
-/// it). Holds the datadir lock for the whole run, so it refuses while a node runs.
+/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. Refuses, before
+/// anything moves, a datadir whose rebuild could not start
+/// ([`refuse_consensus_without_epoch_zero`]).
 pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<ResetPlan> {
     if !datadir.is_dir() {
         bail!("datadir {} does not exist", datadir.display());
     }
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
+    refuse_consensus_without_epoch_zero(datadir)?;
 
     let entries = execution_entries(datadir)?;
     let partials = partial_resets(datadir)?;
@@ -164,12 +214,25 @@ pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<Reset
         }
     };
     let target = final_name(&staging)?;
+    if let Some(partial) = &resumes {
+        // the name is the unfinished reset's own, so a rerun meets the same directory
+        if exists(&target)? {
+            bail!(
+                "{} already exists beside the unfinished reset {}, which finishing renames to that \
+                 name: rename or move {} out of the datadir, then run the reset again",
+                target.display(),
+                partial.display(),
+                target.display(),
+            );
+        }
+    }
     let plan = ResetPlan { moves, target, resumes };
     if !force {
         return Ok(plan);
     }
 
     if exists(&plan.target)? {
+        // a new reset's name is the current second's, so a rerun a second later gets another one
         bail!("{} already exists: run the reset again in a second", plan.target.display());
     }
     if plan.resumes.is_none() {
@@ -211,7 +274,8 @@ fn sync_dir(dir: &Path) -> eyre::Result<()> {
 mod tests {
     use super::*;
 
-    /// A datadir with every entry a reset moves, and the entries it leaves.
+    /// A datadir with every entry a reset moves, and the entries it leaves: its consensus database
+    /// holds the packs of epochs 0 and 1, as a node that synced from genesis does.
     fn datadir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -220,7 +284,8 @@ mod tests {
         fs::create_dir_all(root.join("static_files")).unwrap();
         fs::write(root.join("static_files/static_file_headers_0_499999"), b"headers").unwrap();
         fs::write(root.join("restored-state-floor"), b"42\n").unwrap();
-        fs::create_dir_all(root.join("consensus-db/epochs")).unwrap();
+        fs::create_dir_all(root.join("consensus-db/epochs/epoch-0")).unwrap();
+        fs::create_dir_all(root.join("consensus-db/epochs/epoch-1")).unwrap();
         fs::create_dir_all(root.join("node-keys")).unwrap();
         dir
     }
@@ -285,6 +350,41 @@ mod tests {
         assert!(err.contains("holds no execution database"), "{err}");
     }
 
+    /// A datadir whose consensus database starts at a later epoch (as `db load-state` leaves one)
+    /// is refused, by the dry run too, and nothing moves. An epoch-0 pack an interrupted
+    /// install moved aside counts, as the node's start puts it back; a datadir with no pack at
+    /// all passes, as it syncs from genesis.
+    #[test]
+    fn a_reset_refuses_consensus_without_the_epoch_zero_pack() {
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir(epochs.join("epoch-0")).unwrap();
+        for force in [false, true] {
+            let err = format!("{:#}", reset_execution(root, force).unwrap_err());
+            assert!(err.contains("from epoch 1 on and none for epoch 0"), "{err}");
+            assert!(err.contains("move `consensus-db` aside"), "{err}");
+            assert_eq!(
+                names(root),
+                [
+                    "consensus-db",
+                    "db",
+                    "node-keys",
+                    "restored-state-floor",
+                    "static_files",
+                    "telcoin.pid"
+                ],
+                "nothing moved"
+            );
+            assert_eq!(fs::read(root.join("db/tn-lmdb.dat")).unwrap(), b"database");
+        }
+
+        fs::create_dir(epochs.join("epoch-0.replaced")).unwrap();
+        reset_execution(root, false).unwrap();
+        fs::remove_dir_all(root.join("consensus-db")).unwrap();
+        reset_execution(root, false).unwrap();
+    }
+
     /// A datadir without a floor marker moves what it has.
     #[test]
     fn a_reset_moves_only_what_exists() {
@@ -329,6 +429,33 @@ mod tests {
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
         refuse_interrupted_reset(root).unwrap();
+    }
+
+    /// A finished reset under the name an unfinished one finishes into is refused, by the dry run
+    /// too, with advice a rerun can follow (not "again in a second": the name is fixed).
+    #[test]
+    fn a_rerun_refuses_a_finished_reset_under_its_name() {
+        let dir = datadir();
+        let root = dir.path();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+        let finished = root.join("execution-reset-20261109T163205Z");
+        fs::create_dir(&finished).unwrap();
+        for force in [false, true] {
+            let err = reset_execution(root, force).unwrap_err().to_string();
+            assert!(err.contains(&finished.display().to_string()), "{err}");
+            assert!(err.contains(&partial.display().to_string()), "{err}");
+            assert!(err.contains("rename or move"), "{err}");
+            assert!(!err.contains("in a second"), "{err}");
+            assert!(root.join("static_files").exists(), "nothing moved");
+            assert_eq!(names(&partial), ["db"]);
+        }
+
+        fs::remove_dir(&finished).unwrap();
+        let plan = reset_execution(root, true).unwrap();
+        assert_eq!(plan.target, finished);
+        assert_eq!(names(&finished), ["db", "restored-state-floor", "static_files"]);
     }
 
     /// An entry in both the datadir and an unfinished reset is refused: which one is the node's

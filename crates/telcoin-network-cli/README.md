@@ -487,7 +487,13 @@ build with the legacy `mdbx` feature refuses it.
 `telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
 and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
 rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
-would move. It refuses while a node holds the datadir. The layouts, the upgrade from
+would move. It refuses while a node holds the datadir. It also refuses a datadir whose consensus
+database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
+load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
+from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
+`consensus-db/` moved aside first. While a reset is unfinished (an `execution-reset-*.partial`
+directory), the node, `db load-state`, `db stats`, `db check` and `db migrate-execution` refuse the
+datadir, and running the reset again finishes it. The layouts, the upgrade from
 `v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage
 layouts" and "Upgrading a testnet node" sections.
 

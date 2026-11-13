@@ -886,6 +886,16 @@ migrated both databases but could not resolve its peers, and stalled. So a mixed
 work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
 nodes in place first (they keep v1), and rebuild in the new layout only after that.
 
+**What runs this upgrade.** No automated lane starts from `v0.16.0-adiri`. The e2e lanes'
+previous binary (`make test-e2e-reth-migration`, `make test-e2e-resync`) is this tree's `mdbx`
+build, which already keeps the consensus database in tndb and records the layout marker, so step 1
+and the marker recording of a datadir from before the marker never run there. Unit tests cover
+both: `tn-storage`'s `test_migrate_from_mdbx_*` and
+`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`. The one run on real `v0.16.0-adiri` datadirs is the manual e2e run above: the restarted validator
+migrated both databases and recorded the marker, then could not peer. No lane, and no make target,
+upgrades a whole committee from `v0.16.0-adiri` (every node stopped, then started together on this
+release); rehearse that by hand before upgrading testnet.
+
 **Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
 and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
 the backup is the only way back to `v0.16.0-adiri` (see Rollback).
@@ -899,6 +909,11 @@ and config stay, and so does reth's transaction-pool blob store (`blobstore/`), 
 state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
 moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
 refuses to start while a `.partial` directory is there, and running the command again finishes it.
+It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
+for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
+restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
+pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
+new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
 
 - **In place** (an observer, or a validator that can be out for the rebuild):
 
@@ -909,20 +924,30 @@ refuses to start while a `.partial` directory is there, and running the command 
   telcoin-network node --datadir <datadir> ...                     # rebuilds from genesis
   ```
 
-  The node re-executes every consensus output from its own consensus database and from peers. Each
-  epoch it re-executes is checked against the epoch record it already holds (certified, or its own
-  from before the reset): when it closes the epoch, and again when it enters the next one, the
-  record's `final_state` must be the epoch's closing block in the rebuilt chain, number and hash.
+  The node re-executes the consensus output its own consensus database holds, epoch by epoch from
+  epoch 0, then the output after it from peers. Each epoch it re-executes is checked against the
+  epoch record it already holds (certified, or its own from before the reset): when it closes the
+  epoch, and again when it enters the next one, the record's `final_state` must be the epoch's
+  closing block in the rebuilt chain, number and hash.
   Block hashes chain, so this covers every block up to that closing block: the check finds the
   first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
   final_state does not match this node's closing block` with the epoch and both blocks, counts
   `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
-  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. The reset
-  moves `restored-state-floor` aside with the execution database, so on a datadir once restored
-  from a state pack the rebuild executes and compares every epoch, the restored one included (the
-  restored-block exemption under "Snapshot export / restore" does not apply here). It is out of the
+  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
+  `restored-state-floor` beside a full consensus database (one copied in with a restored
+  observer's execution database by the swap below) moves aside with the execution database, so the
+  rebuild executes and compares every epoch, the restored one included (the restored-block
+  exemption under "Snapshot export / restore" does not apply here). It is out of the
   committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
   validator out leaves no margin, so validators take the swap below.
+
+  A validator rebuilt in place keeps the votes and proposals it made in the epoch it was in: they
+  are in `consensus-db/`, which the reset leaves, and the rebuild's closes of the epochs before
+  it keep them (a close removes only the votes and proposals of the epoch it closes and older
+  ones; each close that keeps some logs `keeping that epoch's votes and proposals` with the
+  epoch). When the node is back in that epoch they keep it from voting twice in a round or
+  proposing a second header for one, as after a restart, so it needs no wait before its start,
+  unlike a fresh datadir (Rollback below).
 
   A record of the node's own that a bad execution wrote stops every rebuild on this release. A
   node that forked (its execution diverged, and it built and stored its own record for that

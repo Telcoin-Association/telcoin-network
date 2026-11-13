@@ -29,8 +29,8 @@ use tn_storage::{
 };
 use tn_types::{
     deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, Certificate,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, DbTxMut as _,
+    Epoch, EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -614,6 +614,9 @@ where
                 //   the first point does not hold, so the clear is skipped whenever `Votes` or
                 //   `LastProposed` holds a row of `current_epoch`: those guards stay, and the older
                 //   rows go at the next boundary as they always did
+                // - a rebuild after `db reset-execution` carries this node's votes and proposals of
+                //   the epoch it was in back through the epochs before it; the clear keeps every
+                //   vote and proposal of `current_epoch` and later
                 // - `OurNodeBatchesCache` is kept, as always
                 self.clear_stale_epoch_tables(current_epoch)?;
                 return Ok(());
@@ -674,7 +677,8 @@ where
         // - every row is from `previous_epoch` or earlier. the epoch `current_epoch` primary is
         //   only built after this function returns, and any earlier pass through here would have
         //   persisted the record, so it has never run on this node and has written no vote or
-        //   proposal that could guard against equivocation
+        //   proposal that could guard against equivocation. a vote or proposal of a later epoch (a
+        //   rebuild after `db reset-execution` carries them) is kept by the clear
         // - `previous_epoch`'s committed output lives in the consensus chain pack, which is not
         //   cleared, and was executed through its closing block. its certificates and votes are not
         //   read again: the epoch `current_epoch` primary neither votes on nor builds on another
@@ -689,7 +693,7 @@ where
             current_epoch,
             "re-derived epoch record written - clearing the previous epoch's consensus db tables",
         );
-        self.clear_consensus_db_for_next_epoch()?;
+        self.clear_consensus_db_for_next_epoch(previous_epoch)?;
         Ok(())
     }
 
@@ -777,7 +781,8 @@ where
                 "epoch record present but the consensus db tables still hold rows of an older epoch \
                  (killed between the record write and the tables clear); clearing them",
             );
-            self.clear_consensus_db_for_next_epoch()?;
+            // `current_epoch` is at least 1 here: epoch 0 has no previous record to recover
+            self.clear_consensus_db_for_next_epoch(current_epoch - 1)?;
         }
         Ok(())
     }
@@ -1086,16 +1091,46 @@ where
     /// is separate from the epoch database's, so their clear is not ordered with the others on
     /// disk; a batch-cache row left by a kill inside the clear is the window the per-table clears
     /// have always had, narrower now that the caches are cleared first.
-    pub(super) fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
+    ///
+    /// `closed_epoch` is the epoch whose tables this clears: the epoch just closed, or the one
+    /// before the epoch being entered. This node's votes and proposals of a later epoch are kept.
+    /// `db reset-execution` keeps the consensus database, and the rebuild replays and closes every
+    /// epoch before the one the node was voting and proposing in; those rows are what keeps it
+    /// from voting twice in a round, or proposing or certifying a second header for one, once it
+    /// is back in that epoch. So when [`later_epoch_guard_row`] finds one, `ProposedCertificates`,
+    /// `LastProposed` and `Votes` lose only their rows of `closed_epoch` and older. Nothing reads
+    /// the kept rows before then: no primary runs in a replayed epoch, the proposer reads
+    /// `LastProposed` only for its own epoch, and a stored vote of a later epoch refuses a header
+    /// of an older one. The close of that later epoch clears them.
+    pub(super) fn clear_consensus_db_for_next_epoch(
+        &self,
+        closed_epoch: Epoch,
+    ) -> eyre::Result<()> {
+        let db = &self.consensus_db;
         // the tables whose rows carry no epoch first, see above
-        self.consensus_db.clear_table::<Payload>()?;
-        self.consensus_db.clear_table::<NodeBatchesCache>()?;
-        self.consensus_db.clear_table::<CertificateDigestByRound>()?;
-        self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
-        self.consensus_db.clear_table::<ProposedCertificates>()?;
-        self.consensus_db.clear_table::<LastProposed>()?;
-        self.consensus_db.clear_table::<Votes>()?;
-        self.consensus_db.clear_table::<Certificates>()?;
+        db.clear_table::<Payload>()?;
+        db.clear_table::<NodeBatchesCache>()?;
+        db.clear_table::<CertificateDigestByRound>()?;
+        db.clear_table::<CertificateDigestByOrigin>()?;
+        if let Some((table, later_epoch)) = later_epoch_guard_row(db, closed_epoch) {
+            warn!(
+                target: "epoch-manager",
+                table,
+                later_epoch,
+                closed_epoch,
+                "the consensus db holds this node's votes or proposals of an epoch after the one \
+                 whose tables are cleared (a rebuild replaying epochs this node already ran); \
+                 keeping that epoch's votes and proposals",
+            );
+            remove_rows_through::<ProposedCertificates, _>(db, closed_epoch, Certificate::epoch)?;
+            remove_rows_through::<LastProposed, _>(db, closed_epoch, Header::epoch)?;
+            remove_rows_through::<Votes, _>(db, closed_epoch, VoteInfo::epoch)?;
+        } else {
+            db.clear_table::<ProposedCertificates>()?;
+            db.clear_table::<LastProposed>()?;
+            db.clear_table::<Votes>()?;
+        }
+        db.clear_table::<Certificates>()?;
         // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
         // orphans and clear then.
         Ok(())
@@ -1318,19 +1353,65 @@ fn stale_first_row<T: Table, DB: TNDatabase>(
 /// if either does.
 ///
 /// Those two tables are what keep this node from voting twice in a round or proposing two headers
-/// for one, so they are the rows a clear must never take from the epoch in progress. `Votes`
-/// holds at most one row per authority and `LastProposed` a single row, so every row of both is
-/// read.
+/// for one, so they are the rows a clear must never take from the epoch in progress.
 pub(super) fn current_epoch_guard_row<DB: TNDatabase>(
     db: &DB,
     current_epoch: Epoch,
 ) -> Option<&'static str> {
-    if db.iter::<Votes>().any(|(_, vote)| vote.epoch() == current_epoch) {
-        return Some(Votes::NAME);
+    guard_row(db, |epoch| epoch == current_epoch).map(|(table, _)| table)
+}
+
+/// The name of the guard table, `Votes` or `LastProposed`, that holds a row of an epoch after
+/// `closed_epoch`, and that epoch, if either does.
+///
+/// `ProposedCertificates` is not read. The certifier stores a certificate only for a header the
+/// proposer stored in `LastProposed` first, and every clear removes an epoch's rows from
+/// `ProposedCertificates` before it removes them from `LastProposed`, so a later epoch's row there
+/// comes with one in `LastProposed`. The table also holds a row for every header this node had
+/// certified in the epoch, too many to read at every close.
+fn later_epoch_guard_row<DB: TNDatabase>(
+    db: &DB,
+    closed_epoch: Epoch,
+) -> Option<(&'static str, Epoch)> {
+    guard_row(db, |epoch| epoch > closed_epoch)
+}
+
+/// The name of the guard table, `Votes` or `LastProposed`, holding a row whose epoch `matches`,
+/// and that epoch, from the first such row. `Votes` holds at most one row per authority and
+/// `LastProposed` a single row, so every row of both is read.
+fn guard_row<DB: TNDatabase>(
+    db: &DB,
+    matches: impl Fn(Epoch) -> bool,
+) -> Option<(&'static str, Epoch)> {
+    db.iter::<Votes>()
+        .map(|(_, vote)| vote.epoch())
+        .find(|epoch| matches(*epoch))
+        .map(|epoch| (Votes::NAME, epoch))
+        .or_else(|| {
+            db.iter::<LastProposed>()
+                .map(|(_, header)| header.epoch())
+                .find(|epoch| matches(*epoch))
+                .map(|epoch| (LastProposed::NAME, epoch))
+        })
+}
+
+/// Remove `T`'s rows whose epoch, as `epoch_of` reads it, is `closed_epoch` or older, in one
+/// transaction, and keep the others.
+fn remove_rows_through<T: Table, DB: TNDatabase>(
+    db: &DB,
+    closed_epoch: Epoch,
+    epoch_of: fn(&T::Value) -> Epoch,
+) -> eyre::Result<()> {
+    let closed: Vec<T::Key> = db
+        .iter::<T>()
+        .filter(|(_, value)| epoch_of(value) <= closed_epoch)
+        .map(|(key, _)| key)
+        .collect();
+    let mut txn = db.write_txn()?;
+    for key in &closed {
+        txn.remove::<T>(key)?;
     }
-    db.iter::<LastProposed>()
-        .any(|(_, header)| header.epoch() == current_epoch)
-        .then_some(LastProposed::NAME)
+    txn.commit()
 }
 
 #[cfg(test)]
@@ -1887,6 +1968,54 @@ mod tests {
             assert_eq!(stale_epoch_table_row(&db, 9), Some((Certificates::NAME, 8)));
             assert_eq!(current_epoch_guard_row(&db, 9), Some(guard), "guard in {guard}");
         }
+    }
+
+    /// A rebuild after `db reset-execution` replays and closes the epochs before the one this node
+    /// was voting and proposing in. Those closes keep that epoch's votes, last proposal and
+    /// proposed certificates, and remove the closed epoch's, so entering that epoch finds its
+    /// guards and nothing stale; its own close clears them with the rest.
+    #[tokio::test]
+    async fn a_replayed_close_keeps_a_later_epochs_votes_and_proposals() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replayed_close_guards")?;
+        let (manager, _engine, _tasks, _keys) = guard_manager(&temp, None).await?;
+        let db = &manager.consensus_db;
+        for (_, write) in epoch_carrying_tables() {
+            write(db, 3);
+        }
+        // rows of the closed epoch beside them: another author's vote and a proposed certificate
+        let other_author = AuthorityIdentifier::from_bytes([4; 32]);
+        db.insert::<Votes>(
+            &other_author,
+            &VoteInfo { epoch: 0, round: 1, vote_digest: VoteDigest::default() },
+        )?;
+        let closed = certificate_of_epoch(0);
+        db.insert::<ProposedCertificates>(&closed.header().digest(), &closed)?;
+        db.insert::<Payload>(&(BlockHash::repeat_byte(1), 0), &0)?;
+
+        manager.clear_consensus_db_for_next_epoch(0)?;
+        let votes: Vec<_> =
+            db.iter::<Votes>().map(|(author, vote)| (author, vote.epoch())).collect();
+        assert_eq!(votes, [(row_author(), 3)], "the later epoch's vote stays, the closed one goes");
+        assert_eq!(db.get::<LastProposed>(&LAST_PROPOSAL_KEY)?.map(|h| h.epoch()), Some(3));
+        let proposed: Vec<_> =
+            db.iter::<ProposedCertificates>().map(|(_, cert)| cert.epoch()).collect();
+        assert_eq!(proposed, [3], "the later epoch's proposed certificate stays");
+        assert_eq!(db.iter::<Certificates>().count(), 0, "certificates are not guards");
+        assert_eq!(db.iter::<Payload>().count(), 0);
+
+        // the next replayed entry and close, and the entry into epoch 3, keep them too
+        assert_eq!(stale_epoch_table_row(db, 1), None);
+        manager.clear_consensus_db_for_next_epoch(1)?;
+        assert_eq!(stale_epoch_table_row(db, 3), None, "nothing stale entering epoch 3");
+        assert_eq!(current_epoch_guard_row(db, 3), Some(Votes::NAME));
+        assert_eq!(db.iter::<ProposedCertificates>().count(), 1);
+
+        // epoch 3's own close clears every table
+        manager.clear_consensus_db_for_next_epoch(3)?;
+        assert_eq!(db.iter::<Votes>().count(), 0);
+        assert_eq!(db.iter::<LastProposed>().count(), 0);
+        assert_eq!(db.iter::<ProposedCertificates>().count(), 0);
+        Ok(())
     }
 
     /// The replay guard tests' manager: an [`EpochManager`] over a fresh datadir, with `floor` as
