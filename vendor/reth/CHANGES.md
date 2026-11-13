@@ -2199,3 +2199,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   to TN-0052) and renumbered one side's. `vendor.py ledger` now prints each id with its entry count
   and fails. *Can reach execution or storage*: no (vendoring tooling only).
   *Upstream*: no (TN's tooling).
+
+- **TN-0146** — NippyJar's dictionary zstd writes with its dictionaries, and a reopened writer
+  commits. *Kind*: fix (upstream bug). *Files*: `crates/storage/nippy-jar/src/{compression/zstd.rs,
+  compression/mod.rs, writer.rs, lib.rs, tn_dictionary_tests.rs}`.
+  *Why*: with `Zstd { use_dict: true }` (upstream's format, version 1, which keeps the trained
+  dictionaries in the configuration) the writer compressed every value with a dictionary-less
+  streaming encoder while the cursor decompressed with the dictionaries; a loaded dictionary kept
+  only its decoder form and serialized as `unreachable!()`, so a writer reopened on a dictionary
+  jar panicked at its first commit; training (`prepare_compression`) was test-only. Now the writer
+  makes one `Compressor` per column from the dictionaries' raw bytes at the jar's level and keeps
+  them for its life; a loaded dictionary keeps its raw bytes; training is public. Jars written by
+  the old writer still read (`test_zstd_013_compatibility`'s checked-in jar). A checksummed jar
+  (version 2, TN-0120) still refuses this compressor at load: its dictionaries would be rewritten
+  with the configuration at every commit. *Can reach execution or storage*: no. The provider's
+  `create_jar` gives headers jars LZ4 and other segments no compressor, never dictionary zstd,
+  and TN never trains a dictionary; a storage-v2 datadir's jars are version 2 (TN-0122), which
+  refuses it. The fix changes only how a dictionary jar is written, a jar TN reads but never
+  writes, so no jar, `.conf` or digest TN writes changes. *Tests*: `test_dictionary_zstd_round_trip`
+  (every value is a frame of the trained dictionary), `test_dictionary_zstd_reopen` (a reopened
+  writer commits and keeps the dictionaries), `test_jars_without_a_dictionary_read_back`,
+  `test_checksummed_jar_refuses_dictionary_zstd`. *Upstream*: maybe (upstream no longer writes
+  dictionary jars).

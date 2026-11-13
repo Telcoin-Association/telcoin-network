@@ -25,9 +25,7 @@ use tracing::*;
 
 /// Compression algorithms supported by `NippyJar`.
 pub mod compression;
-#[cfg(test)]
-use compression::Compression;
-use compression::Compressors;
+use compression::{Compression, Compressors};
 
 /// empty enum for backwards compatibility
 #[derive(Debug, Serialize, Deserialize)]
@@ -358,9 +356,9 @@ impl<H: NippyJarHeader> NippyJar<H> {
         if jar.version != NIPPY_JAR_VERSION && jar.version != NIPPY_JAR_VERSION_CHECKSUMS {
             return Err(NippyJarError::UnsupportedVersion(jar.version))
         }
-        // TN(TN-0120): the dictionary zstd path is not usable (the writer compresses without the
-        // dictionaries the cursor decompresses with, and the cursor `expect`s them), so a
-        // checksummed jar may not name it: refused here rather than panicking on a read.
+        // TN(TN-0120): a checksummed jar may not name dictionary zstd: its dictionaries live in
+        // the configuration, which every commit rewrites. Only upstream's format (version 1)
+        // carries them (TN-0146 makes that path write and reopen correctly).
         if jar.has_checksums() &&
             matches!(&jar.compressor, Some(Compressors::Zstd(zstd)) if zstd.use_dict)
         {
@@ -436,9 +434,10 @@ impl<H: NippyJarHeader> NippyJar<H> {
     }
 }
 
-#[cfg(test)]
 impl<H: NippyJarHeader> NippyJar<H> {
     /// If required, prepares any compression algorithm to an early pass of the data.
+    ///
+    /// TN(TN-0146): no longer test-only: trains a [`compression::Zstd`] jar's dictionaries.
     pub fn prepare_compression(
         &mut self,
         columns: Vec<impl IntoIterator<Item = Vec<u8>>>,
@@ -450,7 +449,10 @@ impl<H: NippyJarHeader> NippyJar<H> {
         }
         Ok(())
     }
+}
 
+#[cfg(test)]
+impl<H: NippyJarHeader> NippyJar<H> {
     /// Writes all data and configuration to a file and the offset index to another.
     pub fn freeze(
         self,
@@ -603,6 +605,9 @@ impl DataReader {
         self.offset_mmap.len()
     }
 }
+
+#[cfg(test)]
+mod tn_dictionary_tests;
 
 #[cfg(test)]
 mod tests {
