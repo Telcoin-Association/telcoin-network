@@ -1,6 +1,7 @@
 //! TN(TN-0057): the per-request bounds that `eth_callMany`, `trace_callMany` and
 //! `debug_traceCallMany` share. Each of them runs any number of calls in one blocking task with
-//! only a per-call gas cap; these bound the request as a whole.
+//! only a per-call gas cap; these bound the request as a whole. `eth_simulateV1` shares the gas
+//! budget across its blocks (TN-0156).
 
 use crate::EthApiError;
 use reth_chainspec::MIN_TRANSACTION_GAS;
@@ -49,6 +50,15 @@ impl CallManyBudget {
         Ok(())
     }
 
+    /// TN(TN-0156): `gas_limit`, lowered to what the budget has left.
+    pub const fn cap(&self, gas_limit: u64) -> u64 {
+        if gas_limit < self.left {
+            gas_limit
+        } else {
+            self.left
+        }
+    }
+
     /// Charges a finished call; fails once the request has used more than its budget.
     pub fn charge(&mut self, gas_used: u64) -> Result<(), EthApiError> {
         self.left = self.left.checked_sub(gas_used).ok_or_else(|| {
@@ -84,6 +94,15 @@ mod tests {
             matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn cap_lowers_a_gas_limit_to_what_is_left() {
+        let mut budget = CallManyBudget::new(50_000);
+        assert_eq!(budget.cap(30_000), 30_000);
+        budget.charge(21_000).unwrap();
+        assert_eq!(budget.cap(30_000), 29_000);
+        assert_eq!(budget.cap(29_000), 29_000);
     }
 
     #[test]

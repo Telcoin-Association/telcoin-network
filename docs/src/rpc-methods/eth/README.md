@@ -25,7 +25,7 @@ The node also serves these `eth` methods. They behave as in reth unless noted.
 | `eth_getRawTransactionByHash` | |
 | `eth_getTransactionBySenderAndNonce` | `null` when the sender's nonce moved without a transaction of theirs in the block (a contract creation, or a system call) |
 | `eth_sendRawTransactionSync` | Guarded by `--rpc.txfeecap` like `eth_sendRawTransaction` |
-| `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks`. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
+| `eth_simulateV1` | Block count capped by `--rpc.max-simulate-blocks`. One request shares a gas budget of `--rpc.gascap` across the calls of all its blocks: a call runs with at most the gas the earlier calls left, even if its `gas` is higher, and the request fails once less than 21,000 gas is left for the next call. Under the default `--rpc.pending-block none`, `pending` selects the latest block |
 | `eth_subscribe`, `eth_unsubscribe` | WebSocket and IPC only. A `logs` subscription's filter takes the same size limit as `eth_getLogs`: at most 1,000 addresses and 1,000 values per topic position |
 
 These are registered but cannot do useful work on Telcoin Network:

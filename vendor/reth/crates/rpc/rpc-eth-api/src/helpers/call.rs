@@ -103,6 +103,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             self.spawn_with_state_at_block(state_at, move |this, mut db| {
                 let _permit = permit;
+                // TN(TN-0156): the request's calls share one gas budget across its blocks, as
+                // `eth_callMany`'s do.
+                let mut budget = CallManyBudget::new(this.call_gas_limit());
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
@@ -245,6 +248,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             builder,
                             calls,
                             default_gas_limit,
+                            &mut budget,
                             chain_id,
                             this.converter(),
                         )
@@ -265,6 +269,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             builder,
                             calls,
                             default_gas_limit,
+                            &mut budget,
                             chain_id,
                             this.converter(),
                         )

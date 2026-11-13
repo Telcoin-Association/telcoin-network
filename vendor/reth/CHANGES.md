@@ -2393,3 +2393,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   position installs), `oversized_log_subscriptions_are_refused` (refused before acceptance,
   accepted at the limit); `active_filters_are_bounded` and the other filter tests unchanged.
   Mutation-checked: `check_filter_size` accepting every filter (both fail). *Upstream*: yes.
+
+- **TN-0156** — `eth_simulateV1` shares one gas budget of `--rpc.gascap` across all its
+  blocks. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/call_many.rs` (`CallManyBudget::cap`, test
+  `cap_lowers_a_gas_limit_to_what_is_left`), `crates/rpc/rpc-eth-types/src/simulate.rs`
+  (`execute_transactions` takes the budget: before each call it refuses the request when less
+  than 21,000 gas is left and lowers the call's gas limit, given or default, to what is left;
+  after the call it charges the gas used), `crates/rpc/rpc-eth-api/src/helpers/call.rs`
+  (`simulate_v1` makes one budget per request), `crates/rpc/rpc/src/eth/helpers/call.rs`
+  (tests `simulated_blocks_share_the_gas_budget`, `a_simulated_call_runs_with_at_most_the_budget`).
+  *Why*: TN-0057 bounded `eth_callMany` and the trace and debug variants as one request, but
+  `eth_simulateV1`, in the same default `eth` namespace, could run 256 blocks
+  (`--rpc.max-simulate-blocks`) with any number of calls each, and a call's own `gas` was bounded
+  only by its block's gas limit, which a block override may raise to the call cap: about 1.3e10
+  gas per request on one blocking thread, with cancellation only between calls. Upstream fixed
+  it in b8116b42b (#24387, after v1.11.4); the pick does not apply to this base (its Amsterdam
+  gas split needs a newer revm and alloy-evm), so this takes its rule: a call runs with at most
+  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request now
+  uses at most `--rpc.gascap` gas in all (50M by default), the budget `eth_callMany` has, and
+  fails with the same -32602 error (`request exceeds the gas budget of <cap>`). Requests that
+  stay under the budget get the same results, except a call whose gas limit, given or default,
+  exceeded what was left, which now runs with less gas. How the default is chosen (the block's
+  gas split among the calls without `gas`, capped at the call cap) is unchanged. *Can reach execution or storage*: no.
+  RPC only: simulated blocks are built on a throwaway state with no state root and are never
+  stored, and nothing on the block execution or storage path calls `execute_transactions`.
+  *Tests*: `simulated_blocks_share_the_gas_budget` (three one-transfer blocks pass a 63,000
+  budget, the third is refused under 50,000), `a_simulated_call_runs_with_at_most_the_budget` (a
+  looping call with `gas` 1,000,000 under a 100,000 budget uses 100,000 and fails, and a transfer
+  after it is refused), `cap_lowers_a_gas_limit_to_what_is_left`; TN-0057's tests unchanged.
+  Mutation-checked: an unlimited budget in `simulate_v1` (both simulate tests fail).
+  *Upstream*: no (upstream has b8116b42b).
