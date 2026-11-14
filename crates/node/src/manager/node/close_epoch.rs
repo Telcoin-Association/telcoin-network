@@ -335,6 +335,11 @@ where
     /// the output's number and digest with `path = "leftover_queue"` and counts in
     /// `tn_node.leftover_outputs_skipped_total`: a count above zero says an output
     /// was queued twice.
+    ///
+    /// The queue phase holds the output it took across `process_output`'s wait
+    /// for room. That is safe only while nothing in the epoch loop races this
+    /// drain (only the node's exit drops it, and the restart replay forwards the
+    /// output from the consensus pack): do not put the drain under a `select!`.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
