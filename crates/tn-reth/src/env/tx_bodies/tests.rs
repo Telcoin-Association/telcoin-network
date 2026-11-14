@@ -9,26 +9,12 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use reth_provider::{
-    providers::TxRow, DatabaseProviderFactory as _, StaticFileProviderFactory as _,
-    TransactionsProvider as _,
-};
 use tempfile::TempDir;
 use tn_storage::consensus_pack::BatchReadError;
-use tn_types::{
-    test_genesis, Address, Batch, CertifiedBatch, ConsensusHeader, ConsensusOutput,
-    Encodable2718 as _, Epoch, ExecHeader, SealedHeader, TaskManager, B256,
-};
+use tn_types::{Batch, Epoch, ExecHeader, B256};
 
 use super::*;
-use crate::{
-    env::OutputBuildScope,
-    payload::TNPayload,
-    test_utils::{
-        batch_with_transactions, consensus_output_for_tests, seeded_genesis_from_random_batches,
-    },
-    DatadirFormat, NewCanonicalChain, RethChainSpec, StorageLayout, TxBodies,
-};
+use crate::test_utils::batch_with_transactions;
 
 /// Bytes that do not decode as an EIP-2718 transaction.
 const UNDECODABLE_TX: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
@@ -479,111 +465,136 @@ fn a_missing_pack_is_mid_install_only_beside_an_install() -> eyre::Result<()> {
 
 // --- end to end: the engine's persist on a pointer datadir ------------------------------------
 
-/// Consensus output `number` with one certificate carrying `batches`, each under its digest.
-fn output_with(number: u64, batches: Vec<Batch>) -> ConsensusOutput {
-    let base = consensus_output_for_tests(number as u32, 0, number, false);
-    let digests: Vec<B256> = batches.iter().map(Batch::digest).collect();
-    ConsensusOutput::new(
-        base.sub_dag().clone(),
-        ConsensusHeader::default().digest(),
-        number,
-        false,
-        digests.into(),
-        vec![CertifiedBatch { address: Address::ZERO, batches }],
-    )
-}
+/// Pointer datadirs are storage v2, which runs on the tn-lmdb build only.
+#[cfg(not(feature = "mdbx"))]
+mod end_to_end {
+    use super::*;
+    use reth_provider::{
+        providers::TxRow, DatabaseProviderFactory as _, StaticFileProviderFactory as _,
+        TransactionsProvider as _,
+    };
+    use tn_types::{
+        test_genesis, Address, CertifiedBatch, ConsensusHeader, ConsensusOutput,
+        Encodable2718 as _, SealedHeader, TaskManager,
+    };
 
-/// Execute `output` on `env` as the engine does: recover the signers, build one block per batch
-/// under its digest, persist the blocks with their positions, then hand the persisted batches to
-/// the env's cache fill. Returns the last block's header.
-fn execute_as_the_engine(
-    env: &RethEnv,
-    mut parent: SealedHeader,
-    output: &ConsensusOutput,
-) -> eyre::Result<SealedHeader> {
-    let mut scope = OutputBuildScope::new();
-    let cims = env.canonical_in_memory_state();
-    let (mut blocks, mut positions) = (Vec::new(), Vec::new());
-    for (index, recovered) in RethEnv::recover_output_signers(output).into_iter().enumerate() {
-        let digest = output.get_batch_digest(index).unwrap_or_default();
-        let payload = TNPayload::new_for_test_with(
-            parent.clone(),
-            output,
-            Address::repeat_byte(0xbe),
-            digest,
-            digest,
-        );
-        let built = env.build_block_from_recovered_payload(payload, recovered, &mut scope)?;
-        parent = built.block.recovered_block.clone_sealed_header();
-        cims.update_chain(NewCanonicalChain::Commit { new: vec![built.block.clone()] });
-        cims.set_canonical_head(parent.clone());
-        blocks.push(built.block);
-        positions.push(built.tx_positions);
+    use crate::{
+        env::OutputBuildScope,
+        payload::TNPayload,
+        test_utils::{consensus_output_for_tests, seeded_genesis_from_random_batches},
+        DatadirFormat, NewCanonicalChain, RethChainSpec, StorageLayout, TxBodies,
+    };
+
+    /// Consensus output `number` with one certificate carrying `batches`, each under its digest.
+    fn output_with(number: u64, batches: Vec<Batch>) -> ConsensusOutput {
+        let base = consensus_output_for_tests(number as u32, 0, number, false);
+        let digests: Vec<B256> = batches.iter().map(Batch::digest).collect();
+        ConsensusOutput::new(
+            base.sub_dag().clone(),
+            ConsensusHeader::default().digest(),
+            number,
+            false,
+            digests.into(),
+            vec![CertifiedBatch { address: Address::ZERO, batches }],
+        )
     }
-    env.persist_executed_output(&blocks, &positions)?;
-    env.cache_persisted_batches(output, &positions);
-    Ok(parent)
-}
 
-/// On a pointer datadir (the jar policy on before genesis), the engine's persist writes position
-/// rows (tag 1) into a tagged jar, and every transaction reads back through the resolver exactly
-/// as the same chain stored inline reads it: by number, by range and by hash, compared by
-/// encoding and hash. The inline datadir's rows are inline.
-#[tokio::test]
-async fn persisted_position_rows_read_back_as_the_inline_chain() -> eyre::Result<()> {
-    // an undecodable transaction between the decodable ones: its position is skipped
-    let mut a = batch_with_transactions(tn_types::test_chain_spec_arc(), 3, 0);
-    let b = batch_with_transactions(tn_types::test_chain_spec_arc(), 2, 0);
-    let (genesis, ..) = seeded_genesis_from_random_batches(test_genesis(), [&a, &b]);
-    a.transactions.insert(1, UNDECODABLE_TX.to_vec());
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-    let output = output_with(1, vec![a, b]);
+    /// Execute `output` on `env` as the engine does: recover the signers, build one block per batch
+    /// under its digest, persist the blocks with their positions, then hand the persisted batches
+    /// to the env's cache fill. Returns the last block's header.
+    fn execute_as_the_engine(
+        env: &RethEnv,
+        mut parent: SealedHeader,
+        output: &ConsensusOutput,
+    ) -> eyre::Result<SealedHeader> {
+        let mut scope = OutputBuildScope::new();
+        let cims = env.canonical_in_memory_state();
+        let (mut blocks, mut positions) = (Vec::new(), Vec::new());
+        for (index, recovered) in RethEnv::recover_output_signers(output).into_iter().enumerate() {
+            let digest = output.get_batch_digest(index).unwrap_or_default();
+            let payload = TNPayload::new_for_test_with(
+                parent.clone(),
+                output,
+                Address::repeat_byte(0xbe),
+                digest,
+                digest,
+            );
+            let built = env.build_block_from_recovered_payload(payload, recovered, &mut scope)?;
+            parent = built.block.recovered_block.clone_sealed_header();
+            cims.update_chain(NewCanonicalChain::Commit { new: vec![built.block.clone()] });
+            cims.set_canonical_head(parent.clone());
+            blocks.push(built.block);
+            positions.push(built.tx_positions);
+        }
+        env.persist_executed_output(&blocks, &positions)?;
+        env.cache_persisted_batches(output, &positions);
+        Ok(parent)
+    }
 
-    let tmp = TempDir::new()?;
-    let tm = TaskManager::new("tx bodies end to end");
-    let mut read = Vec::new();
-    for tx_bodies in [TxBodies::Inline, TxBodies::Pointers] {
-        let format = DatadirFormat { layout: StorageLayout::V2, tx_bodies };
-        let path = tmp.path().join(tx_bodies.to_string());
-        let env = RethEnv::new_for_temp_chain_with_format(chain.clone(), &path, &tm, format)?;
-        assert_eq!(env.datadir_format(), format);
-        execute_as_the_engine(&env, chain.sealed_genesis_header(), &output)?;
+    /// On a pointer datadir (the jar policy on before genesis), the engine's persist writes
+    /// position rows (tag 1) into a tagged jar, and every transaction reads back through the
+    /// resolver exactly as the same chain stored inline reads it: by number, by range and by
+    /// hash, compared by encoding and hash. The inline datadir's rows are inline.
+    #[tokio::test]
+    async fn persisted_position_rows_read_back_as_the_inline_chain() -> eyre::Result<()> {
+        // an undecodable transaction between the decodable ones: its position is skipped
+        let mut a = batch_with_transactions(tn_types::test_chain_spec_arc(), 3, 0);
+        let b = batch_with_transactions(tn_types::test_chain_spec_arc(), 2, 0);
+        let (genesis, ..) = seeded_genesis_from_random_batches(test_genesis(), [&a, &b]);
+        a.transactions.insert(1, UNDECODABLE_TX.to_vec());
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let output = output_with(1, vec![a, b]);
 
-        let static_files = env.blockchain_provider().static_file_provider();
-        let rows = static_files.tx_rows_by_tx_range(0..4)?;
-        let positions: Vec<Option<u32>> = rows
-            .iter()
-            .map(|row| match row {
-                TxRow::Ref(position) => Some(*position),
-                TxRow::Inline(_) => None,
-            })
-            .collect();
-        match tx_bodies {
-            TxBodies::Inline => assert_eq!(positions, [None; 4]),
-            TxBodies::Pointers => {
-                assert_eq!(positions, [Some(0), Some(2), Some(3), Some(0)], "a skips position 1")
+        let tmp = TempDir::new()?;
+        let tm = TaskManager::new("tx bodies end to end");
+        let mut read = Vec::new();
+        for tx_bodies in [TxBodies::Inline, TxBodies::Pointers] {
+            let format = DatadirFormat { layout: StorageLayout::V2, tx_bodies };
+            let path = tmp.path().join(tx_bodies.to_string());
+            let env = RethEnv::new_for_temp_chain_with_format(chain.clone(), &path, &tm, format)?;
+            assert_eq!(env.datadir_format(), format);
+            execute_as_the_engine(&env, chain.sealed_genesis_header(), &output)?;
+
+            let static_files = env.blockchain_provider().static_file_provider();
+            let rows = static_files.tx_rows_by_tx_range(0..4)?;
+            let positions: Vec<Option<u32>> = rows
+                .iter()
+                .map(|row| match row {
+                    TxRow::Ref(position) => Some(*position),
+                    TxRow::Inline(_) => None,
+                })
+                .collect();
+            match tx_bodies {
+                TxBodies::Inline => assert_eq!(positions, [None; 4]),
+                TxBodies::Pointers => {
+                    assert_eq!(
+                        positions,
+                        [Some(0), Some(2), Some(3), Some(0)],
+                        "a skips position 1"
+                    )
+                }
             }
+            // the committed rows, through the database provider (the in-memory blocks are not read)
+            let provider = env.blockchain_provider().database_provider_ro()?;
+            let by_range = provider.transactions_by_tx_range(0..4)?;
+            let mut by_number = Vec::new();
+            for n in 0..4 {
+                let tx = provider.transaction_by_id(n)?.expect("stored");
+                let hash = *tx.tx_hash();
+                assert_eq!(provider.transaction_by_hash(hash)?.map(|t| *t.tx_hash()), Some(hash));
+                by_number.push(tx);
+            }
+            assert_eq!(by_range.len(), 4);
+            for (x, y) in by_range.iter().zip(&by_number) {
+                assert_eq!(x.encoded_2718(), y.encoded_2718());
+            }
+            read.push(by_number);
         }
-        // the committed rows, through the database provider (the in-memory blocks are not read)
-        let provider = env.blockchain_provider().database_provider_ro()?;
-        let by_range = provider.transactions_by_tx_range(0..4)?;
-        let mut by_number = Vec::new();
-        for n in 0..4 {
-            let tx = provider.transaction_by_id(n)?.expect("stored");
-            let hash = *tx.tx_hash();
-            assert_eq!(provider.transaction_by_hash(hash)?.map(|t| *t.tx_hash()), Some(hash));
-            by_number.push(tx);
-        }
-        assert_eq!(by_range.len(), 4);
-        for (x, y) in by_range.iter().zip(&by_number) {
+        let (inline, pointers) = (&read[0], &read[1]);
+        for (x, y) in inline.iter().zip(pointers) {
             assert_eq!(x.encoded_2718(), y.encoded_2718());
+            assert_eq!(x.tx_hash(), y.tx_hash());
         }
-        read.push(by_number);
+        Ok(())
     }
-    let (inline, pointers) = (&read[0], &read[1]);
-    for (x, y) in inline.iter().zip(pointers) {
-        assert_eq!(x.encoded_2718(), y.encoded_2718());
-        assert_eq!(x.tx_hash(), y.tx_hash());
-    }
-    Ok(())
 }
