@@ -415,15 +415,21 @@ where
         // with the correct record. That is why epoch 0 reuses only a record with a certificate,
         // instead of any record like in the general case. Without this we never overwrite the
         // dummy epoch 0 record with the proper record and would break sync. An uncertified record
-        // 0 that is not the dummy (this node's own, still waiting for its certificate) is built
-        // again: the build is deterministic, so `save_record` accepts an identical record and
-        // refuses a different one (`ConflictingRecord`), which stops the node.
+        // 0 that is not the dummy (this node's own, still waiting for its certificate; the dummy
+        // is the one record with a default `final_state`) goes through the replay guard first, so
+        // a closing block that differs stops the node as at any other epoch, logged and counted.
+        // It is then built again: the build is deterministic, so `save_record` accepts an
+        // identical record and refuses a different one (`ConflictingRecord`), which stops the node.
         //
         // A failed read answers `None` here, never a reason to skip the guard: the record is then
         // built and `save_record` compares the whole stored record (its digest) with the new one.
         let stored = match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
             Some((epoch_rec, cert)) if cert.is_some() || epoch != 0 => {
                 Some((epoch_rec, cert.is_some()))
+            }
+            Some((epoch_rec, None)) if epoch_rec.final_state != BlockNumHash::default() => {
+                self.check_stored_record(&epoch_rec, false, parent_state, engine).await?;
+                None
             }
             _ => None,
         };
@@ -1261,7 +1267,7 @@ pub(super) enum StoredFinalState {
 ///   value: a default `final_state` (block 0, the zero hash) is compared like any other and never
 ///   matches a closing block. The epoch-0 dummy record, the one record with a default
 ///   `final_state`, never reaches this check (`write_epoch_record` builds over it, and
-///   `recover_previous_epoch_record` re-derives it).
+///   `recover_previous_epoch_record` re-derives it); this node's own uncertified record 0 does.
 pub(super) fn check_stored_final_state(
     stored: &EpochRecord,
     certified: bool,
@@ -2202,6 +2208,42 @@ mod tests {
         execute_to(&manager, recorded);
         manager.write_epoch_record(0, &engine).await?;
         assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record0));
+        Ok(())
+    }
+
+    /// This node's own uncertified record 0 (not the dummy: its `final_state` is set) is compared
+    /// before the close builds record 0 again: a closing block that differs stops the close with
+    /// the replay guard's mismatch (logged and counted), unpublished, not with the store's
+    /// conflicting-record refusal.
+    #[tokio::test]
+    async fn replay_guard_stops_on_an_uncertified_epoch0_record_that_does_not_match(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("replay_guard_own_epoch0")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let genesis = engine
+            .get_reth_env()
+            .await
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre!("genesis header"))?
+            .num_hash();
+        let recorded = block(0, 0x10);
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: recorded,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save_record(record0).await?;
+        execute_to(&manager, genesis);
+        manager.last_consensus_header = Some(tn_types::ConsensusHeader::default());
+
+        let mismatch = expect_mismatch(manager.write_epoch_record(0, &engine).await);
+        assert_eq!(
+            mismatch,
+            FinalStateMismatch { epoch: 0, certified: false, recorded, local: genesis }
+        );
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
         Ok(())
     }
 
