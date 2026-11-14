@@ -742,8 +742,10 @@ async fn store_epoch_record(
 /// the others.
 ///
 /// A gap whose certificate is stored already, by whatever path, is dropped without a request; so
-/// is one whose certificate this request stores, and the store is persisted then. Fails where
-/// [`store_epoch_record`] does, and when that persist fails.
+/// is one whose certificate this request stores, and the store is persisted then. Only a stored
+/// certificate closes a gap: a read of the gap's epoch that fails (the store reports it as absent)
+/// keeps the gap, unasked, for the next retry. Fails where [`store_epoch_record`] does, and when
+/// that persist fails.
 async fn retry_gaps(
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
@@ -757,11 +759,14 @@ async fn retry_gaps(
         collection.gaps.range(from..).chain(collection.gaps.range(..from)).copied().collect();
     let mut stored = false;
     for epoch in open {
-        let uncertified =
-            matches!(consensus_chain.epochs().get_epoch_by_number(epoch).await, Some((_, None)));
-        if !uncertified {
-            collection.gaps.remove(&epoch);
-            continue;
+        match consensus_chain.epochs().get_epoch_by_number(epoch).await {
+            Some((_, Some(_))) => {
+                collection.gaps.remove(&epoch);
+                continue;
+            }
+            Some((_, None)) => {}
+            // the read failed: the record was stored when the gap opened and is never removed
+            None => continue,
         }
         let answer = tokio::select! {
             biased;
@@ -2429,6 +2434,30 @@ mod tests {
         };
         assert_eq!(name, "Epoch Record Collector");
         assert!(notified.elapsed() < GAP_RETRY_DEADLINE, "{:?}", notified.elapsed());
+        Ok(())
+    }
+
+    /// A gap closes only on a stored certificate. One whose read fails (here an epoch the store
+    /// does not hold, which a failed read reports the same way) stays open and is not asked for;
+    /// an uncertified one is asked for and stays open while no peer holds it.
+    #[tokio::test]
+    async fn test_retry_gaps_keeps_a_gap_whose_read_fails() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (_directory, chain, _records) = own_uncertified_epoch1(&fixture, 1).await?;
+        let peer = keys_and_signers(&fixture).0[0];
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let handle =
+            mock_changing_network(Default::default(), Default::default(), peer, requests_tx);
+        let bus = ConsensusBus::new();
+        let (metrics, _snapshotter) = local_metrics();
+        let mut collection = Collection::new(WALK, &metrics);
+        collection.gaps.extend([1, 5]);
+        let shutdown = tn_types::ShutdownNotifier::new();
+
+        retry_gaps(&chain, &handle, bus.app(), &mut collection, &shutdown.subscribe()).await?;
+        assert_eq!(collection.gaps, BTreeSet::from([1, 5]));
+        expect_requests(&mut requests, &[1, 1, 1]).await?;
+        assert!(requests.try_recv().is_err(), "the unreadable gap must not be asked for");
         Ok(())
     }
 }
