@@ -1342,6 +1342,7 @@ where
             &primary_network_handle,
             &self.consensus_bus,
             self.node_shutdown.subscribe(),
+            &self.builder.tn_config.parameters,
         )
         .await?;
         info!(target: "epoch-manager", "startup epoch record sync finished");
@@ -1361,6 +1362,7 @@ where
             self.consensus_bus.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
+            &self.builder.tn_config.parameters,
         )
         .await?;
 
