@@ -139,11 +139,18 @@ pub const ADIRI_CHAIN_ID: u64 = 2017;
 pub const TESTNET_GENESIS: &str = include_str!("../../../chain-configs/testnet/genesis.yaml");
 pub const TESTNET_COMMITTEE: &str = include_str!("../../../chain-configs/testnet/committee.yaml");
 pub const TESTNET_PARAMETERS: &str = include_str!("../../../chain-configs/testnet/parameters.yaml");
+/// The adiri (testnet) bootstrap servers: a YAML map of [`crate::BootstrapServer`] keyed by BLS
+/// public key, which a node started with `--chain adiri` dials to join the network.
+pub const TESTNET_BOOTSTRAP_SERVERS: &str =
+    include_str!("../../../chain-configs/testnet/bootstrap_servers.yaml");
 
 // The raw strings for the mainnet genesis and config.
 pub const MAINNET_GENESIS: &str = include_str!("../../../chain-configs/mainnet/genesis.yaml");
 pub const MAINNET_COMMITTEE: &str = include_str!("../../../chain-configs/mainnet/committee.yaml");
 pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainnet/parameters.yaml");
+/// The mainnet bootstrap servers, in the shape of [`TESTNET_BOOTSTRAP_SERVERS`].
+pub const MAINNET_BOOTSTRAP_SERVERS: &str =
+    include_str!("../../../chain-configs/mainnet/bootstrap_servers.yaml");
 
 #[cfg(test)]
 mod tests {

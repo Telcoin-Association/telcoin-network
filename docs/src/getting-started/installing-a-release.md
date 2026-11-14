@@ -102,7 +102,7 @@ The lines above it show which check failed, and [When verification fails](#when-
 ### Chain-config files
 
 `SHA256SUMS` lists the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their path in the repository: `chain-configs/testnet/` for an `-adiri` tag and `chain-configs/mainnet/` for any other.
-These are the files built into the release's binary for `--chain`.
+These are the files built into the release's binary for `--chain` that a datadir can also hold. The binary also carries the network's `bootstrap_servers.yaml`, the servers a `--chain` node dials to join; the node never reads that file from disk, so it is checked as part of the binary, by the tarball's hash.
 The block extracts them from the tag into `chain-configs/`, so `sha256sum` checks them against their signed hashes, and you can use these copies.
 To check copies you already have, run this from the directory that holds their `chain-configs/` folder, such as the root of a checkout of the tag, with the path of the verified `SHA256SUMS`:
 

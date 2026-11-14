@@ -1,0 +1,51 @@
+# Bootstrap servers for mainnet (chain id 731), built into the binary.
+#
+# PLACEHOLDERS: these are the throwaway mainnet placeholder validators on loopback addresses
+# (chain-configs/README.md). The real list is set before launch.
+#
+# A node started with `--chain mainnet` dials these to join the network. They serve only that
+# first contact: once a node has peers, kademlia and the peer records it learns take over.
+# Listing a server here grants no committee membership; any reachable node can serve, and the
+# list need not match the genesis committee.
+#
+# The list changes with a software release: edit this file and build a new binary.
+# `network-config`'s `bootstrap_peers` and the node's `--bootstrap-peers` flag override it.
+# Each entry is keyed by the server's BLS public key and lists its primary and its workers in
+# worker id order; every address ends with `/p2p/<peer id>` of the entry's network key.
+---
+obmxJtyxsTcVYCTEfx5xosy2PTTgbsH8LLhPUZFF34NEB8KzMcx5goV78QUcAMFvvhTPaZzizsUDgrfV5zzDwobsS8KKsJvLEL6C8ohNjmz3BJB49Ekb7czVHy5Rcfkkrcc:
+  primary:
+    network_address: /ip4/127.0.0.1/udp/64520/quic-v1/p2p/12D3KooWBqRFymcveQpVRW7xRTbJbFY4FK4mbbQTTrvrdnbSxS99
+    network_key: 4XTTM3A6upv61Fmx9TAaNYVV8jrBiiz4Dip1hC5Lcg2CyvCvF
+    rpc: ~
+  workers:
+    - network_address: /ip4/127.0.0.1/udp/61534/quic-v1/p2p/12D3KooWMdq3sckEGxXeKqE9cLQNoS5VsjQ69QCmUjy8MdoqauSb
+      network_key: 4XTTMCxWhimDJtKfJMVgZjNJCx2jAMQPYGcp1CxNtPsRNYgDh
+      rpc: ~
+uLb48DaFYYbWAmWyuaSLrRqquDEsAFF9NvqmQfccRjr3Q7UY528X4YtvQUSAhHux2bLoy255tTdfJq9mBtwgEi54APqWq1XEwZ7yYWAVoBQisA8knKS2EWHLk7GnNntCUWx:
+  primary:
+    network_address: /ip4/127.0.0.1/udp/55049/quic-v1/p2p/12D3KooWS7rNXuA1bTjpzqGiGQypW9HrMq3heV75GRNuHHSX4EC6
+    network_key: 4XTTMHSY2P3d6CpsV2Vj8PSseejwWqW39mhiJzdnfKX441zyC
+    rpc: ~
+  workers:
+    - network_address: /ip4/127.0.0.1/udp/52936/quic-v1/p2p/12D3KooWKqGikRCg8ytVvd8oQPLzFVgnszRxEp2HwLkDJJ3utqcY
+      network_key: 4XTTMB9xNbZfkkM29xHbDXREpQ6LTMfRQN2dXfZ9yLXfSrcPe
+      rpc: ~
+za9ri83Dp45Hdip9kUt67ngpzgk5WJNeJqTpXjAyk9tq92NZSdoco85uwTQZGaXSwNAwSp4rr9mVppJ5A7Hf3NApqwU6qrCePm9dyjWXk1DqHgefErgtymqf3cu34yqM4Mg:
+  primary:
+    network_address: /ip4/127.0.0.1/udp/64194/quic-v1/p2p/12D3KooWJWpfZ6UKN8wzKCn6MZEhzWZ4jZDfMViFfLyJn2Ur3VEc
+    network_key: 4XTTM9qWKQEwPyW5eLsEWUb8Y97CjDED7UiKVPZP4pG6P1G1i
+    rpc: ~
+  workers:
+    - network_address: /ip4/127.0.0.1/udp/54980/quic-v1/p2p/12D3KooWLephz8zV4PQCs42ZzMc1t1aRUronHS3TAq85qSCVnJQY
+      network_key: 4XTTMByWMqHTZfkXrtiUz7PVr2cE5xXoEQeegu3Xqsfp2k5Be
+      rpc: ~
+21fAHXsP96dUJPXWnACeYS1LNAmCHGt4PW24Nyh9sVXrSCoZNp872yPR7M92gTVYyeqhxU6QRsCPbkavLgJAnmTqBJEgstPvS5TU6X9w6Dh1pBcm99TvEKW4Kzxovs5AGmxL:
+  primary:
+    network_address: /ip4/127.0.0.1/udp/57549/quic-v1/p2p/12D3KooW9uRUWQLGZmnmFBahQMJZcr9YAevtg9EbGZAaHxs9a4c8
+    network_key: 4XTTM1E78MYoMB8vRGr37XPCPmSoCeKvLoMqpzmaLLCUgXqPE
+    rpc: ~
+  workers:
+    - network_address: /ip4/127.0.0.1/udp/51098/quic-v1/p2p/12D3KooWFmNdo5kazupCMBUEBvK2iBgQiiotftvPERqa7j5VdN9d
+      network_key: 4XTTM764HeEDfcGwrNqveJxCrrnL5CPoLo7XcxeFL9xh2b8vj
+      rpc: ~

@@ -21,7 +21,7 @@
 //! is visible without being disruptive.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -30,7 +30,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use tn_kad_client::{BlsPublicKey, Multiaddr};
 use tn_node_record::{parse_bls_pubkey, ParseBlsPubkeyError};
-use tn_types::{Committee, WorkerId};
+use tn_types::{BootstrapServer, Committee, WorkerId};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -389,11 +389,23 @@ pub fn committee_keys(committee: &Committee) -> BTreeSet<BlsPublicKey> {
     committee.authorities().iter().map(|authority| *authority.protocol_key()).collect()
 }
 
+/// Load a bootstrap servers file: the BLS-keyed map of `chain-configs/*/bootstrap_servers.yaml`.
+pub fn load_bootstrap_servers(
+    path: &Path,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, KeySourceError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|source| KeySourceError::Read { path: path.to_path_buf(), source })?;
+    serde_yaml::from_str(&text)
+        .map_err(|source| KeySourceError::Yaml { path: path.to_path_buf(), source })
+}
+
 /// The DHT addresses of every bootstrap server's worker `worker_id`, in key order. A bootstrap
 /// entry that advertises fewer workers is skipped (the list is a dial hint, not an invariant).
-pub fn worker_bootstrap_addrs(committee: &Committee, worker_id: WorkerId) -> Vec<Multiaddr> {
-    committee
-        .bootstrap_servers()
+pub fn worker_bootstrap_addrs(
+    servers: &BTreeMap<BlsPublicKey, BootstrapServer>,
+    worker_id: WorkerId,
+) -> Vec<Multiaddr> {
+    servers
         .values()
         .filter_map(|server| server.worker(worker_id).map(|node| node.network_address.clone()))
         .collect()
@@ -455,6 +467,12 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chain-configs/testnet/committee.yaml")
     }
 
+    /// The real testnet bootstrap servers, relative to the crate.
+    fn testnet_bootstrap_servers_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../chain-configs/testnet/bootstrap_servers.yaml")
+    }
+
     fn hex_of(key: &BlsPublicKey) -> String {
         format!("0x{}", hex::encode(key.as_ref()))
     }
@@ -468,7 +486,7 @@ mod tests {
 
         let committee = load_committee(file.path()).expect("fixture parses");
         assert_eq!(committee_keys(&committee), source.keys);
-        let addrs = worker_bootstrap_addrs(&committee, 0);
+        let addrs = worker_bootstrap_addrs(&committee.bootstrap_servers(), 0);
         assert_eq!(addrs.len(), 2);
         for addr in &addrs {
             let text = addr.to_string();
@@ -476,23 +494,40 @@ mod tests {
             assert!(text.contains("/p2p/"), "{text}");
         }
         // the fixture's bootstrap entries advertise a single worker
-        assert!(worker_bootstrap_addrs(&committee, 1).is_empty());
+        assert!(worker_bootstrap_addrs(&committee.bootstrap_servers(), 1).is_empty());
     }
 
+    /// The testnet committee file lists the five validators and no bootstrap servers; the
+    /// testnet bootstrap servers file supplies the worker DHT addresses.
     #[test]
-    fn real_testnet_committee_has_five_validators_on_the_worker_port() {
+    fn real_testnet_files_give_keys_and_worker_bootstrap_addrs() {
         let path = testnet_committee_path();
         let committee = load_committee(&path).expect("testnet committee parses");
         let keys = committee_keys(&committee);
         assert_eq!(keys.len(), 5);
-        let addrs = worker_bootstrap_addrs(&committee, 0);
-        assert_eq!(addrs.len(), 5);
-        for addr in addrs {
-            let text = addr.to_string();
-            assert!(text.contains("/udp/49594/quic-v1/p2p/"), "{text}");
-        }
+        assert!(committee.bootstrap_servers().is_empty());
         let source = CommitteeFileKeys::load(&path).expect("loads");
         assert_eq!(source.keys, keys);
+
+        let servers = load_bootstrap_servers(&testnet_bootstrap_servers_path())
+            .expect("testnet bootstrap servers parse");
+        let addrs = worker_bootstrap_addrs(&servers, 0);
+        assert!(!addrs.is_empty());
+        assert_eq!(addrs.len(), servers.len());
+        for addr in addrs {
+            let text = addr.to_string();
+            assert!(text.contains("/quic-v1/p2p/"), "{text}");
+        }
+    }
+
+    /// A bootstrap servers file that is not the BLS-keyed map is an error naming the file.
+    #[test]
+    fn bad_bootstrap_servers_file_names_the_file() {
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(b"- not a map\n").expect("write");
+        let error = load_bootstrap_servers(file.path()).expect_err("a list is not a server map");
+        assert!(matches!(error, KeySourceError::Yaml { .. }), "{error}");
+        assert!(error.to_string().contains(&file.path().display().to_string()), "{error}");
     }
 
     #[tokio::test]
