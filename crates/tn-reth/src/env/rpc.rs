@@ -2011,5 +2011,72 @@ mod tests {
         assert!(std::path::Path::new(&suffixed).exists(), "worker 1 IPC socket file must exist");
     }
 
+    /// Send `eth_subscribe("newPendingTransactions")` on a raw IPC stream and return the error
+    /// code of a refusal, `None` when it subscribed.
+    #[cfg(unix)]
+    async fn subscribe_pending_transactions(
+        stream: &mut tokio::io::BufStream<tokio::net::UnixStream>,
+        id: usize,
+    ) -> Option<i64> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "eth_subscribe",
+            "params": ["newPendingTransactions"],
+        });
+        stream.write_all(request.to_string().as_bytes()).await.expect("write request");
+        stream.flush().await.expect("flush request");
+        let mut line = String::new();
+        stream.read_line(&mut line).await.expect("read response");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("json response");
+        assert_eq!(response["id"], id, "{response}");
+        response.get("error").map(|error| error["code"].as_i64().expect("error code"))
+    }
+
+    /// With TN's default `--rpc.max-subscriptions-per-connection`, one connection is refused
+    /// before it holds every `newPendingTransactions` listener slot of the worker's pool, so
+    /// another connection can still subscribe. With reth's default (1,024, the pool's cap) the
+    /// first connection took every slot and the second was refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_connection_cannot_hold_every_pending_transaction_listener() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
+        let rpc_args = TnRpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() }.into();
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+        let accumulator = GasAccumulator::new(1);
+        let _handle = start_worker_rpc(&reth_env, &accumulator, 0).await;
+
+        let connect = || async {
+            tokio::io::BufStream::new(
+                tokio::net::UnixStream::connect(&ipcpath).await.expect("ipc connect"),
+            )
+        };
+        let mut first = connect().await;
+        let mut held = 0;
+        let refusal = loop {
+            match subscribe_pending_transactions(&mut first, held).await {
+                None => held += 1,
+                Some(code) => break code,
+            }
+            assert!(held <= reth_transaction_pool::MAX_RPC_TX_LISTENERS, "never refused");
+        };
+        assert_eq!(held, crate::rpc_server_args::RPC_DEFAULT_MAX_SUBS_PER_CONN as usize);
+        assert_eq!(refusal, i64::from(jsonrpsee::types::error::TOO_MANY_SUBSCRIPTIONS_CODE));
+
+        let mut second = connect().await;
+        assert_eq!(subscribe_pending_transactions(&mut second, 0).await, None);
+    }
+
     mod forward_txs;
 }

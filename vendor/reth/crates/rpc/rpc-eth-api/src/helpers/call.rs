@@ -66,6 +66,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     /// The transactions are packed into individual blocks. Overrides can be provided.
     ///
     /// See also: <https://github.com/ethereum/go-ethereum/pull/27720>
+    ///
+    /// TN(TN-0181): takes a permit of [`SpawnBlocking::tracing_task_guard`] and holds it until
+    /// its blocking work ends, so callers do not take one.
     fn simulate_v1(
         &self,
         payload: SimulatePayload<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
@@ -97,6 +100,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 }
             }
 
+            // TN(TN-0181): the tracing permit moves into the blocking work with the blocking-IO
+            // one. Held by the caller, it returned when an HTTP client disconnected while the
+            // work ran on to its next cancellation check.
+            let tracing_permit =
+                self.acquire_owned_tracing().await.map_err(|_| EthApiError::InternalEthError)?;
             let permit = self
                 .acquire_owned_blocking_io()
                 .await
@@ -110,7 +118,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let state_at = if block.is_pending() { block } else { parent.hash().into() };
 
             self.spawn_with_state_at_block(state_at, move |this, mut db| {
-                let _permit = permit;
+                let _permits = (tracing_permit, permit);
                 // TN(TN-0156): the request's calls share one gas budget across its blocks, as
                 // `eth_callMany`'s do.
                 let mut budget = CallManyBudget::new(this.call_gas_limit());

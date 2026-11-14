@@ -1191,7 +1191,8 @@ impl EpochCloseGas {
 /// for. Every node runs that closing block, so the series is fleet-wide rather than
 /// proposer-only, and it covers closing blocks re-executed while syncing — a replayed value is
 /// still a true observation of what that epoch cost, which is what makes a `max_over_time` query
-/// over these gauges meaningful.
+/// over these gauges meaningful. RPC re-execution of a sealed closing block does not call it
+/// (`TNBlockExecutionCtx::replay`), so an RPC client cannot overwrite the gauges.
 ///
 /// Publishes nothing at all when no call was recorded, rather than a zero total that would read
 /// as a free boundary — the same rule the per-call series follows.

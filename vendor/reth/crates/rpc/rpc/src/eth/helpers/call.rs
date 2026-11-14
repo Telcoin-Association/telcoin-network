@@ -66,9 +66,10 @@ mod call_many_budget_tests {
     use reth_network_api::noop::NoopNetwork;
     use reth_primitives_traits::Block as _;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-    use reth_rpc_eth_api::helpers::EthCall;
+    use reth_rpc_eth_api::helpers::{EthCall, SpawnBlocking as _};
     use reth_rpc_eth_types::{EthApiError, GasCap};
     use reth_transaction_pool::test_utils::testing_pool;
+    use std::time::Duration;
 
     /// Runs `count` transfers, each carrying `calldata` non-zero bytes, as one `eth_callMany`
     /// against a funded sender and an empty block 1 on a mock chain, under a gas cap of
@@ -166,21 +167,7 @@ mod call_many_budget_tests {
         gas_cap: u64,
         block_state_calls: Vec<SimBlock>,
     ) -> Result<Vec<SimulatedBlock<alloy_rpc_types_eth::Block>>, EthApiError> {
-        let provider = MockEthProvider::default()
-            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
-        let block = Block {
-            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
-            body: BlockBody::default(),
-        }
-        .seal_slow();
-        provider.add_block(block.hash(), block.into_block());
-        provider.add_account(SENDER, ExtendedAccount::new(0, U256::from(10u64.pow(18))));
-        // JUMPDEST; PUSH1 0; JUMP
-        provider.add_account(
-            LOOP,
-            ExtendedAccount::new(0, U256::ZERO)
-                .with_bytecode(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56])),
-        );
+        let provider = simulation_chain();
         let api = EthApiBuilder::new(
             provider.clone(),
             testing_pool(),
@@ -196,6 +183,27 @@ mod call_many_budget_tests {
             return_full_transactions: false,
         };
         EthCall::simulate_v1(&api, payload, Some(BlockNumberOrTag::Number(1).into())).await
+    }
+
+    /// TN(TN-0156): the mock chain [`simulate`] runs on: block 1, a funded [`SENDER`] and
+    /// [`LOOP`].
+    fn simulation_chain() -> MockEthProvider {
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+        let block = Block {
+            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        }
+        .seal_slow();
+        provider.add_block(block.hash(), block.into_block());
+        provider.add_account(SENDER, ExtendedAccount::new(0, U256::from(10u64.pow(18))));
+        // JUMPDEST; PUSH1 0; JUMP
+        provider.add_account(
+            LOOP,
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56])),
+        );
+        provider
     }
 
     /// TN(TN-0156): the funded sender of [`simulate`].
@@ -306,5 +314,49 @@ mod call_many_budget_tests {
         .await
         .expect("balance and storage overrides are kept");
         assert_eq!(simulated.len(), 2);
+    }
+    /// TN(TN-0181): `simulate_v1` takes a tracing permit itself, for its blocking work to hold,
+    /// so a request waits while every permit is taken and runs once one is free.
+    #[tokio::test]
+    async fn simulate_takes_a_tracing_permit() {
+        let provider = simulation_chain();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .proof_permits(1)
+        .build();
+        let payload = SimulatePayload {
+            block_state_calls: vec![SimBlock {
+                block_overrides: None,
+                state_overrides: None,
+                calls: vec![transfer()],
+            }],
+            trace_transfers: false,
+            validation: false,
+            return_full_transactions: false,
+        };
+        let at = Some(BlockNumberOrTag::Number(1).into());
+        let free_permit = || {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                api.tracing_task_guard().clone().acquire_owned(),
+            )
+        };
+
+        let held = free_permit().await.expect("one permit is free").expect("open");
+        let waited = tokio::time::timeout(
+            Duration::from_millis(500),
+            EthCall::simulate_v1(&api, payload.clone(), at),
+        )
+        .await;
+        assert!(waited.is_err(), "simulated without a tracing permit: {waited:?}");
+
+        drop(held);
+        let simulated = EthCall::simulate_v1(&api, payload, at).await.expect("simulates");
+        assert_eq!(simulated.len(), 1);
+        drop(free_permit().await.expect("the permit is back once the work ends"));
     }
 }

@@ -168,8 +168,15 @@ details.
 jsonrpsee 0.26's WebSocket server spawns each call on a detached task, so when a client
 disconnects its request future is not dropped and TN-0049's cancellation does not fire: the call
 keeps its blocking thread and permits until it ends. HTTP drops the request, and IPC aborts it
-since TN-0177. The work stays bounded by the gas cap, the trace cap and the permits. A fix
-belongs in jsonrpsee (or a TN wrapper around its WebSocket service).
+since TN-0177. The work stays bounded by the gas cap, the trace cap and the permits.
+
+An RPC middleware (`RpcServerConfig::set_rpc_middleware`) cannot fix it: the connection's task
+keeps its RPC service in an `Arc` that every spawned call clones, so no middleware instance ends
+with the connection, and a method call gets no connection-closed signal (only a subscription's
+sink does). The fix is in jsonrpsee-server's `transport/ws.rs` `background_task`: cancel or abort
+the calls it spawned once its receive loop ends, as a patch under `patches/` or upstream. The
+other way is a TN accept loop on jsonrpsee's `to_service_builder()` that races each call against
+`on_session_closed()`.
 
 ## CI build time with the vendored crates
 

@@ -536,7 +536,7 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.jwtsecret`                        | none                  | Hex-encoded JWT secret for RPC auth                             |
 | `--rpc.max-request-size`                 | `15` (MB)             | Max request payload size                                        |
 | `--rpc.max-response-size`                | `160` (MB)            | Max response payload size                                       |
-| `--rpc.max-subscriptions-per-connection` | `1024`                | Max subscriptions per connection                                |
+| `--rpc.max-subscriptions-per-connection` | `128`                 | Max subscriptions per WebSocket or IPC connection               |
 | `--rpc.max-connections`                  | `500`                 | Max concurrent RPC connections                                  |
 | `--rpc.max-tracing-requests`             | CPU-dependent         | Max concurrent tracing requests (`debug`, `trace`)              |
 | `--rpc.max-trace-filter-blocks`          | `100`                 | Max block range of one `trace_filter` request                   |

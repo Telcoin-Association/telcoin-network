@@ -302,7 +302,9 @@ fire until the spend reached the whole 100M, which is the halt it exists to pred
 
 Every node records these as it executes the closing block, so the series is fleet-wide rather than
 proposer-only, and it covers closing blocks re-executed during a sync — a replayed value is still a
-true observation of what that epoch cost.
+true observation of what that epoch cost. RPC re-execution of a closing block (`debug_executionWitness`,
+block traces) records nothing and logs no registry events (`TNBlockExecutionCtx::replay`), so an RPC
+client cannot overwrite these gauges.
 
 Dashboard — worst epoch close seen in the last 30 days, per call:
 
@@ -455,7 +457,8 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
   (`src/env/rpc.rs`). The TN-specific `tn_*` module is outside this allowlist and is
   registered on every enabled transport.
 - **Transport limits** (`src/rpc_server_args.rs`, CLI-overridable defaults): 500 max connections,
-  15 MB max request, 160 MB max response, 1024 subscriptions per connection, plus reth's default
+  15 MB max request, 160 MB max response, 128 subscriptions per WS or IPC connection (an eighth
+  of the pool's 1,024 `newPendingTransactions` listener slots of each kind), plus reth's default
   `eth_call` gas cap, no RPC transaction fee cap, tracing/filter/proof limits, and
   an eth-proof window.
 - **Blocking pool per worker** (`src/rpc_blocking.rs`): each worker's RPC server runs its

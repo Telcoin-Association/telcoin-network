@@ -2975,3 +2975,43 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   error. *Tests*: `test_populate_bundle_state_hashed_refuses_a_hashed_key` (panics on the
   `debug_assert!` without the change); `test_populate_bundle_state_hashed_with_plain_keys`
   unchanged. *Upstream*: n/a (upstream removed `StorageSlotKey` in 815037e27).
+
+- **TN-0181** — `eth_simulateV1` holds its tracing permit for as long as its blocking work runs.
+  *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1` takes the
+  permit after its cheap checks and moves it into the blocking work with the blocking-IO one),
+  `crates/rpc/rpc-eth-api/src/core.rs` (the `eth_simulateV1` handler no longer takes it),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulation_chain`, test
+  `simulate_takes_a_tracing_permit`); TN's `crates/tn-reth/src/rpc_call.rs` (its handler no
+  longer takes it either).
+  *Why*: the handler took the eth API's tracing permit (the `--rpc.proof-permits` semaphore,
+  25 by default, which `eth_getProof` also takes) and held it in the request future, while
+  `simulate_v1` moved only the blocking-IO permit into its blocking work. When an HTTP client
+  disconnected, the future was dropped and the permit returned at once, while the simulation
+  ran on to its next cancellation check (the end of a call of up to `--rpc.gascap` gas, or of a
+  block's system calls), so a client that sent requests and dropped them could run more
+  simulations at once than there are permits. The handler also ignored the acquire's error; a
+  closed semaphore now fails the request instead of running it without a permit. Requests the
+  cheap checks refuse (too many blocks, no blocks, a system contract's code overridden) no
+  longer wait for a permit. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `simulate_takes_a_tracing_permit` (a request waits while the only permit is held and
+  runs once it is free). Mutation-checked: no permit taken in `simulate_v1` (the request runs
+  while the permit is held).
+  *Upstream*: no; upstream has the same shape (its handler in `rpc-eth-api/src/core.rs`).
+
+- **TN-0182** — The pending block is built on the eth API's CPU pool, not on a blocking-IO
+  thread. *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/pending_block.rs`
+  (`pool_pending_block` builds with `spawn_tracing`), `crates/rpc/rpc/src/eth/helpers/state.rs`
+  (test `a_pending_read_holding_every_blocking_thread_still_gets_its_block`).
+  *Why*: with `--rpc.pending-block` set (TN's default is `none`), a state read at `pending`
+  (`eth_getBalance`, `eth_call` and the other state methods) runs on a blocking-IO thread and
+  waits there for the pending block, which `pool_pending_block` built on another blocking-IO
+  thread. Plain state reads take no blocking-IO permit, so enough of them sent at once held every
+  thread of the server's blocking pool while the build waited for one: every read at `pending`
+  waited forever, and the server's other blocking work queued behind them. The build now runs on
+  the rayon pool each eth API owns (`tracing_task_pool`, one thread per core), which no RPC path
+  used and nothing on it waits for other work, so it always gets a thread. The build is unchanged
+  and still one at a time behind the pending-block lock. *Can reach execution or storage*: no.
+  RPC only; the node's blocks are built and executed elsewhere.
+  *Tests*: `a_pending_read_holding_every_blocking_thread_still_gets_its_block` (a runtime with
+  one blocking thread; the read at `pending` waited forever before the change).
+  *Upstream*: no; upstream has the same shape.
