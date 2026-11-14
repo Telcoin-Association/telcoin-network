@@ -1353,6 +1353,7 @@ fn untracked_trigger() -> ProposalTrigger {
         reason: ProposeReason::MinDelay,
         pending_before: 0,
         proposed: Counter::noop(),
+        hold: HoldReport::default(),
     }
 }
 
@@ -3772,4 +3773,56 @@ async fn test_stale_resend_requeue_is_not_out_of_order() {
     assert_eq!(lane, [(fixed_digest(1), None), (fixed_digest(2), None)], "re-queued, unnumbered");
 
     assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(2)]);
+}
+
+/// The `header proposed` line ends with the order-hold fields, after every earlier field:
+/// `own_parent` is true only when the parents carry this node's certificate of the own header
+/// tracked at the previous round, and `held`, `held_lanes` and `blockers` are zero until the hold
+/// exists.
+///
+/// Catches: `own_parent` read from any own certificate of the previous round (one for another
+/// header, or the genesis certificate under round 1), the fields missing or moved ahead of the
+/// existing ones the stage tools parse by position.
+#[tokio::test]
+async fn test_header_proposed_reports_own_parent_and_hold_fields() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let (fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
+    let committee = fixture.committee();
+    let epoch = committee.epoch();
+    let all = fixture.authorities().count();
+
+    // round 1 is built on genesis, which includes this node's genesis certificate
+    let h1 = propose_and_track(&mut proposer).await;
+    // round 2 is built on round 1 with this node's certificate of the tracked header
+    let own = Certificate::new_unsigned_for_test(&committee, h1.clone(), Vec::new())
+        .expect("own certificate");
+    proposer.last_parents = std::iter::once(own)
+        .chain(parents_at(&fixture, 1, epoch, all).into_iter().skip(1))
+        .collect();
+    let h2 = propose_and_track(&mut proposer).await;
+    // round 3: an own certificate of round 2, but for another header than the tracked one
+    proposer.last_parents = parents_at(&fixture, 2, epoch, all);
+    let h3 = propose_and_track(&mut proposer).await;
+    // round 4: the quorum without this node's certificate
+    proposer.last_parents = parents_at(&fixture, 3, epoch, all).into_iter().skip(1).collect();
+    let h4 = propose_and_track(&mut proposer).await;
+
+    for (header, own_parent) in [(&h1, "false"), (&h2, "true"), (&h3, "false"), (&h4, "false")] {
+        let line = proposed_line(&capture, header.round());
+        assert_eq!(line.field("own_parent"), Some(own_parent), "round {}", header.round());
+        for field in ["held", "held_lanes", "blockers"] {
+            assert_eq!(line.u64_field(field), Some(0), "{field} at round {}", header.round());
+        }
+        let names: Vec<_> = line.fields.iter().map(|(name, _)| *name).collect();
+        let tail = names.len() - 5;
+        assert_eq!(
+            names[tail..],
+            ["exec_policy", "own_parent", "held", "held_lanes", "blockers"],
+            "the new fields close the line"
+        );
+    }
 }
