@@ -2572,3 +2572,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
   storage*: no; a doc comment and a test assertion.
   *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
+
+- **TN-0170** — `eth_callMany` at a transaction index applies the block's pre-execution changes
+  before it replays the block's earlier transactions, and checks for cancellation between them.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`EthCall::call_many`).
+  *Why*: with `stateContext.transactionIndex` inside a block, `call_many` replays the block's
+  transactions before that index on the parent's state, without the block's pre-execution
+  system calls (TN's EIP-4788 root on an output's first batch, the EIP-2935 parent hash on every
+  block). A call or replayed transaction that read either contract saw the parent's values: the
+  history contract answered zero for the parent's hash on TN. `debug_traceCallMany` (TN-0048)
+  and `spawn_replay_transaction` already apply them; this uses the same
+  `executor_for_block(..).apply_pre_execution_changes()`. The replay loop also checks
+  `is_cancelled()` per transaction, as `debug_traceCallMany`'s does. *Can reach execution or
+  storage*: no. RPC only: block execution does not call `call_many`, and the replay runs on a
+  throwaway state.
+  *Tests*: tn-reth `call_many_at_a_transaction_index_applies_pre_execution_changes` (block 1's
+  history contract answers the genesis hash to `eth_call`, to `eth_callMany` and to
+  `debug_traceCallMany` at transaction index 0; `eth_callMany` answered zero without the fix).
+  *Upstream*: upstream main replays through `Trace::replay_block_until`, which applies them.

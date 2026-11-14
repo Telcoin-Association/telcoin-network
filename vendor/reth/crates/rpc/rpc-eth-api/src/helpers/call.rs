@@ -388,8 +388,22 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 if replay_block_txs {
                     // only need to replay the transactions in the block if not all transactions are
                     // to be replayed
+
+                    // TN(TN-0170): the replay starts from the parent's state, so it needs the
+                    // block's pre-execution changes (EIP-4788 root, EIP-2935 parent hash) first,
+                    // as `debug_traceCallMany` and `spawn_replay_transaction` apply them.
+                    RpcNodeCore::evm_config(&this)
+                        .executor_for_block(&mut db, block.sealed_block())
+                        .map_err(RethError::other)
+                        .map_err(Self::Error::from_eth_err)?
+                        .apply_pre_execution_changes()
+                        .map_err(Self::Error::from_eth_err)?;
+
                     let block_transactions = block.transactions_recovered().take(num_txs);
                     for tx in block_transactions {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         let tx_env = RpcNodeCore::evm_config(&this).tx_env(tx);
                         let res = this.transact(&mut db, evm_env.clone(), tx_env)?;
                         db.commit(res.state);
