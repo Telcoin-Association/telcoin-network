@@ -87,11 +87,11 @@ pub(crate) struct TxBodiesConfig {
     new_datadirs: TxBodies,
     /// The decoded-batch cache's budget in bytes ([`TX_BODY_CACHE_BYTES`] unless chosen; 0: none).
     cache_bytes: usize,
-    /// Test builds: read batches from the process-wide `MemoryBatches` before any consensus pack,
-    /// and remember there every batch a persist stores by position (temp chains that store
-    /// transactions by position).
+    /// Test builds: the `MemoryBatches` to read batches from before any consensus pack, and to
+    /// remember every batch a persist stores by position in (temp chains that store transactions
+    /// by position use the process-wide one).
     #[cfg(any(test, feature = "test-utils"))]
-    memory_batches: bool,
+    memory_batches: Option<Arc<crate::MemoryBatches>>,
 }
 
 impl Default for TxBodiesConfig {
@@ -100,7 +100,7 @@ impl Default for TxBodiesConfig {
             new_datadirs: TxBodies::for_new_datadirs(),
             cache_bytes: TX_BODY_CACHE_BYTES,
             #[cfg(any(test, feature = "test-utils"))]
-            memory_batches: false,
+            memory_batches: None,
         }
     }
 }
@@ -581,10 +581,10 @@ impl RethConfig {
         self
     }
 
-    /// Test builds: whether the env reads batches from the process-wide `MemoryBatches`.
+    /// Test builds: the `MemoryBatches` the env reads batches from, if any.
     #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn memory_batches(&self) -> bool {
-        self.4.memory_batches
+    pub(crate) fn memory_batches(&self) -> Option<Arc<crate::MemoryBatches>> {
+        self.4.memory_batches.clone()
     }
 
     /// Test builds: this config, with the env reading batches from the process-wide
@@ -592,7 +592,15 @@ impl RethConfig {
     /// stores by position, as temp chains that store transactions by position do.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_memory_batches(mut self, enabled: bool) -> Self {
-        self.4.memory_batches = enabled;
+        self.4.memory_batches = enabled.then(crate::MemoryBatches::global);
+        self
+    }
+
+    /// Test builds: [`Self::with_memory_batches`] with `memory` in place of the process-wide
+    /// `MemoryBatches`, for a test that must read only the batches it put there.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_memory_batches_from(mut self, memory: Arc<crate::MemoryBatches>) -> Self {
+        self.4.memory_batches = Some(memory);
         self
     }
 
