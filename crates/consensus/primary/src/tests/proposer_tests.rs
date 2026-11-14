@@ -3415,8 +3415,10 @@ fn payload_entries(header: &Header) -> Vec<(BlockHash, WorkerId)> {
 /// header cap, pinned as a golden list (issue #1807).
 ///
 /// The list is the payload order of the base commit, before the proposer numbered its digests:
-/// this test was committed and run green there first. The order bookkeeping is observability only,
-/// so every header must still carry exactly these digests in exactly this order.
+/// this test was committed and run green there first, queuing straight into the lanes. It now
+/// queues through the numbered push, so the bookkeeping runs on every path. The bookkeeping is
+/// observability only, so every header must still carry exactly these digests in exactly this
+/// order.
 ///
 /// Catches: bookkeeping that changes which digests a header drains, their order, or what a cancel
 /// or a commit puts back in the queue.
@@ -3431,36 +3433,27 @@ async fn test_digest_order_bookkeeping_keeps_payloads_golden() {
     let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
     assert_eq!(proposer.max_header_num_of_batches, 10, "the script assumes the default header cap");
     // worker 0 reports digests 1.., worker 1 digests 101..
-    let report = |proposer: &mut Proposer<MemDatabase>, worker_id: WorkerId, numbers: &[u8]| {
-        for n in numbers {
-            proposer
-                .digests
-                .entry(worker_id)
-                .or_default()
-                .push_back(queued(fixed_digest(*n), worker_id));
-        }
-    };
     let mut headers = Vec::new();
 
-    report(&mut proposer, 0, &[1, 2, 3]);
-    report(&mut proposer, 1, &[101, 102]);
+    report_fixed(&mut proposer, 0, &[1, 2, 3]);
+    report_fixed(&mut proposer, 1, &[101, 102]);
     let h1 = propose_and_track(&mut proposer).await;
     headers.push(h1.clone());
-    report(&mut proposer, 0, &[4, 5]);
+    report_fixed(&mut proposer, 0, &[4, 5]);
     headers.push(propose_and_track(&mut proposer).await);
     // the certifier cancels round 1 after round 2 drained newer worker-0 digests
     proposer.process_uncertified_header(h1.round(), h1.digest());
-    report(&mut proposer, 1, &[103]);
+    report_fixed(&mut proposer, 1, &[103]);
     headers.push(propose_and_track(&mut proposer).await);
-    report(&mut proposer, 0, &[6]);
+    report_fixed(&mut proposer, 0, &[6]);
     headers.push(propose_and_track(&mut proposer).await);
     // round 3 commits: round 2 died behind it, round 4 is still in flight
     proposer.process_committed_headers(5, vec![3]);
     headers.push(propose_and_track(&mut proposer).await);
     // round 5 commits: round 4 died behind it
     proposer.process_committed_headers(6, vec![5]);
-    report(&mut proposer, 1, &(104..=115).collect::<Vec<_>>());
-    report(&mut proposer, 0, &[7]);
+    report_fixed(&mut proposer, 1, &(104..=115).collect::<Vec<_>>());
+    report_fixed(&mut proposer, 0, &[7]);
     headers.push(propose_and_track(&mut proposer).await);
     headers.push(propose_and_track(&mut proposer).await);
 
@@ -3893,4 +3886,37 @@ async fn test_proposer_stopped_reports_what_it_leaves() {
     let epoch = Some(u64::from(committee.epoch()));
     assert_eq!(fields(&lines[0]), [epoch, Some(3), Some(2), Some(2), Some(3), Some(1)]);
     assert_eq!(fields(&lines[1]), [epoch, Some(5), Some(0), Some(0), Some(0), Some(0)]);
+}
+
+/// A header whose own commit notice is handled before its proposal result comes back is tracked
+/// after the notice, so its later re-queue counts as `stale_resend`; its digests still leave the
+/// order bookkeeping, as their first receipts do.
+///
+/// Catches: a stale re-send that leaves its digests' entries behind, which would count them as in
+/// flight in `proposer stopped` and as newer digests out of the queue in every later judgment.
+#[tokio::test]
+async fn test_stale_resend_releases_its_digest_numbers() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
+
+    report_fixed(&mut proposer, 0, &[1, 2]);
+    let h1 = proposer
+        .propose_next_header(ProposeReason::MinDelay)
+        .expect("proposal spawned")
+        .await
+        .expect("proposal task reported")
+        .expect("header proposed");
+    // the notice naming round 1 arrives before round 1's result
+    proposer.process_committed_headers(h1.round() + 2, vec![h1.round()]);
+    proposer.handle_proposal_result(Ok(h1.clone())).expect("header tracked");
+
+    report_fixed(&mut proposer, 0, &[3]);
+    let h2 = propose_and_track(&mut proposer).await;
+    proposer.process_committed_headers(h2.round() + 2, vec![h2.round()]);
+    assert_eq!(lane_entries(&proposer, 0), [(fixed_digest(1), None), (fixed_digest(2), None)]);
+    assert_eq!(proposer.lane_seqs.out_of_queue().count(), 0, "no entry outlives its header");
+    assert!(proposer.proposed_first_received.is_empty(), "nor does a first receipt");
+
+    assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(2)]);
 }

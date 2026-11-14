@@ -553,9 +553,11 @@ impl DigestsRequeuedHandles {
 /// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once when a proposer is
 /// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
 ///
-/// A re-queued batch digest counts here when it returns to its worker's queue behind a newer digest
-/// of the same worker, by the proposer's per-worker sequence: the out-of-order carriage of issue
-/// #1807. The proposer's `LaneSequences::judge` holds the exact rule.
+/// A re-queued batch digest counts here when it returns to its worker's queue while a newer digest
+/// of the same worker, by the proposer's per-worker sequence, is out of the queue, so it may
+/// execute after that digest: the out-of-order carriage of issue #1807. The count describes the
+/// lane at the re-queue, not a confirmed execution inversion. The proposer's `LaneSequences::judge`
+/// holds the exact rule.
 #[derive(Clone, Debug)]
 pub(crate) struct RequeuedOutOfOrderHandles {
     /// One counter per [`RequeueCause`], indexed by its position in [`RequeueCause::ALL`].
