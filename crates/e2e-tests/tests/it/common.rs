@@ -551,10 +551,11 @@ pub(crate) fn start_validator_with_env(
 /// starts, after the fleet-wide entries of `TN_E2E_PARAMETERS` (see
 /// [`NodeOverrides::apply_with_e2e_parameters`]): every start writes the harness's file plus
 /// that start's entries, so a restart with the same fleet leaves the file as it was, and a restart
-/// through any other start helper puts the harness's file back (with the fleet-wide entries). Its
-/// environment variables are set on the spawned command after the variables [`TestBinary::command`]
-/// forwards ([`start_validator_with_env`] delegates here with a one-node fleet). A node the fleet
-/// sets nothing for starts exactly as [`start_validator_with_args`] starts it.
+/// through any other start helper puts the harness's file back (with the fleet-wide entries) and
+/// sets none of the fleet's variables. Its environment variables are set on the spawned command
+/// after the variables [`TestBinary::command`] forwards ([`start_validator_with_env`] delegates
+/// here with a one-node fleet). A node the fleet sets nothing for starts exactly as
+/// [`start_validator_with_args`] starts it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_validator_with_overrides(
     instance: usize,
@@ -1240,8 +1241,9 @@ pub(crate) fn start_nodes(
 ///
 /// A node's `parameters.yaml` entries are merged into `temp_path/<name>` before it starts, after
 /// the fleet-wide entries of `TN_E2E_PARAMETERS` (see [`NodeOverrides::apply_with_e2e_parameters`];
-/// a start without entries puts the harness's file back), and
-/// its environment variables are set on its process only. A node the fleet sets nothing for
+/// a start without entries puts the harness's file back), and its environment variables are set
+/// on its process only. A restart through [`start_nodes`] drops both, so a node whose overrides
+/// matter to the chain is restarted here with the same fleet. A node the fleet sets nothing for
 /// starts exactly as [`start_nodes`] starts it.
 pub(crate) fn start_nodes_with_overrides(
     temp_path: &Path,
