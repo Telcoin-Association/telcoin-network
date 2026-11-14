@@ -122,10 +122,11 @@ enum DbSubcommand {
     /// re-executing the chain, in the storage layout new datadirs get. Moves `db`,
     /// `static_files` and `restored-state-floor` into `execution-reset-<UTC time>` under the
     /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
-    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
-    /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
-    /// rebuild replays epoch 0 from the node's own packs. `--for-swap` skips that refusal for the
-    /// side-observer swap. Dry-run by default; pass `--force` to apply.
+    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database lacks
+    /// the pack of an epoch below its latest one (one bootstrapped with `db load-state` lacks
+    /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from
+    /// the node's own packs. `--for-swap` skips that refusal for the side-observer swap.
+    /// Dry-run by default; pass `--force` to apply.
     ///
     /// The default build's new datadirs store each transaction once: their rows hold its position
     /// in a batch of the consensus packs, so a rebuild is how an existing datadir moves to that
@@ -145,9 +146,9 @@ pub struct DbResetExecutionArgs {
     pub force: bool,
     /// The side-observer swap: a synced observer's `db` and `static_files` are copied in before
     /// the next start, which then executes only the consensus output past the copy's tip. Skips
-    /// the refusal of a datadir whose consensus database holds no epoch-0 pack (one bootstrapped
-    /// with `db load-state`). Without that copy the next start rebuilds from genesis, which such a
-    /// datadir cannot do.
+    /// the refusal of a datadir whose consensus database lacks the pack of an epoch below its
+    /// latest one (one bootstrapped with `db load-state`). Without that copy the next start
+    /// rebuilds from genesis, which such a datadir cannot do.
     ///
     /// An observer's database that stores transactions by their position in consensus packs
     /// needs this node to hold the pack of every epoch from the one of its first transaction to
