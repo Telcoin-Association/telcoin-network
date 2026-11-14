@@ -46,7 +46,7 @@ use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 use crate::{
     error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
-    rpc_blocking::RpcTaskSpawner,
+    rpc_blocking::RpcBlockingPool,
     rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
     rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
@@ -267,8 +267,8 @@ async fn ipc_socket_is_live(path: &str) -> bool {
 ///   consumer of the cache.
 /// - `send_raw_transaction_sync_timeout`: applied here, absent from reth's reference. No CLI flag
 ///   feeds it yet, so it re-applies the default (forward compatibility).
-/// - task spawner: reth injects its own; TN sets an [`RpcTaskSpawner`] in `get_rpc_server`, so the
-///   API's blocking work runs on RPC's own pool.
+/// - task spawner: reth injects its own; TN sets one in `get_rpc_server`, so the API's blocking
+///   work runs on the server's own blocking pool (`rpc_blocking.rs`).
 fn apply_eth_config<N: RpcNodeCore, Rpc, NextEnv>(
     builder: EthApiBuilder<N, Rpc, NextEnv>,
     config: EthConfig,
@@ -327,10 +327,20 @@ impl RethEnv {
             TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
-        // RPC's blocking work runs on its own pool, so it cannot take the blocking threads block
-        // execution and certificate validation use (`rpc_blocking.rs`). Every other task keeps
-        // its spawner: TN's for the modules, the env's non-critical one for the eth API (below).
-        let rpc_executor = RpcTaskSpawner::new(self.inner.task_spawner.clone())?;
+        // RPC transaction pool insertion batching is configured by the txpool CLI args.
+        let eth_config = self
+            .node_config()
+            .rpc
+            .eth_config()
+            .max_batch_size(self.node_config().txpool.max_batch_size);
+        // This server's blocking work runs on a pool of its own (`rpc_blocking.rs`), so it cannot
+        // take the blocking threads block execution and certificate validation use, nor those of
+        // another worker's server. The pool has more threads than the eth API has blocking-IO
+        // permits, so permit holders never hold all of them while they wait for nested blocking
+        // work. Every other task keeps its spawner: TN's for the modules, the env's non-critical
+        // one for the eth API.
+        let blocking_pool = RpcBlockingPool::new(eth_config.max_blocking_io_requests)?;
+        let rpc_executor = blocking_pool.spawner(self.inner.task_spawner.clone());
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
@@ -350,12 +360,6 @@ impl RethEnv {
         } else {
             modules_config
         };
-        // RPC transaction pool insertion batching is configured by the txpool CLI args.
-        let eth_config = self
-            .node_config()
-            .rpc
-            .eth_config()
-            .max_batch_size(self.node_config().txpool.max_batch_size);
         // Reth's eth tasks run on the env's task manager, not on reth's default
         // `TokioTaskExecutor`: the state cache and the fee-history task (which follows the
         // canonical-state stream, open for the env's whole life) hold the provider, so untracked
@@ -363,8 +367,8 @@ impl RethEnv {
         // cache as a critical task; here they are tracked as non-critical ones: they only serve
         // RPC, and a panic in one leaves the RPC cache dead with the node running, as on reth's
         // own executor, instead of ending the validator. Their blocking work (cache misses, calls,
-        // traces) runs on RPC's own pool, as the modules' does.
-        let rpc_tasks = RpcTaskSpawner::new(self.inner.task_spawner.non_critical())?;
+        // traces) runs on this server's pool, as the modules' does.
+        let rpc_tasks = blocking_pool.spawner(self.inner.task_spawner.non_critical());
         let eth_cache = EthStateCache::spawn_with(
             self.inner.blockchain_provider.clone(),
             eth_config.cache,
