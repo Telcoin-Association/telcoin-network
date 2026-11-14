@@ -333,8 +333,10 @@ pub struct Parameters {
     ///
     /// When `true`, the proposer ranks its own tip and each same-epoch parent's latest execution
     /// block by voting weight and names the highest block that holders of 2f+1 weight have
-    /// reached, capped at its own tip and never older than a fixed number of entries back in its
-    /// recent-blocks ring. Voters then rarely wait for, or refuse, a block they have not executed.
+    /// reached, capped at its own tip, never older than a fixed number of entries back in its
+    /// recent-blocks ring, and never older than the block the epoch opened on (a parent naming
+    /// an older one is not counted). Voters then rarely wait for, or refuse, a block they have not
+    /// executed.
     /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
     /// keeps the previous behaviour: every header names this node's own newest executed block.
     /// Issue #1804.
