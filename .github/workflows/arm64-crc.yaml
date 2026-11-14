@@ -73,7 +73,11 @@ jobs:
             grep -vE '^[[:space:]]*//' "$1" |
               grep -vxE '[[:space:]]*#\[(cfg_attr\(not\(test\), allow\(dead_code\)\)|inline)\]'
           }
-          diff -u <(code crates/storage/src/archive/crc.rs) <(code crates/tn-lmdb/src/crc.rs)
+          # Each copy's code goes to a file first: a grep failing inside `<(...)` would leave
+          # its side empty without failing the step.
+          code crates/storage/src/archive/crc.rs >"$RUNNER_TEMP/archive-crc.rs"
+          code crates/tn-lmdb/src/crc.rs >"$RUNNER_TEMP/tn-lmdb-crc.rs"
+          diff -u "$RUNNER_TEMP/archive-crc.rs" "$RUNNER_TEMP/tn-lmdb-crc.rs"
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
