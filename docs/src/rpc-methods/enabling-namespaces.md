@@ -62,6 +62,7 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 | `--rpc.gascap` | `50000000` | Gas limit for `eth_call`, `eth_estimateGas` and the debug and trace call methods |
 | `--rpc.max-response-size` | `160` (MB) | Largest response the server sends |
 | `--rpc.max-connections` | `500` | Concurrent RPC connections |
+| `--rpc.max-subscriptions-per-connection` | `128` | Most subscriptions (`eth_subscribe`) one WebSocket or IPC connection holds; further ones fail with -32006. Each `newPendingTransactions` subscription also takes one of the 1,024 listener slots of its kind on the worker's transaction pool, first come across connections, so one connection holds at most an eighth of them |
 | `--rpc.max-batch-requests` | `100` | Most calls in one JSON-RPC batch request, on HTTP, WebSocket and IPC; a larger batch is refused whole |
 | `--rpc.max-active-filters` | `1000` | Most installed filters (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`) on each worker's RPC endpoint, across all its clients, first come, first served; a filter is removed when uninstalled or left unpolled for five minutes |
 | `--http.corsdomain` | none | Origins allowed to call the HTTP server from a browser |

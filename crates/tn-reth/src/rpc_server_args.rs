@@ -6,10 +6,12 @@
 //! since validator RPC endpoints may be publicly reachable:
 //!
 //! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
-//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 1024
-//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per
-//!   batch request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out
-//!   of websocket subscriptions, and how many calls one request can queue.
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 128 subscriptions
+//!   per WS or IPC connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per batch
+//!   request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out of
+//!   subscriptions, and how many calls one request can queue. The subscription limit also keeps one
+//!   connection to an eighth of the 1,024 pool listener slots of each kind that
+//!   `newPendingTransactions` subscriptions take.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
 //!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
@@ -62,7 +64,12 @@ pub const DEFAULT_IPC_ENDPOINT: &str = "/tmp/tn.ipc";
 const MAX_PERMITS: u64 = tokio::sync::Semaphore::MAX_PERMITS as u64;
 
 /// Default max number of subscriptions per connection.
-pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 1024;
+///
+/// An eighth of the pool's 1,024 listener slots of each kind
+/// (`reth_transaction_pool::MAX_RPC_TX_LISTENERS`), which every `newPendingTransactions`
+/// subscription takes one of: one connection cannot hold them all, and 128 is still far more
+/// than a dapp opens on one connection. reth's default is 1,024.
+pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 128;
 
 /// Default max request size in MB.
 pub(crate) const RPC_DEFAULT_MAX_REQUEST_SIZE_MB: u32 = 15;
@@ -162,7 +169,14 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-response-size", alias = "rpc-max-response-size", visible_alias = "rpc.returndata.limit", default_value_t = RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into())]
     pub rpc_max_response_size: MaxU32,
 
-    /// Set the maximum concurrent subscriptions per connection.
+    /// Set the maximum concurrent subscriptions per WS or IPC connection.
+    ///
+    /// Each `newPendingTransactions` subscription takes one of the 1,024 listener slots of its
+    /// kind (transaction hashes or full transactions) on the worker's transaction pool; the
+    /// node's own listeners take a few. The default, 128, is an eighth of them, so one connection
+    /// cannot take them all. The slots stay first come across connections: a client with eight
+    /// connections can take them, and pending-transaction filters, which belong to no
+    /// connection, take the same slots bounded only by `--rpc.max-active-filters`.
     #[arg(long = "rpc.max-subscriptions-per-connection", alias = "rpc-max-subscriptions-per-connection", default_value_t = RPC_DEFAULT_MAX_SUBS_PER_CONN.into())]
     pub rpc_max_subscriptions_per_connection: MaxU32,
 

@@ -455,7 +455,8 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
   (`src/env/rpc.rs`). The TN-specific `tn_*` module is outside this allowlist and is
   registered on every enabled transport.
 - **Transport limits** (`src/rpc_server_args.rs`, CLI-overridable defaults): 500 max connections,
-  15 MB max request, 160 MB max response, 1024 subscriptions per connection, plus reth's default
+  15 MB max request, 160 MB max response, 128 subscriptions per WS or IPC connection (an eighth
+  of the pool's 1,024 `newPendingTransactions` listener slots of each kind), plus reth's default
   `eth_call` gas cap, no RPC transaction fee cap, tracing/filter/proof limits, and
   an eth-proof window.
 - **Blocking pool per worker** (`src/rpc_blocking.rs`): each worker's RPC server runs its
