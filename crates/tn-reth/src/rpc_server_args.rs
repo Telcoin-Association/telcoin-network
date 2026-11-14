@@ -6,14 +6,18 @@
 //! since validator RPC endpoints may be publicly reachable:
 //!
 //! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
-//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 1024
-//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per
-//!   batch request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out
-//!   of websocket subscriptions, and how many calls one request can queue.
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 128 subscriptions
+//!   per WS or IPC connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per batch
+//!   request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out of
+//!   subscriptions, and how many calls one request can queue. The subscription limit also keeps one
+//!   connection to an eighth of the 1,024 pool listener slots of each kind that
+//!   `newPendingTransactions` subscriptions take.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
-//!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
-//!   count and a historical proof window.
+//!   `trace_filter`/log filters have block-scan windows, `eth_getProof` has a historical proof
+//!   window, and `eth_getProof`, `eth_simulateV1`, `eth_callMany` and `eth_callBundle` share a
+//!   permit count (`--rpc.proof-permits`). Each request of the last three keeps at most 32 MiB of
+//!   call output for its response, so those permits bound that memory too.
 //! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
 //!   in native-token units; 0 disables the cap). The default is 0: reth's 1.0 was calibrated for
 //!   ether, and 1.0 in TEL is too small a bound to separate honest fees from runaway ones, so the
@@ -62,7 +66,12 @@ pub const DEFAULT_IPC_ENDPOINT: &str = "/tmp/tn.ipc";
 const MAX_PERMITS: u64 = tokio::sync::Semaphore::MAX_PERMITS as u64;
 
 /// Default max number of subscriptions per connection.
-pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 1024;
+///
+/// An eighth of the pool's 1,024 listener slots of each kind
+/// (`reth_transaction_pool::MAX_RPC_TX_LISTENERS`), which every `newPendingTransactions`
+/// subscription takes one of: one connection cannot hold them all, and 128 is still far more
+/// than a dapp opens on one connection. reth's default is 1,024.
+pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 128;
 
 /// Default max request size in MB.
 pub(crate) const RPC_DEFAULT_MAX_REQUEST_SIZE_MB: u32 = 15;
@@ -162,7 +171,14 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-response-size", alias = "rpc-max-response-size", visible_alias = "rpc.returndata.limit", default_value_t = RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into())]
     pub rpc_max_response_size: MaxU32,
 
-    /// Set the maximum concurrent subscriptions per connection.
+    /// Set the maximum concurrent subscriptions per WS or IPC connection.
+    ///
+    /// Each `newPendingTransactions` subscription takes one of the 1,024 listener slots of its
+    /// kind (transaction hashes or full transactions) on the worker's transaction pool; the
+    /// node's own listeners take a few. The default, 128, is an eighth of them, so one connection
+    /// cannot take them all. The slots stay first come across connections: a client with eight
+    /// connections can take them, and pending-transaction filters, which belong to no
+    /// connection, take the same slots bounded only by `--rpc.max-active-filters`.
     #[arg(long = "rpc.max-subscriptions-per-connection", alias = "rpc-max-subscriptions-per-connection", default_value_t = RPC_DEFAULT_MAX_SUBS_PER_CONN.into())]
     pub rpc_max_subscriptions_per_connection: MaxU32,
 
@@ -174,7 +190,8 @@ pub struct RpcServerArgs {
     pub rpc_max_batch_requests: u32,
 
     /// Maximum number of installed filters (`eth_newFilter`, `eth_newBlockFilter`,
-    /// `eth_newPendingTransactionFilter`) across all clients.
+    /// `eth_newPendingTransactionFilter`) on each worker's RPC server, across all its clients,
+    /// first come, first served.
     ///
     /// Filters outlive the connection that made them and are removed only when uninstalled or
     /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored
@@ -250,8 +267,12 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent getproof requests. At least 1: with none, every
-    /// `eth_getProof` would wait forever.
+    /// Maximum number of concurrent `eth_getProof`, `eth_simulateV1`, `eth_callMany` and
+    /// `eth_callBundle` requests on each worker's RPC server, which share these permits. A request
+    /// keeps its permit until its work ends, even after its client disconnects. An
+    /// `eth_simulateV1`, `eth_callMany` or `eth_callBundle` request keeps at most 32 MiB of call
+    /// output for its response, so these permits also bound that memory: 32 MiB each. At least 1:
+    /// with none, every such request would wait forever.
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 

@@ -14,7 +14,7 @@
 //! | off | size | field |
 //! |---|---|---|
 //! | 0 | 8 | magic `b"tn-lmdb\0"` |
-//! | 8 | 4 | format version (6) |
+//! | 8 | 4 | format version (8) |
 //! | 12 | 4 | page size |
 //! | 16 | 8 | txn id |
 //! | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -815,6 +815,12 @@ mod tests {
     fn a_version_7_record_is_refused() {
         assert_eq!(FORMAT_VERSION, 8);
         assert_version_refused(7);
+        // the refusal names both versions, so an operator sees which build the file needs
+        let message = Error::UnsupportedVersion(7).to_string();
+        assert!(
+            message.contains("format version 7") && message.contains("only format 8"),
+            "{message}"
+        );
     }
 
     /// A weak record and a steady one carrying a boot id round-trip with their tags, the flag at

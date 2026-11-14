@@ -13,7 +13,10 @@
 //! ([`crate::tree::tags`]: the leaf's header carries the same tag, verified when the leaf was
 //! fetched), so a reference that damage redirects to another tree's run of the same txn and
 //! length is refused, as a redirected child pointer is. The cell does not store the tag: a read
-//! takes it from the leaf the cell is in ([`Ovf::tag`]).
+//! takes it from the leaf the cell is in ([`Ovf::tag`]). A reference redirected to another run of
+//! the same tree, txn and length (live, or freed and not yet reused) passes: nothing in a run
+//! names its key or leaf, so the read returns that run's value; [`crate::Env::check`] finds the
+//! run claimed twice (README, do-not-flag item 4).
 //!
 //! **One CRC per run.** The trailer covers `[0, n·P − 4)`: pages 2..n have no header of their
 //! own, so only the run's CRC ties them to it. All zeros means dirty (a run being written), as for

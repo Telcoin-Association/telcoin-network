@@ -135,6 +135,27 @@ pub enum NippyJarError {
         file: &'static str,
     },
 
+    /// TN(TN-0160): a jar that takes no more rows has a data or offsets file of another length
+    /// than its configuration's rows give: another jar's file, or a damaged one.
+    #[error(
+        "static file {} is damaged: its {file} file does not match its configuration",
+        path.display()
+    )]
+    FileLengthMismatch {
+        /// The jar's data file, which names the segment and its block range.
+        path: PathBuf,
+        /// Which file: `offsets` or `data`.
+        file: &'static str,
+    },
+
+    /// TN(TN-0161): a writer whose sync, offsets write or prune failed writes no configuration
+    /// again; a new writer of the jar heals its files back to the last one.
+    #[error(
+        "static file {} writer failed an earlier sync or prune; reopen it to heal the files",
+        .0.display()
+    )]
+    WriterFailed(PathBuf),
+
     /// TN(TN-0131): a jar's offsets file is empty, without even its offset size byte.
     #[error("static file offsets file {} is empty", .0.display())]
     EmptyOffsetsFile(PathBuf),

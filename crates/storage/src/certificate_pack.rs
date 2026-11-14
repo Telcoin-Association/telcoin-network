@@ -58,9 +58,16 @@ pub struct CertificatePack {
     epoch: Epoch,
 }
 
+/// The loop of a pack whose open failed: refuse new messages and drop every queued one, so each
+/// waiting request sees its reply dropped and reports the latched open error.
+///
+/// It drains with `recv` until `None`, not `try_recv` until empty. A send that took its slot
+/// before the close may not have written its message yet, and `try_recv` reports that as empty.
+/// The message would then land after the receiver is gone and never be dropped, so a `shutdown`
+/// or `persist` waiting on its reply would hang. `recv` waits for every such send.
 fn clear_pack_loop(mut rx: Receiver<PackMessage>) {
     rx.close();
-    while let Ok(msg) = rx.try_recv() {
+    while let Some(msg) = rx.blocking_recv() {
         drop(msg);
     }
 }
@@ -1837,5 +1844,37 @@ mod test {
                 assert!(inner.contains(digest), "(unclean: {unclean}) cert {i} kept");
             }
         }
+    }
+
+    /// A pack whose open failed never leaves `shutdown` waiting: its loop drains with `recv`, so
+    /// a request whose send took its slot just before the close is dropped too, and `shutdown`
+    /// returns the open error. Draining with `try_recv` until empty missed such a send and hung
+    /// a few of these 32,000 shutdowns per run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn shutdown_of_a_failed_open_never_hangs() {
+        let temp_dir = TempDir::with_prefix("cert_failed_open_no_hang").expect("temp dir");
+        // A file where the epoch's directory belongs: every open fails.
+        std::fs::write(temp_dir.path().join("epoch-0"), b"not a directory").expect("write");
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let base = temp_dir.path().to_path_buf();
+                tokio::spawn(async move {
+                    let mut hangs = 0;
+                    for _ in 0..1000 {
+                        let pack = CertificatePack::open(&base, 0);
+                        match tokio::time::timeout(Duration::from_secs(5), pack.shutdown()).await {
+                            Ok(reply) => assert!(reply.is_err(), "the open failed"),
+                            Err(_) => hangs += 1,
+                        }
+                    }
+                    hangs
+                })
+            })
+            .collect();
+        let mut hangs = 0;
+        for task in tasks {
+            hangs += task.await.expect("stress task");
+        }
+        assert_eq!(hangs, 0, "shutdowns of a failed open that never returned");
     }
 }

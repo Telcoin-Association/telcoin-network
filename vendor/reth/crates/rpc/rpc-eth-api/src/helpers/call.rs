@@ -66,6 +66,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     /// The transactions are packed into individual blocks. Overrides can be provided.
     ///
     /// See also: <https://github.com/ethereum/go-ethereum/pull/27720>
+    ///
+    /// TN(TN-0181): takes a permit of [`SpawnBlocking::tracing_task_guard`] and holds it until
+    /// its blocking work ends, so callers do not take one.
     fn simulate_v1(
         &self,
         payload: SimulatePayload<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
@@ -88,7 +91,20 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             if block_state_calls.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
             }
+            // TN(TN-0171): every block runs the pre-execution system calls outside the gas
+            // budget, so their code stays the chain's own.
+            for block in &block_state_calls {
+                if let Some(state_overrides) = &block.state_overrides {
+                    simulate::check_system_call_overrides(state_overrides)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+            }
 
+            // TN(TN-0181): the tracing permit moves into the blocking work with the blocking-IO
+            // one. Held by the caller, it returned when an HTTP client disconnected while the
+            // work ran on to its next cancellation check.
+            let tracing_permit =
+                self.acquire_owned_tracing().await.map_err(|_| EthApiError::InternalEthError)?;
             let permit = self
                 .acquire_owned_blocking_io()
                 .await
@@ -102,7 +118,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let state_at = if block.is_pending() { block } else { parent.hash().into() };
 
             self.spawn_with_state_at_block(state_at, move |this, mut db| {
-                let _permit = permit;
+                let _permits = (tracing_permit, permit);
                 // TN(TN-0156): the request's calls share one gas budget across its blocks, as
                 // `eth_callMany`'s do.
                 let mut budget = CallManyBudget::new(this.call_gas_limit());
@@ -114,6 +130,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 let mut prev_timestamp = parent.timestamp();
 
                 for block in block_state_calls {
+                    // TN(TN-0171): a block with no calls still runs the system calls.
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     // Validate block number ordering if overridden
                     if let Some(number) = block.block_overrides.as_ref().and_then(|o| o.number) {
                         let number: u64 = number.try_into().unwrap_or(u64::MAX);
@@ -315,6 +335,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
     /// Simulate arbitrary number of transactions at an arbitrary blockchain index, with the
     /// optionality of state overrides
+    ///
+    /// TN(TN-0184): takes a permit of [`SpawnBlocking::tracing_task_guard`] and holds it until
+    /// its blocking work ends, so callers do not take one.
     fn call_many(
         &self,
         bundles: Vec<Bundle<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
@@ -334,6 +357,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             )
             .map_err(Self::Error::from_eth_err)?;
 
+            // TN(TN-0184): a tracing permit too, taken first and held by the blocking work as
+            // `simulate_v1`'s is (TN-0181), so those permits bound how many requests keep their
+            // output (TN-0183) at once.
+            let tracing_permit =
+                self.acquire_owned_tracing().await.map_err(|_| EthApiError::InternalEthError)?;
             let permit = self
                 .acquire_owned_blocking_io()
                 .await
@@ -381,15 +409,29 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             }
 
             self.spawn_with_state_at_block(at, move |this, mut db| {
-                let _permit = permit;
+                let _permits = (tracing_permit, permit);
                 let mut budget = CallManyBudget::new(gas_budget);
                 let mut all_results = Vec::with_capacity(bundles.len());
 
                 if replay_block_txs {
                     // only need to replay the transactions in the block if not all transactions are
                     // to be replayed
+
+                    // TN(TN-0170): the replay starts from the parent's state, so it needs the
+                    // block's pre-execution changes (EIP-4788 root, EIP-2935 parent hash) first,
+                    // as `debug_traceCallMany` and `spawn_replay_transaction` apply them.
+                    RpcNodeCore::evm_config(&this)
+                        .executor_for_block(&mut db, block.sealed_block())
+                        .map_err(RethError::other)
+                        .map_err(Self::Error::from_eth_err)?
+                        .apply_pre_execution_changes()
+                        .map_err(Self::Error::from_eth_err)?;
+
                     let block_transactions = block.transactions_recovered().take(num_txs);
                     for tx in block_transactions {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         let tx_env = RpcNodeCore::evm_config(&this).tx_env(tx);
                         let res = this.transact(&mut db, evm_env.clone(), tx_env)?;
                         db.commit(res.state);
@@ -437,6 +479,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             },
                         )?;
                         budget.charge(res.result.gas_used()).map_err(Self::Error::from_eth_err)?;
+                        // TN(TN-0183): the return or revert data stays until the response is
+                        // built.
+                        budget
+                            .charge_output(res.result.output().map_or(0, |output| output.len()))
+                            .map_err(Self::Error::from_eth_err)?;
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {

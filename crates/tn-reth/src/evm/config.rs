@@ -230,6 +230,7 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch,
             difficulty: block.difficulty,
             gas_accumulator: self.gas_accumulator.clone(),
+            replay: true,
             // the header carries no slash list: a replayed block cannot reproduce a
             // test-injected slash (and does not need to — production lists are always empty)
             #[cfg(test)]
@@ -250,6 +251,7 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch: payload.close_epoch,
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             gas_accumulator: self.gas_accumulator.clone(),
+            replay: false,
             #[cfg(test)]
             epoch_boundary_slashes: payload.epoch_boundary_slashes,
         })
@@ -376,6 +378,8 @@ mod tests {
         let block = block_with_extra(digest.to_vec().into());
         let ctx = config.context_for_block(&block).expect("32-byte extra_data is valid");
         assert_eq!(ctx.close_epoch, Some(digest));
+        // a sealed block is only ever re-executed: it publishes no node metrics
+        assert!(ctx.replay);
 
         // malformed header: any other length errors instead of panicking
         let block = block_with_extra(Bytes::from_static(b"bad"));

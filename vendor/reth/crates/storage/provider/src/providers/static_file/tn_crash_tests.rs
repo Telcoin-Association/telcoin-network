@@ -1,8 +1,9 @@
 //! TN(TN-0130 to TN-0133): the crash points of the static-file prune, rotation and deletion paths
 //! through `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens
 //! as the state before it or after it, and files shorter than their committed configuration, or
-//! a jar missing between two others, are refused. TN(TN-0138): a failed sync of a segment commit
-//! writes no configuration. TN(TN-0150): a rotation stopped before the next jar has its files.
+//! a jar missing between two others, are refused. TN(TN-0138, TN-0161): a failed sync of a segment
+//! commit writes no configuration, then or later. TN(TN-0150): a rotation stopped before the next
+//! jar has its files.
 
 use super::{
     manager::StaticFileWriter,
@@ -66,7 +67,8 @@ fn assert_accounts(provider: &StaticFileProvider<EthPrimitives>, tip: u64, empty
 /// A changeset prune commits its header before it cuts the rows or the sidecar. A prune whose
 /// configuration cannot be written (a directory where its temporary file goes) has cut nothing:
 /// the next open reads every block. Stopped after the configuration, with the rows, the offsets
-/// or the sidecar not cut yet, the next open heals to the finished prune, byte for byte. Both
+/// the offsets alone, or the sidecar not cut yet, the next open heals to the finished prune, byte
+/// for byte. Both
 /// formats, a prune of rows and one of blocks without changes (only the sidecar shrinks). Fails
 /// if the rows or the sidecar are cut before the header is committed.
 #[test]
@@ -104,10 +106,12 @@ fn changeset_prune_commits_the_header_before_it_cuts() {
             drop(provider);
             let after = changeset_files(&path);
 
-            // Stopped after the configuration: nothing cut, then the rows cut but not the sidecar.
+            // Stopped after the configuration: nothing cut, the offsets cut but not the data, then
+            // the rows cut but not the sidecar.
             let [data, offsets, config, _] = after.clone();
             for stopped in [
                 [before[0].clone(), before[1].clone(), config.clone(), before[3].clone()],
+                [before[0].clone(), offsets.clone(), config.clone(), before[3].clone()],
                 [data.clone(), offsets.clone(), config.clone(), before[3].clone()],
             ] {
                 write_changeset_files(&path, &stopped);
@@ -120,10 +124,13 @@ fn changeset_prune_commits_the_header_before_it_cuts() {
     }
 }
 
-/// The state a prune that cut the rows before its header left (an older build's order): the rows
-/// of blocks 2 and 3 gone, their records and the header still there. A plain jar heals it as
-/// before (`sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap`); a checksummed jar refuses it
-/// as damage and cuts nothing, as it refuses a sidecar shorter than its header.
+/// The state an older build's changeset prune left when stopped between its `prune_rows` and its
+/// header commit (it gave the header its final form only after `prune_rows`): the rows of blocks
+/// 2 and 3 cut and the configuration's row count with them, the block range, the `.csoff` length
+/// and the records not. Built here with `prune_rows` on the jar alone, which writes those files.
+/// A plain jar heals it as before (`sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap`); a
+/// checksummed jar refuses it as damage and cuts nothing, as it refuses a sidecar shorter than its
+/// header.
 #[test]
 fn checksummed_changesets_shorter_than_the_header_are_refused() {
     let (dir, _) = create_test_static_files_dir();
@@ -495,19 +502,26 @@ fn is_injected(err: &ProviderError, phase: SyncPhase) -> bool {
 }
 
 /// TN(TN-0138): a segment commit's `.csoff`, data and offsets syncs run at once, and its
-/// configuration is written only when all three succeeded. With any one of them failed,
-/// `sync_and_freeze` returns that error once all three ended (each file holds the new blocks),
-/// and the configuration on disk is still the last commit's. A reopen heals the files back to it
-/// (the new blocks gone, the committed ones read back, the blocks append again); the same writer,
-/// its sync retried, commits them all. Both formats. Fails if the configuration is written after
-/// a failed sync, or if the call returns before the other syncs ended.
+/// configuration is written only when all three succeeded. With any one of them failed, after its
+/// write and `fsync` or without running at all, `sync_and_freeze` returns that error and the
+/// configuration on disk is still the last commit's; failed after the write, every file holds the
+/// new blocks (the other syncs ran too). TN(TN-0161): the writer then writes no configuration: a
+/// retried sync and a finalize are refused. A reopen heals the files back to the last
+/// configuration (the new blocks gone, the committed ones read back, the blocks append again).
+/// Both formats. Fails if the configuration is written after a failed sync, by the call or by a
+/// retry on the same writer.
 #[test]
 fn a_failed_sync_leaves_the_configuration_unwritten() {
+    use reth_nippy_jar::NippyJarError;
+
     let tip = 3;
+    let is_refused = |err: &ProviderError| {
+        matches!(err.downcast_other_ref::<NippyJarError>(), Some(NippyJarError::WriterFailed(_)))
+    };
     for checksums in [false, true] {
         for phase in [SyncPhase::Csoff, SyncPhase::Data, SyncPhase::Offsets] {
-            for retry in [false, true] {
-                let case = format!("checksums {checksums}, {phase:?}, retry {retry}");
+            for unrun in [false, true] {
+                let case = format!("checksums {checksums}, {phase:?}, unrun {unrun}");
                 let (dir, _) = create_test_static_files_dir();
                 let static_files = provider(dir.path(), checksums, 1_000);
                 write_accounts(&static_files, 0..tip + 1, tip + 1);
@@ -519,38 +533,41 @@ fn a_failed_sync_leaves_the_configuration_unwritten() {
                 for block in tip + 1..tip + 3 {
                     writer.append_account_changeset(account_changes(block), block).unwrap();
                 }
-                writer.fail_syncs = vec![phase];
+                if unrun {
+                    writer.fail_syncs_unrun = vec![phase];
+                } else {
+                    writer.fail_syncs = vec![phase];
+                }
                 let err = writer.sync_and_freeze().unwrap_err();
                 assert!(is_injected(&err, phase), "{case}: {err}");
                 assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{case}");
-                let after = synced_file_lens(&path);
-                for (file, (before, after)) in
-                    ["data", "off", "csoff"].iter().zip(before.iter().zip(after))
-                {
-                    assert!(after > *before, "{case}: {file} not written");
+                if !unrun {
+                    let after = synced_file_lens(&path);
+                    for (file, (before, after)) in
+                        ["data", "off", "csoff"].iter().zip(before.iter().zip(after))
+                    {
+                        assert!(after > *before, "{case}: {file} not written");
+                    }
                 }
 
-                if retry {
-                    writer.fail_syncs.clear();
-                    writer.sync_and_freeze().unwrap();
-                    writer.finalize().unwrap();
-                    drop(writer);
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                    drop(static_files);
-                    let static_files = provider(dir.path(), checksums, 1_000);
-                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                } else {
-                    drop(writer);
-                    drop(static_files);
-                    let static_files = provider(dir.path(), checksums, 1_000);
-                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
-                    assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config);
-                    assert_eq!(synced_file_lens(&path), before, "{case}");
-                    assert_accounts(&static_files, tip, tip + 1);
-                    write_accounts(&static_files, tip + 1..tip + 3, tip + 3);
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                }
+                // The same writer, its syncs no longer failing, writes no configuration.
+                writer.fail_syncs.clear();
+                writer.fail_syncs_unrun.clear();
+                let err = writer.sync_and_freeze().unwrap_err();
+                assert!(is_refused(&err), "{case}: {err}");
+                let err = writer.finalize().unwrap_err();
+                assert!(is_refused(&err), "{case}: {err}");
+                assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{case}");
+                drop(writer);
+                drop(static_files);
+
+                let static_files = provider(dir.path(), checksums, 1_000);
+                drop(static_files.latest_writer(ACCOUNTS).unwrap());
+                assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config);
+                assert_eq!(synced_file_lens(&path), before, "{case}");
+                assert_accounts(&static_files, tip, tip + 1);
+                write_accounts(&static_files, tip + 1..tip + 3, tip + 3);
+                assert_accounts(&static_files, tip + 2, tip + 3);
             }
         }
     }
@@ -599,5 +616,160 @@ fn failed_syncs_return_the_first_in_the_serial_order() {
         let err = writer.sync_and_freeze().unwrap_err();
         assert!(is_injected(&err, expected), "headers {failed:?}: {err}");
         assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{failed:?}");
+    }
+}
+
+/// TN(TN-0166): with no sync thread able to start, a segment commit runs every sync on the
+/// calling thread and commits, for a changeset segment (three syncs) in both formats; the blocks
+/// read back, also after a reopen. Before, a thread that could not start was its sync's error.
+#[test]
+fn syncs_run_here_when_their_threads_cannot_start() {
+    use super::writer::FAIL_SYNC_THREADS;
+
+    FAIL_SYNC_THREADS.with(|fail| fail.set(true));
+    for checksums in [false, true] {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), checksums, 1_000);
+        let mut writer = static_files.latest_writer(ACCOUNTS).unwrap();
+        for block in 0..3 {
+            writer.append_account_changeset(account_changes(block), block).unwrap();
+        }
+        writer.sync_and_freeze().unwrap();
+        writer.finalize().unwrap();
+        drop(writer);
+        assert_accounts(&static_files, 2, 3);
+        drop(static_files);
+        let static_files = provider(dir.path(), checksums, 1_000);
+        drop(static_files.latest_writer(ACCOUNTS).unwrap());
+        assert_accounts(&static_files, 2, 3);
+    }
+    FAIL_SYNC_THREADS.with(|fail| fail.set(false));
+}
+
+/// The data, offsets and configuration files of the jar at `path`.
+fn jar_files(path: &Path) -> [Vec<u8>; 3] {
+    ["", "off", "conf"].map(|ext| {
+        let file = if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+        std::fs::read(file).unwrap()
+    })
+}
+
+/// Writes `files` ([`jar_files`]) as the jar at `path`.
+fn write_jar_files(path: &Path, files: &[Vec<u8>; 3]) {
+    for (ext, bytes) in ["", "off", "conf"].iter().zip(files) {
+        let file: PathBuf =
+            if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+        std::fs::write(file, bytes).unwrap();
+    }
+}
+
+/// TN(TN-0130): a block-segment prune (headers, and transactions, a transaction segment) stopped
+/// after `prune_rows` wrote its configuration, with nothing cut or with only the offsets cut, heals
+/// at the next open to the files of the finished `prune_rows`, and the rows it keeps read. Both
+/// formats. For transactions that configuration has the transaction range cut but not yet the
+/// block range, which the truncation's own commit sets; at a start, `check_consistency` sets it
+/// from the database (not run here).
+#[test]
+fn block_segment_prune_stopped_after_the_configuration_heals() {
+    use alloy_consensus::{Header, Transaction};
+    use reth_static_file_types::SegmentHeader;
+    use reth_storage_api::{HeaderProvider, TransactionsProvider};
+
+    const PRUNED: u64 = 2;
+    for checksums in [false, true] {
+        for segment in [StaticFileSegment::Headers, StaticFileSegment::Transactions] {
+            let case = format!("checksums {checksums}, {segment}");
+            let (dir, _) = create_test_static_files_dir();
+            let static_files = provider(dir.path(), checksums, 1_000);
+            write_block_segments(&static_files, 6);
+            let path = jar_path(&static_files, segment, 0);
+            drop(static_files);
+            let before = jar_files(&path);
+
+            // The configuration `prune_rows` writes, and the files it leaves.
+            let mut writer = NippyJarWriter::<SegmentHeader>::new(load(&path)).unwrap();
+            writer.user_header_mut().prune(PRUNED);
+            writer.prune_rows(PRUNED as usize).unwrap();
+            drop(writer);
+            let [data, offsets, config] = jar_files(&path);
+
+            for stopped in [
+                [before[0].clone(), before[1].clone(), config.clone()],
+                [before[0].clone(), offsets.clone(), config.clone()],
+            ] {
+                write_jar_files(&path, &stopped);
+                let static_files = provider(dir.path(), checksums, 1_000);
+                drop(static_files.latest_writer(segment).unwrap());
+                assert_eq!(jar_files(&path), [data.clone(), offsets.clone(), config.clone()]);
+                let kept = 6 - PRUNED;
+                if segment == StaticFileSegment::Headers {
+                    for number in 0..kept {
+                        let header = static_files.header_by_number(number).unwrap().unwrap();
+                        assert_eq!(
+                            header,
+                            Header { number, gas_limit: 30_000_000 + number, ..Default::default() },
+                            "{case}"
+                        );
+                    }
+                    assert_eq!(static_files.get_highest_static_file_block(segment), Some(kept - 1));
+                } else {
+                    for tx in 0..kept {
+                        let found = static_files.transaction_by_id(tx).unwrap().unwrap();
+                        assert_eq!(found.nonce(), tx, "{case}");
+                    }
+                    assert_eq!(static_files.get_highest_static_file_tx(segment), Some(kept - 1));
+                    assert_eq!(static_files.get_highest_static_file_block(segment), Some(5));
+                }
+            }
+        }
+    }
+}
+
+/// TN(TN-0150): at genesis the first jar of a segment is created too, configuration first. A
+/// creation stopped after the configuration, or after the data file as well, leaves a jar without
+/// a block range, which the next start does not list; the next persist writes the jar, and its
+/// block reads. Both formats, a block segment and a changeset segment.
+#[test]
+fn creation_at_genesis_stopped_before_the_jar_has_its_files() {
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_storage_api::HeaderProvider;
+
+    for checksums in [false, true] {
+        for kept in [&["conf"][..], &["conf", ""]] {
+            let case = format!("checksums {checksums}, kept {kept:?}");
+            let (dir, _) = create_test_static_files_dir();
+            let static_files = provider(dir.path(), checksums, 2);
+            let first = [StaticFileSegment::Headers, ACCOUNTS].map(|segment| {
+                drop(static_files.latest_writer(segment).unwrap());
+                jar_path(&static_files, segment, 0)
+            });
+            drop(static_files);
+            for path in &first {
+                for ext in ["", "off", "csoff"] {
+                    let file = if ext.is_empty() { path.clone() } else { path.with_extension(ext) };
+                    if !kept.contains(&ext) && file.exists() {
+                        std::fs::remove_file(file).unwrap();
+                    }
+                }
+            }
+
+            let static_files = provider(dir.path(), checksums, 2);
+            assert_eq!(
+                static_files.get_highest_static_file_block(StaticFileSegment::Headers),
+                None
+            );
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
+            headers.append_header(&Header::default(), &B256::with_last_byte(1)).unwrap();
+            headers.commit().unwrap();
+            drop(headers);
+            write_accounts(&static_files, 0..1, 1);
+            assert_eq!(
+                static_files.header_by_number(0).unwrap(),
+                Some(Header::default()),
+                "{case}"
+            );
+            assert_accounts(&static_files, 0, 1);
+        }
     }
 }

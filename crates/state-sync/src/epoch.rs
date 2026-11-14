@@ -210,10 +210,38 @@ where
     }
 }
 
+/// The node's count of epoch records that contradict its own execution (`EpochMetrics` in
+/// `tn-node`, `tn_epoch_final_state_mismatches_total` in Prometheus). Every count stops the node.
+const FINAL_STATE_MISMATCHES: &str = "tn_epoch.final_state_mismatches_total";
+
 /// Split a failed save of a downloaded epoch record ([`EpochDbError::stop_on_local_failure`]):
 /// our own store failing is returned, so the collection fails and the node stops; a refused
 /// record, which a peer can send, is only logged, and the caller asks again later.
+///
+/// A certified record (it passed `validate_downloaded_record`) refused because this node holds a
+/// different record for the epoch (`ConflictingRecord`) is returned too: the stored record is this
+/// node's own uncertified one, built from its execution (the collector skips epochs whose record
+/// is already certified), so this node's execution diverged from the one a quorum certified. It is
+/// counted in `tn_epoch_final_state_mismatches_total` and the node stops, as a committee validator
+/// does at the epoch vote: an observer or a node outside the committee would otherwise run on, and
+/// serve, a chain no quorum certified. A restart stops again, as the collector asks again.
 fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
+    if matches!(e, EpochDbError::ConflictingRecord { .. }) {
+        ::metrics::counter!(FINAL_STATE_MISMATCHES).increment(1);
+        error!(
+            target: "epoch-manager",
+            epoch,
+            e = %e,
+            "a certified epoch record from peers conflicts with this node's own record for the \
+             epoch: this node's execution diverged from the certified chain, stopping the node",
+        );
+        return Err(eyre::Report::new(e).wrap_err(format!(
+            "epoch {epoch}: a quorum certified an epoch record other than the one this node built \
+             from its own execution, so this node's execution diverged - stopping the node rather \
+             than run on a chain no quorum certified (do NOT delete chain-data: keep the datadir to \
+             find the first block that differs)"
+        )));
+    }
     e.stop_on_local_failure(format!("failed to save epoch record/cert for epoch {epoch}"))
 }
 
@@ -221,8 +249,9 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 /// Returns the Epoch that was last retrieved, and whether the pass ended on a peer's answer (see
 /// [`CollectedPass`]).
 ///
-/// Fails only when our own epoch store fails to save or persist (see [`stop_on_local_failure`]);
-/// a peer's invalid or refused record is logged and asked for again on a later pass. Each
+/// Fails when our own epoch store fails to save or persist, or when a certified record conflicts
+/// with this node's own (see [`stop_on_local_failure`]); a peer's invalid or otherwise refused
+/// record is logged and asked for again on a later pass. Each
 /// certified record stored is published on [`ConsensusBusApp::certified_record_epoch`], so an
 /// active validator still running an epoch the network already closed leaves it to catch up.
 async fn collect_epoch_records(
@@ -644,11 +673,12 @@ mod tests {
         assert!(consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
     }
 
-    /// A peer's certified record that conflicts with the one we stored is refused by the store
-    /// (`ConflictingRecord`). That is a peer's input, not our store failing: the collector keeps
-    /// going (asks again later) and our record stays.
+    /// A certified record from peers that conflicts with our own uncertified record is refused by
+    /// the store (`ConflictingRecord`): our execution diverged from the one a quorum certified, so
+    /// the collection fails, which stops the node, and on every pass after a restart too. Our
+    /// record stays.
     #[tokio::test]
-    async fn test_collect_epoch_records_keeps_going_past_a_refused_record() {
+    async fn test_collect_epoch_records_stops_on_a_record_conflicting_with_our_own() {
         let fixture = CommitteeFixture::builder(MemDatabase::default)
             .committee_size(NonZeroUsize::new(4).expect("4 > 0"))
             .build();
@@ -688,11 +718,10 @@ mod tests {
         let consensus_bus = ConsensusBus::new();
 
         for _ in 0..2 {
-            let collected =
-                collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app())
-                    .await
-                    .expect("a refused peer record must not stop the collector");
-            assert_eq!(collected.epoch, 0, "the refused epoch is asked for again");
+            let err = collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app())
+                .await
+                .expect_err("a certified record conflicting with ours stops the collector");
+            assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
         }
         assert_eq!(
             consensus_chain.epochs().get_epoch_by_number(1).await,
@@ -793,15 +822,33 @@ mod tests {
     }
 
     /// The split behind a downloaded record's save: our own store failing is returned (the node
-    /// stops), a refused record, which a peer can send, is only logged.
+    /// stops), and so is a certified record that conflicts with this node's own, counted as a
+    /// final-state mismatch; any other refused record, which a peer can send, is only logged.
     #[test]
-    fn test_only_local_store_failures_stop_collection() {
+    fn test_only_local_store_failures_and_conflicts_stop_collection() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
         let digest = EpochRecord::default().digest();
-        let refused = EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest };
-        assert!(stop_on_local_failure(refused, 1).is_ok());
-        let err = stop_on_local_failure(EpochDbError::SendFailed, 1)
-            .expect_err("a dead epoch store is local");
-        assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
+        ::metrics::with_local_recorder(&recorder, || {
+            let conflict =
+                EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest };
+            let err = stop_on_local_failure(conflict, 1).expect_err("a conflict stops the node");
+            assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+            let mismatch = EpochDbError::CertificateMismatch { record: digest, certified: digest };
+            assert!(stop_on_local_failure(mismatch, 1).is_ok());
+            let err = stop_on_local_failure(EpochDbError::SendFailed, 1)
+                .expect_err("a dead epoch store is local");
+            assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (_, _, _, value) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == FINAL_STATE_MISMATCHES)
+            .expect("the conflict is counted");
+        assert!(matches!(value, DebugValue::Counter(1)), "{value:?}");
     }
 
     /// The public gate replaces the dummy anchor and saves a peer's certified epoch chain.

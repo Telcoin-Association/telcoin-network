@@ -518,14 +518,14 @@ It triggers on `pull_request`, never `pull_request_target`: it compiles and runs
 
 ## aarch64 CRC kernel
 
-`.github/workflows/arm64-crc.yaml` (*arm64 CRC kernel*) runs `cargo nextest run --locked -p tn-lmdb -E 'test(/^crc::tests::/)'` on `ubuntu-24.04-arm`.
+`.github/workflows/arm64-crc.yaml` (*arm64 CRC kernel*) runs `cargo nextest run --locked -p tn-lmdb -p tn-lmdb-reth` on `ubuntu-24.04-arm`: the execution engine's and its reth adapter's whole suites.
 `crates/tn-lmdb/src/crc.rs` (a copy of `crates/storage/src/archive/crc.rs`) has a PMULL carry-less-multiply CRC-32 kernel that is compiled on little-endian aarch64 only, and its tests compare that kernel with `crc32fast`.
 Before the tests, a step diffs the two files with every comment line and the `allow(dead_code)` and `#[inline]` attribute lines dropped (the differences tn-lmdb's copy documents), and fails on any other difference, the unit tests included: the one arm64 run then covers both copies without building tn-storage.
-Every test lane in `pr.yaml` runs on `ubuntu-latest`, which is x86_64, so without this workflow the kernel never ran in CI; the maintainers' attested runs on Apple silicon were its only coverage.
+Every test lane in `pr.yaml` runs on `ubuntu-latest`, which is x86_64, so without this workflow the kernel, and the engine's page, mmap and file code on aarch64 Linux, never ran in CI; the maintainers' attested runs on Apple silicon were their only coverage.
 
-It runs on a `pull_request` or a push to `main` that touches `crates/tn-lmdb/**`, `crates/storage/src/archive/crc.rs`, `rust-toolchain.toml`, `Cargo.lock` or the workflow itself, and on every `merge_group` (that event takes no path filter).
+It runs on a `pull_request` or a push to `main` that touches `crates/tn-lmdb/**`, `crates/tn-lmdb-reth/**`, `crates/storage/src/archive/crc.rs`, `rust-toolchain.toml`, `Cargo.lock` or the workflow itself, and on every `merge_group` (that event takes no path filter).
 It is not a required check and is not in `CI Success`'s `needs` list, so a red run blocks nothing but shows on the pull request; keep it that way (item 1 of "Repository settings this requires").
-The checkout takes no submodule (tn-lmdb needs none), the toolchain and `cargo-nextest` install steps are the same as the test lanes', and there is no dependency cache: the package builds from cold in about a minute, and a second architecture's entries would eat the quota the queue's entries need.
+The checkout takes no submodule (tn-lmdb needs none), the toolchain and `cargo-nextest` install steps are the same as the test lanes', and there is no dependency cache: a second architecture's entries would eat the quota the queue's entries need. tn-lmdb builds from cold in about a minute; tn-lmdb-reth adds the vendored reth database crates it adapts, a few minutes more, inside the job's 30-minute limit.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.

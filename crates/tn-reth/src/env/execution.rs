@@ -25,7 +25,8 @@
 //! `output_overlay/account_split.rs`, `output_overlay/storage_split.rs`; `TN_PARALLEL_STATE_ROOT=0`
 //! turns all off, `TN_PARALLEL_ACCOUNT_WALK=0` and `TN_PARALLEL_STORAGE_WALK=0` each split). All
 //! other state reads go through the cross-block execution cache (`exec_cache.rs`: values at the
-//! parent block, kept across blocks and outputs) and, on a miss, reth's memory overlay.
+//! parent block, kept across blocks and outputs; `TN_EXEC_CACHE=0` turns it off) and, on a miss,
+//! reth's memory overlay.
 //!
 //! # Deliberate transaction drops (fork safety)
 //!
@@ -169,7 +170,8 @@ impl RethEnv {
     /// cache, from the same recovered transactions, so the returned block is the one a node
     /// without the cache builds. That rebuild reads no cache, so it cannot see a stale hit; one
     /// would be a bug and fails the build. The rebuilt block's stage timings and invalid
-    /// transaction skips are recorded a second time; signer recovery runs once.
+    /// transaction skips are recorded a second time; signer recovery runs once. Blocks built
+    /// before it are not checked again (`env/exec_cache.rs`, "Checks").
     ///
     /// # Callers
     ///

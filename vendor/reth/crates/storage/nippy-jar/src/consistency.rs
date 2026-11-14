@@ -1,4 +1,7 @@
-use crate::{writer::OFFSET_SIZE_BYTES, NippyJar, NippyJarError, NippyJarHeader};
+use crate::{
+    value_checksum, writer::OFFSET_SIZE_BYTES, DataReader, NippyJar, NippyJarError, NippyJarHeader,
+    CHECKSUM_SIZE,
+};
 use std::{
     cmp::Ordering,
     fs::{File, OpenOptions},
@@ -126,6 +129,13 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
         // Offset list wasn't properly committed
         match last_offset.cmp(&data_file_len) {
             Ordering::Less => {
+                // TN(TN-0162): the final offset says where the data file is cut, so in a
+                // checksummed jar the committed value it ends is verified first: a damaged final
+                // offset is refused, not cut to.
+                if self.jar.has_checksums() {
+                    self.verify_last_value(&reader, last_offset)?;
+                }
+
                 // Windows has locked the file with the mmap handle, so we need to drop it
                 drop(reader);
 
@@ -198,6 +208,35 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
 
         self.offsets_file().seek(SeekFrom::End(0))?;
         self.data_file().seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+
+    /// TN(TN-0162): verifies the committed value that ends at the final offset `end`: the last
+    /// column of the last committed row (a jar without rows was reset before this).
+    fn verify_last_value(&self, reader: &DataReader, end: u64) -> Result<(), NippyJarError> {
+        let (row, column) = (self.jar.rows as u64 - 1, self.jar.columns - 1);
+        let start = reader.reverse_offset(1)?;
+        let value = (start <= end && end <= reader.size() as u64)
+            .then(|| reader.data(start as usize..end as usize))
+            .filter(|value| value.len() >= CHECKSUM_SIZE);
+        let verified = value.is_some_and(|value| {
+            let (stored, checksum) = value.split_at(value.len() - CHECKSUM_SIZE);
+            value_checksum(row, column, stored).to_le_bytes() == checksum
+        });
+        if !verified {
+            tracing::error!(
+                target: "nippy-jar",
+                path = %self.jar.data_path().display(),
+                row,
+                column,
+                "Static file's final offset does not end its last committed value"
+            );
+            return Err(NippyJarError::ChecksumMismatch {
+                path: self.jar.data_path().to_path_buf(),
+                row,
+                column,
+            })
+        }
         Ok(())
     }
 

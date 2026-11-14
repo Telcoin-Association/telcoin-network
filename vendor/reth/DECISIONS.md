@@ -212,7 +212,7 @@ datadir and TN-0014 makes that v1, and an existing datadir keeps the settings it
 also pins `StorageArgs { v2: false }` and does not expose the flag, but `init_genesis` never reads
 it.) Upstream main returns v2 from `base()`, so a sync conflicts on that line; resolving it toward
 upstream would make new nodes write no history indices and disagree with v1 nodes on historical
-reads. `tn-reth`'s `test_new_datadir_uses_storage_v1` fails if that happens.
+reads. `tn-reth`'s `test_new_datadir_uses_storage_v1` guarded against that until D22 (below).
 
 Since 2026-11-09 (D22) TN creates v2 datadirs itself, without RocksDB: `settle`
 (`crates/tn-reth/src/env/layout.rs`) picks a new datadir's layout (v2 on tn-lmdb, v1 on the

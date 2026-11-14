@@ -1050,6 +1050,30 @@ mod trace_permit_tests {
 mod tests {
     use super::*;
 
+    /// TN(TN-0176): `trace_callMany`'s calls share the gas budget: one 25,800-gas call fits a
+    /// 50,000 cap, two do not.
+    #[tokio::test]
+    async fn trace_call_many_calls_share_the_gas_budget() {
+        use crate::permit_test_utils::MockChain;
+        use reth_rpc_eth_types::GasCap;
+
+        let chain = MockChain::new();
+        let api = TraceApi::new(
+            chain.eth_api_with_gas_cap(GasCap(50_000)),
+            BlockingTaskGuard::new(1),
+            EthConfig::default(),
+        );
+        let call = (MockChain::call_of_25_800_gas(), std::iter::once(TraceType::Trace).collect());
+        let at_block_1 = Some(BlockId::number(1));
+        let traces = api.trace_call_many(vec![call.clone()], at_block_1).await.expect("one fits");
+        assert_eq!(traces.len(), 1);
+        let err = api.trace_call_many(vec![call.clone(), call], at_block_1).await.unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn trace_call_many_defaults_to_latest() {
         use crate::EthApiBuilder;

@@ -49,6 +49,13 @@ pub struct NippyJarWriter<H: NippyJarHeader = ()> {
     column: usize,
     /// Whether the writer has changed data that needs to be committed.
     dirty: bool,
+    /// TN(TN-0161): set when a sync, an offsets write or a prune failed. Its files and its rows
+    /// and offsets in memory may then disagree (a failed offsets write has drained the offsets it
+    /// did not write, a failed prune has cut its rows in memory only, and a retried `fsync` can
+    /// report success for pages the failed one lost), so it writes no configuration again:
+    /// [`Self::finalize`] and [`Self::prune_rows`] refuse. A new writer of the jar heals its files
+    /// back to the last configuration.
+    failed: bool,
 }
 
 impl<H: NippyJarHeader> NippyJarWriter<H> {
@@ -95,6 +102,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
             offsets: Vec::with_capacity(1_000_000),
             column: 0,
             dirty: false,
+            failed: false,
         };
 
         if !is_created {
@@ -305,7 +313,15 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// uncommitted tail, which the open-time heal cuts as it cuts an interrupted append. Files
     /// shorter than their configuration are then damage, which a checksummed jar's heal refuses
     /// ([`NippyJarChecker`]). A finished prune leaves the files it left before.
+    ///
+    /// TN(TN-0161): a failed prune leaves the writer failed.
     pub fn prune_rows(&mut self, num_rows: usize) -> Result<(), NippyJarError> {
+        self.check_not_failed()?;
+        let result = self.prune_rows_inner(num_rows);
+        self.fail_on(result)
+    }
+
+    fn prune_rows_inner(&mut self, num_rows: usize) -> Result<(), NippyJarError> {
         self.dirty = true;
 
         self.offsets_file.flush()?;
@@ -452,7 +468,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// TN(TN-0119): split out, and `commit_offsets` made public, so the static-file writer can
     /// time the two syncs apart.
     pub fn sync_data(&mut self) -> Result<(), NippyJarError> {
-        self.sync_jobs().0.run()
+        let result = self.sync_jobs().0.run();
+        self.fail_on(result)
     }
 
     /// The two halves of [`Self::sync_all`], [`Self::sync_data`] and [`Self::commit_offsets`], as
@@ -460,6 +477,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     ///
     /// TN(TN-0138): the static-file writer runs them beside its `.csoff` sync. Their order does
     /// not matter: the configuration, written only after both, bounds what a reopen keeps.
+    /// TN(TN-0161): a caller whose job failed calls [`Self::mark_failed`].
     pub const fn sync_jobs(&mut self) -> (DataSync<'_>, OffsetsSync<'_>) {
         (
             DataSync { data_file: &mut self.data_file },
@@ -471,6 +489,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     ///
     /// Must be called after [`Self::sync_all`] to complete the commit.
     pub fn finalize(&mut self) -> Result<(), NippyJarError> {
+        self.check_not_failed()?;
         // Flushes `max_row_size` and total `rows` to disk.
         self.jar.freeze_config()?;
         self.dirty = false;
@@ -484,6 +503,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// but it does not guarantee that all data is synchronized to persistent storage.
     #[cfg(feature = "test-utils")]
     pub fn commit_without_sync_all(&mut self) -> Result<(), NippyJarError> {
+        self.check_not_failed()?;
         self.data_file.flush()?;
 
         self.commit_offsets_without_sync_all()?;
@@ -497,7 +517,8 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
 
     /// Flushes offsets to disk.
     pub fn commit_offsets(&mut self) -> Result<(), NippyJarError> {
-        self.sync_jobs().1.run()
+        let result = self.sync_jobs().1.run();
+        self.fail_on(result)
     }
 
     #[cfg(feature = "test-utils")]
@@ -510,7 +531,37 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     /// CAUTION: Does not sync the offsets file and requires a manual call to
     /// `reth_fs_util::fsync_file(self.offsets_file.get_ref())`.
     fn commit_offsets_inner(&mut self) -> Result<(), NippyJarError> {
-        self.sync_jobs().1.write()
+        let result = self.sync_jobs().1.write();
+        self.fail_on(result)
+    }
+
+    /// TN(TN-0161): marks the writer failed ([`Self::has_failed`]): it writes no configuration
+    /// again. For a caller whose [`Self::sync_jobs`] job, or sync of a file of its own that the
+    /// configuration counts, failed.
+    pub const fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    /// TN(TN-0161): whether a sync, offsets write or prune of this writer failed, after which it
+    /// writes no configuration.
+    pub const fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// TN(TN-0161): `result`, with the writer marked failed if it is an error.
+    const fn fail_on<T>(&mut self, result: Result<T, NippyJarError>) -> Result<T, NippyJarError> {
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// TN(TN-0161): refuses to write a configuration after a failure.
+    fn check_not_failed(&self) -> Result<(), NippyJarError> {
+        if self.failed {
+            return Err(NippyJarError::WriterFailed(self.jar.data_path().to_path_buf()))
+        }
+        Ok(())
     }
 
     /// Returns the maximum row size for the associated [`NippyJar`].

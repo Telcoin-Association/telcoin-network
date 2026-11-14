@@ -425,7 +425,19 @@ where
             .await
         });
 
-        Box::pin(async move { f.await.map_err(|err| err.into()) })
+        // TN(TN-0177): the call is aborted when the connection drops this future, so a request
+        // whose client went away is dropped and its blocking work sees `is_cancelled()`.
+        let mut f = AbortOnDrop(f);
+        Box::pin(async move { (&mut f.0).await.map_err(|err| err.into()) })
+    }
+}
+
+/// TN(TN-0177): aborts the spawned call when dropped; a call that already ended is unaffected.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -902,6 +914,45 @@ mod tests {
         let response: Result<client::BatchResponse<'_, String>, Error> =
             client.batch_request(batch_request_builder).await;
         assert!(response.is_err());
+    }
+
+    /// TN(TN-0177): a call whose client disconnects is dropped, not left running.
+    #[tokio::test]
+    async fn a_disconnected_clients_call_is_dropped() {
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let endpoint = &dummy_name();
+        let server = Builder::default().build(endpoint.clone());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut module = RpcModule::new(dropped.clone());
+        module
+            .register_async_method("forever", |_, dropped, _| async move {
+                let _guard = SetOnDrop(Arc::clone(&dropped));
+                std::future::pending::<()>().await;
+                "unreachable"
+            })
+            .unwrap();
+        let handle = server.start(module).await.unwrap();
+        tokio::spawn(handle.stopped());
+
+        let client = IpcClientBuilder::default().build(endpoint).await.unwrap();
+        let call = client.request::<String, _>("forever", rpc_params![]);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(200), call).await.is_err());
+        assert!(!dropped.load(std::sync::atomic::Ordering::Relaxed), "the call still runs");
+        drop(client);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !dropped.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the call is dropped once its client disconnects");
     }
 
     /// TN(TN-0055): a batch above the limit is refused whole.

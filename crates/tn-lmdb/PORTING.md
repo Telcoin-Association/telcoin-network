@@ -288,10 +288,10 @@ weak meta is trusted, so a process crash recovers the last sync, as a reboot doe
 `sysctlbyname("kern.bootsessionuuid")`, each a UUID string (`the_host_boot_id_is_known_and_stable`).
 A boot time is not a safe substitute: a stepped clock moves it within a boot (safe: weak heads are
 then distrusted), and a host without a working clock can repeat it across boots (unsafe).
-The boot record (open step 4) reads the same id and needs the other half of the contract too: the
-id must not change within a boot. One that did would make a crash's "open" read as another boot's,
-and the open would keep a cache it must drop. An id that repeats across boots costs the record
-nothing: a new boot's cache holds nothing of the file, so keeping it is right either way.
+The boot record (open step 4) reads the same id but keeps a cache on no id alone: an "open"
+record drops it whatever boot wrote it, and a "clean" one keeps it only while the file's ctime is
+the one the clean close left, so an id that changes within a boot or repeats across boots costs
+the record nothing.
 
 ### The OS page size and `msync` alignment
 

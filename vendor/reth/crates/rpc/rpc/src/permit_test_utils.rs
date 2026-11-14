@@ -14,7 +14,7 @@ use reth_primitives_traits::{Block as _, SealedBlock};
 use reth_provider::test_utils::MockEthProvider;
 use reth_rpc_convert::RpcConverter;
 use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
-use reth_rpc_eth_types::receipt::EthReceiptConverter;
+use reth_rpc_eth_types::{receipt::EthReceiptConverter, GasCap};
 use reth_testing_utils::generators;
 use reth_transaction_pool::test_utils::{testing_pool, TestPool};
 use std::{
@@ -69,13 +69,28 @@ impl MockChain {
 
     /// An `eth` API over this chain.
     pub(crate) fn eth_api(&self) -> TestEthApi {
+        self.eth_api_with_gas_cap(GasCap::default())
+    }
+
+    /// TN(TN-0176): an `eth` API over this chain with `gas_cap` as `--rpc.gascap`.
+    pub(crate) fn eth_api_with_gas_cap(&self, gas_cap: GasCap) -> TestEthApi {
         EthApiBuilder::new(
             self.provider.clone(),
             testing_pool(),
             NoopNetwork::default(),
             EthEvmConfig::new(self.provider.chain_spec()),
         )
+        .gas_cap(gas_cap)
         .build()
+    }
+
+    /// TN(TN-0176): a call of 25,800 gas: a transfer with 300 non-zero bytes of calldata.
+    pub(crate) fn call_of_25_800_gas() -> alloy_rpc_types_eth::TransactionRequest {
+        alloy_rpc_types_eth::TransactionRequest {
+            to: Some(TxKind::Call(Address::with_last_byte(0xff))),
+            input: alloy_rpc_types_eth::TransactionInput::new(vec![1u8; 300].into()),
+            ..Default::default()
+        }
     }
 
     /// Clones of the mock's account store alive: a request's blocking task holds one for its

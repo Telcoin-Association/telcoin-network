@@ -324,6 +324,57 @@ async fn trace_filter_honours_max_trace_filter_blocks() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A call at a transaction index inside a block sees the block's pre-execution changes.
+///
+/// Block 1's EIP-2935 system call stores the genesis hash in the history contract before its
+/// first transaction. `eth_callMany` and `debug_traceCallMany` at `transactionIndex` 0 replay
+/// from genesis state, so the history contract must answer the genesis hash in both, as it does
+/// to `eth_call` on block 1.
+#[tokio::test]
+async fn call_many_at_a_transaction_index_applies_pre_execution_changes() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let served = server_from_cli(
+        &["--http", "--http.api", "eth,debug", "--ipcdisable"],
+        &task_manager,
+        &tmp_dir,
+    )?;
+    mine_transfer(&served)?;
+    let http = served.server.http_methods(|_| true).expect("http is enabled");
+    let genesis_hash = Bytes::from(served.chain.genesis_hash().to_vec());
+
+    // the history contract's `get`: the hash of the block numbered by the 32-byte input
+    let read_genesis_hash = json!({
+        "to": alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS,
+        "input": B256::ZERO,
+    });
+    let at_index_0 = json!({"blockNumber": "0x1", "transactionIndex": 0});
+
+    let on_block_1: Bytes = http.call("eth_call", rpc_params![&read_genesis_hash, "0x1"]).await?;
+    assert_eq!(on_block_1, genesis_hash, "block 1's state holds the genesis hash");
+
+    let call_many: Value = http
+        .call(
+            "eth_callMany",
+            rpc_params![json!([{"transactions": [&read_genesis_hash]}]), &at_index_0],
+        )
+        .await?;
+    assert_eq!(field::<Bytes>(&call_many[0][0], "value")?, genesis_hash, "{call_many}");
+
+    let traced: Value = http
+        .call(
+            "debug_traceCallMany",
+            rpc_params![
+                json!([{"transactions": [&read_genesis_hash]}]),
+                &at_index_0,
+                json!({"tracer": "callTracer"})
+            ],
+        )
+        .await?;
+    assert_eq!(field::<Bytes>(&traced[0][0], "output")?, genesis_hash, "{traced}");
+    Ok(())
+}
+
 /// Every task the RPC server spawns runs on the env's task manager: once the manager's tasks have
 /// exited and the server and the env are dropped, the database is closed and opens again. On
 /// reth's default executor the eth state cache and the fee-history task would still hold it.

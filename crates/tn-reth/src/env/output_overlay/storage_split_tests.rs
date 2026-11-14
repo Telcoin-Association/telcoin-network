@@ -20,10 +20,11 @@ use crate::{
         },
         layered_factories,
         parallel::{
-            ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN,
-            STORAGE_SPLITS_COMPOSED,
+            ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN, LAST_ROOT_FAILURES,
+            RUN_JOBS_BEFORE_WALK, STORAGE_SPLITS_COMPOSED, WALK_HELPERS,
         },
     },
+    metrics::ParallelRootTaskFailure,
     OutputTrieOverlay,
 };
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -491,7 +492,9 @@ async fn pieces_with_unchanged_nibbles() -> eyre::Result<()> {
 /// A commit between the walk's transaction and the helpers' (the finalized block number
 /// advances, as a persist does): every helper sees another tip and claims nothing, so the calling
 /// thread computes every piece over its own transaction and the root is that transaction's serial
-/// root, the hot storage roots still composed.
+/// root, the hot storage roots still composed. Every helper runs before the calling thread claims
+/// a piece ([`RUN_JOBS_BEFORE_WALK`]), so without the tip check the helpers would compute the
+/// pieces over the moved database whatever the scheduling.
 #[tokio::test]
 async fn moved_tip_leaves_the_pieces_to_the_walk() -> eyre::Result<()> {
     let mut fixture = Fixture::new(base())?;
@@ -510,10 +513,15 @@ async fn moved_tip_leaves_the_pieces_to_the_walk() -> eyre::Result<()> {
     drop(after);
 
     let composed_before = STORAGE_SPLITS_COMPOSED.with(|n| n.get());
+    RUN_JOBS_BEFORE_WALK.with(|f| f.set(true));
     let parallel =
         overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(STORAGE_SPLITS_COMPOSED.with(|n| n.get()), composed_before + 2, "both composed");
+    let helpers = rayon::current_num_threads().min(WALK_HELPERS);
+    let (failed, first) = LAST_ROOT_FAILURES.with(|f| f.get());
+    assert_eq!(first, Some(ParallelRootTaskFailure::TipMoved), "{failed} failures");
+    assert!(failed >= helpers, "every helper saw the move: {failed} failures, {helpers} helpers");
     Ok(())
 }
 

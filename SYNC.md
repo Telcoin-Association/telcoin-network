@@ -179,7 +179,10 @@ telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
 
 Node role is derived from committee membership, including after an import. A key outside the current
 committee runs as an observer without any role flag. To take a validator out of consensus, exit it
-on chain.
+on chain. A validator key that voted or proposed from another datadir (an old one lost, replaced or
+moved aside) stays stopped until the network has closed the last epoch it took part in: the fresh
+datadir's consensus database has no record of those votes and proposals, so the node could sign
+conflicting ones.
 
 On startup the node reads the slot hint, opens epoch N's consensus pack, and begins syncing *forward*
 from epoch N — downloading and verifying newer epoch records and consensus output via the metadata

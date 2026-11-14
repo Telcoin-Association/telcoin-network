@@ -397,7 +397,8 @@ fn sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap() {
     assert_eq!(std::fs::read(&csoff).unwrap(), gap);
     drop(provider);
 
-    // An interrupted prune of blocks 2 and 3: the rows went, the records and header did not.
+    // An older build's prune of blocks 2 and 3 stopped between `prune_rows` and its header
+    // commit: the rows and their count went, the block range and records did not.
     std::fs::write(&csoff, &clean).unwrap();
     let mut writer = NippyJarWriter::new(load(&path)).unwrap();
     writer.prune_rows(2 * CHANGES as usize).unwrap();
@@ -460,10 +461,11 @@ fn is_unchecked_jar(err: &ProviderError) -> bool {
 }
 
 /// TN(TN-0135): a provider with checksums on (storage v2) refuses a jar of a checksummed segment
-/// that has none, at every load: one written without checksums (a storage-v2 datadir from before
-/// them), and a checksummed jar whose configuration's version became 1 (its trailer dropped), which
-/// would otherwise read its values with their checksums appended. A provider with checksums off
-/// reads the unchecked jars. TN(TN-0151): the changeset counts (`db stats`) refuse them too.
+/// that has none, at every load that reads or opens it: one written without checksums (a
+/// storage-v2 datadir from before them), and a checksummed jar whose configuration's version became
+/// 1 (its trailer dropped), which would otherwise read its values with their checksums appended. A
+/// provider with checksums off reads the unchecked jars. TN(TN-0151): the changeset counts refuse
+/// them too. TN(TN-0165): so does the writer's open of a jar the cache holds.
 #[test]
 fn storage_v2_refuses_jars_without_checksums() {
     // Written without checksums, opened with them.
@@ -506,6 +508,29 @@ fn storage_v2_refuses_jars_without_checksums() {
     assert!(is_unchecked_jar(&reopened.storage_changeset_count().unwrap_err()));
     assert_eq!(reopened.account_block_changeset(1).unwrap(), account_changes(1));
     assert_eq!(reopened.account_changeset_count().unwrap() as u64, 3 * CHANGES);
+    drop(reopened);
+
+    // TN-0165: turned into version 1 after the jar was cached, its offsets file one offset short;
+    // the writer's open, a cache hit, is refused and leaves both files as they are. It ran the
+    // version-1 heal, which cut a row and rewrote the configuration, before a later load refused.
+    let (dir, _) = create_test_static_files_dir();
+    write_changesets(&provider(dir.path(), true, 1_000), 0..3);
+    let checked = provider(dir.path(), true, 1_000);
+    let path = jar_path(&checked, StaticFileSegment::AccountChangeSets, 0);
+    assert_eq!(checked.account_block_changeset(2).unwrap(), account_changes(2));
+    let config = path.with_extension("conf");
+    let mut bytes = std::fs::read(&config).unwrap();
+    bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+    bytes.truncate(bytes.len() - 4);
+    std::fs::write(&config, &bytes).unwrap();
+    let offsets = path.with_extension("off");
+    let mut short = std::fs::read(&offsets).unwrap();
+    short.truncate(short.len() - 8);
+    std::fs::write(&offsets, &short).unwrap();
+    let err = checked.latest_writer(StaticFileSegment::AccountChangeSets).map(drop).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    assert_eq!(std::fs::read(&config).unwrap(), bytes);
+    assert_eq!(std::fs::read(&offsets).unwrap(), short);
 }
 
 /// A range read that meets a row missing inside a jar's own range is an error, not a shorter
@@ -617,4 +642,136 @@ fn compressed_changeset_jar_is_refused_by_the_lookups() {
     let err = provider.get_storage_before_block(1, address(1, 0), slot(3)).unwrap_err();
     assert!(is_compressed_jar(&err), "{err}");
     assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
+}
+
+/// TN(TN-0160): a jar's configuration must name the segment and block range of its file name: the
+/// name's own range passes, and so does a first jar whose expected start a non-zero genesis moved
+/// past the name's; another range or segment is refused.
+#[test]
+fn a_configuration_must_name_its_own_jar() {
+    use reth_db::static_file::check_static_file_identity;
+
+    let path = Path::new("static_file_account-change-sets_0_499999");
+    let header = |segment| SegmentHeader::new((0..=499_999).into(), None, None, segment);
+    let mut own = header(StaticFileSegment::AccountChangeSets);
+    check_static_file_identity(path, &own).unwrap();
+    own.set_expected_block_start(502);
+    check_static_file_identity(path, &own).unwrap();
+    check_static_file_identity(path, &header(StaticFileSegment::StorageChangeSets)).unwrap_err();
+    let next = SegmentHeader::new(
+        (500_000..=999_999).into(),
+        None,
+        None,
+        StaticFileSegment::AccountChangeSets,
+    );
+    check_static_file_identity(path, &next).unwrap_err();
+    check_static_file_identity(&path.with_extension("conf"), &own).unwrap_err();
+}
+
+/// TN(TN-0160): the checksums bind a value to its row and column, not to its file. A configuration
+/// under another jar's name (another range, or the other changeset segment's) is refused at
+/// startup and, when it changes while the node runs, at the jar's load. A full jar whose data or
+/// offsets file is another jar's, of another length, is refused at its load; reads of the other
+/// jars still answer.
+#[test]
+fn jar_files_under_another_jars_name_are_refused() {
+    const ACCOUNTS: StaticFileSegment = StaticFileSegment::AccountChangeSets;
+    const STORAGE: StaticFileSegment = StaticFileSegment::StorageChangeSets;
+    let is_identity = |err: &str| err.contains("holds the configuration of another jar");
+    let setup = || {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), true, 2);
+        write_block_segments(&static_files, 6);
+        write_changesets(&static_files, 0..6);
+        let paths = [0, 2, 4].map(|block| jar_path(&static_files, ACCOUNTS, block));
+        (dir, paths, jar_path(&static_files, STORAGE, 0))
+    };
+    let conf = |path: &Path| path.with_extension("conf");
+
+    // The configurations of jars 0..=1 and 2..=3 swapped, or the storage jar's at 0..=1.
+    for other in [false, true] {
+        let (dir, paths, storage) = setup();
+        let donor = if other { conf(&storage) } else { conf(&paths[1]) };
+        let original = std::fs::read(conf(&paths[0])).unwrap();
+        std::fs::copy(&donor, conf(&paths[0])).unwrap();
+        let err = StaticFileProviderBuilder::read_write(dir.path())
+            .with_blocks_per_file(2)
+            .with_jar_checksums(true)
+            .build::<EthPrimitives>()
+            .unwrap_err();
+        assert!(is_identity(&err.to_string()), "{err}");
+
+        // Swapped after the start, before the jar is loaded.
+        std::fs::write(conf(&paths[0]), &original).unwrap();
+        let static_files = provider(dir.path(), true, 2);
+        std::fs::copy(&donor, conf(&paths[0])).unwrap();
+        let err = static_files.account_block_changeset(0).unwrap_err();
+        assert!(is_identity(&err.to_string()), "{err}");
+        assert_eq!(static_files.account_block_changeset(2).unwrap(), account_changes(2));
+    }
+
+    // The full jar 0..=1 with the storage jar's data file, or the headers jar's offsets file.
+    for file in ["data", "offsets"] {
+        let (dir, paths, storage) = setup();
+        let (from, to) = if file == "data" {
+            (storage, paths[0].clone())
+        } else {
+            let static_files = provider_ro(dir.path());
+            let headers = jar_path(&static_files, StaticFileSegment::Headers, 0);
+            (headers.with_extension("off"), paths[0].with_extension("off"))
+        };
+        std::fs::copy(from, to).unwrap();
+        let static_files = provider(dir.path(), true, 2);
+        let err = static_files.account_block_changeset(0).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_other_ref::<NippyJarError>(),
+                Some(NippyJarError::FileLengthMismatch { file: found, .. }) if *found == file
+            ),
+            "{file}: {err}"
+        );
+        assert_eq!(static_files.account_block_changeset(2).unwrap(), account_changes(2));
+    }
+}
+
+/// TN(TN-0163): the sidecar heal refuses committed records that do not form one run from row 0,
+/// each block starting where the previous block's rows end, even when every record fits the rows
+/// and verifies: one pointing back into the previous blocks' rows, one skipping rows, and a first
+/// record not at row 0. Both formats; the jar is left as it is. They would map blocks to other
+/// blocks' rows.
+#[test]
+fn sidecar_heal_refuses_records_out_of_order() {
+    use reth_static_file_types::{ChangesetOffset, ChangesetOffsetWriter};
+
+    let runs: [[(u64, u64); 4]; 3] = [
+        [(0, 5), (5, 5), (0, 5), (15, 5)],
+        [(0, 5), (5, 5), (12, 3), (15, 5)],
+        [(1, 4), (5, 5), (10, 5), (15, 5)],
+    ];
+    for checksums in [false, true] {
+        for run in runs {
+            let (dir, _) = create_test_static_files_dir();
+            let provider = provider(dir.path(), checksums, 1_000);
+            write_changesets(&provider, 0..4);
+            let path = jar_path(&provider, StaticFileSegment::AccountChangeSets, 0);
+            drop(provider);
+            let csoff = path.with_extension("csoff");
+            std::fs::remove_file(&csoff).unwrap();
+            let mut writer = ChangesetOffsetWriter::new(&csoff, 0, checksums).unwrap();
+            for (offset, changes) in run {
+                writer.append(&ChangesetOffset::new(offset, changes)).unwrap();
+            }
+            writer.sync().unwrap();
+            drop(writer);
+            let records = std::fs::read(&csoff).unwrap();
+
+            let provider = provider_rw(dir.path());
+            let result = provider.latest_writer(StaticFileSegment::AccountChangeSets).map(drop);
+            assert!(
+                matches!(result, Err(ProviderError::CorruptedChangeSetStaticFile)),
+                "checksums {checksums}, {run:?}: {result:?}"
+            );
+            assert_eq!(std::fs::read(&csoff).unwrap(), records);
+        }
+    }
 }

@@ -434,6 +434,31 @@ impl<H: NippyJarHeader> NippyJar<H> {
         DataReader::new(self.data_path())
     }
 
+    /// TN(TN-0160): checks that the files `reader` opened hold exactly this configuration's rows:
+    /// an offsets file of one offset per value and the final one, and a final offset at the data
+    /// file's end. Only for a jar that takes no more rows: one still written to holds bytes past
+    /// its configuration until its next commit, which the open-time heal cuts.
+    pub fn check_file_lengths(&self, reader: &DataReader) -> Result<(), NippyJarError> {
+        let values = self.rows * self.columns;
+        let mismatch = |file| {
+            tracing::error!(
+                target: "nippy-jar",
+                path = %self.data_path().display(),
+                rows = self.rows,
+                file,
+                "Static file does not match its configuration"
+            );
+            NippyJarError::FileLengthMismatch { path: self.data_path().to_path_buf(), file }
+        };
+        if reader.offsets_size() != 1 + reader.offset_size() as usize * (values + 1) {
+            return Err(mismatch("offsets"))
+        }
+        if reader.offset(values)? != reader.size() as u64 {
+            return Err(mismatch("data"))
+        }
+        Ok(())
+    }
+
     /// Writes all necessary configuration to file.
     fn freeze_config(&self) -> Result<(), NippyJarError> {
         Ok(reth_fs_util::atomic_write_file(&self.config_path(), |file| self.save_to_writer(file))?)
@@ -1819,6 +1844,48 @@ mod tests {
         }
     }
 
+    /// TN(TN-0162): a checksummed jar whose final offset moved down (a cleared bit) leaves its
+    /// data file longer than the offset, as an interrupted append does. The heal verifies the last
+    /// committed value before it cuts the data to that offset: refused, every file unchanged. An
+    /// uncommitted row past the committed ones is still cut. Fails if the heal cuts to the damaged
+    /// offset.
+    #[test]
+    fn test_heal_refuses_a_final_offset_moved_down() {
+        let (col1, col2) = test_data(Some(15));
+        let rows = col1.len();
+        for moved_by in [1u64, 4, 1 << 3] {
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, true);
+            let offsets = jar.path().with_extension(OFFSETS_FILE_EXTENSION);
+            let mut bytes = std::fs::read(&offsets).unwrap();
+            let at = bytes.len() - 8;
+            let last = u64::from_le_bytes(bytes[at..].try_into().unwrap());
+            bytes[at..].copy_from_slice(&(last - moved_by).to_le_bytes());
+            std::fs::write(&offsets, &bytes).unwrap();
+            let damaged = jar_files(jar.path());
+            let err = NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&err, NippyJarError::ChecksumMismatch { row, column: 1, .. }
+                    if *row == rows as u64 - 1),
+                "moved by {moved_by}: {err}"
+            );
+            assert_eq!(jar_files(jar.path()), damaged, "moved by {moved_by}");
+        }
+
+        // An intact jar with an uncommitted row: healed as before.
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        freeze_version(jar.path(), &col1, &col2, true);
+        let committed = jar_files(jar.path());
+        let mut writer =
+            NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap();
+        append_row(&mut writer, &col1, &col2, 0);
+        writer.sync_all().unwrap();
+        drop(writer);
+        drop(NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap());
+        assert_eq!(jar_files(jar.path()), committed);
+    }
+
     /// TN(TN-0152): a plain jar's offsets file cut to 2 to 8 bytes (its offset size and less than
     /// one offset) is an error at the writer's open: the heal counts no rows in it and then reads
     /// its final offset, which starts before the file's second byte. It underflowed (a panic with
@@ -1869,8 +1936,11 @@ mod tests {
                 let blocker = path.with_extension("tmp");
                 std::fs::create_dir(&blocker).unwrap();
                 assert!(writer.prune_rows(prune).is_err());
-                drop(writer);
+                // TN(TN-0161): the writer, its rows cut in memory only, writes no configuration.
                 std::fs::remove_dir(&blocker).unwrap();
+                assert!(matches!(writer.commit(), Err(NippyJarError::WriterFailed(_))));
+                assert!(matches!(writer.prune_rows(1), Err(NippyJarError::WriterFailed(_))));
+                drop(writer);
                 drop(NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap());
                 assert_eq!(jar_files(path), before, "checksums {checksums}, prune {prune}");
 

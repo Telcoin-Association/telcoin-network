@@ -8,12 +8,16 @@ use alloy_rpc_types_trace::{
 };
 use revm::bytecode::opcode::OpCode;
 
-/// TN(TN-0079, TN-0153): the default for [`TracingInspectorConfig::max_recorded_bytes`],
-/// 160 MiB: reth's default `--rpc.max-response-size`. Steps serialize to more bytes than the
-/// trace holds for them, and so do calls' input and output (in hex) for the tracers that return
-/// them, so for those a trace past the cap could not be returned anyway. A tracer that returns
-/// no call input or output (the struct logger, `prestateTracer`) refuses a transaction whose
-/// calls copy more than the cap, although its response would fit.
+/// TN(TN-0079, TN-0153, TN-0172): the default for
+/// [`TracingInspectorConfig::max_recorded_bytes`], 160 MiB: reth's default
+/// `--rpc.max-response-size`. The cap counts what the trace holds, not its JSON. Calls' input and
+/// output serialize in hex, twice what the trace holds, so a call trace past the cap could not be
+/// returned anyway. A step can hold more than its JSON (about 200 bytes against 60 to 100 for a
+/// struct log with a small stack; for `vmTrace`, a copy of the whole memory after each write), so
+/// a struct-logger or `vmTrace` trace can be refused although its response would fit, at about a
+/// third of the cap or less. A tracer that returns no call input or output (the struct logger,
+/// `prestateTracer`) also refuses a transaction whose calls copy more than the cap. The cap does
+/// not follow `--rpc.max-response-size`.
 pub const DEFAULT_MAX_RECORDED_BYTES: usize = 160 << 20;
 
 /// 256 bits each marking whether an opcode should be included into steps trace or not.

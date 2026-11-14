@@ -12,7 +12,10 @@ use reth_rpc_eth_api::{
     helpers::{Call, EthTransactions, LoadPendingBlock},
     EthCallBundleApiServer, FromEthApiError, FromEvmError,
 };
-use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError, RpcInvalidTransactionError};
+use reth_rpc_eth_types::{
+    call_many::OutputBudget, utils::recover_raw_transaction, EthApiError,
+    RpcInvalidTransactionError,
+};
 use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard};
 use reth_transaction_pool::{
     EthBlobTransactionSidecar, EthPoolTransaction, PoolPooledTx, PoolTransaction, TransactionPool,
@@ -88,6 +91,14 @@ where
 
         // TN(TN-0037): upstream takes no permit here (the struct's tracing guard is unused). Hold
         // a blocking-IO permit inside the blocking task, as `eth_callMany` does.
+        // TN(TN-0184): and, taken first, one of the eth API's tracing permits, the ones
+        // `eth_callMany` and `eth_simulateV1` take, so those permits bound how many requests
+        // keep their output (TN-0183) at once.
+        let tracing_permit = self
+            .eth_api()
+            .acquire_owned_tracing()
+            .await
+            .map_err(|_| EthApiError::InternalEthError)?;
         let permit = self
             .eth_api()
             .acquire_owned_blocking_io()
@@ -135,7 +146,7 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, db| {
-                let _permit = permit;
+                let _permits = (tracing_permit, permit);
 
                 // TN(TN-0054): decode and recover the transactions here, on the blocking thread
                 // the permit admits, not in the handler on the runtime that serves every request.
@@ -183,6 +194,8 @@ where
 
                 let mut results = Vec::with_capacity(transactions.len());
                 let mut transactions = transactions.into_iter().peekable();
+                // TN(TN-0183): the return or revert data the response keeps.
+                let mut output_budget = OutputBudget::default();
 
                 while let Some(tx) = transactions.next() {
                     if is_cancelled() {
@@ -237,6 +250,10 @@ where
 
                     // update the coinbase balance
                     coinbase_balance_before_tx = coinbase_balance_after_tx;
+
+                    output_budget
+                        .charge(result.output().map_or(0, |output| output.len()))
+                        .map_err(Eth::Error::from_eth_err)?;
 
                     // set the return data for the response
                     let (value, revert) = if result.is_success() {
@@ -480,8 +497,102 @@ mod gas_limit_tests {
     }
 }
 
+/// TN(TN-0183): an `eth_callBundle` request keeps at most
+/// [`MAX_REQUEST_OUTPUT_BYTES`](reth_rpc_eth_types::call_many::MAX_REQUEST_OUTPUT_BYTES) of
+/// return data.
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    use crate::EthApiBuilder;
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
+    use alloy_primitives::{Address, Bytes, TxKind};
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::Block as _;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_rpc_eth_types::GasCap;
+    use reth_testing_utils::generators::{self, generate_key, sign_tx_with_key_pair};
+    use reth_transaction_pool::test_utils::testing_pool;
+
+    /// A contract that returns 1 MiB of zeros (`PUSH3 0x100000; PUSH1 0; RETURN`), for 2,216,462
+    /// gas with the intrinsic 21,000.
+    const RETURNS_A_MIB: Address = Address::repeat_byte(0xdd);
+
+    /// `count` transactions from one sender to [`RETURNS_A_MIB`] as one bundle, under a 100M gas
+    /// cap.
+    async fn call_returning_a_mib(count: u64) -> Result<EthCallBundleResponse, EthApiError> {
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+        let block = Block {
+            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        }
+        .seal_slow();
+        provider.add_block(block.hash(), block.into_block());
+        provider.add_account(
+            RETURNS_A_MIB,
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(Bytes::from_static(&[0x62, 0x10, 0x00, 0x00, 0x60, 0x00, 0xf3])),
+        );
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(GasCap(100_000_000))
+        .build();
+        let bundle = EthBundle::new(api, BlockingTaskGuard::new(1));
+        let key = generate_key(&mut generators::rng());
+        let txs = (0..count)
+            .map(|nonce| {
+                sign_tx_with_key_pair(
+                    key,
+                    Transaction::Legacy(TxLegacy {
+                        nonce,
+                        gas_limit: 2_500_000,
+                        to: TxKind::Call(RETURNS_A_MIB),
+                        ..Default::default()
+                    }),
+                )
+                .encoded_2718()
+                .into()
+            })
+            .collect();
+        bundle
+            .call_bundle(EthCallBundle {
+                txs,
+                block_number: 2,
+                state_block_number: BlockNumberOrTag::Number(1),
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// 32 transactions that return 1 MiB each fill the output budget; with a 33rd, the bundle is
+    /// refused, though its gas fits the block gas limit.
+    #[tokio::test]
+    async fn bundle_output_over_the_budget_is_refused() {
+        let response = call_returning_a_mib(32).await.expect("32 MiB fits");
+        assert_eq!(response.results.len(), 32);
+        assert!(response.results.iter().all(|result| result.gas_used == 2_216_462 &&
+            result.value.as_ref().is_some_and(|value| value.len() == 1 << 20)));
+
+        let err = call_returning_a_mib(33).await.expect_err("33 MiB exceeds the budget");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "request exceeds the output budget of 33554432 bytes"),
+            "{err:?}"
+        );
+    }
+}
+
 /// TN(TN-0037): `eth_callBundle` and `eth_createAccessList` keep their blocking-IO permit until
-/// their blocking task ends, not until their request ends.
+/// their blocking task ends, not until their request ends. TN(TN-0184): `eth_callBundle` and
+/// `eth_callMany` keep one of the eth API's tracing permits the same way.
 #[cfg(test)]
 mod blocking_io_permit_tests {
     use super::*;
@@ -489,7 +600,7 @@ mod blocking_io_permit_tests {
     use alloy_consensus::{Header, TxLegacy};
     use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
     use alloy_primitives::{Address, TxKind};
-    use alloy_rpc_types_eth::TransactionRequest;
+    use alloy_rpc_types_eth::{Bundle, StateContext, TransactionRequest};
     use reth_chainspec::{ChainSpec, ChainSpecBuilder};
     use reth_ethereum_primitives::{Block, BlockBody, Transaction};
     use reth_evm_ethereum::EthEvmConfig;
@@ -518,8 +629,9 @@ mod blocking_io_permit_tests {
     /// Bounds every wait, so a regression fails instead of hanging.
     const DEADLINE: Duration = Duration::from_secs(20);
 
-    /// An `EthApi` with one blocking-IO permit over a mock chain with an empty block 1 (Berlin, so
-    /// access lists exist), and a signed transaction for bundles.
+    /// An `EthApi` with one blocking-IO permit and (TN-0184) one tracing permit over a mock chain
+    /// with an empty block 1 (Berlin, so access lists exist), and a signed transaction for
+    /// bundles.
     struct Fixture {
         provider: MockEthProvider,
         api: TestEthApi,
@@ -544,6 +656,7 @@ mod blocking_io_permit_tests {
                 EthEvmConfig::new(provider.chain_spec()),
             )
             .max_blocking_io_requests(1)
+            .proof_permits(1)
             .build();
             let bundle = EthBundle::new(api.clone(), BlockingTaskGuard::new(1));
             let tx = generators::sign_tx_with_random_key_pair(
@@ -584,6 +697,34 @@ mod blocking_io_permit_tests {
                 .await
                 .expect("eth_createAccessList");
             })
+        }
+
+        /// TN(TN-0184): one call as an `eth_callMany` request.
+        fn call_many(&self) -> Request<'_> {
+            let bundles = vec![Bundle {
+                transactions: vec![TransactionRequest {
+                    to: Some(TxKind::Call(Address::with_last_byte(2))),
+                    ..Default::default()
+                }],
+                block_override: None,
+            }];
+            let context = StateContext {
+                block_number: Some(BlockNumberOrTag::Number(1).into()),
+                transaction_index: None,
+            };
+            Box::pin(async move {
+                EthCall::call_many(&self.api, bundles, Some(context), None)
+                    .await
+                    .expect("eth_callMany");
+            })
+        }
+
+        /// TN(TN-0184): whether the eth API's only tracing permit is free; a free one is taken
+        /// and given back at once.
+        async fn tracing_permit_free(&self) -> bool {
+            timeout(Duration::from_millis(5), self.api.tracing_task_guard().clone().acquire_owned())
+                .await
+                .is_ok()
         }
 
         /// Clones of the mock provider alive: a blocking task holds one for its state.
@@ -632,11 +773,13 @@ mod blocking_io_permit_tests {
     }
 
     /// Drops a request whose blocking task is still running and checks that the permit stays
-    /// taken until that task ends.
+    /// taken until that task ends; (TN-0184) the tracing permit too, if `takes_tracing_permit`,
+    /// and otherwise that it stays free.
     async fn assert_dropped_request_keeps_its_permit(
         method: &str,
         fx: &Fixture,
         start: impl Fn(&Fixture) -> Request<'_>,
+        takes_tracing_permit: bool,
     ) {
         // Let `EthApi`'s startup tasks run, then warm the caches with one full request, so the
         // only provider clone a request makes below is its blocking task's state.
@@ -646,6 +789,7 @@ mod blocking_io_permit_tests {
         fx.settle_at(idle).await;
         let permits = fx.api.blocking_io_task_guard();
         assert_eq!(permits.available_permits(), 1, "{method}: the warm-up kept its permit");
+        assert!(fx.tracing_permit_free().await, "{method}: the warm-up kept its tracing permit");
 
         let gate = AccountGate::close(&fx.provider);
         let gated = idle + 1;
@@ -666,6 +810,11 @@ mod blocking_io_permit_tests {
             0,
             "{method}: the dropped request freed its permit"
         );
+        assert_eq!(
+            fx.tracing_permit_free().await,
+            !takes_tracing_permit,
+            "{method}: the tracing permit is free while the blocking task runs"
+        );
 
         drop(gate);
         let deadline = Instant::now() + DEADLINE;
@@ -673,12 +822,22 @@ mod blocking_io_permit_tests {
             assert!(Instant::now() < deadline, "{method}: the permit never came back");
             sleep(Duration::from_millis(5)).await;
         }
+        assert!(fx.tracing_permit_free().await, "{method}: the tracing permit never came back");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_call_bundle_keeps_permit_after_client_leaves() {
         let fx = Fixture::new();
-        assert_dropped_request_keeps_its_permit("eth_callBundle", &fx, Fixture::call_bundle).await;
+        assert_dropped_request_keeps_its_permit("eth_callBundle", &fx, Fixture::call_bundle, true)
+            .await;
+    }
+
+    /// TN(TN-0184): `eth_callMany` holds its tracing permit as well as its blocking-IO one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_call_many_keeps_permits_after_client_leaves() {
+        let fx = Fixture::new();
+        assert_dropped_request_keeps_its_permit("eth_callMany", &fx, Fixture::call_many, true)
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -688,6 +847,7 @@ mod blocking_io_permit_tests {
             "eth_createAccessList",
             &fx,
             Fixture::create_access_list,
+            false,
         )
         .await;
     }

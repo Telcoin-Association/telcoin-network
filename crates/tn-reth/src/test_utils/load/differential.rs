@@ -463,10 +463,13 @@ mod tests {
         payload::TNPayload,
         test_utils::{
             execute_payload_and_update_canonical_chain,
-            load::{open_production_env, LoadOutput, OutputConfig, OutputFactory},
+            load::{
+                open_production_env_with_layout, LoadOutput, OutputConfig, OutputFactory,
+                StorageLayout,
+            },
         },
         worker::WorkerNetwork,
-        RethEnv,
+        RethDb, RethEnv,
     };
     use jsonrpsee::RpcModule;
     use std::sync::Arc;
@@ -480,21 +483,25 @@ mod tests {
         PrefillSpec { accounts: 300, senders: 6, pools: 2, seed: 5, registry: false }
     }
 
-    /// An env with three executed outputs of two batches each, and its HTTP methods.
+    /// An env with three executed outputs of two batches each, in one storage layout, and its
+    /// HTTP methods.
     struct Chain {
         env: RethEnv,
+        layout: StorageLayout,
         methods: Methods,
+        _db: RethDb,
         _tasks: TaskManager,
         _tmp: tempfile::TempDir,
     }
 
     impl Chain {
-        /// Build the chain: the same on every call.
-        fn build() -> eyre::Result<Self> {
+        /// Build the chain in `layout`: the same on every call.
+        fn build(layout: StorageLayout) -> eyre::Result<Self> {
             let tmp = tempfile::tempdir()?;
             let tasks = TaskManager::default();
-            let env =
-                open_production_env(tmp.path(), Arc::new(spec().genesis().into()), &[], &tasks)?;
+            let chain = Arc::new(spec().genesis().into());
+            let (env, db) =
+                open_production_env_with_layout(tmp.path(), chain, &[], layout, &tasks)?;
             let pool = env.init_txn_pool(BaseFeeContainer::default())?;
             let methods = env
                 .get_rpc_server(
@@ -511,11 +518,11 @@ mod tests {
             for load in factory.generate(3) {
                 execute(&env, &load)?;
             }
-            Ok(Self { env, methods, _tasks: tasks, _tmp: tmp })
+            Ok(Self { env, layout, methods, _db: db, _tasks: tasks, _tmp: tmp })
         }
 
         /// The header of a differential of `queries` queries at the tip, seeded with `seed`.
-        fn header(&self, seed: u64, queries: usize, layout: &str) -> eyre::Result<DiffHeader> {
+        fn header(&self, seed: u64, queries: usize) -> eyre::Result<DiffHeader> {
             let tip = self.env.canonical_tip();
             let genesis = self.env.sealed_header_by_number(0)?.expect("a genesis").hash();
             Ok(DiffHeader {
@@ -525,7 +532,7 @@ mod tests {
                 tip_hash: tip.hash(),
                 seed,
                 queries,
-                layout: layout.to_owned(),
+                layout: StorageLayout::of(&self.env)?.label().to_owned(),
                 backend: "test".to_owned(),
             })
         }
@@ -559,15 +566,17 @@ mod tests {
         Ok(())
     }
 
-    /// Two chains built from one load record the same queries and answers, which compare
-    /// without a mismatch; every kind ran, with no error. A changed answer, a changed query, a
-    /// missing record and another seed are each caught.
+    /// Two chains built from one load, one per storage layout (both v1 on the MDBX build, which
+    /// runs no v2), record the same queries and answers, which compare without a mismatch; every
+    /// kind ran, with no error. A changed answer, a changed query, a missing record and another
+    /// seed are each caught.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_differential_records_and_compares() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let (a, b) = (dir.path().join("a.jsonl"), dir.path().join("b.jsonl"));
-        let first = Chain::build()?;
-        let summary = first.record(first.header(11, 60, "v1")?, &a)?;
+        let first = Chain::build(StorageLayout::V1)?;
+        assert_eq!(first.header(11, 60)?.layout, "v1");
+        let summary = first.record(first.header(11, 60)?, &a)?;
         assert_eq!(summary.errors(), 0, "{:?}", summary.first_error);
         for kind in DiffKind::ALL {
             assert_eq!(summary.kinds.get(&kind).map(|k| k.latencies.len()), Some(10), "{kind:?}");
@@ -580,8 +589,13 @@ mod tests {
         assert_eq!(found(DiffKind::TxMiss), 0);
         drop(first);
 
-        let second = Chain::build()?;
-        second.record(second.header(11, 60, "v2")?, &b)?;
+        let second = Chain::build(if cfg!(feature = "mdbx") {
+            StorageLayout::V1
+        } else {
+            StorageLayout::V2
+        })?;
+        assert_eq!(second.header(11, 60)?.layout, second.layout.label());
+        second.record(second.header(11, 60)?, &b)?;
         let same = compare(&a, &b)?;
         assert_eq!(same, DiffComparison { compared: 60, mismatches: 0, shown: vec![] });
 
@@ -615,7 +629,7 @@ mod tests {
         let diff = compare(&a, &changed)?;
         assert_eq!((diff.compared, diff.mismatches), (59, 1), "{diff:?}");
         // another seed
-        second.record(second.header(12, 60, "v2")?, &changed)?;
+        second.record(second.header(12, 60)?, &changed)?;
         let diff = compare(&a, &changed)?;
         assert_eq!((diff.compared, diff.mismatches), (0, 1), "{diff:?}");
         assert!(diff.shown[0].contains("seed 11"), "{diff:?}");

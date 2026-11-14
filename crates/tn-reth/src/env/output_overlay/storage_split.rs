@@ -63,7 +63,7 @@ use reth_db::{transaction::DbTx, DatabaseError};
 use reth_trie::{
     hashed_cursor::{HashedCursorFactory, HashedStorageCursor},
     prefix_set::{PrefixSet, PrefixSetMut},
-    trie_cursor::{TrieCursor as _, TrieCursorFactory, TrieStorageCursor},
+    trie_cursor::{TrieCursor, TrieCursorFactory, TrieStorageCursor},
     updates::StorageTrieUpdates,
     Nibbles, StorageRoot, TrieMask, EMPTY_ROOT_HASH,
 };
@@ -148,7 +148,13 @@ pub(super) fn splittable<T: TrieCursorFactory>(
     trie: &T,
     hashed_address: B256,
 ) -> Result<Splittable, DatabaseError> {
-    let mut cursor = trie.storage_trie_cursor(hashed_address)?;
+    shape(&mut trie.storage_trie_cursor(hashed_address)?)
+}
+
+/// The pre-check of a stored trie's shape through `cursor`: no node at the empty path, and all
+/// sixteen first-nibble nodes stored with every child hashed. Shared by this split and the account
+/// split (`parallel.rs`), whose `compose` rebuilds exactly such first-nibble nodes.
+pub(super) fn shape<C: TrieCursor>(cursor: &mut C) -> Result<Splittable, DatabaseError> {
     if cursor.seek_exact(Nibbles::default())?.is_some() {
         return Ok(Splittable::StoredRootNode);
     }

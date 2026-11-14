@@ -24,11 +24,14 @@
 //!
 //! The walk never waits for a task that has not started: it claims it and computes the root itself
 //! (the task then does nothing), and it waits only for a task already running, which waits on
-//! nothing. A busy pool (batch validation on a validator shares it) therefore degrades the root to
-//! serial instead of stalling it; the scope's end waits only for jobs the pool has not picked up,
-//! which then return at once. A task that fails (opening its transaction, a database read, a
-//! moved tip, below) or panics leaves its account to the walk, which computes it serially: the
-//! failures are logged once a block and change no result.
+//! nothing. A busy pool (batch validation on a validator shares it, and so does the next output's
+//! signer recovery) therefore moves the storage roots to the walk instead of holding the walk up.
+//! The root still returns only when `rayon::in_place_scope` ends, which waits until the pool has
+//! run every job the root spawned (one per target, and up to [`WALK_HELPERS`] helpers). A job the
+//! walk claimed returns at once when it runs, but it runs only when a pool thread reaches it in the
+//! pool's queue, so a busy pool delays the end of the root by its backlog. A task that fails
+//! (opening its transaction, a database read, a moved tip, below) or panics leaves its account to
+//! the walk, which computes it serially: the failures are logged once a block and change no result.
 //!
 //! # The account walk
 //!
@@ -36,13 +39,16 @@
 //! the first nibble of the hashed address (`account_split.rs`): sixteen subtrie walks, claimed in
 //! order by the calling thread and up to [`WALK_HELPERS`] pool jobs (each on its own read-only
 //! transaction, with the tip check below), take the storage roots from the tasks above, and the
-//! calling thread composes the root branch and the union of their trie updates. A shape the split
-//! does not compose (a small trie, a root that is not a branch) runs the walk on the calling thread
-//! as before, counted in `tn_reth.account_walk_fallbacks_total`. A block with no storage-root
-//! targets but a split walk takes this path too. Measured on the exec bench (storage v2, against
-//! the walk on one thread with the storage-root tasks): the root fell from 311 to 198 ms an output
-//! at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to 322 and from 113 to
-//! 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the split off on its own.
+//! calling thread composes the root branch and the union of their trie updates. A stored trie
+//! whose shape the split does not compose (a small trie, as a chain has from genesis) is found
+//! before any subtrie runs, and its blocks walk on the calling thread with the storage-root tasks;
+//! a block whose own changes leave such a shape (rare once the trie passes) pays for the subtries
+//! and then for that walk. Both are counted in `tn_reth.account_walk_fallbacks_total`. A block with
+//! no storage-root targets but a split walk takes this path too. Measured on the exec bench
+//! (storage v2, against the walk on one thread with the storage-root tasks): the root fell from 311
+//! to 198 ms an output at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to
+//! 322 and from 113 to 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the
+//! split off on its own.
 //!
 //! # Hot storage tries
 //!
@@ -78,41 +84,61 @@
 //! it writes. On a mismatch the task fails and the walk computes that root on its own transaction;
 //! the failure is logged at error and counted in `tn_reth.parallel_state_root_task_failures_total`
 //! as `tip_moved` (alert on any nonzero value). A writer that changed state without advancing that
-//! marker would not be caught.
+//! marker would not be caught. The walk's own transaction is held to the output: the overlay keeps
+//! the finalized block number its first root's transaction saw, and a later root of the output
+//! whose transaction sees another fails its block with an error (the overlay was built over the
+//! database its first root saw). That catches a commit between two roots of one output, not one
+//! between the start of an output and its first root.
 //!
 //! # Checks
 //!
 //! A wrong root forks the chain, and TN builds its own blocks: no payload's root checks this one.
 //! In production the blocks whose number is a multiple of [`CHECK_ONE_BLOCK_IN`] (of those with
 //! parallel work: storage-root tasks or a split account walk) also compute the root serially and
-//! compare the roots and the trie updates; on a difference the block logs both roots, whether the
-//! split composed the block's and how many split storage roots it took, counts it
-//! (`tn_reth.parallel_state_root_mismatches_total`, a split walk's also in
+//! compare the roots and the trie updates (account nodes, removed nodes and storage tries). On a
+//! difference the block logs both roots, whether the trie updates were equal, whether the split
+//! composed the block's root and how many split storage roots it took, counts it
+//! (`tn_reth.parallel_state_root_mismatches_total`; a block whose root the split composed also in
 //! `tn_reth.account_walk_fallbacks_total` and a block with split storage roots also in
-//! `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial result.
+//! `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial result. The
+//! check never fails the block, and nothing turns the parallel paths off after it.
+//!
+//! What the check finds, and what it cannot:
+//! - It finds a parallel result that differs from the serial walk over the same stored trie and
+//!   overlay, on a checked block. The other blocks commit the parallel result unchecked.
+//! - It cannot see a wrong trie node that an unchecked block persisted or put in the output's
+//!   overlay. The serial walk reads the same layers (`layered_factories`), recomputes only along
+//!   its block's prefix sets and takes the stored hashes elsewhere, so it agrees with the parallel
+//!   walk over that node, on this block and on every later one.
+//! - It does not say which part was wrong. The `mismatch` labels say which splits ran on the block;
+//!   a block where both ran counts under both.
 //!
 //! The sample is a function of the block alone, never of what one node has seen since it started,
-//! so every node checks the same blocks. A repeatable bug in a parallel path then gives every node
-//! running the same code the same root: the serial one on a checked block, the same wrong one on an
-//! unchecked block. (A per-node count would split such nodes by their counts' phase.) The one
-//! per-node difference left is a task that fails (logged, and counted by reason in
-//! `tn_reth.parallel_state_root_task_failures_total`): its part goes to the serial computation on
-//! that node only. The pool's thread count is no such difference: it changes which thread computes
-//! a part, not how, so a node whose pool runs one thread runs the same parallel code (on the
-//! calling thread and that one pool thread) and composes the same roots as its peers; only the off
-//! switches compute serially.
+//! so every node checks the same blocks. (A per-node count would split nodes by their counts'
+//! phase.) Which code computes each part is not the same on every node. Scheduling decides whether
+//! the walk takes a storage root from its task or computes it itself (it claims a task that has not
+//! started, and computes on its own cursors), and which thread works each subtrie and piece; a task
+//! that fails (logged, and counted by reason in `tn_reth.parallel_state_root_task_failures_total`)
+//! leaves its part to the serial computation on that node only. Every one of these paths computes
+//! the same value, which is what keeps nodes agreeing. A node whose pool runs one thread runs the
+//! same parallel code (on the calling thread and that one pool thread); only the off switches
+//! compute every root serially. A bug that every path shares gives every node running this code the
+//! same root: the serial one on a checked block, the same wrong one on an unchecked block. A bug in
+//! one path gives a wrong root only on the nodes whose scheduling took that path, so it can part
+//! nodes running the same code.
 //!
-//! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and the
-//! unchecked blocks the same bug hit carry it on every node running this code. The response is
-//! network-wide, not local: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
-//! or only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
-//! `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning
-//! them off on one node only parts it from its peers on the next block the bug hits. Turning them
-//! off stops the bug; it repairs no trie node an unchecked block already persisted (the comparison
-//! covers the trie updates too, so a bug can be in them). Every later root, serial ones included,
-//! is computed over those nodes, so the nodes keep agreeing while a block's root may not be the
-//! root of its state. A snapshot restore (`snapshot.rs`) finds it: it rebuilds the trie from the
-//! hashed state and fails when that root differs from the snapshot block's header.
+//! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and
+//! unchecked blocks the same bug hit carry it. The response is network-wide, not local: turn the
+//! parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`; read at the first block, so a
+//! restart) and report it. The split switches (`TN_PARALLEL_ACCOUNT_WALK=0`,
+//! `TN_PARALLEL_STORAGE_WALK=0`) narrow that once the fault is known; the `mismatch` labels do not
+//! name it. Turning them off on one node only parts it from its peers on the next block a shared
+//! bug hits. Turning them off stops the bug; it repairs no trie node an unchecked block already
+//! persisted (the comparison covers the trie updates too, so a bug can be in them). Every later
+//! root, serial ones included, is computed over those nodes, so the nodes keep agreeing while a
+//! block's root may not be the root of its state. A snapshot restore (`snapshot.rs`) finds it: it
+//! rebuilds the trie from the hashed state and fails when that root differs from the snapshot
+//! block's header.
 //!
 //! With `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every
 //! such block is compared and a difference panics: the shadow runs of the exec bench compare every
@@ -134,7 +160,7 @@ use super::{
     account_split::{AccountWalk, Subtries},
     layered_factories,
     sorted_runs::SortedTrieRuns,
-    storage_split::{splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk},
+    storage_split::{shape, splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk},
     OutputTrieOverlay,
 };
 use crate::metrics::{
@@ -147,9 +173,9 @@ use reth_errors::ProviderError;
 use reth_provider::{DBProvider as _, DatabaseProviderFactory, ProviderResult};
 use reth_trie::{
     prefix_set::{PrefixSet, TriePrefixSets},
-    trie_cursor::{TrieCursor as _, TrieCursorFactory},
+    trie_cursor::TrieCursorFactory,
     updates::{StorageTrieUpdates, TrieUpdates},
-    HashedPostState, HashedPostStateSorted, Nibbles, StateRoot, StorageRoot, StorageRootSource,
+    HashedPostState, HashedPostStateSorted, StateRoot, StorageRoot, StorageRootSource,
 };
 use reth_trie_db::DatabaseStorageRoot as _;
 use std::{
@@ -267,6 +293,9 @@ impl OutputTrieOverlay {
     /// Block `number`'s state root and trie updates, as [`Self::layered_root_with_updates`]
     /// computes them, with the storage roots of the accounts with changed storage on rayon's pool
     /// as `mode` says. `factory` opens the tasks' transactions; it must be `tx`'s database.
+    ///
+    /// Fails, computing nothing, when `tx` sees another finalized block than the transaction of
+    /// this overlay's first root ([`Self::check_anchor`]).
     pub(crate) fn block_root_with_updates<F, TX>(
         &self,
         factory: &F,
@@ -279,6 +308,8 @@ impl OutputTrieOverlay {
         F: DatabaseProviderFactory,
         TX: DbTx,
     {
+        let walk_tip = snapshot_tip(tx)?;
+        self.check_anchor(walk_tip)?;
         let prefix_sets = current.construct_prefix_sets().freeze();
         let current = current.into_sorted();
         let (walks, shadow) = match mode {
@@ -295,12 +326,22 @@ impl OutputTrieOverlay {
         let storage = walks.storage;
         if !shadow && !block_is_checked(number) {
             return Ok(self
-                .parallel_root(factory, tx, &current, prefix_sets, targets, split, storage)?
+                .parallel_root(
+                    factory,
+                    tx,
+                    walk_tip,
+                    &current,
+                    prefix_sets,
+                    targets,
+                    split,
+                    storage,
+                )?
                 .result);
         }
         let parallel = self.parallel_root(
             factory,
             tx,
+            walk_tip,
             &current,
             prefix_sets.clone(),
             targets,
@@ -332,20 +373,50 @@ impl OutputTrieOverlay {
         if targets.is_empty() && !split {
             return self.serial_root(tx, &current, prefix_sets);
         }
+        let walk_tip = snapshot_tip(tx)?;
         Ok(self
-            .parallel_root(factory, tx, &current, prefix_sets, targets, split, walks.storage)?
+            .parallel_root(
+                factory,
+                tx,
+                walk_tip,
+                &current,
+                prefix_sets,
+                targets,
+                split,
+                walks.storage,
+            )?
             .result)
+    }
+
+    /// Fail unless `tip`, the finalized block number a root's transaction sees, is the one the
+    /// transaction of this overlay's first root saw (recorded by that root). The overlay's runs
+    /// were built over that database: over another, its blocks would be laid over a state they
+    /// were not built on, so the root would be wrong. Nothing commits during an output's builds on
+    /// the node path (module docs); this turns a writer that does into an error of the block.
+    fn check_anchor(&self, tip: Option<BlockNumber>) -> ProviderResult<()> {
+        let anchor = *self.anchor.get_or_init(|| tip);
+        if anchor != tip {
+            error!(target: "engine", ?anchor, ?tip, "the database moved during an output's builds; the block's root is refused");
+            return Err(DatabaseError::Other(format!(
+                "the root's transaction sees finalized block {tip:?}, the output's first root saw \
+                 {anchor:?}: the database moved during the output's builds"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// The account walk over `tx`, split by first nibble when `split` says so (on this thread and
     /// pool jobs) and otherwise on this thread, with one storage-root task per target on rayon's
     /// global pool, the hot targets' tries split as `storage` says (pieces on this thread and the
-    /// same pool jobs, before the walk).
+    /// same pool jobs, before the walk). `walk_tip` is `tx`'s finalized block number, which every
+    /// task's transaction must see too.
     #[allow(clippy::too_many_arguments)]
     fn parallel_root<F, TX>(
         &self,
         factory: &F,
         tx: &TX,
+        walk_tip: Option<BlockNumber>,
         current: &HashedPostStateSorted,
         prefix_sets: TriePrefixSets,
         targets: Vec<(B256, PrefixSet)>,
@@ -356,17 +427,16 @@ impl OutputTrieOverlay {
         F: DatabaseProviderFactory,
         TX: DbTx,
     {
-        let walk_tip = snapshot_tip(tx)?;
         let runs = &self.runs;
         let (trie, hashed) = layered_factories(tx, runs, current);
         let (whole, hot) = split_storage_targets(&trie, targets, storage)?;
         let tasks = Arc::new(StorageRootTasks::new(whole, StorageSplits::new(hot)));
         let source = Arc::clone(&tasks) as Arc<dyn StorageRootSource>;
-        let stored_root_node = split && has_stored_root_node(&trie)?;
-        if stored_root_node {
-            record_account_walk_fallback(AccountWalkFallback::StoredRootNode);
-        }
-        let subtries = (split && !stored_root_node).then(|| Subtries::new(&prefix_sets));
+        let subtries = (split && account_trie_splits(&trie)?).then(|| Subtries::new(&prefix_sets));
+        #[cfg(test)]
+        let jobs_first = RUN_JOBS_BEFORE_WALK.with(|f| f.replace(false));
+        #[cfg(test)]
+        let helpers_done = &std::sync::atomic::AtomicUsize::new(0);
         let root = rayon::in_place_scope(|scope| -> ProviderResult<ParallelRoot> {
             let shared = &*tasks;
             // However the walk below ends, a task not yet started returns at once: the scope's end
@@ -384,13 +454,22 @@ impl OutputTrieOverlay {
             }
             let splits = &shared.splits;
             let subtries = subtries.as_ref();
-            if subtries.is_some() || !splits.is_empty() {
-                let source = &source;
-                for _ in 0..rayon::current_num_threads().min(WALK_HELPERS) {
-                    scope.spawn(move |_| {
-                        walk_helper(factory, walk_tip, runs, current, subtries, source, shared)
-                    });
-                }
+            let helpers = if subtries.is_some() || !splits.is_empty() {
+                rayon::current_num_threads().min(WALK_HELPERS)
+            } else {
+                0
+            };
+            let source_ref = &source;
+            for _ in 0..helpers {
+                scope.spawn(move |_| {
+                    walk_helper(factory, walk_tip, runs, current, subtries, source_ref, shared);
+                    #[cfg(test)]
+                    helpers_done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            #[cfg(test)]
+            if jobs_first {
+                shared.wait_for_jobs(helpers_done, helpers);
             }
             // The hot storage tries' pieces first: the walks below consume them.
             splits.work(tx, &trie, &hashed, &|error| shared.record_failure(error));
@@ -423,6 +502,11 @@ impl OutputTrieOverlay {
         tasks.log_failures();
         tasks.splits.record_fallbacks();
         #[cfg(test)]
+        {
+            let (count, first) = &*tasks.failures.lock();
+            LAST_ROOT_FAILURES.with(|f| f.set((*count, first.as_ref().map(TaskError::reason))));
+        }
+        #[cfg(test)]
         if let Ok(root) = &root {
             STORAGE_SPLITS_COMPOSED.with(|n| n.set(n.get() + root.storage_composed));
         }
@@ -443,7 +527,7 @@ struct ParallelRoot {
 
 /// Pool jobs offered to the split walks besides the calling thread: one per account subtrie but
 /// the one the calling thread takes first (the storage pieces come first on each).
-const WALK_HELPERS: usize = 15;
+pub(super) const WALK_HELPERS: usize = 15;
 
 /// Storage-root targets: hashed address and storage prefix set.
 type Targets = Vec<(B256, PrefixSet)>;
@@ -478,11 +562,19 @@ fn split_storage_targets<T: TrieCursorFactory>(
     Ok((whole, hot))
 }
 
-/// Whether the account trie holds a node at the empty path. Reth never writes one (its trie
-/// updates drop the root path); a walk that found one would skip unchanged nibbles by its hashes,
-/// which the split does not reproduce.
-fn has_stored_root_node<T: TrieCursorFactory>(trie: &T) -> Result<bool, DatabaseError> {
-    Ok(trie.account_trie_cursor()?.seek_exact(Nibbles::default())?.is_some())
+/// Whether the account trie (the walk's view, before the block's changes) has the shape the split
+/// composes ([`shape`]), so a trie it would refuse after the work costs no subtrie. A refusal is
+/// counted by reason and the walk runs on one thread. A node at the empty path is refused because
+/// reth never writes one (its trie updates drop the root path): a walk that found one would skip
+/// unchanged nibbles by its hashes, which the split does not reproduce.
+fn account_trie_splits<T: TrieCursorFactory>(trie: &T) -> Result<bool, DatabaseError> {
+    let refused = match shape(&mut trie.account_trie_cursor()?)? {
+        Splittable::Yes => return Ok(true),
+        Splittable::SmallTrie => AccountWalkFallback::SmallTrie,
+        Splittable::StoredRootNode => AccountWalkFallback::StoredRootNode,
+    };
+    record_account_walk_fallback(refused);
+    Ok(false)
 }
 
 /// A pool job working the split storage tries' pieces and then the account walk's subtries (when
@@ -695,6 +787,22 @@ impl StorageRootTasks {
         failures.1.get_or_insert(error);
     }
 
+    /// Wait until every slot task has finished and `helpers` walk helpers have returned
+    /// (`helpers_done` counts them), so each job has run before the walk claims anything
+    /// ([`RUN_JOBS_BEFORE_WALK`]). The calling thread is not a pool worker, so the pool runs them.
+    #[cfg(test)]
+    fn wait_for_jobs(&self, helpers_done: &std::sync::atomic::AtomicUsize, helpers: usize) {
+        for slot in &self.slots {
+            let mut state = slot.state.lock();
+            while matches!(*state, TaskState::Pending | TaskState::Running) {
+                slot.finished.wait(&mut state);
+            }
+        }
+        while helpers_done.load(std::sync::atomic::Ordering::SeqCst) < helpers {
+            std::thread::yield_now();
+        }
+    }
+
     /// Mark the tasks that have not started as claimed, so they return at once (the walk is done
     /// or failed).
     fn claim_unstarted(&self) {
@@ -805,6 +913,13 @@ thread_local! {
     /// Set by a test to make this thread's next walk on one thread fail before it reads anything,
     /// as a database read error would.
     static FAIL_NEXT_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test to make this thread's next parallel root run every slot task and walk helper
+    /// before its walk claims anything, so each one's tip check runs whatever the scheduling.
+    pub(super) static RUN_JOBS_BEFORE_WALK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The failed tasks of the last parallel root this thread computed, and the first one's reason.
+    pub(super) static LAST_ROOT_FAILURES: std::cell::Cell<(usize, Option<ParallelRootTaskFailure>)> =
+        const { std::cell::Cell::new((0, None)) };
 }
 
 /// The error a walk failed by [`FAIL_NEXT_WALK`] returns.

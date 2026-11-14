@@ -118,9 +118,11 @@
 //!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tn-lmdb 4096): the database page size in
 //!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
 //!   every open. Each page size has its own base and aged base.
-//! - `TN_EXEC_BENCH_GAP_FILL` (0): tn-lmdb's gap fill, a width in pages or `auto`, passed as
-//!   `--db.gap-fill` to the run's open (not the bases'): 0 (or `off`) is off, at most 64; refused
-//!   on MDBX. Its counters (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`,
+//! - `TN_EXEC_BENCH_GAP_FILL` (the node's default, `tn_reth::DEFAULT_DB_GAP_FILL`: `auto` on Linux,
+//!   off on macOS and on MDBX): tn-lmdb's gap fill, a width in pages, `off` (or 0) or `auto`,
+//!   always passed as `--db.gap-fill` to the run's open, so the report's `gap_fill` is the run's
+//!   (the bases open with the node's default): at most 64; on MDBX anything but off is refused. Its
+//!   counters (`tn_lmdb_sync_runs`, `tn_lmdb_gaps_filled`, `tn_lmdb_gap_pages`,
 //!   `tn_lmdb_gap_misses`, `tn_lmdb_gap_fill_refusals`, `tn_lmdb_gap_fill_ns`, and under `auto` the
 //!   `tn_lmdb_gap_auto_*` counters and gauges: the width chosen and the fit) are among the
 //!   per-output database counters.
@@ -345,7 +347,7 @@ use tn_reth::{
         SubmitSamples, Submitter,
     },
     worker::WorkerNetwork,
-    DbTableStat, GapFill, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
+    DbTableStat, GapFill, RethChainSpec, RethDb, RethEnv, WorkerTxPool, DEFAULT_DB_GAP_FILL,
 };
 use tn_storage::{
     disk::{fsync_directory, fsync_file},
@@ -745,6 +747,14 @@ fn db_flags(sync: SyncMode, page_size: &str) -> [&str; 4] {
     [mode_flag, mode, "--db.page-size", page_size]
 }
 
+/// The `--db.*` flags of the run's open: [`db_flags`] and `--db.gap-fill`, always given, so the
+/// run's gap fill is the knob's and never the node's default in its place.
+fn run_db_flags<'a>(sync: SyncMode, page_size: &'a str, gap_fill: &'a str) -> Vec<&'a str> {
+    let mut flags = db_flags(sync, page_size).to_vec();
+    flags.extend(["--db.gap-fill", gap_fill]);
+    flags
+}
+
 /// Where metrics go besides the capture recorder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetricsMode {
@@ -782,7 +792,8 @@ struct Knobs {
     sync: SyncMode,
     /// The requested page size in bytes; `None` for the backend's default ([`Knobs::page_size`]).
     page_size: Option<u32>,
-    /// tn-lmdb's gap fill for the run's open (`--db.gap-fill`; off by default).
+    /// tn-lmdb's gap fill for the run's open (`--db.gap-fill`, always passed; the node's default
+    /// by default).
     gap_fill: GapFill,
     readers: usize,
     submit_fraction: f64,
@@ -966,7 +977,7 @@ impl Knobs {
             sync,
             page_size,
             gap_fill: match get("GAP_FILL") {
-                None => GapFill::OFF,
+                None => DEFAULT_DB_GAP_FILL,
                 Some(value) => {
                     value.parse().map_err(|e| eyre::eyre!("{KNOB_PREFIX}GAP_FILL: {e}"))?
                 }
@@ -4045,10 +4056,7 @@ async fn exec_bench() -> eyre::Result<()> {
     // the driver keeps `tmp`: the clone outlives the env, to be measured closed
     let page_text = page_size.to_string();
     let gap_text = knobs.gap_fill.to_string();
-    let mut flags = db_flags(knobs.sync, &page_text).to_vec();
-    if knobs.gap_fill.is_on() {
-        flags.extend(["--db.gap-fill", gap_text.as_str()]);
-    }
+    let flags = run_db_flags(knobs.sync, &page_text, &gap_text);
     let node = BenchNode::open_at(&datadir, slim_chain(&base), &flags, layout, None)?;
     let effective_page_size = db_page_size(&node.db)?;
     let effective_layout = StorageLayout::of(&node.env)?;
@@ -4226,6 +4234,19 @@ mod tests {
 
     /// With no knob set, every knob takes its documented default; variables without the prefix
     /// are ignored.
+    /// The run's open always names its gap fill: off is `--db.gap-fill 0`, which the node parses
+    /// as off, not an absent flag that gives the node's default (`auto` on Linux).
+    #[test]
+    fn test_run_db_flags_name_the_gap_fill() {
+        let off = GapFill::OFF.to_string();
+        let flags = run_db_flags(SyncMode::Durable, "4096", &off);
+        assert_eq!(
+            flags,
+            ["--db.sync-mode", "durable", "--db.page-size", "4096", "--db.gap-fill", "0"]
+        );
+        assert_eq!(off.parse::<GapFill>().expect("parses"), GapFill::OFF);
+    }
+
     #[test]
     fn test_knobs_default() {
         let knobs = Knobs::parse(vec![("PATH".to_owned(), "/bin".to_owned())]).unwrap();
@@ -4244,7 +4265,7 @@ mod tests {
             metrics: MetricsMode::Off,
             sync: SyncMode::Durable,
             page_size: None,
-            gap_fill: GapFill::OFF,
+            gap_fill: DEFAULT_DB_GAP_FILL,
             readers: 0,
             submit_fraction: 0.25,
             window: 20,

@@ -103,4 +103,44 @@ mod tests {
         let account = eth_api.get_account(address, Default::default()).await.unwrap();
         assert!(account.is_none());
     }
+
+    /// TN(TN-0182): a state read at `pending` waits on its blocking thread for the pending
+    /// block, which is built on the eth API's CPU pool: with that read holding the only blocking
+    /// thread, the build still runs and the read answers.
+    #[test]
+    fn a_pending_read_holding_every_blocking_thread_still_gets_its_block() {
+        use alloy_consensus::Header;
+        use alloy_eips::BlockId;
+        use reth_ethereum_primitives::{Block, BlockBody};
+        use reth_primitives_traits::Block as _;
+        use reth_rpc_eth_types::builder::config::PendingBlockKind;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let provider = MockEthProvider::default();
+            let block = Block {
+                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                body: BlockBody::default(),
+            }
+            .seal_slow();
+            provider.add_block(block.hash(), block.into_block());
+            let evm_config = EthEvmConfig::new(provider.chain_spec());
+            let eth_api =
+                EthApi::builder(provider, testing_pool(), NoopNetwork::default(), evm_config)
+                    .pending_block_kind(PendingBlockKind::Full)
+                    .build();
+
+            let balance = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                eth_api.balance(Address::random(), Some(BlockId::pending())),
+            )
+            .await;
+            assert!(balance.is_ok(), "the read waits for a build that never gets a thread");
+        });
+    }
 }

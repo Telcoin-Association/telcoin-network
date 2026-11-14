@@ -16,6 +16,9 @@
 #      operator may turn on `js-tracer`. The list is read from cargo (`cargo metadata`), so a
 #      feature added later is checked with no edit here. A package that does not reach tn-reth
 #      passes.
+#   Both checks resolve every target (`--target all`), not only this host's: the release builds
+#   linux/amd64, the ad-hoc images arm64 too, and a `[target.'cfg(...)'.dependencies]` entry that
+#   enables the feature on one of them only must fail here on any host.
 #   2. The workspace graph with dev-dependencies (`cargo tree --workspace`), as
 #      `./etc/ci-lanes.sh test-default` builds it: a workspace member enabling `tn-reth/mdbx`
 #      would unify it into that lane, which then never runs tn-lmdb.
@@ -40,10 +43,11 @@ RELEASE=(telcoin-network:yes tn-worker-gateway:no tn-node-record-api:no)
 
 failed=0
 
-# Every package of `cargo tree "$@"`, one per line as "<package> <features>". Called only as a
-# plain assignment's substitution at the top level, so a cargo failure stops the guard (set -e).
+# Every package of `cargo tree "$@"` on every target, one per line as "<package> <features>".
+# Called only as a plain assignment's substitution at the top level, so a cargo failure stops the
+# guard (set -e).
 tree() {
-    cargo tree --locked "$@" -f '{p} {f}' --prefix none
+    cargo tree --locked --target all "$@" -f '{p} {f}' --prefix none
 }
 
 # The features of workspace package "$1" other than `default` and `mdbx`, one per line. Called

@@ -104,7 +104,11 @@ pub enum Error {
     #[error("tn-lmdb: not a tn-lmdb database")]
     NotTnLmdb,
     /// The file is a tn-lmdb database of a format version this build does not read.
-    #[error("tn-lmdb: unsupported format version {0}")]
+    #[error(
+        "tn-lmdb: unsupported format version {0}: this build reads only format {this}; open the \
+         file with the build that wrote it, or recreate the database",
+        this = crate::meta::FORMAT_VERSION
+    )]
     UnsupportedVersion(u32),
     /// A page size that is not a power of two in 4 KiB..=64 KiB.
     #[error("tn-lmdb: invalid page size {0}")]

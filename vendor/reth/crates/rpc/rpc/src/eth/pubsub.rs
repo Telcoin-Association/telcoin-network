@@ -1,6 +1,6 @@
 //! `eth_` `PubSub` RPC handler implementation
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::eth::filter::check_filter_size;
 use alloy_primitives::TxHash;
@@ -23,10 +23,11 @@ use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::BlockNumReader;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::{
-    NewSubpoolTransactionStream, NewTransactionEvent, SubPool, TransactionListenerKind,
-    TransactionPool,
+    NewSubpoolTransactionStream, NewTransactionEvent, PoolTransaction, SubPool,
+    TransactionListenerKind, TransactionPool,
 };
 use serde::Serialize;
+use tokio::sync::mpsc::Receiver;
 use tokio_stream::{
     wrappers::{BroadcastStream, ReceiverStream},
     Stream,
@@ -119,47 +120,8 @@ where
                 pipe_from_stream(accepted_sink, self.log_stream(filter)).await
             }
             SubscriptionKind::NewPendingTransactions => {
-                if let Some(params) = params {
-                    match params {
-                        Params::Bool(true) => {
-                            // full transaction objects requested
-                            let stream = self
-                                .full_pending_transaction_stream()
-                                .ok_or_else(too_many_listeners_err)?
-                                .filter_map(|tx| {
-                                    let tx_value = match self
-                                        .inner
-                                        .eth_api
-                                        .converter()
-                                        .fill_pending(tx.transaction.to_consensus())
-                                    {
-                                        Ok(tx) => Some(tx),
-                                        Err(err) => {
-                                            error!(target = "rpc",
-                                                %err,
-                                                "Failed to fill transaction with block context"
-                                            );
-                                            None
-                                        }
-                                    };
-                                    std::future::ready(tx_value)
-                                });
-                            return pipe_from_stream(accepted_sink, stream).await
-                        }
-                        Params::Bool(false) | Params::None => {
-                            // only hashes requested
-                        }
-                        _ => {
-                            return Err(invalid_params_rpc_err(
-                                "Invalid params for newPendingTransactions",
-                            ))
-                        }
-                    }
-                }
-
-                let stream =
-                    self.pending_transaction_hashes_stream().ok_or_else(too_many_listeners_err)?;
-                pipe_from_stream(accepted_sink, stream).await
+                let listener = self.pending_transactions_listener(params)?;
+                self.pipe_pending_transactions(accepted_sink, listener).await
             }
             SubscriptionKind::Syncing => {
                 // get new block subscription
@@ -225,6 +187,79 @@ where
     }
 }
 
+/// TN(TN-0174): the pool listener of a `newPendingTransactions` subscription, taken before the
+/// subscription is accepted so that a refusal reaches the client as an error.
+enum PendingTransactionsListener<T: PoolTransaction> {
+    /// Hashes of new transactions.
+    Hashes(Receiver<TxHash>),
+    /// New transactions, of which the subscription sends the pending ones in full.
+    Full(Receiver<NewTransactionEvent<T>>),
+}
+
+impl<Eth> EthPubSub<Eth>
+where
+    Eth: RpcNodeCore + EthApiTypes<RpcConvert: RpcConvert<Primitives = Eth::Primitives>>,
+{
+    /// TN(TN-0174): checks a `newPendingTransactions` subscription's params and takes its pool
+    /// listener; fails with the error the client gets when the pool refuses another one.
+    fn pending_transactions_listener(
+        &self,
+        params: Option<Params>,
+    ) -> Result<
+        PendingTransactionsListener<<Eth::Pool as TransactionPool>::Transaction>,
+        ErrorObject<'static>,
+    > {
+        let pool = self.inner.eth_api.pool();
+        let kind = TransactionListenerKind::PropagateOnly;
+        match params {
+            Some(Params::Bool(true)) => {
+                pool.try_new_transactions_listener_for(kind).map(PendingTransactionsListener::Full)
+            }
+            None | Some(Params::Bool(false) | Params::None) => pool
+                .try_pending_transactions_listener_for(kind)
+                .map(PendingTransactionsListener::Hashes),
+            _ => return Err(invalid_params_rpc_err("Invalid params for newPendingTransactions")),
+        }
+        .ok_or_else(too_many_listeners_err)
+    }
+
+    /// TN(TN-0174): sends what `listener` receives to the subscription: hashes, or the pending
+    /// transactions in full.
+    async fn pipe_pending_transactions(
+        &self,
+        accepted_sink: SubscriptionSink,
+        listener: PendingTransactionsListener<<Eth::Pool as TransactionPool>::Transaction>,
+    ) -> Result<(), ErrorObject<'static>> {
+        match listener {
+            PendingTransactionsListener::Hashes(receiver) => {
+                pipe_from_stream(accepted_sink, ReceiverStream::new(receiver)).await
+            }
+            PendingTransactionsListener::Full(receiver) => {
+                let stream = NewSubpoolTransactionStream::new(receiver, SubPool::Pending)
+                    .filter_map(|tx| {
+                        let tx_value = match self
+                            .inner
+                            .eth_api
+                            .converter()
+                            .fill_pending(tx.transaction.to_consensus())
+                        {
+                            Ok(tx) => Some(tx),
+                            Err(err) => {
+                                error!(target = "rpc",
+                                    %err,
+                                    "Failed to fill transaction with block context"
+                                );
+                                None
+                            }
+                        };
+                        std::future::ready(tx_value)
+                    });
+                pipe_from_stream(accepted_sink, stream).await
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<Eth> EthPubSubApiServer<RpcTransaction<Eth::NetworkTypes>> for EthPubSub<Eth>
 where
@@ -243,6 +278,23 @@ where
             let Err(err) = check_filter_size(filter)
         {
             pending.reject(err).await;
+            return Ok(())
+        }
+        // TN(TN-0174): a `newPendingTransactions` subscription takes its pool listener before
+        // it is accepted, so a refused one gets the error instead of an id and no events.
+        if kind == SubscriptionKind::NewPendingTransactions {
+            let listener = match self.pending_transactions_listener(params) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    pending.reject(err).await;
+                    return Ok(())
+                }
+            };
+            let sink = pending.accept().await?;
+            let pubsub = self.clone();
+            self.inner.subscription_task_spawner.spawn_task(Box::pin(async move {
+                let _ = pubsub.pipe_pending_transactions(sink, listener).await;
+            }));
             return Ok(())
         }
         let sink = pending.accept().await?;
@@ -281,10 +333,32 @@ fn too_many_listeners_err() -> ErrorObject<'static> {
     )
 }
 
+/// TN(TN-0173): how long a subscription waits for room in its connection's send buffer before
+/// it ends.
+const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Pipes all stream items to the subscription sink.
 async fn pipe_from_stream<T, St>(
     sink: SubscriptionSink,
+    stream: St,
+) -> Result<(), ErrorObject<'static>>
+where
+    St: Stream<Item = T> + Unpin,
+    T: Serialize,
+{
+    pipe_from_stream_within(sink, stream, SUBSCRIPTION_SEND_TIMEOUT).await
+}
+
+/// [`pipe_from_stream`], ending the subscription once an item waits `send_timeout` for room.
+///
+/// TN(TN-0173): while a send waits, the stream is not polled and its source keeps what it
+/// buffers for this subscriber: a full-transaction listener holds up to 1,024 pool transactions,
+/// evicted ones included. A subscriber that stops reading would hold them until its connection
+/// closed; it now loses the subscription instead, and the stream with its buffer is dropped.
+async fn pipe_from_stream_within<T, St>(
+    sink: SubscriptionSink,
     mut stream: St,
+    send_timeout: Duration,
 ) -> Result<(), ErrorObject<'static>>
 where
     St: Stream<Item = T> + Unpin,
@@ -310,7 +384,7 @@ where
                     &item
                 ).map_err(SubscriptionSerializeError::new)?;
 
-                if sink.send(msg).await.is_err() {
+                if sink.send_timeout(msg, send_timeout).await.is_err() {
                     break Ok(());
                 }
             }
@@ -431,5 +505,115 @@ where
                 );
                 futures::stream::iter(all_logs)
             })
+    }
+}
+
+/// TN(TN-0173): a subscriber that stops reading loses the subscription.
+#[cfg(test)]
+mod send_timeout_tests {
+    use super::*;
+    use jsonrpsee::RpcModule;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll},
+    };
+
+    /// A stream of zeros that never ends and records when it is dropped.
+    struct Endless(Arc<AtomicBool>);
+
+    impl Stream for Endless {
+        type Item = u64;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<u64>> {
+            Poll::Ready(Some(0))
+        }
+    }
+
+    impl Drop for Endless {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The subscriber's buffer of four messages is never read: once it is full, the next send
+    /// waits the timeout, the subscription ends and its stream is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscriber_that_stops_reading_loses_the_subscription() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut module = RpcModule::new(dropped.clone());
+        module
+            .register_subscription(
+                "test_subscribe",
+                "test_item",
+                "test_unsubscribe",
+                |_, pending, dropped, _| async move {
+                    let sink = pending.accept().await?;
+                    let stream = Endless(Arc::clone(&dropped));
+                    let _ = pipe_from_stream_within(sink, stream, Duration::from_millis(50)).await;
+                    jsonrpsee::core::SubscriptionResult::Ok(())
+                },
+            )
+            .unwrap();
+
+        let _subscription = module.subscribe("test_subscribe", Vec::<u8>::new(), 4).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dropped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stream is dropped once the buffer stays full");
+    }
+}
+
+/// TN(TN-0174): a refused `newPendingTransactions` subscription gets the error.
+#[cfg(test)]
+mod pending_listener_tests {
+    use super::*;
+    use crate::EthApiBuilder;
+    use reth_chainspec::ChainSpecProvider;
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_transaction_pool::test_utils::testing_pool;
+
+    /// With every RPC listener slot of the pool taken, both kinds of subscription are refused
+    /// with -32009 instead of being accepted; once a slot is free they are accepted again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_pending_transactions_subscription_gets_the_error() {
+        let provider = MockEthProvider::default();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let module = EthPubSub::new(api.clone()).into_rpc();
+        let pool = api.pool().clone();
+        let kind = TransactionListenerKind::PropagateOnly;
+        let hashes: Vec<_> =
+            std::iter::from_fn(|| pool.try_pending_transactions_listener_for(kind)).collect();
+        let full: Vec<_> =
+            std::iter::from_fn(|| pool.try_new_transactions_listener_for(kind)).collect();
+        assert!(!hashes.is_empty() && !full.is_empty());
+
+        let hashes_params = ("newPendingTransactions",);
+        let full_params = ("newPendingTransactions", true);
+        for result in [
+            module.subscribe_unbounded("eth_subscribe", hashes_params).await,
+            module.subscribe_unbounded("eth_subscribe", full_params).await,
+        ] {
+            let Err(jsonrpsee::MethodsError::JsonRpc(err)) = result else {
+                panic!("expected the refusal, got {result:?}")
+            };
+            assert_eq!(err.code(), jsonrpsee::types::error::ErrorCode::ServerIsBusy.code());
+            assert_eq!(err.message(), "too many pending transaction listeners");
+        }
+
+        drop((hashes, full));
+        module.subscribe_unbounded("eth_subscribe", hashes_params).await.unwrap();
+        module.subscribe_unbounded("eth_subscribe", full_params).await.unwrap();
     }
 }

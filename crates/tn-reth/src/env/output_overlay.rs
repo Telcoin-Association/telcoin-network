@@ -77,10 +77,18 @@ pub(crate) use storage_split::StorageWalk;
 /// merge work by `O(N M log N)` for `N` blocks of at most `M` delta entries. Roots
 /// borrow at most `O(log N)` runs directly; they never flatten the accumulated data.
 /// Repeated keys can remain in separate runs, with the newest run taking precedence.
+///
+/// The output's first root records the anchor (the finalized block number its transaction sees),
+/// and a later root whose transaction sees another fails instead of laying the runs over a
+/// database they were not built on.
 #[derive(Debug, Default)]
 pub struct OutputTrieOverlay {
     /// Chronological state and trie-node runs, compacted together.
     runs: SortedTrieRuns,
+    /// The finalized block number the transaction of the output's first block root saw: the
+    /// anchor the runs were built over. Every later root of the output must see the same
+    /// (`parallel.rs`, `block_root_with_updates`).
+    anchor: std::sync::OnceLock<Option<BlockNumber>>,
 }
 
 impl OutputTrieOverlay {

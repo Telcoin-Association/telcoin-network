@@ -103,6 +103,18 @@ impl MuxInspector {
         Ok(MuxInspector { four_byte, tracing, configs })
     }
 
+    /// TN(TN-0172): readies the inspector for the next transaction, as a fresh one from
+    /// [`Self::try_from_config`] would be, except that the tracing inspector keeps its
+    /// recorded-bytes counter (see [`TracingInspector::fuse`]), so the cap bounds the request.
+    pub fn fuse(&mut self) {
+        if let Some(four_byte) = &mut self.four_byte {
+            core::mem::take(four_byte);
+        }
+        if let Some(tracing) = &mut self.tracing {
+            tracing.fuse();
+        }
+    }
+
     /// Try converting this [MuxInspector] into a [MuxFrame].
     pub fn try_into_mux_frame<DB: DatabaseRef>(
         &self,
@@ -287,4 +299,31 @@ pub enum Error {
     /// Error when deserializing the config
     #[error("error deserializing config: {0}")]
     InvalidConfig(#[from] serde_json::Error),
+}
+
+/// TN(TN-0172): the mux tracer's trace cap.
+#[cfg(test)]
+mod tests {
+    use crate::tracing::DebugInspector;
+    use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
+    use core::sync::atomic::Ordering;
+
+    /// The counter of a mux tracer's tracing inspector carries over a fuse, as the struct
+    /// logger's and the call tracer's do, so the cap bounds the request, not one transaction.
+    #[test]
+    fn fuse_keeps_the_recorded_bytes() {
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "muxTracer",
+            "tracerConfig": {"callTracer": {}},
+        }))
+        .unwrap();
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let DebugInspector::Mux(mux, _) = &inspector else { panic!("a mux tracer") };
+        let counter = mux.tracing.as_ref().unwrap().recorded_bytes.clone();
+        counter.fetch_add(1_000, Ordering::Relaxed);
+
+        inspector.fuse().unwrap();
+        let DebugInspector::Mux(mux, _) = &inspector else { panic!("a mux tracer") };
+        assert_eq!(mux.tracing.as_ref().unwrap().recorded_bytes(), 1_000);
+    }
 }

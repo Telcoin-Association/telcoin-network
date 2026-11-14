@@ -129,8 +129,9 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   never fall back past a short file, never repair a meta, never rewrite a weak head. `open_read_only`
   never writes, syncs (not even step 4's fsync) or creates, drops no cached page, and neither
   reads nor writes the boot record.
-- **The boot record may say "clean" or "another boot" only when the cache equals the device.**
-  Every other doubt drops the cache (`boot_record::decide`). "Open" is synced before the writer
+- **The boot record keeps the cache only on "clean" whose ctime the file still has** (this boot's
+  or another's); "open" drops it whatever boot wrote it, and so does every other doubt
+  (`boot_record::decide`). "Open" is synced before the writer
   can commit (step 10); "clean" is written only after a close's final sync and trim both
   succeeded, once the mappings are gone, under the lock (`mark_clean`). A new path that ends a
   writer (a close, a hand-off) without them leaves "open".

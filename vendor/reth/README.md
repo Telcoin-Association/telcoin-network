@@ -112,8 +112,10 @@ dependencies never get clippy, so run it after editing vendored code:
 `vendor/reth/tn/cargo.sh clippy --workspace --lib --tests -- -D warnings`.
 
 Run cargo in the nested workspace only through `cargo.sh`. A bare `cargo` there (or an editor's
-rust-analyzer opened on `vendor/reth`) resolves without TN's revm-inspectors patch and writes that
-into the nested lockfile; the next `cargo.sh` run overwrites it.
+rust-analyzer opened on `vendor/reth`) gets the revm-inspectors patch from `.cargo/config.toml`
+(TN-0080), but not `cargo.sh`'s seeding of the nested lockfile from TN's: it may resolve versions
+TN does not ship and write them into the nested lockfile (the next `cargo.sh` run overwrites it),
+and it builds into `vendor/reth/target`, not `target/vendor-reth`.
 
 `cargo.sh` seeds `vendor/reth/Cargo.lock` (git-ignored) on every run from TN's lockfile plus
 `tn/test-only.lock`, which pins the 72 packages only reth's tests need, and builds into

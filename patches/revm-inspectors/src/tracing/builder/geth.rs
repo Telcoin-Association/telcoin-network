@@ -40,6 +40,17 @@ impl GethTraceBuilder<'static> {
     }
 }
 
+/// TN(TN-0172): the bytes a struct log copies that its recorded step does not hold: its memory
+/// as one hex `String` per 32-byte word, and its copy of the contract's storage. The rest of the
+/// log (its fields and its stack) mirrors the step, which the recorded-bytes cap already counts.
+pub fn struct_log_copies(log: &StructLog) -> usize {
+    let word = |word: &alloc::string::String| core::mem::size_of_val(word) + word.len();
+    let memory = log.memory.as_ref().map_or(0, |words| words.iter().map(word).sum());
+    let slot = core::mem::size_of::<(B256, B256)>();
+    let storage = log.storage.as_ref().map_or(0, |storage| storage.len() * slot);
+    memory + storage
+}
+
 impl<'a> GethTraceBuilder<'a> {
     /// Returns a new instance of the builder from [`Cow::Borrowed`]
     pub fn new_borrowed(nodes: &'a [CallTraceNode]) -> GethTraceBuilder<'a> {
@@ -58,13 +69,17 @@ impl<'a> GethTraceBuilder<'a> {
 
     /// Fill in the geth trace with all steps of the trace and its children traces in the order they
     /// appear in the transaction.
+    ///
+    /// TN(TN-0172): `charge` is given each struct log's [`struct_log_copies`] once the log is
+    /// built; when it returns `false` the fill stops and returns `false`.
     fn fill_geth_trace(
         &self,
         main_trace_node: &CallTraceNode,
         opts: &GethDefaultTracingOptions,
         storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
         struct_logs: &mut Vec<StructLog>,
-    ) {
+        charge: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
         // A stack with all the steps of the trace and all its children's steps.
         // This is used to process the steps in the order they appear in the transactions.
         // Steps are grouped by their Call Trace Node, in order to process them all in the order
@@ -100,6 +115,11 @@ impl<'a> GethTraceBuilder<'a> {
                 log.return_data = Some(step.returndata.clone());
             }
 
+            // TN(TN-0172): count the log's own copies before keeping it.
+            if !charge(struct_log_copies(&log)) {
+                return false;
+            }
+
             // Add step to geth trace
             struct_logs.push(log);
 
@@ -110,6 +130,7 @@ impl<'a> GethTraceBuilder<'a> {
                 child_trace.push_steps_on_stack(&mut step_stack);
             }
         }
+        true
     }
 
     /// Generate a geth-style trace e.g. for `debug_traceTransaction`
@@ -123,8 +144,21 @@ impl<'a> GethTraceBuilder<'a> {
         return_value: Bytes,
         opts: GethDefaultTracingOptions,
     ) -> DefaultFrame {
+        self.geth_traces_charged(receipt_gas_used, return_value, opts, &mut |_| true)
+            .unwrap_or_default()
+    }
+
+    /// TN(TN-0172): [`Self::geth_traces`], giving `charge` each struct log's
+    /// [`struct_log_copies`] as the log is built. `None` once `charge` returns `false`.
+    pub fn geth_traces_charged(
+        &self,
+        receipt_gas_used: u64,
+        return_value: Bytes,
+        opts: GethDefaultTracingOptions,
+        charge: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<DefaultFrame> {
         if self.nodes.is_empty() {
-            return Default::default();
+            return Some(Default::default());
         }
         // Fetch top-level trace
         let main_trace_node = &self.nodes[0];
@@ -132,15 +166,17 @@ impl<'a> GethTraceBuilder<'a> {
 
         let mut struct_logs = Vec::with_capacity(self.trace_step_count());
         let mut storage = HashMap::default();
-        self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs);
+        if !self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs, charge) {
+            return None;
+        }
 
-        DefaultFrame {
+        Some(DefaultFrame {
             // If the top-level trace succeeded, then it was a success
             failed: !main_trace.success,
             gas: receipt_gas_used,
             return_value,
             struct_logs,
-        }
+        })
     }
 
     /// Generate a geth-style traces for the call tracer.

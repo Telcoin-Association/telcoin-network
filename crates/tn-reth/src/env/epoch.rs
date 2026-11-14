@@ -1921,6 +1921,43 @@ mod tests {
         Ok(())
     }
 
+    /// Re-executing a sealed epoch-closing block, as `debug_executionWitness` and the block
+    /// traces do through `executor_for_block`, publishes no epoch-close gas: an RPC client cannot
+    /// overwrite the gauges the production close published. The replay still computes the
+    /// block's result.
+    #[tokio::test]
+    async fn test_replayed_epoch_close_records_no_gas() -> eyre::Result<()> {
+        use metrics_util::debugging::DebuggingRecorder;
+        use reth_evm::{execute::Executor as _, ConfigureEvm as _};
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics (replay)");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        let block = execute_payload_and_update_canonical_chain(&env, payload, vec![])?;
+        assert_eq!(block.recovered_block.header().extra_data.len(), 32, "a closing block");
+
+        let mut db = StateProviderDatabase::new(env.state_by_block_hash(chain.genesis_hash())?);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let replayed = metrics::with_local_recorder(&recorder, || {
+            env.evm_config().executor(&mut db).execute(&block.recovered_block)
+        })?;
+        assert_eq!(replayed.gas_used, block.recovered_block.header().gas_used);
+        assert_eq!(replayed.receipts.len(), block.recovered_block.body().transactions.len());
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(
+            !snapshot.iter().any(|(key, ..)| key.key().name().starts_with("tn_reth.epoch_close")),
+            "a replayed close must record no epoch-close gas: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
     /// A block that closes no epoch publishes no epoch-close gas at all.
     ///
     /// Absent rather than zero. Ordinary blocks vastly outnumber closing ones, so publishing a

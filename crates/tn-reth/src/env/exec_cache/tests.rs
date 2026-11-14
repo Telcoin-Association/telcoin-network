@@ -50,6 +50,7 @@ fn tiny() -> ExecutionCache {
             wiped: DEFAULT_WIPED_ACCOUNTS,
         },
         None,
+        &[],
     )
 }
 
@@ -135,10 +136,13 @@ fn insert_state_wipes_an_account_that_existed() {
 /// cache), while a wipe of an address already in it is no new entry.
 #[test]
 fn insert_state_refuses_a_wipe_past_the_limit() {
+    // a seeded account (a codeless genesis account with storage) does not count toward the cap
     let mut cache = ExecutionCache::with_code(
         CacheCapacity { accounts: 1 << 16, storage: 1 << 16, code: 4, wiped: 2 },
         None,
+        &[Address::repeat_byte(9)],
     );
+    assert!(cache.is_wiped(&Address::repeat_byte(9)), "seeded");
     let wipe = |n: u8| {
         let destroyed =
             BundleAccount::new(Some(info(0, 1)), None, slots(&[]), AccountStatus::Destroyed);
@@ -146,10 +150,12 @@ fn insert_state_refuses_a_wipe_past_the_limit() {
     };
     cache.insert_state(&bundle(vec![wipe(1), wipe(2)])).expect("two fit");
     cache.insert_state(&bundle(vec![wipe(1)])).expect("already wiped");
+    cache.insert_state(&bundle(vec![wipe(9)])).expect("the seed is already wiped");
     assert_eq!(
         cache.insert_state(&bundle(vec![wipe(3)])),
         Err(InsertStateError::WipedSetFull(Address::repeat_byte(3)))
     );
+    assert_eq!(cache.stats().wiped_accounts, 3);
 }
 
 /// An account created, destroyed and re-created within the block (it did not exist at the
@@ -213,6 +219,7 @@ fn tiny_cache_evicts_without_serving_another_keys_value() {
     let cache = ExecutionCache::with_code(
         CacheCapacity { accounts: 4, storage: 4, code: 4, wiped: DEFAULT_WIPED_ACCOUNTS },
         None,
+        &[],
     );
     let address = |i: u64| Address::left_padding_from(&i.to_be_bytes());
     for round in 0..3u64 {
@@ -360,6 +367,8 @@ const EMPTY_ADDRESS: Address = Address::repeat_byte(0xe0);
 const EMPTY_ADDRESS_2: Address = Address::repeat_byte(0xe2);
 /// A codeless genesis account with slot 1 set: storage layout v1 only.
 const CODELESS_WITH_STORAGE: Address = Address::repeat_byte(0xe1);
+/// [`CHILD_RUNTIME`] at a genesis address, for an EIP-7702 delegation.
+const READER_ADDRESS: Address = Address::repeat_byte(0xd0);
 
 /// The factory's child address (`CREATE2` with salt 0 over `child_init`).
 fn child_address() -> Address {
@@ -575,19 +584,54 @@ impl TestChain {
     }
 }
 
-/// Run `plan` on a chain without the cache and on one with it, over the same `genesis`; both
-/// must build the same blocks. Returns the cached chain.
+/// Run `plan` on a chain with the cache off (the slot `TN_EXEC_CACHE=0` makes) and on one with
+/// it, over the same `genesis`; both must build the same blocks (a block hash commits to the
+/// block's state root). Returns the cached chain.
 fn cached_and_uncached(
     genesis: &Genesis,
     plan: impl Fn(&mut TestChain) -> eyre::Result<Vec<B256>>,
 ) -> eyre::Result<TestChain> {
-    let mut uncached = TestChain::on(genesis.clone(), None)?;
+    cached_and_uncached_on(genesis, None, plan)
+}
+
+/// [`cached_and_uncached`] with both datadirs in storage `layout` (the build's default when
+/// `None`).
+fn cached_and_uncached_on(
+    genesis: &Genesis,
+    layout: Option<StorageLayout>,
+    plan: impl Fn(&mut TestChain) -> eyre::Result<Vec<B256>>,
+) -> eyre::Result<TestChain> {
+    let mut uncached = TestChain::on(genesis.clone(), layout)?;
     uncached.env.disable_execution_cache_for_test();
     let expected = plan(&mut uncached)?;
     assert!(uncached.env.execution_cache_stats().is_none(), "the baseline ran without a cache");
-    let mut cached = TestChain::on(genesis.clone(), None)?;
+    let mut cached = TestChain::on(genesis.clone(), layout)?;
     assert_eq!(plan(&mut cached)?, expected, "the cache changed a block");
     Ok(cached)
+}
+
+/// `TN_EXEC_CACHE`: unset or `1` keeps the cache; `0` turns it off, and so does any other value
+/// (the cache-less build is the reference). An env switched off checks out no cache, so every read
+/// goes to the parent state.
+#[tokio::test]
+async fn exec_cache_switch_turns_the_cache_off() -> eyre::Result<()> {
+    for (value, disabled) in [
+        (None, false),
+        (Some("1"), false),
+        (Some("0"), true),
+        (Some("off"), true),
+        (Some(""), true),
+    ] {
+        assert_eq!(ExecutionCacheSlot::from_env_value(value).disabled, disabled, "{value:?}");
+    }
+    let mut chain = TestChain::new()?;
+    chain.env.disable_execution_cache_for_test();
+    assert!(chain.env.check_out_execution_cache(chain.head.hash()).is_none());
+    let tx = chain.call(COUNTER_ADDRESS);
+    chain.output(vec![vec![tx]])?;
+    assert!(chain.env.execution_cache_stats().is_none(), "no cache was saved");
+    assert_eq!(chain.slot(COUNTER_ADDRESS, 0)?, U256::from(1));
+    Ok(())
 }
 
 /// Block k writes a slot and block k+1 of the same output (not persisted between them) reads
@@ -712,7 +756,9 @@ async fn create2_over_a_funded_address_keeps_the_cache() -> eyre::Result<()> {
 
 /// The hazard the wiped set exists for, on storage v1 (whose genesis keeps storage on a codeless
 /// account): an entry the cache holds for a slot of an account that is then wiped. The entry
-/// stays in its bucket, but a read of the slot through the cache reads the state.
+/// stays in its bucket, but a read of the slot through the cache reads the state. (Such a genesis
+/// account is in every new cache's wiped set from the start, "Codeless genesis storage"; the
+/// wipe keeps it there.)
 #[tokio::test]
 async fn wiped_account_slots_read_the_state_not_the_cache() -> eyre::Result<()> {
     let genesis = genesis().extend_accounts([(
@@ -726,6 +772,7 @@ async fn wiped_account_slots_read_the_state_not_the_cache() -> eyre::Result<()> 
     let tx = chain.call(COUNTER_ADDRESS);
     chain.output(vec![vec![tx]])?;
     assert_eq!(chain.slot(CODELESS_WITH_STORAGE, 1)?, U256::from(5));
+    assert_eq!(chain.stats().wiped_accounts, 1, "seeded");
     // what a read of it would have left: its value at the anchor
     {
         let slot = chain.env.inner.execution_cache.lock();
@@ -969,6 +1016,45 @@ async fn eip7702_delegation_reads_through_the_cache() -> eyre::Result<()> {
     assert!(stats.code_hits > 0 && stats.storage_hits > 0, "{stats:?}");
     let code_hash = chain.account(authority.address())?.map(|a| a.get_bytecode_hash());
     assert_eq!(code_hash, Some(keccak256([])), "the delegation is cleared");
+    Ok(())
+}
+
+/// A storage-v1 genesis account with storage, no code and nonce 0, delegated by its key holder
+/// (EIP-7702). revm marks such an account `InMemoryChange` once it changes, so until its output
+/// persists reth's memory overlay answers 0 for every slot the output did not write, while the
+/// database keeps the genesis values. The cache seeds the account into its wiped set, so its slots
+/// read the parent state as a node without the cache does: 0 in the next block of the output (the
+/// cache filled 5 from the database in the delegating block), 5 again in the next output (a cache
+/// filled from the overlay would hold 0).
+#[tokio::test]
+async fn codeless_genesis_storage_reads_the_state_after_a_delegation() -> eyre::Result<()> {
+    let authority = authority();
+    let genesis = genesis().extend_accounts([
+        (READER_ADDRESS, GenesisAccount::default().with_code(Some(Bytes::from(CHILD_RUNTIME)))),
+        (
+            authority.address(),
+            GenesisAccount::default().with_storage(Some(BTreeMap::from([(
+                B256::from(U256::from(1)),
+                B256::from(U256::from(5)),
+            )]))),
+        ),
+    ]);
+    let plan = |chain: &mut TestChain| -> eyre::Result<Vec<B256>> {
+        // the delegating transaction calls the authority too: slot2 = 0 + 5, read before the
+        // account changes
+        let delegate = chain.set_code(&authority, 0, READER_ADDRESS)?;
+        let read = chain.call(authority.address());
+        let mut hashes = chain.output(vec![vec![delegate], vec![read]])?;
+        assert_eq!(chain.slot(authority.address(), 2)?, U256::ZERO, "slot2 = 0 + the overlay's 0");
+        let read = chain.call(authority.address());
+        hashes.extend(chain.output(vec![vec![read]])?);
+        Ok(hashes)
+    };
+    let chain = cached_and_uncached_on(&genesis, Some(StorageLayout::V1), plan)?;
+    assert_eq!(chain.slot(authority.address(), 2)?, U256::from(5), "slot2 = 0 + the database's 5");
+    let stats = chain.stats();
+    assert_eq!(stats.wiped_accounts, 1, "the seeded authority: {stats:?}");
+    assert!(stats.storage_bypasses >= 2, "{stats:?}");
     Ok(())
 }
 

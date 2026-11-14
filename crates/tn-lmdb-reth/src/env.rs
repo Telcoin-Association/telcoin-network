@@ -746,7 +746,7 @@ impl Database for TnLmdbEnv {
             Some(timeouts) => timeouts.begin(),
             None => ReaderState::untimed(),
         };
-        Ok(TnLmdbTx::new(txn, Arc::clone(&self.tables), reader, self.timeouts.clone()))
+        Ok(TnLmdbTx::new(txn, Arc::clone(&self.tables), reader))
     }
 
     /// Waits while another write transaction is open, as MDBX does, holding no lock of this

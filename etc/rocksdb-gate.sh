@@ -15,11 +15,12 @@
 #      and dev-dependency of the workspace, so this covers optional and transitive paths too.
 #      Neither does vendor/reth/tn/test-only.lock, which pins what only the vendored reth's own
 #      tests need (vendor/reth/tn/lockfile.py).
-#   2. No manifest under vendor/reth, the TN crates or the carried patches/ crates mentions
-#      rocksdb outside a comment. That catches a re-added optional dependency or feature
-#      before anyone enables it.
+#   2. No manifest under vendor/reth, the TN crates, the carried patches/ crates or the testing/
+#      tools mentions rocksdb outside a comment. That catches a re-added optional dependency or
+#      feature before anyone enables it.
 #
-# Fails closed: a missing lockfile or scanned directory is an error, not a pass.
+# Fails closed: a missing lockfile or scanned directory, or a file grep cannot read, is an
+# error, not a pass.
 #
 # etc/test_rocksdb_gate.py runs this script against planted lockfiles and manifests.
 #
@@ -40,9 +41,10 @@ for lockfile in "${LOCKFILES[@]}"; do
     fi
 done
 
-# Directories and files whose Cargo.toml files are scanned. patches/ holds the crates that the
-# root [patch.crates-io] puts into the build.
-SCANNED=(vendor/reth bin crates examples patches Cargo.toml)
+# Directories and files whose Cargo.toml files are scanned: every tracked manifest. patches/
+# holds the crates that the root [patch.crates-io] puts into the build; testing/ the standalone
+# test tools.
+SCANNED=(vendor/reth bin crates examples patches testing Cargo.toml)
 for path in "${SCANNED[@]}"; do
     if [[ ! -e "$path" ]]; then
         echo "rocksdb guard FAILED: $path not found in $ROOT_DIR; update SCANNED in $0."
@@ -50,10 +52,21 @@ for path in "${SCANNED[@]}"; do
     fi
 done
 
+# grep's matching lines. No match (status 1) is a pass; an error (status 2, such as a file it
+# cannot read) fails the guard.
+search() {
+    local status=0
+    grep "$@" || status=$?
+    if ((status > 1)); then
+        echo "rocksdb guard FAILED: grep $* exited $status." >&2
+        exit 1
+    fi
+}
+
 failed=0
 
 for lockfile in "${LOCKFILES[@]}"; do
-    locked=$(grep -iE '^name = "[^"]*rocksdb[^"]*"$' "$lockfile" || true)
+    locked=$(search -iE '^name = "[^"]*rocksdb[^"]*"$' "$lockfile")
     if [[ -n "$locked" ]]; then
         echo "rocksdb guard FAILED: $lockfile contains RocksDB packages:"
         echo "$locked"
@@ -62,7 +75,7 @@ for lockfile in "${LOCKFILES[@]}"; do
 done
 
 # Comment lines are skipped: manifests may explain that RocksDB is gone.
-manifests=$(grep -rIilE --include=Cargo.toml '^[^#]*rocksdb' "${SCANNED[@]}" || true)
+manifests=$(search -rIilE --include=Cargo.toml '^[^#]*rocksdb' "${SCANNED[@]}")
 if [[ -n "$manifests" ]]; then
     echo "rocksdb guard FAILED: these manifests mention rocksdb:"
     echo "$manifests"

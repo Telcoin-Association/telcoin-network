@@ -35,7 +35,8 @@ class RocksdbGate(unittest.TestCase):
         (self.root / "vendor/reth/tn").mkdir(parents=True)
         (self.root / "vendor/reth/tn/test-only.lock").write_text(LOCK)
         (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/x"]\n')
-        for d in ("vendor/reth/crates/x", "bin/x", "crates/x", "examples/x", "patches/x"):
+        for d in ("vendor/reth/crates/x", "bin/x", "crates/x", "examples/x", "patches/x",
+                  "testing/x"):
             (self.root / d).mkdir(parents=True)
             (self.root / d / "Cargo.toml").write_text(MANIFEST)
 
@@ -75,6 +76,27 @@ class RocksdbGate(unittest.TestCase):
         rc, out = self.gate()
         self.assertEqual(rc, 1)
         self.assertIn("patches/x/Cargo.toml", out)
+
+    def test_manifest_under_testing_fails(self):
+        (self.root / "testing/x/Cargo.toml").write_text(
+            MANIFEST + '\n[dependencies]\nrocksdb = "0.24"\n')
+        rc, out = self.gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("testing/x/Cargo.toml", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_unreadable_lockfile_fails_closed(self):
+        (self.root / "Cargo.lock").chmod(0)
+        rc, out = self.gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("rocksdb guard FAILED: grep", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_unreadable_manifest_fails_closed(self):
+        (self.root / "crates/x/Cargo.toml").chmod(0)
+        rc, out = self.gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("rocksdb guard FAILED: grep", out)
 
     def test_comment_mentioning_rocksdb_passes(self):
         (self.root / "crates/x/Cargo.toml").write_text(MANIFEST + "# rocksdb was removed (D14)\n")

@@ -12,7 +12,9 @@
 #                    runs' own SYSTEM, CONFIG, BINARIES and RUNS sections when reports/head.txt
 #                    is there. The runs are reports/runs.tsv's (the script's last runs in that
 #                    dir); a dir without it is refused, and so is a JSON report of a version the
-#                    report does not read (report_versions below), by name.
+#                    report does not read (report_versions below), by name. It exits non-zero
+#                    when the runs failed: a FAILED run, a differential's mismatch or failure, or
+#                    CHAINS DIFFER.
 #   Backend mode (no commit): this checkout (uncommitted changes included) built twice, MDBX
 #                    (`--features tn-reth/mdbx`) against tn-lmdb (the default features).
 #   Layout mode (--layout): this checkout (uncommitted changes included) built once on tn-lmdb
@@ -41,7 +43,7 @@
 #   EXEC_ROUNDS=2    pairs per profile; round 1 runs A then B, round 2 B then A, and so on (the
 #                    default 2 is A B B A, 1 is A B), where A is mdbx, v1 or before and B
 #                    tn-lmdb, v2 or after
-#   EXEC_PROFILES="busy busy-readers peak busy-metrics"  the profiles to run, in order:
+#   EXEC_PROFILES="busy busy-readers peak busy-metrics"  the profiles to run, in order, each once:
 #                    busy          the bench's defaults
 #                    busy-readers  TN_EXEC_BENCH_READERS=4
 #                    peak          TN_EXEC_BENCH_BATCHES=20 TN_EXEC_BENCH_GAS=30000000
@@ -60,7 +62,9 @@
 #                    commit) by more than many changes do. Share them to compare a change that
 #                    writes the same data; the sides' chains must then match, and a profile whose
 #                    runs differ is marked CHAINS DIFFER and fails the script, as in backend and
-#                    layout modes (reports/shared-base marks the run for --report-only). Leave it
+#                    layout modes, and so is one whose after side did not find the before side's
+#                    aged base in the cache (BASE NOT SHARED: another base name, or a rebuild)
+#                    (reports/shared-base marks the run for --report-only). Leave it
 #                    unset for a change to what is written, or to the on-disk format
 #   EXEC_SYS_SAMPLE=1  Linux only (refused elsewhere): a sampler beside each run, started just
 #                    before the binary and killed right after it (and on any exit), which never
@@ -92,6 +96,9 @@
 #   has an EXEC_PAGE_SIZE_* set, TN_EXEC_BENCH_LAYOUT when the run's side has a layout (layout
 #   mode's v1 and v2, EXEC_LAYOUT_*), and in layout mode TN_EXEC_BENCH_DIFF and
 #   TN_EXEC_BENCH_DIFF_AGAINST (a round's first run without any).
+#   The variables the node's own code reads (TN_PARALLEL_*, TN_EXEC_CACHE_*, RUST_LOG) pass through
+#   to both sides too, as they are: CONFIG's "node variables" lists them. A before commit may read
+#   none of them.
 #
 # Each test binary is run directly (not through cargo), its md5 and test count recorded, and the run
 # refused if the two binaries match (layout mode's one binary runs both sides) or either lacks the
@@ -187,7 +194,10 @@ report_versions="5 6"
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
 # of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
 # after rendering everything, when backend or layout mode's two sides, or a shared-base commit
-# run's (reports/shared-base beside the manifest), ran different chains.
+# run's (reports/shared-base beside the manifest), ran different chains, or a shared-base run's
+# after side did not run on the before side's aged base (BASE NOT SHARED), and else, in `dir` mode,
+# 4 when a run failed or a differential mismatched or failed (in `run` mode the caller fails
+# those runs itself).
 render_report() {
     EXEC_REPORT_VERSIONS="$report_versions" python3 -I - "$@" <<'PY'
 import json
@@ -751,6 +761,8 @@ def print_differential(mine):
         earlier = os.path.basename(against.get("path") or "-")
         lines.append(f"  {run['side']} round {run['round']} against {earlier}: {text}")
         lines += [f"    {shown}" for shown in against.get("shown") or []]
+    if mismatches or failed:
+        differential_failures.append(mine[0]["profile"])
     if comparisons:
         print(f"differential: {comparisons} comparisons, {mismatches} mismatches"
               f"{f', {failed} FAILED' if failed else ''} (TN_EXEC_BENCH_DIFF_AGAINST)")
@@ -768,6 +780,9 @@ def section(name, fn, *args):
 
 profiles = []
 chains_differ = []  # the profiles whose runs ran different chains on one load (same_load)
+unshared = []  # the profiles whose shared-base sides did not run on one aged base
+failed_runs = []  # the runs whose status is not 0
+differential_failures = []  # the profiles whose differential mismatched or failed
 for run in runs:
     if run["profile"] not in profiles:
         profiles.append(run["profile"])
@@ -778,6 +793,7 @@ for profile in profiles:
     for r in mine:
         if r["status"] != "0":
             print(f"FAILED: {r['side']} round {r['round']} ({r['status']}); see {r['log']}")
+            failed_runs.append(f"{profile} {r['side']} round {r['round']}")
     docs = {}  # (side, round) -> JSON
     for r in mine:
         if r["status"] == "0":
@@ -793,6 +809,7 @@ for profile in profiles:
         print(f"{side} knobs: {knob_text(first.get('knobs', {}))}")
         print(f"{side} page size: {page_text(first)}")
         print(f"{side} storage layout: {layout_text(first)}")
+        print(f"{side} aged base: {first.get('aged', '-')}")
         for rnd, header in headers[1:]:
             if knob_text(header.get("knobs", {})) != knob_text(first.get("knobs", {})):
                 print(f"{side} round {rnd} KNOBS DIFFER: {knob_text(header.get('knobs', {}))}")
@@ -829,6 +846,15 @@ for profile in profiles:
             chains_differ.append(profile)
         else:
             print(f"chains differ between runs of {profile}: the change alters the load")
+    # a shared-base run's after side must have found the before side's aged base in the cache
+    if shared_base:
+        paths = {(doc["header"].get("aged") or "").split(" (")[0] for doc in docs.values()}
+        built = sorted(rnd for (s, rnd), doc in docs.items()
+                       if s == side_b and "(built" in (doc["header"].get("aged") or ""))
+        if len(paths) > 1 or built:
+            print(f"FAILED: BASE NOT SHARED between runs of {profile}: aged bases "
+                  f"{' '.join(sorted(paths))}; {side_b} built its own in rounds {' '.join(map(str, built)) or '-'}")
+            unshared.append(profile)
     section("differential", print_differential, mine)
     pairs = sorted(rnd for (s, rnd) in docs if s == side_a and (side_b, rnd) in docs)
     if not pairs:
@@ -876,10 +902,17 @@ for run in runs:
     state = "" if run["status"] == "0" else f"  (FAILED: {run['status']})"
     json_path = run["json"] if run["status"] == "0" else "-"
     print(f"{run['profile']} {run['side']} round {run['round']}: {json_path}  log {run['log']}{state}")
-if chains_differ:  # rendered in full, then status 3: the caller fails on it
-    print(f"the {same_load} ran different chains in: {' '.join(chains_differ)}",
-          file=sys.stderr)
+if chains_differ or unshared:  # rendered in full, then status 3: the caller fails on it
+    if chains_differ:
+        print(f"the {same_load} ran different chains in: {' '.join(chains_differ)}",
+              file=sys.stderr)
+    if unshared:
+        print(f"the sides did not share one aged base in: {' '.join(unshared)}", file=sys.stderr)
     sys.exit(3)
+if mode == "dir" and (failed_runs or differential_failures):  # status 4: --report-only fails
+    print(f"failed runs: {', '.join(failed_runs) or 'none'}; differential mismatches or failures: "
+          f"{' '.join(differential_failures) or 'none'}", file=sys.stderr)
+    sys.exit(4)
 PY
 }
 
@@ -904,10 +937,12 @@ if [ "${1:-}" = --report-only ]; then # re-render a bench dir's reports: no buil
     } >"$report"
     render_status=0
     render_report dir "$bench_dir" >>"$report" || render_status=$?
-    case "$render_status" in 0 | 3) ;; *) rm -f "$report"; die "the report failed to render" ;; esac
+    case "$render_status" in 0 | 3 | 4) ;; *) rm -f "$report"; die "the report failed to render" ;; esac
     printf '\n### END %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$report"
     echo "report: $report"
-    [ "$render_status" = 0 ] || die "the two sides ran different chains: see CHAINS DIFFER in the report"
+    [ "$render_status" != 3 ] \
+        || die "the two sides ran different chains or bases: see CHAINS DIFFER or BASE NOT SHARED in the report"
+    [ "$render_status" != 4 ] || die "the runs failed: see FAILED and the differential in the report"
     exit 0
 fi
 
@@ -967,9 +1002,13 @@ profile_settings() { # <profile>: prints the profile's TN_EXEC_BENCH_* assignmen
 }
 read -r -a profiles <<<"${EXEC_PROFILES:-busy busy-readers peak busy-metrics}"
 [ "${#profiles[@]}" -gt 0 ] || die "EXEC_PROFILES is empty"
+listed=" "
 for profile in "${profiles[@]}"; do
     profile_settings "$profile" >/dev/null \
         || die "unknown profile '$profile' (busy, busy-readers, peak, busy-metrics, busy-epoch, busy-export, busy-history)"
+    # a profile's runs share their report and log names, so a second listing would replace them
+    case "$listed" in *" $profile "*) die "profile '$profile' is listed twice in EXEC_PROFILES" ;; esac
+    listed+="$profile "
 done
 command -v python3 >/dev/null || die "python3 is needed for the report"
 sys_sample="${EXEC_SYS_SAMPLE:-0}"
@@ -1131,7 +1170,8 @@ else
 fi
 case "${EXEC_SHARED_BASE:-}" in
     "") ;;
-    1) [ "$mode" = commit ] || die "EXEC_SHARED_BASE=1 is for commit mode; $mode mode already shares one base" ;;
+    1) [ "$mode" = commit ] \
+        || die "EXEC_SHARED_BASE=1 is for commit mode: $mode mode's sides already share one cache dir, and their bases differ by what they compare" ;;
     *) die "EXEC_SHARED_BASE must be 1 or unset, not '$EXEC_SHARED_BASE'" ;;
 esac
 
@@ -1244,6 +1284,9 @@ owned="CACHE_DIR|REPORT" # the knobs the script sets on every run
 caller_knobs="$(env | grep -E '^TN_EXEC_BENCH_' | grep -vE "^TN_EXEC_BENCH_($owned)=" \
     | sort | tr '\n' ' ' | sed 's/ $//' || true)"
 kv "caller knobs" "${caller_knobs:-(none)}"
+node_vars="$(env | grep -E '^(TN_PARALLEL_|TN_EXEC_CACHE_|RUST_LOG=)' | sort | tr '\n' ' ' \
+    | sed 's/ $//' || true)"
+kv "node variables" "${node_vars:-(none of TN_PARALLEL_*, TN_EXEC_CACHE_*, RUST_LOG set)}"
 for profile in "${profiles[@]}"; do
     kv "profile $profile" "$(profile_settings "$profile" | sed 's/^$/(the bench defaults)/')"
 done
@@ -1485,7 +1528,8 @@ render_status=0
 render_report run "$manifest" "$side_a" "$side_b" >>"$report" || render_status=$?
 case "$render_status" in 0 | 3) ;; *) die "the report failed to render; after a fix: $0 --report-only $bench_dir" ;; esac
 chains=""
-[ "$render_status" = 0 ] || chains="; the two sides ran different chains (CHAINS DIFFER in the report)"
+[ "$render_status" = 0 ] \
+    || chains="; the two sides ran different chains or bases (CHAINS DIFFER or BASE NOT SHARED in the report)"
 {
     echo
     echo "### END $(date -u +%Y-%m-%dT%H:%M:%SZ)"

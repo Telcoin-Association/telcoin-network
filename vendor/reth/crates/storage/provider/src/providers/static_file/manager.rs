@@ -19,8 +19,9 @@ use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, NamedChain};
 use reth_db::{
     lockfile::StorageLock,
     static_file::{
-        iter_static_files, BlockHashMask, HeaderMask, HeaderWithHashMask, ReceiptMask,
-        StaticFileCursor, StorageChangesetMask, TransactionMask, TransactionSenderMask,
+        check_static_file_identity, iter_static_files, BlockHashMask, HeaderMask,
+        HeaderWithHashMask, ReceiptMask, StaticFileCursor, StorageChangesetMask, TransactionMask,
+        TransactionSenderMask,
     },
 };
 use reth_db_api::{
@@ -510,6 +511,8 @@ impl<N> StaticFileProviderInner<N> {
         path: &Path,
     ) -> ProviderResult<NippyJar<SegmentHeader>> {
         let jar = NippyJar::<SegmentHeader>::load(path).map_err(ProviderError::other)?;
+        // TN(TN-0160): and the configuration must be this jar's, whatever the datadir's layout.
+        check_static_file_identity(path, jar.user_header()).map_err(ProviderError::other)?;
         if self.jar_checksums(segment) && !jar.has_checksums() {
             tracing::error!(
                 target: "reth::static_file",

@@ -7,8 +7,8 @@ markers: **[done]**, **[next]**, **[later]**.
 ## Status
 
 - reth v1.11.4, cut from 101 crates to 57 plus `reth-testing-utils` (Phases 1, 2 and 6 and
-  reduction pass 2 below). RocksDB is gone (TN-0014). The ledger runs TN-0001 to TN-0149
-  (CHANGES.md; CLAUDE.md maps the ids by area).
+  reduction pass 2 below). RocksDB is gone (TN-0014). Every TN edit has a ledger id in
+  CHANGES.md; CLAUDE.md maps the ids by area.
 - tn-lmdb is the default reth database, and storage layout v2 the default for new datadirs
   (DECISIONS.md D22). Phase 3 lists what is left before MDBX retires.
 - CI runs reth's own tests for the vendored crates and the `js-tracer` build (lane
