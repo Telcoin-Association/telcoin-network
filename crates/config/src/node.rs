@@ -350,7 +350,9 @@ pub struct Parameters {
     /// rounds after one of this node's headers was cancelled uncertified, doubling `K` while that
     /// keeps happening. With the rule on every header, the blocks parents name are earlier picks
     /// of the same rule rather than tips, so every proposer settles at the ring floor; `K` keeps
-    /// tips in the parents. Issue #1804.
+    /// tips in the parents. A value above 128, the bound the doubling stops at, is lowered to 128,
+    /// and a value above zero while `quorum_exec_block` is off has no effect; the proposer logs a
+    /// warning for either at the start of each epoch. Issue #1804.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub quorum_exec_block_starved_rounds: u32,
 

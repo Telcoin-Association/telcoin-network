@@ -2406,11 +2406,13 @@ fn test_quorum_exec_block_adaptive_policy_state_machine() {
     assert_eq!(edge.certified_streak, 0, "a rule header's certificate does not count");
     assert_eq!(edge.next_window, 16);
 
-    // a configured window above the bound is used as is
+    // a configured window above the bound is lowered to it
     let mut wide = ExecBlockPolicy::new(true, 200);
+    assert_eq!((wide.base_window, wide.next_window), (128, 128));
     wide.on_cancelled(1, 2);
+    assert_eq!(window(&wide), (3..=130).collect::<Vec<_>>());
     wide.on_cancelled(250, 251);
-    assert_eq!(wide.next_window, 200);
+    assert_eq!(wide.next_window, 128);
 
     // the switch off and the `always` policy ignore the reports
     for (mut p, expected) in [
@@ -2965,5 +2967,77 @@ fn test_quorum_exec_block_never_names_a_block_before_the_epoch_opened() {
         let choice =
             choose_exec_block(&first, &table_inputs(ExecPolicy::Always, table_parents(1, 9, low)));
         assert_eq!(choice, ExecBlockChoice { block: opening, tip: opening, basis: ExecBasis::Tip });
+    }
+}
+
+/// `quorum_exec_block_starved_rounds` values the proposer cannot use as written: a window with the
+/// switch off has no effect and a window above the bound is lowered to it. Neither stops the node;
+/// the proposer logs one warning at its start, naming both switch values and the bound, and runs
+/// the policy `ExecBlockPolicy::new` builds (off, or adaptive at the bound). Values it uses as
+/// written log nothing.
+///
+/// Catches: a silently ignored window, a window above the bound used as is, and a warning for a
+/// valid configuration.
+#[tokio::test]
+async fn test_quorum_exec_block_starved_rounds_warning() {
+    use crate::log_capture::LogCapture;
+
+    let off = "quorum_exec_block_starved_rounds has no effect while quorum_exec_block is off";
+    let above = "quorum_exec_block_starved_rounds is above its bound; the bound is used";
+    for (enabled, starved_rounds, expected) in [
+        (false, 0, None),
+        (false, 4, Some(off)),
+        (false, 500, Some(off)),
+        (true, 0, None),
+        (true, 4, None),
+        (true, QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS, None),
+        (true, QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS + 1, Some(above)),
+        (true, u32::MAX, Some(above)),
+    ] {
+        assert_eq!(
+            ExecBlockPolicy::starved_rounds_warning(enabled, starved_rounds),
+            expected,
+            "quorum_exec_block={enabled} quorum_exec_block_starved_rounds={starved_rounds}"
+        );
+    }
+
+    let task_manager = TaskManager::default();
+    for (enabled, starved_rounds, expected, window) in [
+        (false, 4, Some(off), 4),
+        (true, 200, Some(above), QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS),
+        (true, 4, None, 4),
+    ] {
+        let capture = LogCapture::new("primary::proposer");
+        let _capture_guard = tracing::subscriber::set_default(capture.clone());
+        let fixture = exec_fixture(tn_config::Parameters {
+            quorum_exec_block: enabled,
+            quorum_exec_block_starved_rounds: starved_rounds,
+            ..tn_config::Parameters::default()
+        });
+        let proposer = exec_proposer(&fixture, &exec_bus(), &task_manager, Vec::new());
+        assert_eq!(proposer.exec_block_policy, ExecBlockPolicy::new(enabled, starved_rounds));
+        assert_eq!(proposer.exec_block_policy.base_window, window);
+        let rule = if enabled { ExecPolicy::Tip } else { ExecPolicy::Off };
+        assert_eq!(proposer.exec_block_policy.for_round(1), rule, "the policy runs as built");
+        let warnings: Vec<_> = [off, above].iter().flat_map(|text| capture.events(text)).collect();
+        match expected {
+            None => assert!(warnings.is_empty(), "no warning: {warnings:?}"),
+            Some(text) => {
+                assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+                assert_eq!(warnings[0].message, text);
+                assert_eq!(
+                    warnings[0].field("quorum_exec_block"),
+                    Some(enabled.to_string().as_str())
+                );
+                assert_eq!(
+                    warnings[0].u64_field("quorum_exec_block_starved_rounds"),
+                    Some(u64::from(starved_rounds))
+                );
+                assert_eq!(
+                    warnings[0].u64_field("bound"),
+                    Some(u64::from(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS))
+                );
+            }
+        }
     }
 }
