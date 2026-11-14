@@ -1136,6 +1136,45 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   so it cannot change a block, a root or a stored row. *Tests*: tn-reth startup tests; reth-provider
   suite. *Upstream*: n/a (upstream commit).
 
+- **TN-0206** — Backport 168b0a477 and the `delete_segment` half of 6cb04766e: TN-0083's resume
+  of a torn first launch works under storage v2, and refuses static files past genesis.
+  *Kind*: backport (ported by hand).
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`: the resume
+  branch refuses static files that hold any block but genesis or any transaction, then deletes the
+  `AccountChangeSets` and `StorageChangeSets` segments; tests `v2_init_genesis_resumes_after_a_torn_first_launch`,
+  `init_genesis_refuses_static_files_past_genesis`),
+  `crates/storage/provider/src/providers/static_file/manager.rs` (`delete_segment` drops the
+  segment's cached writer first), `crates/storage/provider/src/providers/static_file/writer.rs`
+  (`StaticFileWriters::remove`).
+  *Why*: under storage v2 genesis commits block 0 of both changeset segments to static files with
+  the header, before the database transaction. A first launch stopped between the two commits
+  left them there, and TN-0083's resumed `insert_genesis_state` failed appending block 0 again
+  (`UnexpectedStaticFileBlockNumber(StorageChangeSets, 0, 1)`) at every start, until the operator
+  deleted the datadir. The resume now deletes both segments first, so genesis writes them once.
+  `delete_segment` must drop the segment's cached writer, or the next append goes through a writer
+  that still holds the deleted file's block range (the same failure, in the process that tore).
+  Deleting is destructive, so the resume first takes upstream's check: every segment ends and
+  starts at the genesis block and holds no transaction, or initialization returns
+  `UninitializedDatabase` before anything is removed (a synced node whose database was deleted
+  keeps its static files). TN-0083's own check, no stage checkpoint at all, stays beside it.
+  Not a whole `vendor.py pick`: 168b0a477 sits on upstream's `init_genesis_with_settings_and_validate`
+  (the `--debug.skip-genesis-validation` flag, which TN does not carry) and conflicted in three
+  places, and 6cb04766e is mostly v2 state-import code TN removed (TN-0028); only the two lines of
+  `delete_segment` and `StaticFileWriters::remove` were needed, and they are upstream's text.
+  *Storage path*: yes, genesis init and static-file segment deletion. An uninterrupted genesis
+  never enters the resume branch, so it writes the same bytes as before (the format-freeze
+  writer test's fixtures, v1 and v2, are unchanged). The only other caller of `delete_segment`
+  is TN's `layout::remove_unfinished_genesis`, which deletes every segment of a creation stopped
+  inside genesis's commit and then writes genesis again; dropping a cached writer of a deleted
+  segment can only remove stale state there. No manifest or feature change.
+  *Tests*: `v2_init_genesis_resumes_after_a_torn_first_launch` (storage v2, header and changesets
+  in static files, database transaction dropped; init resumes with one changeset row per segment,
+  in the same process and over a reopened static-file provider; the next init is the ordinary
+  skip), `init_genesis_refuses_static_files_past_genesis` (a header past genesis: refused, both
+  changeset segments kept). Mutation-checked, each failing a test: no writer drop in
+  `delete_segment`, no segment deletion, no static-file check. reth-db-common suite; tn-reth's
+  layout and format-freeze tests. *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
@@ -1469,11 +1508,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
   resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
   written. A database with any checkpoint but not the Headers one is still refused.
-  The resume holds for storage v1 only, where the header is genesis's one static-file row (the
-  transactions and receipts segments get only a block range, which the resumed path sets again).
-  Under storage v2 genesis also commits block 0 of both changeset segments to static files, and
-  the resumed `insert_genesis_state` fails appending it again (`UnexpectedStaticFileBlockNumber`)
-  at every start. TN's node never reaches the resume in either layout: `layout::settle`
+  Under storage v1 the header is genesis's one static-file row (the transactions and receipts
+  segments get only a block range, which the resumed path sets again). Under storage v2 genesis
+  also commits block 0 of both changeset segments to static files, and the resumed
+  `insert_genesis_state` failed appending it again (`UnexpectedStaticFileBlockNumber`) at every
+  start, until TN-0206 removed them before the resume. TN's node never reaches the resume in
+  either layout: `layout::settle`
   (`crates/tn-reth/src/env/layout.rs`), the only path to `init_genesis_with_settings`, runs
   first; it removes the static files of a creation stopped inside genesis's commit (TN's marker,
   no `storage_settings` row, static files holding only genesis), so genesis writes them from
