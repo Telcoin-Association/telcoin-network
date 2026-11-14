@@ -974,7 +974,19 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
   first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
   final_state does not match this node's closing block` with the epoch and both blocks, counts
   `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
-  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
+  epoch.
+  The closing block must also be the block where the epoch-closing calls ran for the record's
+  `final_consensus`: its `parent_beacon_block_root` is that consensus header's digest, its nonce
+  carries the epoch, and its `extra_data` is the 32-byte closing seed (compared with the seed of the
+  boundary header the node closed on when it holds one; an adiri build skips the `extra_data`
+  compare for epochs up to 160). A record the node builds at a close gets the same check before it
+  is saved, voted on or published. A block that fails logs `epoch record final_state is not the
+  block where the epoch-closing calls ran, stopping the node` with the failed comparison as
+  `check`, and stops the node. Every check counts in
+  `tn_epoch_epoch_record_closing_block_check_total{result}` (`ok`, `beacon_root`, `nonce_epoch`,
+  `extra_data_length` or `extra_data_seed`), and every record the node publishes as its own logs
+  `epoch record published` with its `final_state`, `final_consensus`, `digest` and `branch`.
+  Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
   `restored-state-floor` beside a full consensus database (one copied in with a restored
   observer's execution database by the swap below) moves aside with the execution database, so the
   rebuild executes and compares every epoch, the restored one included (the restored-block

@@ -3035,4 +3035,62 @@ pub(super) mod tests {
             );
         }
     }
+
+    // ---- bench7 epoch-record-closing-block-check ----
+
+    /// The epoch entry accepts a record built the way the close builds it against the pin the
+    /// entry reads from the registry: epoch 0's closing block executed from a closing output with
+    /// the output digest as its beacon root (as the engine passes it), and record 0 committing
+    /// that block and that output. The pin (`blockHeight - 1`) is that block and carries every
+    /// marker the entry compares.
+    #[tokio::test]
+    async fn epoch_entry_accepts_a_genuine_record_against_the_registry_pin() -> eyre::Result<()> {
+        let temp = TempDir::with_prefix("entry_genuine_record")?;
+        let config = tn_config::Config::default_for_test_with_genesis(
+            test_genesis_with_consensus_registry(4),
+        );
+        let (mut manager, engine, reth_env, _tasks, _committee) =
+            manager_with_engine_on(&temp, None, config).await?;
+        let genesis = reth_env
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre::eyre!("the genesis header"))?;
+        let output = consensus_output_for_tests(1, 0, 1, true);
+        let gas_limit = genesis.gas_limit;
+        let payload = TNPayload::new(
+            genesis,
+            Address::random(),
+            0,
+            B256::random(),
+            &output,
+            output.consensus_header_hash().into(),
+            MIN_PROTOCOL_BASE_FEE,
+            gas_limit,
+            B256::random(),
+            0,
+        );
+        let closing = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?
+            .recovered_block
+            .clone_sealed_header();
+        eyre::ensure!(reth_env.epoch_state_from_canonical_tip()?.epoch == 1, "epoch 0 closed");
+
+        let record = EpochRecord {
+            epoch: 0,
+            final_state: closing.num_hash(),
+            final_consensus: output.num_hash(),
+            ..Default::default()
+        };
+        let cert = tn_types::EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: tn_types::BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        manager.consensus_chain.epochs().save(record, cert).await?;
+
+        let (committee, _epoch_info, _epoch_start, pin) =
+            manager.get_committee_with_epoch_start_info(&engine).await?;
+        assert_eq!(committee.epoch(), 1);
+        assert_eq!(pin.num_hash(), closing.num_hash(), "the pin is epoch 0's closing block");
+        manager.recover_previous_epoch_record(1, &pin, &engine).await?;
+        Ok(())
+    }
 }
