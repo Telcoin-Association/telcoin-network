@@ -221,6 +221,7 @@ impl RethEnv {
         // installed, so a node that never drops a transaction still exports both series
         crate::metrics::init();
         let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
+        let execution_cache = exec_cache::ExecutionCacheSlot::new(&node_config.chain.genesis);
 
         Ok(Self {
             inner: Arc::new(RethEnvInner {
@@ -230,7 +231,7 @@ impl RethEnv {
                 task_spawner,
                 restored_state_floor,
                 tx_forwarder,
-                execution_cache: parking_lot::Mutex::new(exec_cache::ExecutionCacheSlot::new()),
+                execution_cache: parking_lot::Mutex::new(execution_cache),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]

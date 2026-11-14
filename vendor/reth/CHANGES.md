@@ -2957,3 +2957,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   not raise it. The docs now say so. *Can reach execution or storage*: no; docs and a doc
   comment.
   *Tests*: n/a. *Upstream*: n/a.
+
+- **TN-0180** — `populate_bundle_state_hashed` refuses a hashed storage changeset key with an
+  error in every build. *Kind*: fix. *Files*: `crates/storage/provider/src/providers/database/
+  provider.rs` (`populate_bundle_state_hashed`, test).
+  *Why*: TN-0112 made changeset keys plain and guarded this function's plain-key precondition with
+  a `debug_assert!`, which release builds drop. `StorageSlotKey::Hashed` is still a variant (an
+  upstream sync that brings back hashed changesets, as upstream's v2 had, would produce it), and
+  with a hashed key the function keyed the bundle and reverts by the hash, looked `HashedStorages`
+  up with it unchanged, and its callers hashed it again: an unwind would leave the real row and
+  write the old value under `keccak(keccak(slot))`. It now returns `DatabaseError::Other`
+  before using the key. The cost is one enum tag compare per storage changeset entry, beside the
+  entry's `HashedStorages` seek, and only on this path. *Can reach execution or storage*: storage
+  only, and only to fail closed: the function runs under `remove_state_above` and
+  `take_state_above` (the unwind and take paths, which TN's node does not call), not on the
+  persist path, and every changeset reader tags its keys `Plain`, so no current caller sees the
+  error. *Tests*: `test_populate_bundle_state_hashed_refuses_a_hashed_key` (panics on the
+  `debug_assert!` without the change); `test_populate_bundle_state_hashed_with_plain_keys`
+  unchanged. *Upstream*: n/a (upstream removed `StorageSlotKey` in 815037e27).

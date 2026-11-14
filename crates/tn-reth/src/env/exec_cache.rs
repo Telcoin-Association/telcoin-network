@@ -31,7 +31,8 @@
 //! changes: the header commits to its post-state root, and TN has no reorgs or fork choice
 //! (consensus output is the only source of blocks, see `execution.rs`). Entries come from two
 //! places only: misses filled from `state_by_block_hash(parent)`, which is the parent's state by
-//! contract, and the block's full bundle, which carries every account, slot and contract the block
+//! contract (except for one kind of slot, which the cache never holds: "Codeless genesis storage"
+//! below), and the block's full bundle, which carries every account, slot and contract the block
 //! changed, system calls included (TN's epoch-close and fork writes all commit through revm's
 //! `State`, see `evm/block.rs`).
 //!
@@ -74,21 +75,61 @@
 //! default cap (eight full 30M-gas blocks); before the set, one wipe (about 60-80k gas a block)
 //! dropped the whole cache.
 //!
+//! # Codeless genesis storage
+//!
+//! A miss fills the value the parent state gave, so the cache needs every later read of that
+//! state to give the same value. reth's memory overlay breaks that for one kind of account: one
+//! with storage, no code and nonce 0 that a block of the output changes (an EIP-7702 delegation by
+//! its key holder). revm then marks it `InMemoryChange`, which it takes to mean "holds no
+//! storage", so until the output persists the overlay answers 0 for every slot the output did not
+//! write, while the database keeps the old values and serves them again after the persist. A
+//! cached slot would carry the database's value into the overlay's blocks, or the overlay's 0 past
+//! the persist, and the node would build other blocks than one without the cache.
+//!
+//! No block can give a codeless account with nonce 0 storage (a CREATE sets nonce 1, an
+//! authorization bumps the nonce, a fork's etch sets the nonce to at least 1), so only genesis
+//! holds such accounts, and only on storage v1: v2's genesis refuses storage without code
+//! (TN-0116). Adiri and mainnet have none. [`ExecutionCacheSlot::new`] takes the genesis accounts
+//! with storage and no code (any nonce) and every new cache starts with them in its wiped set,
+//! beyond the cap, so their storage reads always go to the parent state, as on a node without the
+//! cache. On a chain without such accounts the set starts empty.
+//!
 //! # Checks
 //!
 //! TN builds its own blocks, so no payload's state root catches a stale hit: it would fork the
 //! chain. In production one hit of each kind in [`CHECK_ONE_HIT_IN`] is re-read from the parent
 //! state. The sample follows the cache's own hit counters, which start at zero with each cache, so
 //! each node checks other hits than its peers. A differing value is logged with its key and both
-//! values, counted (`tn_reth.exec_cache_stale_hits_total`), and makes `build_recovered_block` (the
-//! build behind `build_block_from_batch_payload` and `build_block_from_recovered_payload`) drop
-//! the whole cache and build the block again without one, so that block is right and the node goes
-//! on. Unchecked stale hits of earlier blocks may already have given the node another state than
-//! its peers': a nonzero count is a bug to report, and the node's recent block hashes are to be
-//! compared with a peer's before it is trusted. A zero count on one node says nothing about
-//! another.
+//! values and counted (`tn_reth.exec_cache_stale_hits_total`). `build_recovered_block` (the build
+//! behind `build_block_from_batch_payload` and `build_block_from_recovered_payload`) then discards
+//! the block, drops the whole cache (bytecode table included) and builds that block again without
+//! one, so that block is the one a node without the cache builds. The node goes on, with a new
+//! cache from the next block.
+//!
+//! The rebuild covers the current block only. Nothing re-checks the blocks built before it: an
+//! unchecked stale hit in one of them may already have given the node another state than its
+//! peers', and that block is persisted. The cache is per node, so such a block forks this node
+//! alone. The cross-node checks find it later, not at the detection: the subscriber's leader check
+//! (a certified leader's execution block missing from the local chain) makes the node inactive
+//! (`CvvInactive`), and an epoch record certified by the network other than the node's own stops
+//! it. Neither repairs the blocks the node persisted; that takes a sync from scratch. A nonzero
+//! count is a bug to report, and the node's recent block hashes are to be compared with a peer's
+//! before it is trusted. A zero count on one node says nothing about another.
+//!
 //! With `TN_EXEC_CACHE_SHADOW=1` (test builds; the default in tn-reth's unit tests) every hit is
 //! checked and a stale one panics.
+//!
+//! # Off switch
+//!
+//! `TN_EXEC_CACHE=0` in the node's environment builds every block without the cache: every read
+//! goes to the parent state, as in the rebuild after a stale hit. Unset or `1` uses the cache; any
+//! other value is logged as an error and also turns it off (the cache-less build is the
+//! reference). It is read when the env is created, so a change takes a restart. A node with the
+//! cache off builds the same blocks as one with it: the invariant above makes every hit equal to
+//! the parent-state read it skips, and the state root never reads the cache. So the switch is safe
+//! on one node: it parts the node from no peer whose cache is right. An environment variable, like
+//! the parallel root's switches (`output_overlay/parallel.rs`, "Off switch"), so an operator can
+//! turn the cache off without a new release.
 //!
 //! # Differences from upstream
 //! - Every miss fills the cache (upstream's prewarm mode); TN runs no prewarming, so the block's
@@ -116,7 +157,10 @@
 use std::{
     fmt,
     hash::{BuildHasher, Hasher},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use alloy::primitives::{
@@ -134,7 +178,8 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use tracing::{debug, error, warn};
+use tn_types::Genesis;
+use tracing::{debug, error, info, warn};
 
 use super::RethEnv;
 use crate::metrics::RETH_METRICS;
@@ -174,6 +219,9 @@ pub(crate) const DEFAULT_WIPED_ACCOUNTS: usize = 4096;
 /// ms without checks (Mac, storage v2, default sizes), 1.3 us a check. At 1 in 256 that is about
 /// 143 checks, 0.19 ms an output, and still under 0.5 ms if a read costs 2.5 times as much.
 pub(crate) const CHECK_ONE_HIT_IN: u64 = 256;
+
+/// The cache's off switch (module docs).
+const EXEC_CACHE_ENV: &str = "TN_EXEC_CACHE";
 
 /// A fixed-cache with [`TopBitHash`] and the default config (no epochs, no stats).
 type FixedCache<K, V> = fixed_cache::Cache<K, V, TopBitHash>;
@@ -329,15 +377,15 @@ pub(crate) struct ExecutionCache {
 
 impl ExecutionCache {
     /// An empty cache with `capacity` entries, over `code` (a dropped cache's bytecode table) when
-    /// there is one. Allocation is lazy (zeroed pages), so a large capacity costs memory only as
-    /// entries fill.
-    fn with_code(capacity: CacheCapacity, code: Option<CodeTable>) -> Self {
+    /// there is one, its wiped set seeded with `seeds` (beyond the cap; see the module docs).
+    /// Allocation is lazy (zeroed pages), so a large capacity costs memory only as entries fill.
+    fn with_code(capacity: CacheCapacity, code: Option<CodeTable>, seeds: &[Address]) -> Self {
         Self {
             code: code.unwrap_or_else(|| FixedCache::new(capacity.code, TopBitHash::default())),
             storage: FixedCache::new(capacity.storage, TopBitHash::default()),
             accounts: FixedCache::new(capacity.accounts, TopBitHash::default()),
-            wiped: HashSet::default(),
-            wiped_limit: capacity.wiped,
+            wiped: seeds.iter().copied().collect(),
+            wiped_limit: capacity.wiped + seeds.len(),
             counters: Counters::default(),
             #[cfg(any(test, feature = "test-utils"))]
             shadow: shadow_from_env(),
@@ -438,41 +486,66 @@ pub(crate) struct ExecutionCacheSlot {
     capacity: CacheCapacity,
     /// Blocks built again without the cache after a checked hit was stale.
     rebuilds: u64,
-    /// Build without any cache (the differential tests' baseline).
-    #[cfg(any(test, feature = "test-utils"))]
+    /// Build every block without a cache (`TN_EXEC_CACHE=0`, module docs).
     disabled: bool,
+    /// The wiped set every new cache starts with: [`codeless_accounts_with_storage`].
+    seeds: Arc<[Address]>,
 }
 
 impl ExecutionCacheSlot {
-    /// An empty slot (no cache yet) at the default capacity, or the test knobs' (see
-    /// [`CacheCapacity::from_env`]).
-    pub(crate) fn new() -> Self {
-        Self {
-            saved: None,
-            code: None,
-            capacity: CacheCapacity::from_env(),
-            rebuilds: 0,
-            #[cfg(any(test, feature = "test-utils"))]
-            disabled: false,
-        }
+    /// An empty slot (no cache yet) for a chain from `genesis`, at the default capacity, or the
+    /// test knobs' (see [`CacheCapacity::from_env`]), switched on or off by `TN_EXEC_CACHE`.
+    pub(crate) fn new(genesis: &Genesis) -> Self {
+        let slot = Self::from_env_value(std::env::var(EXEC_CACHE_ENV).ok().as_deref());
+        Self { seeds: codeless_accounts_with_storage(genesis), ..slot }
     }
+
+    /// An empty slot switched by a value of `TN_EXEC_CACHE` (`None`: unset).
+    pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        let disabled = match value {
+            None | Some("1") => false,
+            Some("0") => {
+                info!(target: "engine", "{EXEC_CACHE_ENV}=0: blocks are built without the execution cache");
+                true
+            }
+            Some(other) => {
+                error!(target: "engine", "{EXEC_CACHE_ENV}={other}: expected 0 or 1; blocks are built without the execution cache");
+                true
+            }
+        };
+        let capacity = CacheCapacity::from_env();
+        Self { saved: None, code: None, capacity, rebuilds: 0, disabled, seeds: Arc::from([]) }
+    }
+}
+
+/// The genesis accounts with storage and no code (TN-0116's predicate; storage v2 refuses them,
+/// so on v2 none). See the module docs, "Codeless genesis storage".
+fn codeless_accounts_with_storage(genesis: &Genesis) -> Arc<[Address]> {
+    genesis
+        .alloc
+        .iter()
+        .filter(|(_, account)| {
+            account.storage.as_ref().is_some_and(|storage| !storage.is_empty())
+                && account.code.as_ref().is_none_or(|code| code.is_empty())
+        })
+        .map(|(address, _)| *address)
+        .collect()
 }
 
 impl RethEnv {
     /// Take the saved cache for a block built on `parent`: the saved one when it is anchored at
     /// `parent`, else a new empty one (anchored at `parent` by the caller's use of it) over the
-    /// last dropped cache's bytecode table. `None` only in tests that disabled the cache.
+    /// last dropped cache's bytecode table. `None` when `TN_EXEC_CACHE=0` turned the cache off.
     ///
     /// The env holds no cache while a block builds: only [`Self::check_in_execution_cache`] puts
     /// one back, so a build that fails at any point leaves none.
     pub(crate) fn check_out_execution_cache(&self, parent: B256) -> Option<ExecutionCache> {
-        let (saved, code, capacity) = {
+        let (saved, code, capacity, seeds) = {
             let mut slot = self.inner.execution_cache.lock();
-            #[cfg(any(test, feature = "test-utils"))]
             if slot.disabled {
                 return None;
             }
-            (slot.saved.take(), slot.code.take(), slot.capacity)
+            (slot.saved.take(), slot.code.take(), slot.capacity, slot.seeds.clone())
         };
         let cache = match saved {
             Some(saved) if saved.hash == parent => saved.cache,
@@ -483,7 +556,7 @@ impl RethEnv {
                 // the stale cache's accounts and storage drop here; its code carries over
                 let code = stale.map(|stale| stale.cache.into_code()).or(code);
                 debug!(target: "engine", %parent, bytes = capacity.bucket_bytes(), "new execution cache");
-                ExecutionCache::with_code(capacity, code)
+                ExecutionCache::with_code(capacity, code, &seeds)
             }
         };
         Some(cache)
@@ -557,14 +630,14 @@ impl RethEnv {
         slot.code = None;
     }
 
-    /// TEST-ONLY: build every later block without an execution cache, as a node without one
-    /// would (the baseline of a differential run).
+    /// TEST-ONLY: build every later block without an execution cache, through the slot
+    /// `TN_EXEC_CACHE=0` makes (the baseline of a differential run). Replaces the slot: the saved
+    /// cache, kept bytecode table, test capacity and rebuild count go.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn disable_execution_cache_for_test(&self) {
-        let mut slot = self.inner.execution_cache.lock();
-        slot.disabled = true;
-        slot.saved = None;
-        slot.code = None;
+        let slot = ExecutionCacheSlot::from_env_value(Some("0"));
+        // the old slot's tables drop (unmap) when this returns, after the lock is released
+        let _old = std::mem::replace(&mut *self.inner.execution_cache.lock(), slot);
     }
 }
 

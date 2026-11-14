@@ -43,11 +43,23 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
 - Execution cache (`src/env/exec_cache.rs`): block execution reads accounts, slots and code
   through a cross-block cache of the values at the last built block. One hit of each kind in 256
   is re-read from the parent state; a stale one is logged, counted in
-  `tn_reth_exec_cache_stale_hits_total` (alert on any nonzero value), and the block is built again
-  without the cache, so that block is right and the node goes on. Unchecked stale hits of earlier
-  blocks may already have put the node on another state than its peers': compare its recent block
-  hashes with a peer's before trusting it, and report it. The sample follows each node's own cache,
-  so nodes check different hits, and a zero on one node says nothing about another.
+  `tn_reth_exec_cache_stale_hits_total` (alert on any nonzero value), and that block is discarded
+  and built again without the cache, so it is the block a node without the cache builds, and the
+  node goes on. The rebuild covers that block only: nothing re-checks earlier blocks, and unchecked
+  stale hits in them may already have put the node on another state than its peers'. Such a block
+  forks this node alone; its leader check (the node goes inactive) or a certified epoch record
+  other than its own (the node stops) finds it later, and nothing repairs it short of a sync from
+  scratch. Compare the node's recent block hashes with a peer's before trusting it, and report it.
+  The sample follows each node's own cache, so nodes check different hits, and a zero on one node
+  says nothing about another. `TN_EXEC_CACHE=0` in the node's environment (read when the env is
+  created, so a restart) builds every block without the cache; any value other than `1` does too,
+  and an error is logged. That node builds the same blocks (every hit must equal the read it
+  skips, and the state root never reads the cache), so the switch is safe on one node.
+  The cache never holds a slot of a genesis account with storage but no code (storage v1 only; v2
+  refuses such a genesis, and adiri and mainnet have none): once a block changes such an account
+  with nonce 0 (an EIP-7702 delegation), reth's in-memory overlay answers 0 for its unwritten
+  slots until the output persists while the database keeps their values, so each read goes to the
+  parent state, as on a node without the cache (module docs, "Codeless genesis storage").
 
 ### Block-building timings
 
