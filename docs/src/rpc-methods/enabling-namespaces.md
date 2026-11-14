@@ -55,15 +55,16 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. Values below 2 are refused: `trace_filter` takes two slots at once. A request keeps its slot until its trace ends, even after a timeout or a disconnect |
+| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests on each worker's RPC endpoint, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. Values below 2 are refused: `trace_filter` takes two slots at once. A request keeps its slot until its trace ends, even after a timeout or a disconnect |
 | `--rpc.max-trace-filter-blocks` | `100` | Largest block range one `trace_filter` request may cover |
 | `--rpc.max-blocks-per-filter` | `100000` (`0` = no limit) | Largest block range for `eth_getLogs` and log filters |
 | `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return |
 | `--rpc.gascap` | `50000000` | Gas limit for `eth_call`, `eth_estimateGas` and the debug and trace call methods |
 | `--rpc.max-response-size` | `160` (MB) | Largest response the server sends |
 | `--rpc.max-connections` | `500` | Concurrent RPC connections |
+| `--rpc.max-subscriptions-per-connection` | `128` | Most subscriptions (`eth_subscribe`) one WebSocket or IPC connection holds; further ones fail with -32006. Each `newPendingTransactions` subscription also takes one of the 1,024 listener slots of its kind on the worker's transaction pool, first come across connections, so one connection holds at most an eighth of them |
 | `--rpc.max-batch-requests` | `100` | Most calls in one JSON-RPC batch request, on HTTP, WebSocket and IPC; a larger batch is refused whole |
-| `--rpc.max-active-filters` | `1000` | Most installed filters (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`) across all clients; a filter is removed when uninstalled or left unpolled for five minutes |
+| `--rpc.max-active-filters` | `1000` | Most installed filters (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`) on each worker's RPC endpoint, across all its clients, first come, first served; a filter is removed when uninstalled or left unpolled for five minutes |
 | `--http.corsdomain` | none | Origins allowed to call the HTTP server from a browser |
 | `--ws.origins` | unset: any origin | Origins allowed to open a WebSocket connection. Unset, the node checks no origin, so any web page can connect. A request without an `Origin` header (a client that is not a browser) always passes |
 | `--rpc.jwtsecret` | none | Hex-encoded secret; when set, HTTP and WebSocket requests need a JWT bearer token |

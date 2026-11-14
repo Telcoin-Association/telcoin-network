@@ -165,8 +165,12 @@ pub trait LoadPendingBlock:
                 }
             }
 
+            // TN(TN-0182): built on the eth API's CPU pool, which nothing waits on, not on a
+            // blocking-IO thread: a state read at `pending` waits for this build on a blocking-IO
+            // thread without a permit, so enough such reads could hold every thread while the
+            // build waited for one.
             let executed_block = match self
-                .spawn_blocking_io(move |this| {
+                .spawn_tracing(move |this| {
                     // we rebuild the block
                     this.build_block(&parent)
                 })

@@ -454,6 +454,8 @@ Complete tree after the node has run:
   static_files/                   # execution layer static files (block data)
   execution-reset-<UTC time>/     # what `db reset-execution` moved aside (db/, static_files/,
                                   #   restored-state-floor); `.partial` while it moves them
+  load-state-in-progress          # marker: a `db load-state` is writing chain data (or stopped
+                                  #   part-way); the node refuses to start while it is there
   consensus-db/                   # consensus protocol database
     tndb/                         #   consensus DB (tndb): one log per environment
       epoch/                      #     certificates, votes, payloads, last proposal
@@ -476,6 +478,15 @@ datadir, and the default build refuses a `db/` holding `mdbx.dat`, or an unfinis
 (`db/tn-lmdb-migrating/` beside `tn-lmdb.dat`, which the node's next start finishes), before
 anything opens it.
 
+`db load-state` writes `load-state-in-progress` into the datadir once it has found no chain data
+there, before it writes any, and removes it when the restore is complete. A run stopped part-way
+(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there:
+the execution and consensus databases are incomplete. Run `db load-state` again with the same
+bundle: it removes the chain data the stopped run created (`db/`, `static_files/`, `consensus-db/`
+and `restored-state-floor`) and restores again. Keys and config stay. If the stopped run wrote into
+a chain-data directory that was there before it, the rerun names it and stops: remove it, and the
+marker, by hand. A failed run (a bad bundle, say) removes what it created itself.
+
 `telcoin-network db migrate-execution` runs the MDBX to tn-lmdb migration of the execution
 database with the node stopped, instead of at the node's next start: it refuses while a node
 holds the datadir, holds the datadir while it runs, takes the node's `--db.*` flags (pass what
@@ -491,11 +502,16 @@ would move. It refuses while a node holds the datadir. It also refuses a datadir
 database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
 load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
 from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
-`consensus-db/` moved aside first. While a reset is unfinished (an `execution-reset-*.partial`
-directory), the node, `db load-state`, `db stats`, `db check` and `db migrate-execution` refuse the
-datadir, and running the reset again finishes it. The layouts, the upgrade from
-`v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage
-layouts" and "Upgrading a testnet node" sections.
+`consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
+closed the last epoch it took part in, because its votes and proposals for that epoch leave with
+`consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
+observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
+directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
+migrate-execution` refuse the datadir, and running the reset again finishes it. An empty one (left
+when the entries are moved back to undo an unfinished reset) blocks nothing. The layouts, the
+upgrade from `v0.17.0-adiri`, the side-observer swap and the rollback of a reset are in the tn-reth
+README's "Storage layouts" and "Upgrading a testnet node" sections; rolling a datadir back to an
+earlier release is not supported once this release has started on it.
 
 ## RPC configuration
 
@@ -520,9 +536,10 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.jwtsecret`                        | none                  | Hex-encoded JWT secret for RPC auth                             |
 | `--rpc.max-request-size`                 | `15` (MB)             | Max request payload size                                        |
 | `--rpc.max-response-size`                | `160` (MB)            | Max response payload size                                       |
-| `--rpc.max-subscriptions-per-connection` | `1024`                | Max subscriptions per connection                                |
+| `--rpc.max-subscriptions-per-connection` | `128`                 | Max subscriptions per WebSocket or IPC connection               |
 | `--rpc.max-connections`                  | `500`                 | Max concurrent RPC connections                                  |
 | `--rpc.max-tracing-requests`             | CPU-dependent         | Max concurrent tracing requests (`debug`, `trace`)              |
+| `--rpc.proof-permits`                    | `25`                  | Max concurrent `eth_getProof`, `eth_simulateV1`, `eth_callMany` and `eth_callBundle` requests per worker |
 | `--rpc.max-trace-filter-blocks`          | `100`                 | Max block range of one `trace_filter` request                   |
 | `--rpc.max-blocks-per-filter`            | `100000`              | Max block range for `eth_getLogs` and filters (0 = no limit)    |
 | `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |

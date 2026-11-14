@@ -591,8 +591,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/rpc/rpc-eth-api/src/helpers/{blocking_task.rs, call.rs, estimate.rs, trace.rs,
   pending_block.rs}`, `crates/rpc/rpc-eth-types/src/simulate.rs`,
   `crates/rpc/rpc/src/{debug.rs, trace.rs}`, `crates/rpc/rpc/src/eth/{bundle.rs, core.rs}`.
-  *Why*: a client that disconnects drops its request, but the blocking task it started ran to
-  the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
+  *Why*: a client that disconnects drops its request (over HTTP; over IPC since TN-0177; not
+  over WebSocket, where jsonrpsee runs each call to its end), but the blocking task it started
+  ran to the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
   replay or trace kept its thread (and, since TN-0019 and TN-0036 to TN-0038, its permit) for
   work nobody would read. 13a59de4b runs each `spawn_blocking_io` task inside a `CancelOnDrop`
   scope that the request's drop cancels, and the long loops check `is_cancelled()` between
@@ -1066,9 +1067,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   code (upstream added it in 40015a821, 2025-04, spelled this way since 34fe4c7c5, 2025-06). A
   node with this fix and one without compute different roots, and so different block hashes, on
   any block where the case occurs, and an epoch record commits to the block hash. Mainnet takes it
-  at genesis; a chain already built by an older binary (adiri) is replayed with the fix and its
-  block hashes compared before the fix is deployed there, and a block that differs needs an
-  activation epoch. It is rare on hashed keys: a random-trie probe (base tries of 1k to 49k
+  at genesis. Adiri takes it with no activation epoch: on 2026-11-14 an observer built with the
+  fix synced adiri from genesis, and every certified epoch record's closing block (epochs 0 to
+  751, up to block 529,583) matched the observer's own block and the public RPC's, so the case
+  did not occur in that history. A block an older binary builds later can still differ on this
+  one, so adiri validators upgrade from `v0.17.0-adiri` all at once, never rolling (a committee
+  mixing the two binaries splits on such a block), and later history is checked the same way: a
+  node with the fix that replays adiri stops at the first epoch whose certified closing block it
+  does not reproduce (`check_stored_record`, `crates/node/src/manager/node/close_epoch.rs`), and
+  such a block would need an activation epoch. It is rare on hashed keys: a random-trie probe (base tries of 1k to 49k
   accounts, about 155k inserted keys, the incremental root with the old condition against the
   fixed one) found no wrong root, while it flags upstream's crafted shape. The cost is a few extra
   hashed seeks when the walker lands deeper than the prefix.
@@ -1263,7 +1270,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   limit. Every pending-transaction filter and every `newPendingTransactions` subscription also
   registered a pool listener that every pool insertion walks with a `try_send`, with no bound on
   their number. The node now refuses the filter past `--rpc.max-active-filters`
-  (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
+  (per RPC server, which TN runs one of per worker, and first come across its clients; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
   TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
   are counted, so they take slots of the cap. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
@@ -1389,10 +1396,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   bytes, the pushed values `step_end` records) and, past `max_recorded_bytes`, ends the
   transaction the way TN-0017's interrupt does: the context error becomes `EVMError::Custom`
   ("trace too large: ..."), which the RPC returns as `-32603`, and the halted interpreter cannot
-  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`:
-  a trace whose steps alone pass it serializes to a response the limit refuses, so no answer a
-  default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
-  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request; the sites that
+  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`.
+  (A step can hold more than its JSON, so the cap can refuse a trace whose response the limit
+  would accept, at about a third of the cap for a struct log with a small stack; TN-0178.) The counter survives `fuse`, so `debug_traceBlock*` and
+  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request (the mux
+  tracer's only since TN-0172); the sites that
   build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
   and `trace_filter`, and `trace_callMany`) share a counter. It counted steps only: the call
   traces every preset records, with each call's input, init code and output, stayed uncounted
@@ -1840,8 +1848,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   returns a value's stored bytes without the check, for a search that only compares a prefix to
   steer itself and then reads the row it settles on verified (TN-0124). A heal never acts on a mismatch: it
   checks lengths only, and a damaged value stays an error on every read. Binding the position
-  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
-  written and read exactly as before (byte-identical files); `load` now refuses a version other
+  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar of
+  the kinds TN writes (uncompressed and LZ4) is written and read as before in steady state
+  (byte-identical files); later entries change version-1 behaviour on other paths: interrupted
+  prunes (TN-0130), leftover files (TN-0131, TN-0132), dictionary zstd (TN-0146), damaged offsets
+  (TN-0152), a configuration naming another jar (TN-0160), a failed writer (TN-0161). `load` now refuses a version other
   than 1 or 2 (upstream only ever wrote 1), and a version-2 configuration naming dictionary zstd
   (`UnsupportedCompression`): the writer compresses without the dictionaries the cursor then
   `expect`s, so that path cannot read back, and no TN segment uses it. A jar's own configuration decides its format, so a
@@ -1866,7 +1877,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   The checksums alone did not close one gap: the open-time heal's prune-direction arms
   (`consistency.rs`) trusted the offsets file's length and final offset, so an offsets file one
   row short, or a flipped high bit in the final offset, cut a committed row and rewrote the
-  configuration without an error. TN-0130 refuses that in checksummed jars.
+  configuration without an error. TN-0130 refuses that in checksummed jars, and TN-0162 a final
+  offset moved down, which the append-direction arm cut the data file to.
 
 - **TN-0121** — Checksummed `.csoff` records, and the changeset read paths fail closed on
   damage. *Kind*: feature (storage integrity) and fix (static-file read paths).
@@ -2009,8 +2021,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   cuts nothing; stopped after the `.conf`, or after the offsets cut, heals to the finished prune
   byte for byte), `changeset_prune_commits_the_header_before_it_cuts` (the same for a changeset
   prune through the provider, of rows and of blocks without changes, so the sidecar alone
-  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (rows cut by an older
-  build's order, a sidecar one record short, a sidecar gone). Mutation-checked: the `.conf`
+  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (an older build's
+  changeset prune stopped after its `prune_rows`, before its header commit: the rows and their
+  count cut, the block range and records not, built with `prune_rows` on the jar alone; a sidecar
+  one record short; a sidecar gone). Mutation-checked: the `.conf`
   written after the cuts, the sidecar cut before the commit, each of the three refusals removed.
   *Upstream*: maybe (the order is an upstream bug; the refusal needs TN-0120's versions).
 
@@ -2132,17 +2146,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 - **TN-0135** — A storage-v2 datadir refuses a jar of a checksummed segment without checksums.
   *Kind*: fix (static-file integrity, policy).
   *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
-  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at every jar
-  load: the cache fill and its reload, `prepare_index_update`, `update_index`,
-  `check_segment_consistency`; tests), `crates/storage/provider/src/providers/mod.rs`.
+  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at the loads
+  that read a jar's values or heal it: the cache fill and its reload, `prepare_index_update`,
+  `update_index`, `check_segment_consistency`, and since TN-0151 and TN-0165 the changeset counts
+  and the writer's open; tests), `crates/storage/provider/src/providers/mod.rs`.
   *Why*: the format is the configuration's version (TN-0120), and two flipped bits turn version 2
   into version 1. A checksummed jar read as version 1 hands out its values with the checksum
   appended (a storage changeset's `U256` reads wrong without an error) and its 20-byte `.csoff`
   records at a 16-byte stride. A byte pattern cannot tell that from a real version-1 jar, but the
   datadir's layout can: under storage v2 (the provider's `jar_checksums`, set from the stored
   settings before any read, TN-0122) every new jar of a checksummed segment is version 2, so a
-  version-1 jar there is refused (`UncheckedJarError`) wherever a jar loads for reading, writing or
-  the startup check. Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
+  version-1 jar there is refused (`UncheckedJarError`) at each of those loads. The loads that use
+  only the header keep `NippyJar::load`, since a version-1 header decodes as the version-2 one:
+  `iter_static_files` (the index, the contiguity check, metrics; TN-0160 checks its names) and
+  the deletions (`delete_jar`, `delete_current_and_open_previous`). Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
   open: accepted, as storage v2 was never released and development datadirs are recreated.
   Version-1 datadirs are unaffected (checksums off). Read-only providers opened without a
   `ProviderFactory` do not know the layout and keep reading a jar in its own format. It cannot
@@ -2208,17 +2225,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`std::thread::scope`, the last on the calling thread, no new dependency) through the same
   `fsync_file` helper (TN-0117), joins all of them, and returns an error if any failed: the first
   in the old serial order (`.csoff`, data, offsets), which is the one the serial code returned.
-  So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
-  sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
+  So no `.conf` is written after a failed sync, as before; a sync whose thread cannot start runs
+  on the calling thread (TN-0166), and a panic is resumed once the others ended. The `.csoff` length goes into the
   header only after its sync succeeded, as before. A failed call has run the other syncs too (the
-  serial code stopped at the first failure), which leaves only bytes past the configuration that
-  the heal or a retried sync already handles. `commit` (prune, unwind, rotation) keeps its serial
+  serial code stopped at the first failure), which leaves only bytes past the configuration. A
+  failed sync is not retried on the same writer: it writes no configuration again (TN-0161), the
+  persist's retry fails at its first `increment_block`, which the engine treats as terminal, and
+  the next start's heal cuts those bytes. `commit` (prune, unwind, rotation) keeps its serial
   syncs. The per-file timings now overlap, so `files_sync` times the span of the three, and TN's
   persist bench reads `sf_sync` from it. It cannot reach execution: the bytes written and the
   `.conf` rule are unchanged; only when the three syncs run changes. *Tests*:
   `a_failed_sync_leaves_the_configuration_unwritten` (each of the three syncs failed, both
-  formats: the call returns that error after every file was written, the `.conf` is the last
-  commit's, a reopen heals back to it and the blocks append again, a retried sync commits them)
+  formats: the call returns that error, after every file was written when the sync failed after
+  its write, and the `.conf` is the last commit's; TN-0161 adds a sync that fails without running,
+  and a retried sync and a finalize on the same writer refused; a reopen heals back to the `.conf`
+  and the blocks append again)
   and `failed_syncs_return_the_first_in_the_serial_order` (a changeset and a block segment), both
   through the fault hook; `sync_stats_record_each_phase_per_segment` (the span holds each sync);
   the TN-0130 to TN-0137 crash and checksum tests unchanged. Mutation-checked: the error dropped
@@ -2418,21 +2439,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   changesets, both versions: a rotation whose configuration write fails leaves no file of the
   next jar, and one stopped after the configuration, or after the data file too, opens; the next
   persist writes the jar and every block reads; it fails with the old order, on the stray data
-  file). *Upstream*: yes (upstream's order).
+  file); TN-0167 adds `creation_at_genesis_stopped_before_the_jar_has_its_files` (the first jar of
+  a segment). A leftover configuration of a stopped deletion that the new jar replaces is
+  TN-0132's `deletion_stopped_at_any_file`. A data file without a configuration that an older
+  build's creation left (files first) still fails every start in `iter_static_files`, as before:
+  remove that jar's files by hand. *Upstream*: yes (upstream's order).
 
 - **TN-0151** — The changeset counts load each jar through TN-0135's format check and count a
   segment's last file. *Kind*: fix. *Files*:
   `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
   (`account_changeset_count`, `storage_changeset_count`; test).
   *Why*: the two counts loaded a jar's configuration with `NippyJar::load`, outside `load_jar`,
-  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at every other load,
-  was counted with its own record size instead of refused. They also named each file by the
+  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at the loads that read
+  values, was counted with its own record size instead of refused. They also named each file by the
   blocks its configuration holds (the range `iter_static_files` lists), not by its fixed range,
   so a segment's last file, which holds fewer blocks than its range until it fills, was never
   found and its changes were left out of the count (upstream's line). *Can reach execution or
-  storage*: no. They only read and count, and no TN crate calls them (they back reth's
-  `StatsReader::count_entries` and the `*_changeset_count` provider methods); no byte written or
-  read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
+  storage*: no. They only read and count, and no TN crate calls them (they back the
+  `*_changeset_count` methods of reth's database and consistent providers;
+  `StatsReader::count_entries` does not reach them); no byte written or read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
   refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
   off and for the segment still checked; it fails without either change). *Upstream*: the file
   name, yes; the format check, no (TN-0135 is TN's).
@@ -2540,8 +2565,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   gas per request on one blocking thread, with cancellation only between calls. Upstream fixed
   it in b8116b42b (#24387, after v1.11.4); the pick does not apply to this base (its Amsterdam
   gas split needs a newer revm and alloy-evm), so this takes its rule: a call runs with at most
-  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request now
-  uses at most `--rpc.gascap` gas in all (50M by default), the budget `eth_callMany` has, and
+  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request's
+  calls now use at most `--rpc.gascap` gas in all (50M by default; TN-0171 bounds the
+  pre-execution system calls each block also runs), the budget `eth_callMany` has, and
   fails with the same -32602 error (`request exceeds the gas budget of <cap>`). Requests that
   stay under the budget get the same results, except a call whose gas limit, given or default,
   exceeded what was left, which now runs with less gas. How the default is chosen (the block's
@@ -2566,3 +2592,488 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
   storage*: no; a doc comment and a test assertion.
   *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
+
+- **TN-0160** — A jar's configuration must name its own file, and a full checksummed jar's files
+  must have its configuration's lengths. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/db/src/static_file/mod.rs` (`check_static_file_identity`,
+  `StaticFileIdentityError`, called by `iter_static_files`), `crates/storage/nippy-jar/src/{lib.rs,
+  error.rs}` (`NippyJar::check_file_lengths`, `NippyJarError::FileLengthMismatch`),
+  `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderInner::load_jar`, `LoadedJar::new`; tests).
+  *Why*: TN-0120's checksums seed a value with its row and column and TN-0121's a `.csoff` record
+  with its index, never with the file, and every change-set jar starts at row 0. So another jar's
+  files copied or restored under a jar's name (an operator or tool mistake) verified and served
+  the other range's history with no error. Two cheap checks, no format change: (a) every jar
+  `iter_static_files` lists (each start, `check_contiguity`) and every load through `load_jar`
+  refuses a configuration whose segment differs from its file name's, or whose expected block
+  range does not end where the name's range ends or starts before it (a non-zero genesis moves a
+  first jar's expected start past its name's, `SegmentHeader::set_expected_block_start`); this
+  applies to both jar versions, since no writer names a file other than by its configuration's
+  range. (b) `LoadedJar::new` holds a full checksummed jar (its last block in: every jar below a
+  segment's latest, which TN-0133's contiguity check requires, and the latest once its last block
+  is committed) to its configuration: offsets file `1 + 8 * (rows * columns + 1)` bytes and final
+  offset at the data file's end. A full jar takes no more rows (the next block rotates to a new
+  file) and a prune commits its configuration first (TN-0130), so only damage or another jar's
+  file fails it; a jar still being written is not checked, since it holds bytes past its
+  configuration until the next commit. Not caught: same-length data, offsets or `.csoff` files of
+  another jar of the segment, and another jar's longer files under a segment's latest name, which
+  the open-time heal cuts (`crates/tn-reth/README.md`, "Static-file checksums"). Binding the file
+  into the seeds would catch every swap but changes the format. *Can reach execution or storage*:
+  storage, by refusing: a datadir whose files a writer made passes both checks, and no byte
+  written or value read changes. *Tests*: `a_configuration_must_name_its_own_jar` (the name's
+  range, a moved genesis start, another range, another segment, a name that is no data file),
+  `jar_files_under_another_jars_name_are_refused` (a swapped `.conf` and the other segment's
+  `.conf`, at startup and at a load after it; another jar's data file and offsets file under a
+  full jar: refused, other jars still read). *Upstream*: maybe (the name check; the length check
+  needs TN-0120's version).
+
+- **TN-0161** — A static-file writer whose sync, offsets write or prune failed writes no
+  configuration again. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, error.rs, lib.rs}`
+  (`NippyJarWriter::{mark_failed, has_failed}`, `NippyJarError::WriterFailed`; test),
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_crash_tests.rs}`
+  (`StaticFileProviderRW::{sync_all, commit, increment_block, flush_current_changeset_offset,
+  truncate_changesets}`; the test-only `fail_syncs_unrun` hook; test).
+  *Why*: after a failure the writer's memory and its files can disagree, and its next commit
+  wrote a configuration over them. A failed offsets write drained the offsets it had not written,
+  so a later sync wrote none and the `.conf` counted rows without offsets; a `prune_rows` whose
+  configuration write or cut failed had already cut its rows and offsets in memory, so the next
+  append took its offset from the uncut data end and its seed from the cut row count, and the
+  pruned rows' values verified as the new rows; a failed `.csoff` append dropped the block's
+  record; and on Linux a retried `fsync` can report success for pages the failed one lost. The
+  writer now keeps a `failed` flag, set by its own failed data or offsets sync or offsets write
+  and by a failed `prune_rows`, and by the provider (`mark_failed`) when one of `sync_all`'s
+  concurrent syncs (TN-0138), a `.csoff` append, sync or truncation fails. A failed writer's
+  `finalize` and `prune_rows`, the only writes of its configuration, return `WriterFailed`, so a
+  retried persist or commit on it writes nothing; the next start opens a new writer, whose heal
+  cuts the files back to the last configuration. Not reachable in TN today: a failed persist's
+  retry already fails at its first `increment_block` (`UnexpectedStaticFileBlockNumber`, terminal),
+  and the only prunes are the startup heal's, on writers it just opened, which abort the start on
+  any error. *Can reach execution or storage*: storage, on the failure path only: a writer that
+  never failed writes what it wrote before. *Tests*: `test_interrupted_prune_heals_at_every_point`
+  (after a failed prune the same writer's commit and prune are refused; the files are unchanged),
+  `a_failed_sync_leaves_the_configuration_unwritten` (TN-0138's, now with a retried sync and a
+  finalize refused, and each sync also failed without running). Mutation-checked: no refusal in
+  `finalize` (both tests fail). *Upstream*: maybe (the drain and the prune order are upstream's).
+
+- **TN-0162** — The open-time heal verifies a checksummed jar's last committed value before it
+  cuts the data file to the final offset. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs}` (`NippyJarChecker`'s
+  append-direction data arm, `verify_last_value`; test).
+  *Why*: a data file longer than the final offset is what an interrupted append leaves, and the
+  heal (run at every start on each segment's latest jar) cut it to that offset. The offset itself
+  was not checked: a bit cleared in a checksummed jar's final offset made the heal cut committed
+  bytes of the last value, after which every read of it failed and the next appends started
+  inside it. TN-0130's refusals cover only files shorter than the configuration. Now, in a
+  checksummed jar, the value that ends at the final offset (the last committed row's last
+  column, starting at the offset before it) must verify before the cut; otherwise the open fails
+  with `ChecksumMismatch` naming that row and column and cuts nothing. A version-1 jar keeps
+  upstream's heal. *Can reach execution or storage*: storage, on damage only: an intact jar's last
+  value verifies and the heal cuts what it cut before. *Tests*:
+  `test_heal_refuses_a_final_offset_moved_down` (the final offset lowered by 1, 4 and 8: refused,
+  files unchanged; an intact jar with an uncommitted row still healed to its committed files).
+  Mutation-checked: no verification (the test fails). *Upstream*: no (TN-0120's checksums).
+
+- **TN-0163** — The changeset sidecar heal refuses committed `.csoff` records that are not one
+  contiguous run from row 0. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::heal_changeset_sidecar`; test).
+  *Why*: the heal checked only that each committed record's rows fit the jar's rows and that none
+  fit again after one that did not (TN-0121). Records that verify but overlap, skip rows or start
+  past row 0 (another jar's sidecar, TN-0160's trigger, or a writer bug; bit rot fails the record
+  checksums first) passed, and blocks then read other blocks' rows. The writer gives each block
+  the rows after the previous block's, starting at row 0 (`increment_block` takes the jar's row
+  count), so the heal, which reads the committed records in one bulk read already, now requires
+  each record to start where the previous one's rows end and the first at row 0, and otherwise
+  returns `CorruptedChangeSetStaticFile` and cuts nothing. Both jar versions: an interrupted prune
+  of an older build leaves a contiguous run past the rows, which the heal still cuts. Only the
+  latest jar of each changeset segment is healed at a start; older jars' records are read as
+  lookups need them. *Can reach execution or storage*: storage, by refusing: records a writer
+  made pass, and nothing written or read changes. *Tests*:
+  `sidecar_heal_refuses_records_out_of_order` (a record pointing back into earlier rows, one
+  skipping rows, a first record past row 0; both formats: refused, the sidecar unchanged);
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` and the TN-0130 crash tests unchanged.
+  Mutation-checked: no check (the test fails). *Upstream*: maybe (the run check; the checksums
+  are TN-0121's).
+
+- **TN-0164** — `truncate_changesets` syncs the `.csoff` record it flushed before it writes the
+  configuration. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/provider/src/providers/static_file/writer.rs`
+  (`StaticFileProviderRW::truncate_changesets`).
+  *Why*: the prune flushed the pending block's `.csoff` record and then wrote the configuration
+  (through `prune_rows` or `commit`, whose own sidecar sync comes after `prune_rows`), which can
+  count that record, without syncing the sidecar. A crash then left a sidecar shorter than its
+  header, which a checksummed jar refuses at the next start (TN-0130). `sync_all` and `commit`
+  already sync the sidecar before the configuration; the prune now does too, and a failed sync
+  leaves the writer failed (TN-0161). Not reachable in TN: the only prunes are the startup heal's,
+  on writers just opened, which hold no pending record. *Can reach execution or storage*:
+  storage: one `fsync` more per changeset prune, no byte changes. *Tests*: none new (a sync's
+  ordering against a crash is not observable in a test); the TN-0130 crash tests unchanged.
+  *Upstream*: maybe.
+
+- **TN-0165** — The static-file writer's open loads the jar through TN-0135's and TN-0160's
+  checks. *Kind*: fix (static-file integrity). *Files*:
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::open`; test).
+  *Why*: the open loaded the configuration of a jar the cache already held with `NippyJar::load`.
+  A checksummed jar's configuration turned into version 1 on disk while the node ran (two flipped
+  bits) then ran the version-1 heal, which can cut committed rows, and its commit rewrote the
+  configuration, before the index update's `load_jar` refused the jar. A jar the cache does not
+  hold was already loaded through `load_jar` on the cache fill. Now the open loads through
+  `load_jar` in both cases, so the refusal comes before the heal. *Can reach execution or
+  storage*: storage, by refusing: a jar that passes the checks opens as before. *Tests*:
+  `storage_v2_refuses_jars_without_checksums` (a cached jar's configuration turned into version 1
+  with its offsets file one offset short: the writer's open is refused and both files are left as
+  they are; it fails without the change). *Upstream*: no (TN-0135 is TN's).
+
+- **TN-0166** — A static-file sync whose thread cannot start runs on the calling thread, and a
+  wait for a file's readers is logged once it passes a second. *Kind*: fix (operability).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, mod.rs,
+  tn_crash_tests.rs}` (`sync_at_once`, the test-only `FAIL_SYNC_THREADS`,
+  `LoadedJar::release`; test).
+  *Why*: TN-0138 runs each segment commit's `.csoff`, data and offsets syncs on scoped threads
+  (under storage v2 up to eight a persist), and a thread that could not start (`EAGAIN` under a
+  cgroup pids limit or systemd `TasksMax`) was its sync's error: the persist failed and the node
+  stopped. The job now waits in a slot its thread takes it from; when the thread does not start,
+  the calling thread takes it and runs it after starting the others, as every sync ran before
+  TN-0138, with a warning naming the phase. A sync's own failure is unchanged. TN-0148's
+  `LoadedJar::release` waits, with no bound, for readers of a file's earlier snapshots before the
+  file shrinks or is replaced (an RPC reader holding a changeset tip file across a rotation); a
+  wait now logs a warning naming the segment and range after a second, and again with its length
+  when it ends. *Can reach execution or storage*: storage, in timing only: the same syncs run, on
+  another thread, before the configuration as before; no byte changes. *Tests*:
+  `syncs_run_here_when_their_threads_cannot_start` (no sync thread starts: the changeset commit
+  succeeds and its blocks read back, also after a reopen, both formats; it failed before). The
+  release warning has no test (a log line after a one-second wait). *Upstream*: no (TN-0138 and
+  TN-0148 are TN's).
+
+- **TN-0167** — Tests: crash states of block-segment prunes and of a creation at genesis, the
+  offsets-only cut of a changeset prune, and two tests' descriptions. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/static_file/{tn_crash_tests.rs,
+  tn_checksum_tests.rs}`.
+  *Why*: TN-0130's provider crash tests covered changeset prunes only, and the state a prune
+  stopped between its offsets cut and its data cut only at the jar level; TN-0150's covered
+  rotation only. `block_segment_prune_stopped_after_the_configuration_heals` (headers and
+  transactions, both formats: `prune_rows`'s configuration with nothing cut, or the offsets alone
+  cut, heals at the next open to the finished `prune_rows`'s files, and the kept rows read; for
+  transactions the block range is left to `check_consistency`, not run there),
+  `changeset_prune_commits_the_header_before_it_cuts` (now also the offsets cut without the data),
+  `creation_at_genesis_stopped_before_the_jar_has_its_files` (a segment's first jar stopped after
+  its configuration, or after its data file too: the next start opens and the next persist writes
+  the jar, headers and account changesets, both formats). The descriptions of
+  `checksummed_changesets_shorter_than_the_header_are_refused` and of a case of
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` now say which state they build: an
+  older build's prune stopped between `prune_rows` and its header commit. *Can reach execution or
+  storage*: no; tests only. *Upstream*: n/a.
+
+- **TN-0170** — `eth_callMany` at a transaction index applies the block's pre-execution changes
+  before it replays the block's earlier transactions, and checks for cancellation between them.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`EthCall::call_many`).
+  *Why*: with `stateContext.transactionIndex` inside a block, `call_many` replays the block's
+  transactions before that index on the parent's state, without the block's pre-execution
+  system calls (TN's EIP-4788 root on an output's first batch, the EIP-2935 parent hash on every
+  block). A call or replayed transaction that read either contract saw the parent's values: the
+  history contract answered zero for the parent's hash on TN. `debug_traceCallMany` (TN-0048)
+  and `spawn_replay_transaction` already apply them; this uses the same
+  `executor_for_block(..).apply_pre_execution_changes()`. The replay loop also checks
+  `is_cancelled()` per transaction, as `debug_traceCallMany`'s does. *Can reach execution or
+  storage*: no. RPC only: block execution does not call `call_many`, and the replay runs on a
+  throwaway state.
+  *Tests*: tn-reth `call_many_at_a_transaction_index_applies_pre_execution_changes` (block 1's
+  history contract answers the genesis hash to `eth_call`, to `eth_callMany` and to
+  `debug_traceCallMany` at transaction index 0; `eth_callMany` answered zero without the fix).
+  *Upstream*: upstream main replays through `Trace::replay_block_until`, which applies them.
+
+- **TN-0171** — `eth_simulateV1` refuses state overrides that replace the code its
+  pre-execution system calls run, and checks for cancellation before each block.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/simulate.rs` (`SYSTEM_CALL_TARGETS`,
+  `check_system_call_overrides`), `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1`
+  checks every block's overrides before it takes the blocking-IO permit, and `is_cancelled()`
+  at the top of each block), `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulate_blocks`, test
+  `system_call_targets_keep_their_code`).
+  *Why*: every simulated block runs the executor's pre-execution system calls before its calls:
+  on TN the EIP-4788 beacon roots contract (an output's first batch, which a simulated block
+  is) and the EIP-2935 history contract, each with the executor's system-call gas limit
+  (100M on TN) and outside TN-0156's budget. A block's state overrides are applied before them
+  and could give either address any code, so a request of 256 blocks
+  (`--rpc.max-simulate-blocks`) with no calls could run about a thousand times `--rpc.gascap`, with
+  cancellation checked only between calls. Overrides that set `code` on either address, or move
+  a precompile onto one, are now refused with -32602 (`state override replaces the code of
+  system contract <address>`) before any work; balance, nonce and storage overrides of those
+  accounts are still applied. The chain's own contracts make one or two storage writes per
+  call, under 100,000 gas a block, so 256 blocks of them stay under 26M gas. Requests that do
+  not replace those contracts' code get the same results. *Can reach execution or storage*:
+  no. RPC only: the check and the cancellation point run in `simulate_v1`, which block
+  execution does not call.
+  *Tests*: `system_call_targets_keep_their_code` (new code on either address, empty code, and
+  a precompile moved onto the history contract are refused; a balance and storage override of
+  it simulates). Mutation-checked: the check removed (the refusals fail).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0172** — The trace cap also counts the struct logger's logs as they are built, and the mux
+  tracer keeps its count across a request's transactions.
+  *Kind*: fix (security; TN-owned, in the carried revm-inspectors).
+  *Files*: `patches/revm-inspectors/src/tracing/builder/geth.rs` (`struct_log_copies`,
+  `GethTraceBuilder::geth_traces_charged`, which `geth_traces` now calls with no limit;
+  `fill_geth_trace` takes the charge), `patches/revm-inspectors/src/tracing/mod.rs`
+  (`TracingInspector::try_geth_traces`; tests `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies`), `patches/revm-inspectors/src/tracing/debug.rs`
+  (`DebugInspector::get_result` builds the struct logger's frame with `try_geth_traces`;
+  `DebugInspectorError::TraceTooLarge`; `fuse` fuses the mux tracer instead of rebuilding it),
+  `patches/revm-inspectors/src/tracing/mux.rs` (`MuxInspector::fuse`, test
+  `fuse_keeps_the_recorded_bytes`), `patches/revm-inspectors/PATCH.md` and `upstream.diff`;
+  `crates/rpc/rpc-eth-types/src/error/mod.rs` (`TraceTooLarge` maps to `EvmCustom`, `-32603`,
+  as the cap's error during execution does), `crates/rpc/rpc/src/debug.rs` (test
+  `struct_logs_past_the_recorded_bytes_cap_are_refused`).
+  *Why*: TN-0079 and TN-0153 count what the inspector records. The struct logger's result is
+  built after the trace from the recorded steps, and two parts of it were never counted: every
+  log gets the step's memory as one 64-character hex `String` per 32-byte word, also when the
+  step shares its snapshot with the step before (recorded and counted once), and every SLOAD and
+  SSTORE log gets a copy of the contract's storage seen so far. A loop over 4 KiB of memory
+  recorded about 200 bytes a step and its logs then held 11 KiB a step, and the storage copies
+  grow with the reads times the slots seen, so one `enableMemory` or default trace under the cap could still build
+  many GB before the response limit applied. `try_geth_traces` now adds each log's memory
+  strings and storage copy (64 bytes an entry) to the same counter as the log is built, and past
+  the cap stops and returns the `trace too large` error (`-32603`). The logs' other fields and
+  their stacks mirror the recorded steps, which the cap already counts; a struct-logger trace
+  then holds at most about twice the cap at its peak. Separately, `DebugInspector::fuse` rebuilt
+  the mux tracer from its config, with a fresh counter, so `debug_traceBlock*` and
+  `debug_traceCallMany` with `muxTracer` were capped per transaction; it now fuses the tracing
+  inspector, which keeps the counter, as the other tracers do. Traces that stay under the cap
+  get the same answers. *Can reach execution or storage*: no. revm-inspectors runs only for RPC
+  tracing, and the reth change is an error mapping and a test.
+  *Tests*: in the patched crate `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies` (steps under the cap, logs past it: refused; with no
+  cap the logs build and are counted), `fuse_keeps_the_recorded_bytes`; in reth
+  `struct_logs_past_the_recorded_bytes_cap_are_refused` (through `DebugInspector::get_result`,
+  `-32603`). Mutation-checked: no charge in `try_geth_traces`, and the mux rebuilt in `fuse`
+  (all three patched-crate tests fail).
+  *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.
+
+- **TN-0173** — A subscription whose connection's send buffer stays full for 10 seconds ends.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`SUBSCRIPTION_SEND_TIMEOUT`,
+  `pipe_from_stream_within`, which `pipe_from_stream` calls; test
+  `a_subscriber_that_stops_reading_loses_the_subscription`).
+  *Why*: `pipe_from_stream`, which feeds `newHeads`, `logs` and `newPendingTransactions`
+  subscriptions, awaited each send without a limit. jsonrpsee buffers 1,024 messages per
+  connection; once a WS or IPC client stopped reading, the send waited until the connection
+  closed and the stream was not polled meanwhile. For `newPendingTransactions` with full
+  transactions the stream's pool listener then kept up to `--txpool.max-new-txns` (1,024)
+  transactions, evicted and replaced ones included, outside the pool's limits, for each of up
+  to 1,024 listeners. Each send now waits at most 10 seconds; then the subscription ends and its stream, with the listener and what
+  it held, is dropped. A client reading normally is unaffected; one more than 1,024 messages
+  behind for 10 seconds loses the subscription and must subscribe again. *Can reach execution or
+  storage*: no. RPC only: subscriptions run in their own tasks, and the pool removes a dropped
+  listener at its next send.
+  *Tests*: `a_subscriber_that_stops_reading_loses_the_subscription` (a never-read buffer of four
+  messages over an endless stream: the stream is dropped once a send waits the timeout).
+  Mutation-checked: a plain `send` (the stream is never dropped).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0174** — A refused `newPendingTransactions` subscription gets the error, not an id.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`subscribe` takes the pool listener through
+  `pending_transactions_listener` before it accepts the subscription; `handle_accepted` shares it
+  and `pipe_pending_transactions`; test
+  `a_refused_pending_transactions_subscription_gets_the_error`).
+  *Why*: TN-0056 says these subscriptions fail with the server-busy error when the pool refuses
+  another RPC listener, but `subscribe` accepted the subscription first and the error was dropped
+  in the spawned task: the client got a subscription id and then nothing. The listener (and the
+  params check) now come before the acceptance, and a refusal rejects the subscription with
+  -32009 (`too many pending transaction listeners`), as the pending-transaction filters do.
+  Accepted subscriptions behave as before. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `a_refused_pending_transactions_subscription_gets_the_error` (with every RPC listener
+  slot held, the hash and the full subscription are refused with -32009; once the slots are
+  freed both are accepted). Mutation-checked: acceptance before the listener (the subscription
+  is accepted).
+  *Upstream*: n/a (TN-0056's cap is TN's).
+
+- **TN-0175** — Raw `debug_traceBlock` decodes its block and recovers its signers in a blocking
+  task. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`debug_trace_raw_block`).
+  *Why*: the handler decoded the caller's RLP block (up to the request size limit), checked
+  TN-0078's call count and recovered up to 2,380 signers (a parallel iterator, on a node built
+  with rayon) in the `async fn`, on the runtime that polls RPC handlers. That work now runs in a
+  `spawn_blocking_io` task that holds the trace permit taken first, and hands the permit on to
+  the trace, as `eth_callBundle` does since TN-0054. The order of the checks and the errors are
+  unchanged. *Can reach execution or storage*: no. RPC only.
+  *Tests*: the raw-block tests (`raw_block_transaction_count_is_bounded_by_the_gas_cap`,
+  `raw_block_transaction_gas_is_bounded_by_the_gas_cap`) and the trace permit tests, unchanged;
+  where the work runs has no test.
+  *Upstream*: no; upstream decodes in the handler.
+
+- **TN-0176** — Tests for the gas budget at the trace and debug call sites. *Kind*: test.
+  *Files*: `crates/rpc/rpc/src/permit_test_utils.rs` (`MockChain::eth_api_with_gas_cap`,
+  `MockChain::call_of_25_800_gas`), `crates/rpc/rpc/src/debug.rs` (tests
+  `raw_block_charges_each_transaction_to_the_budget`,
+  `trace_call_many_calls_share_the_gas_budget`), `crates/rpc/rpc/src/trace.rs` (test
+  `trace_call_many_calls_share_the_gas_budget`).
+  *Why*: TN-0057 and TN-0078 charge each call's or transaction's gas to one budget per request
+  in `trace_callMany`, `debug_traceCallMany` and raw `debug_traceBlock`, and only
+  `eth_callMany`'s charge had a test. In the raw block the charge never fails by itself (the
+  check before each transaction already holds it to what is left), so deleting it would have
+  checked every transaction against the whole cap unnoticed. Each test now fails when its
+  site's `charge` is removed: two 25,800-gas calls under a 50,000 cap, and two transfers with a
+  30,000 gas limit, of which the second fits only if the first was not charged. The
+  cancellation checks in these loops still have no test of their own. *Can reach execution or
+  storage*: no; tests.
+  *Tests*: the three above. Mutation-checked: each site's `charge` removed (each test fails).
+  *Upstream*: n/a.
+
+- **TN-0177** — An IPC call whose client disconnects is aborted. *Kind*: fix.
+  *Files*: `crates/rpc/ipc/src/server/mod.rs` (`AbortOnDrop` around the spawned call; test
+  `a_disconnected_clients_call_is_dropped`).
+  *Why*: the IPC server spawns each call on its own task, for concurrency, and the connection
+  awaited the task's `JoinHandle`. When the client went away the connection dropped the handle,
+  which does not cancel a task, so the request future was never dropped: TN-0049's
+  cancellation never fired and the call kept its blocking thread and permits until it ended. The
+  handle is now aborted when the connection drops it, so the request future is dropped and its
+  blocking work sees `is_cancelled()` at its next check. A call that already ended is
+  unaffected. jsonrpsee's WebSocket transport also spawns each call and does not cancel it; that
+  is the library's, outside this copy (`tn/notes/open-issues.md`). *Can reach execution or
+  storage*: no. RPC only.
+  *Tests*: `a_disconnected_clients_call_is_dropped` (a call that never ends is dropped once its
+  client disconnects). Mutation-checked: no abort (the call keeps running).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0178** — The revm-inspectors patch's docs list everything it carries and say when the
+  trace cap refuses a trace the response limit would accept. *Kind*: fix (docs).
+  *Files*: `patches/revm-inspectors/PATCH.md` ("Scope" lists the recursion limit, the trace cap
+  with its files, and the removed `.gitignore`; the out-of-workspace test command runs every
+  test; the cap's paragraph), `patches/revm-inspectors/src/tracing/config.rs`
+  (`DEFAULT_MAX_RECORDED_BYTES`'s doc) and `upstream.diff`; the TN-0079 entry above; TN's
+  `docs/src/rpc-methods/debug/{README.md, debug_tracetransaction.md}` and
+  `docs/src/rpc-methods/trace/README.md`.
+  *Why*: "Scope" said the patch mattered to JavaScript tracers only, although the trace cap
+  reaches every build, so a maintainer could drop the patch from a default build and lose the
+  cap; its fallback test command ran only the JavaScript tests. The cap's docs said a trace past
+  the cap could not have been returned anyway. That holds for call input and output, which
+  serialize in hex, but a struct-log step holds about 200 bytes against 60 to 100 of JSON with a
+  small stack, and a `vmTrace` step copies the whole memory after each write, so the cap can
+  refuse traces the response limit would accept, and raising `--rpc.max-response-size` does
+  not raise it. The docs now say so. *Can reach execution or storage*: no; docs and a doc
+  comment.
+  *Tests*: n/a. *Upstream*: n/a.
+
+- **TN-0180** — `populate_bundle_state_hashed` refuses a hashed storage changeset key with an
+  error in every build. *Kind*: fix. *Files*: `crates/storage/provider/src/providers/database/
+  provider.rs` (`populate_bundle_state_hashed`, test).
+  *Why*: TN-0112 made changeset keys plain and guarded this function's plain-key precondition with
+  a `debug_assert!`, which release builds drop. `StorageSlotKey::Hashed` is still a variant (an
+  upstream sync that brings back hashed changesets, as upstream's v2 had, would produce it), and
+  with a hashed key the function keyed the bundle and reverts by the hash, looked `HashedStorages`
+  up with it unchanged, and its callers hashed it again: an unwind would leave the real row and
+  write the old value under `keccak(keccak(slot))`. It now returns `DatabaseError::Other`
+  before using the key. The cost is one enum tag compare per storage changeset entry, beside the
+  entry's `HashedStorages` seek, and only on this path. *Can reach execution or storage*: storage
+  only, and only to fail closed: the function runs under `remove_state_above` and
+  `take_state_above` (the unwind and take paths, which TN's node does not call), not on the
+  persist path, and every changeset reader tags its keys `Plain`, so no current caller sees the
+  error. *Tests*: `test_populate_bundle_state_hashed_refuses_a_hashed_key` (panics on the
+  `debug_assert!` without the change); `test_populate_bundle_state_hashed_with_plain_keys`
+  unchanged. *Upstream*: n/a (upstream removed `StorageSlotKey` in 815037e27).
+
+- **TN-0181** — `eth_simulateV1` holds its tracing permit for as long as its blocking work runs.
+  *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1` takes the
+  permit after its cheap checks and moves it into the blocking work with the blocking-IO one),
+  `crates/rpc/rpc-eth-api/src/core.rs` (the `eth_simulateV1` handler no longer takes it),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulation_chain`, test
+  `simulate_takes_a_tracing_permit`); TN's `crates/tn-reth/src/rpc_call.rs` (its handler no
+  longer takes it either).
+  *Why*: the handler took the eth API's tracing permit (the `--rpc.proof-permits` semaphore,
+  25 by default, which `eth_getProof` also takes) and held it in the request future, while
+  `simulate_v1` moved only the blocking-IO permit into its blocking work. When an HTTP client
+  disconnected, the future was dropped and the permit returned at once, while the simulation
+  ran on to its next cancellation check (the end of a call of up to `--rpc.gascap` gas, or of a
+  block's system calls), so a client that sent requests and dropped them could run more
+  simulations at once than there are permits. The handler also ignored the acquire's error; a
+  closed semaphore now fails the request instead of running it without a permit. Requests the
+  cheap checks refuse (too many blocks, no blocks, a system contract's code overridden) no
+  longer wait for a permit. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `simulate_takes_a_tracing_permit` (a request waits while the only permit is held and
+  runs once it is free). Mutation-checked: no permit taken in `simulate_v1` (the request runs
+  while the permit is held).
+  *Upstream*: no; upstream has the same shape (its handler in `rpc-eth-api/src/core.rs`).
+
+- **TN-0182** — The pending block is built on the eth API's CPU pool, not on a blocking-IO
+  thread. *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/pending_block.rs`
+  (`pool_pending_block` builds with `spawn_tracing`), `crates/rpc/rpc/src/eth/helpers/state.rs`
+  (test `a_pending_read_holding_every_blocking_thread_still_gets_its_block`).
+  *Why*: with `--rpc.pending-block` set (TN's default is `none`), a state read at `pending`
+  (`eth_getBalance`, `eth_call` and the other state methods) runs on a blocking-IO thread and
+  waits there for the pending block, which `pool_pending_block` built on another blocking-IO
+  thread. Plain state reads take no blocking-IO permit, so enough of them sent at once held every
+  thread of the server's blocking pool while the build waited for one: every read at `pending`
+  waited forever, and the server's other blocking work queued behind them. The build now runs on
+  the rayon pool each eth API owns (`tracing_task_pool`, one thread per core), which no RPC path
+  used and nothing on it waits for other work, so it always gets a thread. The build is unchanged
+  and still one at a time behind the pending-block lock. *Can reach execution or storage*: no.
+  RPC only; the node's blocks are built and executed elsewhere.
+  *Tests*: `a_pending_read_holding_every_blocking_thread_still_gets_its_block` (a runtime with
+  one blocking thread; the read at `pending` waited forever before the change).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0183** — `eth_callMany`, `eth_simulateV1` and `eth_callBundle` keep at most 32 MiB of call
+  output per request. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/call_many.rs` (`MAX_REQUEST_OUTPUT_BYTES`,
+  `OutputBudget`, `CallManyBudget::charge_output`, test `output_is_charged_up_to_the_budget`),
+  `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`call_many` charges each call's return or revert
+  data), `crates/rpc/rpc-eth-types/src/simulate.rs` (`execute_transactions` charges each call's
+  return or revert data and its logs' data), `crates/rpc/rpc/src/eth/bundle.rs` (`call_bundle`
+  charges each transaction's return or revert data; tests `output_budget_tests`),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulation_chain` gains two contracts; tests
+  `call_many_output_over_the_budget_is_refused`, `simulate_output_over_the_budget_is_refused`).
+  *Why*: these methods keep every call's output until the response is built, and only the
+  request's gas bounded it. A call pays for its memory quadratically, but many calls of about
+  100 KB each pay little, so one request kept about 2 bytes per gas: about 100 MB at the default
+  50M `--rpc.gascap`, about 200 MB as hex, which the 160 MB response limit refused only after
+  building it. Each worker's server ran up to 256 such requests at once (one blocking-IO permit
+  each), enough to exhaust the node's memory. A request now counts the raw bytes it keeps after
+  each call (return and revert data; for `eth_simulateV1` also its logs' data, which the response
+  returns) and fails with `-32602` "request exceeds the output budget of 33554432 bytes" once they
+  pass 32 MiB. The limit is fixed, with no flag: a third of what the gas allowed, 64 MiB as hex,
+  well under the response limit. TN-0184 bounds how many of these requests run at once.
+  Requests under the budget get the same results as before. `trace_callMany` and
+  `debug_traceCallMany` stay bounded by the trace cap (TN-0079) instead.
+  *Can reach execution or storage*: no. RPC only: it counts what a call returned after it ran;
+  nothing executed changes.
+  *Tests*: `call_many_output_over_the_budget_is_refused` and
+  `bundle_output_over_the_budget_is_refused` (32 calls returning 1 MiB each run, 33 are refused),
+  `simulate_output_over_the_budget_is_refused` (each call logs 512 KiB and returns 512 KiB, so it
+  fails if either is not counted), `output_is_charged_up_to_the_budget`.
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0184** — `eth_callMany` and `eth_callBundle` hold one of the eth API's tracing permits
+  while their blocking work runs. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`call_many` takes the permit after its
+  cheap checks and moves it into the blocking work with the blocking-IO one),
+  `crates/rpc/rpc/src/eth/bundle.rs` (`call_bundle` likewise; `blocking_io_permit_tests` gives
+  its fixture one tracing permit, `Fixture::call_many`, test
+  `test_call_many_keeps_permits_after_client_leaves`); TN's `crates/tn-reth/src/rpc_call.rs` and
+  `rpc_bundle.rs` (comments), `crates/tn-reth/src/rpc_server_args.rs` (`--rpc.proof-permits`
+  help).
+  *Why*: each request of these two methods keeps up to 32 MiB of call output (TN-0183), but took
+  only a blocking-IO permit, 256 per worker, so together they could keep about 8 GiB per worker.
+  Each now also takes one of the eth API's tracing permits (the `--rpc.proof-permits`
+  semaphore, 25 by default, which `eth_getProof` and `eth_simulateV1` take too), before its
+  blocking-IO permit as `eth_simulateV1` does (TN-0181), and holds both until its blocking work
+  ends, even after its client disconnects. The three methods that keep output then keep at most
+  about 25 x 32 MiB = 800 MiB per worker by default. A closed semaphore fails the request.
+  This guard rather than the `--rpc.max-tracing-requests` one that `trace_callMany` and
+  `debug_traceCallMany` take (and that `EthBundle` holds unused): `eth_callMany` runs in the eth
+  API's `Call` trait, which reaches only the eth API's own guard; one guard for all three methods
+  keeps the bound at permits x budget, where two would add up; and these calls run without an
+  inspector, unlike the CPU-bound traces that guard is sized for. *Can reach execution or
+  storage*: no. RPC only; nothing executed changes.
+  *Tests*: `test_call_many_keeps_permits_after_client_leaves`, and
+  `test_call_bundle_keeps_permit_after_client_leaves` extended (with one tracing permit, a
+  request whose blocking task is held up keeps it after its client left, so taking it again
+  waits, and it comes back when the task ends);
+  `test_create_access_list_keeps_permit_after_client_leaves` checks that `eth_createAccessList`
+  leaves it free. Mutation-checked: no tracing permit in `call_bundle`, and the permit held by
+  `call_many`'s request instead of its blocking work, each fail.
+  *Upstream*: no; upstream takes only a blocking-IO permit for `eth_callMany` and none for
+  `eth_callBundle`.

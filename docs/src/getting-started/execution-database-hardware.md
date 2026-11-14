@@ -4,6 +4,8 @@ This page covers the execution database of this release: reth's tables on the tn
 It adds to [Hardware Requirements](hardware-requirements.md), whose network benchmark ran on the previous execution database (MDBX).
 
 Every figure here is measured, on the setup named beside it.
+All of them ran on development builds of this release's storage work (the `sls_storage_v2` branch) before it merged as #1834: tn-lmdb's format 7, where the release writes format 8 (overflow runs carry their tree's tag), and without the release's split of a hot contract's storage root by first nibble.
+They have not been measured again on the release's code.
 Most come from the execution benchmark, which runs generated transfer and contract load through the node's execution path with durable commits.
 Its **peak** profile puts 20 batches of 30M gas in each consensus output (about 11,700 transactions).
 Its **busy** profile puts 8 batches of 15M gas in each output.
@@ -17,6 +19,8 @@ On the peak profile with storage layout v2 and gap fill off, one commit wrote ab
 On the busy profile it was about 21,400 write I/Os.
 The engine counted these on a Mac M1 Max; the cloud disks below saw writes of about the same size.
 On a disk that caps I/Os per second, the commit's time is set by that I/O count, not by its bytes.
+
+The two tables below ran before 2026-11-12 on builds whose commits were not recorded.
 
 Mean time in the commit of one peak output, gap fill off:
 
@@ -39,7 +43,7 @@ During commits on the 20,000-IOPS disk the node wrote about 90 MiB/s in writes o
 The tables above ran with gap fill off and one state-root thread.
 The tables below ran with the node's defaults on Linux (`--db.gap-fill auto`, parallel state roots), measured on 2026-11-12.
 Setup: a GCP c3-highcpu-8 (8 vCPU, 16 GB) with the datadir on a 200 GB Hyperdisk Balanced data disk (ext4), storage layout v2, durable commits, outputs run back to back.
-The benchmark was built from commit `6886de251` with the gap fill `auto` chooser of `b3623540f`, and run with `TN_EXEC_BENCH_LAYOUT=v2` and `TN_EXEC_BENCH_GAP_FILL=auto` (and `TN_EXEC_BENCH_OUTPUTS=150` at peak): the 800 MiB/s rows through `etc/reth-exec-bench.sh`'s `busy` and `peak` profiles, two rounds each, as the after side of a comparison with `6886de251`; the 300 MiB/s row as two direct runs of the same build.
+The benchmark was built from commit `6886de251` of the `sls_storage_v2` branch with the gap fill `auto` chooser of `b3623540f` (so format 7 and no storage-root split, as the top of this page says; the release's `auto` chooser is `b3623540f`'s), and run with `TN_EXEC_BENCH_LAYOUT=v2` and `TN_EXEC_BENCH_GAP_FILL=auto` (and `TN_EXEC_BENCH_OUTPUTS=150` at peak): the 800 MiB/s rows through `etc/reth-exec-bench.sh`'s `busy` and `peak` profiles, two rounds each, as the after side of a comparison with `6886de251`; the 300 MiB/s row as two direct runs of the same build.
 Each cell is the mean of two runs of 300 busy or 150 peak outputs. The two runs of every cell agreed within 5%, except the 40,000-IOPS busy pair's time per output (512 and 460 ms, explained below).
 
 Mean time per consensus output and in its commit:
@@ -73,13 +77,14 @@ For scale, the benchmark timestamps its outputs one second apart.
 
 What this means for a validator:
 
-- **Local NVMe is best.** It was the fastest disk measured with gap fill off (above), and it is the recommended disk in [Hardware Requirements](hardware-requirements.md#summary).
+- **Local NVMe is the recommended disk** in [Hardware Requirements](hardware-requirements.md#summary). It was the fastest disk measured with gap fill off and one state-root thread (above), and with gap fill `auto` it outran the 20,000-IOPS disk (Gap fill, below). It was not measured with the node's defaults, so the per-IOPS tables do not compare with it: with the defaults, the 40,000-IOPS disk's busy output took 486 ms, against local NVMe's 685 ms with gap fill off and one state-root thread.
 - **On cloud block storage, the minimum is 20,000 sustained write IOPS.** With the defaults, at 800 MiB/s, a busy output took 629 ms (1.59 outputs a second) and a peak one 1,964 ms (0.51 a second).
 - **10,000 IOPS is not enough.** A busy output took 964 ms, about the second between the benchmark's outputs, so the node kept up with busy load with no margin, and at peak its commits wrote about 700 MiB/s of the disk's 800.
 - **For cloud block storage, 40,000 IOPS is recommended.** Its commit took 157 ms of a 486 ms busy output (2.06 outputs a second) and 408 ms of a 1,670 ms peak one (0.60 a second), so more IOPS can save at most that commit time.
 - **Provision at least 800 MiB/s with the IOPS.** At 20,000 IOPS, 300 MiB/s gave a busy output of 807 ms and a peak one of 2,598 ms, against 629 and 1,964 ms at 800 MiB/s: 28% and 32% slower. Nothing above 800 MiB/s was measured on cloud block storage.
 - **No disk measured keeps up with peak load at one output a second.** Even at 40,000 IOPS a peak output took 1.7 s, 1.3 s of it outside the commit (execution, the state root and writing the blocks). Peak-sized outputs arriving that fast queue on any of these disks.
 - **4,500 IOPS is too slow for a busy validator.** The commit of one peak output took 12 s or more.
+- **A migrated datadir needs more.** These figures are for storage layout v2. A datadir migrated from an earlier release keeps layout v1 until its execution database is rebuilt (`telcoin-network db reset-execution`), and v1's commits took longer where both were measured: with gap fill off, 2.4 s against 1.4 s per peak commit at 20,000 IOPS, and 16.4 s against 12.3 s at 4,500. Layout v1 was not measured with the defaults.
 - Quote provisioned, sustained figures, not burst figures.
 
 An observer executes the same outputs and makes the same commits, so the same disk guidance applies.
@@ -89,7 +94,14 @@ An observer executes the same outputs and makes the same commits, so the same di
 Gap fill trades bytes for I/Os.
 Before a commit's sync, the node rewrites each short gap of unchanged pages between two runs of changed pages with the bytes those pages already hold.
 The disk then gets fewer, larger writes.
-The file's contents and size do not change; only more bytes are written.
+A completed commit leaves the same file contents and size; only more bytes are written.
+
+**Gap fill needs a drive that writes each logical block atomically when the power fails.**
+The rewritten pages include live pages of the last committed state, which no commit writes without gap fill.
+NVMe drives and cloud block storage, the disks [Hardware Requirements](hardware-requirements.md#summary) asks for, meet this.
+On a drive that can garble the block it was writing at a power cut (a SATA SSD without power-loss protection, a hard disk, a USB drive, a RAID controller without a battery-backed cache), a power cut during a commit can damage such a page.
+The node then reads the damaged page as data, which can give a wrong state root (or it crashes on a block the drive cannot read), until `telcoin-network db check` or a later write to that page reports the damage; the database then needs a rebuild (`telcoin-network db reset-execution`).
+On such a drive, set `--db.gap-fill off`: `auto` fills on every drive while it measures it.
 
 | Value | Effect |
 | --- | --- |
@@ -97,7 +109,7 @@ The file's contents and size do not change; only more bytes are written.
 | `off` or `0` | No gap fill. The default on macOS. |
 | `1` to `64` | A fixed width: every gap of up to this many pages is filled. |
 
-Busy profile, layout v2, 300 outputs, transactions per second (ratio to `off`):
+Busy profile, layout v2, 300 outputs, transactions per second (ratio to `off`), measured before 2026-11-12 on builds whose commits were not recorded, with the `auto` chooser from before it moved its width one step at a time (the per-IOPS tables above ran the current chooser):
 
 | Disk | VM | `off` | `8` | `auto` |
 | --- | --- | --- | --- | --- |
@@ -119,12 +131,12 @@ When to override the default:
 ## Memory
 
 Every node keeps a cross-block execution cache of recent accounts, storage slots and contract code, which block execution reads before the database.
-It takes about 160 MiB, a fixed size with no setting.
+Its tables take about 160 MiB, a fixed size with no setting. It also keeps the code of up to 4,096 contracts it has executed, up to about 100 MiB more at the 24 KiB contract-size limit.
 
 - It is sized for execution, not for RPC. RPC reads do not use it, so an RPC node's reads depend on the operating system's page cache, which is free RAM.
 - On the peak profile with layout v2, it served 81% of account reads and 82% of storage reads. A 2.5 GiB cache served 84% and 85%.
 - On a Mac M1 Max (peak profile, layout v2) it cut execution from 186.6 ms to 138.7 ms per output.
-- 160 MiB is small next to the validator minimum of 32 GB.
+- At most about 260 MiB, it is small next to the validator minimum of 32 GB.
 - `tn_reth.exec_cache_stale_hits_total` counts any value the cache served that a check found stale. The node checks one hit of each kind (account, slot, code) in 256 against the database. The count should stay 0.
 - On a stale value the node drops the cache and builds that block again without it, so that block is right and the node keeps running. The unchecked values it served before may already have put the node on another state than its peers. Compare the node's recent block hashes with a peer's before you trust it, and report it as a bug.
 - Each node checks its own sample of hits, so a 0 on other nodes does not clear one that counted a stale value.
@@ -135,6 +147,7 @@ Linux is the production platform.
 
 - `--db.gap-fill` defaults to `auto` on Linux.
 - A file just written by `cp`, `rsync` or a restore sits in large page-cache folios. Until they are evicted, each commit writes whole folios back to disk, several times the bytes it changed. At its first open after a copy (when `db/tn-lmdb.dat.boot` is missing or names another file), the node drops `db/tn-lmdb.dat` from the page cache itself. Dropping the cache by hand before the first start (`sync; echo 1 | sudo tee /proc/sys/vm/drop_caches`) is harmless.
+- `db/tn-lmdb.dat.boot` records whether the database was closed cleanly in this boot. The node writes it at every start, and a start can fail on it, naming the file: a full volume, or a file another user owns, such as one a `sudo` run left. Free space or fix the file's owner, or delete it with the node stopped: that is safe, and only makes the next start drop the database from the page cache.
 
 macOS is for development and testing, not for validators.
 

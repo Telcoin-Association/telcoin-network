@@ -46,7 +46,7 @@ use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 use crate::{
     error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
-    rpc_blocking::RpcTaskSpawner,
+    rpc_blocking::RpcBlockingPool,
     rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
     rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
@@ -229,15 +229,24 @@ fn worker_rpc_server_args(
     }
 }
 
+/// How long [`ipc_socket_is_live`] waits for its connection.
+const IPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Whether a process is listening on the IPC socket at `path`.
 ///
-/// Connecting to a live Unix socket succeeds at once; a stale socket file refuses the
-/// connection and a missing one does not exist, and both of those reth replaces when it
-/// listens. Named pipes on Windows are not probed.
-fn ipc_socket_is_live(path: &str) -> bool {
+/// A live Unix socket accepts the connection; a stale socket file refuses it and a missing one
+/// does not exist, and both of those reth replaces when it listens. A listener whose backlog is
+/// full neither accepts nor refuses: the connect fails with `EAGAIN` (Linux) or does not finish,
+/// so that and a connect still pending after [`IPC_PROBE_TIMEOUT`] count as live. The probe
+/// never blocks the runtime. Named pipes on Windows are not probed.
+async fn ipc_socket_is_live(path: &str) -> bool {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
+        match tokio::time::timeout(IPC_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => err.kind() == std::io::ErrorKind::WouldBlock,
+            Err(_elapsed) => true,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -258,8 +267,8 @@ fn ipc_socket_is_live(path: &str) -> bool {
 ///   consumer of the cache.
 /// - `send_raw_transaction_sync_timeout`: applied here, absent from reth's reference. No CLI flag
 ///   feeds it yet, so it re-applies the default (forward compatibility).
-/// - task spawner: reth injects its own; TN sets an [`RpcTaskSpawner`] in `get_rpc_server`, so the
-///   API's blocking work runs on RPC's own pool.
+/// - task spawner: reth injects its own; TN sets one in `get_rpc_server`, so the API's blocking
+///   work runs on the server's own blocking pool (`rpc_blocking.rs`).
 fn apply_eth_config<N: RpcNodeCore, Rpc, NextEnv>(
     builder: EthApiBuilder<N, Rpc, NextEnv>,
     config: EthConfig,
@@ -318,10 +327,20 @@ impl RethEnv {
             TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
-        // RPC's blocking work runs on its own pool, so it cannot take the blocking threads block
-        // execution and certificate validation use (`rpc_blocking.rs`). Every other task keeps
-        // its spawner: TN's for the modules, the env's non-critical one for the eth API (below).
-        let rpc_executor = RpcTaskSpawner::new(self.inner.task_spawner.clone())?;
+        // RPC transaction pool insertion batching is configured by the txpool CLI args.
+        let eth_config = self
+            .node_config()
+            .rpc
+            .eth_config()
+            .max_batch_size(self.node_config().txpool.max_batch_size);
+        // This server's blocking work runs on a pool of its own (`rpc_blocking.rs`), so it cannot
+        // take the blocking threads block execution and certificate validation use, nor those of
+        // another worker's server. The pool has more threads than the eth API has blocking-IO
+        // permits, so permit holders never hold all of them while they wait for nested blocking
+        // work. Every other task keeps its spawner: TN's for the modules, the env's non-critical
+        // one for the eth API.
+        let blocking_pool = RpcBlockingPool::new(eth_config.max_blocking_io_requests)?;
+        let rpc_executor = blocking_pool.spawner(self.inner.task_spawner.clone());
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
@@ -341,12 +360,6 @@ impl RethEnv {
         } else {
             modules_config
         };
-        // RPC transaction pool insertion batching is configured by the txpool CLI args.
-        let eth_config = self
-            .node_config()
-            .rpc
-            .eth_config()
-            .max_batch_size(self.node_config().txpool.max_batch_size);
         // Reth's eth tasks run on the env's task manager, not on reth's default
         // `TokioTaskExecutor`: the state cache and the fee-history task (which follows the
         // canonical-state stream, open for the env's whole life) hold the provider, so untracked
@@ -354,8 +367,8 @@ impl RethEnv {
         // cache as a critical task; here they are tracked as non-critical ones: they only serve
         // RPC, and a panic in one leaves the RPC cache dead with the node running, as on reth's
         // own executor, instead of ending the validator. Their blocking work (cache misses, calls,
-        // traces) runs on RPC's own pool, as the modules' does.
-        let rpc_tasks = RpcTaskSpawner::new(self.inner.task_spawner.non_critical())?;
+        // traces) runs on this server's pool, as the modules' does.
+        let rpc_tasks = blocking_pool.spawner(self.inner.task_spawner.non_critical());
         let eth_cache = EthStateCache::spawn_with(
             self.inner.blockchain_provider.clone(),
             eth_config.cache,
@@ -467,7 +480,7 @@ impl RethEnv {
         worker_id: WorkerId,
     ) -> TnRethResult<RpcServerHandle> {
         let args = worker_rpc_server_args(&self.node_config().rpc, worker_id)?;
-        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath) {
+        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath).await {
             return Err(TnRethError::IpcSocketInUse { path: args.ipcpath });
         }
         let server_config = args.rpc_server_config();
@@ -1880,8 +1893,8 @@ mod tests {
 
     /// A listening socket is live; a stale socket file and a missing path are not.
     #[cfg(unix)]
-    #[test]
-    fn ipc_socket_probe_tells_live_from_stale() {
+    #[tokio::test]
+    async fn ipc_socket_probe_tells_live_from_stale() {
         let tmp_dir = TempDir::new().expect("temp dir");
         let live = tmp_dir.path().join("live.ipc");
         let stale = tmp_dir.path().join("stale.ipc");
@@ -1889,11 +1902,36 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
         drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
 
-        assert!(ipc_socket_is_live(&live.to_string_lossy()));
-        assert!(!ipc_socket_is_live(&stale.to_string_lossy()));
-        assert!(!ipc_socket_is_live(&missing.to_string_lossy()));
+        assert!(ipc_socket_is_live(&live.to_string_lossy()).await);
+        assert!(!ipc_socket_is_live(&stale.to_string_lossy()).await);
+        assert!(!ipc_socket_is_live(&missing.to_string_lossy()).await);
         drop(listener);
-        assert!(!ipc_socket_is_live(&live.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&live.to_string_lossy()).await);
+    }
+
+    /// A listener that never accepts, whose backlog fills, still counts as live, and the probe
+    /// returns within its timeout instead of blocking the runtime's thread.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipc_socket_probe_counts_a_full_backlog_as_live() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let path = tmp_dir.path().join("full.ipc");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // fill the backlog (at least 128 on Linux and macOS): connects that never get accepted
+        let mut pending = Vec::new();
+        while pending.len() < 4_096 {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(stream) => pending.push(stream),
+                Err(_) => break,
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let live = ipc_socket_is_live(&path.to_string_lossy()).await;
+        assert!(started.elapsed() < IPC_PROBE_TIMEOUT * 3, "{:?}", started.elapsed());
+        #[cfg(target_os = "linux")]
+        assert!(live, "a full backlog is a live listener");
+        drop((listener, pending, live));
     }
 
     /// A second server on a live IPC path is refused before it binds, so a second node
@@ -1932,7 +1970,7 @@ mod tests {
         let err = reth_env.start_rpc(&server, 0).await.expect_err("the socket is live");
         assert!(matches!(&err, TnRethError::IpcSocketInUse { path } if *path == ipcpath), "{err}");
         // the first server still owns its socket
-        assert!(ipc_socket_is_live(&ipcpath));
+        assert!(ipc_socket_is_live(&ipcpath).await);
     }
 
     /// Two workers on one `RethEnv` bind two live IPC sockets. Before #1287 both
@@ -1971,6 +2009,73 @@ mod tests {
             "worker 0 IPC socket file must survive worker 1's start"
         );
         assert!(std::path::Path::new(&suffixed).exists(), "worker 1 IPC socket file must exist");
+    }
+
+    /// Send `eth_subscribe("newPendingTransactions")` on a raw IPC stream and return the error
+    /// code of a refusal, `None` when it subscribed.
+    #[cfg(unix)]
+    async fn subscribe_pending_transactions(
+        stream: &mut tokio::io::BufStream<tokio::net::UnixStream>,
+        id: usize,
+    ) -> Option<i64> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "eth_subscribe",
+            "params": ["newPendingTransactions"],
+        });
+        stream.write_all(request.to_string().as_bytes()).await.expect("write request");
+        stream.flush().await.expect("flush request");
+        let mut line = String::new();
+        stream.read_line(&mut line).await.expect("read response");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("json response");
+        assert_eq!(response["id"], id, "{response}");
+        response.get("error").map(|error| error["code"].as_i64().expect("error code"))
+    }
+
+    /// With TN's default `--rpc.max-subscriptions-per-connection`, one connection is refused
+    /// before it holds every `newPendingTransactions` listener slot of the worker's pool, so
+    /// another connection can still subscribe. With reth's default (1,024, the pool's cap) the
+    /// first connection took every slot and the second was refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_connection_cannot_hold_every_pending_transaction_listener() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
+        let rpc_args = TnRpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() }.into();
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+        let accumulator = GasAccumulator::new(1);
+        let _handle = start_worker_rpc(&reth_env, &accumulator, 0).await;
+
+        let connect = || async {
+            tokio::io::BufStream::new(
+                tokio::net::UnixStream::connect(&ipcpath).await.expect("ipc connect"),
+            )
+        };
+        let mut first = connect().await;
+        let mut held = 0;
+        let refusal = loop {
+            match subscribe_pending_transactions(&mut first, held).await {
+                None => held += 1,
+                Some(code) => break code,
+            }
+            assert!(held <= reth_transaction_pool::MAX_RPC_TX_LISTENERS, "never refused");
+        };
+        assert_eq!(held, crate::rpc_server_args::RPC_DEFAULT_MAX_SUBS_PER_CONN as usize);
+        assert_eq!(refusal, i64::from(jsonrpsee::types::error::TOO_MANY_SUBSCRIPTIONS_CODE));
+
+        let mut second = connect().await;
+        assert_eq!(subscribe_pending_transactions(&mut second, 0).await, None);
     }
 
     mod forward_txs;

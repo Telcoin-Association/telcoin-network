@@ -208,6 +208,33 @@ impl TracingInspector {
         false
     }
 
+    /// TN(TN-0172): the struct logger's frame, as [`GethTraceBuilder::geth_traces`] builds it,
+    /// with each log's [`geth::struct_log_copies`] (its memory as hex, its storage copy) added
+    /// to the recorded-bytes counter as the log is built. Past the cap the conversion stops and
+    /// this returns the `trace too large` message.
+    pub fn try_geth_traces(
+        &self,
+        receipt_gas_used: u64,
+        return_value: Bytes,
+        opts: alloy_rpc_types_trace::geth::GethDefaultTracingOptions,
+    ) -> Result<alloy_rpc_types_trace::geth::DefaultFrame, String> {
+        let max = self.config.max_recorded_bytes;
+        self.geth_builder()
+            .geth_traces_charged(receipt_gas_used, return_value, opts, &mut |bytes| {
+                let total =
+                    self.recorded_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+                max.is_none_or(|max| total <= max)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "trace too large: more than {} bytes of calls, opcode steps and struct logs; \
+                     trace a smaller transaction, or set disableStorage and leave out \
+                     enableMemory",
+                    max.unwrap_or_default()
+                )
+            })
+    }
+
     /// TN(TN-0153): the result of a call or create refused at the cap, the one TN-0017's
     /// interrupt returns. The context error [`Self::charge`] set ends the transaction before
     /// revm hands this result to the calling frame.
@@ -1174,5 +1201,76 @@ mod tests {
             assert!(res.unwrap_err().starts_with("trace too large"));
             assert_eq!(inspector.traces().nodes().len(), 1);
         }
+    }
+    /// TN(TN-0172): runs `code` at [`TARGET`] under the struct logger's `opts` and a cap of
+    /// `cap`, then builds its frame with [`TracingInspector::try_geth_traces`].
+    fn struct_logs(
+        opts: alloy_rpc_types_trace::geth::GethDefaultTracingOptions,
+        cap: Option<usize>,
+        code: Vec<u8>,
+        gas_limit: u64,
+    ) -> (TracingInspector, Result<alloy_rpc_types_trace::geth::DefaultFrame, String>) {
+        let mut config = TracingInspectorConfig::from_geth_config(&opts);
+        config.max_recorded_bytes = cap;
+        let (inspector, res) =
+            call_target(TracingInspector::new(config), &[(TARGET, code)], gas_limit);
+        res.expect("the steps fit the cap");
+        let frame = inspector.try_geth_traces(0, Bytes::new(), opts);
+        (inspector, frame)
+    }
+
+    /// Code that stores at `slots` storage slots, then reads slot 0 in a loop until it runs out
+    /// of gas.
+    fn store_then_read(slots: u8) -> Vec<u8> {
+        // PUSH1 1; PUSH1 slot; SSTORE (slots times); JUMPDEST; PUSH0; SLOAD; POP; PUSH2 <jd>; JUMP
+        let mut code = Vec::new();
+        for slot in 0..slots {
+            code.extend([0x60, 0x01, 0x60, slot, 0x55]);
+        }
+        let jumpdest = code.len() as u16;
+        code.extend([0x5b, 0x5f, 0x54, 0x50, 0x61]);
+        code.extend(jumpdest.to_be_bytes());
+        code.push(0x56);
+        code
+    }
+
+    #[test]
+    fn struct_logs_count_their_memory_copies() {
+        let opts = alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default()
+            .enable_memory()
+            .disable_stack()
+            .disable_storage();
+        // 4 KiB of memory once (MSTORE at 4064), then a loop that reuses its snapshot
+        let mut code = vec![0x60, 0x01, 0x61, 0x0f, 0xe0, 0x52];
+        let jumpdest = code.len() as u8;
+        code.extend([0x5b, 0x60, jumpdest, 0x56]);
+
+        let (inspector, frame) = struct_logs(opts, None, code.clone(), 30_000);
+        let frame = frame.unwrap();
+        let copies: usize = frame.struct_logs.iter().map(geth::struct_log_copies).sum();
+        // each reused snapshot becomes 128 hex words again
+        assert!(copies > frame.struct_logs.len() * 128 * 64, "{copies} bytes");
+        assert!(inspector.recorded_bytes() > copies);
+
+        // the steps fit in 4 MiB; their logs repeat the 4 KiB of memory at every step
+        let (inspector, frame) = struct_logs(opts, Some(4 << 20), code, 30_000);
+        let err = frame.unwrap_err();
+        assert!(err.starts_with("trace too large: more than 4194304 bytes"), "{err}");
+        assert!(inspector.recorded_bytes() < (4 << 20) + 128 * 88 + 4096);
+    }
+
+    #[test]
+    fn struct_logs_count_their_storage_copies() {
+        let opts =
+            alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default().disable_stack();
+        let (_, frame) = struct_logs(opts, None, store_then_read(64), 3_000_000);
+        let frame = frame.unwrap();
+        let sloads = frame.struct_logs.iter().filter(|log| log.op == "SLOAD").count();
+        let copies: usize = frame.struct_logs.iter().map(geth::struct_log_copies).sum();
+        assert!(sloads > 1_000, "{sloads} reads");
+        assert!(copies >= sloads * 64 * 64, "{copies} bytes for {sloads} reads");
+
+        let (_, frame) = struct_logs(opts, Some(copies), store_then_read(64), 3_000_000);
+        assert!(frame.unwrap_err().starts_with("trace too large"));
     }
 }

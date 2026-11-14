@@ -25,7 +25,7 @@ built on a thread with a 2 MiB stack, must fail with a `setup` error, and recurs
 limit must still work. With the old limit both recursion tests abort the test process (SIGABRT,
 stack overflow).
 
-### A cap on what a trace records (TN-0079, TN-0153)
+### A cap on what a trace records (TN-0079, TN-0153, TN-0172)
 
 `TracingInspector` records a step for every opcode when steps are requested (the struct logger,
 and `vmTrace`), copying the whole stack at each step unless the stack is disabled and memory when
@@ -39,21 +39,32 @@ the output, so a contract looping on `STATICCALL` with 16 KiB of calldata did th
 The inspector now counts the bytes its trace holds (`TracingInspector::recorded_bytes`): each
 call's and create's trace node with its input or init code and its output (TN-0153), and each
 step with its stack snapshot, a fresh memory copy, return data, immediate bytes and the values
-`step_end` records (TN-0079). Logs and storage changes are not counted; gas bounds them. Past
+`step_end` records (TN-0079). The struct logger's result counts too, as it is built
+(`TracingInspector::try_geth_traces`, TN-0172): each log's memory as hex strings, which it
+repeats at every step even where the steps share one snapshot, and the copy of the contract's
+storage it gets at an SLOAD or SSTORE. Past the cap that conversion stops with the same
+`trace too large` error (`DebugInspectorError::TraceTooLarge`). The logs' other fields and their
+stacks mirror the recorded steps, so such a trace holds at most about twice the cap at its
+peak. Logs and storage changes are not counted; gas bounds them. Past
 `TracingInspectorConfig::max_recorded_bytes` it ends the transaction as the JS interrupt does:
 the context error becomes `EVMError::Custom("trace too large: ...")`. A step halts the
 interpreter with `FatalExternalError`; a call or create that would pass the cap is not made, and
 its hook returns a `FatalExternalError` outcome, which revm never hands to the calling frame
 because it takes the context error first. Every preset sets the cap to
-`DEFAULT_MAX_RECORDED_BYTES` (160 MiB, reth's default `--rpc.max-response-size`). Steps, and
-calls' input and output for the tracers that return them (in hex), serialize to more bytes than
-the trace holds for them, so such a trace could not be returned anyway; the struct logger and
-`prestateTracer`, which return no call input or output, refuse a transaction whose calls copy
-more than the cap. `merge` keeps the tighter of two caps, and `None` disables it. The counter is an
+`DEFAULT_MAX_RECORDED_BYTES` (160 MiB, reth's default `--rpc.max-response-size`). The cap
+counts what the trace holds, not its JSON. Calls' input and output, for the tracers that return
+them, serialize in hex to twice what the trace holds, so such a trace could not be returned
+anyway. Steps can hold more than their JSON (about 200 bytes against 60 to 100 for a struct log
+with a small stack; for `vmTrace`, a copy of the whole memory after each write), so a
+struct-logger or `vmTrace` trace can be refused although its response would fit, at about a
+third of the cap or less. The struct logger and `prestateTracer`, which return no call input or
+output, also refuse a transaction whose calls copy more than the cap. Raising
+`--rpc.max-response-size` does not raise the cap. `merge` keeps the tighter of two caps, and `None` disables it. The counter is an
 `Arc<AtomicUsize>` kept across `fuse` and shared between inspectors through
 `share_recorded_bytes`, so reth bounds a request, not a transaction (see TN-0079 in
-`vendor/reth/CHANGES.md` for the call sites). Tests are in `src/tracing/mod.rs` and
-`src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
+`vendor/reth/CHANGES.md` for the call sites). `DebugInspector::fuse` fuses the mux tracer's
+inspector instead of rebuilding it, so the mux tracer keeps the count too (TN-0172). Tests are
+in `src/tracing/mod.rs`, `src/tracing/mux.rs` and `src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
 
 The crate's `.gitignore` is removed, because it would hide the standalone `Cargo.lock` from git.
 `upstream.diff` is the full difference from the registry archive (without
@@ -65,11 +76,20 @@ directory holding the extracted archive as `upstream` and this directory as `pat
 ## Scope
 
 revm-inspectors is used only for RPC tracing (`debug_*`, `trace_*`, `eth_simulateV1`'s
-transfer tracing). Block execution never runs an inspector from it. The recursion limit applies
-only to JavaScript tracers, which TN builds only with the opt-in `js-tracer` feature
-(`crates/tn-reth/js-tracer.md`). The trace cap applies to every build: the default build compiles
-the patched crate without Boa, and its code there differs from the registry's by the cap alone
-(`src/tracing/{mod,config}.rs`).
+transfer tracing). Block execution never runs an inspector from it. The patch carries:
+
+- the recursion limit (`src/tracing/js/mod.rs`), which reaches only JavaScript tracers, built
+  only with the opt-in `js-tracer` feature (`crates/tn-reth/js-tracer.md`);
+- the trace cap (TN-0079, TN-0153, TN-0172), which reaches every build and every
+  `TracingInspector` tracer: the counter and the charges for steps and calls
+  (`src/tracing/mod.rs`), the cap in every preset (`src/tracing/config.rs`), the charged
+  struct-log conversion (`src/tracing/builder/geth.rs`, `TracingInspector::try_geth_traces`),
+  `DebugInspector`'s use of it and its `TraceTooLarge` error, and the mux tracer's fuse that keeps
+  the count (`src/tracing/{debug,mux}.rs`);
+- the removed `.gitignore`.
+
+The default build compiles the patched crate without Boa, so there it differs from the
+registry's crate by the trace cap alone. Dropping the patch from any build drops the cap.
 
 The nested reth workspace carries the same patch in `vendor/reth/.cargo/config.toml` (TN-0080),
 which every cargo invocation there reads, the one cargo-nextest runs included, so reth's tests run
@@ -96,14 +116,14 @@ worktree nested in another checkout it does not: cargo walks up past the excludi
 the outer one. There, copy the crate somewhere outside any workspace, drop the `snapbox`
 dev-dependency (used only by upstream's integration tests, which the published crate does not
 include) if it is not in the local registry, and run
-`cargo test --features js-tracer --lib tracing::js::tests`.
+`cargo test --features js-tracer --lib`, which runs the recursion-limit and the trace-cap tests.
 
 ## Retirement
 
 The recursion limit retires when TN's reth moves to a revm-inspectors release that contains #548
 (0.44.2 or later); check that release's `RECURSION_LIMIT`. The trace size cap has no upstream
 equivalent, so the patch directory stays: on an upgrade, take the new registry source, re-apply
-the cap (the `TN(TN-0079)` and `TN(TN-0153)` hunks of `upstream.diff`), and update the checksum,
+the cap (the `TN(TN-0079)`, `TN(TN-0153)` and `TN(TN-0172)` hunks of `upstream.diff`), and update the checksum,
 revision and `upstream.diff` above. Should upstream grow a cap of its own, drop TN's and, if nothing else is
 carried, delete:
 - this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;

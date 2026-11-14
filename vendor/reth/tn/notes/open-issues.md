@@ -3,16 +3,19 @@
 The items below are known and deliberately left for their own changes, because each is too large
 to fix in passing or needs other owners. None of them lets two validators on the same release
 execute a block differently. The first one is fixed now
-(TN-0140); the fix changes the state root of any block where the old code was wrong, so it ships
-with a coordinated upgrade.
+(TN-0140); the fix changes the state root of any block where the old code was wrong, so adiri
+upgrades to it all at once, never rolling (CHANGES.md TN-0140).
 
 Upstream fixes that are simply not applied yet are tracked in `upstream-backports.md`, not here.
 
 ## The incremental state root can skip a changed subtree (upstream 8572c88fe) [fixed: TN-0140]
 
-Applied as TN-0140 with the storage-v2 work. Mainnet takes it at genesis; a chain an older binary
-built (adiri) is replayed with the fix and its block hashes compared before the fix is deployed
-there (CHANGES.md TN-0140). The analysis below is from before the fix.
+Applied as TN-0140 with the storage-v2 work, with no activation epoch. Mainnet takes it at
+genesis. Adiri's history was replayed with the fix: on 2026-11-14 an observer built with it synced
+adiri from genesis, and every certified epoch record's closing block (epochs 0 to 751, up to block
+529,583) matched the observer's own block and the public RPC's. Adiri validators upgrade from
+`v0.17.0-adiri` all at once (CHANGES.md TN-0140). The analysis below describes the old code; the
+bullets after it say where things stand with the fix.
 
 `TrieNodeIter` (`vendor/reth/crates/trie/trie/src/node_iter.rs`, the `can_skip_node` seek check)
 skips re-hashing a stored branch when the walker's key merely *starts with* the seek prefix. When
@@ -26,22 +29,26 @@ TN computes every block's root this way: `OutputTrieOverlay::layered_root_with_u
 sets from the block's own changes. Upstream's test fails on this copy (incremental root `0x52fe…`,
 rebuilt root `0x6b94…`) and passes with the one-line fix.
 
-- Fork risk today: none between nodes on the same release. The skip is deterministic, so every
-  node that built its trie by executing the same blocks computes the same root, right or wrong. A
-  node whose trie was rebuilt from scratch (snapshot import, `crates/tn-reth/src/snapshot.rs`)
-  hard-fails at import if the chain's root ever went wrong, instead of forking.
-- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary.
-  So the fix is a coordinated upgrade, never a rolling one, and it is not applied here.
-- Has the testnet hit it? Unknown. A snapshot export from a testnet node and an import elsewhere
-  answers it: the import rebuilds the trie from scratch and compares with the header's root. A
-  replay of the testnet from genesis on a fixed binary answers it too, but does not name the
-  block: no check compares a replayed block's hash, so the node runs to the close of the epoch
-  that contains it and stops at the stored epoch record's check (`check_stored_record`,
+- Fork risk between nodes on one release: none, with the fix or without it. The skip is
+  deterministic, so every node that built its trie by executing the same blocks computes the same
+  root, right or wrong. A node whose trie was rebuilt from scratch (snapshot import,
+  `crates/tn-reth/src/snapshot.rs`) hard-fails at import if the chain's root ever went wrong,
+  instead of forking.
+- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary
+  than on an older one. So adiri upgrades to it all at once, never rolling, and rolling a node
+  back to an older release after the fixed one has started on its datadir is not supported.
+- Has the testnet hit it? Not up to block 529,583 (the close of epoch 751): the replay above
+  reproduced every certified closing block to there. Later history is checked the same way. A
+  snapshot export from a testnet node and an import elsewhere also answers it: the import rebuilds
+  the trie from scratch and compares with the header's root. A replay of the testnet from genesis
+  on a fixed binary answers it too, but does not name the block: no check compares a replayed
+  block's hash, so the node runs to the close of the epoch that contains it and stops at the
+  stored epoch record's check (`check_stored_record`,
   `crates/node/src/manager/node/close_epoch.rs`), naming that epoch's recorded and local closing
   blocks. The first block that differs is found by comparing the replayed block hashes with the
   chain's (CHANGES.md TN-0140).
-- Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
-  history already contains such a block), after `graph.py` and `make test-upgrade`.
+- Fix: 8572c88fe, applied as TN-0140 with no activation epoch. A block of later adiri history that
+  a fixed binary does not reproduce would need one.
 
 ## The pool re-admits a nonce from a batch that reached quorum
 
@@ -150,11 +157,26 @@ storage path, so it takes its own change with the fork checks (CLAUDE.md, "Fork 
 
 `patches/revm-inspectors` carries two changes to the revm-inspectors version TN's revm needs
 (0.34.3): Boa's recursion limit, which retires when TN's reth moves to a release with upstream's
-fix (0.44.2 or later), and the cap on recorded trace steps (TN-0079), which upstream lacks as of
-0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
+fix (0.44.2 or later), and the trace cap (TN-0079, TN-0153, TN-0172: steps, calls and the struct
+logger's logs), which upstream lacks as of 0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
 resolves the registry crate instead of the patch (TN-0085), and the nested test lane builds
 against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
 details.
+
+## WebSocket calls run to their end after the client leaves
+
+jsonrpsee 0.26's WebSocket server spawns each call on a detached task, so when a client
+disconnects its request future is not dropped and TN-0049's cancellation does not fire: the call
+keeps its blocking thread and permits until it ends. HTTP drops the request, and IPC aborts it
+since TN-0177. The work stays bounded by the gas cap, the trace cap and the permits.
+
+An RPC middleware (`RpcServerConfig::set_rpc_middleware`) cannot fix it: the connection's task
+keeps its RPC service in an `Arc` that every spawned call clones, so no middleware instance ends
+with the connection, and a method call gets no connection-closed signal (only a subscription's
+sink does). The fix is in jsonrpsee-server's `transport/ws.rs` `background_task`: cancel or abort
+the calls it spawned once its receive loop ends, as a patch under `patches/` or upstream. The
+other way is a TN accept loop on jsonrpsee's `to_service_builder()` that races each call against
+`on_session_closed()`.
 
 ## CI build time with the vendored crates
 

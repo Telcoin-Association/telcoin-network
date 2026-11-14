@@ -36,11 +36,18 @@
 //!
 //! [`AccountWalk::OneThread`] (`TN_PARALLEL_ACCOUNT_WALK=0`), or a block with fewer than
 //! [`SPLIT_MIN_ACCOUNTS`] changed accounts, runs the walk on the calling thread as before. So does
-//! a block the split cannot compose: a node at the empty path in the database (reth never writes
-//! one), or a shape `compose` refuses (a small trie: a first nibble's node with a leaf or
-//! extension child, or fewer than two non-empty nibbles). These fallbacks are counted by reason in
-//! `tn_reth.account_walk_fallbacks_total` ([`crate::metrics::AccountWalkFallback`]), as is a
-//! sampled serial check that found the split's result wrong.
+//! a block whose stored trie (the walk's view, before the block's changes) fails the pre-check
+//! that the storage split also uses (`storage_split::shape`): a node at the empty path (reth never
+//! writes one), or a first nibble's node missing or with a leaf or extension child (a small trie:
+//! a few thousand accounts or fewer, as a chain has from genesis). No subtrie runs for such a
+//! block, so it costs what the walk on one thread costs. A trie that passes can still come out of
+//! the block in a shape `compose` refuses (the block removed all but one account under a
+//! second-level path, added the first under an empty one, or emptied all but one first nibble).
+//! That block pays for the subtries and then for the walk on one thread, which computes again every
+//! storage root the subtries took from the storage-root tasks (a task hands its result out once).
+//! These fallbacks are counted by reason in `tn_reth.account_walk_fallbacks_total`
+//! ([`crate::metrics::AccountWalkFallback`]), as is a sampled serial check that found a wrong
+//! result on a block the split composed.
 //!
 //! # Off switch
 //!

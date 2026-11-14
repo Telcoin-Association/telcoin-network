@@ -205,37 +205,50 @@ where
         opts: GethDebugTracingOptions,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
         let permit = self.trace_task_permit().await?;
-        let block: ProviderBlock<Eth::Provider> = Decodable::decode(&mut rlp_block.as_ref())
-            .map_err(BlockError::RlpDecodeRawBlock)
-            .map_err(Eth::Error::from_eth_err)?;
-
-        // TN(TN-0078): the header and the transactions come from the caller, so nothing the
-        // chain enforced bounds them: a header with a huge gas limit and no base fee lets a
-        // transaction with a huge gas limit run until it ends. The block is bounded
-        // as a `debug_traceCallMany` request is: a call count the gas cap can hold, which also
-        // bounds the signer recovery below, and one gas budget across its transactions.
         let gas_budget = self.eth_api().call_gas_limit();
-        call_many::check_call_count(gas_budget, block.body().transaction_count())
-            .map_err(Eth::Error::from_eth_err)?;
-
-        let evm_env = self
+        // TN(TN-0175): decoding and signer recovery run in a blocking task that holds the
+        // permit, not in the handler on the RPC runtime.
+        let (block, evm_env, permit) = self
             .eth_api()
-            .evm_config()
-            .evm_env(block.header())
-            .map_err(RethError::other)
-            .map_err(Eth::Error::from_eth_err)?;
+            .spawn_blocking_io(move |eth_api| {
+                let block: ProviderBlock<Eth::Provider> =
+                    Decodable::decode(&mut rlp_block.as_ref())
+                        .map_err(BlockError::RlpDecodeRawBlock)
+                        .map_err(Eth::Error::from_eth_err)?;
 
-        // Depending on EIP-2 we need to recover the transactions differently
-        let senders =
-            if self.provider().chain_spec().is_homestead_active_at_block(block.header().number()) {
-                block.body().recover_signers()
-            } else {
-                block.body().recover_signers_unchecked()
-            }
-            .map_err(Eth::Error::from_eth_err)?;
+                // TN(TN-0078): the header and the transactions come from the caller, so nothing
+                // the chain enforced bounds them: a header with a huge gas limit and no base fee
+                // lets a transaction with a huge gas limit run until it ends. The block is
+                // bounded as a `debug_traceCallMany` request is: a call count the gas cap can
+                // hold, which also bounds the signer recovery below, and one gas budget across
+                // its transactions.
+                call_many::check_call_count(gas_budget, block.body().transaction_count())
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                let evm_env = eth_api
+                    .evm_config()
+                    .evm_env(block.header())
+                    .map_err(RethError::other)
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                // Depending on EIP-2 we need to recover the transactions differently
+                let senders = if eth_api
+                    .provider()
+                    .chain_spec()
+                    .is_homestead_active_at_block(block.header().number())
+                {
+                    block.body().recover_signers()
+                } else {
+                    block.body().recover_signers_unchecked()
+                }
+                .map_err(Eth::Error::from_eth_err)?;
+
+                Ok((block.into_recovered_with_signers(senders), evm_env, permit))
+            })
+            .await?;
 
         self.trace_block(
-            Arc::new(block.into_recovered_with_signers(senders)),
+            Arc::new(block),
             evm_env,
             opts,
             Some(CallManyBudget::new(gas_budget)),
@@ -1552,6 +1565,45 @@ mod recorded_bytes_tests {
             ],
         );
     }
+
+    /// TN(TN-0172): the struct logs count against the cap as they are built, so a trace whose
+    /// steps fit the cap can still be refused, and the RPC returns that error as `-32603`.
+    #[test]
+    fn struct_logs_past_the_recorded_bytes_cap_are_refused() {
+        let opts = GethDebugTracingOptions {
+            config: alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default()
+                .enable_memory()
+                .disable_storage(),
+            ..Default::default()
+        };
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let DebugInspector::Default(tracing, _) = &mut inspector else {
+            panic!("default options select the struct logger")
+        };
+        tracing.config_mut().max_recorded_bytes = Some(4 << 20);
+
+        // 4 KiB of memory once, then a loop whose steps share its snapshot:
+        // PUSH1 1; PUSH2 0x0fe0; MSTORE; JUMPDEST; PUSH1 6; JUMP
+        let code = [0x60, 0x01, 0x61, 0x0f, 0xe0, 0x52, 0x5b, 0x60, 0x06, 0x56];
+        let target = Address::with_last_byte(0xaa);
+        let mut db = CacheDB::<EmptyDB>::default();
+        let code = Bytecode::new_raw(Bytes::copy_from_slice(&code));
+        db.insert_account_info(target, AccountInfo::default().with_code(code));
+        let mut evm = revm::Context::mainnet().with_db(db).build_mainnet_with_inspector(inspector);
+        let tx = TxEnv { gas_limit: 30_000, kind: TxKind::Call(target), ..Default::default() };
+        let res = evm.inspect_tx(tx.clone()).expect("the steps fit the cap");
+        let block = evm.ctx.block.clone();
+        let err = evm
+            .inspector
+            .get_result(None, &tx, &block, &res, &mut CacheDB::<EmptyDB>::default())
+            .expect_err("the logs repeat the memory at every step");
+        let rpc_err: jsonrpsee_types::error::ErrorObject<'static> = EthApiError::from(err).into();
+        assert_eq!(rpc_err.code(), jsonrpsee_types::error::INTERNAL_ERROR_CODE);
+        assert!(
+            rpc_err.message().starts_with("Revm error: trace too large: more than 4194304 bytes"),
+            "{rpc_err:?}"
+        );
+    }
 }
 
 /// TN(TN-0078): a raw block is bounded as a `debug_traceCallMany` request is.
@@ -1563,6 +1615,7 @@ mod raw_block_bound_tests {
     use alloy_primitives::TxKind;
     use reth_ethereum_primitives::{Block, BlockBody, Transaction as TnTransaction};
     use reth_rpc_eth_api::helpers::Call;
+    use reth_rpc_eth_types::GasCap;
     use reth_tasks::TokioTaskExecutor;
     use reth_testing_utils::generators;
 
@@ -1613,6 +1666,62 @@ mod raw_block_bound_tests {
         let err = api.debug_trace_raw_block(rlp, Default::default()).await.unwrap_err();
         assert!(
             matches!(&err, EthApiError::InvalidParams(m) if *m == format!("request exceeds the limit of {max} calls")),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0176): the first transaction's gas is charged to the block's budget: two 30,000
+    /// gas-limit transfers fit a 50,000 cap one at a time, not after the first used 21,000.
+    #[tokio::test]
+    async fn raw_block_charges_each_transaction_to_the_budget() {
+        let chain = MockChain::new();
+        let api = DebugApi::new(
+            chain.eth_api_with_gas_cap(GasCap(50_000)),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        );
+        let traces = api
+            .debug_trace_raw_block(raw_block(&chain, [30_000]), Default::default())
+            .await
+            .expect("one transfer fits");
+        assert_eq!(traces.len(), 1);
+        let err = api
+            .debug_trace_raw_block(raw_block(&chain, [30_000, 30_000]), Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0176): `debug_traceCallMany`'s calls share the gas budget: one 25,800-gas call fits
+    /// a 50,000 cap, two do not.
+    #[tokio::test]
+    async fn trace_call_many_calls_share_the_gas_budget() {
+        let chain = MockChain::new();
+        let api = DebugApi::new(
+            chain.eth_api_with_gas_cap(GasCap(50_000)),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        );
+        let call = MockChain::call_of_25_800_gas();
+        let at_block_1 =
+            Some(StateContext { block_number: Some(BlockId::number(1)), transaction_index: None });
+        let bundle = |calls| vec![Bundle { transactions: calls, block_override: None }];
+        let traces = api
+            .debug_trace_call_many(bundle(vec![call.clone()]), at_block_1, None)
+            .await
+            .expect("one call fits");
+        assert_eq!(traces[0].len(), 1);
+        let err = api
+            .debug_trace_call_many(bundle(vec![call.clone(), call]), at_block_1, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
             "{err:?}"
         );
     }

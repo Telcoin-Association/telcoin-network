@@ -290,8 +290,12 @@ async fn assert_remaining_output(
             // Geth omits empty trace output, while eth methods serialize it as "0x".
             let output = response.pointer(path).and_then(Value::as_str).unwrap_or("0x");
             assert_eq!(output, expected, "{method}: {response}");
-            if method.starts_with("debug_") {
-                assert!(response.pointer(&path.replace("output", "error")).is_none());
+            // a failed call reports its error inside a successful response, beside the output
+            let call = &path[..path.rfind('/').unwrap_or_default()];
+            assert!(response.pointer(&format!("{call}/error")).is_none(), "{method}: {response}");
+            if method == "eth_simulateV1" {
+                let status = response.pointer(&format!("{call}/status"));
+                assert_eq!(status, Some(&json!("0x1")), "{method}: {response}");
             }
             Ok::<(), eyre::Report>(())
         },
@@ -710,7 +714,6 @@ async fn test_rpc_simulation_multiple_bundles() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Pending calls preserve default HeaderNotFound errors and work when full pending is enabled.
 /// Under the default `--rpc.pending-block none`, `pending` selects the latest block for every
 /// simulation method, as it does for `eth_call`; before, reth's multi-call methods answered
 /// "block not found: pending".

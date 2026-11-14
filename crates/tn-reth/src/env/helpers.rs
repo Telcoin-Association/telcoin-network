@@ -134,8 +134,11 @@ impl RethEnv {
     /// is worth it, and no serial comparison (`output_overlay/parallel.rs`). The walks are chosen
     /// here, not by `TN_PARALLEL_ACCOUNT_WALK` or `TN_PARALLEL_STORAGE_WALK`.
     ///
-    /// The #1301 trie-level differential test checks it against the same oracle as the serial
-    /// root.
+    /// The #1301 trie-level differential test (`tests/it/trie_overlay.rs`) checks it against the
+    /// same oracle as the serial root. Its blocks change at most a few accounts and slots, below
+    /// both splits' thresholds, so it covers the storage-root tasks only; the splits are compared
+    /// with the serial walk by the unit tests of `output_overlay/account_split.rs` and
+    /// `output_overlay/storage_split.rs`.
     #[cfg(any(feature = "test-utils", test))]
     pub fn parallel_layered_root_for_test(
         &self,

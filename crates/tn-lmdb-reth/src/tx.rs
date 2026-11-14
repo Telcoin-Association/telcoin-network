@@ -7,9 +7,9 @@ use crate::{
         last_is_row_of, Deferred, ReadCursor, ReadPool, TnLmdbCursor, TnLmdbCursorMut, WriteCursor,
     },
     dup::DupLayout,
-    env::{resolve, ReaderWatch, TableMap},
+    env::{resolve, warning_due, ReaderWatch, TableMap, NEVER_WARNED},
     error::{self, Mdbx},
-    timeout::{ReaderState, ReaderTimeouts},
+    timeout::ReaderState,
 };
 use parking_lot::Mutex;
 use reth_db_api::{
@@ -18,7 +18,13 @@ use reth_db_api::{
     DatabaseError,
 };
 use reth_storage_errors::db::DatabaseWriteOperation;
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
+};
 use tn_lmdb::{KeyTail, ReadTxn, RoTxn, RwTxn, Table as EngineTable};
 
 /// A write transaction shared by its handle and its cursors ([`TxnState`]).
@@ -59,13 +65,17 @@ pub(crate) fn compressed<'b, V: Compress>(value: &'b V, buf: &'b mut Vec<u8>) ->
 /// `f`, a decode of a row of table `T` stored at `key` (its key or its value), with a panic in it
 /// caught and made [`DatabaseError::Decode`]: reth's `Decompress` and `Decode` (its `Compact`
 /// forms) expect their input well formed and panic on a damaged one (a truncated `Bytecode`, say),
-/// where this crate reports it as the read's error (the crate docs' differences from MDBX). Costs
-/// nothing on the path that does not panic.
+/// where this crate reports it as the read's error (the crate docs' differences from MDBX). On the
+/// path that does not panic it adds about 1 to 3 ns a decode: a loop of decodes alone, on an
+/// Apple M1 Max, took 10.4 ns an `Account` bare and 11.7 to 12.1 guarded, 6.2 ns a `StorageEntry`
+/// bare and 8.0 to 8.9 guarded (2026-11-13). Its share of a read through a cursor was not
+/// measured.
 ///
 /// The process's panic hook runs before the catch: the default hook prints the panic's message and
 /// where it panicked (in reth's decoder) to stderr, and a backtrace under `RUST_BACKTRACE`, at
-/// every read of the row, naming neither the table nor the key. The catch then logs one error that
-/// names both ([`decode_panicked`]). This crate installs no hook.
+/// every read of the row, naming neither the table nor the key. The catch then logs an error that
+/// names both, at most once a minute in the process ([`decode_panicked`]). This crate installs no
+/// hook.
 pub(crate) fn guarded<T: Table, V>(
     key: &[u8],
     f: impl FnOnce() -> Result<V, DatabaseError>,
@@ -74,12 +84,39 @@ pub(crate) fn guarded<T: Table, V>(
         .unwrap_or_else(|panic| Err(decode_panicked(T::NAME, key, &*panic)))
 }
 
+/// The least time between two logs of [`decode_panicked`] in the process: a read loop over a row
+/// that does not decode would otherwise log at every read.
+const DECODE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When [`decode_panicked`] last logged, in nanoseconds since [`decode_log_clock`]'s base
+/// ([`NEVER_WARNED`] before the first).
+static DECODE_LOGGED: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+
+/// The decode failures [`decode_panicked`] did not log since its last log.
+static DECODE_UNLOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// The clock of [`DECODE_LOGGED`]: nanoseconds since the process's first decode failure.
+fn decode_log_clock() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let elapsed = BASE.get_or_init(Instant::now).elapsed().as_nanos();
+    u64::try_from(elapsed).unwrap_or(NEVER_WARNED - 1)
+}
+
 /// The error of a decode of a row of `table` stored at `key` that panicked with `panic`
-/// ([`guarded`]): an `error` log naming the table, the key in hex and the panic's message, then
-/// [`DatabaseError::Decode`].
+/// ([`guarded`]): [`DatabaseError::Decode`], and an `error` log naming the table, the key in hex,
+/// the panic's message and the failures not logged since the last log, at most once per
+/// [`DECODE_LOG_INTERVAL`] in the process (the first is logged).
 #[cold]
 #[inline(never)]
 fn decode_panicked(table: &str, key: &[u8], panic: &(dyn std::any::Any + Send)) -> DatabaseError {
+    let now = decode_log_clock();
+    let last = DECODE_LOGGED.load(Ordering::Relaxed);
+    let due = warning_due(last, now, DECODE_LOG_INTERVAL)
+        && DECODE_LOGGED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+    if !due {
+        DECODE_UNLOGGED.fetch_add(1, Ordering::Relaxed);
+        return DatabaseError::Decode;
+    }
     let message = panic
         .downcast_ref::<&str>()
         .copied()
@@ -89,8 +126,11 @@ fn decode_panicked(table: &str, key: &[u8], panic: &(dyn std::any::Any + Send)) 
         table,
         key = %Hex(key),
         panic = message,
-        "a stored row of the reth database does not decode (its decoder panicked): the read fails \
-         with DatabaseError::Decode; the row is damaged"
+        unlogged_since = DECODE_UNLOGGED.swap(0, Ordering::Relaxed),
+        "a stored row of the reth database did not decode (its decoder panicked), so the read \
+         fails with DatabaseError::Decode: the row is damaged, or holds a form this build's \
+         decoder does not read. Logged at most once a minute; unlogged_since counts the decode \
+         failures since the last log"
     );
     DatabaseError::Decode
 }
@@ -220,20 +260,14 @@ pub struct TnLmdbTx {
     txn: Arc<RoTxn>,
     tables: Arc<TableMap>,
     pool: Arc<ReadPool>,
-    /// The transaction's state under the read transaction timeout, shared with its cursors.
+    /// The transaction's state under the read transaction timeout, shared with its cursors: the
+    /// last of them to drop takes the reader off the timeout, as it ends the engine's reader.
     reader: Arc<ReaderState>,
-    /// The environment's timeout, which the transaction leaves when it ends; `None` when off.
-    timeouts: Option<Arc<ReaderTimeouts>>,
 }
 
 impl TnLmdbTx {
-    pub(crate) fn new(
-        txn: RoTxn,
-        tables: Arc<TableMap>,
-        reader: Arc<ReaderState>,
-        timeouts: Option<Arc<ReaderTimeouts>>,
-    ) -> Self {
-        Self { txn: Arc::new(txn), tables, pool: Arc::default(), reader, timeouts }
+    pub(crate) fn new(txn: RoTxn, tables: Arc<TableMap>, reader: Arc<ReaderState>) -> Self {
+        Self { txn: Arc::new(txn), tables, pool: Arc::default(), reader }
     }
 
     /// Test-only: the engine cursors the transaction's pool holds.
@@ -305,18 +339,7 @@ impl DbTx for TnLmdbTx {
     /// ends; a commit made while it has held a superseded snapshot for over a minute logs a
     /// warning (at most once a minute).
     fn disable_long_read_transaction_safety(&mut self) {
-        if let Some(timeouts) = &self.timeouts {
-            timeouts.opt_out(&self.reader);
-        }
-    }
-}
-
-impl Drop for TnLmdbTx {
-    /// Leaves the read transaction timeout: the engine's reader ends with the last cursor.
-    fn drop(&mut self) {
-        if let Some(timeouts) = &self.timeouts {
-            timeouts.ended(&self.reader);
-        }
+        self.reader.opt_out();
     }
 }
 

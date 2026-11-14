@@ -4,7 +4,8 @@
 //! root collapsed; and freeing a whole tree.
 //!
 //! A put first plans from a read-only descent (checking every page on the path, and verifying
-//! each published page it will copy), then allocates every page it can need — the copies of the
+//! each published page it will copy unless this writer stamped it itself:
+//! `Allocator::is_stamped`), then allocates every page it can need — the copies of the
 //! published pages on the path and, if the leaf overflows, the worst case of the split cascade —
 //! and only then changes anything. A failed allocation (a full disk, say) therefore leaves the
 //! tree exactly as it was: the same root handle and every reachable page byte for byte. A delete
@@ -1695,7 +1696,10 @@ fn leaving_run<S: PageWrite + ?Sized>(store: &S, leaf: u32, ovf: Ovf) -> Result<
 
 /// A published page about to be copied must pass its CRC and [`page::validate`]: the copy is
 /// stamped afresh at commit, so copying a page damaged at rest would make the damage CRC-valid
-/// and invisible, and the mutators keep a page valid only if it was valid. The check and its
+/// and invisible, and the mutators keep a page valid only if it was valid. The callers skip it
+/// for a page this writer stamped at one of its own commits (`Allocator::is_stamped`: its bytes
+/// were built here), so a change at rest to such a page is re-sealed by its copy, and only an
+/// `Env::check` that runs before the copy finds it (README, do-not-flag item 3). The check and its
 /// time are counted on `store` ([`PageWrite::count_verify`]).
 fn verify_published<S: PageWrite + ?Sized>(
     store: &S,

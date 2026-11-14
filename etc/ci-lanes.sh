@@ -48,6 +48,25 @@ set -euo pipefail
 # so anchor at the workspace root and work from any cwd.
 cd "$(dirname "$0")/.."
 
+# Cleared, so a caller's environment cannot weaken the lane the flags below set:
+# CARGO_ENCODED_RUSTFLAGS takes precedence over RUSTFLAGS, a CARGO_PROFILE_{DEV,TEST}_DEBUG_ASSERTIONS
+# or _OVERFLOW_CHECKS variable turns off the test profile's checks, NEXTEST_RETRIES overrides the
+# profile's retries, and RUSTUP_TOOLCHAIN the pin in rust-toolchain.toml. Other CARGO_PROFILE_*
+# variables stay: CI sets CARGO_PROFILE_{DEV,TEST}_DEBUG=0 to keep its builds small, which
+# changes no check.
+unset CARGO_ENCODED_RUSTFLAGS NEXTEST_RETRIES RUSTUP_TOOLCHAIN
+for name in $(compgen -e); do
+    case "$name" in
+        CARGO_PROFILE_DEV_DEBUG_ASSERTIONS | CARGO_PROFILE_TEST_DEBUG_ASSERTIONS | \
+            CARGO_PROFILE_DEV_OVERFLOW_CHECKS | CARGO_PROFILE_TEST_OVERFLOW_CHECKS) unset "$name" ;;
+    esac
+done
+# The two nextest profiles the lanes run (see above); any other could change retries or timeouts.
+case "${NEXTEST_PROFILE:-default}" in
+    default | ci) ;;
+    *) echo "NEXTEST_PROFILE=$NEXTEST_PROFILE: the lanes run profile default or ci only" >&2; exit 2 ;;
+esac
+
 # Set, not defaulted. A caller cannot silently weaken a lane by exporting something
 # different: these flags are part of what the attestation attests to.
 export CARGO_INCREMENTAL=0
@@ -240,6 +259,17 @@ lane_test_default() {
     # keeps the workspace's feature resolution, so the binaries above are reused, not rebuilt.
     run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked --workspace \
         -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
+    # Gap fill (`--db.gap-fill`, `auto` on Linux) reads with RWF_NOWAIT, which tmpfs refuses, and
+    # its tests assert only that fallback there: CI's `test` job keeps TMPDIR on /dev/shm. Rerun
+    # them on a temp dir under the target directory, on the disk, with TN_TEST_REQUIRE_GAP_FILL
+    # set, so a refusal fails them and every run writes gaps on Linux (crates/tn-lmdb/README.md,
+    # gap fill). The filter reuses the binaries above.
+    mkdir -p "${CARGO_TARGET_DIR:-target}/tmp-gap-fill"
+    local disk_tmp
+    disk_tmp=$(cd "${CARGO_TARGET_DIR:-target}/tmp-gap-fill" && pwd)
+    run env TMPDIR="$disk_tmp" TN_TEST_REQUIRE_GAP_FILL=1 cargo nextest run --locked --workspace \
+        -E '(package(tn-lmdb) & test(gap_fill)) | (package(tn-reth) & test(db_gap_fill))' \
+        "${run_mode[@]}"
 }
 
 lane_test_adiri() {
@@ -259,10 +289,14 @@ lane_test_adiri() {
     # tests failed under the adiri features. They pass now, so it is back. tn-engine
     # joined for #1247: with the mix-hash oracle dispatching on the fork gate, this lane
     # is the only one that runs its pre-fork legacy arm.
-    run cargo nextest run --locked \
-        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config \
-        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri \
-        "${run_mode[@]}"
+    local packages=(-p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config)
+    local features=tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri
+    run cargo nextest run --locked "${packages[@]}" --features "$features" "${run_mode[@]}"
+    # The adiri-gated suites of tn-reth and tn-engine on temp chains in layout v1, as
+    # lane_test_default reruns its own (every adiri datadir is v1 until it is rebuilt). The same
+    # packages and features, filtered, so the binaries above are reused.
+    run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked "${packages[@]}" \
+        --features "$features" -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
 }
 
 lane_test_mdbx() {
