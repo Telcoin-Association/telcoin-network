@@ -322,9 +322,10 @@ pub struct Parameters {
     #[serde(default = "Parameters::default_allow_private_forward_targets")]
     pub allow_private_forward_targets: bool,
     // ---- runtime switches: begin ----
-    // one field per switch, defaulting to the behaviour from before the switch existed; every
-    // field here also gets its default in `Default for Parameters` and an entry in
-    // `runtime_switches!`
+    // one field per switch, `#[serde(default, skip_serializing_if =
+    // "Parameters::switch_at_default")]`, whose type's default is the behaviour from before the
+    // switch existed; every field here also gets its default in `Default for Parameters` and an
+    // entry in `runtime_switches!`
     // ---- runtime switches: end ----
 }
 
@@ -569,6 +570,17 @@ impl Parameters {
             self.basefee_address
         );
     }
+
+    /// Whether `value`, a runtime switch, is its type's default: the serde
+    /// `skip_serializing_if` predicate of every switch field.
+    ///
+    /// A switch at its default is left out when the parameters are written, so a written
+    /// `parameters.yaml` (the genesis ceremony's, a regenerated chain preset) holds the same keys
+    /// as one from before the switch existed, and a key absent from a node's file means the
+    /// default.
+    pub fn switch_at_default<T: Default + PartialEq>(value: &T) -> bool {
+        *value == T::default()
+    }
 }
 
 /// Defines [`Parameters::switches`] from the one list of runtime switch fields.
@@ -584,7 +596,9 @@ macro_rules! runtime_switches {
             /// A switch turns one behaviour change on or off per benchmark arm, and its default is
             /// the behaviour from before the switch existed. A mistyped key is ignored without an
             /// error, like any unknown key, so the node logs this list once at start and exports
-            /// it as a gauge: that shows which arm a node actually runs.
+            /// it as a gauge: that shows which arm a node actually runs. A switch at its default
+            /// is left out when the parameters are written, so a key absent from a node's file
+            /// means the default.
             ///
             /// Every switch field must be listed here. A test fails while one is missing.
             pub fn switches(&self) -> Vec<(&'static str, SwitchValue)> {
@@ -1165,36 +1179,88 @@ mod test {
         serde_yaml::from_value(yaml).expect("flipped switches parse")
     }
 
-    /// The switch list names every field that is not a plain parameter, once, by its YAML key.
+    /// A deserializer that records the field names a struct's `Deserialize` impl asks for, then
+    /// stops. It sees every field, including those a serializer leaves out.
+    struct FieldNames<'a>(&'a mut Vec<&'static str>);
+
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("only a struct's field names are collected"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0.extend_from_slice(fields);
+            Err(serde::de::Error::custom("field names collected"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+            option unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier
+            ignored_any
+        }
+    }
+
+    /// The switch list names every field that is not a plain parameter, once, by its YAML key,
+    /// and a default `Parameters` writes only the plain parameters.
     #[test]
     fn switches_list_every_switch_field() {
-        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
-        let fields: std::collections::BTreeSet<String> = yaml
-            .as_mapping()
-            .expect("parameters serialize as a mapping")
-            .iter()
-            .map(|(key, _)| key.as_str().expect("parameter keys are strings").to_string())
-            .filter(|key| !NON_SWITCH_KEYS.contains(&key.as_str()))
-            .collect();
+        let mut names = Vec::new();
+        <Parameters as serde::Deserialize>::deserialize(FieldNames(&mut names))
+            .expect_err("the probe stops once it has the field names");
+        for key in NON_SWITCH_KEYS {
+            assert!(
+                names.contains(key),
+                "NON_SWITCH_KEYS names {key}, which is no field: {names:?}"
+            );
+        }
+        let fields: std::collections::BTreeSet<&str> =
+            names.into_iter().filter(|name| !NON_SWITCH_KEYS.contains(name)).collect();
         let switches = Parameters::default().switches();
-        let listed: std::collections::BTreeSet<String> =
-            switches.iter().map(|(name, _)| name.to_string()).collect();
+        let listed: std::collections::BTreeSet<&str> =
+            switches.iter().map(|(name, _)| *name).collect();
         assert_eq!(listed.len(), switches.len(), "a switch is listed twice: {switches:?}");
         assert_eq!(
             listed, fields,
             "every Parameters field must be listed by Parameters::switches or in NON_SWITCH_KEYS"
         );
+
+        // the genesis ceremony writes `Parameters::default()`; it must match the pre-switch file
+        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        let written: std::collections::BTreeSet<String> = yaml
+            .as_mapping()
+            .expect("parameters serialize as a mapping")
+            .iter()
+            .map(|(key, _)| key.as_str().expect("parameter keys are strings").to_string())
+            .collect();
+        let plain: std::collections::BTreeSet<String> =
+            NON_SWITCH_KEYS.iter().map(|key| key.to_string()).collect();
+        assert_eq!(written, plain, "a default switch must not be written");
     }
 
-    /// Each listed value is the value of its own field, rendered as the YAML serializer writes it,
-    /// at the defaults and with every switch flipped.
+    /// Each listed value is the value of its own field. Away from its default it renders as the
+    /// YAML serializer writes it; at its default it is not written, and its rendering parses back
+    /// to the default.
     #[test]
     fn switch_values_render_as_their_yaml() {
-        for params in [Parameters::default(), every_switch_flipped()] {
-            let yaml = serde_yaml::to_value(&params).expect("parameters serialize");
-            for (name, value) in params.switches() {
-                assert_eq!(value.to_string(), yaml_scalar(&yaml[name]), "switch {name}");
-            }
+        let flipped = every_switch_flipped();
+        let yaml = serde_yaml::to_value(&flipped).expect("parameters serialize");
+        for (name, value) in flipped.switches() {
+            assert_eq!(value.to_string(), yaml_scalar(&yaml[name]), "switch {name}");
+        }
+        let yaml = serde_yaml::to_value(Parameters::default()).expect("parameters serialize");
+        for (name, value) in Parameters::default().switches() {
+            assert_eq!(yaml.get(name), None, "default switch {name} is written");
+            assert_eq!(parse_with(&format!("{name}: {value}")), parse_with(""), "switch {name}");
         }
         let defaults = Parameters::default().switches();
         for ((name, default), (_, flipped)) in
@@ -1253,8 +1319,40 @@ mod test {
         assert_eq!(parse_with("gc_depth: 40").switches(), Parameters::default().switches());
     }
 
+    /// A field under the switch attributes is not written at its type's default and reads back as
+    /// that default when absent; away from its default it is written and reads back. Checked on a
+    /// stand-in struct with one field of each switch kind, so the rule holds before any switch
+    /// field exists.
+    #[test]
+    fn switch_at_default_is_not_written() {
+        #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Switches {
+            #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+            on: bool,
+            #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+            count: u32,
+            #[serde(
+                with = "humantime_serde",
+                default,
+                skip_serializing_if = "Parameters::switch_at_default"
+            )]
+            grace: Duration,
+        }
+        let written = serde_yaml::to_value(Switches::default()).expect("switches serialize");
+        assert_eq!(written.as_mapping().map(|mapping| mapping.len()), Some(0), "{written:?}");
+        let absent: Switches = serde_yaml::from_str("{}").expect("an empty file parses");
+        assert_eq!(absent, Switches::default());
+
+        let flipped = Switches { on: true, count: 3, grace: Duration::from_millis(150) };
+        let written = serde_yaml::to_value(&flipped).expect("switches serialize");
+        let expected: serde_yaml::Value =
+            serde_yaml::from_str("on: true\ncount: 3\ngrace: 150ms").expect("yaml parses");
+        assert_eq!(written, expected);
+        assert_eq!(serde_yaml::from_value::<Switches>(written).expect("reads back"), flipped);
+    }
+
     /// Re-serializing a file that predates the switches keeps every key it held at the same
-    /// value, and the result parses back to the same parameters.
+    /// value, adds no switch key, and the result parses back to the same parameters.
     ///
     /// Strings compare without case: an address is written back in lowercase hex whatever its
     /// checksum case in the file, which is the same address.
@@ -1280,6 +1378,9 @@ mod test {
                     Some(lowercase(value)),
                     "key {key:?} changed on re-serialization"
                 );
+            }
+            for (name, _) in params.switches() {
+                assert_eq!(output.get(name), None, "re-serialization added switch {name}");
             }
             let reparsed: Parameters = serde_yaml::from_value(output).expect("output parses");
             assert_eq!(reparsed, params);
