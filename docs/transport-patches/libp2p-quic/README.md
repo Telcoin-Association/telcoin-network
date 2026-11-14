@@ -18,12 +18,14 @@ reporting still apply.
 | Maintained mirror | [Telcoin's tracked vendored tree](../../../patches/libp2p-quic) |
 | Exact patch revision | [`372fa302bbb85758c9341b2c6b2247db3e9601ca`](https://github.com/Telcoin-Association/telcoin-network/commit/372fa302bbb85758c9341b2c6b2247db3e9601ca) |
 | Override | Root `[patch.crates-io]`, `libp2p-quic = { path = "patches/libp2p-quic" }`, excluded from workspace membership |
-| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `444cba51a1bc018163e1176ce42e58453b7761a3909895cc035e77203c58849d` |
-| Runtime tree fingerprint | `31dd6839aa578069f3c8847401fa95baa5fe3a339dd2d2908e4ad70ae32f4884` |
+| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `3c51558c8cce24ef5abc28cf898126b96cf50a70e4c5575204be056f26c26804` |
+| Runtime tree fingerprint | `63881e6b0b96a278771c4af15976c916c14f84939bea2bd4dd14fd11180908d1` |
 
 The patch revision identifies the current Retry and incoming-observation source. The original
 Retry policy was introduced in `a740a484e4944871f8a81e825ce84dd1559ee158`; issue #1680 adds the
 [Quinn observation companion](../quinn-proto/README.md) and lifecycle observations.
+The patch also keeps a dial to a non-loopback address off a listener bound to a loopback IP
+(see [PATCH.md](../../../patches/libp2p-quic/PATCH.md)).
 The fingerprint excludes only `PATCH.md` and `upstream.diff`; per-file hashes
 are retained in the source evidence. Cargo selects the path package, not an
 unused override. `libp2p-tls`, `quinn` and crypto dependencies remain registry packages.
