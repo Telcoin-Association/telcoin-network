@@ -776,8 +776,9 @@ mod tn_lmdb {
 
     /// `db check` runs the engine's full check on a stopped node's database: it passes on a
     /// healthy one, listing every table the node created with the file's page accounting;
-    /// it is refused while a read-write handle holds the database; and damage at rest (pages
-    /// overwritten) fails it with an error naming the directory, the file unchanged.
+    /// it is refused while a read-write handle holds the database; and damage at rest that only
+    /// a page's CRC finds (one value byte of one row, in a leaf the open does not read) fails the
+    /// check itself with an error naming the directory, the file unchanged.
     #[test]
     fn db_check_reports_the_state_and_fails_on_damage() {
         use std::os::unix::fs::FileExt as _;
@@ -803,21 +804,22 @@ mod tn_lmdb {
             + report.free_pages;
         assert_eq!(counted, report.page_count, "the accounting is exact: {report:?}");
 
-        // Pages past the roots open checks (the 2000 `CanonicalHeaders` rows span many leaves),
-        // so the damage is the check's to find; an open that refuses the file is a refusal too.
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path.join(tn_lmdb_reth::DATA_FILE))
-            .expect("the data file");
-        file.write_all_at(&[0xFF; 4 * 4096], 8 * 4096).expect("overwrite pages 8 to 11");
-        let before = std::fs::read(path.join(tn_lmdb_reth::DATA_FILE)).expect("read");
-        let err = format!("{:#}", db_check(&path).expect_err("damaged pages fail the check"));
-        assert!(
-            err.contains("fails its check") || err.contains("corrupted"),
-            "the damage is reported: {err}"
-        );
+        // The last byte of a `CanonicalHeaders` value: 31 zero bytes, then the row number's low
+        // byte (rows 232, 488, ... hold 0xe8). The page's header stays valid, so only its CRC
+        // finds the change, and the 2000 rows span many leaves past the roots the open reads.
+        let data = path.join(tn_lmdb_reth::DATA_FILE);
+        let value = [[0u8; 31].as_slice(), &[0xe8]].concat();
+        let at = std::fs::read(&data).expect("read").windows(32).position(|w| w == value);
+        let at = at.expect("a row's value in the file") + 31;
+        let file = std::fs::OpenOptions::new().write(true).open(&data).expect("the data file");
+        file.write_all_at(&[0xe9], at as u64).expect("flip one value byte");
+        drop(file);
+        drop(open_tn_lmdb_read_only(&path).expect("the open does not read the damaged leaf"));
+        let before = std::fs::read(&data).expect("read");
+        let err = format!("{:#}", db_check(&path).expect_err("the damaged leaf fails the check"));
+        assert!(err.contains("fails its check"), "the check reports the damage: {err}");
         assert!(err.contains(&path.display().to_string()), "names the directory: {err}");
-        assert_eq!(std::fs::read(path.join(tn_lmdb_reth::DATA_FILE)).expect("read"), before);
+        assert_eq!(std::fs::read(&data).expect("read"), before);
     }
 
     /// A directory without either engine's file holds no reth database, and the stats say so.
