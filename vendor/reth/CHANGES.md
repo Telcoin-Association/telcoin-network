@@ -1866,7 +1866,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   The checksums alone did not close one gap: the open-time heal's prune-direction arms
   (`consistency.rs`) trusted the offsets file's length and final offset, so an offsets file one
   row short, or a flipped high bit in the final offset, cut a committed row and rewrote the
-  configuration without an error. TN-0130 refuses that in checksummed jars.
+  configuration without an error. TN-0130 refuses that in checksummed jars, and TN-0162 a final
+  offset moved down, which the append-direction arm cut the data file to.
 
 - **TN-0121** — Checksummed `.csoff` records, and the changeset read paths fail closed on
   damage. *Kind*: feature (storage integrity) and fix (static-file read paths).
@@ -2633,3 +2634,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `a_failed_sync_leaves_the_configuration_unwritten` (TN-0138's, now with a retried sync and a
   finalize refused, and each sync also failed without running). Mutation-checked: no refusal in
   `finalize` (both tests fail). *Upstream*: maybe (the drain and the prune order are upstream's).
+
+- **TN-0162** — The open-time heal verifies a checksummed jar's last committed value before it
+  cuts the data file to the final offset. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs}` (`NippyJarChecker`'s
+  append-direction data arm, `verify_last_value`; test).
+  *Why*: a data file longer than the final offset is what an interrupted append leaves, and the
+  heal (run at every start on each segment's latest jar) cut it to that offset. The offset itself
+  was not checked: a bit cleared in a checksummed jar's final offset made the heal cut committed
+  bytes of the last value, after which every read of it failed and the next appends started
+  inside it. TN-0130's refusals cover only files shorter than the configuration. Now, in a
+  checksummed jar, the value that ends at the final offset (the last committed row's last
+  column, starting at the offset before it) must verify before the cut; otherwise the open fails
+  with `ChecksumMismatch` naming that row and column and cuts nothing. A version-1 jar keeps
+  upstream's heal. *Can reach execution or storage*: storage, on damage only: an intact jar's last
+  value verifies and the heal cuts what it cut before. *Tests*:
+  `test_heal_refuses_a_final_offset_moved_down` (the final offset lowered by 1, 4 and 8: refused,
+  files unchanged; an intact jar with an uncommitted row still healed to its committed files).
+  Mutation-checked: no verification (the test fails). *Upstream*: no (TN-0120's checksums).

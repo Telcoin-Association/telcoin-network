@@ -1844,6 +1844,48 @@ mod tests {
         }
     }
 
+    /// TN(TN-0162): a checksummed jar whose final offset moved down (a cleared bit) leaves its
+    /// data file longer than the offset, as an interrupted append does. The heal verifies the last
+    /// committed value before it cuts the data to that offset: refused, every file unchanged. An
+    /// uncommitted row past the committed ones is still cut. Fails if the heal cuts to the damaged
+    /// offset.
+    #[test]
+    fn test_heal_refuses_a_final_offset_moved_down() {
+        let (col1, col2) = test_data(Some(15));
+        let rows = col1.len();
+        for moved_by in [1u64, 4, 1 << 3] {
+            let jar = tempfile::NamedTempFile::new().unwrap();
+            freeze_version(jar.path(), &col1, &col2, true);
+            let offsets = jar.path().with_extension(OFFSETS_FILE_EXTENSION);
+            let mut bytes = std::fs::read(&offsets).unwrap();
+            let at = bytes.len() - 8;
+            let last = u64::from_le_bytes(bytes[at..].try_into().unwrap());
+            bytes[at..].copy_from_slice(&(last - moved_by).to_le_bytes());
+            std::fs::write(&offsets, &bytes).unwrap();
+            let damaged = jar_files(jar.path());
+            let err = NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&err, NippyJarError::ChecksumMismatch { row, column: 1, .. }
+                    if *row == rows as u64 - 1),
+                "moved by {moved_by}: {err}"
+            );
+            assert_eq!(jar_files(jar.path()), damaged, "moved by {moved_by}");
+        }
+
+        // An intact jar with an uncommitted row: healed as before.
+        let jar = tempfile::NamedTempFile::new().unwrap();
+        freeze_version(jar.path(), &col1, &col2, true);
+        let committed = jar_files(jar.path());
+        let mut writer =
+            NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap();
+        append_row(&mut writer, &col1, &col2, 0);
+        writer.sync_all().unwrap();
+        drop(writer);
+        drop(NippyJarWriter::new(NippyJar::load_without_header(jar.path()).unwrap()).unwrap());
+        assert_eq!(jar_files(jar.path()), committed);
+    }
+
     /// TN(TN-0152): a plain jar's offsets file cut to 2 to 8 bytes (its offset size and less than
     /// one offset) is an error at the writer's open: the heal counts no rows in it and then reads
     /// its final offset, which starts before the file's second byte. It underflowed (a panic with

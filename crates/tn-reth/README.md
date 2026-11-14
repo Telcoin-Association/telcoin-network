@@ -833,8 +833,9 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   value (`damaged_v2_changeset_fails_pinned_reads_closed`). RPC reads of the damaged rows fail;
   others answer. Startup opens each segment's latest file to heal an interrupted write, and
   refuses that file, rather than cutting it, when its `.csoff` holds a committed record that fails
-  its checksum, or when it or its `.csoff` is shorter than its committed configuration (a prune
-  commits the configuration before it shrinks a file, so only damage leaves that); older files are
+  its checksum, when the last committed value, which ends where an uncommitted tail would be cut,
+  fails its checksum, or when it or its `.csoff` is shorter than its committed configuration (a
+  prune commits the configuration before it shrinks a file, so only damage leaves that); older files are
   verified as they are read. Startup also refuses a segment whose files skip blocks between two of
   them (a file missing: `<segment> static files skip blocks`). A checksum binds a value to its row
   and column, not to its file, so another file's bytes under a jar's name are caught only in part.
