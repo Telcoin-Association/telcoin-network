@@ -105,26 +105,32 @@ Use this rollout order:
 5. Compare every node's running version, configuration digest, peer set, and chain progress with the release's signed checksums and release notes.
 6. Stop before the rollback cutoff if acceptance checks fail, restore the prior artifact and configuration, and verify recovery.
 
-The release that moves the consensus database to tndb makes a one-way change.
-On its first start the node copies its consensus database from MDBX into `<datadir>/consensus-db/tndb`, makes the copy durable, and then deletes the MDBX files.
+The consensus database moved from MDBX to tndb in `v0.17.0-adiri`, one-way.
+On its first start a node copies its consensus database from MDBX into `<datadir>/consensus-db/tndb`, makes the copy durable, and then deletes the MDBX files.
 
-Once a node has started this release, rolling it back to an earlier (MDBX) release is not supported.
-The earlier release would find no MDBX data and start with no record of the votes and proposals this validator has made, so it could sign conflicting messages.
-The last rollback point for each node is before it first starts this release.
-Fix any problem found after that forward, with a later release.
-
-The same release moves the execution (reth) database from MDBX to tn-lmdb, also one-way.
+This release moves the execution (reth) database from MDBX to tn-lmdb, also one-way.
 On its first start the node copies `db/mdbx.dat` into `db/tn-lmdb.dat`, verifies the copy against it, makes it durable, and then deletes the MDBX files.
 It needs free disk for the database's live pages plus a quarter plus 1 GiB (or the `--db.growth-step`, if larger) while it copies, and refuses to start, with nothing changed, when there is less.
 The migrated datadir keeps reth's storage layout v1; only a new datadir gets layout v2.
+A node still on `v0.16.0-adiri` makes both moves at its first start of this release.
 
-There is no automatic rollback for either migration.
+This release also raises the validator disk minimum from 10,000 to 20,000 sustained write IOPS and from 300 MB/s to 800 MiB/s, and turns gap fill on by default on Linux (`--db.gap-fill auto`), which needs a drive that writes each logical block atomically when the power fails.
+Check each validator's volume against [Execution database: disk and memory](execution-database-hardware.md) before the upgrade; on any other drive, run with `--db.gap-fill off`.
+
+Once a node has started this release, rolling it back to an earlier release is not supported.
+The last rollback point for each node is before it first starts this release.
+Fix any problem found after that forward, with a later release.
 An earlier release refuses the migrated execution database before it changes anything, at the version file `db/database.version`; do not edit or remove that file to get past the refusal.
-To go back, stop the node and restore the backup of the whole datadir taken, with the node stopped, before its first start on this release.
-Without that backup there is no safe way back for a validator.
+Restoring a backup taken before the upgrade is no way back either: the earlier release computes the state root of some blocks differently (next paragraph), and a restored `consensus-db/` has no record of the votes and proposals the validator made since, so it could sign conflicting messages.
+Whenever a validator's `consensus-db/` is restored from a backup or moved aside, keep the validator stopped until the network has closed the epoch it was last in.
 
-Upgrade every node in place first: since #1788 this release and the previous one cannot peer, so a mixed committee stalls.
-No automated test upgrades a committee from `v0.16.0-adiri`: the e2e upgrade tests start from this release's own MDBX build, and the one run on real `v0.16.0-adiri` datadirs upgraded a single validator, which migrated both databases and then could not peer; rehearse the whole-committee upgrade, every node stopped and then started on this release, on a test network first.
+Upgrade the validators from `v0.17.0-adiri` all at once, not in the rollout order above: stop every validator, then start every validator on this release.
+This release fixes the state root of a rare trie shape (TN-0140 in `vendor/reth/CHANGES.md`).
+On a block where the shape occurs, the two releases compute different block hashes, and a committee that mixes them splits on that block: with five validators and a quorum of four, a split of two and three halts consensus.
+Adiri's history up to block 529,583 (the close of epoch 751) holds no such block: an observer on this release synced adiri from genesis and reproduced every certified epoch record's closing block.
+A block the old release builds later, during a rolling upgrade included, can still be one.
+Observers can upgrade first: one on this release that meets such a block stops rather than follow it.
+No automated test upgrades a whole committee at once; rehearse it, every node stopped and then started on this release, on a test network first.
 Once every node runs this release, an existing datadir moves to layout v2 only by rebuilding its execution database from genesis.
 With the node stopped, `telcoin-network db reset-execution --datadir <datadir>` shows what it would move, and with `--force` it moves `db/`, `static_files/` and any `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`; the next start re-executes the chain from genesis.
 The rebuild replays epoch 0 from the node's own consensus packs, so the command refuses, moving nothing, a datadir bootstrapped with `db load-state`, which holds consensus only from the restored epoch on; such a node rebuilds as a new one, with `consensus-db/` moved aside as well.
