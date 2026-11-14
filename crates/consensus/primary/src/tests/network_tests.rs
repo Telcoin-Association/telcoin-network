@@ -5517,7 +5517,8 @@ async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<(
 /// recorded for or an earlier one (a mode change, or the first handler of the lagging epoch), and
 /// a handler of a later epoch starts it at zero.
 ///
-/// The value lives in a process-wide static, so this test must run in its own process (nextest).
+/// The recorded value lives on this test's bus and the gauge is read through this test's own
+/// recorder, so tests sharing one process (`cargo test`) cannot move either.
 #[tokio::test]
 async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();

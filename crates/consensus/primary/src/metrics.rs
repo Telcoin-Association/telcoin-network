@@ -7,7 +7,10 @@ use reth_metrics::{
     Metrics,
 };
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tn_types::{Epoch, Noticer, Round, TaskSpawner};
@@ -23,16 +26,6 @@ pub(crate) mod test_recorder;
 /// The `metrics` `Gauge` handle has no getter, so the "max since startup" gauge needs an
 /// external running max. There is one `PrimaryMetrics` per process, so a static is fine.
 static MAX_CONSENSUS_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Process-wide epoch and running max behind `tn_primary_epoch_entry_rounds_behind`.
-///
-/// The gauge has no getter, and the request handler that records it is rebuilt on every mode
-/// change inside an epoch, so the max is kept here, keyed by the certificates' epoch. `None`
-/// until the first request handler starts. There is one `PrimaryMetrics` per process, so a
-/// static is fine; tests that build several buses share it, so a test that reads the gauge
-/// relies on nextest running it in its own process. The gauge is written under this lock, so
-/// certificates checked side by side cannot leave it below the max.
-static EPOCH_ENTRY_ROUNDS_BEHIND: Mutex<Option<(Epoch, Round)>> = parking_lot::const_mutex(None);
 
 /// Metrics for the primary's consensus pipeline.
 ///
@@ -165,6 +158,16 @@ pub struct PrimaryMetrics {
     /// it a few rounds further. A request handler built for a later epoch than the recorded one
     /// starts it at zero; one rebuilt by a mode change inside the epoch keeps it.
     pub(crate) epoch_entry_rounds_behind: Gauge,
+    /// The epoch and running max behind [`Self::epoch_entry_rounds_behind`], `None` until the
+    /// first request handler starts.
+    ///
+    /// The gauge has no getter, and the request handler that records it is rebuilt on every mode
+    /// change inside an epoch, so the max is kept here, on the application-lifetime bus, keyed by
+    /// the certificates' epoch. Each bus has its own, so nodes and tests that share a process do
+    /// not share it. The gauge is written under this lock, so certificates checked side by side
+    /// cannot leave it below the max.
+    #[metric(skip)]
+    epoch_entry: Arc<Mutex<Option<(Epoch, Round)>>>,
 }
 
 impl PrimaryMetrics {
@@ -184,7 +187,7 @@ impl PrimaryMetrics {
     /// the first handler of an epoch whose certificates the previous epoch's handler saw while
     /// execution was still behind.
     pub(crate) fn start_epoch_entry_rounds_behind(&self, epoch: Epoch) {
-        let mut entry = EPOCH_ENTRY_ROUNDS_BEHIND.lock();
+        let mut entry = self.epoch_entry.lock();
         if entry.is_none_or(|(recorded, _)| recorded < epoch) {
             *entry = Some((epoch, 0));
             self.epoch_entry_rounds_behind.set(0.0);
@@ -198,7 +201,7 @@ impl PrimaryMetrics {
     /// This node has executed nothing of that epoch, so the round is how far it trails the
     /// committee there. Observation only: the caller decides as before.
     pub(crate) fn record_epoch_entry_rounds_behind(&self, epoch: Epoch, round: Round) {
-        let mut entry = EPOCH_ENTRY_ROUNDS_BEHIND.lock();
+        let mut entry = self.epoch_entry.lock();
         if entry.is_none_or(|recorded| recorded < (epoch, round)) {
             *entry = Some((epoch, round));
             self.epoch_entry_rounds_behind.set(f64::from(round));
