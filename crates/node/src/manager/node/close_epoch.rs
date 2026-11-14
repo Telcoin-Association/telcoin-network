@@ -330,6 +330,11 @@ where
     /// over every output it takes (`wait_for_epoch_boundary` is cancel safe). It
     /// is there so a regression stops a node cleanly instead of forking its
     /// execution.
+    ///
+    /// No honest path reaches the skip either, for the same reasons. A skip logs
+    /// the output's number and digest with `path = "leftover_queue"` and counts in
+    /// `tn_node.leftover_outputs_skipped_total`: a count above zero says an output
+    /// was queued twice.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
@@ -340,10 +345,14 @@ where
             let last_forwarded = self.last_forwarded_consensus_number;
             match check_output_continuity(last_forwarded, output.number()) {
                 OutputContinuity::Stale => {
+                    // none on an honest run (see the doc): a count says an output was queued twice
+                    metrics::counter!("tn_node.leftover_outputs_skipped_total").increment(1);
                     warn!(
                         target: "epoch-manager",
                         number = output.number(),
                         last_forwarded,
+                        digest = ?output.consensus_header_hash(),
+                        path = "leftover_queue",
                         "skipping already-forwarded consensus output",
                     );
                     continue;
@@ -3788,6 +3797,56 @@ mod tests {
         Ok(())
     }
 
+    /// Captures the fields of every event, so a test can read a log line without a log backend.
+    #[derive(Default)]
+    struct LineCapture(std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, String>>>);
+
+    impl LineCapture {
+        /// The fields of the first captured event whose message is `message`.
+        fn line(&self, message: &str) -> Option<std::collections::BTreeMap<&'static str, String>> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|fields| fields.get("message").is_some_and(|logged| logged == message))
+                .cloned()
+        }
+    }
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().expect("capture lock").push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// One event's fields, by name, as their `Debug` text.
+    #[derive(Default)]
+    struct FieldCapture(std::collections::BTreeMap<&'static str, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+    }
+
     // ---- bench7 epoch-loop-output-drop ----
 
     /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
@@ -3861,5 +3920,63 @@ mod tests {
         assert_eq!(received, [3], "forwarded once, in order");
         assert_eq!(last_forwarded, 3);
         Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
+
+    /// The queue phase's skip names the output it skips (number and digest) and the phase that
+    /// skipped it, and counts once in `tn_node.leftover_outputs_skipped_total`.
+    #[test]
+    fn the_leftover_drain_logs_and_counts_an_output_it_skips() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let capture = std::sync::Arc::new(LineCapture::default());
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let drain = async {
+            let temp = tempfile::TempDir::with_prefix("leftover_skip")?;
+            let (mut manager, _engine, _reth_env, _tasks, committee) =
+                super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+            manager.epoch_boundary = u64::MAX;
+            manager.last_forwarded_consensus_number = 2;
+            let stale = super::super::run_epoch::tests::member_output_at(&committee, 2);
+            let next = super::super::run_epoch::tests::member_output_at(&committee, 3);
+            let (queue_tx, mut queue) = mpsc::channel(8);
+            queue_tx.send(stale.clone()).await?;
+            queue_tx.send(next).await?;
+            let (to_engine, mut engine_rx) = mpsc::channel(8);
+            let drained =
+                manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await?;
+            assert!(drained.is_none(), "no boundary in reach");
+            assert_eq!(engine_rx.try_recv()?.number(), 3, "the next output is forwarded");
+            assert!(engine_rx.try_recv().is_err(), "the skipped one is not");
+            eyre::Ok(stale.consensus_header_hash())
+        };
+        let digest =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain)).expect("the drain runs");
+
+        let line = capture
+            .line("skipping already-forwarded consensus output")
+            .expect("the skip is logged");
+        let field = |name: &str| line.get(name).map(|value| value.trim_matches('"').to_string());
+        assert_eq!(field("number").as_deref(), Some("2"));
+        assert_eq!(field("last_forwarded").as_deref(), Some("2"));
+        assert_eq!(field("digest"), Some(format!("{digest:?}")));
+        assert_eq!(field("path").as_deref(), Some("leftover_queue"));
+        let skipped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_outputs_skipped_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(skipped, Some(1));
     }
 }

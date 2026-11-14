@@ -827,6 +827,8 @@ where
                         target: "epoch-manager",
                         number=output.number(),
                         last_forwarded=self.last_forwarded_consensus_number,
+                        digest=?output.consensus_header_hash(),
+                        path="live",
                         "skipping already-forwarded consensus output",
                     );
                     continue;
