@@ -5598,6 +5598,90 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
     assert_eq!(gauge(), Some(2.0), "a later epoch replaces a higher round");
     metrics.record_epoch_entry_rounds_behind(2, window);
     assert_eq!(gauge(), Some(2.0), "a certificate of an older epoch is ignored");
+    Ok(())
+}
+
+// ---- bench7 voter-lock ----
+
+/// A header from `author` at `round` that names `block`, created `round` ms after the UNIX epoch,
+/// far behind the wall clock, so the vote path's drift check never defers it.
+fn header_at(
+    committee: &CommitteeFixture<MemDatabase>,
+    author: &AuthorityFixture<MemDatabase>,
+    round: Round,
+    block: BlockNumHash,
+) -> Header {
+    author
+        .header_builder_at_round(&committee.committee(), round)
+        .latest_execution_block(block)
+        .build()
+}
+
+/// Vote requests queued for one author whose block has not executed take that author's vote lock
+/// in turn, and each waits out the execution wait under it: the k-th request is answered k
+/// execution waits after they all arrived (#1804).
+///
+/// Two authors queue six requests each at the same time. One sends rounds 1 to 6 in order, the
+/// other the same round-1 header six times (retries piling up). In each queue the k-th answer comes
+/// k waits in, so a newer round waits behind every older one, and the two queues run side by side
+/// because the lock is per author. The sixth answer comes after the vote timeout: the time a
+/// request waits for the lock is not bounded by it. Every answer is the recoverable
+/// `ExecutionBehind`, which leaves the author's vote-cache entry as it was, so no request is
+/// refused early on the lock either.
+#[tokio::test(start_paused = true)]
+async fn vote_queued_requests_of_one_author_wait_in_turn() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let vote_timeout = Parameters::default().vote_timeout;
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    // the paused clock jumps from timer to timer, so each answer lands on its turn's tick
+    let slack = Duration::from_millis(10);
+
+    // each request records when it was answered, measured from when all of them were sent
+    let start = tokio::time::Instant::now();
+    let answered_in_turn = |headers: Vec<Header>, peer: BlsPublicKey| {
+        let handler = &handler;
+        futures::future::join_all(headers.into_iter().map(move |header| async move {
+            let res = handler.vote(peer, header, Vec::new()).await;
+            (res, start.elapsed())
+        }))
+    };
+
+    let rounds_author = committee.last_authority();
+    let rounds = (1..=6).map(|round| header_at(&committee, rounds_author, round, unexecuted));
+    let copies_author = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let copies = vec![header_at(&committee, copies_author, 1, unexecuted); 6];
+    let (rounds, copies) = tokio::join!(
+        answered_in_turn(rounds.collect(), *rounds_author.authority().protocol_key()),
+        answered_in_turn(copies, *copies_author.authority().protocol_key()),
+    );
+
+    for (queue, results) in [("round", &rounds), ("copy", &copies)] {
+        for (turn, (res, at)) in (1..).zip(results) {
+            let due = VOTE_EXECUTION_WAIT * turn;
+            assert!(
+                *at >= due && *at < due + slack,
+                "{queue} {turn} waits under its author's lock behind {} earlier requests, so it is \
+                 due at {due:?}, answered at {at:?}",
+                turn - 1
+            );
+            assert_matches!(
+                res,
+                Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+                    header_block: 1,
+                    local_block: 0
+                })),
+                "{queue} {turn} is behind"
+            );
+        }
+        let (_, last) = results.last().expect("six requests");
+        assert!(
+            *last > vote_timeout,
+            "the last {queue} waits for the lock past the vote timeout {vote_timeout:?}, answered \
+             at {last:?}"
+        );
+    }
 
     Ok(())
 }
