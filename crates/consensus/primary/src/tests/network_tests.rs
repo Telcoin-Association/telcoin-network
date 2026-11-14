@@ -5746,9 +5746,11 @@ impl tracing::Subscriber for LinesAt {
 /// The same header five times (retries piling up): every request waits before the author lock,
 /// side by side, then each takes the lock in turn and finds the block still missing without
 /// waiting again, so all five are refused `ExecutionBehind` at one second. Rounds 1 to 5 from
-/// another author, arriving in order: after the shared wait the four older rounds are refused as
-/// superseded by round 5, which alone reaches the lock. With the switch off the same requests wait
-/// in turn (`vote_queued_requests_of_one_author_wait_in_turn`).
+/// another author, arriving in order while an earlier request holds that author's lock: after the
+/// shared wait the four older rounds are refused as superseded by round 5 with the lock still
+/// held, so by the check after the wait, and round 5 alone reaches the lock once it is free. With
+/// the switch off the same requests wait in turn
+/// (`vote_queued_requests_of_one_author_wait_in_turn`).
 #[tokio::test(start_paused = true)]
 async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -5781,17 +5783,30 @@ async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
 
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
+    // with the lock held, only the check after the wait before the lock can refuse a request
+    let held = handler.lock_author_vote(&author.id()).await.expect("a committee member");
+    let mut requests: Vec<_> = (1..=5)
+        .map(|round| {
+            Box::pin(handler.vote(
+                peer,
+                header_at(&committee, author, round, unexecuted),
+                Vec::new(),
+            ))
+        })
+        .collect();
+    // every round arrives, in order, before any wait ends
+    for request in &mut requests {
+        assert!(futures::poll!(request.as_mut()).is_pending(), "each request waits for execution");
+    }
+    let mut newest = requests.pop().expect("five requests");
     let start = tokio::time::Instant::now();
-    let results = futures::future::join_all((1..=5).map(|round| {
-        handler.vote(peer, header_at(&committee, author, round, unexecuted), Vec::new())
-    }))
-    .await;
+    let older = futures::future::join_all(requests).await;
     let waited = start.elapsed();
     assert!(
         waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
-        "five rounds must be answered after one execution wait, took {waited:?}"
+        "four older rounds must be answered after one execution wait, took {waited:?}"
     );
-    for (round, res) in (1..).zip(&results[..4]) {
+    for (round, res) in (1..).zip(&older) {
         assert_matches!(
             res,
             Err(PrimaryNetworkError::SupersededRequest {
@@ -5800,10 +5815,13 @@ async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
                 newest_epoch: 0,
                 newest_round: 5
             }) if *refused == round,
-            "round {round} is superseded by round 5"
+            "round {round} is superseded by round 5 while the lock is held"
         );
     }
-    assert!(behind(&results[4]), "round 5 reaches the lock and is behind: {:?}", results[4]);
+    assert!(futures::poll!(newest.as_mut()).is_pending(), "round 5 waits for the lock");
+    drop(held);
+    let newest = newest.await;
+    assert!(behind(&newest), "round 5 reaches the lock and is behind: {newest:?}");
 
     Ok(())
 }
@@ -5925,9 +5943,9 @@ async fn vote_queue_fix_far_future_round_does_not_move_mark() -> eyre::Result<()
     Ok(())
 }
 
-/// A request that fails the peer-is-author check does not move the author's mark, and one that
-/// names another epoch's committee is outside the window, so it is refused without the wait
-/// before the author lock: the author's own round-1 header still earns a vote after both.
+/// A request that fails the peer-is-author check does not move the author's mark: the author's own
+/// round-1 header still earns a vote after it. One that names another epoch's committee is outside
+/// the window, so it is refused without the wait before the author lock.
 #[tokio::test(start_paused = true)]
 async fn vote_queue_fix_unauthenticated_request_does_not_move_mark() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -5967,7 +5985,7 @@ async fn vote_queue_fix_unauthenticated_request_does_not_move_mark() -> eyre::Re
     assert_matches!(
         handler.vote(peer, first, Vec::new()).await?,
         PrimaryResponse::Vote(_),
-        "neither request may move the author's mark"
+        "the impostor's request must not move the author's mark"
     );
 
     Ok(())

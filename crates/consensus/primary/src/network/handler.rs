@@ -1047,8 +1047,11 @@ where
             // a request queued behind the author lock waits out the execution wait under it, one
             // request after another. wait here instead, side by side with the author's other
             // requests, and refuse the ones a newer request supersedes. a header outside the
-            // window is refused by `vote_inner` before its execution check, so it neither moves
-            // the mark nor waits
+            // window on arrival neither moves the mark nor waits: `vote_inner` refuses it before
+            // its execution check, unless the committed round moved it inside the window while
+            // it queued on the lock, when it is checked without a wait (a recoverable
+            // `ExecutionBehind` if its block is not executed yet). the wait runs before the header
+            // checks of `vote_inner`, so a header that fails them is refused after it
             let in_window = self.in_vote_window(&header);
             self.refuse_superseded_request(&header, in_window)?;
             if in_window {
@@ -1353,7 +1356,11 @@ where
     ///
     /// Only a request of the newest one's epoch and a strictly lower round is refused, so a retry
     /// of the same header and the resend that carries missing parents pass, and a header of
-    /// another epoch keeps the answer `vote_inner` gives it. The caller has checked that the peer
+    /// another epoch is never refused here and gets the answer it gets with the switch off. The
+    /// mark refuses any lower round of its author without checking the header, so a malformed
+    /// header below the mark (a round-0 one, say) is answered `SupersededRequest` without the
+    /// penalty its own check would bring; only the author's own requests get that far. The caller
+    /// has checked that the peer
     /// is the header's author, and records only a header inside [`Self::in_vote_window`]: one past
     /// it is never voted on, and a mark it set would refuse the author's real headers until its
     /// rounds caught up. It is asked on arrival, after the wait before the author lock and once
@@ -1525,9 +1532,9 @@ where
         // the header and the local clock. a tier-2 answer is uncached and carries no penalty, so
         // an author can make this node repeat it at will, with the same header or with a new one
         // for the same round; decided here, each repeat costs no signature verify, no execution
-        // wait (with `vote_queue_fix` on, after the bounded wait before the author lock) and no
-        // parent reads. a lead within the tolerance is waited out after the parent checks
-        // instead, because the time they take uses up part of it
+        // wait (with `vote_queue_fix` on, it has already paid the bounded wait before the author
+        // lock) and no parent reads. a lead within the tolerance is waited out after the parent
+        // checks instead, because the time they take uses up part of it
         if let HeaderLead::Deferred(reason) = self.check_header_lead(&header, subsecond_active)? {
             return Ok(PrimaryResponse::RecoverableError(reason));
         }
