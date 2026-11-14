@@ -906,12 +906,19 @@ pub(crate) fn take_advice_log() -> Vec<Option<Advice>> {
     ADVICE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
+/// Test-only: the env var that makes a gap fill test fail where the temp dir's file system
+/// refuses the gap fill's reads, instead of asserting the fallback. `etc/ci-lanes.sh test-default`
+/// sets it on its rerun of the gap fill tests on a disk-backed temp dir.
+#[cfg(all(test, target_os = "linux"))]
+const REQUIRE_GAP_FILL_VAR: &str = "TN_TEST_REQUIRE_GAP_FILL";
+
 /// Test-only: whether the file system holding `dir` refuses reads that do not wait for the disk
 /// (tmpfs refuses `RWF_NOWAIT`), where a gap fill turns itself off at its first read: the
 /// fallback a gap fill test asserts there. Probed on a file of its own by a `preadv2` of its own,
 /// not through [`PageFile::read_cached`], so a fault in that function's error mapping makes such
 /// a test fail rather than expect the fallback. Never on macOS, whose plain `pread` nothing
-/// refuses.
+/// refuses. With `TN_TEST_REQUIRE_GAP_FILL` set, a refusing file system panics instead: the run
+/// asked for gap fill to work.
 #[cfg(test)]
 pub(crate) fn refuses_nowait_reads(dir: &std::path::Path) -> bool {
     #[cfg(target_os = "linux")]
@@ -926,7 +933,15 @@ pub(crate) fn refuses_nowait_reads(dir: &std::path::Path) -> bool {
                 preadv2(&probe, &mut [io::IoSliceMut::new(&mut page)], 0, ReadWriteFlags::NOWAIT);
             match read {
                 Err(Errno::INTR) => {}
-                Err(Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS) => return true,
+                Err(errno @ (Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS)) => {
+                    assert!(
+                        std::env::var_os(REQUIRE_GAP_FILL_VAR).is_none(),
+                        "{REQUIRE_GAP_FILL_VAR} is set, but the file system holding {} refuses \
+                         RWF_NOWAIT ({errno}): put TMPDIR on a disk",
+                        dir.display()
+                    );
+                    return true;
+                }
                 Ok(_) | Err(_) => return false,
             }
         }

@@ -439,6 +439,8 @@ jobs:
       - name: Run tests
         # `ci` profile: retries = 2, so a flake is less likely to eject a PR from the
         # queue and force a rebuild of everything behind it. See etc/ci-lanes.sh.
+        # TMPDIR on tmpfs for speed; the lane reruns the gap-fill tests on a temp dir on the
+        # disk, since tmpfs refuses the reads a gap fill makes (etc/ci-lanes.sh, test-default).
         env:
           NEXTEST_PROFILE: ci
           TMPDIR: /dev/shm

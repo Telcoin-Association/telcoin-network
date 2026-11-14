@@ -11,6 +11,12 @@ crates.io holds the day a lane runs.
   python3 -I vendor/reth/tn/lockfile.py check    # what the test-vendor-reth lane runs
   python3 -I vendor/reth/tn/lockfile.py update   # rewrite tn/test-only.lock from a fresh resolve
 
+`check` compares registry and git packages. Of the crates TN's root `[patch.crates-io]` replaces
+with patches/<name>, it checks only revm-inspectors (TN-0085, below). The nested workspace
+compiles none of the others (quinn-proto, the libp2p crates): `cargo.sh tree -i quinn-proto`
+prints nothing, although `cargo metadata` lists it through reqwest's optional quinn. A vendored
+crate that compiled one would build the registry version, unchecked.
+
 `check` resolves the nested workspace from the seed and fails when:
   - the resolve holds a registry or git package that neither TN's lockfile nor tn/test-only.lock
     pins (a dependency reth's tests gained, or a pin that no longer fits TN's versions);

@@ -39,7 +39,10 @@ use alloy::{
     consensus::{
         SignableTransaction as _, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxLegacy,
     },
-    eips::{eip7594::BlobTransactionSidecarVariant, eip7702::Authorization},
+    eips::{
+        eip7594::BlobTransactionSidecarVariant,
+        eip7702::{Authorization, SignedAuthorization},
+    },
     hex,
     primitives::{utils::parse_ether, ChainId},
     signers::{
@@ -665,6 +668,28 @@ impl TransactionFactory {
         self.inc_nonce();
 
         TransactionSigned::new_unhashed(transaction, signature)
+    }
+
+    /// Sign `transaction`, built with [`Self::nonce`], with this factory's key, and advance the
+    /// nonce.
+    pub fn sign_transaction(&mut self, transaction: impl Into<Transaction>) -> TransactionSigned {
+        let transaction = transaction.into();
+        let signature = self.sign_hash(transaction.signature_hash());
+        self.inc_nonce();
+        TransactionSigned::new_unhashed(transaction, signature)
+    }
+
+    /// An EIP-7702 authorization signed with this factory's key: it delegates this factory's
+    /// account to `address`, and applies only while the account's nonce is `nonce`.
+    pub fn authorize(
+        &self,
+        chain_id: ChainId,
+        address: Address,
+        nonce: u64,
+    ) -> SignedAuthorization {
+        let authorization = Authorization { chain_id: U256::from(chain_id), address, nonce };
+        let signature = self.sign_hash(authorization.signature_hash());
+        authorization.into_signed(signature)
     }
 
     /// Sign the transaction hash with the key in memory

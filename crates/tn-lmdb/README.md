@@ -705,7 +705,10 @@ extra bytes, and two system calls per gap filled.
   `a_nowait_read_turns_gap_fill_off_on_any_error_but_eintr_and_eagain`). The read is advisory and
   nothing has been written for it, so no error of it fails the commit. The gap
   fill tests assert that fallback on such a file system (`file::refuses_nowait_reads`, a probe of
-  their own), so they fill gaps only where the temp dir is on a disk. No safe call reports residency
+  their own), so they fill gaps only where the temp dir is on a disk; with
+  `TN_TEST_REQUIRE_GAP_FILL=1` such a file system fails them instead. `etc/ci-lanes.sh
+  test-default` reruns them that way on a temp dir under the target directory, so the lane fills
+  gaps on Linux even where its `TMPDIR` is a tmpfs (CI's `test` job). No safe call reports residency
   without reading (`mincore` would be a raw call: new `unsafe`).
 - **macOS** has no `RWF_NOWAIT`: a gap is read with a plain `pread`, and a page not in memory
   costs a synchronous read. Gap fill there serves the tests and measurement, not production.

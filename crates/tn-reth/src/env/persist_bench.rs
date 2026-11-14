@@ -70,15 +70,17 @@
 //!   build instead opens its database with the engine's `SyncMode::NoSync` and no automatic syncs
 //!   through the test-only `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings, so its
 //!   no-sync rows time no sync at all.
-//! - `TN_PERSIST_BENCH_GAP_FILL` (0): tn-lmdb's gap fill (`--db.gap-fill`): a width in pages (0
-//!   off, at most 64) or `auto`. The tn-lmdb rows add the engine's counters per durable commit over
-//!   the timed loop (`IoStats`): `pages_per_commit`, `runs_per_commit` (runs of adjacent dirty
-//!   pages, before the fill), `gaps_filled_per_commit`, `gap_pages_per_commit`, `gap_misses`,
-//!   `writes_per_commit` (`runs - gaps filled + 1` for the meta: the writes Linux sends the disk, a
-//!   run longer than its largest write aside) and `gap_fill_us_per_commit`; under `auto` also the
-//!   mean width chosen (`auto_mean_width`), the last width and the fit at the run's end
-//!   (`auto_width`, `auto_run_ns`, `auto_page_ns`, `auto_gap_ns`, `auto_capped`), and its probes
-//!   and re-adaptations over the loop.
+//! - `TN_PERSIST_BENCH_GAP_FILL` (the node's default, `DEFAULT_DB_GAP_FILL`: `auto` on Linux, off
+//!   on macOS and on MDBX): tn-lmdb's gap fill (`--db.gap-fill`, always set, so the `gap_fill` the
+//!   rows print is the run's): a width in pages (0 or `off` is off, at most 64) or `auto`. The
+//!   tn-lmdb rows add the engine's counters per durable commit over the timed loop (`IoStats`):
+//!   `pages_per_commit`, `runs_per_commit` (runs of adjacent dirty pages, before the fill),
+//!   `gaps_filled_per_commit`, `gap_pages_per_commit`, `gap_misses`, `writes_per_commit` (`runs -
+//!   gaps filled + 1` for the meta: the writes Linux sends the disk, a run longer than its largest
+//!   write aside) and `gap_fill_us_per_commit`; under `auto` also the mean width chosen
+//!   (`auto_mean_width`), the last width and the fit at the run's end (`auto_width`, `auto_run_ns`,
+//!   `auto_page_ns`, `auto_gap_ns`, `auto_capped`), and its probes and re-adaptations over the
+//!   loop.
 //!
 //! **Caveats.**
 //!
@@ -183,9 +185,10 @@ impl Knobs {
             txs,
             per_commit: knob("TN_PERSIST_BENCH_PER_COMMIT", 4),
             accounts: knob("TN_PERSIST_BENCH_ACCOUNTS", 10_000),
-            gap_fill: std::env::var("TN_PERSIST_BENCH_GAP_FILL").map_or(GapFill::OFF, |v| {
-                v.parse().unwrap_or_else(|e| panic!("TN_PERSIST_BENCH_GAP_FILL: {e}"))
-            }),
+            gap_fill: std::env::var("TN_PERSIST_BENCH_GAP_FILL")
+                .map_or(crate::DEFAULT_DB_GAP_FILL, |v| {
+                    v.parse().unwrap_or_else(|e| panic!("TN_PERSIST_BENCH_GAP_FILL: {e}"))
+                }),
             durable,
             layout,
         }
@@ -460,7 +463,7 @@ fn run_mode(
         rpc: RpcServerArgs { ipcdisable: true, ..Default::default() },
         txpool: TxPoolArgs::default(),
         db: DatabaseArgs { sync_mode, ..Default::default() },
-        db_gap_fill: knobs.gap_fill.is_on().then_some(knobs.gap_fill),
+        db_gap_fill: Some(knobs.gap_fill),
     };
     let reth_config = RethConfig::new(command, None, datadir, false, chain.clone())
         .with_new_datadir_layout(knobs.layout);

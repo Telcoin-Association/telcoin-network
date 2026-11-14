@@ -126,6 +126,15 @@ class BackendGate(unittest.TestCase):
                 self.assertNotIn("the release graph of telcoin-network enables", out)
                 self.assertNotIn("the workspace graph", out)
 
+    def test_a_target_specific_dependency_enabling_mdbx_fails(self):
+        # Enabled on a target no CI or developer host is: the guard resolves every target.
+        self.write("bin/telcoin-network/Cargo.toml", node_manifest() + (
+            "\n[target.'cfg(target_os = \"freebsd\")'.dependencies]\n"
+            'tn-reth = { path = "../../crates/tn-reth", features = ["mdbx"] }\n'))
+        rc, out = self.gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the release graph of telcoin-network enables tn-reth's mdbx feature", out)
+
     def test_a_workspace_dev_dependency_enabling_mdbx_fails(self):
         self.write("crates/e2e-tests/Cargo.toml", E2E.format(features='"test-utils", "mdbx"'))
         rc, out = self.gate()

@@ -943,17 +943,20 @@ db reset-execution` moves it aside, and the next start rebuilds the execution da
   gives `None`), and one that does not know configuration held in the database heals a stale
   `.conf` and cuts rows the database committed. Only the marker, checked before any heal, stops it.
 - **reth's compiled-in zstd dictionaries** for transactions and receipts never change: a stored
-  value records that it is compressed, not with which dictionary.
+  value records that it is compressed, not with which dictionary. The format-freeze fixtures hold
+  transactions and receipts compressed with each, so a changed dictionary fails both tests.
 - **Two releases.** Release N reads the new format (and the old); release N+1 writes it. A
   one-release rollback then still opens every datadir; a release that writes what its predecessor
   refuses turns a rollback into a resync.
 
 **Format-freeze fixtures** (`src/env/format_freeze_tests.rs`). `tests/fixtures/format-freeze/`
 holds a v1 and a v2 tn-lmdb datadir built from one fixed chain (`genesis.json` and the module's
-plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions, contract creation, an account removal,
-an epoch close, a two-block output), each with its digests (`digests.txt`).
+plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions with and without access lists, contract
+creation, an account removal, receipts with logs, an EIP-7702 delegation set and cleared and one
+kept, an epoch close, a two-block output), each with its digests (`digests.txt`).
 `format_fixtures_read_back_unchanged` opens a copy of each with the current code and compares every
-table row, static-file row, provider read and the state-pack export; once the copy is closed,
+table row, static-file row, provider read, the plan's accounts at every past block, the registry's
+epoch state at every header and the state-pack export; once the copy is closed,
 every checked-in file but `db/tn-lmdb.dat` must still hold its bytes, so an open that rewrites a
 file (each segment's latest `.conf` is rewritten by the open's heal today, unchanged) fails.
 `format_writer_output_unchanged` builds the chain again and compares each tn-lmdb table's raw rows
@@ -981,7 +984,8 @@ TN_REGENERATE_FORMAT_FIXTURES=1 cargo test -p tn-reth --features test-utils --li
 ```
 
 It keeps `genesis.json` (delete it to rebuild it from the current contracts) and rewrites `v1/` and
-`v2/`. `tn-lmdb.dat` differs at every run (transaction ids, boot id); everything else is
+`v2/`. It refuses, before writing anything, a fixture whose version markers differ from the
+build's: move that fixture first, or delete it if no release has written its format. `tn-lmdb.dat` differs at every run (transaction ids, boot id); everything else is
 byte-identical, so review the `digests.txt` diff: every changed line must follow from the intended
 change.
 
@@ -1345,9 +1349,11 @@ large folios.
 
 Backend mode on a Linux machine (a consumer NVMe drive, ext4) at commit 06a413e9e: the six
 profiles, 2 ABBA rounds each, 300 timed outputs per run, durable sync, the bench's defaults
-otherwise. tn-lmdb passed on all six:
+otherwise. tn-lmdb was within the reference ratio on all six. The reference is the owners' target,
+compared by hand: `etc/reth-exec-bench.sh` prints the ratios and judges none of them, so a
+regression of any size still exits 0.
 
-| profile | tn-lmdb / MDBX | bar |
+| profile | tn-lmdb / MDBX | reference |
 |---|---|---|
 | `busy` | 0.980 | 1.02 |
 | `peak` (20 batches of 30M gas) | 1.013 | 1.02 |

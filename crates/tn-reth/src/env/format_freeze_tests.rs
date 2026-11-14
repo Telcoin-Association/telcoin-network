@@ -7,9 +7,11 @@
 //! - [`format_fixtures_read_back_unchanged`] (reader compatibility): opens a copy of each
 //!   checked-in datadir with the current code, through `RethEnv::new`, and reads back every row of
 //!   every reth table, every row of every static-file jar, the chain through the provider's readers
-//!   (headers, bodies, transactions, receipts, senders, both changesets) and the state-pack export.
-//!   Each read is digested and compared with the `read` lines. A binary that can no longer read
-//!   today's bytes, or reads them as other values, fails here.
+//!   (headers, bodies, transactions, receipts, senders, both changesets), the plan's accounts at
+//!   every block through the historical state provider (account, code, slots 0 to 9), the
+//!   registry's epoch state at every header, and the state-pack export. Each read is digested and
+//!   compared with the `read` lines. A binary that can no longer read today's bytes, or reads them
+//!   as other values, fails here.
 //! - [`format_writer_output_unchanged`] (writer stability): builds the chain again in a temp dir
 //!   and compares the `write` lines: each tn-lmdb table's ordered raw (key, value) pairs, and each
 //!   static file's bytes (data, `.off`, `.csoff`, `.conf`; the decompressed rows instead of the
@@ -21,18 +23,25 @@
 //!
 //! **The chain** ([`Plan`]), blocks 0 to [`TIP`], from a fixed genesis (`genesis.json`, checked in
 //! so a later contract artifact cannot change the chain): legacy, EIP-2930, EIP-1559 and EIP-7702
-//! transactions; value transfers that create accounts; a genesis slot zeroed, slots set and zeroed
-//! later; a contract created by a transaction and one created and self-destructed in one
-//! transaction; an empty genesis account removed by a touch (EIP-161); an epoch close, which
-//! rewrites `ConsensusRegistry` slots; and an output that executes two blocks. Storage wipes of
-//! existing slots cannot happen from Cancun on (EIP-6780), so none is covered.
+//! transactions, with and without access lists; value transfers that create accounts; a genesis
+//! slot zeroed, slots set and zeroed later; a contract created by a transaction and one created
+//! and self-destructed in one transaction; an empty genesis account removed by a touch (EIP-161);
+//! receipts with logs (`LOG0` to `LOG4`, so each such receipt is stored zstd-compressed); EIP-7702
+//! delegations to a contract, one cleared later by an authorization to the zero address and one
+//! held at the tip, and calls that run a delegated account's code; an epoch close, which rewrites
+//! `ConsensusRegistry` slots; and an output that executes two blocks. Storage wipes of existing
+//! slots cannot happen from Cancun on (EIP-6780), so none is covered. [`Plan::execute`] fails if
+//! the plan stops producing the logs or the delegations.
 //!
 //! **Not pinned**: `VersionHistory` (each open's wall clock and client version), the tn-lmdb file
 //! bytes, the compressed bytes of the headers jar, and anything outside the reth datadir (the
-//! consensus DB and packs).
+//! consensus DB and packs). The chain is short, so it also holds no history shard split past
+//! `NUM_OF_INDICES_IN_SHARD` (2,000 indices), no jar past block 499,999, no prune checkpoint or
+//! snapshot-restore scaffold (`crate::snapshot`), and no datadir migrated from MDBX.
 //!
 //! **Regenerating** is explicit, never part of a test run: see [`regenerate_format_fixtures`] and
-//! the crate README, "On-disk format versions".
+//! the crate README, "On-disk format versions". It refuses to rewrite a fixture whose `version`
+//! lines differ from the build's.
 
 use super::{database::TN_LMDB_DB_VERSION, layout::TN_LAYOUT_VERSION};
 use crate::{
@@ -45,6 +54,12 @@ use crate::{
     MaybePlatformPath, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethConfig, RethDb,
     RethEnv, StorageLayout,
 };
+use alloy::{
+    consensus::{TxEip2930, TxEip7702},
+    eips::eip2930::{AccessList, AccessListItem},
+    primitives::TxKind,
+    sol_types::SolValue as _,
+};
 use rand::{rngs::StdRng, SeedableRng as _};
 use reth_db::{
     cursor::DbCursorRO as _,
@@ -56,8 +71,9 @@ use reth_db::{
 };
 use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
 use reth_provider::{
-    BlockBodyIndicesProvider as _, ChangeSetReader as _, DatabaseProviderFactory as _,
-    HeaderProvider as _, ReceiptProvider as _, StaticFileProviderFactory as _, StaticFileSegment,
+    AccountReader as _, BlockBodyIndicesProvider as _, ChangeSetReader as _,
+    DatabaseProviderFactory as _, HeaderProvider as _, ReceiptProvider as _,
+    StateProviderFactory as _, StaticFileProviderFactory as _, StaticFileSegment,
     StorageChangeSetReader as _, StorageSettingsCache as _, TransactionsProvider as _,
 };
 use sha2::{Digest as _, Sha256};
@@ -105,17 +121,29 @@ regenerating the fixtures). An unintended version change is a bug.";
 const GENESIS_TIME: u64 = 1_767_225_600;
 
 /// The highest block the plan executes.
-const TIP: u64 = 6;
+const TIP: u64 = 9;
 
 /// A contract that stores its second calldata word at the slot its first word names:
 /// `SSTORE(calldataload(0), calldataload(32))`.
 const STORE_CODE: &[u8] = &[0x60, 0x20, 0x35, 0x60, 0x00, 0x35, 0x55, 0x00];
 
-/// Init code deploying [`STORE_CODE`]: `CODECOPY(0, 12, 8)`, then `RETURN(0, 8)`.
-const STORE_INIT: &[u8] = &[
-    0x60, 0x08, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x08, 0x60, 0x00, 0xf3, 0x60, 0x20, 0x35, 0x60,
-    0x00, 0x35, 0x55, 0x00,
+/// A contract that logs its calldata five times: `LOG0` to `LOG4`, with topics 1 to 4.
+const LOG_CODE: &[u8] = &[
+    0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+    0x36, 0x60, 0x00, 0xa0, // LOG0(0, CALLDATASIZE)
+    0x60, 0x01, 0x36, 0x60, 0x00, 0xa1, // LOG1(0, CALLDATASIZE, 1)
+    0x60, 0x02, 0x60, 0x01, 0x36, 0x60, 0x00, 0xa2, // LOG2(.., 1, 2)
+    0x60, 0x03, 0x60, 0x02, 0x60, 0x01, 0x36, 0x60, 0x00, 0xa3, // LOG3(.., 1, 2, 3)
+    0x60, 0x04, 0x60, 0x03, 0x60, 0x02, 0x60, 0x01, 0x36, 0x60, 0x00,
+    0xa4, // LOG4(.., 1, 2, 3, 4)
+    0x00,
 ];
+
+/// Init code deploying `code` (at most 255 bytes): `CODECOPY(0, 12, len)`, then `RETURN(0, len)`.
+fn init_code(code: &[u8]) -> Bytes {
+    let len = u8::try_from(code.len()).expect("init_code deploys at most 255 bytes");
+    [&[0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3], code].concat().into()
+}
 
 /// Init code that stores 1 at slot 0, then self-destructs in its own creation:
 /// `SSTORE(0, 1)`, `SELFDESTRUCT(CALLER)`.
@@ -180,15 +208,21 @@ struct PlannedOutput {
     batches: Vec<Vec<Vec<u8>>>,
 }
 
-/// The chain the fixtures hold: its spec and its outputs, in order.
+/// The chain the fixtures hold: its spec, its outputs in order, and the accounts it touches.
 struct Plan {
     chain: Arc<RethChainSpec>,
     outputs: Vec<PlannedOutput>,
+    /// The accounts the reader's historical reads cover.
+    accounts: Vec<Address>,
+    /// The two accounts block 8 and block 9 delegate (EIP-7702): the first is cleared in block 9,
+    /// the second holds its delegation at the tip.
+    delegated: [Address; 2],
 }
 
 impl Plan {
     /// The fixed plan over `genesis`. Every transaction is signed by the governance owner (seed
-    /// 33, funded in the genesis), from nonce 0.
+    /// 33, funded in the genesis), from nonce 0; the delegated accounts (seeds 34 and 35) sign
+    /// only their EIP-7702 authorizations.
     fn new(genesis: Genesis) -> Self {
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let chain_id = chain.chain.id();
@@ -203,7 +237,7 @@ impl Plan {
             call(Some(STORE), 0, store(4, 44)),
             call(Some(EMPTY), 0, Bytes::new()),
             call(Some(FRESH[0]), 1, Bytes::new()),
-            call(None, 0, Bytes::from_static(STORE_INIT)),
+            call(None, 0, init_code(STORE_CODE)),
             call(None, 0, Bytes::from_static(DESTRUCT_INIT)),
         ];
         let block2 = vec![
@@ -231,6 +265,99 @@ impl Plan {
         block6.push(owner.create_eip2930(chain_id, None, 100, STORE).encoded_2718());
         block6.push(owner.create_eip7702(chain_id, None, 100).encoded_2718());
 
+        // block 6's authorization is the owner's own, and applying it bumped the owner's nonce
+        owner.inc_nonce();
+        let logger = owner.address().create(owner.nonce());
+        let delegates = [34, 35]
+            .map(|seed| TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(seed)));
+        let delegated = delegates.each_ref().map(TransactionFactory::address);
+        let data = |len: u8| Bytes::from((0..len).collect::<Vec<u8>>());
+        let access_list = |items: &[(Address, &[u64])]| {
+            AccessList(
+                items
+                    .iter()
+                    .map(|&(address, slots)| AccessListItem {
+                        address,
+                        storage_keys: slots.iter().map(|&slot| word(slot)).collect(),
+                    })
+                    .collect(),
+            )
+        };
+        let block7 = vec![
+            owner.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                None,
+                U256::ZERO,
+                init_code(LOG_CODE),
+            ),
+            owner
+                .sign_transaction(TxEip2930 {
+                    chain_id,
+                    nonce: owner.nonce(),
+                    gas_price: 100,
+                    gas_limit: 1_000_000,
+                    to: TxKind::Call(STORE),
+                    value: U256::ZERO,
+                    access_list: access_list(&[(STORE, &[1, 8]), (FRESH[0], &[])]),
+                    input: store(8, 88),
+                })
+                .encoded_2718(),
+        ];
+        let block8 = vec![
+            // the first account delegates to the logger, in a call to another contract
+            owner
+                .sign_transaction(TxEip7702 {
+                    chain_id,
+                    nonce: owner.nonce(),
+                    gas_limit: 1_000_000,
+                    max_fee_per_gas: 100,
+                    max_priority_fee_per_gas: 0,
+                    to: STORE,
+                    value: U256::ZERO,
+                    access_list: access_list(&[(STORE, &[9])]),
+                    authorization_list: vec![delegates[0].authorize(chain_id, logger, 0)],
+                    input: store(9, 99),
+                })
+                .encoded_2718(),
+            // a call to the delegated account runs the logger's code
+            owner.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(delegated[0]),
+                U256::ZERO,
+                data(40),
+            ),
+            owner.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(logger),
+                U256::ZERO,
+                data(100),
+            ),
+        ];
+        // the first delegation is cleared and the second set, in a call to the second account
+        let block9 = vec![owner
+            .sign_transaction(TxEip7702 {
+                chain_id,
+                nonce: owner.nonce(),
+                gas_limit: 1_000_000,
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 0,
+                to: delegated[1],
+                value: U256::ZERO,
+                access_list: access_list(&[(logger, &[])]),
+                authorization_list: vec![
+                    delegates[0].authorize(chain_id, Address::ZERO, 1),
+                    delegates[1].authorize(chain_id, logger, 0),
+                ],
+                input: data(64),
+            })
+            .encoded_2718()];
+
         let output = |round, epoch, index: u64, close| {
             consensus_output_for_tests_at(round, epoch, index, close, GENESIS_TIME + 10 * index)
         };
@@ -242,8 +369,15 @@ impl Plan {
             // blocks 4 and 5: one output, two batches
             PlannedOutput { output: output(2, 1, 4, false), batches: vec![block4, block5] },
             PlannedOutput { output: output(4, 1, 5, false), batches: vec![block6] },
+            PlannedOutput { output: output(6, 1, 6, false), batches: vec![block7] },
+            PlannedOutput { output: output(8, 1, 7, false), batches: vec![block8] },
+            PlannedOutput { output: output(10, 1, 8, false), batches: vec![block9] },
         ];
-        Self { chain, outputs }
+        let owner = owner.address();
+        let mut accounts =
+            vec![owner, STORE, EMPTY, created, owner.create(5), logger, Address::ZERO];
+        accounts.extend(FRESH.into_iter().chain(delegated));
+        Self { chain, outputs, accounts, delegated }
     }
 
     /// Execute every output on `env`, from its genesis, as the engine does: one trie overlay an
@@ -252,6 +386,7 @@ impl Plan {
     fn execute(&self, env: &RethEnv) -> eyre::Result<()> {
         let canonical = env.blockchain_provider().canonical_in_memory_state();
         let mut parent = header(env, 0)?;
+        let mut logs = 0;
         for planned in &self.outputs {
             let mut overlay = OutputTrieOverlay::new();
             let mut blocks = Vec::new();
@@ -277,6 +412,7 @@ impl Plan {
                 if let Some(at) = receipts.iter().position(|receipt| !receipt.success) {
                     eyre::bail!("block {number}: transaction {at} reverted");
                 }
+                logs += receipts.iter().map(|receipt| receipt.logs.len()).sum::<usize>();
                 parent = block.recovered_block.clone_sealed_header();
                 canonical.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
                 canonical.set_canonical_head(parent.clone());
@@ -286,6 +422,19 @@ impl Plan {
             env.finalize_block(parent.clone())?;
         }
         eyre::ensure!(parent.number == TIP, "the plan ends at block {}, not {TIP}", parent.number);
+        // what a later edit of the plan must not lose: receipts with logs (each one compressed),
+        // one delegation cleared and one kept
+        eyre::ensure!(logs == 15, "the plan's receipts hold {logs} logs, not 15");
+        let state = env.blockchain_provider().latest()?;
+        let cleared = state.basic_account(&self.delegated[0])?.unwrap_or_default();
+        eyre::ensure!(
+            cleared.nonce == 2 && state.account_code(&self.delegated[0])?.is_none(),
+            "the first delegation was not set and cleared: {cleared:?}"
+        );
+        eyre::ensure!(
+            state.account_code(&self.delegated[1])?.is_some_and(|code| code.is_eip7702()),
+            "the second account holds no delegation at the tip"
+        );
         Ok(())
     }
 }
@@ -534,8 +683,14 @@ fn write_lines(opened: &Opened, root: &Path, lines: &mut Lines) -> eyre::Result<
 }
 
 /// The `read` lines of `opened`: every table decoded, every jar's rows, the chain through the
-/// provider's readers, and the state-pack export at the tip.
-fn read_lines(opened: &Opened, root: &Path, lines: &mut Lines) -> eyre::Result<()> {
+/// provider's readers, the historical state of `accounts` and the registry's epoch state at every
+/// block, and the state-pack export at the tip.
+fn read_lines(
+    opened: &Opened,
+    root: &Path,
+    accounts: &[Address],
+    lines: &mut Lines,
+) -> eyre::Result<()> {
     let env = &opened.env;
     let provider = env.blockchain_provider().database_provider_ro()?;
     digest_tables(&opened.db, provider.tx_ref(), false, lines)?;
@@ -587,6 +742,31 @@ fn read_lines(opened: &Opened, root: &Path, lines: &mut Lines) -> eyre::Result<(
         lines.insert(format!("read chain/{name}"), digest.finish());
     }
     drop(provider);
+
+    // each account's fields, code and slots 0 to 9 at every block, through the history indices
+    // and change sets, and the epoch state the registry reports at every past header
+    let mut history = Digest::default();
+    let mut epochs = Digest::default();
+    for number in 0..=TIP {
+        let state = env.blockchain_provider().history_by_block_number(number)?;
+        for address in accounts {
+            let code = state.account_code(address)?.map(|code| code.original_bytes());
+            history.json(&(number, address, state.basic_account(address)?, code))?;
+            for slot in 0..10 {
+                history.json(&(number, address, slot, state.storage(*address, word(slot))?))?;
+            }
+        }
+        let epoch = env.epoch_state_at_header(&header(env, number)?)?;
+        epochs.row(&[
+            &epoch.epoch.to_le_bytes(),
+            &epoch.epoch_info.abi_encode(),
+            &epoch.validators.abi_encode(),
+            &epoch.bls_pubkeys.concat(),
+            &epoch.epoch_start.to_le_bytes(),
+        ]);
+    }
+    lines.insert("read history/accounts".into(), history.finish());
+    lines.insert("read history/epochs".into(), epochs.finish());
 
     let export = TempDir::new()?;
     let tip = header(env, TIP)?;
@@ -728,14 +908,14 @@ fn ensure_same(
 /// readers and the state-pack export. See the module docs.
 #[tokio::test]
 async fn format_fixtures_read_back_unchanged() -> eyre::Result<()> {
-    let chain: Arc<RethChainSpec> = Arc::new(load_genesis()?.into());
+    let plan = Plan::new(load_genesis()?);
     for (name, layout) in FIXTURES {
         let expected = load_lines(name)?;
-        let (opened, dir) = open_fixture(name, chain.clone(), layout)
+        let (opened, dir) = open_fixture(name, plan.chain.clone(), layout)
             .map_err(|e| failed(name, "the current code cannot open the checked-in datadir", e))?;
         let mut found = Lines::new();
         blocks(&opened.env, &mut found)?;
-        read_lines(&opened, &dir.path().join("datadir"), &mut found)
+        read_lines(&opened, &dir.path().join("datadir"), &plan.accounts, &mut found)
             .map_err(|e| failed(name, "the current code cannot read the checked-in datadir", e))?;
         ensure_same(
             name,
@@ -826,8 +1006,10 @@ async fn format_writer_output_unchanged() -> eyre::Result<()> {
 }
 
 /// Write the fixtures: `genesis.json` (kept when present; delete it to rebuild it from the current
-/// contracts) and, for each layout, `<name>/datadir` and `<name>/digests.txt`. Ignored, and a
-/// no-op unless `TN_REGENERATE_FORMAT_FIXTURES=1`, so no test run rewrites them:
+/// contracts) and, for each layout, `<name>/datadir` and `<name>/digests.txt`. A fixture whose
+/// `version` lines differ from the build's is refused, before anything is written: move it to its
+/// own directory first (or delete it, for a format no release has written). Ignored, and a no-op
+/// unless `TN_REGENERATE_FORMAT_FIXTURES=1`, so no test run rewrites them:
 ///
 /// ```text
 /// TN_REGENERATE_FORMAT_FIXTURES=1 cargo test -p tn-reth --features test-utils --lib \
@@ -855,6 +1037,19 @@ async fn regenerate_format_fixtures() -> eyre::Result<()> {
         let (opened, built, mut lines) = build(&plan, layout)?;
         opened.close()?;
 
+        // a fixture of another format version is kept, never rewritten in place
+        if root.join(name).join("digests.txt").exists() {
+            ensure_same(
+                name,
+                "the build's version markers differ from the checked-in fixture's, so it is not \
+                 regenerated in place",
+                differences(&load_lines(name)?, &lines, &["version"]),
+                "Move the fixture to its own directory first (e.g. v2 -> v2-layout1), with a test \
+                 of what the new binary does with it; delete it instead only if no release has \
+                 written its format (crates/tn-reth/README.md, \"On-disk format versions\").",
+            )?;
+        }
+
         let target = fixture_datadir(name);
         if target.exists() {
             std::fs::remove_dir_all(&target)?;
@@ -867,7 +1062,7 @@ async fn regenerate_format_fixtures() -> eyre::Result<()> {
         }
 
         let (opened, dir) = open_fixture(name, plan.chain.clone(), layout)?;
-        read_lines(&opened, &dir.path().join("datadir"), &mut lines)?;
+        read_lines(&opened, &dir.path().join("datadir"), &plan.accounts, &mut lines)?;
         opened.close()?;
 
         let mut text = String::from(
