@@ -1842,7 +1842,13 @@ pub(crate) struct ExecBlockChoice {
 /// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
 ///   oldest entry of a shorter ring);
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
-///   always this node's own execution, never a parent's hash.
+///   always this node's own execution, never a parent's hash;
+/// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
+///   block (see [`RecentBlocks::newest_before_epoch`]): a parent naming an older block is not
+///   counted. Every member executed that block before it entered the epoch, so only a faulty
+///   parent names less, and a voter restored from that epoch's export holds nothing older: one
+///   low parent in a minimal parent set would otherwise drag the choice to a floor entry that
+///   such a voter refuses for good.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.
@@ -1853,10 +1859,20 @@ pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -
         return own_tip;
     }
 
+    // the epoch's opening block, while the ring still holds it; once the ring holds only this
+    // epoch's blocks, every entry (and so every choice below) is above it. The own tip and every
+    // counted parent value are at or above it, so the quorum value is too; the block named for
+    // that value is the newest entry at or below it (the opening entry is a candidate) or the
+    // floor entry above it, so no separate clamp is needed
+    let lowest_usable = ring.newest_before_epoch(inputs.epoch).map_or(0, |opening| opening.number);
     let mut counted = BTreeSet::from([&inputs.author]);
     let mut values = vec![(tip.number, inputs.own_power)];
     for parent in &inputs.parents {
-        if parent.epoch == inputs.epoch && parent.round > 0 && counted.insert(&parent.author) {
+        if parent.epoch == inputs.epoch
+            && parent.round > 0
+            && parent.number >= lowest_usable
+            && counted.insert(&parent.author)
+        {
             values.push((parent.number, parent.power));
         }
     }

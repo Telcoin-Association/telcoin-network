@@ -1940,18 +1940,34 @@ fn exec_off(committee: &Committee, author: &AuthorityIdentifier) -> ExecBlockInp
     ExecBlockInputs::new(ExecPolicy::Off, committee, author, &[])
 }
 
+/// The epoch of the quorum-exec-block models: their parents and their ring's blocks carry it.
+const EXEC_MODEL_EPOCH: Epoch = 3;
+
 /// The final block of executed output `output` in the quorum-exec-block models: three blocks per
-/// output, so ring entries and block numbers differ.
+/// output, so ring entries and block numbers differ. Its nonce names [`EXEC_MODEL_EPOCH`].
 fn exec_output_block(output: u64) -> tn_types::SealedHeader {
+    exec_epoch_block(EXEC_MODEL_EPOCH, output)
+}
+
+/// [`exec_output_block`] built by an output of `epoch`: the nonce carries the epoch in its upper
+/// half and the output as the round in its lower half, as execution stamps it.
+fn exec_epoch_block(epoch: Epoch, output: u64) -> tn_types::SealedHeader {
+    let round = u64::from(Round::try_from(output).expect("small model"));
     tn_types::SealedHeader::seal_slow(tn_types::ExecHeader {
         number: 100 + 3 * output,
+        nonce: ((u64::from(epoch) << 32) | round).into(),
         ..Default::default()
     })
 }
 
-/// Push executed output `output` onto `ring` and return its final block.
+/// Push executed output `output` of [`EXEC_MODEL_EPOCH`] onto `ring` and return its final block.
 fn push_exec_output(ring: &mut RecentBlocks, output: u64) -> BlockNumHash {
-    let block = exec_output_block(output);
+    push_epoch_output(ring, EXEC_MODEL_EPOCH, output)
+}
+
+/// Push executed output `output` of `epoch` onto `ring` and return its final block.
+fn push_epoch_output(ring: &mut RecentBlocks, epoch: Epoch, output: u64) -> BlockNumHash {
+    let block = exec_epoch_block(epoch, output);
     let num_hash = block.num_hash();
     let consensus =
         tn_types::ConsensusNumHash::new(output, tn_types::ConsensusHeaderDigest::from([7u8; 32]));
@@ -1976,7 +1992,7 @@ fn table_inputs(policy: ExecPolicy, parents: Vec<ParentExecBlock>) -> ExecBlockI
         policy,
         author: AuthorityIdentifier::dummy_for_test(0),
         own_power: 1,
-        epoch: 3,
+        epoch: EXEC_MODEL_EPOCH,
         quorum_threshold: 7,
         parents,
     }
@@ -1987,7 +2003,7 @@ fn table_parent(id: u8, number: BlockNumber) -> ParentExecBlock {
     ParentExecBlock {
         author: AuthorityIdentifier::dummy_for_test(id),
         power: 1,
-        epoch: 3,
+        epoch: EXEC_MODEL_EPOCH,
         round: 5,
         number,
     }
@@ -2203,7 +2219,7 @@ fn self_feeding_fleet(
             .map(|(author, block)| ParentExecBlock {
                 author: author.clone(),
                 power: 1,
-                epoch: 3,
+                epoch: EXEC_MODEL_EPOCH,
                 // genesis parents for round 1
                 round: round - 1,
                 number: block.number,
@@ -2216,7 +2232,7 @@ fn self_feeding_fleet(
                 policy: policy.for_round(round),
                 author: author.clone(),
                 own_power: 1,
-                epoch: 3,
+                epoch: EXEC_MODEL_EPOCH,
                 quorum_threshold: 7,
                 parents: parents.clone(),
             };
@@ -2439,12 +2455,13 @@ fn exec_parents(
         .collect()
 }
 
-/// A bus whose ring holds twelve executed outputs: blocks 100, 103, ..., 133.
+/// A bus whose ring holds twelve executed outputs of epoch 0, the fixtures' epoch: blocks 100,
+/// 103, ..., 133.
 fn exec_bus() -> ConsensusBus {
     let cb = ConsensusBus::new_with_args(50);
     cb.app().recent_blocks().send_modify(|ring| {
         for output in 0..12 {
-            push_exec_output(ring, output);
+            push_epoch_output(ring, 0, output);
         }
     });
     cb
@@ -2864,5 +2881,89 @@ fn test_quorum_exec_block_policy_model_after_the_regime_ends() {
             (1, bound),
             "regime of {end}: a cancel before the reset"
         );
+    }
+}
+
+// ---- bench7 quorum-exec-block ----
+
+/// The quorum rule in an epoch's first rounds, under both forms that apply it: the ring holds
+/// twenty outputs of the epoch before (blocks 100 to 157; 157 closed that epoch) and three of the
+/// header's epoch (160, 163, 166), so the floor entry eight back (142) lies before the epoch's
+/// opening block. A parent naming a block below 157 is not counted, so nothing below 157 is named:
+/// a voter restored from that epoch's export (floor 157) would refuse such a header for good.
+///
+/// Catches: a quorum value or a floor below the epoch's opening block, a low parent still counted
+/// toward the quorum, and an opening block read from anything but the ring's previous-epoch
+/// entries.
+#[test]
+fn test_quorum_exec_block_never_names_a_block_before_the_epoch_opened() {
+    let mut ring = RecentBlocks::new(50);
+    for output in 0..20 {
+        push_epoch_output(&mut ring, EXEC_MODEL_EPOCH - 1, output);
+    }
+    let opening = ring.latest_execution_block_num_hash();
+    assert_eq!(opening.number, 157);
+    for output in 20..23 {
+        push_exec_output(&mut ring, output);
+    }
+    let tip = ring.latest_execution_block_num_hash();
+    assert_eq!(tip.number, 166);
+    assert_eq!(ring.newest_before_epoch(EXEC_MODEL_EPOCH), Some(opening));
+    assert_eq!(ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).map(|b| b.number), Some(142));
+    let entry = |number: BlockNumber| ring.newest_at_or_below(number).expect("ring entry");
+    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+
+    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
+        let choose = |parents: Vec<ParentExecBlock>| {
+            choose_exec_block(&ring, &table_inputs(policy, parents))
+        };
+        // honest parents still on the opening block name it
+        assert_eq!(
+            choose(table_parents(1, 6, 157)),
+            ExecBlockChoice { block: opening, tip, basis: ExecBasis::Quorum },
+            "{policy:?}: a quorum on the opening block"
+        );
+        // one low parent in a minimal set no longer drags the choice below the opening block:
+        // without it the set falls short of a quorum and the own tip is named
+        for low in [120, 148] {
+            let mut parents = table_parents(1, 5, 160);
+            parents.push(table_parent(6, low));
+            assert_eq!(choose(parents), own_tip, "{policy:?}: one parent at {low}");
+        }
+        // f low parents beside a quorum: the quorum value is set by the counted values only
+        let mut parents = table_parents(1, 6, 160);
+        parents.extend(table_parents(7, 3, 103));
+        assert_eq!(
+            choose(parents),
+            ExecBlockChoice { block: entry(160), tip, basis: ExecBasis::Quorum },
+            "{policy:?}: three low parents beside six at 160"
+        );
+        // whatever the low parent names, the choice is never below the opening block
+        for low in 0..=tip.number {
+            let mut parents = table_parents(1, 5, 160);
+            parents.push(table_parent(6, low));
+            let choice = choose(parents);
+            assert!(
+                choice.block.number >= opening.number,
+                "{policy:?}: a parent at {low} named {choice:?}"
+            );
+            if low >= opening.number {
+                // a usable value still counts and sets the quorum value, as before
+                let expected = if low >= 160 { entry(160) } else { entry(low) };
+                assert_eq!(choice.block, expected, "{policy:?}: a usable parent at {low}");
+            }
+        }
+    }
+
+    // the epoch's first round: the own tip is still the opening block, so it is named whatever the
+    // parents name
+    let mut first = RecentBlocks::new(50);
+    for output in 0..20 {
+        push_epoch_output(&mut first, EXEC_MODEL_EPOCH - 1, output);
+    }
+    for low in [0, 100, 142, 156, 157] {
+        let choice =
+            choose_exec_block(&first, &table_inputs(ExecPolicy::Always, table_parents(1, 9, low)));
+        assert_eq!(choice, ExecBlockChoice { block: opening, tip: opening, basis: ExecBasis::Tip });
     }
 }
