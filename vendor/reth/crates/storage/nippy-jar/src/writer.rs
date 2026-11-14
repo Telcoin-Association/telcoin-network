@@ -148,6 +148,12 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
         self.jar.has_checksums()
     }
 
+    /// TN(TN-0200): whether every value starts with a tag byte the jar's owner interprets
+    /// ([`NippyJar::has_tagged_values`]).
+    pub const fn has_tagged_values(&self) -> bool {
+        self.jar.has_tagged_values()
+    }
+
     /// Consumes the writer and returns the associated [`NippyJar`].
     pub fn into_jar(self) -> NippyJar<H> {
         self.jar

@@ -3077,3 +3077,29 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `call_many`'s request instead of its blocking work, each fail.
   *Upstream*: no; upstream takes only a blocking-IO permit for `eth_callMany` and none for
   `eth_callBundle`.
+
+- **TN-0200** — NippyJar format version 3: version 2 with a tag byte at the start of every
+  value. *Kind*: feature (storage format; nothing creates one until TN-0201's policy asks).
+  *Files*: `crates/storage/nippy-jar/src/{lib.rs, writer.rs}` (`NippyJar::with_tagged_values`,
+  `has_tagged_values`; `has_checksums` covers version 3; `decode_config` accepts 3 and verifies
+  its configuration checksum as version 2's; `NippyJarWriter::has_tagged_values`; tests).
+  *Why*: a `Transactions` row can then say what it stores (TN-0201: the transaction inline, or its
+  position in a consensus batch) without a marker anywhere else: `SegmentHeader` has no spare
+  field and bincode is positional, so the configuration's version is the only in-jar place. A
+  version-3 jar is a version-2 jar in every respect (configuration CRC32, each value's
+  row-seeded checksum, offsets that include it, `.csoff` records, heal, prune, rotation), and its
+  values are opaque to the jar: the first byte belongs to the segment that writes it. Versions 2
+  and 3 differ in bit 0, which the configuration's checksum covers; 3 to 1 is one flipped bit (bit
+  1) to a configuration without a checksum, which only the storage layer can catch: in a storage
+  v2 datadir TN-0135 refuses an unchecked jar of every segment. The next format change takes 4.
+  *Can reach execution or storage*: storage format only, and only for jars a provider creates
+  with TN-0201's policy on; version 1 and 2 jars are written and read exactly as before, and no
+  block field or root changes. *Tests*: `test_checksummed_jar_round_trip` (version 3 plain and
+  LZ4: its values read back, are stored as their bytes then the seeded checksum, four bytes a
+  value), `test_checksummed_config_serialization` (version 3's configuration, byte for byte),
+  `test_checksummed_config_damage_is_refused` (every byte of a version-2 and a version-3
+  configuration with bit 0 and bit 4 flipped: 2 and 3 never become each other unnoticed),
+  `test_checksummed_jar_heal_and_prune` (a version-3 jar heals and prunes as version 2 and keeps
+  its version), and `test_unknown_version_refused_before_decode` (now 4). Mutation-checked:
+  `has_checksums` without version 3, and no configuration checksum for version 3, each fail.
+  *Upstream*: no (TN-0120's checksummed format is TN's).
