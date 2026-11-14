@@ -214,6 +214,10 @@ test-faucet:
 # overridden by the flag).
 E2E_TARGET_ROOT := $(if $(CARGO_TARGET_DIR),$(if $(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(CURDIR)/$(CARGO_TARGET_DIR)),$(CURDIR)/target)
 
+# The e2e builds name no package (-p): at the virtual root cargo builds the bin with every
+# member's features unified, so the e2e-tests crate's `tn-reth/test-utils` reaches this node
+# binary too. The e2e lanes and the attested run therefore run a test-utils node, unlike the
+# release image, which builds `-p telcoin-network` (etc/Dockerfile).
 .PHONY: build-e2e-bin
 build-e2e-bin:
 	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$(E2E_TARGET_ROOT)" ;
