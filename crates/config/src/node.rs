@@ -1378,6 +1378,11 @@ mod test {
     /// A new `Parameters` field is either a switch, listed by [`Parameters::switches`], or a
     /// plain parameter listed here. [`switches_list_every_switch_field`] fails until it is one or
     /// the other.
+    ///
+    /// A behaviour switch never goes here. The test cannot tell a switch from a plain parameter:
+    /// a switch filed here passes every test, yet it is missing from the `node switches` line and
+    /// the gauge, and every written `parameters.yaml` holds its key. A review of any addition to
+    /// this list checks that the new key is a plain parameter.
     const NON_SWITCH_KEYS: &[&str] = &[
         "header_num_of_batches_threshold",
         "max_header_num_of_batches",
