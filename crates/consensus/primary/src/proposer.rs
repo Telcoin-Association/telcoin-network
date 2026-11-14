@@ -984,8 +984,9 @@ impl<DB: Database> Proposer<DB> {
     /// does to transaction nonces.
     ///
     /// Every report, acted on here or not, also reaches [`ExecBlockPolicy::on_cancelled`]: under
-    /// the adaptive `quorum_exec_block` policy a cancelled own header opens a window of rounds in
-    /// which the next headers name a block a quorum already holds.
+    /// the adaptive `quorum_exec_block` policy a cancelled own header opens a window, counted in
+    /// headers this node builds, not rounds, in which the next headers name a block a quorum
+    /// already holds.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
         // every cancel report is evidence for the execution-block policy, whatever happens to the
         // header's digests below
