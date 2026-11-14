@@ -352,21 +352,40 @@ pub struct Parameters {
     ///
     /// When a peer answers that it holds no certified record for an epoch this node closed and
     /// stored itself without a certificate, the record collector and the startup sync go on to the
-    /// next epoch, anchored on this node's own record, and the record collector asks for the
-    /// skipped epoch again on every later pass until its certificate is stored (at most 16 such
-    /// epochs at a time). A node without its own record of the epoch does not walk. The default
-    /// `false` keeps the previous behaviour: collection stops at the first epoch the network left
-    /// uncertified, on every node and across restarts. Issue #1850.
+    /// next epoch, anchored on this node's own record. Once a certified record after it is
+    /// stored, the skipped epoch is a gap (at most 16 at a time) that the record collector asks
+    /// for again until its certificate is stored: at most once per 5 s retry interval, after a
+    /// pass a peer answered, one record request (up to three peers in turn) per gap, the whole
+    /// retry cut off after 5 s or at shutdown. A walk that ends before a certified record after
+    /// it is stored is tried again at most once per retry interval, not on every pass. A node
+    /// without its own record of the epoch does not walk. The default `false` keeps the
+    /// previous behaviour: collection stops at the first epoch the network left uncertified, on
+    /// every node and across restarts. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_collect_past_uncertified: bool,
-    /// Stop the node when the network's certified record of an epoch differs from this node's own.
+    /// Stop the node when a record certified by a super-quorum of the full committee differs
+    /// from this node's own record of the epoch.
     ///
-    /// A peer's record that validates against this node's record of the epoch before and carries a
-    /// super-quorum certificate, but differs from the record this node stored for the same epoch,
-    /// ends the record collector with an error, which stops the node (in the startup sync it
-    /// fails startup); the stop repeats on every restart until an operator acts. The default
-    /// `false` keeps the previous behaviour: the conflict is logged and the record asked for
-    /// again on every pass. Issue #1850.
+    /// A peer's record that validates against this node's record of the epoch before, but
+    /// differs from the record this node stored for the same epoch, is a conflict. With this
+    /// switch on, the record collector, its gap retry and the startup sync stop the node on a
+    /// conflict whose certificate is signed by a super-quorum of the full committee the
+    /// previous record names (`2n/3 + 1` of its `n` members: 7 of 10, 3 of 4). Validation also
+    /// accepts a super-quorum of a smaller committee left by an on-chain ejection (5 signers of
+    /// 10); such a conflict does not stop the node. The stop ends the record collector with an
+    /// error (in the startup sync it fails startup), repeats on every restart until an operator
+    /// acts, and logs a line starting with `epoch record conflict halt:`; the node's chain data
+    /// must not be deleted before the cause is known. Every other conflict, and every conflict
+    /// with the switch off, is logged on a line starting with `epoch record conflict:` and
+    /// counted, and the node keeps its own record and asks again on later passes: every
+    /// conflict counts in `tn_state_sync.epoch_record_conflicts_total`, one short of the
+    /// threshold also in `tn_state_sync.epoch_record_conflicts_below_halt_threshold_total`. A
+    /// vote round's recovery stops the node when the network certified another record of the
+    /// newest epoch or the one before it, as it did before this switch existed; that stop does
+    /// not read this switch. Before turning it on, on the image with it off: read both counters
+    /// on every node (the total minus the below-threshold count is how many conflicts would
+    /// stop the node), grep every node's log for `ConflictingRecord {`, and turn it on one node
+    /// at a time. The default `false` keeps the previous behaviour. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_conflict_halt: bool,
 
