@@ -62,7 +62,9 @@
 #                    commit) by more than many changes do. Share them to compare a change that
 #                    writes the same data; the sides' chains must then match, and a profile whose
 #                    runs differ is marked CHAINS DIFFER and fails the script, as in backend and
-#                    layout modes (reports/shared-base marks the run for --report-only). Leave it
+#                    layout modes, and so is one whose after side did not find the before side's
+#                    aged base in the cache (BASE NOT SHARED: another base name, or a rebuild)
+#                    (reports/shared-base marks the run for --report-only). Leave it
 #                    unset for a change to what is written, or to the on-disk format
 #   EXEC_SYS_SAMPLE=1  Linux only (refused elsewhere): a sampler beside each run, started just
 #                    before the binary and killed right after it (and on any exit), which never
@@ -189,7 +191,8 @@ report_versions="5 6"
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
 # of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
 # after rendering everything, when backend or layout mode's two sides, or a shared-base commit
-# run's (reports/shared-base beside the manifest), ran different chains, and else, in `dir` mode,
+# run's (reports/shared-base beside the manifest), ran different chains, or a shared-base run's
+# after side did not run on the before side's aged base (BASE NOT SHARED), and else, in `dir` mode,
 # 4 when a run failed or a differential mismatched or failed (in `run` mode the caller fails
 # those runs itself).
 render_report() {
@@ -774,6 +777,7 @@ def section(name, fn, *args):
 
 profiles = []
 chains_differ = []  # the profiles whose runs ran different chains on one load (same_load)
+unshared = []  # the profiles whose shared-base sides did not run on one aged base
 failed_runs = []  # the runs whose status is not 0
 differential_failures = []  # the profiles whose differential mismatched or failed
 for run in runs:
@@ -802,6 +806,7 @@ for profile in profiles:
         print(f"{side} knobs: {knob_text(first.get('knobs', {}))}")
         print(f"{side} page size: {page_text(first)}")
         print(f"{side} storage layout: {layout_text(first)}")
+        print(f"{side} aged base: {first.get('aged', '-')}")
         for rnd, header in headers[1:]:
             if knob_text(header.get("knobs", {})) != knob_text(first.get("knobs", {})):
                 print(f"{side} round {rnd} KNOBS DIFFER: {knob_text(header.get('knobs', {}))}")
@@ -838,6 +843,15 @@ for profile in profiles:
             chains_differ.append(profile)
         else:
             print(f"chains differ between runs of {profile}: the change alters the load")
+    # a shared-base run's after side must have found the before side's aged base in the cache
+    if shared_base:
+        paths = {(doc["header"].get("aged") or "").split(" (")[0] for doc in docs.values()}
+        built = sorted(rnd for (s, rnd), doc in docs.items()
+                       if s == side_b and "(built" in (doc["header"].get("aged") or ""))
+        if len(paths) > 1 or built:
+            print(f"FAILED: BASE NOT SHARED between runs of {profile}: aged bases "
+                  f"{' '.join(sorted(paths))}; {side_b} built its own in rounds {' '.join(map(str, built)) or '-'}")
+            unshared.append(profile)
     section("differential", print_differential, mine)
     pairs = sorted(rnd for (s, rnd) in docs if s == side_a and (side_b, rnd) in docs)
     if not pairs:
@@ -885,9 +899,12 @@ for run in runs:
     state = "" if run["status"] == "0" else f"  (FAILED: {run['status']})"
     json_path = run["json"] if run["status"] == "0" else "-"
     print(f"{run['profile']} {run['side']} round {run['round']}: {json_path}  log {run['log']}{state}")
-if chains_differ:  # rendered in full, then status 3: the caller fails on it
-    print(f"the {same_load} ran different chains in: {' '.join(chains_differ)}",
-          file=sys.stderr)
+if chains_differ or unshared:  # rendered in full, then status 3: the caller fails on it
+    if chains_differ:
+        print(f"the {same_load} ran different chains in: {' '.join(chains_differ)}",
+              file=sys.stderr)
+    if unshared:
+        print(f"the sides did not share one aged base in: {' '.join(unshared)}", file=sys.stderr)
     sys.exit(3)
 if mode == "dir" and (failed_runs or differential_failures):  # status 4: --report-only fails
     print(f"failed runs: {', '.join(failed_runs) or 'none'}; differential mismatches or failures: "
@@ -920,7 +937,8 @@ if [ "${1:-}" = --report-only ]; then # re-render a bench dir's reports: no buil
     case "$render_status" in 0 | 3 | 4) ;; *) rm -f "$report"; die "the report failed to render" ;; esac
     printf '\n### END %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$report"
     echo "report: $report"
-    [ "$render_status" != 3 ] || die "the two sides ran different chains: see CHAINS DIFFER in the report"
+    [ "$render_status" != 3 ] \
+        || die "the two sides ran different chains or bases: see CHAINS DIFFER or BASE NOT SHARED in the report"
     [ "$render_status" != 4 ] || die "the runs failed: see FAILED and the differential in the report"
     exit 0
 fi
@@ -1503,7 +1521,8 @@ render_status=0
 render_report run "$manifest" "$side_a" "$side_b" >>"$report" || render_status=$?
 case "$render_status" in 0 | 3) ;; *) die "the report failed to render; after a fix: $0 --report-only $bench_dir" ;; esac
 chains=""
-[ "$render_status" = 0 ] || chains="; the two sides ran different chains (CHAINS DIFFER in the report)"
+[ "$render_status" = 0 ] \
+    || chains="; the two sides ran different chains or bases (CHAINS DIFFER or BASE NOT SHARED in the report)"
 {
     echo
     echo "### END $(date -u +%Y-%m-%dT%H:%M:%SZ)"
