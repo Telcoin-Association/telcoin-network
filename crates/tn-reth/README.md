@@ -1326,9 +1326,11 @@ large folios.
 
 Backend mode on a Linux machine (a consumer NVMe drive, ext4) at commit 06a413e9e: the six
 profiles, 2 ABBA rounds each, 300 timed outputs per run, durable sync, the bench's defaults
-otherwise. tn-lmdb passed on all six:
+otherwise. tn-lmdb was within the reference ratio on all six. The reference is the owners' target,
+compared by hand: `etc/reth-exec-bench.sh` prints the ratios and judges none of them, so a
+regression of any size still exits 0.
 
-| profile | tn-lmdb / MDBX | bar |
+| profile | tn-lmdb / MDBX | reference |
 |---|---|---|
 | `busy` | 0.980 | 1.02 |
 | `peak` (20 batches of 30M gas) | 1.013 | 1.02 |
