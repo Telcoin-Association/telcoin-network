@@ -67,6 +67,8 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
 // TN(TN-0201): the check on the positions `save_blocks_with_tx_positions` is given.
 use crate::providers::static_file::check_tx_positions_len;
+// TN(TN-0202): reading the `Transactions` rows that store positions.
+use crate::providers::{TxBodyReadError, TxRow};
 use reth_trie::{
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
     HashedPostStateSorted, StoredNibbles,
@@ -1027,7 +1029,175 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     }
 }
 
+/// TN(TN-0202): a block whose `Transactions` rows a read resolves, as far as the caller knows it.
+struct TxRowsBlock<'a, H> {
+    /// The block.
+    number: BlockNumber,
+    /// Its header, if the caller holds it; fetched only when a row stores a position.
+    header: Option<&'a H>,
+    /// Its transactions.
+    tx_range: Range<TxNumber>,
+}
+
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
+    /// TN(TN-0202): the transactions of `rows`, the `Transactions` rows of the transactions from
+    /// `first_tx` on, in order. A row that stores the transaction is taken as it is; the rows of a
+    /// block that store positions in its batch go to the installed
+    /// [`TxBodyResolver`](crate::providers::TxBodyResolver) in one call, with the block's header:
+    /// `known`'s for its block, otherwise the block `TransactionBlocks` names for the row's
+    /// transaction. A row that cannot be resolved is an error ([`TxBodyReadError`]), never a
+    /// transaction missing from the list.
+    fn resolve_tx_rows(
+        &self,
+        first_tx: TxNumber,
+        rows: Vec<TxRow<TxTy<N>>>,
+        known: Option<TxRowsBlock<'_, HeaderTy<N>>>,
+    ) -> ProviderResult<Vec<TxTy<N>>> {
+        let mut txs = Vec::with_capacity(rows.len());
+        let mut rows = rows.into_iter();
+        let mut tx = first_tx;
+        while let Some(row) = rows.next() {
+            let position = match row {
+                TxRow::Inline(transaction) => {
+                    txs.push(transaction);
+                    tx += 1;
+                    continue
+                }
+                TxRow::Ref(position) => position,
+            };
+            // `tx` is the first row of its block that stores a position.
+            let fetched;
+            let (block, header, tx_range) = match &known {
+                Some(TxRowsBlock { number, header: Some(header), tx_range })
+                    if tx_range.contains(&tx) =>
+                {
+                    (*number, *header, tx_range.clone())
+                }
+                Some(TxRowsBlock { number, header: None, tx_range }) if tx_range.contains(&tx) => {
+                    fetched = self
+                        .header_by_number(*number)?
+                        .ok_or(TxBodyReadError::NoHeader { block: *number })
+                        .map_err(ProviderError::other)?;
+                    (*number, &fetched, tx_range.clone())
+                }
+                _ => {
+                    let (number, header, tx_range) = self.tx_row_block(tx)?;
+                    fetched = header;
+                    (number, &fetched, tx_range)
+                }
+            };
+            let block_rows: Vec<_> = core::iter::once(TxRow::Ref(position))
+                .chain(rows.by_ref().take((tx_range.end - tx - 1) as usize))
+                .collect();
+            let positions: Vec<u32> = block_rows
+                .iter()
+                .filter_map(|row| match row {
+                    TxRow::Ref(position) => Some(*position),
+                    TxRow::Inline(_) => None,
+                })
+                .collect();
+            let resolver = self
+                .static_file_provider
+                .tx_body_resolver()
+                .ok_or(TxBodyReadError::NoResolver { block, tx })
+                .map_err(ProviderError::other)?;
+            let resolved = resolver.resolve(block, header, &positions)?;
+            if resolved.len() != positions.len() {
+                return Err(ProviderError::other(TxBodyReadError::WrongCount {
+                    block,
+                    asked: positions.len(),
+                    returned: resolved.len(),
+                }))
+            }
+            tx += block_rows.len() as u64;
+            let mut resolved = resolved.into_iter();
+            txs.extend(block_rows.into_iter().filter_map(|row| match row {
+                TxRow::Inline(transaction) => Some(transaction),
+                TxRow::Ref(_) => resolved.next(),
+            }));
+        }
+        Ok(txs)
+    }
+
+    /// TN(TN-0202): the block, header and transactions of the block holding transaction `tx`,
+    /// whose row stores a position: through `TransactionBlocks`, as
+    /// [`BlockReader::block_by_transaction_id`].
+    fn tx_row_block(
+        &self,
+        tx: TxNumber,
+    ) -> ProviderResult<(BlockNumber, HeaderTy<N>, Range<TxNumber>)> {
+        let block = self
+            .block_by_transaction_id(tx)?
+            .ok_or(TxBodyReadError::NoBlock { tx, block: None })
+            .map_err(ProviderError::other)?;
+        let tx_range = self
+            .block_body_indices(block)?
+            .map(|body| body.tx_num_range())
+            .filter(|tx_range| tx_range.contains(&tx))
+            .ok_or(TxBodyReadError::NoBlock { tx, block: Some(block) })
+            .map_err(ProviderError::other)?;
+        let header = self
+            .header_by_number(block)?
+            .ok_or(TxBodyReadError::NoHeader { block })
+            .map_err(ProviderError::other)?;
+        Ok((block, header, tx_range))
+    }
+
+    /// TN(TN-0202): the transactions in `tx_range`, resolved as [`Self::resolve_tx_rows`] does.
+    fn resolved_txs_by_tx_range(
+        &self,
+        tx_range: Range<TxNumber>,
+        known: Option<TxRowsBlock<'_, HeaderTy<N>>>,
+    ) -> ProviderResult<Vec<TxTy<N>>> {
+        let rows = self.static_file_provider.tx_rows_by_tx_range(tx_range.clone())?;
+        self.resolve_tx_rows(tx_range.start, rows, known)
+    }
+
+    /// TN(TN-0202): the transaction of transaction `id`'s row, resolved as
+    /// [`Self::resolve_tx_rows`] does; with `hash`, a transaction resolved from a position must
+    /// have it ([`TxBodyReadError::TxBodyMismatch`]).
+    fn resolve_tx_row(
+        &self,
+        id: TxNumber,
+        row: TxRow<TxTy<N>>,
+        known: Option<TxRowsBlock<'_, HeaderTy<N>>>,
+        hash: Option<TxHash>,
+    ) -> ProviderResult<TxTy<N>> {
+        let resolved = matches!(row, TxRow::Ref(_));
+        let transaction = self
+            .resolve_tx_rows(id, vec![row], known)?
+            .pop()
+            .ok_or(ProviderError::InvalidStorageOutput)?;
+        if let Some(hash) = hash &&
+            resolved &&
+            *transaction.tx_hash() != hash
+        {
+            return Err(ProviderError::other(TxBodyReadError::TxBodyMismatch {
+                hash,
+                tx: id,
+                resolved: *transaction.tx_hash(),
+            }))
+        }
+        Ok(transaction)
+    }
+
+    /// TN(TN-0202): the transactions of block `number`, `None` without body indices, as
+    /// [`TransactionsProvider::transactions_by_block`] reads them; `header` is the block's, if the
+    /// caller holds it.
+    fn block_transactions(
+        &self,
+        number: BlockNumber,
+        header: Option<&HeaderTy<N>>,
+    ) -> ProviderResult<Option<Vec<TxTy<N>>>> {
+        let Some(body) = self.block_body_indices(number)? else { return Ok(None) };
+        let tx_range = body.tx_num_range();
+        if tx_range.is_empty() {
+            return Ok(Some(Vec::new()))
+        }
+        let known = TxRowsBlock { number, header, tx_range: tx_range.clone() };
+        self.resolved_txs_by_tx_range(tx_range, Some(known)).map(Some)
+    }
+
     fn recovered_block<H, HF, B, BF>(
         &self,
         id: BlockHashOrNumber,
@@ -1056,7 +1226,13 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         let transactions = if tx_range.is_empty() {
             vec![]
         } else {
-            self.transactions_by_tx_range(tx_range.clone())?
+            // TN(TN-0202): the header in hand resolves rows that store positions.
+            let known = TxRowsBlock {
+                number: block_number,
+                header: Some(header.as_ref()),
+                tx_range: tx_range.clone(),
+            };
+            self.resolved_txs_by_tx_range(tx_range.clone(), Some(known))?
         };
 
         let body = self
@@ -1134,7 +1310,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
             let transactions = if tx_range.is_empty() {
                 Vec::new()
             } else {
-                self.transactions_by_tx_range(tx_range.clone())?
+                // TN(TN-0202): the header in hand resolves rows that store positions.
+                let header = header.as_ref();
+                let known = TxRowsBlock {
+                    number: header.number(),
+                    header: Some(header),
+                    tx_range: tx_range.clone(),
+                };
+                self.resolved_txs_by_tx_range(tx_range.clone(), Some(known))?
             };
 
             inputs.push((header.as_ref(), transactions));
@@ -1922,7 +2105,8 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
             // exist in the database yet, or they do exit but are not indexed.
             // If they exist but are not indexed, we don't have enough
             // information to return the block anyways, so we return `None`.
-            let Some(transactions) = self.transactions_by_block(number.into())? else {
+            // TN(TN-0202): the header in hand resolves rows that store positions.
+            let Some(transactions) = self.block_transactions(number, Some(&header))? else {
                 return Ok(None)
             };
 
@@ -2055,7 +2239,24 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProviderExt
         &self,
         tx_range: Range<TxNumber>,
     ) -> ProviderResult<Vec<(TxHash, TxNumber)>> {
-        self.static_file_provider.transaction_hashes_by_range(tx_range)
+        match self.static_file_provider.transaction_hashes_by_range(tx_range.clone()) {
+            // TN(TN-0202): the static files met a row that stores a position, which only this
+            // provider resolves: the range is read again here, block by block.
+            Err(ProviderError::Other(err))
+                if matches!(
+                    err.as_error().downcast_ref(),
+                    Some(TxBodyReadError::InConsensusPack { .. })
+                ) =>
+            {
+                Ok(self
+                    .transactions_by_tx_range(tx_range.clone())?
+                    .iter()
+                    .zip(tx_range)
+                    .map(|(transaction, tx)| (*transaction.tx_hash(), tx))
+                    .collect())
+            }
+            result => result,
+        }
     }
 }
 
@@ -2071,19 +2272,30 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
     }
 
     fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.static_file_provider.transaction_by_id(id)
+        // TN(TN-0202): a row that stores a position is resolved through its block.
+        self.static_file_provider
+            .tx_row_by_id(id)?
+            .map(|row| self.resolve_tx_row(id, row, None, None))
+            .transpose()
     }
 
     fn transaction_by_id_unhashed(
         &self,
         id: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.static_file_provider.transaction_by_id_unhashed(id)
+        self.static_file_provider
+            .tx_row_by_id(id)?
+            .map(|row| self.resolve_tx_row(id, row, None, None))
+            .transpose()
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
         if let Some(id) = self.transaction_id(hash)? {
-            Ok(self.transaction_by_id_unhashed(id)?)
+            // TN(TN-0202): a transaction resolved from a position must have the hash asked.
+            self.static_file_provider
+                .tx_row_by_id(id)?
+                .map(|row| self.resolve_tx_row(id, row, None, Some(hash)))
+                .transpose()
         } else {
             Ok(None)
         }
@@ -2093,13 +2305,22 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
+        // TN(TN-0202): the row is resolved with the block and header read for the meta, and a
+        // transaction resolved from a position must have the hash asked.
         if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
-            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
+            let Some(row) = self.static_file_provider.tx_row_by_id(transaction_id)? &&
             let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
             let Some(sealed_header) = self.sealed_header(block_number)?
         {
             let (header, block_hash) = sealed_header.split();
             if let Some(block_body) = self.block_body_indices(block_number)? {
+                let known = TxRowsBlock {
+                    number: block_number,
+                    header: Some(&header),
+                    tx_range: block_body.tx_num_range(),
+                };
+                let transaction =
+                    self.resolve_tx_row(transaction_id, row, Some(known), Some(tx_hash))?;
                 // the index of the tx in the block is the offset:
                 // len([start..tx_id])
                 // NOTE: `transaction_id` is always `>=` the block's first
@@ -2127,15 +2348,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        if let Some(block_number) = self.convert_hash_or_number(id)? &&
-            let Some(body) = self.block_body_indices(block_number)?
-        {
-            let tx_range = body.tx_num_range();
-            return if tx_range.is_empty() {
-                Ok(Some(Vec::new()))
-            } else {
-                self.transactions_by_tx_range(tx_range).map(Some)
-            }
+        // TN(TN-0202): rows that store positions are resolved with the block's header.
+        if let Some(block_number) = self.convert_hash_or_number(id)? {
+            return self.block_transactions(block_number, None)
         }
         Ok(None)
     }
@@ -2146,14 +2361,24 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
     ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
         let range = to_range(range);
 
-        self.block_body_indices_range(range.start..=range.end.saturating_sub(1))?
-            .into_iter()
-            .map(|body| {
+        // TN(TN-0202): the bodies' walk keeps each one's block number, whose header resolves rows
+        // that store positions; the same bodies `block_body_indices_range` reads.
+        let bodies = range.start..=range.end.saturating_sub(1);
+        if bodies.is_empty() {
+            return Ok(Vec::new())
+        }
+        self.tx
+            .cursor_read::<tables::BlockBodyIndices>()?
+            .walk_range(bodies)?
+            .map(|entry| {
+                let (number, body) = entry?;
                 let tx_num_range = body.tx_num_range();
                 if tx_num_range.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    self.transactions_by_tx_range(tx_num_range)
+                    let known =
+                        TxRowsBlock { number, header: None, tx_range: tx_num_range.clone() };
+                    self.resolved_txs_by_tx_range(tx_num_range, Some(known))
                 }
             })
             .collect()
@@ -2163,7 +2388,8 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
-        self.static_file_provider.transactions_by_tx_range(range)
+        // TN(TN-0202): rows that store positions are resolved block by block.
+        self.resolved_txs_by_tx_range(to_range(range), None)
     }
 
     fn senders_by_tx_range(

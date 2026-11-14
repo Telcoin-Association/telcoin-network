@@ -3170,3 +3170,87 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   missing, a position row in an untagged jar, `JarFormat::of` testing checksums first, and the
   decoder accepting a redundant last byte, trailing bytes, six bytes, a value above `u32::MAX`
   or an unknown tag. *Upstream*: no (TN's format).
+
+- **TN-0202** — Reading the `Transactions` rows that store a transaction's position in its
+  consensus batch: the `TxBodyResolver` hook and the readers that resolve through it. *Kind*:
+  feature (storage reads; changes nothing until a datadir holds such rows).
+  *Files*: `crates/storage/provider/src/providers/static_file/{tx_bodies.rs, tx_row.rs, jar.rs,
+  manager.rs, mod.rs}` (`tx_bodies.rs` new), `crates/storage/provider/src/providers/{mod.rs,
+  database/provider.rs, database/mod.rs}`, `crates/storage/provider/src/lib.rs`.
+  *Why*: TN-0201 writes position rows (tag 1), and until now every typed transaction read took a
+  tagged jar's tag byte for the start of the transaction. A position row names no batch: its
+  block's header does, so only a reader that knows the block can resolve it. Hook:
+  `TxBodyResolver<N>` (one method, `resolve(number, header, positions)`: the transactions at
+  those positions of the batch the header names, exactly one each, in order), installed once on
+  `StaticFileProviderInner` (`set_tx_body_resolver`, a `OnceLock`, as TN-0122's policy is held:
+  no constructor change, and every clone and every `DatabaseProvider` sees it; a second install is
+  `TxBodyResolverInstalled`). reth-provider names no TN crate; TN implements it. Rows:
+  `read_tx_row` reads a value through `StaticFileCursor::get` and splits it by its jar's
+  `has_tagged_values` (`split_tx_row`, the parser `decode_tx_row` now shares); an inline row is
+  decoded with `Decompress`, exactly what `TransactionMask` read before, so an untagged jar reads
+  as upstream's; a row that does not decode is `TxBodyReadError::Row`, naming the file and the
+  transaction. The static-file provider and its jars gain `tx_row_by_id` and
+  `tx_rows_by_tx_range`; their own `transaction_by_id`, `transaction_by_id_unhashed`,
+  `transactions_by_tx_range` and `transaction_hashes_by_range` return
+  `TxBodyReadError::InConsensusPack` for a position row (never `MissingStaticFileTx`, which
+  `transaction_by_id` turns into `Ok(None)`). `DatabaseProvider` resolves (`resolve_tx_rows`):
+  inline rows are taken as they are; a block's position rows go to the resolver in one call, with
+  the header the caller holds (`block`, `recovered_block`, `sealed_block_with_senders`, the block
+  ranges, `transaction_by_hash_with_meta`), the header of the block number it holds, fetched only
+  when a position row appears (`transactions_by_block`, `transactions_by_block_range`, which now
+  walks `BlockBodyIndices` with its keys for that number), or else the block `TransactionBlocks`
+  names (`transaction_by_id*`, `transaction_by_hash`, `transactions_by_tx_range`), whose body must
+  hold the transaction. A missing resolver, block, body or header, and an answer of another
+  length, are errors (`TxBodyReadError`), as is a resolver's own error: never `None`, a shorter
+  list or another transaction. A read by hash of a resolved transaction checks its hash
+  (`TxBodyReadError::TxBodyMismatch`); inline rows keep upstream's behaviour.
+  `transaction_hashes_by_range` keeps the static files' parallel pass and, when it meets a
+  position row, reads the range again through the resolving funnel, so `remove_blocks_above` and
+  `take_block_and_execution_above` drop the right hashes (correct, not fast; TN calls neither).
+  `ProviderFactory`'s `transaction_by_id`, `transaction_by_id_unhashed` and
+  `transactions_by_tx_range` go through `provider()` instead of the static files.
+  `BlockchainProvider` and `ConsistentProvider` reach stored transactions only through
+  `DatabaseProvider`, so they need no change.
+  *Can reach execution or storage*: storage reads only. Nothing is written, and no block field,
+  hash or root changes. A datadir without tagged jars (every existing one, and v1 always) reads
+  every row as before, through the same decode; the extra work on those paths is a check of the
+  jar's version and a move of each decoded transaction, and a database transaction for the
+  factory's three reads.
+  *Tests*: TN-0203. *Upstream*: no (TN's format).
+
+- **TN-0203** — Tests for TN-0202. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/static_file/{tn_tx_ref_tests.rs, mod.rs}`
+  (`tn_tx_ref_tests.rs` new).
+  *Why*: one chain (genesis and nine blocks over four jars, an empty block, every transaction
+  type: legacy with and without a chain id, EIP-2930, 1559, 4844 and 7702), each block's
+  transactions at increasing positions of a batch that also holds transactions the block dropped
+  (positions of one and two LEB128 bytes), written four ways: storage v1, v2 without tags, v2
+  with a position row per transaction, and v2 with position rows for odd blocks and inline rows
+  for even ones. A mock resolver finds each batch by the hash of the header it is given and
+  decodes its EIP-2718 bytes. `position_rows_read_as_inline_rows`: every read answers the chain's
+  transactions, each compared by `encoded_2718()` and `tx_hash()`, through `BlockchainProvider`
+  (by id, unhashed, by hash, with meta (its block, hash and index too), by block number and hash,
+  block ranges, transaction ranges across blocks and jars, `block`, `recovered_block`,
+  `sealed_block_with_senders`, `block_range`, `block_with_senders_range`,
+  `recovered_block_range`, with senders), through `ProviderFactory`'s own reads, and
+  `transaction_hashes_by_range`. `a_block_read_resolves_its_rows_in_one_call` (and a transaction
+  range one call per block, with that block's positions only). Damage, each an error from every
+  read through `BlockchainProvider`, never `None`: `a_failing_resolver_fails_every_read`,
+  `a_short_answer_fails_every_read`, `without_a_resolver_every_read_fails` (a v2 chain without
+  tags needs none), `a_read_by_hash_checks_the_resolved_hash` (the resolver answers each
+  position's neighbour: by hash and with meta fail, by number has no hash to check),
+  `static_file_reads_refuse_position_rows` (the static-file provider's and the jar's own reads,
+  never `None` or a shorter list; inline rows answer as upstream's),
+  `remove_blocks_above_resolves_position_rows` (the removed transactions' hashes are dropped and
+  the kept ones stay, for inline, position and mixed rows; without a resolver the removal fails),
+  `a_position_row_outside_its_indexed_block_is_an_error` (`TransactionBlocks` without the block's
+  entry names the next block, whose body does not hold the transaction: an error, not the next
+  block's batch; a block read still resolves) and `a_second_resolver_is_refused`.
+  Mutation-checked, each failing a test: no length check on the resolver's answer, no hash check
+  by hash or with meta, a missing resolver read as no transactions, the static-file reads taking
+  a position row for a missing one (by number and in `transaction_hashes_by_range`), each of the
+  factory's three reads back on the static files, no re-read in `transaction_hashes_by_range`,
+  the wrong header fetched for a looked-up block, block numbers off by one in
+  `transactions_by_block_range`, a block's rows split wrongly or resolved one call per row, the
+  tag ignored, a second resolver accepted silently, and no check that the indexed block holds the
+  transaction. *Upstream*: no.

@@ -24,6 +24,8 @@ pub use providers::{
     PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
     StaticFileWriteCtx, StaticFileWriter,
 };
+// TN(TN-0202): the hook that resolves the `Transactions` rows storing batch positions.
+pub use providers::{TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled};
 
 pub mod changeset_walker;
 pub mod changesets_utils;

@@ -15,6 +15,10 @@ pub use manager::CompressedChangesetJarError;
 pub use manager::{JarFormat, TaggedJarError};
 mod tx_row;
 pub(crate) use tx_row::check_tx_positions_len;
+// TN(TN-0202): reading `Transactions` rows, and resolving the ones that store positions.
+pub(crate) use tx_row::{read_inline_tx, read_tx_row};
+mod tx_bodies;
+pub use tx_bodies::{TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled};
 pub use tx_row::{
     decode_tx_row, encode_tx_ref, TxPositionsError, TxRow, TxRowError, TX_ROW_INLINE, TX_ROW_REF,
 };
@@ -38,6 +42,8 @@ pub use sync_stats::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
 mod tn_checksum_tests;
 #[cfg(test)]
 mod tn_crash_tests;
+#[cfg(test)]
+mod tn_tx_ref_tests;
 #[cfg(test)]
 mod tn_tx_row_tests;
 #[cfg(test)]

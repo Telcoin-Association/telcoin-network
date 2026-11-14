@@ -11,8 +11,12 @@
 //! Any other tag is refused. A jar without tagged values stores every transaction inline,
 //! untagged, as upstream does.
 
-use alloy_primitives::{bytes::BufMut, BlockNumber};
+use super::TxBodyReadError;
+use alloy_primitives::{bytes::BufMut, BlockNumber, TxNumber};
 use reth_codecs::Compact;
+use reth_db::static_file::{ColumnSelectorOne, StaticFileCursor, TransactionMask};
+use reth_db_api::table::Decompress;
+use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::path::PathBuf;
 
 /// The tag of a row that stores the transaction itself.
@@ -77,14 +81,64 @@ impl core::error::Error for TxRowError {}
 /// [`has_tagged_values`](reth_nippy_jar::NippyJar::has_tagged_values): a value of a jar without
 /// tags is always the transaction itself, decoded as upstream does.
 pub fn decode_tx_row<T: Compact>(value: &[u8], tagged: bool) -> Result<TxRow<T>, TxRowError> {
+    Ok(match split_tx_row(value, tagged)? {
+        TxRow::Inline(tx) => TxRow::Inline(T::from_compact(tx, tx.len()).0),
+        TxRow::Ref(position) => TxRow::Ref(position),
+    })
+}
+
+/// TN(TN-0202): splits a `Transactions` value as [`decode_tx_row`] does, without decoding the
+/// transaction: [`TxRow::Inline`] holds its bytes (the whole value of a jar without tags).
+fn split_tx_row(value: &[u8], tagged: bool) -> Result<TxRow<&[u8]>, TxRowError> {
     if !tagged {
-        return Ok(TxRow::Inline(T::from_compact(value, value.len()).0))
+        return Ok(TxRow::Inline(value))
     }
     match value.split_first() {
         None => Err(TxRowError::Empty),
-        Some((&TX_ROW_INLINE, tx)) => Ok(TxRow::Inline(T::from_compact(tx, tx.len()).0)),
+        Some((&TX_ROW_INLINE, tx)) => Ok(TxRow::Inline(tx)),
         Some((&TX_ROW_REF, position)) => decode_position(position).map(TxRow::Ref),
         Some((&tag, _)) => Err(TxRowError::UnknownTag(tag)),
+    }
+}
+
+/// TN(TN-0202): reads the `Transactions` row of transaction `tx` at `cursor`, `None` if the jar
+/// has no row for it. An inline row is decoded as an untagged jar's value always was
+/// ([`Decompress`], what `TransactionMask` reads); a row that does not decode is
+/// [`TxBodyReadError::Row`], naming the file and the transaction.
+pub(crate) fn read_tx_row<T: Decompress>(
+    cursor: &mut StaticFileCursor<'_>,
+    tx: TxNumber,
+) -> ProviderResult<Option<TxRow<T>>> {
+    let tagged = cursor.jar().has_tagged_values();
+    let Some(row) = cursor.get(tx.into(), <TransactionMask<T> as ColumnSelectorOne>::MASK)? else {
+        return Ok(None)
+    };
+    match split_tx_row(row[0], tagged) {
+        Ok(TxRow::Inline(value)) => Ok(Some(TxRow::Inline(T::decompress(value)?))),
+        Ok(TxRow::Ref(position)) => Ok(Some(TxRow::Ref(position))),
+        Err(error) => Err(ProviderError::other(TxBodyReadError::Row {
+            path: cursor.jar().data_path().to_path_buf(),
+            tx,
+            error,
+        })),
+    }
+}
+
+/// TN(TN-0202): reads the transaction of transaction `tx`'s row at `cursor` as [`read_tx_row`]
+/// does, for the readers that have no block to resolve a position with (`StaticFileProvider` and
+/// its jars): a row that stores a position is [`TxBodyReadError::InConsensusPack`].
+pub(crate) fn read_inline_tx<T: Decompress>(
+    cursor: &mut StaticFileCursor<'_>,
+    tx: TxNumber,
+) -> ProviderResult<Option<T>> {
+    match read_tx_row(cursor, tx)? {
+        None => Ok(None),
+        Some(TxRow::Inline(value)) => Ok(Some(value)),
+        Some(TxRow::Ref(position)) => Err(ProviderError::other(TxBodyReadError::InConsensusPack {
+            path: cursor.jar().data_path().to_path_buf(),
+            tx,
+            position,
+        })),
     }
 }
 

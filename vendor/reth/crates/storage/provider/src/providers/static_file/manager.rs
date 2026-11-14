@@ -4,7 +4,11 @@ use super::{
     SyncPhase,
 };
 // TN(TN-0201): the checks on the positions `write_blocks_data` is given.
-use super::tx_row::{check_tx_positions, check_tx_positions_len};
+use super::{
+    read_inline_tx, read_tx_row,
+    tx_row::{check_tx_positions, check_tx_positions_len},
+    TxBodyResolver, TxBodyResolverInstalled, TxRow,
+};
 use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
     to_range, BlockHashReader, BlockNumReader, BlockReader, BlockSource, EitherWriter,
@@ -59,7 +63,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, OnceLock,
     },
 };
 use tracing::{debug, info, info_span, instrument, trace, warn};
@@ -479,6 +483,8 @@ pub struct StaticFileProviderInner<N> {
     tx_pointer_jars: AtomicBool,
     /// TN(TN-0201): the transactions written inline into jars with tagged values.
     tagged_jar_inline_tx_rows: AtomicU64,
+    /// TN(TN-0202): resolves the `Transactions` rows that store batch positions, installed once.
+    tx_body_resolver: OnceLock<Arc<dyn TxBodyResolver<N>>>,
     #[cfg(test)]
     before_cache_insert: BeforeCacheInsertHook,
     #[cfg(test)]
@@ -553,6 +559,21 @@ impl<N> StaticFileProviderInner<N> {
     /// [`StaticFileProvider::write_blocks_data`] was given no positions for.
     pub fn tagged_jar_inline_tx_rows(&self) -> u64 {
         self.tagged_jar_inline_tx_rows.load(Ordering::Relaxed)
+    }
+
+    /// TN(TN-0202): installs the resolver of the `Transactions` rows that store batch positions
+    /// ([`super::TxRow::Ref`]), for every clone of this provider and every database provider
+    /// built over it. Once only: a second call is an error and keeps the first resolver. Without
+    /// one, reading such a row is an error ([`super::TxBodyReadError::NoResolver`]).
+    pub fn set_tx_body_resolver(&self, resolver: Arc<dyn TxBodyResolver<N>>) -> ProviderResult<()> {
+        self.tx_body_resolver
+            .set(resolver)
+            .map_err(|_| ProviderError::other(TxBodyResolverInstalled))
+    }
+
+    /// TN(TN-0202): the resolver [`Self::set_tx_body_resolver`] installed, if any.
+    pub fn tx_body_resolver(&self) -> Option<&Arc<dyn TxBodyResolver<N>>> {
+        self.tx_body_resolver.get()
     }
 
     /// TN(TN-0201): the format of each of `segment`'s jars, by expected block range, lowest first,
@@ -794,6 +815,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             jar_checksums: Default::default(),
             tx_pointer_jars: Default::default(),
             tagged_jar_inline_tx_rows: Default::default(),
+            tx_body_resolver: Default::default(),
             #[cfg(test)]
             before_cache_insert: Default::default(),
             #[cfg(test)]
@@ -3552,13 +3574,15 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
                     StaticFileSegment::Transactions,
                     chunk_range,
                     |cursor, number| {
-                        Ok(cursor
-                            .get_one::<TransactionMask<Self::Transaction>>(number.into())?
-                            .map(|transaction| {
+                        // TN(TN-0202): a row that stores a position is an error; a database
+                        // provider resolves it.
+                        Ok(read_inline_tx::<Self::Transaction>(cursor, number)?.map(
+                            |transaction| {
                                 rlp_buf.clear();
                                 let _ = channel_tx
                                     .send(calculate_hash((number, transaction), &mut rlp_buf));
-                            }))
+                            },
+                        ))
                     },
                     |_| true,
                 );
@@ -3581,6 +3605,37 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
         }
 
         Ok(tx_list)
+    }
+}
+
+impl<N: NodePrimitives<SignedTx: Decompress>> StaticFileProvider<N> {
+    /// TN(TN-0202): the `Transactions` row of transaction `num`, `None` if no jar has it: the
+    /// transaction, or its position in its batch ([`TxRow::Ref`]), which only a
+    /// [`DatabaseProvider`](crate::DatabaseProvider) resolves.
+    pub fn tx_row_by_id(&self, num: TxNumber) -> ProviderResult<Option<TxRow<N::SignedTx>>> {
+        self.get_segment_provider_for_transaction(StaticFileSegment::Transactions, num, None)
+            .and_then(|provider| provider.tx_row_by_id(num))
+            .or_else(|err| {
+                if let ProviderError::MissingStaticFileTx(_, _) = err {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            })
+    }
+
+    /// TN(TN-0202): the `Transactions` rows of the transactions in `range`, in order, across
+    /// jars, as [`Self::tx_row_by_id`] reads them; the list ends where the rows do.
+    pub fn tx_rows_by_tx_range(
+        &self,
+        range: impl RangeBounds<TxNumber>,
+    ) -> ProviderResult<Vec<TxRow<N::SignedTx>>> {
+        self.fetch_range_with_predicate(
+            StaticFileSegment::Transactions,
+            to_range(range),
+            read_tx_row,
+            |_| true,
+        )
     }
 }
 
@@ -3668,10 +3723,11 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
+        // TN(TN-0202): a row that stores a position is an error here, never a shorter list.
         self.fetch_range_with_predicate(
             StaticFileSegment::Transactions,
             to_range(range),
-            |cursor, number| cursor.get_one::<TransactionMask<Self::Transaction>>(number.into()),
+            read_inline_tx,
             |_| true,
         )
     }
