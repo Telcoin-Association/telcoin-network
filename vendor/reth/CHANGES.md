@@ -1396,9 +1396,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   bytes, the pushed values `step_end` records) and, past `max_recorded_bytes`, ends the
   transaction the way TN-0017's interrupt does: the context error becomes `EVMError::Custom`
   ("trace too large: ..."), which the RPC returns as `-32603`, and the halted interpreter cannot
-  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`:
-  a trace whose steps alone pass it serializes to a response the limit refuses, so no answer a
-  default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
+  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`.
+  (A step can hold more than its JSON, so the cap can refuse a trace whose response the limit
+  would accept, at about a third of the cap for a struct log with a small stack; TN-0178.) The counter survives `fuse`, so `debug_traceBlock*` and
   `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request (the mux
   tracer's only since TN-0172); the sites that
   build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
@@ -2748,3 +2748,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `a_disconnected_clients_call_is_dropped` (a call that never ends is dropped once its
   client disconnects). Mutation-checked: no abort (the call keeps running).
   *Upstream*: no; upstream has the same shape.
+
+- **TN-0178** — The revm-inspectors patch's docs list everything it carries and say when the
+  trace cap refuses a trace the response limit would accept. *Kind*: fix (docs).
+  *Files*: `patches/revm-inspectors/PATCH.md` ("Scope" lists the recursion limit, the trace cap
+  with its files, and the removed `.gitignore`; the out-of-workspace test command runs every
+  test; the cap's paragraph), `patches/revm-inspectors/src/tracing/config.rs`
+  (`DEFAULT_MAX_RECORDED_BYTES`'s doc) and `upstream.diff`; the TN-0079 entry above; TN's
+  `docs/src/rpc-methods/debug/{README.md, debug_tracetransaction.md}` and
+  `docs/src/rpc-methods/trace/README.md`.
+  *Why*: "Scope" said the patch mattered to JavaScript tracers only, although the trace cap
+  reaches every build, so a maintainer could drop the patch from a default build and lose the
+  cap; its fallback test command ran only the JavaScript tests. The cap's docs said a trace past
+  the cap could not have been returned anyway. That holds for call input and output, which
+  serialize in hex, but a struct-log step holds about 200 bytes against 60 to 100 of JSON with a
+  small stack, and a `vmTrace` step copies the whole memory after each write, so the cap can
+  refuse traces the response limit would accept, and raising `--rpc.max-response-size` does
+  not raise it. The docs now say so. *Can reach execution or storage*: no; docs and a doc
+  comment.
+  *Tests*: n/a. *Upstream*: n/a.
