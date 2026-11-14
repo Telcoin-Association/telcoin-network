@@ -750,8 +750,42 @@ async fn format_fixtures_read_back_unchanged() -> eyre::Result<()> {
             WHAT_TO_DO,
         )?;
         opened.close()?;
+        ensure_same(
+            name,
+            "opening and closing the checked-in datadir rewrote its files",
+            rewritten_files(&fixture_datadir(name), &dir.path().join("datadir"))?,
+            WHAT_TO_DO,
+        )?;
     }
     Ok(())
+}
+
+/// The files of the checked-in datadir `fixture` that the open and close of its copy at `copy`
+/// changed or removed, every file but `db/tn-lmdb.dat`: an open adds a `VersionHistory` row and
+/// rewrites the layout records there, and its rows are compared through the reads. An open
+/// rewrites each segment's latest `.conf` (the static-file writer's heal commits it), so a
+/// release whose open changes a file's bytes fails here, before a one-release rollback meets it.
+fn rewritten_files(fixture: &Path, copy: &Path) -> eyre::Result<Vec<String>> {
+    let skipped = Path::new("db").join("tn-lmdb.dat");
+    let mut rewritten = Vec::new();
+    let mut dirs = vec![PathBuf::new()];
+    while let Some(relative) = dirs.pop() {
+        for entry in std::fs::read_dir(fixture.join(&relative))? {
+            let entry = entry?;
+            let path = relative.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                dirs.push(path);
+            } else if path != skipped {
+                let opened = std::fs::read(copy.join(&path)).ok();
+                if opened.as_deref() != Some(std::fs::read(entry.path())?.as_slice()) {
+                    let what = if opened.is_some() { "rewritten" } else { "removed" };
+                    rewritten.push(format!("file {}: {what}", path.display()));
+                }
+            }
+        }
+    }
+    rewritten.sort();
+    Ok(rewritten)
 }
 
 /// Writer stability: the current code, building the fixtures' chain again, writes the same version

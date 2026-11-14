@@ -886,7 +886,9 @@ holds a v1 and a v2 tn-lmdb datadir built from one fixed chain (`genesis.json` a
 plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions, contract creation, an account removal,
 an epoch close, a two-block output), each with its digests (`digests.txt`).
 `format_fixtures_read_back_unchanged` opens a copy of each with the current code and compares every
-table row, static-file row, provider read and the state-pack export.
+table row, static-file row, provider read and the state-pack export; once the copy is closed,
+every checked-in file but `db/tn-lmdb.dat` must still hold its bytes, so an open that rewrites a
+file (each segment's latest `.conf` is rewritten by the open's heal today, unchanged) fails.
 `format_writer_output_unchanged` builds the chain again and compares each tn-lmdb table's raw rows
 and each static file's bytes (the decompressed rows of the LZ4 headers jar), the version markers
 and the block hashes; it is ignored on the adiri build, whose fork schedule builds other blocks.
