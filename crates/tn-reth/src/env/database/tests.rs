@@ -563,7 +563,8 @@ mod tn_lmdb {
     /// that refuses reads that do not wait for the disk (tmpfs refuses `RWF_NOWAIT`) the first
     /// commit with a gap to fill turns gap fill off instead, a width and `auto` alike
     /// (`IoStats::gap_fill_refusals`, the engine's documented fallback), filling none: the option
-    /// reached the engine either way.
+    /// reached the engine either way. With `TN_TEST_REQUIRE_GAP_FILL` set (`etc/ci-lanes.sh`'s
+    /// rerun on a disk-backed temp dir) a refusal fails instead.
     #[test]
     fn db_gap_fill_reaches_the_engine_and_is_refused_past_its_maximum() {
         use clap::Parser as _;
@@ -623,6 +624,11 @@ mod tn_lmdb {
                     assert!(!auto || s.gap_auto_steps > 0, "{gap_fill}: auto chose: {s:?}");
                 }
                 _ => {
+                    assert!(
+                        std::env::var_os("TN_TEST_REQUIRE_GAP_FILL").is_none(),
+                        "{gap_fill}: TN_TEST_REQUIRE_GAP_FILL is set, but the temp dir's file \
+                         system refused the gap fill's reads: {s:?}"
+                    );
                     let counts = (s.gap_fill_refusals, s.gaps_filled);
                     assert_eq!(counts, (1, 0), "{gap_fill}: refused once: {s:?}");
                 }

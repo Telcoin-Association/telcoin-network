@@ -240,6 +240,17 @@ lane_test_default() {
     # keeps the workspace's feature resolution, so the binaries above are reused, not rebuilt.
     run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked --workspace \
         -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
+    # Gap fill (`--db.gap-fill`, `auto` on Linux) reads with RWF_NOWAIT, which tmpfs refuses, and
+    # its tests assert only that fallback there: CI's `test` job keeps TMPDIR on /dev/shm. Rerun
+    # them on a temp dir under the target directory, on the disk, with TN_TEST_REQUIRE_GAP_FILL
+    # set, so a refusal fails them and every run writes gaps on Linux (crates/tn-lmdb/README.md,
+    # gap fill). The filter reuses the binaries above.
+    mkdir -p "${CARGO_TARGET_DIR:-target}/tmp-gap-fill"
+    local disk_tmp
+    disk_tmp=$(cd "${CARGO_TARGET_DIR:-target}/tmp-gap-fill" && pwd)
+    run env TMPDIR="$disk_tmp" TN_TEST_REQUIRE_GAP_FILL=1 cargo nextest run --locked --workspace \
+        -E '(package(tn-lmdb) & test(gap_fill)) | (package(tn-reth) & test(db_gap_fill))' \
+        "${run_mode[@]}"
 }
 
 lane_test_adiri() {
