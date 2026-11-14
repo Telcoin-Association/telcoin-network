@@ -147,6 +147,7 @@ Linux is the production platform.
 
 - `--db.gap-fill` defaults to `auto` on Linux.
 - A file just written by `cp`, `rsync` or a restore sits in large page-cache folios. Until they are evicted, each commit writes whole folios back to disk, several times the bytes it changed. At its first open after a copy (when `db/tn-lmdb.dat.boot` is missing or names another file), the node drops `db/tn-lmdb.dat` from the page cache itself. Dropping the cache by hand before the first start (`sync; echo 1 | sudo tee /proc/sys/vm/drop_caches`) is harmless.
+- `db/tn-lmdb.dat.boot` records whether the database was closed cleanly in this boot. The node writes it at every start, and a start can fail on it, naming the file: a full volume, or a file another user owns, such as one a `sudo` run left. Free space or fix the file's owner, or delete it with the node stopped: that is safe, and only makes the next start drop the database from the page cache.
 
 macOS is for development and testing, not for validators.
 

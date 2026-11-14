@@ -1388,7 +1388,11 @@ checks as `Cursor`'s.
    between this step and the first commit leaves "open": the next open drops, which costs only
    its reads. The record is written only under the data file's exclusive lock (a writer open and
    its close), so no two processes race on it; a symbolic link or anything but a regular file at
-   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed.
+   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed. An open this step
+   fails (a full or over-quota volume, a record another user owns, such as one a `sudo` run left)
+   is recovered by freeing the space or fixing the record's owner, or by removing `<path>.boot`
+   with no writer open: a missing record only makes the next writer open drop the file's cached
+   pages (`Cache::NoRecord`).
 
 **Open never writes to an existing file.** Every failure above leaves the file unchanged (the
 boot record beside it is written at step 10 only, once everything else has passed).
