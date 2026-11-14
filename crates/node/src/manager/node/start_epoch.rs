@@ -127,6 +127,10 @@ where
     /// If a replayed output is itself the epoch close, the returned [`super::ReplayResult`]
     /// reports its hash, the boundary header is stashed in `last_consensus_header` for the
     /// caller's close-and-write sequence, and replay stops there.
+    ///
+    /// The current pack is persisted before the first output is sent, so every replayed batch is
+    /// durable before execution can store a transaction as its position in it; a failed persist
+    /// sends nothing.
     pub(super) async fn replay_missed_consensus(
         &mut self,
         committee: Committee,
@@ -146,6 +150,14 @@ where
             committee.epoch(),
         )
         .await?;
+        // Make the current pack durable before the first replayed output reaches the engine. The
+        // outputs were read back from the pack a restart recovered, whose tail may never have been
+        // synced, and execution may store a block's transactions as positions in its batch: a
+        // power loss after that block's commit must not leave a row pointing into a batch the
+        // pack lost.
+        if !missing.is_empty() {
+            self.consensus_chain.persist_current().await?;
+        }
         let mut last_replayed_hash = None;
         let mut epoch_close_hash = None;
         let mut parent = executed;
