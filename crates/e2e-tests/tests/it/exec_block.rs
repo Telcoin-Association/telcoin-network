@@ -106,7 +106,7 @@ pub(crate) const FATAL_LOGS: [&str; 4] =
     [HALT_LOG, CONFLICT_HALT_LOG, LEFTOVER_GAP_LOG, CLOSING_BLOCK_HALT_LOG];
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
-const PASSPHRASE: &str = "restart_test";
+pub(crate) const PASSPHRASE: &str = "restart_test";
 
 /// Every runtime switch of the node turned on, as `parameters.yaml` entries, in the order of the
 /// node's `runtime_switches!` list (`crates/config/src/node.rs`).
@@ -486,7 +486,7 @@ pub(crate) struct Fleet {
     /// The fleet's datadirs; removed when the fleet drops.
     _temp: tempfile::TempDir,
     /// The path of [`Self::_temp`].
-    temp_path: PathBuf,
+    pub(crate) temp_path: PathBuf,
     /// Each node's HTTP RPC url.
     pub(crate) urls: [String; 4],
     /// Each node's RPC port, kept for restarts.
