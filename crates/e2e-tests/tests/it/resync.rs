@@ -6,7 +6,7 @@
 //! `static_files`, `restored-state-floor`) is moved aside into `execution-reset-<UTC time>`, the
 //! consensus database, keys and config stay, and the next start creates a new execution database
 //! and rebuilds it by executing the chain again from genesis. This test runs that on a live
-//! validator of a network that started on the previous release, after an in-place upgrade.
+//! validator of a network that started on `TN_BIN_PATH_PREV`, after an in-place upgrade.
 //!
 //! The run, in order:
 //!
@@ -34,9 +34,17 @@
 //!
 //! **Binaries and lane.** As in `reth_db_migration`, the test runs only with the marker
 //! `TN_E2E_TN_LMDB_BIN` set (`TN_BIN_PATH` is the default, tn-lmdb, build) and skips with a message
-//! without it or without `TN_BIN_PATH_PREV`. `make test-e2e-resync` passes all three. The files
-//! prove the roles: validator-4's datadir holds MDBX files before the upgrade and the migrated
-//! layout after it, and validator-1's reth database is still MDBX at the end.
+//! without it. With the marker set, a missing `TN_BIN_PATH` or `TN_BIN_PATH_PREV` fails the test.
+//! `make test-e2e-resync` passes all three. The files prove the roles: validator-4's datadir holds
+//! MDBX files before the upgrade and the migrated layout after it, and validator-1's reth database
+//! is still MDBX at the end.
+//!
+//! **The reference.** Validator-1 executes with whatever `TN_BIN_PATH_PREV` is. `make
+//! test-e2e-resync` defaults it (`TN_RESYNC_BIN_PREV`) to this tree's MDBX e2e build, which runs
+//! this tree's executor: on that lane step 5 compares layout v2 on tn-lmdb with layout v1 on MDBX
+//! under the same execution code, and finds a storage or rebuild fault, not an execution change
+//! against a released binary. For a released reference, build it (`make build-e2e-bin-prev
+//! TN_PREV_REF=<tag>`) and pass it as `TN_RESYNC_BIN_PREV`.
 
 use crate::{
     common::{
@@ -766,13 +774,6 @@ async fn run_resync(
 #[ignore = "should not run with a default cargo test, run with `make test-e2e-resync`"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resync_execution_from_genesis() -> eyre::Result<()> {
-    let Some(previous) = e2e_tests::get_previous_telcoin_network_binary() else {
-        const SKIPPED: &str = "SKIPPING test_resync_execution_from_genesis: TN_BIN_PATH_PREV is \
-                               unset. Run `make test-e2e-resync`.";
-        warn!(target: "resync-test", "{SKIPPED}");
-        eprintln!("{SKIPPED}");
-        return Ok(());
-    };
     if std::env::var_os(TN_LMDB_BIN_MARKER).filter(|value| !value.is_empty()).is_none() {
         const SKIPPED: &str = "SKIPPING test_resync_execution_from_genesis: TN_E2E_TN_LMDB_BIN is \
                                unset, so TN_BIN_PATH is not declared the tn-lmdb e2e binary. Run \
@@ -781,6 +782,20 @@ async fn test_resync_execution_from_genesis() -> eyre::Result<()> {
         eprintln!("{SKIPPED}");
         return Ok(());
     }
+    // the marker declares this the resync lane, so a missing binary is a misconfigured lane, not a
+    // skip. TN_BIN_PATH is checked before the harness resolves it: unset, it builds a binary
+    // through cargo, under features this lane did not choose
+    let previous = e2e_tests::get_previous_telcoin_network_binary().ok_or_else(|| {
+        eyre::eyre!(
+            "{TN_LMDB_BIN_MARKER} is set but TN_BIN_PATH_PREV is unset: the test needs the \
+             reference validator's binary there (`make test-e2e-resync` passes it)"
+        )
+    })?;
+    eyre::ensure!(
+        std::env::var_os("TN_BIN_PATH").is_some_and(|value| !value.is_empty()),
+        "{TN_LMDB_BIN_MARKER} is set but TN_BIN_PATH is unset: the test needs the tn-lmdb e2e \
+         binary there (`make test-e2e-resync` passes it)"
+    );
     let _permit = acquire_test_permit();
     let current = e2e_tests::get_telcoin_network_binary();
     let temp_dir = tempfile::TempDir::with_prefix(TEST)?;
