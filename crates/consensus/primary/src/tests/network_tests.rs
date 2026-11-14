@@ -5588,5 +5588,15 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
         assert_eq!(gauge(), Some(expected), "a handler of epoch {epoch}");
     }
 
+    // the max is over (epoch, round): a later epoch replaces a higher round, an older one is
+    // ignored
+    let metrics = cb.app().metrics();
+    metrics.record_epoch_entry_rounds_behind(2, 7);
+    assert_eq!(gauge(), Some(7.0));
+    metrics.record_epoch_entry_rounds_behind(3, 2);
+    assert_eq!(gauge(), Some(2.0), "a later epoch replaces a higher round");
+    metrics.record_epoch_entry_rounds_behind(2, window);
+    assert_eq!(gauge(), Some(2.0), "a certificate of an older epoch is ignored");
+
     Ok(())
 }

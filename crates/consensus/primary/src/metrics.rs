@@ -29,8 +29,9 @@ static MAX_CONSENSUS_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The gauge has no getter, and the request handler that records it is rebuilt on every mode
 /// change inside an epoch, so the max is kept here, keyed by the certificates' epoch. `None`
 /// until the first request handler starts. There is one `PrimaryMetrics` per process, so a
-/// static is fine. The gauge is written under this lock, so certificates checked side by side
-/// cannot leave it below the max.
+/// static is fine; tests that build several buses share it, so a test that reads the gauge
+/// relies on nextest running it in its own process. The gauge is written under this lock, so
+/// certificates checked side by side cannot leave it below the max.
 static EPOCH_ENTRY_ROUNDS_BEHIND: Mutex<Option<(Epoch, Round)>> = parking_lot::const_mutex(None);
 
 /// Metrics for the primary's consensus pipeline.
