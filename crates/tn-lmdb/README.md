@@ -294,7 +294,10 @@ run (n·P bytes, n = ceil((28 + len) / P)):
   tag the leaf's header carries, [Tree pages](#tree-pages-pagers)); the cell does not store it,
   a read takes it from the leaf the cell is in (`Ovf::tag`). So a reference that damage
   redirects to another tree's run of the same txn and length is `Corrupt`, as a child pointer
-  redirected to another tree's page is.
+  redirected to another tree's page is. One redirected to another run of the same tree, commit
+  and length (a live one, or one freed and not yet reused) passes every check: nothing in a run
+  names its key or the leaf that owns it, so the read returns that run's value, as MDBX would.
+  `Env::check` finds it: the run is claimed twice (by two cells, or by a cell and the free list).
 
 - **The cell is canonical.** `ovf_pgno` is the run's first page, `ovf_txn` the low 32 bits of the
   txn that wrote it (the identity check, as a branch cell's `child_txn`), and `len` the value's
@@ -1152,7 +1155,7 @@ against its cell before returning a byte:
 - the run's `n` pages lie in `2..page_count` (a checked add) and are mapped;
 - its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
 - its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
-  `ovf_txn`, so a redirected or stale reference is `Corrupt`;
+  `ovf_txn`, so a stale reference, or one redirected to a run of another commit, is `Corrupt`;
 - its `len` is the cell's, and its `tag` is the tag of the tree whose leaf holds the cell;
 - unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
   page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
@@ -2679,9 +2682,15 @@ argument and the measurements. Code and other docs cite the items by number, so 
    redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32. A
    pointer redirected to a page of another tree that the same commit wrote fails the header's
    tree tag instead (every page names its tree: a table's id, or a tag derived from the dup
-   table's and the outer key for a nested tree); one redirected to another page of the same tree
-   and commit is damage at rest to a 4-byte field, which the key-range checks of the descents and
-   `Env::check` find (no page is reached twice). See [Tree pages](#tree-pages-pagers).
+   table's and the outer key for a nested tree). One redirected to another page of the same tree
+   and commit is damage at rest to a 4-byte field. The key-range checks of the descents find it
+   when the page's keys fall outside its slot's range; they do not when they fall inside it, as
+   for a page a later commit freed (not yet reused) whose range a sibling inherited: a `get` then
+   returns the freed page's rows (a hit is not range-checked) or misses the live ones, and a
+   write through it copies the freed page back into the tree. An overflow reference redirected
+   to another run of the same tree, commit and length returns that run's value. `Env::check`
+   finds both (a page claimed twice); MDBX would be at least as silent. See
+   [Tree pages](#tree-pages-pagers) and [Overflow runs](#overflow-runs-overflowrs).
 5. **The file can be longer than `page_count × P`.** That is growth slack; the meta's page count is
    authoritative. A clean close trims it; a crash, a latched close, a failed final sync or a failed
    trim keeps it, because the longer file is always valid while a trim whose length rests on state
