@@ -2212,8 +2212,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`std::thread::scope`, the last on the calling thread, no new dependency) through the same
   `fsync_file` helper (TN-0117), joins all of them, and returns an error if any failed: the first
   in the old serial order (`.csoff`, data, offsets), which is the one the serial code returned.
-  So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
-  sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
+  So no `.conf` is written after a failed sync, as before; a sync whose thread cannot start runs
+  on the calling thread (TN-0166), and a panic is resumed once the others ended. The `.csoff` length goes into the
   header only after its sync succeeded, as before. A failed call has run the other syncs too (the
   serial code stopped at the first failure), which leaves only bytes past the configuration. A
   failed sync is not retried on the same writer: it writes no configuration again (TN-0161), the
@@ -2707,3 +2707,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `storage_v2_refuses_jars_without_checksums` (a cached jar's configuration turned into version 1
   with its offsets file one offset short: the writer's open is refused and both files are left as
   they are; it fails without the change). *Upstream*: no (TN-0135 is TN's).
+
+- **TN-0166** — A static-file sync whose thread cannot start runs on the calling thread, and a
+  wait for a file's readers is logged once it passes a second. *Kind*: fix (operability).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, mod.rs,
+  tn_crash_tests.rs}` (`sync_at_once`, the test-only `FAIL_SYNC_THREADS`,
+  `LoadedJar::release`; test).
+  *Why*: TN-0138 runs each segment commit's `.csoff`, data and offsets syncs on scoped threads
+  (under storage v2 up to eight a persist), and a thread that could not start (`EAGAIN` under a
+  cgroup pids limit or systemd `TasksMax`) was its sync's error: the persist failed and the node
+  stopped. The job now waits in a slot its thread takes it from; when the thread does not start,
+  the calling thread takes it and runs it after starting the others, as every sync ran before
+  TN-0138, with a warning naming the phase. A sync's own failure is unchanged. TN-0148's
+  `LoadedJar::release` waits, with no bound, for readers of a file's earlier snapshots before the
+  file shrinks or is replaced (an RPC reader holding a changeset tip file across a rotation); a
+  wait now logs a warning naming the segment and range after a second, and again with its length
+  when it ends. *Can reach execution or storage*: storage, in timing only: the same syncs run, on
+  another thread, before the configuration as before; no byte changes. *Tests*:
+  `syncs_run_here_when_their_threads_cannot_start` (no sync thread starts: the changeset commit
+  succeeds and its blocks read back, also after a reopen, both formats; it failed before). The
+  release warning has no test (a log line after a one-second wait). *Upstream*: no (TN-0138 and
+  TN-0148 are TN's).

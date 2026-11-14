@@ -37,7 +37,17 @@ mod writer_tests;
 use reth_nippy_jar::NippyJar;
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
-use std::{io, marker::PhantomData, ops::Deref, sync::Arc};
+use std::{
+    io,
+    marker::PhantomData,
+    ops::Deref,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// TN(TN-0166): how long [`LoadedJar::release`] waits for a file's readers before it logs a
+/// warning.
+const RELEASE_WAIT_WARNING: Duration = Duration::from_secs(1);
 
 /// A cached `NippyJar`, as a reader holds it.
 ///
@@ -152,11 +162,35 @@ impl LoadedJar {
     /// segment at its tip and so replaces the jar of the file holding the tip; so do a stale jar
     /// above a new range, a re-initialization and a removal of a cached jar. Never call it while
     /// holding a provider of the same file: it would wait forever, as upstream deadlocks.
+    /// TN(TN-0166): a wait past [`RELEASE_WAIT_WARNING`] is logged as a warning naming the file,
+    /// and again with its length when it ends.
     fn release(jar: Arc<Self>) {
+        let (segment, range) = (jar.segment(), jar.user_header().expected_block_range());
         let lease = Arc::clone(&jar.lease);
         drop(jar);
+        let mut waiting = None;
+        let mut warned = false;
         while Arc::strong_count(&lease) > 1 {
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            let since = *waiting.get_or_insert_with(Instant::now);
+            if !warned && since.elapsed() >= RELEASE_WAIT_WARNING {
+                tracing::warn!(
+                    target: "providers::static_file",
+                    %segment,
+                    %range,
+                    "Waiting for readers of a static file before it changes"
+                );
+                warned = true;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        if let Some(since) = waiting.filter(|_| warned) {
+            tracing::warn!(
+                target: "providers::static_file",
+                %segment,
+                %range,
+                waited = ?since.elapsed(),
+                "Readers of a static file released it"
+            );
         }
     }
 }

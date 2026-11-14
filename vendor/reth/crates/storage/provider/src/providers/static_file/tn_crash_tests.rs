@@ -612,3 +612,30 @@ fn failed_syncs_return_the_first_in_the_serial_order() {
         assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{failed:?}");
     }
 }
+
+/// TN(TN-0166): with no sync thread able to start, a segment commit runs every sync on the
+/// calling thread and commits, for a changeset segment (three syncs) in both formats; the blocks
+/// read back, also after a reopen. Before, a thread that could not start was its sync's error.
+#[test]
+fn syncs_run_here_when_their_threads_cannot_start() {
+    use super::writer::FAIL_SYNC_THREADS;
+
+    FAIL_SYNC_THREADS.with(|fail| fail.set(true));
+    for checksums in [false, true] {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), checksums, 1_000);
+        let mut writer = static_files.latest_writer(ACCOUNTS).unwrap();
+        for block in 0..3 {
+            writer.append_account_changeset(account_changes(block), block).unwrap();
+        }
+        writer.sync_and_freeze().unwrap();
+        writer.finalize().unwrap();
+        drop(writer);
+        assert_accounts(&static_files, 2, 3);
+        drop(static_files);
+        let static_files = provider(dir.path(), checksums, 1_000);
+        drop(static_files.latest_writer(ACCOUNTS).unwrap());
+        assert_accounts(&static_files, 2, 3);
+    }
+    FAIL_SYNC_THREADS.with(|fail| fail.set(false));
+}

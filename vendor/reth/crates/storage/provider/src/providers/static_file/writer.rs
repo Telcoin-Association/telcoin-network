@@ -5,7 +5,7 @@ use super::{
 use crate::providers::static_file::metrics::StaticFileProviderOperation;
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber, TxNumber, U256};
-use parking_lot::{lock_api::RwLockWriteGuard, RawRwLock, RwLock};
+use parking_lot::{lock_api::RwLockWriteGuard, Mutex, RawRwLock, RwLock};
 use reth_codecs::Compact;
 use reth_db::models::{AccountBeforeTx, StorageBeforeTx};
 use reth_db_api::models::CompactU256;
@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Represents different pruning strategies for various static file segments.
 #[derive(Debug, Clone, Copy)]
@@ -200,40 +200,71 @@ type SyncJob<'a> = (SyncPhase, Box<dyn FnOnce() -> ProviderResult<()> + Send + '
 
 /// TN(TN-0138): runs `jobs` at once, the last on this thread and each other one on a scoped
 /// thread of its own, and returns once all have ended, with each one's result and time in the
-/// order given. A thread that cannot be started is its job's error (the job does not run). A job
-/// that panics resumes its panic here once the others have ended.
+/// order given. TN(TN-0166): a job whose thread cannot be started (thread limits) runs on this
+/// thread instead, after the others, as every sync ran before. A job that panics resumes its
+/// panic here once the others have ended.
 fn sync_at_once(jobs: Vec<SyncJob<'_>>) -> Vec<(SyncPhase, ProviderResult<Duration>)> {
-    fn timed(job: Box<dyn FnOnce() -> ProviderResult<()> + Send + '_>) -> ProviderResult<Duration> {
+    type Slot<'a> = Mutex<Option<Box<dyn FnOnce() -> ProviderResult<()> + Send + 'a>>>;
+    /// Runs the job in `slot`, which its thread or this one takes once.
+    fn run(slot: &Slot<'_>) -> ProviderResult<Duration> {
+        let job = slot.lock().take().expect("each sync job runs once");
         let start = Instant::now();
         job().map(|()| start.elapsed())
     }
 
+    let slots: Vec<(SyncPhase, Slot<'_>)> =
+        jobs.into_iter().map(|(phase, job)| (phase, Mutex::new(Some(job)))).collect();
+    let Some(((here_phase, here), others)) = slots.split_last() else { return Vec::new() };
     std::thread::scope(|scope| {
-        let mut jobs = jobs.into_iter();
-        let here = jobs.next_back();
-        let spawned: Vec<_> = jobs
-            .map(|(phase, job)| {
-                let thread = std::thread::Builder::new()
-                    .name("sf-sync".to_owned())
-                    .spawn_scoped(scope, move || timed(job));
-                (phase, thread)
+        let spawned: Vec<_> = others
+            .iter()
+            .map(|(phase, slot)| {
+                let spawn = || {
+                    std::thread::Builder::new()
+                        .name("sf-sync".to_owned())
+                        .spawn_scoped(scope, move || run(slot))
+                };
+                #[cfg(test)]
+                let thread = if FAIL_SYNC_THREADS.with(std::cell::Cell::get) {
+                    Err(std::io::Error::other("injected thread start failure"))
+                } else {
+                    spawn()
+                };
+                #[cfg(not(test))]
+                let thread = spawn();
+                (*phase, slot, thread)
             })
             .collect();
-        let here = here.map(|(phase, job)| (phase, timed(job)));
+        let here = (*here_phase, run(here));
         spawned
             .into_iter()
-            .map(|(phase, thread)| {
+            .map(|(phase, slot, thread)| {
                 let result = match thread {
                     Ok(thread) => {
                         thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                     }
-                    Err(err) => Err(ProviderError::other(err)),
+                    Err(err) => {
+                        warn!(
+                            target: "providers::static_file",
+                            ?phase,
+                            %err,
+                            "Static file sync thread did not start; syncing on this thread"
+                        );
+                        run(slot)
+                    }
                 };
                 (phase, result)
             })
-            .chain(here)
+            .chain(std::iter::once(here))
             .collect()
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TN(TN-0166): test-only: `sync_at_once` on this thread treats every thread as failing to
+    /// start.
+    pub(crate) static FAIL_SYNC_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// TN(TN-0161): test-only: `jobs` with each one of a phase in `failed` replaced by one that
