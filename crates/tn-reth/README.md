@@ -504,11 +504,13 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 What restore does *not* verify: the authenticity of the header window itself — that is the
 caller's trust decision (the window is validated upstream against consensus data).
 
-A restored node did not execute `B`, so its epoch-record check (see "Rebuilding in the new layout"
-below) skips the one record whose closing block is `B`: when the node enters the epoch after it,
-the restored epoch's record is not compared with `B`. `db load-state` already bound that record's
-`final_state` to the pack's final block. The restored-state floor marker (`restored-state-floor`)
-is what tells the node `B` was imported; every epoch it closes above `B` is compared.
+A restored node did not execute `B`, but its header at `B` is the real one the restore imported, so
+its epoch-record check (see "Rebuilding in the new layout" below) compares the restored epoch's
+record with `B` when the node enters the epoch after it. On the restored datadir that matches:
+`db load-state` bound the record's `final_state` to the pack's final block. Below `B` the node holds
+only the header scaffold, so a record whose closing block is below `B` is not compared. The
+restored-state floor marker (`restored-state-floor`) is what tells the node `B` was imported; every
+epoch closing at `B` or above is compared.
 
 ## Database backend
 
@@ -988,7 +990,7 @@ because the copied execution database replaces the rebuild.
   epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
   `restored-state-floor` beside a full consensus database (one copied in with a restored
   observer's execution database by the swap below) moves aside with the execution database, so the
-  rebuild executes and compares every epoch, the restored one included (the restored-block
+  rebuild executes and compares every epoch, including those below the old floor (the below-floor
   exemption under "Snapshot export / restore" does not apply here). It is out of the
   committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
   validator out leaves no margin, so validators take the swap below.

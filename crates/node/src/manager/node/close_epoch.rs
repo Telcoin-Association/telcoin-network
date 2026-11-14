@@ -731,8 +731,8 @@ where
                     epoch = stored.epoch,
                     floor,
                     closing_block = local.number,
-                    "stored epoch record not compared: its closing block is at or below this \
-                     datadir's restored-state floor, so this node restored it and did not execute it",
+                    "stored epoch record not compared: its closing block is below this datadir's \
+                     restored-state floor, so this node holds only a scaffolded header for it",
                 );
                 Ok(())
             }
@@ -1251,18 +1251,21 @@ impl std::error::Error for FinalStateMismatch {}
 pub(super) enum StoredFinalState {
     /// The record's `final_state` is this node's closing block.
     Matches,
-    /// Not compared: this node did not execute the closing block. It is at or below the
-    /// restored-state floor `floor` of a snapshot-restored datadir, so the restore imported it
-    /// (`db load-state` checked the pack's final block against this certified record).
+    /// Not compared: this node did not execute the closing block, and holds no real header for
+    /// it. It is below the restored-state floor `floor` of a snapshot-restored datadir, where the
+    /// restore wrote a header-only scaffold.
     Restored { floor: u64 },
 }
 
 /// The replay guard's decision for a stored epoch record and `local`, the closing block this node
 /// executed for the record's epoch.
 ///
-/// - At or below `restored_floor` (a snapshot-restored datadir), this node did not execute `local`,
-///   so there is nothing to compare: [`StoredFinalState::Restored`]. Only the restored block itself
-///   can be a closing block there, since no block below it was ever executed.
+/// - Below `restored_floor` (a snapshot-restored datadir), this node did not execute `local` and
+///   holds only a scaffolded header for it, so there is nothing to compare:
+///   [`StoredFinalState::Restored`]. The floor block itself is compared: its header is the real one
+///   the restore imported, so on the restored datadir it matches the record `db load-state` bound
+///   it to, and beside another consensus database (the side-observer swap copying a restored
+///   observer's floor in) the compare is what ties that header to this node's records.
 /// - Otherwise the record's `final_state`, number and hash, must be `local`. There is no "unset"
 ///   value: a default `final_state` (block 0, the zero hash) is compared like any other and never
 ///   matches a closing block. The epoch-0 dummy record, the one record with a default
@@ -1274,7 +1277,7 @@ pub(super) fn check_stored_final_state(
     local: BlockNumHash,
     restored_floor: Option<u64>,
 ) -> Result<StoredFinalState, FinalStateMismatch> {
-    if let Some(floor) = restored_floor.filter(|floor| local.number <= *floor) {
+    if let Some(floor) = restored_floor.filter(|floor| local.number < *floor) {
         return Ok(StoredFinalState::Restored { floor });
     }
     if stored.final_state == local {
@@ -2285,31 +2288,36 @@ mod tests {
         Ok(())
     }
 
-    /// On a snapshot-restored datadir a closing block at or below the restored-state floor was
-    /// restored, not executed, so neither the close nor the epoch entry compares it; above the
-    /// floor both do.
+    /// On a snapshot-restored datadir a closing block below the restored-state floor was neither
+    /// executed nor imported with a real header, so neither the close nor the epoch entry compares
+    /// it. The floor block's header is real, so both compare it, as they do every block above it.
     #[tokio::test]
-    async fn replay_guard_skips_a_closing_block_this_node_restored() -> eyre::Result<()> {
+    async fn replay_guard_skips_only_closing_blocks_below_the_restored_floor() -> eyre::Result<()> {
         let temp = tempfile::TempDir::with_prefix("replay_guard_floor")?;
         let floor = 20;
         let (mut manager, engine, _tasks, keys) = guard_manager(&temp, Some(floor)).await?;
         let recorded = block(floor, 0x20);
         let record = store_epoch1_record(&manager, &keys, recorded, true).await?;
 
-        let restored = block(floor, 0x21);
-        execute_to(&manager, restored);
+        let scaffolded = block(floor - 1, 0x21);
+        execute_to(&manager, scaffolded);
         manager.write_epoch_record(1, &engine).await?;
         assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record));
-        manager.recover_previous_epoch_record(2, &header_of(restored), &engine).await?;
+        manager.recover_previous_epoch_record(2, &header_of(scaffolded), &engine).await?;
 
-        let executed = block(floor + 1, 0x21);
-        execute_to(&manager, executed);
-        let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
-        assert_eq!(mismatch.local, executed);
-        let mismatch = expect_mismatch(
-            manager.recover_previous_epoch_record(2, &header_of(executed), &engine).await,
-        );
-        assert_eq!(mismatch.local, executed);
+        for local in [block(floor, 0x21), block(floor + 1, 0x21)] {
+            execute_to(&manager, local);
+            let mismatch = expect_mismatch(manager.write_epoch_record(1, &engine).await);
+            assert_eq!(mismatch.local, local);
+            let mismatch = expect_mismatch(
+                manager.recover_previous_epoch_record(2, &header_of(local), &engine).await,
+            );
+            assert_eq!(mismatch.local, local);
+        }
+
+        execute_to(&manager, recorded);
+        manager.write_epoch_record(1, &engine).await?;
+        manager.recover_previous_epoch_record(2, &header_of(recorded), &engine).await?;
         Ok(())
     }
 
