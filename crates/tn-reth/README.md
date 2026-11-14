@@ -1413,7 +1413,24 @@ v1's in even ones): the report lists each comparison and their total mismatches 
 profile's table, and a mismatch fails the run. In commit mode `EXEC_LAYOUT_BEFORE` and
 `EXEC_LAYOUT_AFTER` (`v1` or `v2`) set one side's layout, and the before commit's bench may write
 report version 5, from before the layout knob: such a bench refuses the knob, so for it set only
-`EXEC_LAYOUT_AFTER`. It runs the profiles in
+`EXEC_LAYOUT_AFTER`. `etc/reth-exec-bench.sh --tx-bodies <bench dir>` is layout mode's twin for
+"Transactions stored by position": one tn-lmdb build, both sides on storage v2, transactions
+inline (A, `TN_EXEC_BENCH_TX_BODIES=inline`) against stored by batch position (B, `=pointers`),
+with the same differential (its `tx` and `receipt` queries read each side's own rows, so a
+mismatch fails the run) and one base per format in `cache/` (`base-tn-lmdb-v2-ptr-...` for
+pointers). The bench has no consensus packs: an aged base that stores transactions by position
+keeps the aging's batches in `bench-batches.bin` beside its meta, and the run resolves pointer
+rows from them and from the batches of each output it builds, held in memory
+(`MemoryBatches::filled_by_caller`, which the persists do not copy into, so a timed output pays
+only the node's own cache fill); pack reads are `tx_body_read_bench`'s (below). In commit mode
+`EXEC_TX_BODIES_BEFORE` and `EXEC_TX_BODIES_AFTER` (`inline` or `pointers`, which needs that
+side's layout v2) set one side's format; a before bench from before the knob (report version 5 or
+6) refuses it, so for it set only `EXEC_TX_BODIES_AFTER`. Each format has its own bases, so
+`EXEC_SHARED_BASE=1` is refused when the sides' formats differ: each side ages its own, and the
+chains they run must still match (blocks do not depend on the format). For the feature's
+"no degradation" run, against its branch point:
+`EXEC_LAYOUT_BEFORE=v2 EXEC_LAYOUT_AFTER=v2 EXEC_TX_BODIES_AFTER=pointers etc/reth-exec-bench.sh
+<bench dir> <branch point>`. It runs the profiles in
 `EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch`,
 `busy-export` and `busy-history` when named) as interleaved pairs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
@@ -1449,10 +1466,13 @@ its runs' JSON headers: execution is deterministic, so in backend and layout mod
 mode with `EXEC_SHARED_BASE=1` (both sides on the before side's aged bases), a difference is marked
 `CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
 dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
-runs. The script reads JSON report versions 6 (the bench's `JSON_REPORT_VERSION`) and 5 (6 only
-added fields, which a version 5 run renders as `-`): it refuses a directory without `runs.tsv` or
-with a report of another version, and refuses before building this checkout's bench when it
-writes another than 6, and commit mode's before bench when it writes neither. On Linux,
+runs. The script reads JSON report versions 7 (the bench's `JSON_REPORT_VERSION`), 6 and 5 (6 and 7
+only added fields, which an older run renders as `-`): it refuses a directory without `runs.tsv`
+or with a report of another version, and refuses before building this checkout's bench when it
+writes another than 7, and commit mode's before bench when it writes none of them. Each profile's
+table names each side's transaction format (as requested and as its datadir holds it, with the
+batches its env resolved from) and adds the `Transactions` segment's apparent MiB and its growth
+per output (allocated and apparent KiB) beside its allocated MiB. On Linux,
 `EXEC_SYS_SAMPLE=1` runs a sampler beside each run (every second: `/proc/meminfo`'s Dirty and
 Writeback, the `/proc/diskstats` line of the whole disk under the bench directory and the drive's
 temperature; `filefrag`'s extent count of the data file when it appears and every 30 s, when
@@ -1569,17 +1589,22 @@ clones) had tn-lmdb's mean output time at 1.00 to 1.08x MDBX's on the busy profi
     `B.transfer(caller, amount_out)` from its prefilled balance and logs `ISwapRouter::Swap`. It
     reverts when a token call fails.
   - On the test chain a token transfer uses 38,974 gas and a swap 79,520.
-- **`base`:** `build_base(spec, page_size, cache_dir)` builds a spec's genesis once per backend and
-  page size into a closed datadir, `<cache_dir>/base-<backend>-pg<page_size>-<key>`, with
-  production `--db.*`, durable sync and `--db.page-size <page_size>`; a database with another page
-  size (`db_page_size`) is an error.
+- **`base`:** `build_base(spec, layout, tx_bodies, page_size, cache_dir)` builds a spec's genesis
+  once per backend, storage layout, transaction format and page size into a closed datadir,
+  `<cache_dir>/base-<backend>[-v2][-ptr]-pg<page_size>-<key>` (`-v2` for layout v2, `-ptr` for
+  transactions stored by position), with production `--db.*`, durable sync and
+  `--db.page-size <page_size>`; a database with another page size (`db_page_size`) is an error.
+  The layout and the format are selected for a new datadir in one place each
+  (`StorageLayout::select`, `TxBodies::select`: inline unless pointers are asked, never the env's
+  default for new datadirs), and `open_production_env_with_format` refuses a datadir that holds
+  another.
   - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
     derived datadir, such as an aged one, appends its own `extra` component. A change that makes a
     base built by earlier code differ from what the code builds bumps `LAYOUT_VERSION`, which
     renames every base: each backend's bases, and their aged children, rebuild once. The constant's
     doc comment lists each version and why.
-  - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the page size, the layout
-    version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
+  - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the storage layout, the
+    transaction format, the page size, the layout version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
     `<name>.building` into place. A later call returns the cached base.
   - An existing base whose meta does not match (layout version, backend, page size, spec, header
     hash, or the slim genesis hash, which changes with the token or router code or the test
@@ -1637,6 +1662,31 @@ clones) had tn-lmdb's mean output time at 1.00 to 1.08x MDBX's on the busy profi
     errors.
   - Each drains per-window latency samples and error counts, keeping the first error message.
 
+### Transaction read benchmark
+
+`env::tx_body_read_bench::tx_body_read_bench` (`src/env/tx_body_read_bench.rs`, `#[ignore]`d,
+tn-lmdb only) prices the reads a datadir that stores its transactions by position answers from
+consensus packs. It saves `OutputFactory` outputs (the peak profile's 20 batches of about 600
+transactions by default) into a real consensus chain over three epochs (two closed, one live),
+executes them as the engine does into an inline and a pointer datadir, and times, each inline and
+by position, `transaction_by_hash_with_meta`, the receipt-by-hash path, a full block, the
+`eth_getLogs` shape (`transaction_by_id` of 1, 10 and all of a block's transactions), a
+transaction range across blocks and the two RPC methods in process, as p50/p99 µs. The pointer
+columns split where a read is answered: the cache's recent part, its cold part, a pack with its
+reader open and its pages cached, a pack whose reader was dropped (the open a read outside the
+4-reader LRU pays), the same with the pack's pages dropped (Linux only), and the live epoch's pack
+with no cache. It ends with the space of each closed datadir (`static_files/`, the `Transactions`
+files, `db/`; allocated and apparent) and of the packs, and the `Transactions` bytes per
+transaction. Its knobs (`TN_TX_READ_BENCH_*`: outputs per epoch, epochs, batch shape, genesis,
+samples, range length, seed) are in its module docs. Run it in release with `TMPDIR` on the disk
+under test:
+
+```sh
+mkdir -p target/tx-read-bench-tmp
+TMPDIR=$PWD/target/tx-read-bench-tmp cargo test --release -p tn-reth --lib \
+  env::tx_body_read_bench::tx_body_read_bench -- --ignored --exact --nocapture
+```
+
 ## Determinism rules
 
 Block production must be a pure function of certified consensus output. Concretely:
@@ -1673,6 +1723,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/env/genesis.rs` | Genesis construction, including `ConsensusRegistry` account generation via a pre-genesis EVM and embedded-artifact JSON parsing; temp-chain env for tests. |
 | `src/env/helpers.rs` | Read-side accessors: headers, blocks, receipts, accounts, `read_contract*`, canonical streams and tips. |
 | `src/env/persist_bench.rs` | Test-only, `#[ignore]`d: the per-block persist benchmark (`per_block_persist`; see "Persist benchmark" under "Database backend"). |
+| `src/env/tx_body_read_bench.rs` | Test-only, `#[ignore]`d: the read benchmark of transactions stored by position against inline, by where a read is answered, with each format's space (`tx_body_read_bench`; see "Transaction read benchmark"). |
 | `src/env/rpc.rs` | Assembles and starts reth's RPC server over the worker pool + `WorkerNetwork`; no engine namespace. |
 | `src/env/tx_bodies.rs` | The resolver of a datadir that stores transactions by position (`TxBodySource`): the decoded-batch cache (`tx_bodies/cache.rs`), the consensus packs it reads (`tx_bodies/packs.rs`), `MemoryBatches` for test builds; see "Transactions stored by position". |
 | `src/error.rs` | `TnRethError` and the state-read error taxonomy. |
