@@ -328,6 +328,19 @@ pub struct Parameters {
     // "Parameters::switch_at_default")]`, whose type's default is the behaviour from before the
     // switch existed; every field here also gets its default in `Default for Parameters` and an
     // entry in `runtime_switches!`
+    /// Re-vote one older uncertified epoch record of this node's own at each epoch close and at
+    /// startup, and keep verified epoch-vote signatures across vote rounds.
+    ///
+    /// When on, the close-time failsafe re-votes the previous epoch's record as before plus one
+    /// older record this node holds uncertified within the last 16 epochs (picked round-robin by
+    /// the closing epoch), the startup re-arm does the same, and a vote round for a record is
+    /// seeded with the signatures earlier rounds for that record verified, so two rounds that each
+    /// fell short can add up to a quorum. The vote is the same signed message as the original:
+    /// nothing new goes on the wire. The default `false` keeps the previous behaviour: only the
+    /// previous epoch's record is re-voted, once, and every vote round starts empty. Issue #1850.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub epoch_record_recertify: bool,
+
     /// Keep vote requests queued on the voter's per-author lock from each waiting out the
     /// execution wait in turn.
     ///
@@ -452,6 +465,7 @@ impl Default for Parameters {
                 Parameters::default_parallel_fetch_request_delay_interval(),
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             // ---- runtime switches: begin ----
+            epoch_record_recertify: false,
             vote_queue_fix: false,
             // ---- runtime switches: end ----
         }
@@ -652,6 +666,7 @@ macro_rules! runtime_switches {
 runtime_switches! {
     // ---- runtime switches: begin ----
     // one entry per switch field, in the order the node lists them
+    epoch_record_recertify,
     vote_queue_fix,
     // ---- runtime switches: end ----
 }
