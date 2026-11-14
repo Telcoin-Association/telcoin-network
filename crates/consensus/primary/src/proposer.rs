@@ -1425,6 +1425,30 @@ impl<DB: Database> Proposer<DB> {
             .filter(|header| header.epoch() == current_epoch && header.round() >= self.round)
     }
 
+    /// Log `proposer stopped` when the proposer shuts down, which ends its epoch: what it leaves to
+    /// the orphan re-pool of the next epoch start (issue #1807).
+    ///
+    /// `queued_digests` are still in the queues; `proposed_uncommitted` are the own headers
+    /// proposed and neither committed nor canceled (the tracked ones) and `uncommitted_digests`
+    /// their distinct digests; `in_flight_digests` were drained into a header whose proposal had
+    /// not come back. The three digest counts do not overlap.
+    fn log_stopped(&self) {
+        let tracked: BTreeSet<&BlockHash> =
+            self.proposed_headers.values().flat_map(|header| header.payload().keys()).collect();
+        let in_flight_digests =
+            self.lane_seqs.out_of_queue().filter(|d| !tracked.contains(d)).count();
+        info!(
+            target: "consensus::metrics",
+            epoch = self.committee.epoch(),
+            round = self.round,
+            queued_digests = self.pending_digests_len(),
+            proposed_uncommitted = self.proposed_headers.len(),
+            uncommitted_digests = tracked.len(),
+            in_flight_digests,
+            "proposer stopped"
+        );
+    }
+
     /// Wrapper async function to either query the pending header or never resolve.
     async fn pending_header(
         pending_header: &mut Option<PendingHeaderTask>,
@@ -1451,6 +1475,7 @@ impl<DB: Database> Proposer<DB> {
         loop {
             tokio::select! {
                 _ = &self.rx_shutdown => {
+                    self.log_stopped();
                     return Ok(())
                 }
                 // check for new digests from workers and send ack back to worker
@@ -1671,6 +1696,11 @@ impl LaneSequences {
                 .and_modify(|mark| *mark = (*mark).max(seq))
                 .or_insert(seq);
         }
+    }
+
+    /// The digests drained into an own header that is in flight or tracked.
+    fn out_of_queue(&self) -> impl Iterator<Item = &BlockHash> + '_ {
+        self.out.keys()
     }
 
     /// Judge the order of the digests in `requeued`, which return to the front of their lanes.
