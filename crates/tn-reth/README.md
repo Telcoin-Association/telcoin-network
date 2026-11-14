@@ -949,7 +949,8 @@ restored from a snapshot, which would refuse the rebuilt chain's old blocks if i
 and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
 state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
 moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
-refuses to start while a `.partial` directory is there, and running the command again finishes it.
+refuses to start while a `.partial` directory holding an entry is there, and running the command
+again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
 It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
 for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
 restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no

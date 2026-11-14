@@ -8,10 +8,11 @@
 //! the config stay where they are.
 //!
 //! The moves are staged in `execution-reset-<UTC time>.partial`, renamed to its final name once
-//! every entry is in it. A node refuses to start while a `.partial` directory is there
-//! ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding half an
-//! execution database. Running the command again finishes an interrupted reset into the same
-//! directory.
+//! every entry is in it. A node refuses to start while a `.partial` directory holding an entry is
+//! there ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding
+//! half an execution database. An empty one (a reset stopped before its first move, or undone by
+//! moving its entries back) holds none of it and blocks nothing. Running the command again finishes
+//! an interrupted reset into the same directory.
 //!
 //! The rebuild replays epoch 0 from the node's own consensus packs first, so the command refuses a
 //! datadir whose consensus database holds a later epoch's pack and none for epoch 0
@@ -75,18 +76,36 @@ fn partial_resets(datadir: &Path) -> eyre::Result<Vec<PathBuf>> {
 
 /// Refuse to start a node, or to run a `db` command on the execution database, on `datadir` while
 /// an execution reset there is unfinished: the datadir may hold part of the old execution database
-/// beside nothing, and the node would open it.
+/// beside nothing, and the node would open it. An empty staging directory holds none of the
+/// execution database (a reset stopped before its first move, or undone by moving its entries
+/// back), so it does not refuse.
 pub(crate) fn refuse_interrupted_reset(datadir: &Path) -> eyre::Result<()> {
-    if let Some(partial) = partial_resets(datadir)?.first() {
+    for partial in partial_resets(datadir)? {
+        if is_empty_dir(&partial)? {
+            continue;
+        }
         bail!(
             "an execution reset of {} did not finish: {} holds part of the execution database. \
              Run `telcoin-network db reset-execution --force` to finish it, or move its entries \
-             back into the datadir to undo it",
+             back into the datadir to undo it (an empty one blocks nothing)",
             datadir.display(),
             partial.display(),
         );
     }
     Ok(())
+}
+
+/// Whether `path` is a directory with no entries. Anything else (a file, a link, a directory
+/// holding an entry) is not.
+fn is_empty_dir(path: &Path) -> eyre::Result<bool> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(false);
+    }
+    let mut entries =
+        fs::read_dir(path).wrap_err_with(|| format!("failed to list {}", path.display()))?;
+    Ok(entries.next().is_none())
 }
 
 /// The epoch of a consensus pack directory named `name` (`epoch-N`), or of one an interrupted
@@ -473,6 +492,52 @@ mod tests {
         assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        refuse_interrupted_reset(root).unwrap();
+    }
+
+    /// An interrupted reset undone as its refusal says (its entries moved back) leaves an empty
+    /// staging directory, which blocks nothing; a later reset fills it.
+    #[test]
+    fn an_interrupted_reset_moved_back_no_longer_blocks_the_node() {
+        let dir = datadir();
+        let root = dir.path();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+        assert!(refuse_interrupted_reset(root).is_err());
+
+        fs::rename(partial.join("db"), root.join("db")).unwrap();
+        refuse_interrupted_reset(root).unwrap();
+        assert_eq!(fs::read(root.join("db/tn-lmdb.dat")).unwrap(), b"database");
+
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+    }
+
+    /// The resume branch where every entry is in the staging directory but the final rename did
+    /// not happen (a stop just before it): the rerun moves nothing and only renames.
+    #[test]
+    fn a_reset_stopped_before_its_final_rename_is_finished_by_a_rerun() {
+        let dir = datadir();
+        let root = dir.path();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        for entry in ["db", "static_files", "restored-state-floor"] {
+            fs::rename(root.join(entry), partial.join(entry)).unwrap();
+        }
+        assert!(refuse_interrupted_reset(root).is_err());
+
+        let plan = reset_execution(root, false, ResetMode::Rebuild).unwrap();
+        assert!(plan.moves.is_empty(), "{:?}", plan.moves);
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        assert_eq!(
+            names(root),
+            ["consensus-db", "execution-reset-20261109T163205Z", "node-keys", "telcoin.pid"]
+        );
         refuse_interrupted_reset(root).unwrap();
     }
 
