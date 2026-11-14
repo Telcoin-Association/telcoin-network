@@ -335,15 +335,26 @@ pub struct Parameters {
     /// older record this node holds uncertified within the last 16 epochs (picked round-robin by
     /// the closing epoch), the startup re-arm does the same, and a vote round for a record is
     /// seeded with the signatures earlier rounds for that record verified, so two rounds that each
-    /// fell short can add up to a quorum. The vote is the same signed message as the original:
-    /// nothing new goes on the wire. The round for the older record leaves the
+    /// fell short can add up to a quorum, and a round that ends short aggregates the kept
+    /// signatures once they reach a quorum. The vote is the same signed message as the original:
+    /// nothing new goes on the wire. Rounds for records older than the previous one leave the
     /// `tn_node.epoch_record_signers` gauge to the rounds of the latest and the previous record
-    /// and reports its outcome in `tn_node.epoch_record_recertify_rounds_total` instead. A
-    /// node that holds an old record which differs from the network's stops at the close that
-    /// picks it, through the fork check the vote round already makes when it fetches the
-    /// certificate from a peer. The default `false` keeps the previous behaviour: only the
-    /// previous epoch's record is re-voted, once, and every vote round starts empty. Issue
-    /// #1850.
+    /// and label their missed votes `round="recertify"` in
+    /// `tn_node.epoch_record_missing_signers_total`; the outcome of this node's own picks is in
+    /// `tn_node.epoch_record_recertify_rounds_total`.
+    ///
+    /// A node whose own record of an older epoch differs from the network's certified one learns
+    /// it when the round for that record falls short and the round fetches the certificate from a
+    /// peer. Whether it stops then follows [`Self::epoch_record_conflict_halt`]: with that switch
+    /// on, it stops when the certificate is signed by a super-quorum of the full committee the
+    /// record before names; a restart does not change the stored record, so a later pick of it
+    /// stops the node again until an operator acts. With it off, the node logs the conflict at
+    /// error, counts it in `tn_node.epoch_record_round_conflicts_total` (label
+    /// `round="recertify"`) and keeps running; the record stays uncertified, and each later close
+    /// that picks it again runs one more round that ends the same way. The newest record and the
+    /// previous one stop the node on such a conflict whatever either switch says, as before. The
+    /// default `false` keeps the previous behaviour: only the previous epoch's record is re-voted,
+    /// once, and every vote round starts empty. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_recertify: bool,
 
