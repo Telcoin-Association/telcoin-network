@@ -539,6 +539,7 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.max-subscriptions-per-connection` | `128`                 | Max subscriptions per WebSocket or IPC connection               |
 | `--rpc.max-connections`                  | `500`                 | Max concurrent RPC connections                                  |
 | `--rpc.max-tracing-requests`             | CPU-dependent         | Max concurrent tracing requests (`debug`, `trace`)              |
+| `--rpc.proof-permits`                    | `25`                  | Max concurrent `eth_getProof`, `eth_simulateV1`, `eth_callMany` and `eth_callBundle` requests per worker |
 | `--rpc.max-trace-filter-blocks`          | `100`                 | Max block range of one `trace_filter` request                   |
 | `--rpc.max-blocks-per-filter`            | `100000`              | Max block range for `eth_getLogs` and filters (0 = no limit)    |
 | `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |

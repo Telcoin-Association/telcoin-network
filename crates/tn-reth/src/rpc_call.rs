@@ -299,6 +299,9 @@ where
     }
 
     /// Preserve reth's state selection, replay, sequential execution, and error handling.
+    ///
+    /// Reth's helper takes a blocking-IO permit and one of the eth API's tracing permits and
+    /// holds them in its blocking task (vendored TN-0184), so this handler must not take one too.
     async fn call_many(
         &self,
         bundles: Vec<Bundle>,

@@ -3045,3 +3045,35 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `simulate_output_over_the_budget_is_refused` (each call logs 512 KiB and returns 512 KiB, so it
   fails if either is not counted), `output_is_charged_up_to_the_budget`.
   *Upstream*: no; upstream has the same shape.
+
+- **TN-0184** — `eth_callMany` and `eth_callBundle` hold one of the eth API's tracing permits
+  while their blocking work runs. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`call_many` takes the permit after its
+  cheap checks and moves it into the blocking work with the blocking-IO one),
+  `crates/rpc/rpc/src/eth/bundle.rs` (`call_bundle` likewise; `blocking_io_permit_tests` gives
+  its fixture one tracing permit, `Fixture::call_many`, test
+  `test_call_many_keeps_permits_after_client_leaves`); TN's `crates/tn-reth/src/rpc_call.rs` and
+  `rpc_bundle.rs` (comments), `crates/tn-reth/src/rpc_server_args.rs` (`--rpc.proof-permits`
+  help).
+  *Why*: each request of these two methods keeps up to 32 MiB of call output (TN-0183), but took
+  only a blocking-IO permit, 256 per worker, so together they could keep about 8 GiB per worker.
+  Each now also takes one of the eth API's tracing permits (the `--rpc.proof-permits`
+  semaphore, 25 by default, which `eth_getProof` and `eth_simulateV1` take too), before its
+  blocking-IO permit as `eth_simulateV1` does (TN-0181), and holds both until its blocking work
+  ends, even after its client disconnects. The three methods that keep output then keep at most
+  about 25 x 32 MiB = 800 MiB per worker by default. A closed semaphore fails the request.
+  This guard rather than the `--rpc.max-tracing-requests` one that `trace_callMany` and
+  `debug_traceCallMany` take (and that `EthBundle` holds unused): `eth_callMany` runs in the eth
+  API's `Call` trait, which reaches only the eth API's own guard; one guard for all three methods
+  keeps the bound at permits x budget, where two would add up; and these calls run without an
+  inspector, unlike the CPU-bound traces that guard is sized for. *Can reach execution or
+  storage*: no. RPC only; nothing executed changes.
+  *Tests*: `test_call_many_keeps_permits_after_client_leaves`, and
+  `test_call_bundle_keeps_permit_after_client_leaves` extended (with one tracing permit, a
+  request whose blocking task is held up keeps it after its client left, so taking it again
+  waits, and it comes back when the task ends);
+  `test_create_access_list_keeps_permit_after_client_leaves` checks that `eth_createAccessList`
+  leaves it free. Mutation-checked: no tracing permit in `call_bundle`, and the permit held by
+  `call_many`'s request instead of its blocking work, each fail.
+  *Upstream*: no; upstream takes only a blocking-IO permit for `eth_callMany` and none for
+  `eth_callBundle`.
