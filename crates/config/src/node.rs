@@ -356,11 +356,12 @@ pub struct Parameters {
     /// stored, the skipped epoch is a gap (at most 16 at a time) that the record collector asks
     /// for again until its certificate is stored: at most once per 5 s retry interval, after a
     /// pass a peer answered, one record request (up to three peers in turn) per gap, the whole
-    /// retry cut off after 5 s or at shutdown. A walk that ends before a certified record after
-    /// it is stored is tried again at most once per retry interval, not on every pass. A node
-    /// without its own record of the epoch does not walk. The default `false` keeps the
-    /// previous behaviour: collection stops at the first epoch the network left uncertified, on
-    /// every node and across restarts. Issue #1850.
+    /// retry cut off after 5 s or at shutdown. The record collector tries a walk that ended
+    /// before a certified record after it was stored again at most once per retry interval, not
+    /// on every pass; the startup sync walks on each of its passes. A node without its own
+    /// record of the epoch does not walk. The default `false` keeps the previous behaviour:
+    /// collection stops at the first epoch the network left uncertified, on every node and
+    /// across restarts. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_collect_past_uncertified: bool,
     /// Stop the node when a record certified by a super-quorum of the full committee differs
@@ -383,9 +384,10 @@ pub struct Parameters {
     /// vote round's recovery stops the node when the network certified another record of the
     /// newest epoch or the one before it, as it did before this switch existed; that stop does
     /// not read this switch. Before turning it on, on the image with it off: read both counters
-    /// on every node (the total minus the below-threshold count is how many conflicts would
-    /// stop the node), grep every node's log for `ConflictingRecord {`, and turn it on one node
-    /// at a time. The default `false` keeps the previous behaviour. Issue #1850.
+    /// on every node (they count occurrences, about one per pass; any difference between the
+    /// total and the below-threshold count means the switch would stop the node), grep every
+    /// node's log for `ConflictingRecord {`, and turn it on one node at a time. The default
+    /// `false` keeps the previous behaviour. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_conflict_halt: bool,
 
