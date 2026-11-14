@@ -205,15 +205,16 @@ pub(crate) struct RethEnvMetrics {
     /// `CHECK_ONE_BLOCK_IN`, of those with parallel work (storage-root tasks or a split account
     /// walk), are also computed serially (`env/output_overlay/parallel.rs`); a difference means
     /// the parallel path is wrong. The block uses the serial result. Every node checks the same
-    /// blocks, so nodes running the same code publish the same root either way, but the
-    /// unchecked blocks the same bug hit carry the wrong one on all of them. The response is
-    /// network-wide: switch the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
-    /// or only the split the fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
-    /// `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it;
-    /// switching one node off only parts it from its peers. A node whose pool runs one thread
-    /// runs the same parallel code. The error log says whether the split composed the block's
-    /// root; a split's difference is also counted as [`AccountWalkFallback::Mismatch`], a
-    /// composed storage root's as [`StorageWalkFallback::Mismatch`].
+    /// blocks, but the unchecked blocks the same bug hit carry the wrong root: on every node for a
+    /// bug every path shares, on some for a bug in one path that scheduling picks. The check
+    /// cannot see a wrong trie node an unchecked block persisted. The response is network-wide:
+    /// switch the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`; read at the first
+    /// block, so a restart) and report it; switching one node off only parts it from its peers,
+    /// and switching off repairs no persisted node. A node whose pool runs one thread runs the
+    /// same parallel code. The error log says whether the split composed the block's root; a
+    /// block the split composed is also counted as [`AccountWalkFallback::Mismatch`], a block
+    /// with composed storage roots as [`StorageWalkFallback::Mismatch`]. Those say which splits
+    /// ran, not which part was wrong.
     pub(crate) parallel_state_root_mismatches_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
@@ -459,30 +460,42 @@ pub(crate) enum AccountWalkFallback {
     /// Fewer changed accounts than `SPLIT_MIN_ACCOUNTS`: the split's fixed costs are not worth
     /// paying. Expected on most blocks of a quiet chain.
     FewChanges,
-    /// The trie's shape is not one the split composes: a first nibble's node with a leaf or an
-    /// extension child, fewer than two non-empty first nibbles, or a rebuilt node that failed its
-    /// hash check. Expected while the account trie is small (a few thousand accounts or fewer);
-    /// the block paid for the split and then the walk on one thread.
+    /// The stored account trie failed the pre-check (a first nibble's node missing or with a leaf
+    /// or an extension child): a trie of a few thousand accounts or fewer, as a chain has from
+    /// genesis. Not tried, so free: the walk ran on one thread with the storage-root tasks, as
+    /// with `TN_PARALLEL_ACCOUNT_WALK=0`. Expected on every block the split would take while the
+    /// trie is small.
+    SmallTrie,
+    /// The trie passed the pre-check, but the block's own changes left a shape the split does not
+    /// compose: a first nibble's node with a leaf or an extension child (the block removed all
+    /// but one account under a second-level path, or added the first under an empty one), fewer
+    /// than two non-empty first nibbles, or a rebuilt node that failed its hash check. Rare. The
+    /// block paid for the subtries, and then the walk on one thread computed again every storage
+    /// root they had taken from the tasks.
     Shape,
     /// The database holds an account-trie node at the empty path, which reth never writes.
     /// Alert on any nonzero value: the stored trie is not one reth wrote.
     StoredRootNode,
-    /// A sampled serial check found the split's root or trie updates wrong; the block used the
-    /// serial result. Alert on any nonzero value: also counted in
-    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
-    /// (`TN_PARALLEL_ACCOUNT_WALK=0`) and report it.
+    /// A sampled serial check found the root or trie updates wrong on a block whose root the
+    /// split composed; the block used the serial result. It says the split ran, not that the
+    /// split was the wrong part: the storage-root tasks and the storage split ran too, and a
+    /// block with composed storage roots also counts [`StorageWalkFallback::Mismatch`]. Alert on
+    /// any nonzero value: also counted in `tn_reth.parallel_state_root_mismatches_total`, whose
+    /// response (`TN_PARALLEL_STATE_ROOT=0` on every node) applies.
     Mismatch,
 }
 
 impl AccountWalkFallback {
     /// Every variant, for zero-registration in [`register_account_walk_fallback_series`]. Extend
     /// it with [`Self::label`]'s match.
-    const ALL: [Self; 4] = [Self::FewChanges, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+    const ALL: [Self; 5] =
+        [Self::FewChanges, Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
 
     /// The `reason` label value this variant records under.
     const fn label(self) -> &'static str {
         match self {
             Self::FewChanges => "few_changes",
+            Self::SmallTrie => "small_trie",
             Self::Shape => "shape",
             Self::StoredRootNode => "stored_root_node",
             Self::Mismatch => "mismatch",
@@ -531,10 +544,12 @@ pub(crate) enum StorageWalkFallback {
     /// The database holds a storage-trie node at the empty path, which reth never writes. Alert
     /// on any nonzero value: the stored trie is not one reth wrote.
     StoredRootNode,
-    /// A sampled serial check found a block with a composed storage root wrong; the block used
-    /// the serial result. Alert on any nonzero value: also counted in
-    /// `tn_reth.parallel_state_root_mismatches_total`; switch the split off on every node
-    /// (`TN_PARALLEL_STORAGE_WALK=0`) and report it.
+    /// A sampled serial check found the root or trie updates wrong on a block with at least one
+    /// composed storage root; the block used the serial result. Counted once per such block, not
+    /// per trie. It says the split ran, not that the split was the wrong part: a block the
+    /// account split composed also counts [`AccountWalkFallback::Mismatch`]. Alert on any nonzero
+    /// value: also counted in `tn_reth.parallel_state_root_mismatches_total`, whose response
+    /// (`TN_PARALLEL_STATE_ROOT=0` on every node) applies.
     Mismatch,
 }
 

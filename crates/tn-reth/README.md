@@ -79,8 +79,9 @@ changed accounts also splits the account walk by the first nibble of the hashed 
 (`src/env/output_overlay/account_split.rs`): sixteen subtrie walks, each reth's own `StateRoot`
 over cursors restricted to one nibble, run on the calling thread and pool jobs, and the calling
 thread composes the root branch and the union of their trie updates. No vendored change beyond the
-storage-root hook (TN-0139). A trie the split cannot compose (a small one: a few thousand accounts
-or fewer) runs the walk on one thread as before.
+storage-root hook (TN-0139). A stored trie the split cannot compose (a small one: a few thousand
+accounts or fewer, as a chain has from genesis) is found before any subtrie runs, and the walk runs
+on one thread with the storage-root tasks, as with `TN_PARALLEL_ACCOUNT_WALK=0`.
 
 A hot contract's storage root is split the same way (`src/env/output_overlay/storage_split.rs`): a
 contract with at least 64 changed slots whose stored trie has all sixteen first-nibble nodes over
@@ -97,35 +98,56 @@ time the state root saved for the same pages written (both sides on one aged bas
 4 pages).
 
 The blocks whose number is a multiple of 256, of those with parallel work (storage-root tasks or a
-split walk), are also computed serially and compared; a difference is logged with both roots,
-counted in `tn_reth_parallel_state_root_mismatches_total` (alert on any nonzero value), and the
-block uses the serial result. The sample is the block number, not a count kept by each node, so
-every node checks the same blocks and nodes running the same code always publish the same root,
-right or wrong. A node whose rayon pool runs one thread runs the same parallel code and composes
-the same roots; only the off switches below compute serially. Any nonzero mismatch count means
-the parallel code computed a wrong root, and the unchecked blocks the same bug hit carry it on every
-node running this code: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`, or
-only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
-`TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning them off
-on one node only parts it from its peers on the next block the bug hits. Turning them off stops the
-bug; it repairs no trie node an unchecked block already persisted (the check compares the trie
-updates too, so a bug can be in them). Every later root, serial ones included, is computed over
-those nodes, so the nodes keep agreeing while a block's root may not be the root of its state. A
-snapshot restore (`src/snapshot.rs`) finds it: it rebuilds the trie from the hashed state and fails
-when that root differs from the snapshot block's header.
-`tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
-ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
-split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
-split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
-the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
-expected, `stored_root_node` and `mismatch` are alerts.
+split walk), are also computed serially and compared, the root and every trie update. A difference
+is logged with both roots, counted in `tn_reth_parallel_state_root_mismatches_total` (alert on any
+nonzero value), and the block uses the serial result; the node goes on. The sample is the block
+number, not a count kept by each node, so every node checks the same blocks. What the check covers:
+
+- It finds a parallel result that differs from the serial walk over the same stored trie, on a
+  checked block. The other 255 blocks in 256 commit the parallel result unchecked.
+- It cannot see a wrong trie node that an unchecked block persisted or left in the output's overlay.
+  Both walks read that node alike, and the serial walk recomputes only the paths its block changed,
+  so every later check passes over it.
+- Which code computes each storage root (a task, a split piece, a subtrie, or the walk itself)
+  depends on scheduling and on per-node task failures, so it differs between nodes. Nodes agree
+  because every path computes the same value. A bug that every path shares gives every node the
+  same wrong root on an unchecked block. A bug in one path gives a wrong root only on the nodes
+  whose scheduling took that path, so it can part nodes running the same code. A node whose rayon
+  pool runs one thread still runs the parallel code; only the off switches below compute every
+  root serially.
+
+Any nonzero mismatch count means the parallel code computed a wrong root. The response is
+network-wide: every node sets `TN_PARALLEL_STATE_ROOT=0` (read at the first block, so a restart),
+and the Telcoin Association network team is told. The `mismatch` reasons of the two fallback series
+below say which splits ran on the mismatching block, not which part was wrong: a block where both
+ran counts under both. They narrow the search; switching off one split (`TN_PARALLEL_ACCOUNT_WALK=0`
+or `TN_PARALLEL_STORAGE_WALK=0`) is for the network team to choose once it has found the fault.
+Turning a path off on one node only parts it from its peers on the next block a shared bug hits.
+Turning the paths off stops the bug; it repairs no trie node an unchecked block already persisted.
+Every later root, serial ones included, is computed over those nodes, so the nodes keep agreeing
+while a block's root may not be the root of its state. A snapshot restore (`src/snapshot.rs`)
+finds it: it rebuilds the trie from the hashed state and fails when that root differs from the
+snapshot block's header.
+
+`tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk ran on one
+thread: `few_changes` and `small_trie` are expected and free (most blocks of a quiet chain, and
+every block the split would take while the trie is small); `shape` is rare (the trie passed the
+pre-check but the block's own changes left a shape the split does not compose: the block paid for
+the subtries, then the walk on one thread computed again the storage roots they took);
+`stored_root_node` is an alert, and so is `mismatch` (a sampled check found a wrong result on a
+block the split composed). `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage
+tries the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed
+serially) are expected; `stored_root_node` is an alert, and so is `mismatch` (a sampled check found
+a wrong result on a block with a composed storage root).
 `tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
 storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
-part to the serial computation, on this node only; the block also logs the first error. It is the
-one per-node difference the parallel paths have, so read it first when one node parts from its
-peers. `provider`, `database` and `panicked` cost the block time; `tip_moved` (a task's transaction
-saw another finalized block than the walk's: something wrote the state or trie tables while an
-output's blocks were built) is an alert, as the node has no such writer.
+part to the serial computation, on this node only; the block also logs the first error. Read it
+first when one node parts from its peers. `provider`, `database` and `panicked` cost the block
+time; `tip_moved` (a task's transaction saw another finalized block than the walk's: something
+wrote the state or trie tables while an output's blocks were built) is an alert, as the node has no
+such writer. The walk's own transaction is held to the finalized block the output's first root saw:
+a later root of the output that sees another one fails its block, as the output's overlay no longer
+sits on the database it was built over.
 
 Off switches, read once at the first block from the node's environment:
 `TN_PARALLEL_STATE_ROOT=0` computes every root serially; `TN_PARALLEL_ACCOUNT_WALK=0` keeps the

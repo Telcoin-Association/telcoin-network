@@ -8,10 +8,12 @@
 use super::{
     block_is_checked, checked, storage_root_targets, DatabaseError, ParallelRoot, ParallelRoots,
     ProviderError, StorageRootSource as _, StorageRootTasks, StorageSplits, TaskError,
-    CHECK_ONE_BLOCK_IN, FAIL_NEXT_WALK, INJECTED_WALK_FAILURE, TASKS_STARTED, TASK_ROOTS_TAKEN,
+    CHECK_ONE_BLOCK_IN, FAIL_NEXT_WALK, INJECTED_WALK_FAILURE, LAST_ROOT_FAILURES,
+    RUN_JOBS_BEFORE_WALK, TASKS_STARTED, TASK_ROOTS_TAKEN,
 };
 use crate::{
     env::output_overlay::{AccountWalk, StorageWalk, Walks},
+    metrics::ParallelRootTaskFailure,
     OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -313,7 +315,8 @@ async fn no_storage_changes_runs_serially() -> eyre::Result<()> {
 /// A commit between the walk's transaction and the tasks' (it changes a slot of every target and
 /// advances the finalized block number, as a persist does): every task sees another tip and
 /// leaves its account to the walk, so the root is the serial one over the walk's transaction.
-/// Without the tip check any task result the walk took would carry the commit's slot.
+/// Every task runs before the walk claims any ([`RUN_JOBS_BEFORE_WALK`]), so without the tip
+/// check every task's root would carry the commit's slot whatever the scheduling.
 #[tokio::test]
 async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -340,10 +343,60 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     drop(after);
 
     let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
+    RUN_JOBS_BEFORE_WALK.with(|f| f.set(true));
     let parallel =
         overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
+    let failures = LAST_ROOT_FAILURES.with(|f| f.get());
+    assert_eq!(failures, (61, Some(ParallelRootTaskFailure::TipMoved)), "every task saw the move");
+    Ok(())
+}
+
+/// A commit between two roots of one output (it advances the finalized block number, as a persist
+/// does): the overlay holds the first block, built over the database before the commit, so a later
+/// root over the moved database would lay that block over a state it was not built on. The root
+/// fails in every mode, before it computes anything; the first root of a fresh overlay over the
+/// moved database is fine.
+#[tokio::test]
+async fn root_over_a_moved_anchor_fails() -> eyre::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let first = HashedPostState::default().with_accounts((0..10).map(|i| (eoa(i), account(i + 3))));
+    let second = HashedPostState::default().with_accounts((10..20).map(|i| (eoa(i), account(i))));
+    let mut overlay = OutputTrieOverlay::new();
+    {
+        let factory = fixture.env.blockchain_provider();
+        let provider = factory.database_provider_ro()?;
+        let (_, updates) = overlay.block_root_with_updates(
+            factory,
+            provider.tx_ref(),
+            first.clone(),
+            ParallelRoots::Off,
+            2,
+        )?;
+        overlay.extend_from_block(&ComputedTrieData::without_trie_input(
+            Arc::new(first.clone().into_sorted()),
+            Arc::new(updates.into_sorted()),
+        ));
+    }
+    fixture.persist(&[first])?;
+
+    let factory = fixture.env.blockchain_provider();
+    let provider = factory.database_provider_ro()?;
+    let modes = [ParallelRoots::Off, ParallelRoots::Sampled(Walks::SPLIT)];
+    for mode in modes.into_iter().chain([ParallelRoots::Shadow(Walks::SPLIT)]) {
+        let error = overlay
+            .block_root_with_updates(factory, provider.tx_ref(), second.clone(), mode, 3)
+            .expect_err("a root over a moved anchor must fail");
+        assert!(error.to_string().contains("moved during the output"), "{mode:?}: {error}");
+    }
+    OutputTrieOverlay::new().block_root_with_updates(
+        factory,
+        provider.tx_ref(),
+        second,
+        ParallelRoots::Off,
+        3,
+    )?;
     Ok(())
 }
 
