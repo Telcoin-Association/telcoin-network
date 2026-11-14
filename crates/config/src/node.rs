@@ -390,15 +390,19 @@ pub struct Parameters {
     /// must not be deleted before the cause is known. Every other conflict, and every conflict
     /// with the switch off, is logged on a line starting with `epoch record conflict:` and
     /// counted, and the node keeps its own record and asks again on later passes: every
-    /// conflict counts in `tn_state_sync.epoch_record_conflicts_total`, one short of the
-    /// threshold also in `tn_state_sync.epoch_record_conflicts_below_halt_threshold_total`. A
-    /// vote round's recovery stops the node when the network certified another record of the
-    /// newest epoch or the one before it, as it did before this switch existed; that stop does
-    /// not read this switch. Before turning it on, on the image with it off: read both counters
-    /// on every node (they count occurrences, about one per pass; any difference between the
-    /// total and the below-threshold count means the switch would stop the node), grep every
-    /// node's log for `ConflictingRecord {`, and turn it on one node at a time. The default
-    /// `false` keeps the previous behaviour. Issue #1850.
+    /// conflict counts in `tn_state_sync.epoch_record_conflicts_total`, and one whose signers
+    /// fall short of the threshold also in
+    /// `tn_state_sync.epoch_record_conflicts_below_halt_threshold_total`. A re-certify round of
+    /// [`Self::epoch_record_recertify`], for a record older than the previous one, stops the
+    /// node on the same threshold only while this switch is on; it logs `own epoch record
+    /// differs from a certified record in a re-certify round` either way. A vote round's
+    /// recovery stops the node when the network certified another record of the newest epoch
+    /// or the one before it, as it did before this switch existed; that stop does not read this
+    /// switch. Before turning it on, on the image with it off: read both counters on every node
+    /// (they count occurrences, about one per pass; any difference between the total and the
+    /// below-threshold count means the switch would stop the node), grep every node's log for
+    /// `epoch record conflict:` and for the re-certify line, and turn it on one node at a time.
+    /// The default `false` keeps the previous behaviour. Issue #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_conflict_halt: bool,
 
