@@ -228,14 +228,37 @@ async fn manage_epoch_votes(
             "epoch vote round for {epoch_hash} ended before quorum (collector evicted or shutting down)",
         );
     } else {
-        error!(
-            target: "epoch-manager",
-            signers,
-            timeouts,
-            missing = %SignerList(&missing),
-            "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
-        );
-        record_epoch_record_signers(signers);
+        // The record can be certified without this round: the record collector or an earlier
+        // round may have stored a certificate for the same digest while this round waited. Then
+        // the round's own failure is not a certification failure. The count is touched by 0 on
+        // the other branch so its series exists before the first such round.
+        let held = consensus_chain.epochs().cert_by_digest(epoch_hash).await;
+        let already_certified = held.is_some();
+        metrics::counter!("tn_node.epoch_record_round_ended_certified_total")
+            .increment(u64::from(already_certified));
+        if let Some(cert) = held {
+            info!(
+                target: "epoch-manager",
+                epoch = epoch_rec.epoch,
+                digest = %epoch_hash,
+                signers,
+                cert_signers = cert.signed_authorities.len(),
+                timeouts,
+                missing = %SignerList(&missing),
+                "epoch vote round ended without a local quorum; the record is already certified",
+            );
+            // the epoch is certified: report the held certificate's signers, not this round's
+            record_epoch_record_signers(cert.signed_authorities.len());
+        } else {
+            error!(
+                target: "epoch-manager",
+                signers,
+                timeouts,
+                missing = %SignerList(&missing),
+                "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
+            );
+            record_epoch_record_signers(signers);
+        }
         let db = consensus_chain.epochs().clone();
         let network = primary_network.clone();
         // Try to recover by downloading the epoch record and cert from a peer. This needs only the
@@ -314,9 +337,10 @@ async fn manage_epoch_votes(
                 }
             }
         }
-        // Alarm only on a genuine fetch failure: not while shutting down, and not if we were
-        // evicted mid-recovery (is_closed() here gates the log only, never the fetch above).
-        if !got_epoch_record && !shutting_down && !vote_rx.is_closed() {
+        // Alarm only on a genuine fetch failure: not while shutting down, not if we were evicted
+        // mid-recovery (is_closed() here gates the log only, never the fetch above), and not when
+        // the certificate is already held.
+        if !got_epoch_record && !shutting_down && !vote_rx.is_closed() && !already_certified {
             error!(
                 target: "epoch-manager",
                 "Failed to retrieve an epoch record for epoch {}- We have a missing epoch certificate, if this is not local then sync will be compromised!",
@@ -615,12 +639,13 @@ fn missing_signers(
         .collect()
 }
 
-/// Set `tn_node.epoch_record_signers` to the number of committee members whose vote was counted
-/// when a vote round ended, whether or not it reached quorum.
+/// Set `tn_node.epoch_record_signers` when a vote round ends: to the number of committee members
+/// whose vote the round counted, or, for a round that ended without quorum on a record this node
+/// already holds certified, to that certificate's signer count.
 ///
-/// A round that fails to reach quorum sets it too, so during that failure the gauge shows the
-/// failed round's count, not the count of the last round that reached quorum. A round cut short
-/// by eviction or shutdown leaves it alone.
+/// A round that fails to reach quorum on a record not yet certified sets it to its own count, so
+/// during that failure the gauge shows the failed round's count, not the count of the last round
+/// that reached quorum. A round cut short by eviction or shutdown leaves it alone.
 fn record_epoch_record_signers(signers: u64) {
     metrics::gauge!("tn_node.epoch_record_signers").set(signers as f64);
 }
@@ -2055,7 +2080,7 @@ mod epoch_vote_collector_tests {
     /// Node shutdown must cancel a stalled peer-recovery instead of hanging inside
     /// `request_epoch_cert`. The mock answers the recovery request by signalling shutdown and then
     /// never replying, so the only way `manage_epoch_votes` returns is the recovery loop's shutdown
-    /// arm. Without that arm the held reply blocks forever and the outer timeout elapses.
+    /// arm. Without that arm the held reply blocks forever and the watchdog fires.
     #[tokio::test(start_paused = true)]
     async fn test_shutdown_cancels_recovery() {
         let mut rng = StdRng::from_os_rng();
@@ -2108,21 +2133,27 @@ mod epoch_vote_collector_tests {
         let (_vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
 
         // With the shutdown arm, `manage_epoch_votes` returns; without it, it blocks on the held
-        // reply and the outer timeout elapses.
-        let result = tokio::time::timeout(
-            Duration::from_secs(120),
-            manage_epoch_votes(
+        // reply and the watchdog fires. The watchdog arms only once the recovery request signalled
+        // shutdown: before that the round reads the epoch store, whose actor runs on its own
+        // thread, and the paused clock would jump to an armed timer while the reply is on its way.
+        let noticer = node_shutdown.subscribe();
+        let watchdog = async {
+            noticer.await;
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        };
+        let returned = tokio::select! {
+            result = manage_epoch_votes(
                 epoch_rec,
                 key_config,
                 primary_network,
                 vote_rx,
                 consensus_chain,
                 node_shutdown,
-            ),
-        )
-        .await;
+            ) => result.is_ok(),
+            _ = watchdog => false,
+        };
 
-        assert!(result.is_ok(), "shutdown must cancel recovery so manage_epoch_votes returns");
+        assert!(returned, "shutdown must cancel recovery so manage_epoch_votes returns");
     }
 
     /// Four deterministic committee keys, in committee order.
@@ -2295,19 +2326,18 @@ mod epoch_vote_collector_tests {
             vote_tx.send(vote).await.unwrap();
         }
 
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            manage_epoch_votes(
-                epoch_rec,
-                key_config,
-                primary_network,
-                vote_rx,
-                consensus_chain,
-                node_shutdown,
-            ),
+        // No outer virtual-time timeout: the failed round reads the epoch store, whose actor runs
+        // on its own thread, and the paused clock would jump to that timeout while the
+        // reply is on its way. A hung round is ended by nextest's slow-timeout.
+        manage_epoch_votes(
+            epoch_rec,
+            key_config,
+            primary_network,
+            vote_rx,
+            consensus_chain,
+            node_shutdown,
         )
         .await
-        .expect("the recovery request signals shutdown, so the round returns")
         .expect("no local store failure");
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -2381,6 +2411,10 @@ mod epoch_vote_collector_tests {
     struct FailedRound {
         /// The round's `epoch-manager` lines.
         lines: Vec<String>,
+        /// `tn_node.epoch_record_round_ended_certified_total`, when the round touched it.
+        ended_certified: Option<u64>,
+        /// `tn_node.epoch_record_signers`, when the round set it.
+        signers_gauge: Option<f64>,
         /// Our record's digest, as the lines print it.
         digest: String,
         /// The key the mock network answers from.
@@ -2390,11 +2424,15 @@ mod epoch_vote_collector_tests {
     /// Run a vote round for our epoch-1 record that fails to reach quorum: two of four members
     /// vote, short of the quorum of three, and the vote windows time out under the paused clock.
     ///
-    /// With `serve`, the mock network answers the recovery request with our record and a
-    /// three-signer certificate from `peer`; without it, the mock signals shutdown and holds the
-    /// reply, so the round ends right after the failure branch. The round runs on this thread
-    /// (current-thread runtime, awaited, not spawned), so the line subscriber sees it.
-    async fn failed_round(serve: bool) -> FailedRound {
+    /// With `cert_held`, the store already holds a certificate for our record, as when the record
+    /// collector stored one while the round waited. With `serve`, the mock network answers the
+    /// recovery request with our record and a three-signer certificate from `peer`; without it,
+    /// the mock signals shutdown and holds the reply, so the round ends right after the failure
+    /// branch. The round runs on this thread (current-thread runtime, awaited, not spawned), so
+    /// the local recorder and the line subscriber see it.
+    async fn failed_round(cert_held: bool, serve: bool) -> FailedRound {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
         let mut rng = StdRng::from_os_rng();
         let kp1 = BlsKeypair::generate(&mut rng);
         let kp2 = BlsKeypair::generate(&mut rng);
@@ -2428,6 +2466,9 @@ mod epoch_vote_collector_tests {
             ..Default::default()
         };
         let cert = make_cert(&local_rec, &[&kc1, &kc2, &kc3]);
+        if cert_held {
+            consensus_chain.epochs().save(local_rec.clone(), cert.clone()).await.unwrap();
+        }
         consensus_chain.epochs().persist().await.unwrap();
 
         let node_shutdown = ShutdownNotifier::new();
@@ -2461,6 +2502,9 @@ mod epoch_vote_collector_tests {
 
         let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
 
         // neither vote is ours, so the timed-out windows republish nothing
         let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
@@ -2482,15 +2526,81 @@ mod epoch_vote_collector_tests {
         .await
         .expect("no local store failure");
 
+        let snapshot = snapshotter.snapshot().into_vec();
+        let ended_certified = snapshot.iter().find_map(|(key, .., value)| match value {
+            DebugValue::Counter(n)
+                if key.key().name() == "tn_node.epoch_record_round_ended_certified_total" =>
+            {
+                Some(*n)
+            }
+            _ => None,
+        });
+        let signers_gauge = snapshot.iter().find_map(|(key, .., value)| match value {
+            DebugValue::Gauge(gauge) if key.key().name() == "tn_node.epoch_record_signers" => {
+                Some(gauge.0)
+            }
+            _ => None,
+        });
         let lines = lines.lock().clone();
-        FailedRound { lines, digest, peer }
+        FailedRound { lines, ended_certified, signers_gauge, digest, peer }
+    }
+
+    /// A round that ends without its own quorum while the store already holds the record's
+    /// certificate logs one info line and counts the round, and raises no quorum error.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_round_with_a_held_cert_logs_info_and_counts() {
+        let round = failed_round(true, false).await;
+        let info = round
+            .lines
+            .iter()
+            .find(|line| {
+                line.starts_with(
+                    "INFO epoch vote round ended without a local quorum; the record is already \
+                     certified",
+                )
+            })
+            .unwrap_or_else(|| panic!("no already-certified line in {:?}", round.lines));
+        for field in [
+            " epoch=1".to_string(),
+            format!(" digest={}", round.digest),
+            " signers=2".to_string(),
+            " cert_signers=3".to_string(),
+        ] {
+            assert!(info.contains(&field), "{field} missing from {info}");
+        }
+        assert_eq!(round.ended_certified, Some(1));
+        assert!(
+            !round.lines.iter().any(|line| line.contains("failed to reach quorum on epoch close")),
+            "a held certificate must not raise the quorum error: {:?}",
+            round.lines,
+        );
+    }
+
+    /// Without a held certificate the failed round raises the quorum error as before; the
+    /// already-certified count is touched by 0 and no already-certified line is logged.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_round_without_a_cert_logs_the_quorum_error() {
+        let round = failed_round(false, false).await;
+        let prefix = format!("ERROR failed to reach quorum on epoch close for {}", round.digest);
+        let error = round
+            .lines
+            .iter()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no quorum error in {:?}", round.lines));
+        assert!(error.contains(" signers=2"), "{error}");
+        assert_eq!(round.ended_certified, Some(0));
+        assert!(
+            !round.lines.iter().any(|line| line.contains("the record is already certified")),
+            "{:?}",
+            round.lines,
+        );
     }
 
     /// The recovery download's `retrieved cert` line names the peer that served the certificate
     /// and how many signers the certificate carries.
     #[tokio::test(start_paused = true)]
     async fn test_recovered_cert_line_names_the_peer_and_signers() {
-        let round = failed_round(true).await;
+        let round = failed_round(false, true).await;
         let prefix = format!("INFO retrieved cert for epoch 1/{} from a peer", round.digest);
         let line = round
             .lines
@@ -2499,5 +2609,15 @@ mod epoch_vote_collector_tests {
             .unwrap_or_else(|| panic!("no retrieved line in {:?}", round.lines));
         assert!(line.contains(&format!(" peer={}", round.peer)), "{line}");
         assert!(line.contains(" signers=3"), "{line}");
+    }
+
+    /// A failed round sets `tn_node.epoch_record_signers` from the held certificate (three
+    /// signers) when there is one, and from its own partial count (two votes) when there is not.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_round_signer_gauge_follows_a_held_cert() {
+        let held = failed_round(true, false).await;
+        assert_eq!(held.signers_gauge, Some(3.0), "the held certificate's signers");
+        let not_held = failed_round(false, false).await;
+        assert_eq!(not_held.signers_gauge, Some(2.0), "the failed round's own count");
     }
 }
