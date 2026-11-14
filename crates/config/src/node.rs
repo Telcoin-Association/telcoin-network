@@ -386,9 +386,12 @@ pub struct Parameters {
     ///
     /// When `true`, the proposer ranks its own tip and each same-epoch parent's latest execution
     /// block by voting weight and names the highest block that holders of 2f+1 weight have
-    /// reached, capped at its own tip, never older than a fixed number of entries back in its
-    /// recent-blocks ring, and never older than the block the epoch opened on. Voters then rarely
-    /// wait for, or refuse, a block they have not executed.
+    /// reached, capped at its own tip, never older than 8 entries back in its recent-blocks ring
+    /// (the floor), and never older than the block the epoch opened on.
+    /// Voters then rarely wait for, or refuse, a block they have not executed. The floor counts
+    /// ring entries, and a ring entry is an executed output that produced a block; an output
+    /// without transactions adds none, so the floor is not a bound in rounds or in time, and
+    /// under light traffic the named block can be old.
     /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
     /// keeps the previous behaviour: every header names this node's own newest executed block.
     /// Issue #1804.
@@ -398,11 +401,15 @@ pub struct Parameters {
     /// switch is `true`.
     ///
     /// The default `0` applies the rule to every header, as first designed. A value `K` above
-    /// zero names this node's own execution tip by default and applies the rule only for `K`
-    /// rounds after one of this node's headers was cancelled uncertified, doubling `K` while that
-    /// keeps happening. With the rule on every header, the blocks parents name are earlier picks
-    /// of the same rule rather than tips, so every proposer settles at the ring floor; `K` keeps
-    /// tips in the parents. A value above 128, the bound the doubling stops at, is lowered to 128,
+    /// zero names this node's own execution tip by default and applies the rule only to the next
+    /// `K` headers this node builds after one of its headers was cancelled uncertified, doubling
+    /// `K` while that keeps happening; it returns to `K` once 64 own headers in a row that named
+    /// the tip have certified. The window counts headers built, not rounds, and the name is
+    /// historical: a proposer in step with its committee builds one header a round, but a lagging
+    /// one skips rounds, so a window of rounds could pass with no header built under the rule.
+    /// With the rule on every header, the blocks parents name are earlier picks of the same rule
+    /// rather than tips, so every proposer settles at the ring floor; `K` keeps tips in the
+    /// parents. A value above 128, the bound the doubling stops at, is lowered to 128,
     /// and a value above zero while `quorum_exec_block` is off has no effect; the proposer logs a
     /// warning for either at the start of each epoch. Issue #1804.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
