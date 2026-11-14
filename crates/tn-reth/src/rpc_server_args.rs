@@ -174,7 +174,8 @@ pub struct RpcServerArgs {
     pub rpc_max_batch_requests: u32,
 
     /// Maximum number of installed filters (`eth_newFilter`, `eth_newBlockFilter`,
-    /// `eth_newPendingTransactionFilter`) across all clients.
+    /// `eth_newPendingTransactionFilter`) on each worker's RPC server, across all its clients,
+    /// first come, first served.
     ///
     /// Filters outlive the connection that made them and are removed only when uninstalled or
     /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored

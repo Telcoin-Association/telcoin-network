@@ -157,11 +157,19 @@ storage path, so it takes its own change with the fork checks (CLAUDE.md, "Fork 
 
 `patches/revm-inspectors` carries two changes to the revm-inspectors version TN's revm needs
 (0.34.3): Boa's recursion limit, which retires when TN's reth moves to a release with upstream's
-fix (0.44.2 or later), and the cap on recorded trace steps (TN-0079), which upstream lacks as of
-0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
+fix (0.44.2 or later), and the trace cap (TN-0079, TN-0153, TN-0172: steps, calls and the struct
+logger's logs), which upstream lacks as of 0.44.3 and must be re-ported on every upgrade. `lockfile.py check` fails when either workspace
 resolves the registry crate instead of the patch (TN-0085), and the nested test lane builds
 against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
 details.
+
+## WebSocket calls run to their end after the client leaves
+
+jsonrpsee 0.26's WebSocket server spawns each call on a detached task, so when a client
+disconnects its request future is not dropped and TN-0049's cancellation does not fire: the call
+keeps its blocking thread and permits until it ends. HTTP drops the request, and IPC aborts it
+since TN-0177. The work stays bounded by the gas cap, the trace cap and the permits. A fix
+belongs in jsonrpsee (or a TN wrapper around its WebSocket service).
 
 ## CI build time with the vendored crates
 

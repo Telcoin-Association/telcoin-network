@@ -591,8 +591,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/rpc/rpc-eth-api/src/helpers/{blocking_task.rs, call.rs, estimate.rs, trace.rs,
   pending_block.rs}`, `crates/rpc/rpc-eth-types/src/simulate.rs`,
   `crates/rpc/rpc/src/{debug.rs, trace.rs}`, `crates/rpc/rpc/src/eth/{bundle.rs, core.rs}`.
-  *Why*: a client that disconnects drops its request, but the blocking task it started ran to
-  the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
+  *Why*: a client that disconnects drops its request (over HTTP; over IPC since TN-0177; not
+  over WebSocket, where jsonrpsee runs each call to its end), but the blocking task it started
+  ran to the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
   replay or trace kept its thread (and, since TN-0019 and TN-0036 to TN-0038, its permit) for
   work nobody would read. 13a59de4b runs each `spawn_blocking_io` task inside a `CancelOnDrop`
   scope that the request's drop cancels, and the long loops check `is_cancelled()` between
@@ -1269,7 +1270,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   limit. Every pending-transaction filter and every `newPendingTransactions` subscription also
   registered a pool listener that every pool insertion walks with a `try_send`, with no bound on
   their number. The node now refuses the filter past `--rpc.max-active-filters`
-  (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
+  (per RPC server, which TN runs one of per worker, and first come across its clients; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
   TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
   are counted, so they take slots of the cap. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
@@ -1395,10 +1396,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   bytes, the pushed values `step_end` records) and, past `max_recorded_bytes`, ends the
   transaction the way TN-0017's interrupt does: the context error becomes `EVMError::Custom`
   ("trace too large: ..."), which the RPC returns as `-32603`, and the halted interpreter cannot
-  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`:
-  a trace whose steps alone pass it serializes to a response the limit refuses, so no answer a
-  default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
-  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request; the sites that
+  carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`.
+  (A step can hold more than its JSON, so the cap can refuse a trace whose response the limit
+  would accept, at about a third of the cap for a struct log with a small stack; TN-0178.) The counter survives `fuse`, so `debug_traceBlock*` and
+  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request (the mux
+  tracer's only since TN-0172); the sites that
   build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
   and `trace_filter`, and `trace_callMany`) share a counter. It counted steps only: the call
   traces every preset records, with each call's input, init code and output, stayed uncounted
@@ -2563,8 +2565,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   gas per request on one blocking thread, with cancellation only between calls. Upstream fixed
   it in b8116b42b (#24387, after v1.11.4); the pick does not apply to this base (its Amsterdam
   gas split needs a newer revm and alloy-evm), so this takes its rule: a call runs with at most
-  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request now
-  uses at most `--rpc.gascap` gas in all (50M by default), the budget `eth_callMany` has, and
+  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request's
+  calls now use at most `--rpc.gascap` gas in all (50M by default; TN-0171 bounds the
+  pre-execution system calls each block also runs), the budget `eth_callMany` has, and
   fails with the same -32602 error (`request exceeds the gas budget of <cap>`). Requests that
   stay under the budget get the same results, except a call whose gas limit, given or default,
   exceeded what was left, which now runs with less gas. How the default is chosen (the block's
@@ -2762,3 +2765,195 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` now say which state they build: an
   older build's prune stopped between `prune_rows` and its header commit. *Can reach execution or
   storage*: no; tests only. *Upstream*: n/a.
+
+- **TN-0170** — `eth_callMany` at a transaction index applies the block's pre-execution changes
+  before it replays the block's earlier transactions, and checks for cancellation between them.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`EthCall::call_many`).
+  *Why*: with `stateContext.transactionIndex` inside a block, `call_many` replays the block's
+  transactions before that index on the parent's state, without the block's pre-execution
+  system calls (TN's EIP-4788 root on an output's first batch, the EIP-2935 parent hash on every
+  block). A call or replayed transaction that read either contract saw the parent's values: the
+  history contract answered zero for the parent's hash on TN. `debug_traceCallMany` (TN-0048)
+  and `spawn_replay_transaction` already apply them; this uses the same
+  `executor_for_block(..).apply_pre_execution_changes()`. The replay loop also checks
+  `is_cancelled()` per transaction, as `debug_traceCallMany`'s does. *Can reach execution or
+  storage*: no. RPC only: block execution does not call `call_many`, and the replay runs on a
+  throwaway state.
+  *Tests*: tn-reth `call_many_at_a_transaction_index_applies_pre_execution_changes` (block 1's
+  history contract answers the genesis hash to `eth_call`, to `eth_callMany` and to
+  `debug_traceCallMany` at transaction index 0; `eth_callMany` answered zero without the fix).
+  *Upstream*: upstream main replays through `Trace::replay_block_until`, which applies them.
+
+- **TN-0171** — `eth_simulateV1` refuses state overrides that replace the code its
+  pre-execution system calls run, and checks for cancellation before each block.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/simulate.rs` (`SYSTEM_CALL_TARGETS`,
+  `check_system_call_overrides`), `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1`
+  checks every block's overrides before it takes the blocking-IO permit, and `is_cancelled()`
+  at the top of each block), `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulate_blocks`, test
+  `system_call_targets_keep_their_code`).
+  *Why*: every simulated block runs the executor's pre-execution system calls before its calls:
+  on TN the EIP-4788 beacon roots contract (an output's first batch, which a simulated block
+  is) and the EIP-2935 history contract, each with the executor's system-call gas limit
+  (100M on TN) and outside TN-0156's budget. A block's state overrides are applied before them
+  and could give either address any code, so a request of 256 blocks
+  (`--rpc.max-simulate-blocks`) with no calls could run about a thousand times `--rpc.gascap`, with
+  cancellation checked only between calls. Overrides that set `code` on either address, or move
+  a precompile onto one, are now refused with -32602 (`state override replaces the code of
+  system contract <address>`) before any work; balance, nonce and storage overrides of those
+  accounts are still applied. The chain's own contracts make one or two storage writes per
+  call, under 100,000 gas a block, so 256 blocks of them stay under 26M gas. Requests that do
+  not replace those contracts' code get the same results. *Can reach execution or storage*:
+  no. RPC only: the check and the cancellation point run in `simulate_v1`, which block
+  execution does not call.
+  *Tests*: `system_call_targets_keep_their_code` (new code on either address, empty code, and
+  a precompile moved onto the history contract are refused; a balance and storage override of
+  it simulates). Mutation-checked: the check removed (the refusals fail).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0172** — The trace cap also counts the struct logger's logs as they are built, and the mux
+  tracer keeps its count across a request's transactions.
+  *Kind*: fix (security; TN-owned, in the carried revm-inspectors).
+  *Files*: `patches/revm-inspectors/src/tracing/builder/geth.rs` (`struct_log_copies`,
+  `GethTraceBuilder::geth_traces_charged`, which `geth_traces` now calls with no limit;
+  `fill_geth_trace` takes the charge), `patches/revm-inspectors/src/tracing/mod.rs`
+  (`TracingInspector::try_geth_traces`; tests `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies`), `patches/revm-inspectors/src/tracing/debug.rs`
+  (`DebugInspector::get_result` builds the struct logger's frame with `try_geth_traces`;
+  `DebugInspectorError::TraceTooLarge`; `fuse` fuses the mux tracer instead of rebuilding it),
+  `patches/revm-inspectors/src/tracing/mux.rs` (`MuxInspector::fuse`, test
+  `fuse_keeps_the_recorded_bytes`), `patches/revm-inspectors/PATCH.md` and `upstream.diff`;
+  `crates/rpc/rpc-eth-types/src/error/mod.rs` (`TraceTooLarge` maps to `EvmCustom`, `-32603`,
+  as the cap's error during execution does), `crates/rpc/rpc/src/debug.rs` (test
+  `struct_logs_past_the_recorded_bytes_cap_are_refused`).
+  *Why*: TN-0079 and TN-0153 count what the inspector records. The struct logger's result is
+  built after the trace from the recorded steps, and two parts of it were never counted: every
+  log gets the step's memory as one 64-character hex `String` per 32-byte word, also when the
+  step shares its snapshot with the step before (recorded and counted once), and every SLOAD and
+  SSTORE log gets a copy of the contract's storage seen so far. A loop over 4 KiB of memory
+  recorded about 200 bytes a step and its logs then held 11 KiB a step, and the storage copies
+  grow with the reads times the slots seen, so one `enableMemory` or default trace under the cap could still build
+  many GB before the response limit applied. `try_geth_traces` now adds each log's memory
+  strings and storage copy (64 bytes an entry) to the same counter as the log is built, and past
+  the cap stops and returns the `trace too large` error (`-32603`). The logs' other fields and
+  their stacks mirror the recorded steps, which the cap already counts; a struct-logger trace
+  then holds at most about twice the cap at its peak. Separately, `DebugInspector::fuse` rebuilt
+  the mux tracer from its config, with a fresh counter, so `debug_traceBlock*` and
+  `debug_traceCallMany` with `muxTracer` were capped per transaction; it now fuses the tracing
+  inspector, which keeps the counter, as the other tracers do. Traces that stay under the cap
+  get the same answers. *Can reach execution or storage*: no. revm-inspectors runs only for RPC
+  tracing, and the reth change is an error mapping and a test.
+  *Tests*: in the patched crate `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies` (steps under the cap, logs past it: refused; with no
+  cap the logs build and are counted), `fuse_keeps_the_recorded_bytes`; in reth
+  `struct_logs_past_the_recorded_bytes_cap_are_refused` (through `DebugInspector::get_result`,
+  `-32603`). Mutation-checked: no charge in `try_geth_traces`, and the mux rebuilt in `fuse`
+  (all three patched-crate tests fail).
+  *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.
+
+- **TN-0173** — A subscription whose connection's send buffer stays full for 10 seconds ends.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`SUBSCRIPTION_SEND_TIMEOUT`,
+  `pipe_from_stream_within`, which `pipe_from_stream` calls; test
+  `a_subscriber_that_stops_reading_loses_the_subscription`).
+  *Why*: `pipe_from_stream`, which feeds `newHeads`, `logs` and `newPendingTransactions`
+  subscriptions, awaited each send without a limit. jsonrpsee buffers 1,024 messages per
+  connection; once a WS or IPC client stopped reading, the send waited until the connection
+  closed and the stream was not polled meanwhile. For `newPendingTransactions` with full
+  transactions the stream's pool listener then kept up to `--txpool.max-new-txns` (1,024)
+  transactions, evicted and replaced ones included, outside the pool's limits, for each of up
+  to 1,024 listeners. Each send now waits at most 10 seconds; then the subscription ends and its stream, with the listener and what
+  it held, is dropped. A client reading normally is unaffected; one more than 1,024 messages
+  behind for 10 seconds loses the subscription and must subscribe again. *Can reach execution or
+  storage*: no. RPC only: subscriptions run in their own tasks, and the pool removes a dropped
+  listener at its next send.
+  *Tests*: `a_subscriber_that_stops_reading_loses_the_subscription` (a never-read buffer of four
+  messages over an endless stream: the stream is dropped once a send waits the timeout).
+  Mutation-checked: a plain `send` (the stream is never dropped).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0174** — A refused `newPendingTransactions` subscription gets the error, not an id.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`subscribe` takes the pool listener through
+  `pending_transactions_listener` before it accepts the subscription; `handle_accepted` shares it
+  and `pipe_pending_transactions`; test
+  `a_refused_pending_transactions_subscription_gets_the_error`).
+  *Why*: TN-0056 says these subscriptions fail with the server-busy error when the pool refuses
+  another RPC listener, but `subscribe` accepted the subscription first and the error was dropped
+  in the spawned task: the client got a subscription id and then nothing. The listener (and the
+  params check) now come before the acceptance, and a refusal rejects the subscription with
+  -32009 (`too many pending transaction listeners`), as the pending-transaction filters do.
+  Accepted subscriptions behave as before. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `a_refused_pending_transactions_subscription_gets_the_error` (with every RPC listener
+  slot held, the hash and the full subscription are refused with -32009; once the slots are
+  freed both are accepted). Mutation-checked: acceptance before the listener (the subscription
+  is accepted).
+  *Upstream*: n/a (TN-0056's cap is TN's).
+
+- **TN-0175** — Raw `debug_traceBlock` decodes its block and recovers its signers in a blocking
+  task. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`debug_trace_raw_block`).
+  *Why*: the handler decoded the caller's RLP block (up to the request size limit), checked
+  TN-0078's call count and recovered up to 2,380 signers (a parallel iterator, on a node built
+  with rayon) in the `async fn`, on the runtime that polls RPC handlers. That work now runs in a
+  `spawn_blocking_io` task that holds the trace permit taken first, and hands the permit on to
+  the trace, as `eth_callBundle` does since TN-0054. The order of the checks and the errors are
+  unchanged. *Can reach execution or storage*: no. RPC only.
+  *Tests*: the raw-block tests (`raw_block_transaction_count_is_bounded_by_the_gas_cap`,
+  `raw_block_transaction_gas_is_bounded_by_the_gas_cap`) and the trace permit tests, unchanged;
+  where the work runs has no test.
+  *Upstream*: no; upstream decodes in the handler.
+
+- **TN-0176** — Tests for the gas budget at the trace and debug call sites. *Kind*: test.
+  *Files*: `crates/rpc/rpc/src/permit_test_utils.rs` (`MockChain::eth_api_with_gas_cap`,
+  `MockChain::call_of_25_800_gas`), `crates/rpc/rpc/src/debug.rs` (tests
+  `raw_block_charges_each_transaction_to_the_budget`,
+  `trace_call_many_calls_share_the_gas_budget`), `crates/rpc/rpc/src/trace.rs` (test
+  `trace_call_many_calls_share_the_gas_budget`).
+  *Why*: TN-0057 and TN-0078 charge each call's or transaction's gas to one budget per request
+  in `trace_callMany`, `debug_traceCallMany` and raw `debug_traceBlock`, and only
+  `eth_callMany`'s charge had a test. In the raw block the charge never fails by itself (the
+  check before each transaction already holds it to what is left), so deleting it would have
+  checked every transaction against the whole cap unnoticed. Each test now fails when its
+  site's `charge` is removed: two 25,800-gas calls under a 50,000 cap, and two transfers with a
+  30,000 gas limit, of which the second fits only if the first was not charged. The
+  cancellation checks in these loops still have no test of their own. *Can reach execution or
+  storage*: no; tests.
+  *Tests*: the three above. Mutation-checked: each site's `charge` removed (each test fails).
+  *Upstream*: n/a.
+
+- **TN-0177** — An IPC call whose client disconnects is aborted. *Kind*: fix.
+  *Files*: `crates/rpc/ipc/src/server/mod.rs` (`AbortOnDrop` around the spawned call; test
+  `a_disconnected_clients_call_is_dropped`).
+  *Why*: the IPC server spawns each call on its own task, for concurrency, and the connection
+  awaited the task's `JoinHandle`. When the client went away the connection dropped the handle,
+  which does not cancel a task, so the request future was never dropped: TN-0049's
+  cancellation never fired and the call kept its blocking thread and permits until it ended. The
+  handle is now aborted when the connection drops it, so the request future is dropped and its
+  blocking work sees `is_cancelled()` at its next check. A call that already ended is
+  unaffected. jsonrpsee's WebSocket transport also spawns each call and does not cancel it; that
+  is the library's, outside this copy (`tn/notes/open-issues.md`). *Can reach execution or
+  storage*: no. RPC only.
+  *Tests*: `a_disconnected_clients_call_is_dropped` (a call that never ends is dropped once its
+  client disconnects). Mutation-checked: no abort (the call keeps running).
+  *Upstream*: no; upstream has the same shape.
+
+- **TN-0178** — The revm-inspectors patch's docs list everything it carries and say when the
+  trace cap refuses a trace the response limit would accept. *Kind*: fix (docs).
+  *Files*: `patches/revm-inspectors/PATCH.md` ("Scope" lists the recursion limit, the trace cap
+  with its files, and the removed `.gitignore`; the out-of-workspace test command runs every
+  test; the cap's paragraph), `patches/revm-inspectors/src/tracing/config.rs`
+  (`DEFAULT_MAX_RECORDED_BYTES`'s doc) and `upstream.diff`; the TN-0079 entry above; TN's
+  `docs/src/rpc-methods/debug/{README.md, debug_tracetransaction.md}` and
+  `docs/src/rpc-methods/trace/README.md`.
+  *Why*: "Scope" said the patch mattered to JavaScript tracers only, although the trace cap
+  reaches every build, so a maintainer could drop the patch from a default build and lose the
+  cap; its fallback test command ran only the JavaScript tests. The cap's docs said a trace past
+  the cap could not have been returned anyway. That holds for call input and output, which
+  serialize in hex, but a struct-log step holds about 200 bytes against 60 to 100 of JSON with a
+  small stack, and a `vmTrace` step copies the whole memory after each write, so the cap can
+  refuse traces the response limit would accept, and raising `--rpc.max-response-size` does
+  not raise it. The docs now say so. *Can reach execution or storage*: no; docs and a doc
+  comment.
+  *Tests*: n/a. *Upstream*: n/a.

@@ -476,6 +476,8 @@ where
             }
             DebugInspectorError::MuxInspector(err) => err.into(),
             DebugInspectorError::Database(err) => Self::Internal(RethError::other(err)),
+            // TN(TN-0172): the same error a trace stopped at the cap during execution gets.
+            DebugInspectorError::TraceTooLarge(msg) => Self::EvmCustom(msg),
             #[cfg(feature = "js-tracer")]
             DebugInspectorError::JsInspector(err) => err.into(),
             #[allow(unreachable_patterns)]

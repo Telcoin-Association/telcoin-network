@@ -51,10 +51,13 @@ where
 mod call_many_budget_tests {
     use crate::EthApiBuilder;
     use alloy_consensus::Header;
-    use alloy_eips::BlockNumberOrTag;
-    use alloy_primitives::{Address, Bytes, TxKind, U256};
+    use alloy_eips::{
+        eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, BlockNumberOrTag,
+    };
+    use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
     use alloy_rpc_types_eth::{
         simulate::{SimBlock, SimulatePayload, SimulatedBlock},
+        state::{AccountOverride, StateOverride},
         Bundle, StateContext, TransactionInput, TransactionRequest,
     };
     use reth_chainspec::{ChainSpecBuilder, ChainSpecProvider};
@@ -151,6 +154,18 @@ mod call_many_budget_tests {
         gas_cap: u64,
         blocks: Vec<Vec<TransactionRequest>>,
     ) -> Result<Vec<SimulatedBlock<alloy_rpc_types_eth::Block>>, EthApiError> {
+        let blocks = blocks
+            .into_iter()
+            .map(|calls| SimBlock { block_overrides: None, state_overrides: None, calls })
+            .collect();
+        simulate_blocks(gas_cap, blocks).await
+    }
+
+    /// TN(TN-0171): [`simulate`] with each block's overrides.
+    async fn simulate_blocks(
+        gas_cap: u64,
+        block_state_calls: Vec<SimBlock>,
+    ) -> Result<Vec<SimulatedBlock<alloy_rpc_types_eth::Block>>, EthApiError> {
         let provider = MockEthProvider::default()
             .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
         let block = Block {
@@ -175,10 +190,7 @@ mod call_many_budget_tests {
         .gas_cap(GasCap(gas_cap))
         .build();
         let payload = SimulatePayload {
-            block_state_calls: blocks
-                .into_iter()
-                .map(|calls| SimBlock { block_overrides: None, state_overrides: None, calls })
-                .collect(),
+            block_state_calls,
             trace_transfers: false,
             validation: false,
             return_full_transactions: false,
@@ -241,5 +253,58 @@ mod call_many_budget_tests {
                 if message == "request exceeds the gas budget of 100000"),
             "{err:?}"
         );
+    }
+
+    /// TN(TN-0171): no block may replace the code of a pre-execution system call's target, by
+    /// new code or by moving a precompile there; other overrides of those accounts are kept.
+    #[tokio::test]
+    async fn system_call_targets_keep_their_code() {
+        let with_overrides = |overrides: StateOverride| {
+            vec![
+                SimBlock { block_overrides: None, state_overrides: None, calls: vec![transfer()] },
+                SimBlock {
+                    block_overrides: None,
+                    state_overrides: Some(overrides),
+                    calls: vec![transfer()],
+                },
+            ]
+        };
+        let spin = Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56]);
+        let refused = [
+            (BEACON_ROOTS_ADDRESS, AccountOverride::default().with_code(spin.clone())),
+            (HISTORY_STORAGE_ADDRESS, AccountOverride::default().with_code(Bytes::new())),
+            (
+                Address::with_last_byte(1),
+                AccountOverride {
+                    move_precompile_to: Some(HISTORY_STORAGE_ADDRESS),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (address, account) in refused {
+            let target = account.move_precompile_to.unwrap_or(address);
+            let err = simulate_blocks(
+                100_000,
+                with_overrides(std::iter::once((address, account)).collect()),
+            )
+            .await
+            .expect_err("the system call's code is replaced");
+            assert!(
+                matches!(&err, EthApiError::InvalidParams(message)
+                    if *message == format!("state override replaces the code of system contract {target}")),
+                "{err:?}"
+            );
+        }
+
+        let kept = AccountOverride::default()
+            .with_balance(U256::from(1))
+            .with_state_diff([(B256::ZERO, B256::with_last_byte(1))]);
+        let simulated = simulate_blocks(
+            100_000,
+            with_overrides(std::iter::once((HISTORY_STORAGE_ADDRESS, kept)).collect()),
+        )
+        .await
+        .expect("balance and storage overrides are kept");
+        assert_eq!(simulated.len(), 2);
     }
 }

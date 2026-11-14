@@ -88,6 +88,14 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             if block_state_calls.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
             }
+            // TN(TN-0171): every block runs the pre-execution system calls outside the gas
+            // budget, so their code stays the chain's own.
+            for block in &block_state_calls {
+                if let Some(state_overrides) = &block.state_overrides {
+                    simulate::check_system_call_overrides(state_overrides)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+            }
 
             let permit = self
                 .acquire_owned_blocking_io()
@@ -114,6 +122,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 let mut prev_timestamp = parent.timestamp();
 
                 for block in block_state_calls {
+                    // TN(TN-0171): a block with no calls still runs the system calls.
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     // Validate block number ordering if overridden
                     if let Some(number) = block.block_overrides.as_ref().and_then(|o| o.number) {
                         let number: u64 = number.try_into().unwrap_or(u64::MAX);
@@ -388,8 +400,22 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 if replay_block_txs {
                     // only need to replay the transactions in the block if not all transactions are
                     // to be replayed
+
+                    // TN(TN-0170): the replay starts from the parent's state, so it needs the
+                    // block's pre-execution changes (EIP-4788 root, EIP-2935 parent hash) first,
+                    // as `debug_traceCallMany` and `spawn_replay_transaction` apply them.
+                    RpcNodeCore::evm_config(&this)
+                        .executor_for_block(&mut db, block.sealed_block())
+                        .map_err(RethError::other)
+                        .map_err(Self::Error::from_eth_err)?
+                        .apply_pre_execution_changes()
+                        .map_err(Self::Error::from_eth_err)?;
+
                     let block_transactions = block.transactions_recovered().take(num_txs);
                     for tx in block_transactions {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         let tx_env = RpcNodeCore::evm_config(&this).tx_env(tx);
                         let res = this.transact(&mut db, evm_env.clone(), tx_env)?;
                         db.commit(res.state);

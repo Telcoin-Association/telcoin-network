@@ -229,15 +229,24 @@ fn worker_rpc_server_args(
     }
 }
 
+/// How long [`ipc_socket_is_live`] waits for its connection.
+const IPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Whether a process is listening on the IPC socket at `path`.
 ///
-/// Connecting to a live Unix socket succeeds at once; a stale socket file refuses the
-/// connection and a missing one does not exist, and both of those reth replaces when it
-/// listens. Named pipes on Windows are not probed.
-fn ipc_socket_is_live(path: &str) -> bool {
+/// A live Unix socket accepts the connection; a stale socket file refuses it and a missing one
+/// does not exist, and both of those reth replaces when it listens. A listener whose backlog is
+/// full neither accepts nor refuses: the connect fails with `EAGAIN` (Linux) or does not finish,
+/// so that and a connect still pending after [`IPC_PROBE_TIMEOUT`] count as live. The probe
+/// never blocks the runtime. Named pipes on Windows are not probed.
+async fn ipc_socket_is_live(path: &str) -> bool {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
+        match tokio::time::timeout(IPC_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => err.kind() == std::io::ErrorKind::WouldBlock,
+            Err(_elapsed) => true,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -467,7 +476,7 @@ impl RethEnv {
         worker_id: WorkerId,
     ) -> TnRethResult<RpcServerHandle> {
         let args = worker_rpc_server_args(&self.node_config().rpc, worker_id)?;
-        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath) {
+        if !args.ipcdisable && ipc_socket_is_live(&args.ipcpath).await {
             return Err(TnRethError::IpcSocketInUse { path: args.ipcpath });
         }
         let server_config = args.rpc_server_config();
@@ -1880,8 +1889,8 @@ mod tests {
 
     /// A listening socket is live; a stale socket file and a missing path are not.
     #[cfg(unix)]
-    #[test]
-    fn ipc_socket_probe_tells_live_from_stale() {
+    #[tokio::test]
+    async fn ipc_socket_probe_tells_live_from_stale() {
         let tmp_dir = TempDir::new().expect("temp dir");
         let live = tmp_dir.path().join("live.ipc");
         let stale = tmp_dir.path().join("stale.ipc");
@@ -1889,11 +1898,36 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
         drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
 
-        assert!(ipc_socket_is_live(&live.to_string_lossy()));
-        assert!(!ipc_socket_is_live(&stale.to_string_lossy()));
-        assert!(!ipc_socket_is_live(&missing.to_string_lossy()));
+        assert!(ipc_socket_is_live(&live.to_string_lossy()).await);
+        assert!(!ipc_socket_is_live(&stale.to_string_lossy()).await);
+        assert!(!ipc_socket_is_live(&missing.to_string_lossy()).await);
         drop(listener);
-        assert!(!ipc_socket_is_live(&live.to_string_lossy()));
+        assert!(!ipc_socket_is_live(&live.to_string_lossy()).await);
+    }
+
+    /// A listener that never accepts, whose backlog fills, still counts as live, and the probe
+    /// returns within its timeout instead of blocking the runtime's thread.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipc_socket_probe_counts_a_full_backlog_as_live() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let path = tmp_dir.path().join("full.ipc");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // fill the backlog (at least 128 on Linux and macOS): connects that never get accepted
+        let mut pending = Vec::new();
+        while pending.len() < 4_096 {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(stream) => pending.push(stream),
+                Err(_) => break,
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let live = ipc_socket_is_live(&path.to_string_lossy()).await;
+        assert!(started.elapsed() < IPC_PROBE_TIMEOUT * 3, "{:?}", started.elapsed());
+        #[cfg(target_os = "linux")]
+        assert!(live, "a full backlog is a live listener");
+        drop((listener, pending, live));
     }
 
     /// A second server on a live IPC path is refused before it binds, so a second node
@@ -1932,7 +1966,7 @@ mod tests {
         let err = reth_env.start_rpc(&server, 0).await.expect_err("the socket is live");
         assert!(matches!(&err, TnRethError::IpcSocketInUse { path } if *path == ipcpath), "{err}");
         // the first server still owns its socket
-        assert!(ipc_socket_is_live(&ipcpath));
+        assert!(ipc_socket_is_live(&ipcpath).await);
     }
 
     /// Two workers on one `RethEnv` bind two live IPC sockets. Before #1287 both

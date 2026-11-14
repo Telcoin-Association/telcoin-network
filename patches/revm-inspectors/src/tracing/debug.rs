@@ -171,9 +171,8 @@ impl DebugInspector {
             | Self::Erc7562Tracer(inspector, _)
             | Self::Default(inspector, _) => inspector.fuse(),
             Self::Noop(_) => {}
-            Self::Mux(inspector, config) => {
-                *inspector = MuxInspector::try_from_config(config.clone())?;
-            }
+            // TN(TN-0172): fused, not rebuilt, so the recorded-bytes counter carries over.
+            Self::Mux(inspector, _) => inspector.fuse(),
             #[cfg(feature = "js-tracer")]
             Self::Js(inspector, code, config) => {
                 *inspector =
@@ -243,13 +242,14 @@ impl DebugInspector {
             Self::Default(inspector, config) => {
                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
                 inspector.set_transaction_caller(tx_env.caller());
+                // TN(TN-0172): the struct logs count against the trace cap as they are built.
                 inspector
-                    .geth_builder()
-                    .geth_traces(
+                    .try_geth_traces(
                         res.result.gas_used(),
                         res.result.output().unwrap_or_default().clone(),
                         *config,
                     )
+                    .map_err(DebugInspectorError::TraceTooLarge)?
                     .into()
             }
             #[cfg(feature = "js-tracer")]
@@ -356,4 +356,7 @@ pub enum DebugInspectorError<DBError = core::convert::Infallible> {
     /// Database error
     #[error("database error: {0}")]
     Database(DBError),
+    /// TN(TN-0172): the struct logs passed the trace cap while they were built.
+    #[error("{0}")]
+    TraceTooLarge(String),
 }
