@@ -1505,6 +1505,9 @@ impl<DB: Database> Proposer<DB> {
         // order bookkeeping as a committed header's do. Tracked again, it would hold its lanes
         // behind every later header without an own parent until the next own commit at or above
         // its round, and that commit would re-queue its committed digests (`stale_resend`).
+        // `committed_own_round` starts at 0 after a restart, so this guard does not catch the
+        // max-delay re-send of a last own header that committed before the restart (see the order
+        // hold's module doc).
         if self.order_hold.is_some() && header.round() <= self.committed_own_round {
             header.payload().keys().for_each(|digest| {
                 self.proposed_first_received.remove(digest);
@@ -1703,9 +1706,12 @@ impl<DB: Database> Proposer<DB> {
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = self.has_parents_for_round();
             // with `digest_order_hold` on, digests held back in a lane still count here, as every
-            // queued digest did before: a held backlog can meet the threshold although the next
-            // header cannot take it, and that header is then built without waiting for the min
-            // delay
+            // queued digest did before: a held backlog of at least the threshold builds the next
+            // header without waiting for the min delay, and that header can carry none of it.
+            // Under load this fires as with the switch off (the queue is above the threshold
+            // either way); at light load a held backlog fires earlier. Leaving held digests out of
+            // the count while the only blocker is the previous round's own header, so that the
+            // min delay waits for its certificate, is not built (see the order hold's module doc)
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
