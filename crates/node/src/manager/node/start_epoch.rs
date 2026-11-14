@@ -150,11 +150,11 @@ where
             committee.epoch(),
         )
         .await?;
-        // Make the current pack durable before the first replayed output reaches the engine. The
-        // outputs were read back from the pack a restart recovered, whose tail may never have been
-        // synced, and execution may store a block's transactions as positions in its batch: a
-        // power loss after that block's commit must not leave a row pointing into a batch the
-        // pack lost.
+        // Make the current pack durable before the first replayed output reaches the engine:
+        // execution may store a block's transactions as positions in its batch, and a power loss
+        // after that block's commit must not leave a row pointing into a batch the pack lost. What
+        // the restart recovered was synced when its data log opened unclean (a writable open of an
+        // unclean file syncs its existing bytes); this persists anything saved to the pack since.
         if !missing.is_empty() {
             self.consensus_chain.persist_current().await?;
         }
