@@ -312,10 +312,13 @@ where
     /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
     /// record.
     ///
-    /// A forwarding failure (the engine channel closed) also returns `None`: the
-    /// caller must not wait on execution of output the engine never received, and
-    /// the dead channel resurfaces as a hard error at the next forwarding attempt
-    /// after re-entry.
+    /// A forwarding failure (the engine channel closed before it accepted the
+    /// output) also returns `None`: the caller must not wait on execution of
+    /// output the engine never received, and the dead channel resurfaces as a hard
+    /// error at the next forwarding attempt after re-entry. A forwarded output is
+    /// one accepted into the engine channel; a receiver dropped in the instant
+    /// between `reserve` and the write loses it without an error, and the engine's
+    /// exit then ends the node (it is a critical task).
     ///
     /// Phase 1 applies the live forward's continuity rule
     /// ([`check_output_continuity`]) to what it takes off the queue: an output

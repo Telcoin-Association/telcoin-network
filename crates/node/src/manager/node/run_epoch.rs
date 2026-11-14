@@ -730,9 +730,17 @@ where
     /// [`evict_committed_batches`]), then the output is stamped with `forwarded_at`
     /// (`ConsensusOutput::set_forwarded_at`, observability only: when the forwarder began to wait
     /// for room for it, see [`Self::wait_for_epoch_boundary`] for the live path) and sent.
-    /// `last_forwarded_consensus_number` moves with the send, so the restart-replay and
-    /// leftover-drain paths can rely on it marking what actually reached the engine rather than
-    /// what was merely dequeued.
+    /// `last_forwarded_consensus_number` moves with the send: it marks what was accepted into the
+    /// engine channel rather than what was merely dequeued, and the restart-replay and
+    /// leftover-drain paths rely on that.
+    ///
+    /// A send through a permit cannot fail: it drops the output if the engine's receiver is gone.
+    /// So each caller checks the channel with no await between that check and this call
+    /// ([`Self::process_output`] through `reserve`, the live forward through
+    /// [`mpsc::Sender::is_closed`] once its output is in hand). As with an awaited `send` between
+    /// its check and its write, what remains is a receiver dropped in that instant; the engine is
+    /// a critical task, so its exit ends the node's outer select, and the restart replay forwards
+    /// again from the executed tip.
     ///
     /// Nothing here awaits: a caller that reserved `permit` before taking `output` off its source
     /// holds the output across no await point, so a cancelled caller never drops one.
@@ -799,6 +807,14 @@ where
                     None => break,
                 },
             };
+            // the room was reserved before the wait for this output, and a send through it cannot
+            // fail: it drops the output if the engine's receiver went away meanwhile. Fail with
+            // the error `reserve` gives on a closed channel instead, so an output the engine never
+            // receives is neither counted as forwarded nor stashed as the boundary (it is in the
+            // consensus pack, and the restart replay forwards it).
+            if to_engine.is_closed() {
+                return Err(mpsc::error::SendError(()).into());
+            }
             // The engine executes exactly the sequence forwarded here, so enforce continuity
             // against the last number that actually reached it. A stale output (already
             // forwarded, e.g. replayed from the DB) would double-execute; a gap would silently
@@ -3549,6 +3565,36 @@ pub(super) mod tests {
         }
         assert_eq!(received, [1, 2], "the queued output reaches the engine");
         assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// The engine's receiver gone while the forward holds room and waits for output: the output
+    /// that then arrives (here the boundary) fails the forward with the closed-channel error, is
+    /// not counted as forwarded and is not stashed as the boundary.
+    #[tokio::test]
+    async fn the_forward_fails_on_an_engine_gone_while_it_waits() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // room for one more output, an empty queue
+        let mut fx = ForwardFixture::new(2).await?;
+        let boundary = member_output_at(&fx.committee, 2);
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for output");
+            drop(fx.engine_rx);
+            queue_tx.send(boundary.clone()).await?;
+            forward.await
+        };
+        let err = res.expect_err("the engine is gone");
+        assert!(err.downcast_ref::<mpsc::error::SendError<()>>().is_some(), "{err:#}");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 1, "nothing more was forwarded");
+        assert_ne!(
+            fx.manager.last_consensus_header.as_ref().map(|header| header.digest()),
+            Some(boundary.consensus_header_hash()),
+            "the boundary the engine never got is not stashed",
+        );
         Ok(())
     }
 }
