@@ -156,6 +156,33 @@ fn a_timed_out_read_transaction_fails_every_later_call_until_dropped() {
     assert_eq!(timed_out(&db), 0.0);
 }
 
+/// A cursor kept after its read transaction dropped holds the engine's reader, and with it the
+/// transaction's place under the timeout: its calls fail once the deadline passes, and the gauge
+/// counts it until the cursor drops.
+#[test]
+fn a_cursor_that_outlives_its_read_transaction_still_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = TnLmdbArgs::default().with_read_transaction_timeout(Some(SHORT_TIMEOUT));
+    let mut db = super::open_env(dir.path(), TnLmdbEnvKind::RW, args).unwrap();
+    db.create_tables().unwrap();
+    db.update(|tx| tx.put::<CanonicalHeaders>(7, B256::with_last_byte(7))).unwrap().unwrap();
+    let timed_out =
+        |db: &TnLmdbEnv| gauges(db)[&("db.timed_out_not_aborted_transactions".to_string(), vec![])];
+
+    let tx = db.tx().unwrap();
+    let mut kept = tx.cursor_read::<CanonicalHeaders>().unwrap();
+    drop(tx);
+    assert_eq!(kept.first().unwrap(), Some((7, B256::with_last_byte(7))), "within the limit");
+    thread::sleep(LONG_READ);
+    assert!(
+        matches!(kept.next(), Err(DatabaseError::Read(e)) if e == Error::ReadTransactionTimeout.into()),
+        "a cursor past its transaction and the deadline"
+    );
+    assert_eq!(timed_out(&db), 1.0, "timed out and still open through the cursor");
+    drop(kept);
+    assert_eq!(timed_out(&db), 0.0, "dropped");
+}
+
 /// The first long-reader warning is due at once, and each later one a full interval after the
 /// last.
 #[test]

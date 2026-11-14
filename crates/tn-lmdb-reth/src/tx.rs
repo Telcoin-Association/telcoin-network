@@ -9,7 +9,7 @@ use crate::{
     dup::DupLayout,
     env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
-    timeout::{ReaderState, ReaderTimeouts},
+    timeout::ReaderState,
 };
 use parking_lot::Mutex;
 use reth_db_api::{
@@ -220,20 +220,14 @@ pub struct TnLmdbTx {
     txn: Arc<RoTxn>,
     tables: Arc<TableMap>,
     pool: Arc<ReadPool>,
-    /// The transaction's state under the read transaction timeout, shared with its cursors.
+    /// The transaction's state under the read transaction timeout, shared with its cursors: the
+    /// last of them to drop takes the reader off the timeout, as it ends the engine's reader.
     reader: Arc<ReaderState>,
-    /// The environment's timeout, which the transaction leaves when it ends; `None` when off.
-    timeouts: Option<Arc<ReaderTimeouts>>,
 }
 
 impl TnLmdbTx {
-    pub(crate) fn new(
-        txn: RoTxn,
-        tables: Arc<TableMap>,
-        reader: Arc<ReaderState>,
-        timeouts: Option<Arc<ReaderTimeouts>>,
-    ) -> Self {
-        Self { txn: Arc::new(txn), tables, pool: Arc::default(), reader, timeouts }
+    pub(crate) fn new(txn: RoTxn, tables: Arc<TableMap>, reader: Arc<ReaderState>) -> Self {
+        Self { txn: Arc::new(txn), tables, pool: Arc::default(), reader }
     }
 
     /// Test-only: the engine cursors the transaction's pool holds.
@@ -305,18 +299,7 @@ impl DbTx for TnLmdbTx {
     /// ends; a commit made while it has held a superseded snapshot for over a minute logs a
     /// warning (at most once a minute).
     fn disable_long_read_transaction_safety(&mut self) {
-        if let Some(timeouts) = &self.timeouts {
-            timeouts.opt_out(&self.reader);
-        }
-    }
-}
-
-impl Drop for TnLmdbTx {
-    /// Leaves the read transaction timeout: the engine's reader ends with the last cursor.
-    fn drop(&mut self) {
-        if let Some(timeouts) = &self.timeouts {
-            timeouts.ended(&self.reader);
-        }
+        self.reader.opt_out();
     }
 }
 

@@ -162,15 +162,16 @@
 //!   off) is not aborted from outside, as MDBX's transaction manager does: its handle and cursors
 //!   own the engine's reader, so it is marked instead (`timeout`), and every later call of the
 //!   transaction or a cursor of it fails with `ReadTransactionTimeout`, on which reth's code drops
-//!   the transaction and the pages freed since it began return to reuse. Until it is dropped they
-//!   are held, and `db.timed_out_not_aborted_transactions` counts such transactions still open (0
-//!   on MDBX, which aborts them). `disable_long_read_transaction_safety` takes a transaction out of
-//!   the timeout, as on MDBX. A long reader is also reported: while a read transaction holds a
-//!   superseded snapshot, the pages freed since are not reused, so the file grows until it ends and
-//!   they return; a write commit made once that has lasted over 60 seconds logs a `warn!` with its
-//!   age, at most once a minute per environment (`tn_lmdb::Env::oldest_reader_age`, a lock-free
-//!   read: readers pay nothing, and a commit one atomic load while no reader holds a superseded
-//!   snapshot, plus a clock read while one does);
+//!   the transaction and the pages freed since it began return to reuse. Until it and its cursors
+//!   are dropped they are held (a cursor kept after its transaction holds the reader, and stays
+//!   under the timeout), and `db.timed_out_not_aborted_transactions` counts such transactions still
+//!   open (0 on MDBX, which aborts them). `disable_long_read_transaction_safety` takes a
+//!   transaction out of the timeout, as on MDBX. A long reader is also reported: while a read
+//!   transaction holds a superseded snapshot, the pages freed since are not reused, so the file
+//!   grows until it ends and they return; a write commit made once that has lasted over 60 seconds
+//!   logs a `warn!` with its age, at most once a minute per environment
+//!   (`tn_lmdb::Env::oldest_reader_age`, a lock-free read: readers pay nothing, and a commit one
+//!   atomic load while no reader holds a superseded snapshot, plus a clock read while one does);
 //! - one file, `<dir>/tn-lmdb.dat`, with the engine's `flock` as the lock: a second open of a file
 //!   another handle holds is `MDBX_BUSY`;
 //! - the table stats ([`TnLmdbEnv::table_stats`]) and the metrics skip a table the file lacks
