@@ -3103,3 +3103,70 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   its version), and `test_unknown_version_refused_before_decode` (now 4). Mutation-checked:
   `has_checksums` without version 3, and no configuration checksum for version 3, each fail.
   *Upstream*: no (TN-0120's checksummed format is TN's).
+
+- **TN-0201** — `Transactions` rows that store a transaction's position in its consensus batch,
+  in jars with tagged values; the policy that creates those jars; the writer and
+  `save_blocks_with_tx_positions`. *Kind*: feature (storage; off until TN turns the policy on).
+  *Files*: `crates/storage/provider/src/providers/static_file/{tx_row.rs, manager.rs,
+  writer.rs, mod.rs, tn_checksum_tests.rs, tn_tx_row_tests.rs}` (`tx_row.rs` and
+  `tn_tx_row_tests.rs` new), `crates/storage/provider/src/providers/{mod.rs,
+  database/provider.rs}`.
+  *Why*: TN keeps every transaction in its consensus packs, so a datadir can store a pointer per
+  transaction instead of the body a second time. Rows: in a `Transactions` jar with tagged
+  values (TN-0200's version 3) each value is a tag and its payload: tag 0, the transaction's
+  `Compact` bytes, byte for byte what an untagged jar stores; tag 1, its position in the batch
+  its block executed, the canonical unsigned LEB128 of a `u32` (1 to 5 bytes, no redundant last
+  zero, nothing after it); any other tag is refused. `TxRow`, `decode_tx_row` (an untagged value
+  is always inline and decodes as upstream does) and `encode_tx_ref`, with `TxRowError` for an
+  empty value, an unknown tag, and a position that is truncated, longer than five bytes,
+  non-canonical, above `u32::MAX` or followed by bytes; the value's checksum is verified before,
+  so these mean a writer bug or a newer format. Nothing reads these rows yet: the readers that
+  resolve them are a later change, and until then nothing creates such a jar. Policy:
+  `StaticFileProviderInner::set_tx_pointer_jars` (and the builder's `with_tx_pointer_jars`, for
+  tests) makes new `Transactions` jars version 3, only with checksums on (`tx_pointer_jars`,
+  `new_jar_format`, `JarFormat`); no settings push it, TN sets it from the datadir's format, and
+  an existing jar keeps its own format. `load_jar` refuses a version-3 jar of any other segment
+  in any datadir (`TaggedJarError`), and `jar_formats` lists a segment's jars' formats from their
+  configurations, read only, for TN's startup checks. Writer: `create_jar` takes the format;
+  `append_transaction` writes tag 0 before the transaction in a tagged jar, so every caller
+  stays correct; `append_transaction_ref` writes a position row, with `append_with_tx_number`'s
+  range checks, and is an error (`TxPositionsError::UntaggedJar`) in any other jar;
+  `tagged_tx_rows` says which the current jar is. `write_blocks_data` and
+  `DatabaseProvider::save_blocks_with_tx_positions` take the positions as one optional
+  `Arc<[u32]>` per block (an empty slice for none; any other count is an error before anything
+  is written); `save_blocks` passes none. After each block's `increment_block`, which may rotate
+  to a new jar created with the policy, the block's jar decides: tagged and given positions, a
+  position row per transaction, which must be one per transaction and strictly increasing or the
+  save fails (`TxPositionsError`, and the node stops as on any persist failure); tagged without
+  positions, inline rows, counted by `tagged_jar_inline_tx_rows`; untagged, the transactions as
+  before, positions ignored. The positions are an argument, not state, so a retried persist
+  writes the same rows.
+  *Can reach execution or storage*: storage only, and only in jars created with the policy on.
+  No block field, hash or root changes; the hashes, body indices and transaction-block index
+  `save_blocks` writes come from memory as before. With the policy off (every existing datadir,
+  and v1 always) every static file is written byte for byte as before, with or without positions
+  (`untagged_jars_ignore_positions`), and an untagged jar is read exactly as before.
+  *Tests*: `tx_rows_round_trip` (an inline row is tag 0 and the untagged bytes, legacy and a
+  compressed 1559; positions at every LEB128 length edge), `malformed_tx_rows_are_refused` (an
+  empty value, tags 2 to 255, truncated, overlong, non-canonical, above `u32::MAX`, trailing
+  bytes), `tx_positions_are_checked`, `policy_picks_the_jar_format` (every segment's format and
+  `jar_formats` with checksums and pointers on and off: only a `Transactions` jar with both is
+  version 3, its inline rows a byte longer; the setter, and settings that never turn it on),
+  `tagged_values_are_refused_outside_transactions` (header and changeset jars made version 3 are
+  refused by reads, counts and the writer's open, with checksums on and off and read only; the
+  `Transactions` jar loads), and in `tn_tx_row_tests.rs`
+  `rows_follow_the_positions_across_new_jars` (one save crossing into two new jars: position rows
+  where given, counted inline rows where not, every value verified through the cursor and every
+  jar consistent; `save_blocks` writes inline), `a_new_jar_takes_the_policy_mid_call` (turned on
+  mid-way: the existing jar's block stays untagged, the jars the call creates are version 3; off
+  again, the tagged jar keeps its format), `positions_that_do_not_fit_fail_the_save` (a wrong
+  block count, a block's count off by one either way, equal and decreasing positions: each fails
+  and commits nothing), `untagged_jars_ignore_positions` (v1, v2, and v1 with the flag: every
+  static file byte-identical to the same saves without positions), and
+  `position_rows_need_a_tagged_jar`. Mutation-checked, each failing a test: positions
+  written whatever the jar's format, the format decided once per call instead of per block, no
+  per-block check, equal positions allowed, no tag before an inline row, no inline count, the
+  policy without checksums or for every segment, no refusal at load, either block-count check
+  missing, a position row in an untagged jar, `JarFormat::of` testing checksums first, and the
+  decoder accepting a redundant last byte, trailing bytes, six bytes, a value above `u32::MAX`
+  or an unknown tag. *Upstream*: no (TN's format).
