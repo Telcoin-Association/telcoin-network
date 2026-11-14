@@ -1252,6 +1252,24 @@ fn a_directory_that_refuses_the_boot_record_opens_without_one() {
     assert_eq!(boot_file.record().map(|r| r.state), Some(State::Clean), "created");
 }
 
+/// A clean close writes the boot record's "clean" while it still holds the database file's lock:
+/// another open of the file is refused the lock until the record is written, so a writer that
+/// opens the file next (and writes "open" over the record) can never have its "open" overwritten
+/// by the close's "clean".
+#[test]
+fn a_clean_close_marks_the_record_clean_under_the_lock() {
+    let (_dir, path) = temp();
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    let env = Env::open(&path, EnvOptions::default()).expect("open");
+    put_all(&env, "a", &[(b"k", b"v")]);
+    assert_eq!(take_clean_under_lock(), None, "no close yet");
+    drop(env);
+    assert_eq!(take_clean_under_lock(), Some(true), "the lock is held across the write");
+    assert_eq!(boot_file.record().map(|r| r.state), Some(State::Clean));
+    let other = File::open(&path).expect("open");
+    assert!(sys::flock_exclusive(&other).expect("lock"), "released once the record is written");
+}
+
 /// A close that stops before its end leaves the record "open", so the next open in this boot
 /// drops the cache: a failed final sync (the close stops, latched), and a latched environment.
 #[test]
