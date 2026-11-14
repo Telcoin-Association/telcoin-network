@@ -508,9 +508,10 @@ closed the last epoch it took part in, because its votes and proposals for that 
 observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
 directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
 migrate-execution` refuse the datadir, and running the reset again finishes it. An empty one (left
-when the entries are moved back to undo the reset) blocks nothing. The layouts, the upgrade from
-`v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage
-layouts" and "Upgrading a testnet node" sections.
+when the entries are moved back to undo an unfinished reset) blocks nothing. The layouts, the
+upgrade from `v0.17.0-adiri`, the side-observer swap and the rollback of a reset are in the tn-reth
+README's "Storage layouts" and "Upgrading a testnet node" sections; rolling a datadir back to an
+earlier release is not supported once this release has started on it.
 
 ## RPC configuration
 
