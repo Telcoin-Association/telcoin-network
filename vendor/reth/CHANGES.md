@@ -1840,8 +1840,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   returns a value's stored bytes without the check, for a search that only compares a prefix to
   steer itself and then reads the row it settles on verified (TN-0124). A heal never acts on a mismatch: it
   checks lengths only, and a damaged value stays an error on every read. Binding the position
-  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
-  written and read exactly as before (byte-identical files); `load` now refuses a version other
+  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar of
+  the kinds TN writes (uncompressed and LZ4) is written and read as before in steady state
+  (byte-identical files); later entries change version-1 behaviour on other paths: interrupted
+  prunes (TN-0130), leftover files (TN-0131, TN-0132), dictionary zstd (TN-0146), damaged offsets
+  (TN-0152), a configuration naming another jar (TN-0160), a failed writer (TN-0161). `load` now refuses a version other
   than 1 or 2 (upstream only ever wrote 1), and a version-2 configuration naming dictionary zstd
   (`UnsupportedCompression`): the writer compresses without the dictionaries the cursor then
   `expect`s, so that path cannot read back, and no TN segment uses it. A jar's own configuration decides its format, so a
