@@ -23,8 +23,9 @@ use crate::{
 /// file is opened (and a trusted weak head's pages since the last sync: `check::check_since`),
 /// and `Env::check` verifies every page.
 /// So damage inside a page's bounds (a key, a value, an in-bounds length or entry count) is
-/// returned as data until a copy, a free walk or `Env::check` meets it, as on an engine with no
-/// page CRC.
+/// returned as data until a copy of a page this writer did not stamp, a free walk or `Env::check`
+/// meets it, as on an engine with no page CRC; a copy of a page this writer stamped re-seals it,
+/// and nothing finds it after.
 #[inline]
 pub(crate) fn checked_page<'a>(
     pgno: u32,

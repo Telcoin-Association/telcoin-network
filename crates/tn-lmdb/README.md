@@ -2664,14 +2664,16 @@ argument and the measurements. Code and other docs cite the items by number, so 
    - the test-only `disk_model.rs`: a copy out of a live mapping into the model's own buffer.
 3. **Reads do not recompute a tree page's CRC, nor a 1-page overflow run's.** The per-fetch checks
    (and a 1-page run's header checks) catch misdirected and reused pages; the CRC is checked before
-   copy-on-write (unless this writer stamped the page itself: item 25's exemption, so a change at
-   rest to a page this writer built is found by `Env::check` only), on the roots at open, on a
-   trusted weak head's pages written since the last sync at open, on free-list leaves before
-   reuse, and in `Env::check`. A run of more than one page is the exception (item 13). So damage
-   inside a page's bounds (a key, a value, an in-bounds length or entry count, any byte of a
-   1-page run) is returned as data until a copy, a free walk or `Env::check` meets it, as on
-   MDBX, which has no page CRC; the node runs `Env::check` at the end of a migration and on
-   `db check`, not on its own. See [Readers and snapshots](#readers-and-snapshots).
+   copy-on-write, on the roots at open, on a trusted weak head's pages written since the last sync
+   at open, on free-list leaves before reuse, and in `Env::check`. A run of more than one page is
+   the exception (item 13). Copy-on-write skips the check for a page this writer stamped at one of
+   its own commits since it opened (`Allocator::is_stamped`: its bytes were built in memory), so a
+   change at rest to such a page is found only by an `Env::check` that runs before a copy of it,
+   which re-seals the change under a new CRC. So damage inside a page's bounds (a key, a value, an
+   in-bounds length or entry count, any byte of a 1-page run) is returned as data until a copy of
+   a page this writer did not stamp, a free walk or `Env::check` meets it, as on MDBX, which has
+   no page CRC; the node runs `Env::check` at the end of a migration and on `db check`, not on its
+   own. See [Readers and snapshots](#readers-and-snapshots).
 4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector: a
    sound tree never points at a reused page (the reuse gate guarantees it), and a pointer
    redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32. A
@@ -2773,8 +2775,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
 25. **A packed set is not checked at page validation or copy-on-write.** `page::validate` cannot
     tell an outer leaf from any other, and `check_cells_naming_this_txn` skips a set under
     `Cells::Packing`: it names no page, its bytes are under the CRC `verify_published` has just
-    checked (for a page this writer did not stamp itself: item 3), and the page mutators never
-    parse it. Checking there would make copy-on-write the
+    checked (for a page this writer did not stamp itself; item 3 says what that exemption leaves
+    unchecked), and the page mutators never parse it. Checking there would make copy-on-write the
     first use of keys the writer never touched; each set is checked at its own first use (item 23).
     See [Packed sets](#packed-sets).
 26. **Keys of 18 to ~34 rows are left nested** (at 20-byte keys, 32-byte subkeys and 4 KiB pages). A
