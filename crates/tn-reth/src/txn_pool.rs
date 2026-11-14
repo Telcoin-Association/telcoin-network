@@ -572,11 +572,12 @@ impl WorkerTxPool {
         stream::iter(ready)
             .for_each(|(hash, bytes)| async move {
                 let provider = self.1.clone();
-                let included = tokio::task::spawn_blocking(move || provider.transaction_by_hash(hash))
+                // inclusion needs only the hash index: never read or decode the body
+                let included = tokio::task::spawn_blocking(move || provider.transaction_id(hash))
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| {
-                        result.map(|transaction| transaction.is_some()).map_err(|error| error.to_string())
+                        result.map(|id| id.is_some()).map_err(|error| error.to_string())
                     });
                 if included.as_ref().is_ok_and(|included| *included) {
                     self.pending_forwards().remove(&hash);
@@ -1300,15 +1301,20 @@ mod tests {
         tmp_dir: &TempDir,
         task_manager: &TaskManager,
     ) -> (Arc<RethChainSpec>, RethEnv, WorkerTxPool) {
-        let genesis = test_genesis().extend_accounts([(
-            tx_factory.address(),
-            GenesisAccount::default().with_balance(U256::MAX),
-        )]);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let chain = funded_chain_for_test(tx_factory);
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
+    }
+
+    /// A chain whose genesis funds the factory's sender.
+    fn funded_chain_for_test(tx_factory: &TransactionFactory) -> Arc<RethChainSpec> {
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        Arc::new(genesis.into())
     }
 
     /// A real canonical notification retires retained forwarding state independently of pool
@@ -1379,6 +1385,69 @@ mod tests {
         pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
         assert!(pool.get(&hash).is_some(), "the original signed payload must return to the pool");
         assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded]));
+        Ok(())
+    }
+
+    /// The forwarded-inclusion check reads only the hash index, never a transaction body. Every
+    /// value of the persisted block's `Transactions` jar is damaged (storage v2: each carries a
+    /// CRC-32), so a body read fails its checksum while the hash index still answers; the
+    /// included transaction retires its retained record instead of being retried or requeued.
+    #[cfg(not(feature = "mdbx"))]
+    #[tokio::test]
+    async fn forwarded_inclusion_check_reads_no_transaction_body() -> eyre::Result<()> {
+        use crate::StorageLayout;
+        use reth_provider::{StaticFileProviderFactory as _, StaticFileSegment};
+        use std::io::Write as _;
+
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let chain = funded_chain_for_test(&factory);
+        let reth_env = RethEnv::new_for_temp_chain_with_layout(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            StorageLayout::V2,
+        )?;
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        // persisted and pruned from the in-memory chain: both reads below go to storage
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded])?;
+
+        let static_files = pool.1.static_file_provider();
+        let segment = StaticFileSegment::Transactions;
+        let path = static_files
+            .directory()
+            .join(segment.filename(&static_files.find_fixed_range(segment, 0)));
+        let damaged: Vec<u8> = std::fs::read(&path)?.into_iter().map(|byte| byte ^ 0x01).collect();
+        std::fs::OpenOptions::new().write(true).open(&path)?.write_all(&damaged)?;
+        let err = pool.1.transaction_by_hash(hash).expect_err("the body read must fail");
+        assert!(err.to_string().contains("fails its checksum"), "{err}");
+        assert!(pool.1.transaction_id(hash)?.is_some(), "the hash index must still answer");
+
+        pool.pending_forwards().defer(&hash);
+        (1_u8..=3).for_each(|output| {
+            pool.pending_forwards().committed(u64::from(output), B256::repeat_byte(output), []);
+        });
+        pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
+        assert_eq!(
+            pool.pending_forwards().ready(Instant::now() + FORWARD_PENDING_LIFETIME, 1),
+            (vec![], 0),
+            "an included transaction must retire its retained record",
+        );
+        assert!(pool.get(&hash).is_none(), "an included transaction must not return to the pool");
         Ok(())
     }
 
