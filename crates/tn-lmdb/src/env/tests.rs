@@ -1116,7 +1116,8 @@ fn a_reopen_that_keeps_the_cache_does_not_see_a_lost_writeback() {
 /// Each row of the boot record's decision at a writer open (`boot_record::decide`), through
 /// `Env::open`: a new file has no record (drop), and its open writes "open" of this boot naming
 /// the file; a clean close writes "clean" with the file's ctime, and a reopen keeps the cache; a
-/// crash leaves "open", and a reopen drops it; a reboot keeps it, after a crash or a clean close;
+/// crash leaves "open", and a reopen drops it, after a reboot too; a reboot after a clean close
+/// keeps it;
 /// an unknown boot id drops it and records zeros, which drop it again; a record torn, missing or
 /// written over by another process drops it (a missing one's create syncs the directory again);
 /// a file changed since its clean close drops it; and a read-only open neither decides nor
@@ -1148,7 +1149,7 @@ fn a_writer_open_drops_the_cache_as_the_boot_record_says() {
     reopen("a clean close again", Cache::Clean).crash();
     reopen("a crash", Cache::Unclean).crash();
     disk_model::reboot();
-    drop(reopen("a crash, then a reboot", Cache::OtherBoot));
+    drop(reopen("a crash, then a reboot", Cache::Unclean));
     disk_model::reboot();
     drop(reopen("a clean close, then a reboot", Cache::OtherBoot));
 
@@ -1184,6 +1185,39 @@ fn a_writer_open_drops_the_cache_as_the_boot_record_says() {
     drop(ro);
     assert!(fs::read(boot_file.path()).expect("read") == before, "a read-only open");
     drop(reopen("after a read-only open", Cache::Clean));
+}
+
+/// A file reached through two path names (here a hard link) has a boot record per name: a writer
+/// through one name moves the ctime the other name's "clean" holds, so that name's next open
+/// drops the cache, and the other name's "open", left by a crash in an earlier boot, drops it too.
+#[test]
+fn a_file_reached_through_two_names_drops_the_cache_after_the_other_names_writer() {
+    use boot_record::Cache;
+    let (dir, path) = temp();
+    let other = dir.path().join("link");
+    put_all(&open(&path), "a", &[(b"k", b"v")]);
+    fs::hard_link(&path, &other).expect("link");
+    drop(open(&path));
+    take_cache_decision();
+
+    // A commit through the other name (made until the ctime moves: a file system with coarse
+    // timestamps keeps one ctime for a while).
+    let before = fs::metadata(&path).expect("metadata");
+    boot_record::tests::until_ctime_moves(&before, || {
+        put_all(&open(&other), "a", &[(b"k", b"w")]);
+        fs::metadata(&path).expect("metadata")
+    });
+    take_cache_decision();
+    drop(open(&path));
+    assert_eq!(take_cache_decision(), Some(Cache::Changed), "a writer through the other name");
+
+    open(&path).crash();
+    take_cache_decision();
+    disk_model::reboot();
+    put_all(&open(&other), "a", &[(b"k", b"x")]);
+    take_cache_decision();
+    drop(open(&path));
+    assert_eq!(take_cache_decision(), Some(Cache::Unclean), "a crash's open, then a reboot");
 }
 
 /// A datadir copied with its boot record (to another host, or beside itself) is another file:

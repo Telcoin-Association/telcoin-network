@@ -294,7 +294,10 @@ run (n·P bytes, n = ceil((28 + len) / P)):
   tag the leaf's header carries, [Tree pages](#tree-pages-pagers)); the cell does not store it,
   a read takes it from the leaf the cell is in (`Ovf::tag`). So a reference that damage
   redirects to another tree's run of the same txn and length is `Corrupt`, as a child pointer
-  redirected to another tree's page is.
+  redirected to another tree's page is. One redirected to another run of the same tree, commit
+  and length (a live one, or one freed and not yet reused) passes every check: nothing in a run
+  names its key or the leaf that owns it, so the read returns that run's value, as MDBX would.
+  `Env::check` finds it: the run is claimed twice (by two cells, or by a cell and the free list).
 
 - **The cell is canonical.** `ovf_pgno` is the run's first page, `ovf_txn` the low 32 bits of the
   txn that wrote it (the identity check, as a branch cell's `child_txn`), and `len` the value's
@@ -1152,7 +1155,7 @@ against its cell before returning a byte:
 - the run's `n` pages lie in `2..page_count` (a checked add) and are mapped;
 - its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
 - its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
-  `ovf_txn`, so a redirected or stale reference is `Corrupt`;
+  `ovf_txn`, so a stale reference, or one redirected to a run of another commit, is `Corrupt`;
 - its `len` is the cell's, and its `tag` is the tag of the tree whose leaf holds the cell;
 - unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
   page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
@@ -1263,18 +1266,28 @@ checks as `Cursor`'s.
    `<path>.boot`: a magic, a version, the state ("open" or "clean"), the boot id of the writer
    that wrote it (`sys::boot_id`), the data file's device and inode, the file's ctime at a clean
    close, and a CRC. It is advisory: the data file's format and `FORMAT_VERSION` are unchanged, and
-   every way the record can go wrong costs a drop, never data. Only a writer leaves a stale page,
-   and only in its boot (a new boot's cache holds only what that boot read from the device), and
-   a clean close leaves none (its final sync would have failed). So at a writer open:
+   every way the record can go wrong costs a drop, never data. Any write whose writeback failed
+   can leave a stale page, in its boot: a writer's, or a write in place that keeps no record (a
+   copy over the file, a writer through another path name). A clean close leaves none (its final
+   sync would have failed), and its "clean" holds the file's ctime, which a write since moves.
+   So at a writer open:
 
    | the record | the cache |
    |---|---|
-   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup) | dropped |
+   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup to a new file) | dropped |
    | this boot's id or the record's unknown (zeros) | dropped |
    | "clean", but the file's ctime moved since (something wrote the file after the close) | dropped |
-   | another boot's | kept |
-   | this boot's, "open": its writer crashed, was killed, or closed latched | dropped |
-   | this boot's, "clean" | kept |
+   | "open", of any boot: its writer crashed, was killed, or closed latched | dropped |
+   | another boot's "clean" | kept |
+   | this boot's "clean" | kept |
+
+   "Open" holds no ctime, so it drops whichever boot wrote it: a file restored over its own inode
+   after a crash, whose writeback failed, fails the first open's `fsync` and leaves the record as
+   it was, and the next open's `fsync` has nothing left to report. A new boot's cache holds only
+   what that boot read or wrote of the file, so the drop costs little there. The record sits
+   beside the path the open was given: a file reached through two names (a hard link, a symbolic
+   link to it) has one per name, and a writer through either name moves the ctime the other's
+   "clean" holds.
 
    A copied file is another inode, so its first open drops the cache the copy filled (in large
    folios, perhaps: [Platform notes](#platform-notes)) whatever record came with it
@@ -1562,13 +1575,13 @@ in order:
    only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
    own `page_count × P` bytes, all below the new length.
 6. **The boot record says "clean"** (`env::mark_clean`), once the sync and the trim both
-   succeeded (any earlier stop leaves "open", so the next writer open in this boot drops the
-   cache: `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
+   succeeded (any earlier stop leaves "open", so the next writer open drops the cache:
+   `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
    mappings are gone (an unmap can move the file's times: macOS's file systems update them for
    pages written through a mapping), while a second descriptor of the file (`dup`) keeps the
    lock; then the record takes the file's ctime and is written, with no sync. A power loss before
-   its writeback leaves "open" of a boot that is over, and the next boot keeps its cache either
-   way; a failed writeback of it leaves the device's "open", which drops. A failure is logged
+   its writeback, or a failed writeback of it, leaves the device's "open", which drops: a cost in
+   a new boot, whose cache holds only what that boot read. A failure is logged
    (`tracing::warn!`) and changes nothing else.
 
 ---
@@ -2654,22 +2667,30 @@ argument and the measurements. Code and other docs cite the items by number, so 
    - the test-only `disk_model.rs`: a copy out of a live mapping into the model's own buffer.
 3. **Reads do not recompute a tree page's CRC, nor a 1-page overflow run's.** The per-fetch checks
    (and a 1-page run's header checks) catch misdirected and reused pages; the CRC is checked before
-   copy-on-write (unless this writer stamped the page itself: item 25's exemption, so a change at
-   rest to a page this writer built is found by `Env::check` only), on the roots at open, on a
-   trusted weak head's pages written since the last sync at open, on free-list leaves before
-   reuse, and in `Env::check`. A run of more than one page is the exception (item 13). So damage
-   inside a page's bounds (a key, a value, an in-bounds length or entry count, any byte of a
-   1-page run) is returned as data until a copy, a free walk or `Env::check` meets it, as on
-   MDBX, which has no page CRC; the node runs `Env::check` at the end of a migration and on
-   `db check`, not on its own. See [Readers and snapshots](#readers-and-snapshots).
+   copy-on-write, on the roots at open, on a trusted weak head's pages written since the last sync
+   at open, on free-list leaves before reuse, and in `Env::check`. A run of more than one page is
+   the exception (item 13). Copy-on-write skips the check for a page this writer stamped at one of
+   its own commits since it opened (`Allocator::is_stamped`: its bytes were built in memory), so a
+   change at rest to such a page is found only by an `Env::check` that runs before a copy of it,
+   which re-seals the change under a new CRC. So damage inside a page's bounds (a key, a value, an
+   in-bounds length or entry count, any byte of a 1-page run) is returned as data until a copy of
+   a page this writer did not stamp, a free walk or `Env::check` meets it, as on MDBX, which has
+   no page CRC; the node runs `Env::check` at the end of a migration and on `db check`, not on its
+   own. See [Readers and snapshots](#readers-and-snapshots).
 4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector: a
    sound tree never points at a reused page (the reuse gate guarantees it), and a pointer
    redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32. A
    pointer redirected to a page of another tree that the same commit wrote fails the header's
    tree tag instead (every page names its tree: a table's id, or a tag derived from the dup
-   table's and the outer key for a nested tree); one redirected to another page of the same tree
-   and commit is damage at rest to a 4-byte field, which the key-range checks of the descents and
-   `Env::check` find (no page is reached twice). See [Tree pages](#tree-pages-pagers).
+   table's and the outer key for a nested tree). One redirected to another page of the same tree
+   and commit is damage at rest to a 4-byte field. The key-range checks of the descents find it
+   when the page's keys fall outside its slot's range; they do not when they fall inside it, as
+   for a page a later commit freed (not yet reused) whose range a sibling inherited: a `get` then
+   returns the freed page's rows (a hit is not range-checked) or misses the live ones, and a
+   write through it copies the freed page back into the tree. An overflow reference redirected
+   to another run of the same tree, commit and length returns that run's value. `Env::check`
+   finds both (a page claimed twice); MDBX would be at least as silent. See
+   [Tree pages](#tree-pages-pagers) and [Overflow runs](#overflow-runs-overflowrs).
 5. **The file can be longer than `page_count × P`.** That is growth slack; the meta's page count is
    authoritative. A clean close trims it; a crash, a latched close, a failed final sync or a failed
    trim keeps it, because the longer file is always valid while a trim whose length rests on state
@@ -2763,8 +2784,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
 25. **A packed set is not checked at page validation or copy-on-write.** `page::validate` cannot
     tell an outer leaf from any other, and `check_cells_naming_this_txn` skips a set under
     `Cells::Packing`: it names no page, its bytes are under the CRC `verify_published` has just
-    checked (for a page this writer did not stamp itself: item 3), and the page mutators never
-    parse it. Checking there would make copy-on-write the
+    checked (for a page this writer did not stamp itself; item 3 says what that exemption leaves
+    unchecked), and the page mutators never parse it. Checking there would make copy-on-write the
     first use of keys the writer never touched; each set is checked at its own first use (item 23).
     See [Packed sets](#packed-sets).
 26. **Keys of 18 to ~34 rows are left nested** (at 20-byte keys, 32-byte subkeys and 4 KiB pages). A

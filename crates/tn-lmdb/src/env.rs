@@ -690,10 +690,10 @@ impl Drop for EnvInner {
 /// final sync and its trim, with the mappings gone), over `file`, a descriptor of the database
 /// file that still holds its lock: the file's ctime as the close left it, and no sync. `file` is
 /// closed only once the record is written, so its lock keeps a second writer's open, which writes
-/// "open" over the record, out until then. A power loss before its writeback leaves "open" of a
-/// boot that is over, and the next boot's open keeps its cache for that anyway (`boot_record`). A
-/// failure is logged and leaves the record as it was, "open", which the next open in this boot
-/// drops the file's cached pages for.
+/// "open" over the record, out until then. A power loss before its writeback leaves "open", which
+/// the next boot's open drops a cache for that holds only what that boot read (`boot_record`). A
+/// failure is logged and leaves the record as it was, "open", which the next open drops the
+/// file's cached pages for.
 fn mark_clean(boot_file: &BootFile, boot_id: BootId, file: io::Result<File>) {
     let written = file.and_then(|file| {
         let meta = file.metadata()?;
@@ -1888,7 +1888,7 @@ impl Env {
         // built on it (a directory that cannot be synced is skipped, with a warning:
         // `sys::fsync_directory`). A weak head stays weak on disk: the next sync writes its
         // steady meta. Then, unless the boot record shows the cache equals the device (a clean
-        // close in this boot, or another boot's record: `boot_record`), drop the file's cached
+        // close, the file unchanged since: `boot_record`), drop the file's cached
         // pages (Linux), so every read of this open, the metas' and step 9's check, is the
         // device's: a page a failed writeback left clean in the cache, its bytes never on the
         // device and its error reported to the writer that is gone, would otherwise pass from the

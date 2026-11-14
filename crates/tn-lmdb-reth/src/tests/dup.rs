@@ -483,9 +483,12 @@ fn dup_steps<D: Database>(db: &D, steps: &str) -> String {
 /// the key's rows, as MDBX's is: `next` and `next_no_dup` take the next key's first row, never
 /// skipping that key (the step is built from the kept key, not from the engine cursor, which is
 /// on the follower); `current`, `prev`, `prev_dup` and `last_dup` the key's last row (one put
-/// since included), or, the key emptied, the follower and its key's last row. A `delete_current`
-/// or `delete_current_duplicates` there is not compared: libmdbx aborts in `tree_rebalance` when
-/// a cursor's dup key was changed by another accessor (crate docs, class 3).
+/// since included), and `delete_current_duplicates` wipes the key's rows. Once the transaction
+/// has emptied the key, `current` returns the follower, `prev` the row before it, `last_dup` the
+/// follower's key's last row, `prev_dup` nothing (never the key before's last row), and
+/// `delete_current_duplicates` wipes the follower's key. A `delete_current` there is not
+/// compared: libmdbx can abort in `tree_rebalance` when a cursor's dup key was changed by another
+/// accessor (crate docs, class 3).
 const DUP_MATCHED: &[&str] = &[
     "sk:1/3 d c n",
     "sk:1/3 d nd nd",
@@ -625,6 +628,17 @@ const DUP_MATCHED: &[&str] = &[
     "sk:1/5 d del:1/3 del:1/1 p",
     "sk:1/5 d del:1/3 del:1/1 ld",
     "sk:1/5 d del:1/3 del:1/1 c",
+    "sk:1/5 d del:1/3 del:1/1 pd c n",
+    "se:2 ld del:2/2 pd c n p",
+    "se:2 ld del:2/2 pd pd",
+    "se:2 ld del:2/2 pd ld",
+    "se:2 ld del:2/2 pd d c",
+    "sk:4/2 d del:4/1 pd",
+    "sk:4/2 ld del:4/2 del:4/1 pd",
+    "sk:1/5 ld del:1/5 dd c n",
+    "sk:1/5 ld del:1/5 dd f n n n",
+    "sk:1/5 d del:1/3 dd c n",
+    "se:2 ld del:2/2 dd c n",
 ];
 
 #[test]
@@ -701,7 +715,12 @@ fn dup_delete_in_a_key_whose_subkeys_differ_in_their_first_byte_matches_mdbx() {
 ///   skips it; after a `prev` from the next key, or a `next_dup` that found nothing, its `next`
 ///   skips a row the transaction puts after it; and `delete_current_duplicates` leaves `entries`
 ///   one more than the rows after the transaction's put in the key, one less after its delete of
-///   the cursor's row. tn-lmdb's cursor finds its place again by key.
+///   the cursor's row. Once the transaction has emptied the key of a cursor ending its rows, MDBX's
+///   `prev_dup` finds nothing even after the transaction puts rows of the key again, and after that
+///   `prev_dup` its dup moves act as if the cursor were outside the follower's key (`next_dup`
+///   finds nothing, `next_no_dup` returns the follower). tn-lmdb's cursor finds its place again by
+///   key: `prev_dup` takes the key's rows put again, and after a `prev_dup` that found nothing the
+///   cursor is on the follower as after any move.
 /// - **`append_dup` of the value a key's last row holds** is refused here (`MDBX_EKEYMISMATCH`);
 ///   MDBX takes it when the key has two rows or more (and refuses it when the key has one).
 /// - **A key of one row**, which MDBX holds apart from its dup values: after an `append` gives such
@@ -778,6 +797,26 @@ const DUP_DEVIATIONS: &[(&str, &str, &str)] = &[
     ),
     ("se:4 put:4/3 dd en", "se:4=4/1 put:4/3=ok dd=ok en=5", "se:4=4/1 put:4/3=ok dd=ok en=4"),
     ("f del:1/1 dd en", "f=1/1 del:1/1=ok dd=ok en=2", "f=1/1 del:1/1=ok dd=ok en=3"),
+    (
+        "sk:1/5 ld del:1/5 dd en",
+        "sk:1/5=5 ld=5 del:1/5=ok dd=ok en=2",
+        "sk:1/5=5 ld=5 del:1/5=ok dd=ok en=3",
+    ),
+    (
+        "se:2 ld del:2/2 put:2/3 pd",
+        "se:2=2/2 ld=2 del:2/2=ok put:2/3=ok pd=none",
+        "se:2=2/2 ld=2 del:2/2=ok put:2/3=ok pd=2/3",
+    ),
+    (
+        "se:2 ld del:2/2 pd nd",
+        "se:2=2/2 ld=2 del:2/2=ok pd=none nd=none",
+        "se:2=2/2 ld=2 del:2/2=ok pd=none nd=4/2",
+    ),
+    (
+        "se:2 ld del:2/2 pd nnd",
+        "se:2=2/2 ld=2 del:2/2=ok pd=none nnd=4/1",
+        "se:2=2/2 ld=2 del:2/2=ok pd=none nnd=none",
+    ),
 ];
 
 #[test]
