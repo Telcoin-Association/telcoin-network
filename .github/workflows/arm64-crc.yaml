@@ -87,11 +87,17 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Confirm the runner is aarch64
+      # The CRC dispatch takes the PMULL folding path only where the `aes` feature, which carries
+      # PMULL, is detected (crates/tn-lmdb/src/crc.rs); without it the tests compare crc32fast
+      # with itself.
+      - name: Confirm the runner is aarch64 with PMULL
         run: |
           set -euo pipefail
           uname -m
           [[ "$(uname -m)" == "aarch64" ]]
+          features=$(grep -m1 '^Features' /proc/cpuinfo)
+          echo "$features"
+          grep -qw pmull <<<"$features"
 
       - name: Run the CRC tests
         # The `crc::tests` module only: the rest of tn-lmdb's suite runs in pr.yaml's test
