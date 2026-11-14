@@ -625,7 +625,9 @@ pub(crate) fn spawn_epoch_vote_collector(
                 // vote to trigger a fresh collection attempt.
                 if let Some((last_epoch_rec, None)) = consensus_chain.epochs().get_epoch_by_number(epoch_rec.epoch.saturating_sub(1)).await {
                     // No cert for last epoch.  Were we in the committee?
-                    if last_epoch_rec.committee.contains(&me) {
+                    if last_epoch_rec.committee.contains(&me)
+                        && !withhold_own_epoch_vote(last_epoch_rec.epoch)
+                    {
                         // If so then lets send a vote out which will trigger a new collection attempt.
                         let epoch_vote = last_epoch_rec.sign_vote(&key_config);
                         error!(
@@ -657,7 +659,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             // If we already have a cert (for instance we are catching up) then don't vote.
             if consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_none() {
                 // If we are in the committee and this epoch is un-certified, sign and publish our vote
-                if epoch_rec.committee.contains(&me) {
+                if epoch_rec.committee.contains(&me) && !withhold_own_epoch_vote(epoch_rec.epoch) {
                     let epoch_vote = epoch_rec.sign_vote(&key_config);
                     info!(
                         target: "epoch-manager",
@@ -813,6 +815,9 @@ async fn recertify_older_record(
         "epoch record re-certify round",
     );
     retained.mark_recertify(record.epoch);
+    if withhold_own_epoch_vote(record.epoch) {
+        return;
+    }
     let epoch_vote = record.sign_vote(key_config);
     new_epoch_vote(consensus_bus, epoch_vote);
     let _ = primary_network.publish_epoch_vote(epoch_vote).await;
@@ -1030,6 +1035,35 @@ fn record_missing_signers(committee: &[BlsPublicKey], remaining: &HashSet<BlsPub
         metrics::counter!("tn_node.epoch_record_missing_signers_total", "signer" => signer)
             .increment(u64::from(remaining.contains(key)));
     }
+}
+
+/// Whether this node withholds its own vote for the record of `epoch` in the round it is about
+/// to sign for (test hook `TN_TEST_WITHHOLD_EPOCH_VOTE`, see
+/// [`tn_types::test_hooks::withhold_epoch_vote`]), logging the withheld round.
+///
+/// Each call counts one of this node's rounds for the record, so every site that signs this
+/// node's own vote consults it once, right before signing: the vote for a new record, the
+/// failsafe for the previous record, and the re-certify pick. A withheld vote is neither sent to
+/// the local collector nor gossiped; a round for the record still starts on the first vote of
+/// another member, counts the votes of others, recovers from peers and stores a certificate as
+/// usual. Unset, this is `false` and nothing else changes.
+fn withhold_own_epoch_vote(epoch: Epoch) -> bool {
+    let Some(round) = withhold_epoch_vote_round(epoch) else { return false };
+    info!(target: "epoch-manager", epoch, round, "test hook: withholding own epoch vote");
+    true
+}
+
+/// The withhold hook's answer for `epoch`: the process-wide hook, read from the environment.
+#[cfg(not(test))]
+fn withhold_epoch_vote_round(epoch: Epoch) -> Option<u32> {
+    tn_types::test_hooks::withhold_epoch_vote(epoch)
+}
+
+/// The withhold hook's answer for `epoch` in this crate's unit tests: the hook a test installed on
+/// its own thread, so no test reads the environment and none can change another's votes.
+#[cfg(test)]
+fn withhold_epoch_vote_round(epoch: Epoch) -> Option<u32> {
+    epoch_vote_collector_tests::withheld_round(epoch)
 }
 
 #[cfg(test)]
@@ -3703,5 +3737,247 @@ mod epoch_vote_collector_tests {
         }
         assert_eq!(signers_gauge, Some(4.0), "the latest record's round set the gauge");
         assert_eq!(rounds, BTreeMap::from([("certified".into(), 1), ("short".into(), 1)]));
+    }
+
+    // ---- bench7 epoch-record-collector-hardening: withhold hook ----
+
+    thread_local! {
+        /// The withhold hook a test installed on this thread with [`WithholdOnThisThread`]. The
+        /// tests run on current-thread runtimes, so the rounds they spawn consult it too.
+        static WITHHOLD: std::cell::RefCell<Option<tn_types::test_hooks::WithholdEpochVote>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The hook installed on this thread, if any, asked for `epoch` (see
+    /// [`super::withhold_epoch_vote_round`]).
+    pub(super) fn withheld_round(epoch: Epoch) -> Option<u32> {
+        WITHHOLD.with(|hook| hook.borrow().as_ref().and_then(|hook| hook.withhold(epoch)))
+    }
+
+    /// A withhold hook installed on this thread until the value is dropped.
+    struct WithholdOnThisThread;
+
+    impl WithholdOnThisThread {
+        /// Withhold this node's vote for the record of `epoch` in its first `rounds` rounds.
+        fn install(epoch: Epoch, rounds: u32) -> Self {
+            let hook = tn_types::test_hooks::WithholdEpochVote::new(epoch, rounds);
+            WITHHOLD.with(|slot| *slot.borrow_mut() = Some(hook));
+            Self
+        }
+    }
+
+    impl Drop for WithholdOnThisThread {
+        fn drop(&mut self) {
+            WITHHOLD.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// The hook's lines among `lines`.
+    fn hook_lines(lines: &parking_lot::Mutex<Vec<String>>) -> Vec<String> {
+        lines.lock().iter().filter(|line| line.contains("test hook")).cloned().collect()
+    }
+
+    /// Run the collector as member 0 of four with records 0..=4 stored uncertified and the hook
+    /// withholding the first `rounds` rounds for record 3, close epoch 3 and then epoch 4, and
+    /// return the epochs this node gossiped a vote for and the hook's lines.
+    ///
+    /// The close of 3 re-votes record 2 (the failsafe) and would vote for record 3 (round 1);
+    /// the close of 4 would re-vote record 3 (the failsafe, round 2) and votes for record 4. The
+    /// vote for record 4 goes out `INITIAL_VOTE_PUBLISH_DELAY` after the close of 4, so a vote for
+    /// record 3 delayed the same way from the earlier close would have gone out before it.
+    async fn closes_with_the_hook(rounds: u32) -> (BTreeSet<Epoch>, Vec<String>) {
+        let _hook = WithholdOnThisThread::install(3, rounds);
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let (committee, keys) = four_keys();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("withhold_closes").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let records: Vec<EpochRecord> = (0..=4)
+            .map(|epoch| EpochRecord {
+                epoch,
+                committee: committee.clone(),
+                next_committee: committee.clone(),
+                ..Default::default()
+            })
+            .collect();
+        for record in &records {
+            consensus_chain.epochs().save_record(record.clone()).await.unwrap();
+        }
+        consensus_chain.epochs().persist().await.unwrap();
+        let (primary_network, published) = spawn_quiet_network();
+        let consensus_bus = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            keys[0].clone(),
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+            false,
+        );
+
+        // the failsafe's vote for record 2 shows the collector took record 3 off the watch
+        consensus_bus.app().epoch_record_watch().send_replace(Some(records[3].clone()));
+        wait_until(Duration::from_secs(5), "the failsafe vote for epoch 2", || async {
+            Ok(published.lock().iter().any(|vote| vote.epoch == 2))
+        })
+        .await
+        .unwrap();
+        consensus_bus.app().epoch_record_watch().send_replace(Some(records[4].clone()));
+        wait_until(Duration::from_secs(5), "the vote for epoch 4 gossiped", || async {
+            Ok(published.lock().iter().any(|vote| vote.epoch == 4))
+        })
+        .await
+        .unwrap();
+        node_shutdown.notify();
+        let votes = published.lock().clone();
+        assert!(votes.iter().all(|vote| vote.public_key == committee[0]), "only our votes");
+        (votes.iter().map(|vote| vote.epoch).collect(), hook_lines(&lines))
+    }
+
+    /// The default form withholds the original round for the named record only: the failsafe for
+    /// the record before it, the failsafe for the named record at the next close and the vote for
+    /// the record after it all go out.
+    #[tokio::test]
+    async fn test_withhold_hook_silences_only_the_first_round_by_default() {
+        let (voted, lines) = closes_with_the_hook(1).await;
+        assert_eq!(voted, BTreeSet::from([2, 3, 4]));
+        assert_eq!(lines, vec!["INFO test hook: withholding own epoch vote epoch=3 round=1"]);
+    }
+
+    /// Two rounds withhold the failsafe at the next close as well, so no vote of this node for
+    /// the named record goes out.
+    #[tokio::test]
+    async fn test_withhold_hook_rounds_reach_the_failsafe() {
+        let (voted, lines) = closes_with_the_hook(2).await;
+        assert_eq!(voted, BTreeSet::from([2, 4]));
+        assert_eq!(
+            lines,
+            vec![
+                "INFO test hook: withholding own epoch vote epoch=3 round=1",
+                "INFO test hook: withholding own epoch vote epoch=3 round=2",
+            ]
+        );
+    }
+
+    /// A withheld round still starts on another member's vote and counts the others: three peer
+    /// votes certify our record, and the certificate carries their signatures and not ours.
+    #[tokio::test]
+    async fn test_withheld_vote_is_not_counted_but_the_others_are() {
+        let _hook = WithholdOnThisThread::install(1, 1);
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let (committee, keys) = four_keys();
+        let (_dir, consensus_chain, local_rec) = record_chain("withheld_vote", &committee).await;
+        let (primary_network, published) = spawn_quiet_network();
+        let consensus_bus = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            keys[0].clone(),
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+            false,
+        );
+
+        // the failsafe's vote for record 0 shows the collector took record 1 off the watch
+        consensus_bus.app().epoch_record_watch().send_replace(Some(local_rec.clone()));
+        wait_until(Duration::from_secs(5), "the failsafe vote for epoch 0", || async {
+            Ok(published.lock().iter().any(|vote| vote.epoch == 0))
+        })
+        .await
+        .unwrap();
+        for key_config in &keys[1..] {
+            new_epoch_vote(consensus_bus.app(), local_rec.sign_vote(key_config));
+        }
+        let digest = local_rec.digest();
+        wait_until(Duration::from_secs(10), "the certificate for record 1", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(digest).await.is_some())
+        })
+        .await
+        .unwrap();
+        node_shutdown.notify();
+
+        let cert = consensus_chain.epochs().cert_by_digest(digest).await.expect("stored");
+        assert_eq!(cert.signed_authorities.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(local_rec.verify_with_cert(&cert));
+        assert!(published.lock().iter().all(|vote| vote.epoch != 1), "no vote of ours for 1");
+        assert_eq!(
+            hook_lines(&lines),
+            vec!["INFO test hook: withholding own epoch vote epoch=1 round=1"]
+        );
+    }
+
+    /// The re-certify pick is one more round for the record: inside the configured rounds it is
+    /// withheld (the pick's line and mark stay), and the next pick past them votes.
+    #[tokio::test]
+    async fn test_withhold_hook_reaches_recertify_picks_only_within_its_rounds() {
+        use tn_types::TnReceiver as _;
+
+        let _hook = WithholdOnThisThread::install(1, 3);
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let (committee, keys) = four_keys();
+        let temp_dir = TempDir::with_prefix("withhold_recertify").unwrap();
+        let db = EpochRecordDb::open(temp_dir.path()).unwrap();
+        for epoch in 0..=3 {
+            db.save_record(EpochRecord {
+                epoch,
+                committee: committee.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        db.persist().await.unwrap();
+        let consensus_bus = ConsensusBus::new();
+        let mut bus_votes = consensus_bus.app().subscribe_new_epoch_votes();
+        let (primary_network, published) = spawn_quiet_network();
+        let retained = RetainedEpochVotes::default();
+
+        // rounds 1 and 2 for record 1 stand for its original round and the failsafe
+        assert!(withhold_own_epoch_vote(1));
+        assert!(withhold_own_epoch_vote(1));
+        // the close of epoch 3 picks candidate 3 % 2 = 1 of {0, 1}: round 3, withheld
+        recertify_older_record(&db, consensus_bus.app(), &keys[0], &primary_network, &retained, 3)
+            .await;
+        assert!(bus_votes.try_recv().is_err(), "no vote for the local collector");
+        assert!(published.lock().is_empty(), "no vote gossiped");
+        assert!(retained.take_recertify(1), "the pick still marks its round");
+        // the close of epoch 5 picks candidate 5 % 4 = 1 of {0, 1, 2, 3}: round 4 votes
+        recertify_older_record(&db, consensus_bus.app(), &keys[0], &primary_network, &retained, 5)
+            .await;
+        let vote = bus_votes.try_recv().expect("our vote for the local collector");
+        assert_eq!((vote.epoch, vote.public_key), (1, committee[0]));
+        assert_eq!(published.lock().iter().map(|vote| vote.epoch).collect::<Vec<_>>(), vec![1]);
+        let lines = hook_lines(&lines);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.rsplit(' ').next().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["round=1", "round=2", "round=3"],
+        );
+    }
+
+    /// Without a hook installed every round votes, as on a node without the variables.
+    #[test]
+    fn test_withhold_hook_unset_withholds_nothing() {
+        for epoch in [0, 1, 3, Epoch::MAX] {
+            assert!(!withhold_own_epoch_vote(epoch));
+        }
+        let hook = WithholdOnThisThread::install(3, 1);
+        assert!(withhold_own_epoch_vote(3));
+        drop(hook);
+        assert!(!withhold_own_epoch_vote(3), "the hook is gone with its guard");
     }
 }

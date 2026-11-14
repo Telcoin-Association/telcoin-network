@@ -20,6 +20,10 @@
 //!
 //! [`execution_delay`] slows a node's engine without touching its consensus, so a test can make
 //! one validator's execution trail its commits by more than the activity window.
+//!
+//! [`withhold_epoch_vote`] keeps a node's own vote for one epoch's record off the network for a
+//! chosen number of its vote rounds, so a test can leave that record uncertified on every node
+//! without stopping one.
 
 use crate::{Database, Epoch, Table};
 use std::time::Duration;
@@ -178,6 +182,145 @@ fn parse_execution_delay(raw: Option<&str>) -> Option<Duration> {
         "test hook: delaying the execution of every consensus output with batches",
     );
     Some(Duration::from_millis(delay_ms))
+}
+
+/// The number of this node's vote round for the record of `epoch` when the hook withholds the
+/// round's own vote, or `None` when this node votes.
+///
+/// Reads `TN_TEST_WITHHOLD_EPOCH_VOTE=<epoch>` and `TN_TEST_WITHHOLD_EPOCH_VOTE_ROUNDS=<n>` once
+/// per process. Set on two validators of four, it leaves the record of `epoch` with two votes of
+/// the three it needs, so the record stays uncertified on every node with no stall and no restart.
+/// The caller consults it once per round, right before it would sign its own vote for a record,
+/// and withholds that vote (no local count, no gossip) when it returns `Some`; the rest of the
+/// round runs as usual. Each call for the named epoch counts one round, from 1, and the first `n`
+/// rounds are withheld. A node signs for one record in the original round at the record's close,
+/// in the failsafe at the next close and, with the switch `epoch_record_recertify`, in the
+/// re-certify picks of later closes, in that order. So `n` = 1 (the default) withholds the
+/// original round only, after which the failsafe can certify the record one close later; `n` = 2
+/// withholds the failsafe too; a large `n` keeps this node's vote off until it restarts without
+/// the hook. The count starts again in each process, so a node restarted with the hook still set
+/// withholds again.
+///
+/// Unset means never, and `n` is read only with the epoch set. An epoch that does not parse is
+/// ignored with a warning and the node votes. A round count that is not a whole number of at least
+/// 1 is ignored with a warning and 1 applies. Always `None` without `test-utils`; as with the
+/// fork-epoch overrides, a node-scoped release build lacks the hook and a workspace-root build
+/// without `-p` has it.
+#[inline]
+pub fn withhold_epoch_vote(epoch: Epoch) -> Option<u32> {
+    #[cfg(feature = "test-utils")]
+    {
+        WITHHOLD_EPOCH_VOTE
+            .get_or_init(|| {
+                // a non-unicode value is lossily converted so it is warned about rather than read
+                // as unset
+                let raw_epoch = std::env::var_os(WITHHOLD_EPOCH_VOTE_VAR);
+                let raw_rounds = std::env::var_os(WITHHOLD_EPOCH_VOTE_ROUNDS_VAR);
+                parse_withhold_epoch_vote(
+                    raw_epoch.as_deref().map(|raw| raw.to_string_lossy()).as_deref(),
+                    raw_rounds.as_deref().map(|raw| raw.to_string_lossy()).as_deref(),
+                )
+            })
+            .as_ref()
+            .and_then(|hook| hook.withhold(epoch))
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        let _ = epoch;
+        None
+    }
+}
+
+/// The rounds of one epoch record's vote in which a node withholds its own vote (see
+/// [`withhold_epoch_vote`]).
+///
+/// Public so a crate's unit tests can run a hook of their own on one thread instead of the
+/// process-wide one, which reads the environment.
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct WithholdEpochVote {
+    /// The epoch whose record's vote is withheld.
+    epoch: Epoch,
+    /// How many of this node's rounds for the record are withheld, from the first.
+    rounds: u32,
+    /// How many rounds for the record have consulted the hook so far.
+    seen: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "test-utils")]
+impl WithholdEpochVote {
+    /// A hook that withholds this node's vote for the record of `epoch` in its first `rounds`
+    /// rounds.
+    pub const fn new(epoch: Epoch, rounds: u32) -> Self {
+        Self { epoch, rounds, seen: std::sync::atomic::AtomicU32::new(0) }
+    }
+
+    /// Count one round for the record of `epoch` and return the round's number, from 1, when its
+    /// vote is withheld. A round for another epoch is not counted and votes.
+    pub fn withhold(&self, epoch: Epoch) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if epoch != self.epoch {
+            return None;
+        }
+        // the closure never declines, so both arms carry the previous count
+        let previous = self
+            .seen
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some(seen.saturating_add(1)))
+            .unwrap_or_else(|seen| seen);
+        let round = previous.saturating_add(1);
+        (round <= self.rounds).then_some(round)
+    }
+}
+
+/// The environment variable that names the epoch for [`withhold_epoch_vote`].
+#[cfg(feature = "test-utils")]
+const WITHHOLD_EPOCH_VOTE_VAR: &str = "TN_TEST_WITHHOLD_EPOCH_VOTE";
+
+/// The environment variable that names how many rounds [`withhold_epoch_vote`] withholds.
+#[cfg(feature = "test-utils")]
+const WITHHOLD_EPOCH_VOTE_ROUNDS_VAR: &str = "TN_TEST_WITHHOLD_EPOCH_VOTE_ROUNDS";
+
+/// The hook behind [`withhold_epoch_vote`], read once per process.
+#[cfg(feature = "test-utils")]
+static WITHHOLD_EPOCH_VOTE: std::sync::OnceLock<Option<WithholdEpochVote>> =
+    std::sync::OnceLock::new();
+
+/// Parses the values of [`WITHHOLD_EPOCH_VOTE_VAR`] and [`WITHHOLD_EPOCH_VOTE_ROUNDS_VAR`] into the
+/// hook.
+///
+/// An unset epoch yields `None`. Surrounding whitespace is trimmed. An epoch that does not parse
+/// as an [`Epoch`] logs a warning and yields `None`, so a typo leaves the node voting. An unset
+/// round count means 1; one that does not parse as a whole number of at least 1 logs a warning and
+/// means 1, the documented default.
+#[cfg(feature = "test-utils")]
+fn parse_withhold_epoch_vote(
+    raw_epoch: Option<&str>,
+    raw_rounds: Option<&str>,
+) -> Option<WithholdEpochVote> {
+    let raw_epoch = raw_epoch?;
+    let epoch = raw_epoch
+        .trim()
+        .parse::<Epoch>()
+        .inspect_err(|err| {
+            tracing::warn!(
+                target: "epoch-manager",
+                value = ?raw_epoch,
+                %err,
+                "ignoring {WITHHOLD_EPOCH_VOTE_VAR}: not an epoch number; the node votes as usual",
+            );
+        })
+        .ok()?;
+    let rounds = raw_rounds.map_or(1, |raw| {
+        raw.trim().parse::<u32>().ok().filter(|rounds| *rounds > 0).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "epoch-manager",
+                value = ?raw,
+                "ignoring {WITHHOLD_EPOCH_VOTE_ROUNDS_VAR}: not a whole number of at least 1; one round is withheld",
+            );
+            1
+        })
+    });
+    Some(WithholdEpochVote::new(epoch, rounds))
 }
 
 /// The hook behind [`exit_before_epoch_record`].
@@ -345,5 +488,61 @@ mod tests {
                 assert_eq!(parse_epoch_hook(var, Some(raw)), None, "var = {var}, raw = {raw:?}");
             }
         }
+    }
+
+    // ---- bench7 epoch-record-collector-hardening: withhold hook ----
+
+    /// The withhold hook withholds the first rounds of the named epoch and no other. This is the
+    /// only test in the crate that sets the two variables, and the values latch on first read, so
+    /// it holds under a single-process `cargo test` run as well as under nextest's process per
+    /// test. It names an epoch the other hook tests do not.
+    #[test]
+    fn withhold_epoch_vote_withholds_the_first_rounds_of_the_named_epoch() {
+        std::env::set_var(WITHHOLD_EPOCH_VOTE_VAR, "6");
+        std::env::set_var(WITHHOLD_EPOCH_VOTE_ROUNDS_VAR, "2");
+        assert_eq!(withhold_epoch_vote(5), None);
+        assert_eq!(withhold_epoch_vote(6), Some(1));
+        assert_eq!(withhold_epoch_vote(7), None);
+        assert_eq!(withhold_epoch_vote(6), Some(2));
+        assert_eq!(withhold_epoch_vote(6), None, "the third round votes");
+        assert_eq!(withhold_epoch_vote(6), None);
+    }
+
+    /// The parsed hook's epoch and round count.
+    fn withhold_form(epoch: Option<&str>, rounds: Option<&str>) -> Option<(Epoch, u32)> {
+        parse_withhold_epoch_vote(epoch, rounds).map(|hook| (hook.epoch, hook.rounds))
+    }
+
+    #[test]
+    fn parse_withhold_epoch_vote_reads_both_forms() {
+        assert_eq!(withhold_form(None, None), None);
+        assert_eq!(withhold_form(None, Some("3")), None, "the round count alone is no hook");
+        assert_eq!(withhold_form(Some("8"), None), Some((8, 1)), "one round by default");
+        assert_eq!(withhold_form(Some(" 8\n"), Some(" 3\n")), Some((8, 3)));
+        assert_eq!(withhold_form(Some("0"), Some("4294967295")), Some((0, u32::MAX)));
+    }
+
+    #[test]
+    fn parse_withhold_epoch_vote_ignores_garbage() {
+        for raw in ["garbage", "", "-1", "8.0", "0x8", "4294967296", "\u{FFFD}"] {
+            assert_eq!(withhold_form(Some(raw), Some("2")), None, "epoch = {raw:?}");
+        }
+        for raw in ["0", "garbage", "", "-1", "1.5", "0x2", "4294967296", "\u{FFFD}"] {
+            assert_eq!(withhold_form(Some("8"), Some(raw)), Some((8, 1)), "rounds = {raw:?}");
+        }
+    }
+
+    /// Rounds for other epochs are not counted; the count saturates rather than wrapping back
+    /// into the withheld rounds.
+    #[test]
+    fn withhold_counts_only_the_named_epoch() {
+        let hook = WithholdEpochVote::new(4, 1);
+        assert_eq!(hook.withhold(3), None);
+        assert_eq!(hook.withhold(5), None);
+        assert_eq!(hook.withhold(4), Some(1));
+        assert_eq!(hook.withhold(4), None);
+        hook.seen.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(hook.withhold(4), None);
+        assert_eq!(hook.seen.load(std::sync::atomic::Ordering::Relaxed), u32::MAX);
     }
 }
