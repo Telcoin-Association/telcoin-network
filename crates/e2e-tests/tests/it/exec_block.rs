@@ -95,9 +95,15 @@ pub(crate) const LEFTOVER_GAP_LOG: &str = "leftover consensus output does not fo
                                            output forwarded to the engine: stopping the node \
                                            before the engine executes past the gap";
 
+/// The error the closing-block check logs before it stops the node: an epoch record's
+/// `final_state` is not the block where the epoch-closing calls ran for its `final_consensus`.
+pub(crate) const CLOSING_BLOCK_HALT_LOG: &str =
+    "epoch record final_state is not the block where the epoch-closing calls ran";
+
 /// Every error a node logs as it stops because its chain or its epoch records went wrong; no test
 /// here passes while a node logged one of them.
-pub(crate) const FATAL_LOGS: [&str; 3] = [HALT_LOG, CONFLICT_HALT_LOG, LEFTOVER_GAP_LOG];
+pub(crate) const FATAL_LOGS: [&str; 4] =
+    [HALT_LOG, CONFLICT_HALT_LOG, LEFTOVER_GAP_LOG, CLOSING_BLOCK_HALT_LOG];
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
 const PASSPHRASE: &str = "restart_test";
