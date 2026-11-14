@@ -493,6 +493,25 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 .map_err(ProviderError::other)?;
             let offsets = reader.get_range(0, committed_blocks).map_err(ProviderError::other)?;
 
+            // TN(TN-0163): the writer gives each block the rows after the previous block's, from
+            // row 0, so committed records form one contiguous run. Records that do not (another
+            // jar's sidecar, or a writer bug) would map blocks to other blocks' rows: refuse.
+            let mut next_row = 0u64;
+            for (index, offset) in offsets.iter().enumerate() {
+                if offset.offset() != next_row {
+                    tracing::error!(
+                        target: "reth::static_file",
+                        path = %csoff_path.display(),
+                        record = index,
+                        offset = offset.offset(),
+                        expected = next_row,
+                        "Changeset offset record does not start where the previous block's rows end"
+                    );
+                    return Err(ProviderError::CorruptedChangeSetStaticFile)
+                }
+                next_row = offset.offset().saturating_add(offset.num_changes());
+            }
+
             // Find last block where offset + num_changes <= actual_nippy_rows
             // This correctly handles rows=0 with offset=0, num_changes=0 (empty blocks)
             let fits = |offset: &ChangesetOffset| {

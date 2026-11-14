@@ -708,3 +708,45 @@ fn jar_files_under_another_jars_name_are_refused() {
         assert_eq!(static_files.account_block_changeset(2).unwrap(), account_changes(2));
     }
 }
+
+/// TN(TN-0163): the sidecar heal refuses committed records that do not form one run from row 0,
+/// each block starting where the previous block's rows end, even when every record fits the rows
+/// and verifies: one pointing back into the previous blocks' rows, one skipping rows, and a first
+/// record not at row 0. Both formats; the jar is left as it is. They would map blocks to other
+/// blocks' rows.
+#[test]
+fn sidecar_heal_refuses_records_out_of_order() {
+    use reth_static_file_types::{ChangesetOffset, ChangesetOffsetWriter};
+
+    let runs: [[(u64, u64); 4]; 3] = [
+        [(0, 5), (5, 5), (0, 5), (15, 5)],
+        [(0, 5), (5, 5), (12, 3), (15, 5)],
+        [(1, 4), (5, 5), (10, 5), (15, 5)],
+    ];
+    for checksums in [false, true] {
+        for run in runs {
+            let (dir, _) = create_test_static_files_dir();
+            let provider = provider(dir.path(), checksums, 1_000);
+            write_changesets(&provider, 0..4);
+            let path = jar_path(&provider, StaticFileSegment::AccountChangeSets, 0);
+            drop(provider);
+            let csoff = path.with_extension("csoff");
+            std::fs::remove_file(&csoff).unwrap();
+            let mut writer = ChangesetOffsetWriter::new(&csoff, 0, checksums).unwrap();
+            for (offset, changes) in run {
+                writer.append(&ChangesetOffset::new(offset, changes)).unwrap();
+            }
+            writer.sync().unwrap();
+            drop(writer);
+            let records = std::fs::read(&csoff).unwrap();
+
+            let provider = provider_rw(dir.path());
+            let result = provider.latest_writer(StaticFileSegment::AccountChangeSets).map(drop);
+            assert!(
+                matches!(result, Err(ProviderError::CorruptedChangeSetStaticFile)),
+                "checksums {checksums}, {run:?}: {result:?}"
+            );
+            assert_eq!(std::fs::read(&csoff).unwrap(), records);
+        }
+    }
+}

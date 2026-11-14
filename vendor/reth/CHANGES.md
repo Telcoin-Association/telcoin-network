@@ -2652,3 +2652,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `test_heal_refuses_a_final_offset_moved_down` (the final offset lowered by 1, 4 and 8: refused,
   files unchanged; an intact jar with an uncommitted row still healed to its committed files).
   Mutation-checked: no verification (the test fails). *Upstream*: no (TN-0120's checksums).
+
+- **TN-0163** — The changeset sidecar heal refuses committed `.csoff` records that are not one
+  contiguous run from row 0. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::heal_changeset_sidecar`; test).
+  *Why*: the heal checked only that each committed record's rows fit the jar's rows and that none
+  fit again after one that did not (TN-0121). Records that verify but overlap, skip rows or start
+  past row 0 (another jar's sidecar, TN-0160's trigger, or a writer bug; bit rot fails the record
+  checksums first) passed, and blocks then read other blocks' rows. The writer gives each block
+  the rows after the previous block's, starting at row 0 (`increment_block` takes the jar's row
+  count), so the heal, which reads the committed records in one bulk read already, now requires
+  each record to start where the previous one's rows end and the first at row 0, and otherwise
+  returns `CorruptedChangeSetStaticFile` and cuts nothing. Both jar versions: an interrupted prune
+  of an older build leaves a contiguous run past the rows, which the heal still cuts. Only the
+  latest jar of each changeset segment is healed at a start; older jars' records are read as
+  lookups need them. *Can reach execution or storage*: storage, by refusing: records a writer
+  made pass, and nothing written or read changes. *Tests*:
+  `sidecar_heal_refuses_records_out_of_order` (a record pointing back into earlier rows, one
+  skipping rows, a first record past row 0; both formats: refused, the sidecar unchanged);
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` and the TN-0130 crash tests unchanged.
+  Mutation-checked: no check (the test fails). *Upstream*: maybe (the run check; the checksums
+  are TN-0121's).
