@@ -1261,6 +1261,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     ///
     /// TN(TN-0112): changeset keys are plain slots (upstream 815037e27). They are hashed for the
     /// `HashedStorages` lookup, and the output is keyed by plain address and plain slot.
+    /// TN(TN-0180): a hashed key is an error.
     fn populate_bundle_state_hashed(
         &self,
         account_changeset: Vec<(u64, AccountBeforeTx)>,
@@ -1301,8 +1302,16 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
                 hash_map::Entry::Occupied(entry) => entry.into_mut(),
             };
 
-            debug_assert!(old_storage.key.is_plain(), "storage changesets hold plain slots");
-            let storage_key = old_storage.key.as_b256();
+            // TN(TN-0180): a release check, not a `debug_assert!`. A hashed key would key the
+            // bundle and reverts by the hash and be hashed again by the callers, so the unwind
+            // would miss the real row and write the old value under `keccak(keccak(slot))`.
+            let StorageSlotKey::Plain(storage_key) = old_storage.key else {
+                return Err(DatabaseError::Other(format!(
+                    "block {block_number}: the storage changeset of {address} holds a hashed \
+                     slot; changesets hold plain slots"
+                ))
+                .into())
+            };
             match account_state.2.entry(storage_key) {
                 hash_map::Entry::Vacant(entry) => {
                     let hashed_address = keccak256(address);
@@ -5642,6 +5651,36 @@ mod tests {
 
         let mdbx_account_cs = provider_rw.tx.entries::<tables::AccountChangeSets>().unwrap();
         assert_eq!(mdbx_account_cs, 0, "v2: MDBX AccountChangeSets should remain empty");
+    }
+
+    #[test]
+    // TN(TN-0180): a hashed changeset key fails the call in release builds too.
+    fn test_populate_bundle_state_hashed_refuses_a_hashed_key() {
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let address = Address::with_last_byte(1);
+        let provider_rw = factory.provider_rw().unwrap();
+        let storage_changeset = vec![(
+            BlockNumberAddress((1, address)),
+            ChangesetEntry {
+                key: StorageSlotKey::Hashed(keccak256(B256::from(U256::from(42)))),
+                value: U256::from(50),
+            },
+        )];
+        let mut hashed_accounts_cursor =
+            provider_rw.tx.cursor_read::<tables::HashedAccounts>().unwrap();
+        let mut hashed_storage_cursor =
+            provider_rw.tx.cursor_dup_read::<tables::HashedStorages>().unwrap();
+
+        let err = provider_rw
+            .populate_bundle_state_hashed(
+                Vec::new(),
+                storage_changeset,
+                &mut hashed_accounts_cursor,
+                &mut hashed_storage_cursor,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("holds a hashed slot"), "{err}");
     }
 
     #[test]
