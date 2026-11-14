@@ -25,7 +25,7 @@ built on a thread with a 2 MiB stack, must fail with a `setup` error, and recurs
 limit must still work. With the old limit both recursion tests abort the test process (SIGABRT,
 stack overflow).
 
-### A cap on what a trace records (TN-0079, TN-0153)
+### A cap on what a trace records (TN-0079, TN-0153, TN-0172)
 
 `TracingInspector` records a step for every opcode when steps are requested (the struct logger,
 and `vmTrace`), copying the whole stack at each step unless the stack is disabled and memory when
@@ -39,7 +39,13 @@ the output, so a contract looping on `STATICCALL` with 16 KiB of calldata did th
 The inspector now counts the bytes its trace holds (`TracingInspector::recorded_bytes`): each
 call's and create's trace node with its input or init code and its output (TN-0153), and each
 step with its stack snapshot, a fresh memory copy, return data, immediate bytes and the values
-`step_end` records (TN-0079). Logs and storage changes are not counted; gas bounds them. Past
+`step_end` records (TN-0079). The struct logger's result counts too, as it is built
+(`TracingInspector::try_geth_traces`, TN-0172): each log's memory as hex strings, which it
+repeats at every step even where the steps share one snapshot, and the copy of the contract's
+storage it gets at an SLOAD or SSTORE. Past the cap that conversion stops with the same
+`trace too large` error (`DebugInspectorError::TraceTooLarge`). The logs' other fields and their
+stacks mirror the recorded steps, so such a trace holds at most about twice the cap at its
+peak. Logs and storage changes are not counted; gas bounds them. Past
 `TracingInspectorConfig::max_recorded_bytes` it ends the transaction as the JS interrupt does:
 the context error becomes `EVMError::Custom("trace too large: ...")`. A step halts the
 interpreter with `FatalExternalError`; a call or create that would pass the cap is not made, and
@@ -52,8 +58,9 @@ the trace holds for them, so such a trace could not be returned anyway; the stru
 more than the cap. `merge` keeps the tighter of two caps, and `None` disables it. The counter is an
 `Arc<AtomicUsize>` kept across `fuse` and shared between inspectors through
 `share_recorded_bytes`, so reth bounds a request, not a transaction (see TN-0079 in
-`vendor/reth/CHANGES.md` for the call sites). Tests are in `src/tracing/mod.rs` and
-`src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
+`vendor/reth/CHANGES.md` for the call sites). `DebugInspector::fuse` fuses the mux tracer's
+inspector instead of rebuilding it, so the mux tracer keeps the count too (TN-0172). Tests are
+in `src/tracing/mod.rs`, `src/tracing/mux.rs` and `src/tracing/config.rs`. Upstream has no equivalent as of 0.44.3.
 
 The crate's `.gitignore` is removed, because it would hide the standalone `Cargo.lock` from git.
 `upstream.diff` is the full difference from the registry archive (without
@@ -69,7 +76,7 @@ transfer tracing). Block execution never runs an inspector from it. The recursio
 only to JavaScript tracers, which TN builds only with the opt-in `js-tracer` feature
 (`crates/tn-reth/js-tracer.md`). The trace cap applies to every build: the default build compiles
 the patched crate without Boa, and its code there differs from the registry's by the cap alone
-(`src/tracing/{mod,config}.rs`).
+(`src/tracing/{mod,config,debug,mux}.rs`, `src/tracing/builder/geth.rs`).
 
 The nested reth workspace carries the same patch in `vendor/reth/.cargo/config.toml` (TN-0080),
 which every cargo invocation there reads, the one cargo-nextest runs included, so reth's tests run
@@ -103,7 +110,7 @@ include) if it is not in the local registry, and run
 The recursion limit retires when TN's reth moves to a revm-inspectors release that contains #548
 (0.44.2 or later); check that release's `RECURSION_LIMIT`. The trace size cap has no upstream
 equivalent, so the patch directory stays: on an upgrade, take the new registry source, re-apply
-the cap (the `TN(TN-0079)` and `TN(TN-0153)` hunks of `upstream.diff`), and update the checksum,
+the cap (the `TN(TN-0079)`, `TN(TN-0153)` and `TN(TN-0172)` hunks of `upstream.diff`), and update the checksum,
 revision and `upstream.diff` above. Should upstream grow a cap of its own, drop TN's and, if nothing else is
 carried, delete:
 - this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;

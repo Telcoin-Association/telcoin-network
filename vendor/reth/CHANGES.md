@@ -1398,7 +1398,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   carry on past a pending action. The default is 160 MiB, reth's default `--rpc.max-response-size`:
   a trace whose steps alone pass it serializes to a response the limit refuses, so no answer a
   default node could give changes. The counter survives `fuse`, so `debug_traceBlock*` and
-  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request; the sites that
+  `debug_traceCallMany`, which reuse one `DebugInspector`, are bounded per request (the mux
+  tracer's only since TN-0172); the sites that
   build one inspector per transaction (`trace_block_until` behind `trace_replayBlockTransactions`
   and `trace_filter`, and `trace_callMany`) share a counter. It counted steps only: the call
   traces every preset records, with each call's input, init code and output, stayed uncounted
@@ -2619,3 +2620,43 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   a precompile moved onto the history contract are refused; a balance and storage override of
   it simulates). Mutation-checked: the check removed (the refusals fail).
   *Upstream*: no; upstream has the same shape.
+
+- **TN-0172** — The trace cap also counts the struct logger's logs as they are built, and the mux
+  tracer keeps its count across a request's transactions.
+  *Kind*: fix (security; TN-owned, in the carried revm-inspectors).
+  *Files*: `patches/revm-inspectors/src/tracing/builder/geth.rs` (`struct_log_copies`,
+  `GethTraceBuilder::geth_traces_charged`, which `geth_traces` now calls with no limit;
+  `fill_geth_trace` takes the charge), `patches/revm-inspectors/src/tracing/mod.rs`
+  (`TracingInspector::try_geth_traces`; tests `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies`), `patches/revm-inspectors/src/tracing/debug.rs`
+  (`DebugInspector::get_result` builds the struct logger's frame with `try_geth_traces`;
+  `DebugInspectorError::TraceTooLarge`; `fuse` fuses the mux tracer instead of rebuilding it),
+  `patches/revm-inspectors/src/tracing/mux.rs` (`MuxInspector::fuse`, test
+  `fuse_keeps_the_recorded_bytes`), `patches/revm-inspectors/PATCH.md` and `upstream.diff`;
+  `crates/rpc/rpc-eth-types/src/error/mod.rs` (`TraceTooLarge` maps to `EvmCustom`, `-32603`,
+  as the cap's error during execution does), `crates/rpc/rpc/src/debug.rs` (test
+  `struct_logs_past_the_recorded_bytes_cap_are_refused`).
+  *Why*: TN-0079 and TN-0153 count what the inspector records. The struct logger's result is
+  built after the trace from the recorded steps, and two parts of it were never counted: every
+  log gets the step's memory as one 64-character hex `String` per 32-byte word, also when the
+  step shares its snapshot with the step before (recorded and counted once), and every SLOAD and
+  SSTORE log gets a copy of the contract's storage seen so far. A loop over 4 KiB of memory
+  recorded about 200 bytes a step and its logs then held 11 KiB a step, and the storage copies
+  grow with the reads times the slots seen, so one `enableMemory` or default trace under the cap could still build
+  many GB before the response limit applied. `try_geth_traces` now adds each log's memory
+  strings and storage copy (64 bytes an entry) to the same counter as the log is built, and past
+  the cap stops and returns the `trace too large` error (`-32603`). The logs' other fields and
+  their stacks mirror the recorded steps, which the cap already counts; a struct-logger trace
+  then holds at most about twice the cap at its peak. Separately, `DebugInspector::fuse` rebuilt
+  the mux tracer from its config, with a fresh counter, so `debug_traceBlock*` and
+  `debug_traceCallMany` with `muxTracer` were capped per transaction; it now fuses the tracing
+  inspector, which keeps the counter, as the other tracers do. Traces that stay under the cap
+  get the same answers. *Can reach execution or storage*: no. revm-inspectors runs only for RPC
+  tracing, and the reth change is an error mapping and a test.
+  *Tests*: in the patched crate `struct_logs_count_their_memory_copies`,
+  `struct_logs_count_their_storage_copies` (steps under the cap, logs past it: refused; with no
+  cap the logs build and are counted), `fuse_keeps_the_recorded_bytes`; in reth
+  `struct_logs_past_the_recorded_bytes_cap_are_refused` (through `DebugInspector::get_result`,
+  `-32603`). Mutation-checked: no charge in `try_geth_traces`, and the mux rebuilt in `fuse`
+  (all three patched-crate tests fail).
+  *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.

@@ -1552,6 +1552,45 @@ mod recorded_bytes_tests {
             ],
         );
     }
+
+    /// TN(TN-0172): the struct logs count against the cap as they are built, so a trace whose
+    /// steps fit the cap can still be refused, and the RPC returns that error as `-32603`.
+    #[test]
+    fn struct_logs_past_the_recorded_bytes_cap_are_refused() {
+        let opts = GethDebugTracingOptions {
+            config: alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default()
+                .enable_memory()
+                .disable_storage(),
+            ..Default::default()
+        };
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let DebugInspector::Default(tracing, _) = &mut inspector else {
+            panic!("default options select the struct logger")
+        };
+        tracing.config_mut().max_recorded_bytes = Some(4 << 20);
+
+        // 4 KiB of memory once, then a loop whose steps share its snapshot:
+        // PUSH1 1; PUSH2 0x0fe0; MSTORE; JUMPDEST; PUSH1 6; JUMP
+        let code = [0x60, 0x01, 0x61, 0x0f, 0xe0, 0x52, 0x5b, 0x60, 0x06, 0x56];
+        let target = Address::with_last_byte(0xaa);
+        let mut db = CacheDB::<EmptyDB>::default();
+        let code = Bytecode::new_raw(Bytes::copy_from_slice(&code));
+        db.insert_account_info(target, AccountInfo::default().with_code(code));
+        let mut evm = revm::Context::mainnet().with_db(db).build_mainnet_with_inspector(inspector);
+        let tx = TxEnv { gas_limit: 30_000, kind: TxKind::Call(target), ..Default::default() };
+        let res = evm.inspect_tx(tx.clone()).expect("the steps fit the cap");
+        let block = evm.ctx.block.clone();
+        let err = evm
+            .inspector
+            .get_result(None, &tx, &block, &res, &mut CacheDB::<EmptyDB>::default())
+            .expect_err("the logs repeat the memory at every step");
+        let rpc_err: jsonrpsee_types::error::ErrorObject<'static> = EthApiError::from(err).into();
+        assert_eq!(rpc_err.code(), jsonrpsee_types::error::INTERNAL_ERROR_CODE);
+        assert!(
+            rpc_err.message().starts_with("Revm error: trace too large: more than 4194304 bytes"),
+            "{rpc_err:?}"
+        );
+    }
 }
 
 /// TN(TN-0078): a raw block is bounded as a `debug_traceCallMany` request is.
