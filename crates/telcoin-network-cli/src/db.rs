@@ -106,7 +106,10 @@ enum DbSubcommand {
     /// default; pass `--force` to apply.
     Migrate(DbMigrateArgs),
 
-    /// Load an EVM state-export pack into a new reth database under the datadir.
+    /// Load an EVM state-export pack into a new reth database under the datadir. The database
+    /// gets the format new datadirs get: it holds no transaction up to the pack's block, and in
+    /// the default build stores each later transaction as its position in the consensus packs the
+    /// node saves from the next epoch on, so it never needs a pack from before the restore.
     LoadState(DbLoadStateArgs),
 
     /// Report what the node's tndb consensus database holds: per environment, its generation,
@@ -123,6 +126,14 @@ enum DbSubcommand {
     /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
     /// rebuild replays epoch 0 from the node's own packs. `--for-swap` skips that refusal for the
     /// side-observer swap. Dry-run by default; pass `--force` to apply.
+    ///
+    /// The default build's new datadirs store each transaction once: their rows hold its position
+    /// in a batch of the consensus packs, so a rebuild is how an existing datadir moves to that
+    /// format, and from then on the node needs every pack its rows point into. A start that finds
+    /// one missing refuses, naming the epochs, and a rebuild does not get past that (it
+    /// re-executes from the same packs): restore `consensus-db` from a backup, or start over as a
+    /// new node with `consensus-db` moved aside as well, or swap in an observer's execution
+    /// database (`--for-swap`).
     ResetExecution(DbResetExecutionArgs),
 }
 
@@ -137,6 +148,14 @@ pub struct DbResetExecutionArgs {
     /// the refusal of a datadir whose consensus database holds no epoch-0 pack (one bootstrapped
     /// with `db load-state`). Without that copy the next start rebuilds from genesis, which such a
     /// datadir cannot do.
+    ///
+    /// An observer's database that stores transactions by their position in consensus packs
+    /// needs this node to hold the pack of every epoch from the one of its first transaction to
+    /// its tip's: the next start refuses otherwise, naming the epochs this node lacks (a node
+    /// bootstrapped with `db load-state` holds packs only from the restored epoch on). An observer
+    /// bootstrapped with `db load-state` stores no transaction up to its restored epoch, so one
+    /// restored from this node's last missing epoch or a later one recovers a node that lost past
+    /// packs.
     #[arg(long)]
     pub for_swap: bool,
 }
