@@ -21,9 +21,9 @@
 //! [`execution_delay`] slows a node's engine without touching its consensus, so a test can make
 //! one validator's execution trail its commits by more than the activity window.
 //!
-//! [`withhold_epoch_vote`] keeps a node's own vote for one epoch's record off the network for a
-//! chosen number of its vote rounds, so a test can leave that record uncertified on every node
-//! without stopping one.
+//! [`withhold_epoch_vote`] keeps a node's own vote for one epoch's record out of its local count
+//! and off the network for a chosen number of its vote rounds, so a test can leave that record
+//! uncertified on every node without stopping one.
 
 use crate::{Database, Epoch, Table};
 use std::time::Duration;
@@ -188,8 +188,9 @@ fn parse_execution_delay(raw: Option<&str>) -> Option<Duration> {
 /// round's own vote, or `None` when this node votes.
 ///
 /// Reads `TN_TEST_WITHHOLD_EPOCH_VOTE=<epoch>` and `TN_TEST_WITHHOLD_EPOCH_VOTE_ROUNDS=<n>` once
-/// per process. Set on two validators of four, it leaves the record of `epoch` with two votes of
-/// the three it needs, so the record stays uncertified on every node with no stall and no restart.
+/// per process. Set on two validators of four, with a round count that covers every round the
+/// test runs through, it leaves the record of `epoch` with two votes of the three it needs, so the
+/// record stays uncertified on every node with no stall and no restart.
 /// The caller consults it once per round, right before it would sign its own vote for a record,
 /// and withholds that vote (no local count, no gossip) when it returns `Some`; the rest of the
 /// round runs as usual. Each call for the named epoch counts one round, from 1, and the first `n`
