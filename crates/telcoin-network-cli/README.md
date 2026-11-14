@@ -491,7 +491,10 @@ would move. It refuses while a node holds the datadir. It also refuses a datadir
 database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
 load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
 from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
-`consensus-db/` moved aside first. While a reset is unfinished (an `execution-reset-*.partial`
+`consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
+closed the last epoch it took part in, because its votes and proposals for that epoch leave with
+`consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
+observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
 directory), the node, `db load-state`, `db stats`, `db check` and `db migrate-execution` refuse the
 datadir, and running the reset again finishes it. The layouts, the upgrade from
 `v0.16.0-adiri`, the side-observer swap and the rollback are in the tn-reth README's "Storage

@@ -117,8 +117,8 @@ enum DbSubcommand {
     /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
     /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
     /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
-    /// rebuild replays epoch 0 from the node's own packs. Dry-run by default; pass `--force` to
-    /// apply.
+    /// rebuild replays epoch 0 from the node's own packs. `--for-swap` skips that refusal for the
+    /// side-observer swap. Dry-run by default; pass `--force` to apply.
     ResetExecution(DbResetExecutionArgs),
 }
 
@@ -128,20 +128,37 @@ pub struct DbResetExecutionArgs {
     /// Move the entries. Without it, print what would move and change nothing.
     #[arg(long)]
     pub force: bool,
+    /// The side-observer swap: a synced observer's `db` and `static_files` are copied in before
+    /// the next start, which then executes only the consensus output past the copy's tip. Skips
+    /// the refusal of a datadir whose consensus database holds no epoch-0 pack (one bootstrapped
+    /// with `db load-state`). Without that copy the next start rebuilds from genesis, which such a
+    /// datadir cannot do.
+    #[arg(long)]
+    pub for_swap: bool,
 }
 
 impl DbResetExecutionArgs {
     /// Run the reset on `datadir` (a dry run without `--force`) and print what it did.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        let plan = reset_execution::reset_execution(&datadir, self.force)?;
+        let mode = if self.for_swap {
+            reset_execution::ResetMode::Swap
+        } else {
+            reset_execution::ResetMode::Rebuild
+        };
+        let plan = reset_execution::reset_execution(&datadir, self.force, mode)?;
         let moves = plan.moves.iter().map(|m| m.display().to_string()).collect::<Vec<_>>();
         if let Some(partial) = &plan.resumes {
             println!("finishing the unfinished execution reset in {}", partial.display());
         }
         if self.force {
+            let next = if self.for_swap {
+                "copy the observer's execution database in before the next start"
+            } else {
+                "the next start rebuilds it from genesis"
+            };
             println!(
-                "moved the execution database ({}) aside to {}; the next start rebuilds it from \
-                 genesis. To undo, stop the node and move the entries back into {}",
+                "moved the execution database ({}) aside to {}; {next}. To undo, stop the node and \
+                 move the entries back into {}",
                 moves.join(", "),
                 plan.target.display(),
                 datadir.display(),
@@ -3003,9 +3020,10 @@ mod tests {
 
     #[test]
     fn parse_db_reset_execution_subcommand() {
-        for (args, force) in [
-            (&["tn", "db", "reset-execution"][..], false),
-            (&["tn", "db", "reset-execution", "--force"][..], true),
+        for (args, force, for_swap) in [
+            (&["tn", "db", "reset-execution"][..], false, false),
+            (&["tn", "db", "reset-execution", "--force"][..], true, false),
+            (&["tn", "db", "reset-execution", "--force", "--for-swap"][..], true, true),
         ] {
             let cli = Cli::<NoArgs>::try_parse_args_from(args.iter().copied()).expect("parsed");
             let Commands::Db(db) = cli.command else {
@@ -3015,6 +3033,7 @@ mod tests {
                 panic!("expected reset-execution");
             };
             assert_eq!(reset.force, force, "{args:?}");
+            assert_eq!(reset.for_swap, for_swap, "{args:?}");
         }
     }
 

@@ -955,6 +955,10 @@ for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds conse
 restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
 pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
 new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
+A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
+in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
+side-observer swap below instead, which keeps its `consensus-db/`: `--for-swap` skips this refusal,
+because the copied execution database replaces the rebuild.
 
 - **In place** (an observer, or a validator that can be out for the rebuild):
 
@@ -1019,7 +1023,9 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
      It gets the layout new datadirs get.
   2. Stop the observer cleanly at the tip, so its files do not change while they are copied.
   3. Stop the validator, then move its execution database aside:
-     `telcoin-network db reset-execution --datadir <validator-datadir> --force`.
+     `telcoin-network db reset-execution --datadir <validator-datadir> --force --for-swap`.
+     `--for-swap` lets a validator bootstrapped with `db load-state` through: the start in step 5
+     executes only the consensus output past the copy's tip, so it needs no epoch-0 pack.
   4. Copy the observer's `db/` and `static_files/` (and its `restored-state-floor`, only if it has
      one) into the validator's datadir. Never copy its `consensus-db/` or its keys.
   5. Start the validator. It opens the copied execution database and executes the consensus output

@@ -16,6 +16,8 @@
 //! The rebuild replays epoch 0 from the node's own consensus packs first, so the command refuses a
 //! datadir whose consensus database holds a later epoch's pack and none for epoch 0
 //! ([`refuse_consensus_without_epoch_zero`]), as a datadir bootstrapped with `db load-state` does.
+//! The side-observer swap moves the execution database aside to copy in a synced observer's, which
+//! replays nothing below the copy's tip, so it skips that check ([`ResetMode::Swap`]).
 
 use eyre::{bail, eyre, WrapErr as _};
 use std::{
@@ -122,11 +124,24 @@ fn refuse_consensus_without_epoch_zero(datadir: &Path) -> eyre::Result<()> {
              `db load-state` holds consensus only from the restored epoch on), and the rebuild \
              replays epoch 0 from this datadir's packs. To rebuild it, move `consensus-db` aside \
              first, so the node syncs from genesis as a new one does (a validator then stays \
-             stopped until the network has closed the epoch it was in)",
+             stopped until the network has closed the last epoch it took part in). For the \
+             side-observer swap, which copies a synced observer's execution database in instead \
+             of rebuilding, pass `--for-swap`",
             datadir.display(),
         ),
         _ => Ok(()),
     }
+}
+
+/// What the moved-aside execution database is replaced with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResetMode {
+    /// The next start rebuilds it from genesis, replaying the node's own consensus packs from
+    /// epoch 0: refuse a datadir that cannot ([`refuse_consensus_without_epoch_zero`]).
+    Rebuild,
+    /// The side-observer swap copies a synced observer's execution database in before the next
+    /// start, which executes only the consensus output past the copy's tip: no epoch-0 check.
+    Swap,
 }
 
 /// The UTC time `secs` after the Unix epoch, as `YYYYMMDDTHHMMSSZ`.
@@ -159,15 +174,21 @@ pub(crate) struct ResetPlan {
 }
 
 /// Move `datadir`'s execution database aside (with `force`), or report what would move (without
-/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. Refuses, before
-/// anything moves, a datadir whose rebuild could not start
+/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. For
+/// [`ResetMode::Rebuild`], refuses, before anything moves, a datadir whose rebuild could not start
 /// ([`refuse_consensus_without_epoch_zero`]).
-pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<ResetPlan> {
+pub(crate) fn reset_execution(
+    datadir: &Path,
+    force: bool,
+    mode: ResetMode,
+) -> eyre::Result<ResetPlan> {
     if !datadir.is_dir() {
         bail!("datadir {} does not exist", datadir.display());
     }
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
-    refuse_consensus_without_epoch_zero(datadir)?;
+    if mode == ResetMode::Rebuild {
+        refuse_consensus_without_epoch_zero(datadir)?;
+    }
 
     let entries = execution_entries(datadir)?;
     let partials = partial_resets(datadir)?;
@@ -317,7 +338,7 @@ mod tests {
     fn a_reset_moves_the_execution_entries_aside() {
         let dir = datadir();
         let root = dir.path();
-        let plan = reset_execution(root, false).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Rebuild).unwrap();
         assert_eq!(
             plan.moves,
             ["db", "static_files", "restored-state-floor"].map(PathBuf::from).to_vec()
@@ -336,7 +357,7 @@ mod tests {
             "a dry run moves nothing"
         );
 
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         let target_name = plan.target.file_name().unwrap().to_string_lossy().into_owned();
         assert!(target_name.starts_with("execution-reset-"), "{target_name}");
         assert!(!target_name.ends_with(".partial"), "{target_name}");
@@ -346,7 +367,7 @@ mod tests {
         assert_eq!(fs::read(plan.target.join("restored-state-floor")).unwrap(), b"42\n");
         refuse_interrupted_reset(root).unwrap();
 
-        let err = reset_execution(root, true).unwrap_err().to_string();
+        let err = reset_execution(root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("holds no execution database"), "{err}");
     }
 
@@ -361,9 +382,12 @@ mod tests {
         let epochs = root.join("consensus-db/epochs");
         fs::remove_dir(epochs.join("epoch-0")).unwrap();
         for force in [false, true] {
-            let err = format!("{:#}", reset_execution(root, force).unwrap_err());
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
             assert!(err.contains("from epoch 1 on and none for epoch 0"), "{err}");
             assert!(err.contains("move `consensus-db` aside"), "{err}");
+            assert!(err.contains("until the network has closed the last epoch"), "{err}");
+            assert!(err.contains("pass `--for-swap`"), "{err}");
             assert_eq!(
                 names(root),
                 [
@@ -380,9 +404,30 @@ mod tests {
         }
 
         fs::create_dir(epochs.join("epoch-0.replaced")).unwrap();
-        reset_execution(root, false).unwrap();
+        reset_execution(root, false, ResetMode::Rebuild).unwrap();
         fs::remove_dir_all(root.join("consensus-db")).unwrap();
-        reset_execution(root, false).unwrap();
+        reset_execution(root, false, ResetMode::Rebuild).unwrap();
+    }
+
+    /// The side-observer swap (`--for-swap`) moves the execution database of a datadir whose
+    /// consensus database starts at a later epoch, as for a validator bootstrapped with `db
+    /// load-state`: the copied database replaces it, so no replay of epoch 0 follows. The consensus
+    /// database stays.
+    #[test]
+    fn a_swap_reset_moves_a_datadir_without_the_epoch_zero_pack() {
+        let dir = datadir();
+        let root = dir.path();
+        fs::remove_dir(root.join("consensus-db/epochs/epoch-0")).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Swap).unwrap();
+        assert_eq!(
+            plan.moves,
+            ["db", "static_files", "restored-state-floor"].map(PathBuf::from).to_vec()
+        );
+        let plan = reset_execution(root, true, ResetMode::Swap).unwrap();
+        let target_name = plan.target.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(root), ["consensus-db", target_name.as_str(), "node-keys", "telcoin.pid"]);
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        assert_eq!(names(&root.join("consensus-db/epochs")), ["epoch-1"]);
     }
 
     /// A datadir without a floor marker moves what it has.
@@ -392,7 +437,7 @@ mod tests {
         let root = dir.path();
         fs::remove_file(root.join("restored-state-floor")).unwrap();
         fs::remove_dir_all(root.join("static_files")).unwrap();
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.moves, [PathBuf::from("db")]);
         assert_eq!(names(&plan.target), ["db"]);
     }
@@ -404,7 +449,7 @@ mod tests {
         let dir = datadir();
         let root = dir.path().to_path_buf();
         let held = PidLock::acquire(&root).unwrap();
-        let err = reset_execution(&root, true).unwrap_err().to_string();
+        let err = reset_execution(&root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("another telcoin process"), "{err}");
         assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         drop(held);
@@ -424,7 +469,7 @@ mod tests {
         let err = refuse_interrupted_reset(root).unwrap_err().to_string();
         assert!(err.contains("did not finish"), "{err}");
 
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
@@ -443,7 +488,7 @@ mod tests {
         let finished = root.join("execution-reset-20261109T163205Z");
         fs::create_dir(&finished).unwrap();
         for force in [false, true] {
-            let err = reset_execution(root, force).unwrap_err().to_string();
+            let err = reset_execution(root, force, ResetMode::Rebuild).unwrap_err().to_string();
             assert!(err.contains(&finished.display().to_string()), "{err}");
             assert!(err.contains(&partial.display().to_string()), "{err}");
             assert!(err.contains("rename or move"), "{err}");
@@ -453,7 +498,7 @@ mod tests {
         }
 
         fs::remove_dir(&finished).unwrap();
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.target, finished);
         assert_eq!(names(&finished), ["db", "restored-state-floor", "static_files"]);
     }
@@ -466,7 +511,7 @@ mod tests {
         let root = dir.path();
         let partial = root.join("execution-reset-20261109T163205Z.partial");
         fs::create_dir_all(partial.join("db")).unwrap();
-        let err = reset_execution(root, true).unwrap_err().to_string();
+        let err = reset_execution(root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("is both in the datadir and in the unfinished reset"), "{err}");
         assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
     }
