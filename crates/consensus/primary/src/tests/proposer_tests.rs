@@ -3041,3 +3041,58 @@ async fn test_quorum_exec_block_starved_rounds_warning() {
         }
     }
 }
+
+/// The quorum rule's inputs as the proposer builds them, in an epoch above 0: the header's epoch
+/// comes from the committee and each parent's block from its certificate, so in a minimal parent
+/// set at epoch 4 a parent naming a block of the epoch counts and one naming a block from before
+/// the epoch opened does not.
+///
+/// Catches: an `ExecBlockInputs` epoch that is not the committee's (every parent skipped, or the
+/// opening block never found), which the epoch-0 proposer tests cannot see.
+#[test]
+fn test_quorum_exec_block_inputs_carry_the_committee_epoch() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(4).build();
+    let committee = fixture.committee();
+    assert_eq!((committee.epoch(), committee.quorum_threshold()), (4, 3));
+    let author = fixture.first_authority().id();
+    // epoch 3 closes at block 133; epoch 4 has executed 136 and 139
+    let mut ring = RecentBlocks::new(50);
+    for output in 0..12 {
+        push_epoch_output(&mut ring, 3, output);
+    }
+    let opening = ring.latest_execution_block_num_hash();
+    for output in 12..14 {
+        push_epoch_output(&mut ring, 4, output);
+    }
+    let tip = ring.latest_execution_block_num_hash();
+    assert_eq!((opening.number, tip.number), (133, 139));
+    assert_eq!(ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).map(|b| b.number), Some(115));
+
+    // round-1 certificates of the committee's epoch by the second and third authority
+    let choose = |numbers: [BlockNumber; 2]| {
+        let parents: Vec<Certificate> = fixture
+            .authorities()
+            .skip(1)
+            .zip(numbers)
+            .map(|(authority, number)| {
+                let header = HeaderBuilder::default()
+                    .author(authority.id())
+                    .round(1)
+                    .epoch(committee.epoch())
+                    .parents(BTreeSet::new())
+                    .latest_execution_block(BlockNumHash::new(number, B256::repeat_byte(0xee)))
+                    .build();
+                Certificate::new_unsigned_for_test(&committee, header, Vec::new())
+                    .expect("unsigned parent certificate")
+            })
+            .collect();
+        let inputs = ExecBlockInputs::new(ExecPolicy::Always, &committee, &author, &parents);
+        assert_eq!(inputs.epoch, 4);
+        choose_exec_block(&ring, &inputs)
+    };
+    let entry = ring.newest_at_or_below(136).expect("ring entry");
+    assert_eq!(choose([136, 136]), ExecBlockChoice { block: entry, tip, basis: ExecBasis::Quorum });
+    // the parent at 103 is skipped, so the set falls short of a quorum; counted, it would have
+    // dragged the choice to the floor entry 115, below the opening block
+    assert_eq!(choose([136, 103]), ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip });
+}
