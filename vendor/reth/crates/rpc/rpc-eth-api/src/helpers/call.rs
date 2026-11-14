@@ -335,6 +335,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
     /// Simulate arbitrary number of transactions at an arbitrary blockchain index, with the
     /// optionality of state overrides
+    ///
+    /// TN(TN-0184): takes a permit of [`SpawnBlocking::tracing_task_guard`] and holds it until
+    /// its blocking work ends, so callers do not take one.
     fn call_many(
         &self,
         bundles: Vec<Bundle<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
@@ -354,6 +357,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             )
             .map_err(Self::Error::from_eth_err)?;
 
+            // TN(TN-0184): a tracing permit too, taken first and held by the blocking work as
+            // `simulate_v1`'s is (TN-0181), so those permits bound how many requests keep their
+            // output (TN-0183) at once.
+            let tracing_permit =
+                self.acquire_owned_tracing().await.map_err(|_| EthApiError::InternalEthError)?;
             let permit = self
                 .acquire_owned_blocking_io()
                 .await
@@ -401,7 +409,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             }
 
             self.spawn_with_state_at_block(at, move |this, mut db| {
-                let _permit = permit;
+                let _permits = (tracing_permit, permit);
                 let mut budget = CallManyBudget::new(gas_budget);
                 let mut all_results = Vec::with_capacity(bundles.len());
 
@@ -471,6 +479,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             },
                         )?;
                         budget.charge(res.result.gas_used()).map_err(Self::Error::from_eth_err)?;
+                        // TN(TN-0183): the return or revert data stays until the response is
+                        // built.
+                        budget
+                            .charge_output(res.result.output().map_or(0, |output| output.len()))
+                            .map_err(Self::Error::from_eth_err)?;
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {

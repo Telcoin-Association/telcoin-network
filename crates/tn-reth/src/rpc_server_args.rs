@@ -14,8 +14,10 @@
 //!   `newPendingTransactions` subscriptions take.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
-//!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
-//!   count and a historical proof window.
+//!   `trace_filter`/log filters have block-scan windows, `eth_getProof` has a historical proof
+//!   window, and `eth_getProof`, `eth_simulateV1`, `eth_callMany` and `eth_callBundle` share a
+//!   permit count (`--rpc.proof-permits`). Each request of the last three keeps at most 32 MiB of
+//!   call output for its response, so those permits bound that memory too.
 //! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
 //!   in native-token units; 0 disables the cap). The default is 0: reth's 1.0 was calibrated for
 //!   ether, and 1.0 in TEL is too small a bound to separate honest fees from runaway ones, so the
@@ -265,10 +267,12 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent `eth_getProof` and `eth_simulateV1` requests on each worker's
-    /// RPC server, which share these permits. A request keeps its permit until its work ends,
-    /// even after its client disconnects. At least 1: with none, every such request would wait
-    /// forever.
+    /// Maximum number of concurrent `eth_getProof`, `eth_simulateV1`, `eth_callMany` and
+    /// `eth_callBundle` requests on each worker's RPC server, which share these permits. A request
+    /// keeps its permit until its work ends, even after its client disconnects. An
+    /// `eth_simulateV1`, `eth_callMany` or `eth_callBundle` request keeps at most 32 MiB of call
+    /// output for its response, so these permits also bound that memory: 32 MiB each. At least 1:
+    /// with none, every such request would wait forever.
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 

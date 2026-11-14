@@ -241,7 +241,8 @@ pub fn check_system_call_overrides(state_overrides: &StateOverride) -> Result<()
 ///
 /// Returns all executed transactions and the result of the execution.
 ///
-/// TN(TN-0156): every call is charged to `budget`, the request's budget across all its blocks.
+/// TN(TN-0156): every call is charged to `budget`, the request's budget across all its blocks,
+/// for its gas and (TN-0183) for the output it keeps.
 ///
 /// [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
 #[expect(clippy::type_complexity)]
@@ -294,6 +295,14 @@ where
         let gas_used = builder
             .execute_transaction_with_result_closure(tx, |result| results.push(result.clone()))?;
         budget.charge(gas_used)?;
+        // TN(TN-0183): the call's return or revert data and its logs' data stay until the
+        // response is built.
+        if let Some(result) = results.last() {
+            budget.charge_output(
+                result.output().map_or(0, |output| output.len()) +
+                    result.logs().iter().map(|log| log.data.data.len()).sum::<usize>(),
+            )?;
+        }
     }
 
     // Pass noop provider to skip state root calculations.
