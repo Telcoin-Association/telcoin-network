@@ -1,11 +1,16 @@
-//! Prometheus metrics for the node's epoch lifecycle.
+//! Prometheus metrics for the node's epoch lifecycle and runtime switches.
 
 use reth_metrics::{
     metrics::{Counter, Gauge},
     Metrics,
 };
+use tn_config::SwitchValue;
 
 use crate::manager::RunEpochMode;
+
+/// The gauge that exports one runtime switch from `parameters.yaml`, labelled `name` with the
+/// switch's YAML key.
+pub(crate) const NODE_SWITCH_GAUGE: &str = "tn_node_switch";
 
 /// Metrics for the epoch manager.
 ///
@@ -53,6 +58,18 @@ impl EpochMetrics {
     }
 }
 
+/// Export each runtime switch as `tn_node_switch{name="<yaml key>"}`.
+///
+/// The value is [`SwitchValue::gauge`]: 0 or 1 for an on/off switch, a count as is, and a
+/// duration in milliseconds. Set once at start, after `parameters.yaml` is loaded, so a scrape
+/// shows which benchmark arm the node runs. A switch takes effect only at restart, so the value
+/// does not change while the process lives.
+pub(crate) fn record_node_switches(switches: &[(&'static str, SwitchValue)]) {
+    for (name, value) in switches {
+        metrics::gauge!(NODE_SWITCH_GAUGE, "name" => *name).set(value.gauge());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +113,47 @@ mod tests {
             .key()
             .labels()
             .any(|l| l.key() == "read" && l.value() == "epoch-entry state read"));
+    }
+
+    // ---- bench6 bench6-switches ----
+
+    /// Every switch exports one `tn_node_switch` series labelled with its YAML key, valued as
+    /// 0/1, a count, or milliseconds. Stand-in switches of each kind, so the mapping holds before
+    /// any switch field exists.
+    #[test]
+    fn test_node_switch_gauge_per_switch() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let switches = [
+            ("on_switch", SwitchValue::Bool(true)),
+            ("off_switch", SwitchValue::Bool(false)),
+            ("count_switch", SwitchValue::Count(3)),
+            ("duration_switch", SwitchValue::Duration(std::time::Duration::from_millis(150))),
+        ];
+
+        metrics::with_local_recorder(&recorder, || record_node_switches(&switches));
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge = |switch: &str| {
+            snapshot
+                .iter()
+                .filter(|(key, ..)| key.key().name() == NODE_SWITCH_GAUGE)
+                .find(|(key, ..)| {
+                    key.key().labels().any(|l| l.key() == "name" && l.value() == switch)
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Gauge(g) => g.0,
+                    other => panic!("{switch} is not a gauge: {other:?}"),
+                })
+                .unwrap_or_else(|| panic!("no tn_node_switch series for {switch}"))
+        };
+        assert_eq!(
+            snapshot.iter().filter(|(key, ..)| key.key().name() == NODE_SWITCH_GAUGE).count(),
+            switches.len()
+        );
+        assert_eq!(gauge("on_switch"), 1.0);
+        assert_eq!(gauge("off_switch"), 0.0);
+        assert_eq!(gauge("count_switch"), 3.0);
+        assert_eq!(gauge("duration_switch"), 150.0);
     }
 }
