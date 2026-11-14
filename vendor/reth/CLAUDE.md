@@ -54,19 +54,19 @@ TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (
 | RPC surface removed (namespaces TN never serves) | TN-0010, TN-0021, TN-0033 |
 | build only (deps, build scripts, features, formatting) | TN-0002, TN-0007, TN-0020, TN-0025 to TN-0027, TN-0080 |
 | tooling (`vendor.py ledger`, `lockfile.py`) | TN-0084, TN-0085, TN-0143 |
-| tests only | TN-0001, TN-0003, TN-0004, TN-0045, TN-0142 |
+| tests only | TN-0001, TN-0003, TN-0004, TN-0045, TN-0142, TN-0167 |
 | RocksDB removed (`StorageSettings::base()` stays v1) | TN-0014 |
 | upstream sync to v1.11.4 | TN-0013 |
 | RPC security backports | TN-0015 to TN-0017, TN-0019, TN-0034, TN-0035, TN-0046, TN-0058, TN-0076 |
-| RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077 to TN-0079 |
+| RPC limits TN adds beyond upstream | TN-0036 to TN-0038, TN-0054 to TN-0057, TN-0061, TN-0077 to TN-0079, TN-0153, TN-0155 to TN-0157 |
 | transaction pool backports | TN-0018, TN-0022, TN-0024, TN-0041 to TN-0043, TN-0073 to TN-0075 |
 | RPC and CLI fixes backported after v1.11.4 | TN-0039, TN-0040, TN-0044, TN-0047 to TN-0051, TN-0059, TN-0060, TN-0062 to TN-0072 |
 | storage and static-file backports | TN-0023, TN-0052, TN-0106 to TN-0109, TN-0159 |
 | trie backports | TN-0081, TN-0102 to TN-0105, TN-0140, TN-0141 |
 | execution and storage fixes | TN-0082, TN-0083 |
 | storage v2 without RocksDB (history and tx hashes in the database, plain-slot keys, v2 genesis, tests) | TN-0100, TN-0110 to TN-0113, TN-0115, TN-0116 |
-| checksummed static files (NippyJar format 2) and jar crash safety | TN-0120 to TN-0123, TN-0130 to TN-0137, TN-0146, TN-0149 |
-| static-file performance (commit syncs, `.csoff` cache, jar cache) | TN-0101, TN-0117 to TN-0119, TN-0124, TN-0138, TN-0144, TN-0148 |
+| checksummed static files (NippyJar format 2) and jar crash safety | TN-0120 to TN-0123, TN-0130 to TN-0137, TN-0146, TN-0149 to TN-0152, TN-0160 to TN-0165 |
+| static-file performance (commit syncs, `.csoff` cache, jar cache) | TN-0101, TN-0117 to TN-0119, TN-0124, TN-0138, TN-0144, TN-0148, TN-0166 |
 | storage roots from a `StorageRootSource` (TN's parallel state roots) | TN-0139 |
 
 CHANGES.md is ordered by section, then by id, newest last within a section.
@@ -90,7 +90,9 @@ Invariants that must hold:
   (`crates/tn-reth/src/env/layout.rs`) gives a new datadir v2 on the default tn-lmdb build and v1
   on the MDBX build, and genesis is written with it (`init_genesis_with_settings`). Pinned by
   `the_default_build_gives_new_datadirs_v2` there; `crates/tn-reth/src/env/format_freeze_tests.rs`
-  pins both layouts' on-disk bytes. reth's `StorageSettings::base()` (v1 by TN-0014; upstream main
+  pins both layouts' formats against checked-in fixtures: every table's raw rows and every static
+  file's bytes as written, and what the current code reads back from them (not the tn-lmdb file's
+  own bytes, which differ between runs). reth's `StorageSettings::base()` (v1 by TN-0014; upstream main
   returns v2) is not on TN's path.
 - Removing a crate or an edge must not switch off a feature something else relied on (D10).
 - No RocksDB, in any form, anywhere in the lockfile (D14).
