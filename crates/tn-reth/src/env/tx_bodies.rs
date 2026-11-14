@@ -89,7 +89,7 @@ pub enum TxBodyErrorKind {
     BatchMissing,
     /// The pack read failed, a batch digest check included.
     #[error("the batch could not be read: {0}")]
-    Read(BatchReadError),
+    Read(Box<BatchReadError>),
     /// A position is past the batch's last transaction.
     #[error("position {pos} is past the batch's {len} transactions")]
     PositionOutOfRange {
@@ -110,8 +110,12 @@ pub enum TxBodyErrorKind {
     #[error("the batch's transactions exceed 4 GiB")]
     BatchTooLarge,
     /// The epoch's pack stayed unsealed, or its replacement unfinished, for [`PACK_WAIT`]: an
-    /// epoch handoff that did not finish, or a past epoch left unsealed (`db validate`).
-    #[error("the epoch's consensus pack stayed unsealed or mid-install for {0:?}")]
+    /// epoch handoff that did not finish, a past epoch left unsealed, or a pack missing files
+    /// beside its data log (`db validate`).
+    #[error(
+        "the epoch's consensus pack stayed unsealed, mid-install or without all its files for \
+         {0:?}"
+    )]
     HandoffTimeout(Duration),
 }
 
@@ -358,7 +362,7 @@ fn read_packs(
         Some(Ok(None)) => return Err(TxBodyErrorKind::BatchMissing),
         // sealed under the read: read it as a closed epoch
         Some(Err(BatchReadError::Closed)) | None => {}
-        Some(Err(e)) => return Err(TxBodyErrorKind::Read(e)),
+        Some(Err(e)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
     }
     let deadline = Instant::now() + PACK_WAIT;
     let mut reopened = false;
@@ -374,9 +378,9 @@ fn read_packs(
                 reopened = true;
             }
             Ok((Ok(None), _)) => return Err(TxBodyErrorKind::BatchMissing),
-            Ok((Err(e), _)) => return Err(TxBodyErrorKind::Read(e)),
+            Ok((Err(e), _)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
             Err(PackOpenError::Missing) => return Err(TxBodyErrorKind::PackMissing),
-            Err(PackOpenError::Failed(e)) => return Err(TxBodyErrorKind::Read(e)),
+            Err(PackOpenError::Failed(e)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
             Err(PackOpenError::Unsealed | PackOpenError::Installing) => {
                 if Instant::now() >= deadline {
                     return Err(TxBodyErrorKind::HandoffTimeout(PACK_WAIT));

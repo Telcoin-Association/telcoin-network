@@ -108,7 +108,6 @@ use crate::{
 use super::{
     exec_cache::{CachedStateProvider, ExecutionCache},
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
-    tx_bodies::TxBodyCacheFill,
     RethEnv,
 };
 
@@ -753,9 +752,9 @@ impl RethEnv {
     }
 
     /// Hand the batches whose transactions a just-persisted output stored by position to the
-    /// env's own decoded-batch cache fill ([`TxBodyCacheFill`], in a datadir that stores
-    /// transactions by position once its batches have a source), then to the installed
-    /// [`PersistedBatchSink`], if any.
+    /// env's own decoded-batch cache fill ([`TxBodyCacheFill`](super::tx_bodies::TxBodyCacheFill),
+    /// in a datadir that stores transactions by position once its batches have a source), then
+    /// to the installed [`PersistedBatchSink`], if any.
     ///
     /// The engine calls it once per output, after [`Self::persist_executed_output`] returned `Ok`
     /// and before the output is announced, with the output and the `tx_positions` it persisted:

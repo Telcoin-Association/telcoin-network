@@ -124,6 +124,7 @@ fn the_cache_charges_each_entry_and_evicts_the_least_recently_used() {
     );
     cache.insert_recent(a, ba);
     assert_eq!(cache.used(), (1200, 0), "a replaced entry is charged once");
+    assert_eq!(cache.holds(&c), (true, false), "and evicts nothing");
     let (heavy, bh) = entry(4, 1500);
     cache.insert_recent(heavy, bh);
     assert_eq!(cache.holds(&heavy), (false, false), "heavier than the part");
@@ -333,7 +334,7 @@ fn the_live_pack_resolves_and_fails_by_arm() -> eyre::Result<()> {
         Some(|| BatchReadError::DigestMismatch { pos: 9, found: B256::repeat_byte(9) });
     assert!(matches!(
         kind(resolve(&source, 4, &b, &[0])),
-        TxBodyErrorKind::Read(BatchReadError::DigestMismatch { pos: 9, .. })
+        TxBodyErrorKind::Read(e) if matches!(*e, BatchReadError::DigestMismatch { pos: 9, .. })
     ));
     // sealed under the read: read as a closed epoch
     *packs.live_error.lock() = Some(|| BatchReadError::Closed);
@@ -363,12 +364,12 @@ fn a_closed_pack_resolves_and_fails_by_arm() -> eyre::Result<()> {
     packs.script.lock().push_back(Scripted::Legacy);
     assert!(matches!(
         kind(resolve(&source, 2, &b, &[0])),
-        TxBodyErrorKind::Read(BatchReadError::Legacy)
+        TxBodyErrorKind::Read(e) if matches!(*e, BatchReadError::Legacy)
     ));
     *packs.read_error.lock() = Some(|| BatchReadError::NotBatch { pos: 3 });
     assert!(matches!(
         kind(resolve(&source, 2, &b, &[0])),
-        TxBodyErrorKind::Read(BatchReadError::NotBatch { pos: 3 })
+        TxBodyErrorKind::Read(e) if matches!(*e, BatchReadError::NotBatch { pos: 3 })
     ));
     Ok(())
 }
@@ -456,6 +457,23 @@ fn a_pack_read_fills_the_cold_part() -> eyre::Result<()> {
         assert_eq!(resolve(&source, 6, &b, &[1])?, expected(&b, &[1]));
     }
     assert_eq!(packs.live_reads.load(Ordering::SeqCst), 3, "no cache");
+    Ok(())
+}
+
+/// A missing epoch counts as mid-install while its old directory is set aside, or once its data
+/// log is back; a directory without a data log is missing.
+#[test]
+fn a_missing_pack_is_mid_install_only_beside_an_install() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    assert!(!ChainPacks::installing(dir.path(), 3), "nothing there");
+    std::fs::create_dir(dir.path().join("epoch-3"))?;
+    assert!(!ChainPacks::installing(dir.path(), 3), "a directory without its data log");
+    std::fs::create_dir(dir.path().join("epoch-3.replaced"))?;
+    assert!(ChainPacks::installing(dir.path(), 3), "the old copy set aside");
+    std::fs::remove_dir(dir.path().join("epoch-3.replaced"))?;
+    std::fs::write(dir.path().join("epoch-3").join(tn_storage::consensus_pack::DATA_NAME), b"")?;
+    assert!(ChainPacks::installing(dir.path(), 3), "the new copy renamed in");
+    assert!(!ChainPacks::installing(dir.path(), 4), "another epoch");
     Ok(())
 }
 

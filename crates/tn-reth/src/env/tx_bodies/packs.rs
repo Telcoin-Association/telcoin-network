@@ -18,7 +18,7 @@ use std::{
 use parking_lot::{Condvar, Mutex};
 use tn_storage::{
     consensus::ConsensusChain,
-    consensus_pack::{BatchReadError, PackReader},
+    consensus_pack::{BatchReadError, PackReader, DATA_NAME},
 };
 use tn_types::{Batch, Epoch, B256};
 
@@ -85,12 +85,13 @@ impl ChainPacks {
         Self { chain, epochs_dir }
     }
 
-    /// Whether `epoch`'s directory is being replaced: an install moves the old directory to
-    /// `epoch-{N}.replaced` before it renames the new one in, so the epoch is briefly missing
-    /// while that exists. A directory that exists again now was renamed in after the open looked.
-    fn installing(epochs_dir: &Path, epoch: Epoch) -> bool {
+    /// Whether `epoch`'s pack, which an open just found missing, is being replaced: an install
+    /// moves the old `epoch-{N}` directory to `epoch-{N}.replaced` before it renames the new one
+    /// in, so the epoch is briefly missing while that exists; a data log found now was renamed in
+    /// after the open looked.
+    pub(crate) fn installing(epochs_dir: &Path, epoch: Epoch) -> bool {
         epochs_dir.join(format!("epoch-{epoch}.replaced")).exists()
-            || epochs_dir.join(format!("epoch-{epoch}")).exists()
+            || epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME).exists()
     }
 }
 
