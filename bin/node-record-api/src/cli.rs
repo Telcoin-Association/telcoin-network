@@ -17,7 +17,7 @@ use tn_kad_client::{BlsPublicKey, Multiaddr};
 use url::Url;
 
 use crate::{
-    keys::{load_committee, worker_bootstrap_addrs, StaticKeys},
+    keys::{load_bootstrap_servers, load_committee, worker_bootstrap_addrs, StaticKeys},
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
@@ -53,12 +53,21 @@ pub struct Cli {
 
     /// A worker DHT bootstrap address (`/ip4/../udp/../quic-v1/p2p/<peer-id>`). Repeatable;
     /// comma-separated in the environment. When omitted, the bootstrap addresses are the
-    /// `worker_id` worker of every bootstrap server in `--committee-file`.
+    /// `worker_id` worker of every server in `--bootstrap-servers-file`, or else of every
+    /// bootstrap server in `--committee-file`.
     #[arg(long, env = "NODE_RECORD_API_BOOTSTRAP", value_delimiter = ',')]
     pub bootstrap: Vec<Multiaddr>,
 
+    /// A bootstrap servers file, the BLS-keyed map of a chain's
+    /// `chain-configs/*/bootstrap_servers.yaml`. Its servers supply the DHT addresses when
+    /// `--bootstrap` is unset. Read once at startup.
+    #[arg(long, env = "NODE_RECORD_API_BOOTSTRAP_SERVERS_FILE")]
+    pub bootstrap_servers_file: Option<PathBuf>,
+
     /// A `committee.yaml`. Its authorities form part of the tracked key floor (re-read every
-    /// cycle), and its bootstrap servers supply the DHT addresses when `--bootstrap` is unset.
+    /// cycle). Its bootstrap servers, if it lists any, supply the DHT addresses when neither
+    /// `--bootstrap` nor `--bootstrap-servers-file` is set; the bundled chain committee files
+    /// list none.
     #[arg(long, env = "NODE_RECORD_API_COMMITTEE_FILE")]
     pub committee_file: Option<PathBuf>,
 
@@ -340,21 +349,33 @@ impl Cli {
             .as_deref()
             .map(|path| load_committee(path).map_err(|err| eyre::eyre!("--committee-file: {err}")))
             .transpose()?;
-        let bootstrap = if self.bootstrap.is_empty() {
-            let Some(committee) = &committee else {
-                eyre::bail!(
-                    "no bootstrap source configured: provide --bootstrap or --committee-file"
-                );
-            };
-            let addrs = worker_bootstrap_addrs(committee, self.worker_id);
+        let bootstrap = if !self.bootstrap.is_empty() {
+            self.bootstrap.clone()
+        } else if let Some(path) = &self.bootstrap_servers_file {
+            let servers = load_bootstrap_servers(path)
+                .map_err(|err| eyre::eyre!("--bootstrap-servers-file: {err}"))?;
+            let addrs = worker_bootstrap_addrs(&servers, self.worker_id);
             eyre::ensure!(
                 !addrs.is_empty(),
-                "no bootstrap server in the committee file advertises worker {}",
+                "no server in the bootstrap servers file advertises worker {}",
+                self.worker_id
+            );
+            addrs
+        } else if let Some(committee) = &committee {
+            let addrs = worker_bootstrap_addrs(&committee.bootstrap_servers(), self.worker_id);
+            eyre::ensure!(
+                !addrs.is_empty(),
+                "no bootstrap server in the committee file advertises worker {} (the bundled \
+                 chain committee files list none: pass --bootstrap-servers-file with the chain's \
+                 bootstrap_servers.yaml)",
                 self.worker_id
             );
             addrs
         } else {
-            self.bootstrap.clone()
+            eyre::bail!(
+                "no bootstrap source configured: provide --bootstrap, --bootstrap-servers-file or \
+                 --committee-file"
+            );
         };
         for addr in &bootstrap {
             eyre::ensure!(
@@ -474,6 +495,22 @@ mod tests {
             .into_owned()
     }
 
+    fn testnet_bootstrap_servers() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../chain-configs/testnet/bootstrap_servers.yaml")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The crate's committee fixture, which still lists bootstrap servers as a datadir
+    /// genesis committee file does.
+    fn fixture_committee() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/committee.yaml")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// A minimal valid CLI (explicit bootstrap, rpc key source) plus `extra` flags.
     fn cli_with(extra: &[&str]) -> Cli {
         let mut argv = vec![
@@ -540,15 +577,17 @@ mod tests {
         assert!(error_of(result).contains("no bootstrap source"));
     }
 
+    /// A committee file that lists bootstrap servers (a datadir genesis committee) supplies the
+    /// DHT addresses and keys; an explicit --bootstrap wins over it.
     #[test]
     fn committee_file_supplies_bootstrap_and_keys() -> eyre::Result<()> {
         let settings = Cli::parse_from([
             "node-record-api",
             "--chain-id=2017",
-            &format!("--committee-file={}", testnet_committee()),
+            &format!("--committee-file={}", fixture_committee()),
         ])
         .into_settings()?;
-        assert_eq!(settings.bootstrap.len(), 5);
+        assert_eq!(settings.bootstrap.len(), 2);
         for addr in &settings.bootstrap {
             assert!(addr.to_string().contains("/udp/49594/quic-v1/p2p/"));
         }
@@ -559,7 +598,7 @@ mod tests {
         let settings = Cli::parse_from([
             "node-record-api",
             "--chain-id=2017",
-            &format!("--committee-file={}", testnet_committee()),
+            &format!("--committee-file={}", fixture_committee()),
             &format!("--bootstrap={BOOTSTRAP}"),
         ])
         .into_settings()?;
@@ -570,11 +609,82 @@ mod tests {
             "node-record-api",
             "--chain-id=2017",
             "--worker-id=3",
-            &format!("--committee-file={}", testnet_committee()),
+            &format!("--committee-file={}", fixture_committee()),
         ])
         .into_settings();
         assert!(error_of(result).contains("advertises worker 3"));
         Ok(())
+    }
+
+    /// The testnet deployment: the committee file gives the key floor and the bootstrap servers
+    /// file the DHT addresses. The bundled committee alone has no addresses, and says which flag
+    /// supplies them.
+    #[test]
+    fn bootstrap_servers_file_supplies_bootstrap() -> eyre::Result<()> {
+        let settings = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            &format!("--committee-file={}", testnet_committee()),
+            &format!("--bootstrap-servers-file={}", testnet_bootstrap_servers()),
+        ])
+        .into_settings()?;
+        let servers = load_bootstrap_servers(Path::new(&testnet_bootstrap_servers()))?;
+        assert_eq!(settings.bootstrap, worker_bootstrap_addrs(&servers, 0));
+        assert!(!settings.bootstrap.is_empty());
+
+        // the file wins over a committee file that lists its own servers
+        let settings = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            &format!("--committee-file={}", fixture_committee()),
+            &format!("--bootstrap-servers-file={}", testnet_bootstrap_servers()),
+        ])
+        .into_settings()?;
+        assert_eq!(settings.bootstrap, worker_bootstrap_addrs(&servers, 0));
+
+        // and --bootstrap wins over the file
+        let settings = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            "--rpc-url=http://127.0.0.1:8545",
+            &format!("--bootstrap-servers-file={}", testnet_bootstrap_servers()),
+            &format!("--bootstrap={BOOTSTRAP}"),
+        ])
+        .into_settings()?;
+        assert_eq!(settings.bootstrap.len(), 1);
+
+        let result = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            "--worker-id=3",
+            "--rpc-url=http://127.0.0.1:8545",
+            &format!("--bootstrap-servers-file={}", testnet_bootstrap_servers()),
+        ])
+        .into_settings();
+        assert!(error_of(result).contains("advertises worker 3"));
+
+        let result = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            &format!("--committee-file={}", testnet_committee()),
+        ])
+        .into_settings();
+        assert!(error_of(result).contains("--bootstrap-servers-file"));
+        Ok(())
+    }
+
+    #[test]
+    fn bad_bootstrap_servers_file_is_a_startup_error() {
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(b"- not a map\n").expect("write");
+        let result = Cli::parse_from([
+            "node-record-api",
+            "--chain-id=2017",
+            "--rpc-url=http://127.0.0.1:8545",
+            &format!("--bootstrap-servers-file={}", file.path().display()),
+        ])
+        .into_settings();
+        assert!(error_of(result).contains("--bootstrap-servers-file"));
     }
 
     #[test]

@@ -73,6 +73,7 @@ COPY --from=builder /tmp/node-record-api /usr/local/bin/node-record-api
 EXPOSE 8080
 
 # The daemon requires --chain-id plus a bootstrap and a key source: pass
-# --committee-file (or --bootstrap with --rpc-url / --keys-file), or their
+# --bootstrap or --bootstrap-servers-file (or a --committee-file that lists
+# bootstrap servers) and --committee-file, --rpc-url or --keys-file, or their
 # NODE_RECORD_API_* environment variables, at run time.
 ENTRYPOINT ["node-record-api"]
