@@ -22,7 +22,8 @@
 //!   so a later change to TN's format (packed trie keys, a different transaction-hash index) is an
 //!   explicit conversion or refusal, never a silent misread.
 //!
-//! Refused, before anything else touches the datadir:
+//! Refused, before reth's consistency check or anything after it touches the datadir (the
+//! database's own open runs first and may already have created or migrated `db/`):
 //! - a `storage_settings` row or a marker that does not parse;
 //! - a marker of a format version this binary does not know (a newer binary wrote it);
 //! - a marker whose layout disagrees with `storage_settings`;
@@ -179,9 +180,10 @@ pub(super) fn settle(
             "the reth database holds no chain, but its static files ({}) hold headers up to \
              block {sf_tip}: the database was removed or replaced, or the datadir's creation \
              stopped before genesis committed. Opening it would prune the static files down to \
-             the empty database. Restore the datadir's `db` directory, or move `db` and \
-             `static_files` aside together (`telcoin-network db reset-execution`) to rebuild \
-             the execution database from genesis",
+             the empty database. Restore the datadir's `db` directory whole (this start may \
+             have created an empty one: remove it first, never copy a backup into it), or move \
+             `db` and `static_files` aside together (`telcoin-network db reset-execution`) to \
+             rebuild the execution database from genesis",
             static_files.directory().display(),
         ),
         (None, None) => create(factory, requested)?,

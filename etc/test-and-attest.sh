@@ -166,11 +166,12 @@ TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
 # binary (TN_BIN_PATH_PREV, with the TN_E2E_TN_LMDB_BIN marker), which the run above does not set,
 # so they run here through their make targets: those build the MDBX e2e binary (`mdbx-e2e/` under
 # the same target root) and pass both, so each lane has one definition.
-# The rolling-upgrade suite (`make test-upgrade`) stays manual. Its previous binary has to be the
-# release the network runs, and since #1788 changed node records that release (v0.16.0-adiri) and
-# this tree do not peer: an upgraded validator migrates both databases and then cannot resolve its
-# peers (crates/tn-reth/README.md, "Upgrade every node together"). It joins this script once a
-# release that peers with this tree is the previous binary.
+# The rolling-upgrade suite (`make test-upgrade`) is not run here: its previous binary is a build
+# of the release the network runs (`make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri`), which this
+# script does not build. Run it by hand against that release before a change to the execution path
+# ships (vendor/reth/CLAUDE.md, "Fork safety"). Its passing does not make a rolling adiri upgrade
+# safe: TN-0140 changes the state root of a trie shape its workload does not build, so adiri
+# validators upgrade all at once (crates/tn-reth/README.md, "Upgrade every validator together").
 make test-e2e-reth-migration
 make test-e2e-resync
 

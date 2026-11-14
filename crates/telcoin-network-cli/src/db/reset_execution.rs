@@ -4,8 +4,9 @@
 //! The command moves the datadir's reth database (`db`), its static files (`static_files`) and the
 //! restored-state floor marker (`restored-state-floor`, present on a datadir bootstrapped from a
 //! snapshot) into `execution-reset-<UTC time>` under the datadir. It renames, never deletes, so
-//! moving the three entries back restores the node as it was. The consensus database, the keys and
-//! the config stay where they are.
+//! moving the three entries back restores the execution database as it was; the consensus
+//! database keeps what the node wrote meanwhile (`crates/tn-reth/README.md`, "Rollback"). The
+//! consensus database, the keys and the config stay where they are.
 //!
 //! The moves are staged in `execution-reset-<UTC time>.partial`, renamed to its final name once
 //! every entry is in it. A node refuses to start while a `.partial` directory is there

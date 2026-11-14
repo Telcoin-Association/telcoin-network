@@ -131,10 +131,12 @@ recovery](#open-and-recovery)).
 Decoding (`Meta::decode`) runs its checks in this order:
 
 1. The magic must match, else `NotTnLmdb`.
-2. The version must be 7, else `UnsupportedVersion`. This runs before the CRC check, because
+2. The version must be 8, else `UnsupportedVersion`. This runs before the CRC check, because
    another version may lay the record out differently. The format is pre-release: a file of
-   version 1 to 6 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(6)`), with no
-   migration and never as damage. Version 3 added the nested cell (leaf cell flags 2) and the
+   version 1 to 7 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(7)`), with no
+   migration and never as damage. The error names the version found and the one this build
+   reads; the way out is the build that wrote the file, or a new database (on a node, `db
+   reset-execution` and a rebuild). Version 3 added the nested cell (leaf cell flags 2) and the
    96-byte catalog record. Version 4 changed the tree page's CRC to skip the page's free gap
    ([Tree pages](#tree-pages-pagers)), so a version-3 page's whole-page CRC would not check.
    Version 5 raised the leaf entry limit from `U / 4` to `U / 2` ([Limits](#limits)), so values
@@ -673,8 +675,14 @@ extra bytes, and two system calls per gap filled.
   write unit is at least one logical block; cloud block storage writes whole blocks). Without gap
   fill no commit writes a page the last durable state names, so a drive that can garble the
   block it was writing at a power cut damages only free pages and a meta (see the page-size
-  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page,
-  which its CRC then reports as `Corrupt`. Leave gap fill off on such a drive.
+  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page of
+  that state. Reads do not recompute a page's CRC (do-not-flag item 3), and the open after the
+  power cut checks the opened state's roots, not its other pages, so the damage is read as data,
+  or is a `SIGBUS` for a sector the drive cannot read, until a copy-on-write, a free-list load, a
+  multi-page overflow run's read or `Env::check` reports it as `Corrupt`. Gap fill therefore
+  needs a drive that writes each logical block atomically when the power fails (NVMe, cloud
+  block storage); leave it off on any other drive (a SATA SSD without power-loss protection, a
+  hard disk, a USB drive, a RAID controller without a battery-backed cache).
 - **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous random
   read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
   `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap it
@@ -1382,7 +1390,11 @@ checks as `Cursor`'s.
    between this step and the first commit leaves "open": the next open drops, which costs only
    its reads. The record is written only under the data file's exclusive lock (a writer open and
    its close), so no two processes race on it; a symbolic link or anything but a regular file at
-   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed.
+   `<path>.boot` is refused (`Io` of kind `InvalidInput`), never followed. An open this step
+   fails (a full or over-quota volume, a record another user owns, such as one a `sudo` run left)
+   is recovered by freeing the space or fixing the record's owner, or by removing `<path>.boot`
+   with no writer open: a missing record only makes the next writer open drop the file's cached
+   pages (`Cache::NoRecord`).
 
 **Open never writes to an existing file.** Every failure above leaves the file unchanged (the
 boot record beside it is written at step 10 only, once everything else has passed).

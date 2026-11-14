@@ -530,7 +530,7 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
 - **Version file** (`check_db_version_file`, `record_db_version_file`, tn-lmdb build):
   `db/database.version` holds `TN_LMDB_DB_VERSION` (1002: reth's version 2 plus 1000), never
   reth's own. It is a rollback tripwire: a binary that runs reth on MDBX alone (a release from
-  before the backend guard, `v0.16.0-adiri` among them) checks the file before it opens anything
+  before the backend guard, `v0.16.0-adiri` and `v0.17.0-adiri` among them) checks the file before it opens anything
   and stops with "breaking database change detected: your database version (v1002) is
   incompatible with the latest database version (v2)", where it would otherwise create an empty
   `mdbx.dat` beside `tn-lmdb.dat` and prune the static files down to it. The check runs before the
@@ -574,6 +574,12 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   fills where writes are capped; its choice and fit are the `tn_lmdb_gap_auto_*` database
   counters (`DbCounters`; the width, the fitted cost per write and per page, the fill's cost per
   gap and the capped flag are gauges, `NOT_DIFFERENCES`). The MDBX build refuses any but off.
+  The fill rewrites live pages of the last durable state, which no commit writes without it, so
+  it is safe at a power loss only on a drive that writes each logical block atomically when the
+  power fails (NVMe, cloud block storage): elsewhere a cut during the sync can garble such a
+  page, and reads, which do not recompute page CRCs, return it as data until a copy-on-write or
+  `db check` reports it (tn-lmdb's README, "A torn write"). On any other drive set
+  `--db.gap-fill off`; `auto` fills on every drive while it measures it.
   `--db.sync-mode durable` (the default) is durable commits. `--db.sync-mode safe-no-sync` is the
   engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
   MiB): a commit returns before it is durable, and the first commit a second after the last durable
@@ -603,7 +609,9 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   holds the datadir lock). Damage is an error naming the directory and what failed, and the file
   is never changed. The MDBX build refuses it: MDBX keeps no page checksums. Run it after a
   migration (which runs the same check itself), after a disk or memory scare, and before trusting
-  a restored file.
+  a restored file. Its read-only open reads through the page cache and drops none of it
+  (tn-lmdb's README, "Read-only open"), so after a write error (`EIO`) reboot the host first:
+  until then the cache can hold pages the device never took, and a pass proves only the cache.
 - **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
   database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
   size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build
@@ -802,6 +810,10 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   | a v2 datadir whose static files hold headers but no senders segment, which v2 writes from genesis | a v1 datadir's static files: the other half-done swap; v2's consistency check would prune them to this database |
   | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
 
+  To restore `db/` after such a refusal, replace the directory whole: a backup copied into the
+  `db/` the refused open created lands beside the new `tn-lmdb.dat`, and an MDBX `mdbx.dat`
+  beside it is refused as the files of two engines (Migrating from MDBX, "Refusals").
+
   One state beside a database without a chain is healed instead: a creation stopped inside
   genesis's commit. Genesis finalizes its static files before it commits the database, so a stop
   between the two leaves TN's marker (committed first) and no `storage_settings` row in the
@@ -849,7 +861,9 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 
 Every format TN writes carries a version marker, and a binary refuses every version it does not
 read. A change to the bytes a marker covers bumps that marker; nothing else tells old bytes from
-new ones.
+new ones. A `db/tn-lmdb.dat` of a tn-lmdb format this build does not read (a development build's)
+is refused at the open, before anything changes ("unsupported format version"); `telcoin-network
+db reset-execution` moves it aside, and the next start rebuilds the execution database.
 
 | marker | covers | bump it when |
 |---|---|---|
@@ -907,39 +921,61 @@ change.
 
 ### Upgrading a testnet node
 
-A testnet node on `v0.16.0-adiri` runs MDBX for both databases, in storage layout v1. The first
-start of this release's binary (the default build, tn-lmdb):
+A testnet node on `v0.17.0-adiri` keeps its consensus database in tndb (#1558) and its reth
+database on MDBX, in storage layout v1, with no layout marker. The first start of this release's
+binary (the default build, tn-lmdb):
 
 1. migrates the reth database from MDBX to tn-lmdb ([Migrating from MDBX](#migrating-from-mdbx)):
-   the engine changes, the layout stays v1, and the node records the layout marker. The node opens
-   the reth database before it touches the consensus database, so this step runs first, and can
-   run alone: to run it before the start, with the node stopped, run
+   the engine changes, the layout stays v1, and the node records the layout marker (a datadir
+   without one is v1). To run the migration before the start, with the node stopped, run
    `telcoin-network db migrate-execution` with the node's `--db.*` flags; the start then finds a
    tn-lmdb database;
-2. migrates the consensus database from MDBX to tndb and removes the MDBX environments (one-way,
-   #1558);
-3. runs on. Nothing else is needed: a v1 datadir keeps working on this binary.
+2. runs on. `consensus-db/` is already tndb and is left as it is, and a v1 datadir keeps working
+   on this binary.
 
-**Upgrade every node together.** Since #1788 a node record carries a network-key co-signature, and
-this release drops the records `v0.16.0-adiri` publishes (and the old binary cannot use the new
-ones): in an e2e committee started on `v0.16.0-adiri`, a validator restarted on this release
-migrated both databases but could not resolve its peers, and stalled. So a mixed committee does not
-work; and an observer on this release cannot sync from a network still on the old one. Upgrade all
-nodes in place first (they keep v1), and rebuild in the new layout only after that.
+A node still on `v0.16.0-adiri` (MDBX for both databases) also moves its consensus database from
+MDBX to tndb at that start, after the reth database, and removes the MDBX environments (one-way,
+#1558).
 
-**What runs this upgrade.** No automated lane starts from `v0.16.0-adiri`. The e2e lanes'
-previous binary (`make test-e2e-reth-migration`, `make test-e2e-resync`) is this tree's `mdbx`
-build, which already keeps the consensus database in tndb and records the layout marker, so step 1
-and the marker recording of a datadir from before the marker never run there. Unit tests cover
-both: `tn-storage`'s `test_migrate_from_mdbx_*` and
-`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`. The one run on real `v0.16.0-adiri` datadirs is the manual e2e run above: the restarted validator
-migrated both databases and recorded the marker, then could not peer. No lane, and no make target,
-upgrades a whole committee from `v0.16.0-adiri` (every node stopped, then started together on this
-release); rehearse that by hand before upgrading testnet.
+**Upgrade every validator together.** This release fixes the state root of a rare trie shape
+(vendor/reth CHANGES.md TN-0140). On a block where the shape occurs, `v0.17.0-adiri` and this
+release compute different state roots, so different block hashes, and a committee that mixes the
+two binaries splits on that block: with five validators and a quorum of four, a split of two and
+three leaves neither side a quorum and consensus halts, and a validator alone on its binary stops.
+Adiri's history holds no such block up to block 529,583 (the close of epoch 751): an observer on
+this release synced adiri from genesis and reproduced every certified epoch record's closing
+block. A block the old binary builds later, during a rolling upgrade included, can still be one.
+So stop every validator, then start every validator on this release; the one-validator canary and
+the stake-weighted batches of a rolling rollout do not apply to validators in this upgrade. An
+observer can move first: one on this release that meets such a block stops rather than follow it.
+Upgrade all nodes in place first (they keep v1), and rebuild in the new layout only after that.
 
-**Back up first.** With the node stopped, copy the whole datadir (at least `consensus-db/`, `db/`
-and `static_files/`) before the first start of the new binary. Both migrations are one-way, and
-the backup is the only way back to `v0.16.0-adiri` (see Rollback).
+**Disk and gap fill.** This release raises the validator disk minimum from 10,000 to 20,000
+sustained write IOPS, and its throughput from 300 MB/s to 800 MiB/s: the tn-lmdb execution
+database's commits are bound by write IOPS on cloud block storage ([Execution database: disk and
+memory](../../docs/src/getting-started/execution-database-hardware.md)). Those figures were
+measured on layout v2; a migrated datadir stays on v1, whose commits took longer where both were
+measured (gap fill off: 2.4 s against 1.4 s per peak commit at 20,000 IOPS), until it is rebuilt.
+Gap fill (`--db.gap-fill`) is new and `auto` by default on Linux; it needs a drive that writes
+each logical block atomically when the power fails, and `--db.gap-fill off` turns it off (see
+"`--db.*` flags on tn-lmdb" above).
+
+**What runs this upgrade.** The e2e lanes' previous binary (`make test-e2e-reth-migration`,
+`make test-e2e-resync`) is this tree's `mdbx` build, not `v0.17.0-adiri`. That build records the
+layout marker when it creates a datadir, so the marker recording of a datadir from before the
+marker (every `v0.17.0-adiri` datadir) never runs there; a unit test covers it
+(`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`), and `tn-storage`'s
+`test_migrate_from_mdbx_*` cover the consensus migration of a `v0.16.0-adiri` datadir.
+`make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri`, then `make test-upgrade`, runs committees that
+mix `v0.17.0-adiri` with this tree; no lane runs it. Its workload does not build the shape TN-0140
+changes, so its passing does not make a rolling upgrade safe. No lane, and no make target, upgrades
+a whole committee at once (every node stopped, then started together on this release); rehearse
+that by hand before upgrading testnet.
+
+**Back up first.** With the node stopped, copy `db/` and `static_files/` before the first start of
+the new binary: the migration is one-way, and the copy keeps the MDBX database as it was. The copy
+is no way back to the old release: rolling a datadir back to an older release once this release
+has started on it is not supported (Rollback below).
 
 **Rebuilding in the new layout.** `telcoin-network db reset-execution` moves the execution database
 aside, so the next start rebuilds it from genesis by re-executing the chain, in the layout new
@@ -955,6 +991,8 @@ for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds conse
 restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
 pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
 new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
+A validator's votes and proposals go aside with `consensus-db/`, so it stays stopped until the
+network has closed the epoch it was last in.
 
 - **In place** (an observer, or a validator that can be out for the rebuild):
 
@@ -988,7 +1026,7 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
   ones; each close that keeps some logs `keeping that epoch's votes and proposals` with the
   epoch). When the node is back in that epoch they keep it from voting twice in a round or
   proposing a second header for one, as after a restart, so it needs no wait before its start,
-  unlike a fresh datadir (Rollback below).
+  unlike a validator whose `consensus-db/` was moved aside (below).
 
   A record of the node's own that a bad execution wrote stops every rebuild on this release. A
   node that forked (its execution diverged, and it built and stored its own record for that
@@ -1002,6 +1040,7 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
   # node stopped
   telcoin-network db reset-execution --datadir <datadir> --force   # db/, static_files/, floor
   mv <datadir>/consensus-db <datadir>/consensus-db.forked           # the stale record's store
+  # validator: stay stopped until the network has closed the last epoch this node took part in
   telcoin-network node --datadir <datadir> ...                       # syncs from genesis
   ```
 
@@ -1009,7 +1048,7 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
   genesis (or restore it from a state pack with `db load-state`, which needs this fresh datadir).
   A validator's votes and proposals for the epoch it was in stay in the moved-aside
   `consensus-db.forked/`, so a validator stays stopped until the network has closed the last
-  epoch it took part in, as for a fresh datadir under Rollback below. The side-observer swap below
+  epoch it took part in, as the comment in the block says. The side-observer swap below
   is no way around this: it keeps the validator's `consensus-db/`, and the stale record with it.
   Keep the moved-aside directories until the cause is known: they hold the diverged chain.
 - **Side-observer swap** (validators): build the new execution database on another node, then swap
@@ -1029,26 +1068,38 @@ new one: move `consensus-db/` aside as well, as for a forked record below, and i
 
 - **To the database before a reset or a swap** (same binary): stop the node, move the new `db/`,
   `static_files/` and any `restored-state-floor` out of the datadir, move the entries of
-  `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. Once the
-  rebuilt node is healthy and no rollback is wanted, delete `execution-reset-*` to free the space.
-- **To `v0.16.0-adiri`:** restore the backup taken before the upgrade, then start the old binary.
-  There is no automatic rollback, and without a backup no safe way back for a validator. The old
-  binary cannot open a tn-lmdb `db/` and has no backend guard; what stops it is the version file:
-  it refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything ("breaking
-  database change detected: your database version (v1002) is incompatible with the latest
-  database version (v2)"), so `db/` and `static_files/` are left as they were and the new binary
-  still runs on them. Do not edit or delete the file to get past it: the old binary would then
+  `execution-reset-<UTC time>/` back into it, and start. The node resumes from its old tip. This
+  restores the execution database, not the whole node: `consensus-db/` keeps what the node wrote
+  meanwhile. A rebuild that ran past the old tip and closed an epoch before that epoch's certified
+  record arrived stored its own record for it; if the rebuilt chain diverged, the rolled-back node
+  meets that record at the epoch's close and stops there at every start, and the recovery is the
+  fresh `consensus-db/` of a forked record (above). Once the rebuilt node is healthy and no
+  rollback is wanted, delete `execution-reset-*` to free the space.
+- **To an older release** (`v0.17.0-adiri` or earlier): not supported once this release has
+  started on the datadir. Fix problems forward, with a later release. Two reasons:
+  - the older binary computes the state root of some blocks differently (TN-0140, "Upgrade every
+    validator together" above), so a node rolled back can disagree with the chain this release
+    built, and a committee with validators on both binaries can split;
+  - restoring a backup taken before the upgrade replaces `consensus-db/` with one that lacks the
+    votes and proposals the validator made since. Those records keep it from voting twice in a
+    round or proposing a second header for one, so without them it could sign conflicting
+    messages.
+
+  Whenever a validator's `consensus-db/` is restored from a backup or moved aside, the validator
+  stays stopped until the network has closed the epoch it was last in.
+
+  An older binary started on the datadir by mistake changes nothing. It cannot open a tn-lmdb
+  `db/` and has no backend guard; what stops it is the version file: it refuses
+  `db/database.version` (1002, the tn-lmdb version) before it opens anything ("breaking database
+  change detected: your database version (v1002) is incompatible with the latest database version
+  (v2)"), so `db/` and `static_files/` are left as they were and this release still runs on them.
+  It opens the reth database before the consensus database, so it stops before it reaches
+  `consensus-db/` too. Do not edit or delete the file to get past it: the old binary would then
   create an empty MDBX database beside `tn-lmdb.dat`, prune the static files down to it, and fail
-  at genesis. The old binary opens the reth database before the consensus database, so it stops
-  before it reaches `consensus-db/` either, which the new binary moved to tndb (one-way, #1558). On
-  a fresh datadir the old binary starts with an empty consensus database and forgets the votes this
-  validator cast in the current epoch, so it could equivocate: keep such a validator stopped until
-  the network has closed the epoch it was in, then start the old binary on a fresh datadir. The
-  version file is the default (tn-lmdb) build's tripwire. A build with `tn-reth`'s `mdbx` feature
-  (no release is one) keeps the reth database on MDBX and `database.version` at reth's 2, but
-  still moves the consensus database to tndb, so `v0.16.0-adiri` started on a datadir that build
-  ran opens it without a refusal, with empty consensus databases: never run the `mdbx` build on a
-  validator's datadir you may roll back.
+  at genesis. The version file is the default (tn-lmdb) build's tripwire. A build with `tn-reth`'s
+  `mdbx` feature (no release is one) keeps the reth database on MDBX and `database.version` at
+  reth's 2, so nothing stops an older release on a datadir that build ran: never run the `mdbx`
+  build on a validator's datadir.
 
 ### Persist benchmark
 

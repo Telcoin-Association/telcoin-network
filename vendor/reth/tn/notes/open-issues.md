@@ -3,16 +3,19 @@
 The items below are known and deliberately left for their own changes, because each is too large
 to fix in passing or needs other owners. None of them lets two validators on the same release
 execute a block differently. The first one is fixed now
-(TN-0140); the fix changes the state root of any block where the old code was wrong, so it ships
-with a coordinated upgrade.
+(TN-0140); the fix changes the state root of any block where the old code was wrong, so adiri
+upgrades to it all at once, never rolling (CHANGES.md TN-0140).
 
 Upstream fixes that are simply not applied yet are tracked in `upstream-backports.md`, not here.
 
 ## The incremental state root can skip a changed subtree (upstream 8572c88fe) [fixed: TN-0140]
 
-Applied as TN-0140 with the storage-v2 work. Mainnet takes it at genesis; a chain an older binary
-built (adiri) is replayed with the fix and its block hashes compared before the fix is deployed
-there (CHANGES.md TN-0140). The analysis below is from before the fix.
+Applied as TN-0140 with the storage-v2 work, with no activation epoch. Mainnet takes it at
+genesis. Adiri's history was replayed with the fix: on 2026-11-14 an observer built with it synced
+adiri from genesis, and every certified epoch record's closing block (epochs 0 to 751, up to block
+529,583) matched the observer's own block and the public RPC's. Adiri validators upgrade from
+`v0.17.0-adiri` all at once (CHANGES.md TN-0140). The analysis below describes the old code; the
+bullets after it say where things stand with the fix.
 
 `TrieNodeIter` (`vendor/reth/crates/trie/trie/src/node_iter.rs`, the `can_skip_node` seek check)
 skips re-hashing a stored branch when the walker's key merely *starts with* the seek prefix. When
@@ -26,22 +29,26 @@ TN computes every block's root this way: `OutputTrieOverlay::layered_root_with_u
 sets from the block's own changes. Upstream's test fails on this copy (incremental root `0x52fe…`,
 rebuilt root `0x6b94…`) and passes with the one-line fix.
 
-- Fork risk today: none between nodes on the same release. The skip is deterministic, so every
-  node that built its trie by executing the same blocks computes the same root, right or wrong. A
-  node whose trie was rebuilt from scratch (snapshot import, `crates/tn-reth/src/snapshot.rs`)
-  hard-fails at import if the chain's root ever went wrong, instead of forking.
-- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary.
-  So the fix is a coordinated upgrade, never a rolling one, and it is not applied here.
-- Has the testnet hit it? Unknown. A snapshot export from a testnet node and an import elsewhere
-  answers it: the import rebuilds the trie from scratch and compares with the header's root. A
-  replay of the testnet from genesis on a fixed binary answers it too, but does not name the
-  block: no check compares a replayed block's hash, so the node runs to the close of the epoch
-  that contains it and stops at the stored epoch record's check (`check_stored_record`,
+- Fork risk between nodes on one release: none, with the fix or without it. The skip is
+  deterministic, so every node that built its trie by executing the same blocks computes the same
+  root, right or wrong. A node whose trie was rebuilt from scratch (snapshot import,
+  `crates/tn-reth/src/snapshot.rs`) hard-fails at import if the chain's root ever went wrong,
+  instead of forking.
+- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary
+  than on an older one. So adiri upgrades to it all at once, never rolling, and rolling a node
+  back to an older release after the fixed one has started on its datadir is not supported.
+- Has the testnet hit it? Not up to block 529,583 (the close of epoch 751): the replay above
+  reproduced every certified closing block to there. Later history is checked the same way. A
+  snapshot export from a testnet node and an import elsewhere also answers it: the import rebuilds
+  the trie from scratch and compares with the header's root. A replay of the testnet from genesis
+  on a fixed binary answers it too, but does not name the block: no check compares a replayed
+  block's hash, so the node runs to the close of the epoch that contains it and stops at the
+  stored epoch record's check (`check_stored_record`,
   `crates/node/src/manager/node/close_epoch.rs`), naming that epoch's recorded and local closing
   blocks. The first block that differs is found by comparing the replayed block hashes with the
   chain's (CHANGES.md TN-0140).
-- Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
-  history already contains such a block), after `graph.py` and `make test-upgrade`.
+- Fix: 8572c88fe, applied as TN-0140 with no activation epoch. A block of later adiri history that
+  a fixed binary does not reproduce would need one.
 
 ## The pool re-admits a nonce from a batch that reached quorum
 
