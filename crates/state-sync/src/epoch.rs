@@ -129,6 +129,10 @@ struct Collection<'m> {
     /// the one the previous retry stopped at, so the retry's deadline cannot keep one gap from
     /// ever being asked by sorting it last.
     retry_from: Epoch,
+    /// The first epoch of the last walk that ended before a certified record after it was stored,
+    /// and when it ended. A walk from that epoch is not tried again until a retry interval has
+    /// passed (see [`Collection::may_walk_past`]).
+    unlanded_walk: Option<(Epoch, tokio::time::Instant)>,
     /// Where the walk and conflict counters go.
     metrics: &'m StateSyncMetrics,
 }
@@ -136,7 +140,7 @@ struct Collection<'m> {
 impl<'m> Collection<'m> {
     /// A collection with no gap open yet.
     fn new(switches: EpochRecordCollectSwitches, metrics: &'m StateSyncMetrics) -> Self {
-        Self { switches, gaps: BTreeSet::new(), retry_from: 0, metrics }
+        Self { switches, gaps: BTreeSet::new(), retry_from: 0, unlanded_walk: None, metrics }
     }
 
     /// Whether a pass told by a peer that it holds no certified record of `epoch` may go on to the
@@ -144,16 +148,18 @@ impl<'m> Collection<'m> {
     /// them landing yet.
     ///
     /// Only with the walk switched on, only while fewer than [`MAX_UNCERTIFIED_GAPS`] gaps would
-    /// be open, and only when this node holds `epoch` as its own stored, uncertified record that
-    /// is not the epoch-0 dummy anchor. The next epoch's record is then anchored on that record:
-    /// its digest and its `next_committee` come from this node's own execution of the epoch, so a
-    /// record past it is checked exactly as it would be had the epoch been certified. An
-    /// uncertified record is stored by this node's own epoch close, or is a peer's record that
-    /// validated with a super-quorum certificate whose own write then failed. A node without
-    /// its own record of the epoch (a fresh node, an observer far behind) never walks: the
-    /// epoch's `next_committee` is not constrained by anything such a node can check, so a
-    /// fabricated record of the epoch could name the committee that certifies a fabricated next
-    /// one.
+    /// be open, not for a new walk from the epoch a walk that did not land started at less than a
+    /// retry interval ago ([`Collection::unlanded_walk`]: its extra requests are made at most once
+    /// per interval, not on every wake-up), and only when this node holds `epoch` as its own
+    /// stored, uncertified record that is not the epoch-0 dummy anchor. The next epoch's record is
+    /// then anchored on that record: its digest and its `next_committee` come from this node's
+    /// own execution of the epoch, so a record past it is checked exactly as it would be had
+    /// the epoch been certified. An uncertified record is stored by this node's own epoch
+    /// close, or is a peer's record that validated with a super-quorum certificate whose own
+    /// write then failed. A node without its own record of the epoch (a fresh node, an observer
+    /// far behind) never walks: the epoch's `next_committee` is not constrained by anything
+    /// such a node can check, so a fabricated record of the epoch could name the committee that
+    /// certifies a fabricated next one.
     async fn may_walk_past(
         &self,
         epoch: Epoch,
@@ -161,6 +167,14 @@ impl<'m> Collection<'m> {
         consensus_chain: &ConsensusChain,
     ) -> bool {
         if !self.switches.past_uncertified {
+            return false;
+        }
+        let retry_interval = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
+        if walked.is_empty()
+            && self
+                .unlanded_walk
+                .is_some_and(|(from, at)| from == epoch && at.elapsed() < retry_interval)
+        {
             return false;
         }
         let opening = walked.iter().filter(|walked| !self.gaps.contains(walked)).count();
@@ -637,6 +651,10 @@ async fn collect_epoch_records(
         if result_epoch != epoch {
             break;
         }
+    }
+    if walked_any {
+        // remember a walk that did not land, so the next passes do not repeat it at once
+        collection.unlanded_walk = walked.first().map(|from| (*from, tokio::time::Instant::now()));
     }
     // A persist writes only our own files, so any failure is local.
     consensus_chain
@@ -1975,18 +1993,19 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(2, (theirs2, cert2))]), keys[0], 1);
         let bus = ConsensusBus::new();
         let (metrics, snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
 
-        // the cursor stays before the walked epoch, so the next pass meets it again
+        // the cursor stays before the walked epoch, so the next pass meets it again (in a new
+        // collection: one collection holds a walk that did not land back for a retry interval)
         for _ in 0..2 {
+            let mut collection = Collection::new(WALK, &metrics);
             let collected =
                 collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
             assert_eq!(collected, CollectedPass { epoch: 0, definitive: true });
             let counted = counters(&snapshotter);
             assert_eq!(counted.get(PARENT_MISMATCHES), Some(&1));
             assert_eq!(counted.get(GAP_WALKS), Some(&0));
+            assert!(collection.gaps.is_empty());
         }
-        assert!(collection.gaps.is_empty());
         assert_eq!(chain.epochs().get_epoch_by_number(2).await, None);
         Ok(())
     }
@@ -2519,6 +2538,45 @@ mod tests {
             chain.epochs().get_epoch_by_number(1).await,
             Some((records[1].0.clone(), Some(records[1].1.clone())))
         );
+        Ok(())
+    }
+
+    /// A walk that does not land is not repeated on every wake-up: right after one, a pass from
+    /// the same epoch stops at the walked epoch as with the walk off, and the walk is tried again
+    /// once a retry interval has passed. Here no peer holds a certified record of epoch 1 (this
+    /// node's own, uncertified) or of epoch 2.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_walk_that_does_not_land_waits_a_retry_interval() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (_directory, chain, _records) = own_uncertified_epoch1(&fixture, 1).await?;
+        let peer = keys_and_signers(&fixture).0[0];
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let handle =
+            mock_changing_network(Default::default(), Default::default(), peer, requests_tx);
+        let bus = ConsensusBus::new();
+        let (metrics, _snapshotter) = local_metrics();
+        let mut collection = Collection::new(WALK, &metrics);
+        let stopped = CollectedPass { epoch: 0, definitive: true };
+
+        assert_eq!(
+            collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?,
+            stopped
+        );
+        expect_requests(&mut requests, &[1, 1, 1, 2, 2, 2]).await?;
+        assert_eq!(
+            collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?,
+            stopped
+        );
+        expect_requests(&mut requests, &[1, 1, 1]).await?;
+        assert!(requests.try_recv().is_err(), "the walk must wait a retry interval");
+
+        tokio::time::advance(Duration::from_secs(EPOCH_COLLECT_RETRY_SECS)).await;
+        assert_eq!(
+            collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?,
+            stopped
+        );
+        expect_requests(&mut requests, &[1, 1, 1, 2, 2, 2]).await?;
+        assert!(collection.gaps.is_empty());
         Ok(())
     }
 }
