@@ -857,7 +857,9 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
 
 Every format TN writes carries a version marker, and a binary refuses every version it does not
 read. A change to the bytes a marker covers bumps that marker; nothing else tells old bytes from
-new ones.
+new ones. A `db/tn-lmdb.dat` of a tn-lmdb format this build does not read (a development build's)
+is refused at the open, before anything changes ("unsupported format version"); `telcoin-network
+db reset-execution` moves it aside, and the next start rebuilds the execution database.
 
 | marker | covers | bump it when |
 |---|---|---|

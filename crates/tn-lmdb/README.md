@@ -131,10 +131,12 @@ recovery](#open-and-recovery)).
 Decoding (`Meta::decode`) runs its checks in this order:
 
 1. The magic must match, else `NotTnLmdb`.
-2. The version must be 7, else `UnsupportedVersion`. This runs before the CRC check, because
+2. The version must be 8, else `UnsupportedVersion`. This runs before the CRC check, because
    another version may lay the record out differently. The format is pre-release: a file of
-   version 1 to 6 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(6)`), with no
-   migration and never as damage. Version 3 added the nested cell (leaf cell flags 2) and the
+   version 1 to 7 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(7)`), with no
+   migration and never as damage. The error names the version found and the one this build
+   reads; the way out is the build that wrote the file, or a new database (on a node, `db
+   reset-execution` and a rebuild). Version 3 added the nested cell (leaf cell flags 2) and the
    96-byte catalog record. Version 4 changed the tree page's CRC to skip the page's free gap
    ([Tree pages](#tree-pages-pagers)), so a version-3 page's whole-page CRC would not check.
    Version 5 raised the leaf entry limit from `U / 4` to `U / 2` ([Limits](#limits)), so values
