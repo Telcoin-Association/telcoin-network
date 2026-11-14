@@ -426,11 +426,14 @@ pub fn config_observer(
 ///   genesis helpers wrote, right before they spawn the node (see
 ///   [`NodeOverrides::apply_parameters`] and [`merge_parameters_yaml`]). Every start rewrites the
 ///   file as the harness wrote it plus that start's entries, so a node restarted with other
-///   entries, or with none, does not keep an earlier start's. The harness knows none of the keys:
-///   the node's `Parameters` ignores a top-level key it does not know, so a test can name a switch
-///   whether or not the node under test reads it. The same holds for a misspelled key, or one the
-///   node reads from another file, so a test should check the setting took effect in the node
-///   itself (a log line or metric that reports it) rather than trust the merge.
+///   entries, or with none, does not keep an earlier start's. Once a start has merged entries, the
+///   harness's file is kept as `parameters.yaml.harness-base` and every later start rebuilds from
+///   it, so a test that edits a node's `parameters.yaml` directly between starts loses the edit;
+///   change a node's parameters between starts through its overrides instead. The harness knows
+///   none of the keys: the node's `Parameters` ignores a top-level key it does not know, so a test
+///   can name a switch whether or not the node under test reads it. The same holds for a misspelled
+///   key, or one the node reads from another file, so a test should check the setting took effect
+///   in the node itself (a log line or metric that reports it) rather than trust the merge.
 /// - `env` holds environment variables for the node's process only, set after the variables
 ///   [`TestBinary::command`] forwards, so an entry overrides a forwarded variable of the same name.
 ///   This is how a test arms the hooks in `tn_types::test_hooks` (for example
@@ -438,8 +441,12 @@ pub fn config_observer(
 ///   process instead: every node spawned afterwards would inherit it.
 ///
 /// A setting that changes what the chain computes, such as a `TN_*_FORK_EPOCH` variable or the
-/// `basefee_address` parameter, forks the fleet when only some nodes carry it. Give those to every
-/// node or to none, unless the divergence is what the test is about.
+/// `basefee_address` or `gc_depth` parameter, forks the fleet when only some nodes carry it. Give
+/// those to every node or to none, unless the divergence is what the test is about; a fork pin for
+/// the whole fleet belongs in the harness environment, which [`TestBinary::command`] forwards to
+/// every node. A node restarted through a start helper that takes no overrides gets neither its
+/// entries nor its variables back, so a node that carries such a setting is restarted with the
+/// same overrides.
 ///
 /// [`FleetOverrides`] assigns these per node across a fleet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -720,15 +727,20 @@ pub const E2E_PARAMETERS_VAR: &str = "TN_E2E_PARAMETERS";
 ///
 /// # Errors
 ///
-/// A value [`parse_e2e_parameters`] refuses, on this and every later call.
+/// A value that is not valid unicode, or one [`parse_e2e_parameters`] refuses, on this and every
+/// later call.
 pub fn e2e_parameters() -> eyre::Result<&'static [(String, String)]> {
     /// The parsed variable, or the parse error as text (a report is not `Sync`).
     static PARSED: OnceLock<Result<Vec<(String, String)>, String>> = OnceLock::new();
     let parsed = PARSED.get_or_init(|| {
-        // a non-unicode value is read lossily so it fails the parse rather than reading as unset
-        let raw = std::env::var_os(E2E_PARAMETERS_VAR)
-            .map(|raw| raw.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // a non-unicode value is refused: read lossily, a bad byte in a value would be applied
+        let raw = match std::env::var(E2E_PARAMETERS_VAR) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                return Err(format!("{E2E_PARAMETERS_VAR} is not valid unicode: {raw:?}"));
+            }
+        };
         let parsed = parse_e2e_parameters(&raw).map_err(|e| format!("{e:#}"))?;
         if !parsed.is_empty() {
             let applied =
