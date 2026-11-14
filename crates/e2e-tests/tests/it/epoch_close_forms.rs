@@ -28,8 +28,8 @@ use super::{
     common::{
         acquire_test_permit, address_from_word, call_rpc, current_epoch, epoch_seconds_remaining,
         get_block, get_block_number, get_node_info, kill_child, log_field, network_advancing,
-        node_log_lines, parse_hex_u64, scrape_metrics, start_validator_with_overrides,
-        EpochSnapshot, ProcessGuard,
+        node_log_lines, parse_hex_u64, scrape_metric_value, scrape_metrics,
+        start_validator_with_overrides, EpochSnapshot, ProcessGuard,
     },
     exec_block::{
         assert_switches, expected_switches, log_str_field, node_epoch, wait_for_epoch_on_all, Load,
@@ -46,6 +46,7 @@ use eyre::WrapErr as _;
 use jsonrpsee::rpc_params;
 use serde_json::{json, Value};
 use std::{
+    cell::Cell,
     collections::BTreeSet,
     path::PathBuf,
     process::Child,
@@ -113,6 +114,13 @@ const CLOSING_BLOCK_CHECKS: &str = "tn_epoch_epoch_record_closing_block_check_to
 /// The prometheus counter of the close-time base-fee identity check (canonical tip + 1 is the
 /// entered epoch's `blockHeight`), by `result` (`ok` or `mismatch`).
 const IDENTITY_CHECKS: &str = "tn_epoch_epoch_close_identity_check_total";
+
+/// The prometheus gauge of the highest epoch E for which a node holds a record and its certificate
+/// for every epoch `0..=E`, set by the record collector after each pass (at most 5 s apart).
+const CERTIFIED_THROUGH: &str = "tn_state_sync_epoch_records_certified_through";
+
+/// Time limit for every node's [`CERTIFIED_THROUGH`] to reach its last closed epoch.
+const CERTIFIED_THROUGH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Time limit for one node to serve a certified record once every node is past its epoch.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -309,7 +317,8 @@ fn test_missed_record_round_adaptive() -> eyre::Result<()> {
 /// member's own copy included, lacks the held member's signature; the held member reached its close
 /// with the certified record stored: it published record 0 as [`STORED_MATCHED`] (its replay guard
 /// compared the stored record with its own closing block without halting) and logged no vote of
-/// its own for it. No node logs a line of [`fork_logs`].
+/// its own for it. No node logs a line of [`fork_logs`]. At the end every node's
+/// [`CERTIFIED_THROUGH`] is its last closed epoch.
 fn held_member_two_closes(form: VoteForm) -> eyre::Result<()> {
     let _permit = acquire_test_permit();
     let test = format!("held_member_two_closes_{}", form.name());
@@ -429,9 +438,11 @@ fn check_held_member(
     fleet.assert_one_chain_logs()?;
     let checks =
         (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
+    let through = assert_certified_through(fleet)?;
 
     Ok(format!(
-        "held member {HELD_MEMBER} trailed the closing block {} of epoch 0 by {lag_outputs} outputs \
+        "certified through (gauge, registry epoch) per node {through:?}; held member {HELD_MEMBER} \
+         trailed the closing block {} of epoch 0 by {lag_outputs} outputs \
          ({lag_blocks} blocks); its close {held_close:?}; its checks before the release: \
          {held_checks}; record 0: {}; record 1 (after the release, held index {held_index}): {}; \
          checks at the end {checks:?}",
@@ -458,7 +469,8 @@ fn check_held_member(
 /// node has made that close. After it: at least one node logged the collector's re-vote of the
 /// record ([`REVOTE_LOG`]); the records of epochs 0 to [`MISSED_EPOCH`] + 1 meet every check of
 /// [`check_closed_epoch`] on every node; the next epoch committed outputs beyond its closing one;
-/// no node logs a line of [`fork_logs`].
+/// no node logs a line of [`fork_logs`]; every node's [`CERTIFIED_THROUGH`] is its last closed
+/// epoch.
 fn missed_record_round(form: VoteForm) -> eyre::Result<()> {
     let _permit = acquire_test_permit();
     let test = format!("missed_record_round_{}", form.name());
@@ -596,9 +608,11 @@ fn check_missed_round(
     fleet.assert_one_chain_logs()?;
     let checks =
         (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
+    let through = assert_certified_through(fleet)?;
 
     Ok(format!(
-        "checks at the end {checks:?}; the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
+        "certified through (gauge, registry epoch) per node {through:?}; checks at the end \
+         {checks:?}; the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
          {missed}; epoch {next} closed {:.0} s after the release with {outputs} outputs and \
          {blocks} blocks; nodes {revoted:?} re-voted record {missed}; records: {:?}",
         gave_up_after.as_secs_f64(),
@@ -939,6 +953,32 @@ fn assert_close_checks(fleet: &CloseFleet, node: usize) -> eyre::Result<String> 
         ok.push(passed);
     }
     Ok(format!("node {node}: closing-block ok {}, identity ok {}", ok[0], ok[1]))
+}
+
+/// Every node's [`CERTIFIED_THROUGH`] equals the last epoch its registry shows closed (the current
+/// epoch minus one), both read together, within [`CERTIFIED_THROUGH_TIMEOUT`]. Returns each node's
+/// last `(gauge, registry epoch)` reading.
+fn assert_certified_through(fleet: &CloseFleet) -> eyre::Result<Vec<(f64, u32)>> {
+    let mut readings = Vec::new();
+    for node in 0..4 {
+        let last = Cell::new((f64::NAN, 0));
+        wait_until_blocking(
+            CERTIFIED_THROUGH_TIMEOUT,
+            &format!("node {node}'s {CERTIFIED_THROUGH} is its last closed epoch"),
+            || {
+                let epoch = node_epoch(&fleet.urls[node])?;
+                let through = scrape_metric_value(&fleet.metrics[node], CERTIFIED_THROUGH)?;
+                last.set((through, epoch));
+                Ok(through == f64::from(epoch) - 1.0)
+            },
+        )
+        .wrap_err_with(|| {
+            let (through, epoch) = last.get();
+            format!("node {node}'s last reading: {CERTIFIED_THROUGH} {through} in epoch {epoch}")
+        })?;
+        readings.push(last.get());
+    }
+    Ok(readings)
 }
 
 /// The record matches the chain on `url`: its `final_state` is the block in which the registry's
