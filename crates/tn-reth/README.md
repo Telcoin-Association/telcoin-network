@@ -458,6 +458,14 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
   15 MB max request, 160 MB max response, 1024 subscriptions per connection, plus reth's default
   `eth_call` gas cap, no RPC transaction fee cap, tracing/filter/proof limits, and
   an eth-proof window.
+- **Blocking pool per worker** (`src/rpc_blocking.rs`): each worker's RPC server runs its
+  blocking work (state reads, calls, traces, log scans, cache misses) on a tokio runtime of its
+  own, not on the node's blocking pool that block execution uses, and not on another worker's.
+  A pool has 256 more threads than its server has blocking-IO permits (512 with reth's default
+  of 256), so permit holders never hold all of its threads and the blocking work they wait for
+  (cache misses, parallel log-scan chunks) gets one once a thread frees. A node with W workers can
+  run up to 512 × W RPC blocking threads; tokio starts them on demand and ends each after 10 s
+  idle.
 - The RPC stack is built over the worker's pool and the `WorkerNetwork` shim (`src/worker.rs`),
   which serves `net`/`web3` info from TN's libp2p peer count. No engine/auth namespace exists.
   A failure to merge the TN-specific RPC module is logged at `error!` but does not stop the
@@ -1521,6 +1529,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
 | `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected), the per-block stage timings, the epoch-close system-call gas gauges, and the `--forward-txs` submission counters. |
 | `src/payload.rs` | `TNPayload` and `BuildArguments`: consensus data shaped for execution. |
+| `src/rpc_blocking.rs` | `RpcBlockingPool` (one per worker RPC server) and `RpcTaskSpawner`, which sends RPC's blocking work to it. |
 | `src/rpc_server_args.rs` | RPC CLI argument subset and transport-limit defaults. |
 | `src/rpc_tx_forward.rs` | `EthSubmitForwarded`: the `--forward-txs` handlers for `eth_sendRawTransaction` and `eth_sendRawTransactionSync` (local precheck, forward, local receipt wait for the sync method). |
 | `src/rpc_tx_forward/target.rs` | `--forward-txs` parsing (`parse_forward_targets`), `ForwardTargets` (at most 8, deduplicated after normalization, redacted `Debug`) and `TxForwardConfig`. |
