@@ -19,7 +19,8 @@ use tn_storage::{
     epoch_records::{EpochDbError, EpochRecordValidation},
 };
 use tn_types::{
-    BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash, Epoch, Noticer, TaskError, TaskSpawner,
+    AuthorityIdentifier, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash, Epoch,
+    EpochCertificate, EpochRecord, Noticer, TaskError, TaskSpawner,
 };
 use tracing::{debug, error, info};
 
@@ -192,20 +193,53 @@ impl<'m> Collection<'m> {
     /// own previous record names (see [`tn_types::EpochRecord::committee_compatible`]). Everything
     /// else goes to [`stop_on_local_failure`]: our own store failing stops the node, a refusal is
     /// logged.
-    fn refused(&self, e: EpochDbError, epoch: Epoch, peer: BlsPublicKey) -> eyre::Result<()> {
+    ///
+    /// A conflict is logged at error with what an operator needs to look into it (see
+    /// [`ConflictEvidence`]): both digests, the peer that served the record (a relay, not
+    /// necessarily a signer), the certificate's signers as authority ids, how many signed out of
+    /// how many members of the committee the record before the epoch names, and the offered
+    /// record's epoch, parent and final execution state.
+    async fn refused(
+        &self,
+        e: EpochDbError,
+        epoch: Epoch,
+        peer: BlsPublicKey,
+        (record, cert): (&EpochRecord, &EpochCertificate),
+        consensus_chain: &ConsensusChain,
+    ) -> eyre::Result<()> {
         if let EpochDbError::ConflictingRecord { stored, offered, .. } = &e {
             self.metrics.epoch_record_conflicts_total.increment(1);
-            if self.switches.conflict_halt {
-                error!(
-                    target: "epoch-manager",
-                    epoch,
-                    %stored,
-                    %offered,
-                    %peer,
-                    "this node's epoch record differs from a certified record of the network: \
-                     this node has forked and stops; do not delete its chain data before the \
-                     cause is known",
-                );
+            let evidence = ConflictEvidence::read(epoch, record, cert, consensus_chain).await;
+            let signers = evidence.signer_ids.len();
+            let committee = evidence.committee;
+            let halt = self.switches.conflict_halt;
+            let text = if halt {
+                "this node's epoch record differs from a certified record of the network: this \
+                 node has forked and stops; do not delete its chain data before the cause is known"
+                    .to_string()
+            } else {
+                format!(
+                    "epoch record conflict: this node's stored record of epoch {epoch} differs \
+                     from a record certified by {signers} of the {committee} members of the \
+                     committee the record before it names; this node keeps its own record"
+                )
+            };
+            error!(
+                target: "epoch-manager",
+                epoch,
+                %stored,
+                %offered,
+                %peer,
+                signers,
+                committee,
+                signer_ids = %AuthorityIds(&evidence.signer_ids),
+                offered_epoch = record.epoch,
+                offered_parent = %record.parent_hash,
+                offered_final_number = record.final_state.number,
+                offered_final_hash = %record.final_state.hash,
+                "{text}",
+            );
+            if halt {
                 return Err(eyre::Report::new(e).wrap_err(format!(
                     "this node's record for epoch {epoch} differs from a certified record of the \
                      network: the node has forked; do not delete its chain data before the cause \
@@ -214,6 +248,68 @@ impl<'m> Collection<'m> {
             }
         }
         stop_on_local_failure(e, epoch)
+    }
+}
+
+/// What a conflicting certified record shows about who certified it, read from this node's store
+/// for the conflict's log line (see [`Collection::refused`]).
+struct ConflictEvidence {
+    /// The offered certificate's signers that belong to the committee the record before the epoch
+    /// names, as authority ids in the offered record's committee order.
+    signer_ids: Vec<AuthorityIdentifier>,
+    /// Size of that committee: the previous record's `next_committee`, the committee validation
+    /// anchors the epoch on (for epoch 0, the committee this node holds for epoch 0). Zero when
+    /// the read fails.
+    committee: usize,
+}
+
+impl ConflictEvidence {
+    /// Read the anchor committee of `epoch` as `EpochRecordDb::validate_downloaded_record` does
+    /// and count `cert`'s signers of `record` in it.
+    async fn read(
+        epoch: Epoch,
+        record: &EpochRecord,
+        cert: &EpochCertificate,
+        consensus_chain: &ConsensusChain,
+    ) -> Self {
+        let epochs = consensus_chain.epochs();
+        let anchor: BTreeSet<BlsPublicKey> = if epoch == 0 {
+            epochs.get_committee_keys(0).await
+        } else {
+            epochs
+                .record_by_epoch(epoch - 1)
+                .await
+                .map(|previous| previous.next_committee.into_iter().collect())
+        }
+        .unwrap_or_default();
+        // the bitmap iterates in ascending order, so the ids follow the committee order
+        let signer_ids = cert
+            .signed_authorities
+            .iter()
+            .filter_map(|index| record.committee.get(index as usize))
+            .filter(|key| anchor.contains(*key))
+            .map(|key| AuthorityIdentifier::from(*key))
+            .collect();
+        Self { signer_ids, committee: anchor.len() }
+    }
+}
+
+/// Log rendering of a list of authority ids: `[id1,id2]`, or `[]` when empty.
+///
+/// Comma-separated with no spaces and no quotes, so a `key=value` log parser that reads the value
+/// up to the next whitespace captures the whole list.
+struct AuthorityIds<'a>(&'a [AuthorityIdentifier]);
+
+impl std::fmt::Display for AuthorityIds<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        f.write_str("]")
     }
 }
 
@@ -563,8 +659,9 @@ async fn fetch_epoch_record(
             // Capture final_consensus before save consumes epoch_rec.
             let final_consensus = epoch_rec.final_consensus;
             let signers = cert.signed_authorities.len();
-            if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
-                collection.refused(e, epoch, peer)?;
+            // the pair stays at hand for a conflict's log line once save consumes it
+            if let Err(e) = consensus_chain.epochs().save(epoch_rec.clone(), cert.clone()).await {
+                collection.refused(e, epoch, peer, (&epoch_rec, &cert), consensus_chain).await?;
                 return Ok(Fetched::Refused { parent_mismatch: false });
             }
             consensus_bus.set_certified_record_epoch_if_newer(epoch);
@@ -588,6 +685,7 @@ async fn fetch_epoch_record(
                 ?parents_match,
                 ?committee_valid,
                 ?cert_valid,
+                %peer,
                 "got an invalid epoch record, epoch {epoch}",
             );
             Ok(Fetched::Refused { parent_mismatch: !parents_match })
@@ -1264,9 +1362,9 @@ mod tests {
 
     // ---- bench7 epoch-record-collector-hardening ----
 
-    /// Records every `epoch-manager` info line as `message key=value ...` on the thread it is
-    /// installed on with [`tracing::subscriber::set_default`].
-    struct EpochManagerInfoLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+    /// Records every `epoch-manager` info and error line as `message key=value ...` on the thread
+    /// it is installed on with [`tracing::subscriber::set_default`].
+    struct EpochManagerLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
 
     /// Collects an event's message and its other fields, in the order the event records them.
     #[derive(Default)]
@@ -1285,9 +1383,10 @@ mod tests {
         }
     }
 
-    impl tracing::Subscriber for EpochManagerInfoLines {
+    impl tracing::Subscriber for EpochManagerLines {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == "epoch-manager" && *metadata.level() == tracing::Level::INFO
+            metadata.target() == "epoch-manager"
+                && [tracing::Level::INFO, tracing::Level::ERROR].contains(metadata.level())
         }
 
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1355,7 +1454,7 @@ mod tests {
         let bus = ConsensusBus::new();
 
         let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let _log_guard = tracing::subscriber::set_default(EpochManagerInfoLines(lines.clone()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
         collect_epoch_records(0, &chain, &handle, bus.app(), &mut walk_off()).await?;
 
         let lines = lines.lock().clone();
@@ -1664,7 +1763,7 @@ mod tests {
         let mut collection = Collection::new(WALK, &metrics);
 
         let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let _log_guard = tracing::subscriber::set_default(EpochManagerInfoLines(lines.clone()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
         let collected =
             collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
         assert_eq!(collected, CollectedPass { epoch: 3, definitive: true });
@@ -2072,6 +2171,80 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The `epoch-manager` lines recorded while `run` runs on this thread.
+    async fn lines_of<T>(run: impl Future<Output = T>) -> (T, Vec<String>) {
+        let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let output = run.await;
+        let lines = lines.lock().clone();
+        (output, lines)
+    }
+
+    /// A conflict's line, with the halt on and off, carries what an operator needs to look into
+    /// it: both digests, the serving peer, the certificate's signers as authority ids, how many of
+    /// the members of the committee the record before it names signed, and the offered record's
+    /// epoch, parent and final execution state. A refused invalid record's line names the peer.
+    #[tokio::test]
+    async fn test_conflict_and_invalid_record_lines_carry_the_evidence() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (keys, signers) = keys_and_signers(&fixture);
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 1).await?;
+        let mut theirs = records[1].0.clone();
+        theirs.final_state.number = 7;
+        let cert = make_cert(&theirs, &signers, &[0, 1, 3]);
+        // a peer that is not a signer: the line must not name the relay as one
+        let peer = keys[2];
+        let handle =
+            mock_epoch_record_network(HashMap::from([(1, (theirs.clone(), cert))]), peer, 1);
+        let bus = ConsensusBus::new();
+        let (metrics, _snapshotter) = local_metrics();
+
+        let mut conflict_lines = Vec::new();
+        for switches in [EpochRecordCollectSwitches::default(), HALT] {
+            let mut collection = Collection::new(switches, &metrics);
+            let (collected, lines) =
+                lines_of(collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection))
+                    .await;
+            assert_eq!(collected.is_err(), switches.conflict_halt, "{switches:?}");
+            conflict_lines.extend(lines.into_iter().filter(|line| line.contains(" signer_ids=")));
+        }
+        assert_eq!(conflict_lines.len(), 2, "{conflict_lines:?}");
+        let ids: Vec<String> =
+            [0, 1, 3].iter().map(|i| AuthorityIdentifier::from(keys[*i]).to_string()).collect();
+        let fields = [
+            " epoch=1".to_string(),
+            format!(" stored={}", records[1].0.digest()),
+            format!(" offered={}", theirs.digest()),
+            format!(" peer={peer}"),
+            " signers=3".to_string(),
+            " committee=4".to_string(),
+            format!(" signer_ids=[{}]", ids.join(",")),
+            " offered_epoch=1".to_string(),
+            format!(" offered_parent={}", theirs.parent_hash),
+            " offered_final_number=7".to_string(),
+            format!(" offered_final_hash={}", theirs.final_state.hash),
+        ];
+        for line in &conflict_lines {
+            for field in &fields {
+                assert!(line.contains(field.as_str()), "{field} missing in {line}");
+            }
+        }
+
+        // two signers of four: the certificate fails validation
+        let short = make_cert(&theirs, &signers, &[0, 1]);
+        let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, short))]), peer, 1);
+        let mut collection = walk_off();
+        let (collected, lines) =
+            lines_of(collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection)).await;
+        assert_eq!(collected?, CollectedPass { epoch: 0, definitive: true });
+        let invalid = lines
+            .iter()
+            .find(|line| line.starts_with("got an invalid epoch record, epoch 1"))
+            .ok_or_else(|| eyre::eyre!("no invalid-record line in {lines:?}"))?;
+        assert!(invalid.contains(&format!(" peer={peer}")), "{invalid}");
         Ok(())
     }
 }
