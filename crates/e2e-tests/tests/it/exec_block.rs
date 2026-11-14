@@ -749,7 +749,7 @@ fn duration_nanos(text: &str) -> Option<u128> {
 }
 
 /// The value of the `name=value` field of a plain log line, without the quotes of a string field.
-fn log_str_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn log_str_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
         .map(|value| value.trim_matches('"'))
