@@ -78,12 +78,63 @@ async fn save_and_persist_with_logs(
     })
 }
 
+/// Aggregate `sigs`, signed by the committee members in `signed_authorities`, into a certificate
+/// for `epoch_rec`, verify it against the record, and save and persist it.
+///
+/// A failed aggregate or verify is logged and returns [`Certify::Invalid`]; a save the store
+/// refuses for a reason other than a local failure is logged and returns [`Certify::Refused`].
+/// Returns `Err` only when our own epoch store fails to save or persist (see
+/// `EpochDbError::stop_on_local_failure`).
+async fn certify_record(
+    epoch_rec: &EpochRecord,
+    epoch_hash: EpochDigest,
+    sigs: &[BlsSignature],
+    signed_authorities: roaring::RoaringBitmap,
+    consensus_chain: &ConsensusChain,
+) -> eyre::Result<Certify> {
+    let Ok(aggregated_signature) = BlsAggregateSignature::aggregate(sigs, true) else {
+        error!(
+            target: "epoch-manager",
+            "failed to aggregate epoch record signatures for {epoch_hash}",
+        );
+        return Ok(Certify::Invalid);
+    };
+    let signature: BlsSignature = aggregated_signature.to_signature();
+    let cert = EpochCertificate { epoch_hash, signature, signed_authorities };
+    if !epoch_rec.verify_with_cert(&cert) {
+        error!(
+            target: "epoch-manager",
+            "failed to verify epoch record and cert for {epoch_hash}",
+        );
+        return Ok(Certify::Invalid);
+    }
+    let epoch = epoch_rec.epoch;
+    let saved = match consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await {
+        Ok(()) => Certify::Stored,
+        Err(e) => {
+            e.stop_on_local_failure(format!(
+                "failed to save epoch cert after reaching quorum {epoch}"
+            ))?;
+            Certify::Refused
+        }
+    };
+    // A persist writes only our own files, so any failure is local.
+    consensus_chain
+        .epochs()
+        .persist()
+        .await
+        .wrap_err_with(|| format!("failed to persist epoch cert after reaching quorum {epoch}"))?;
+    Ok(saved)
+}
+
 /// Collect and manage votes for a specific epoch record.
 ///
 /// With `retained` (the switch `epoch_record_recertify` on), the round starts from the signatures
-/// earlier rounds for the same record counted and adds each vote it counts to them; once the
-/// record is certified the kept signatures for its epoch are dropped. Without it the round starts
-/// empty and keeps nothing.
+/// earlier rounds for the same record kept and adds each vote it counts to them; once the record
+/// is certified the kept signatures for its epoch are dropped. A round that ends without a
+/// certificate also keeps the votes left in its channel and, when the signatures kept for the
+/// record reach its quorum (with votes other rounds kept), aggregates them and stores the
+/// certificate. Without it the round starts empty and keeps nothing.
 ///
 /// A round whose vote windows run out short of a quorum asks peers for the epoch's certified
 /// record. When the record a peer returns validates against the committee this node trusts for
@@ -125,11 +176,13 @@ async fn manage_epoch_votes(
     let quorum = epoch_rec.super_quorum();
     // set once a certificate for this record is stored or found stored
     let mut certified = false;
+    // set when this round's peer recovery validated a certified record that differs from ours
+    let mut conflict = false;
     // a round of a record older than the previous one leaves the signer gauge to the rounds of
     // the latest record and the failsafe, whoever started it
     let kind = retained.as_ref().map_or(RoundKind::Current, |r| r.round_kind(epoch_rec.epoch));
     if let Some(retained) = &retained {
-        // the kept signatures were counted for this same record (same digest, so same committee),
+        // the kept signatures were kept for this same record (same digest, so same committee),
         // under the committee indices this round assigns
         for (index, signature) in retained.signatures(epoch_rec.epoch, epoch_hash) {
             let Some(key) = epoch_rec.committee.get(index as usize) else { continue };
@@ -239,41 +292,13 @@ async fn manage_epoch_votes(
                 record_missing_signers(&epoch_rec.committee, &committee_keys, kind)
             }
         }
-        match BlsAggregateSignature::aggregate(&sigs[..], true) {
-            Ok(aggregated_signature) => {
-                let signature: BlsSignature = aggregated_signature.to_signature();
-                let cert = EpochCertificate { epoch_hash, signature, signed_authorities };
-                if epoch_rec.verify_with_cert(&cert) {
-                    let epoch = epoch_rec.epoch;
-                    if let Err(e) =
-                        consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await
-                    {
-                        e.stop_on_local_failure(format!(
-                            "failed to save epoch cert after reaching quorum {epoch}"
-                        ))?;
-                    } else {
-                        certified = true;
-                    }
-                    // A persist writes only our own files, so any failure is local.
-                    consensus_chain.epochs().persist().await.wrap_err_with(|| {
-                        format!("failed to persist epoch cert after reaching quorum {epoch}")
-                    })?;
-                } else {
-                    error!(
-                        target: "epoch-manager",
-                        "failed to verify epoch record and cert for {epoch_hash}",
-                    );
-                    // a kept signature that does not verify would fail every later round too
-                    if let Some(retained) = &retained {
-                        retained.forget_record(epoch_rec.epoch, epoch_hash);
-                    }
-                }
-            }
-            Err(_) => {
-                error!(
-                    target: "epoch-manager",
-                    "failed to aggregate epoch record signatures for {epoch_hash}",
-                );
+        match certify_record(&epoch_rec, epoch_hash, &sigs, signed_authorities, &consensus_chain)
+            .await?
+        {
+            Certify::Stored => certified = true,
+            Certify::Refused => {}
+            Certify::Invalid => {
+                // a kept signature that does not verify would fail every later round too
                 if let Some(retained) = &retained {
                     retained.forget_record(epoch_rec.epoch, epoch_hash);
                 }
@@ -372,6 +397,7 @@ async fn manage_epoch_votes(
                             {
                                 let new_epoch_hash = new_epoch_rec.digest();
                                 if new_epoch_hash != epoch_hash {
+                                    conflict = true;
                                     error!(
                                         target: "epoch-manager",
                                         "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
@@ -432,6 +458,45 @@ async fn manage_epoch_votes(
                 }
                 if let Some(idx) = committee_index.get(&vote.public_key) {
                     retained.keep(epoch_rec.epoch, epoch_hash, *idx as u32, vote.signature);
+                }
+            }
+            // the drain can complete a quorum, and so can the votes another round for the same
+            // record kept: aggregate them now rather than wait for another vote for the epoch,
+            // unless the record conflicts with the network's certified one or the node stops
+            if !conflict && !shutdown.noticed() {
+                if let Some(kept) = retained.take_quorum(epoch_rec.epoch, epoch_hash, quorum) {
+                    let mut kept_signers = roaring::RoaringBitmap::new();
+                    let mut kept_sigs = Vec::with_capacity(kept.len());
+                    for (index, signature) in kept {
+                        if (index as usize) < epoch_rec.committee.len()
+                            && kept_signers.insert(index)
+                        {
+                            kept_sigs.push(signature);
+                        }
+                    }
+                    let kept_count = kept_signers.len();
+                    let outcome = certify_record(
+                        &epoch_rec,
+                        epoch_hash,
+                        &kept_sigs,
+                        kept_signers,
+                        &consensus_chain,
+                    )
+                    .await?;
+                    if matches!(outcome, Certify::Stored) {
+                        certified = true;
+                        info!(
+                            target: "epoch-manager",
+                            epoch = epoch_rec.epoch,
+                            digest = %epoch_hash,
+                            signers = kept_count,
+                            "epoch record certified from kept votes",
+                        );
+                        retained.forget_epoch(epoch_rec.epoch);
+                        if kind == RoundKind::Current {
+                            record_epoch_record_signers(kept_count);
+                        }
+                    }
                 }
             }
         }
@@ -840,12 +905,16 @@ async fn recertify_older_record(
 /// Signatures are kept per record, keyed by its epoch and digest, and within a record by the
 /// signer's index in that record's committee: the index [`manage_epoch_votes`] sets in the
 /// certificate's `signed_authorities`. A round for a record starts from the signatures earlier
-/// rounds for the same record counted, so votes that reached this node in rounds that never
-/// overlapped add up to a quorum. A signature is kept only once a round counted it, that is a
-/// vote for this node's own record of that epoch from a member of the record's committee, whose
-/// signature the primary's vote handler verified (or this node's own vote). The certificate a
-/// round builds from kept signatures is the one a single round with the same votes builds: the
-/// aggregate is a sum and the signer set is a bitmap of committee indices.
+/// rounds for the same record kept, so votes that reached this node in rounds that never
+/// overlapped add up to a quorum. A round keeps a signature when it counts the vote, and, when it
+/// ends without a certificate, the votes still in its channel (they reached it during its peer
+/// recovery, and the handler drops their repeats): either way a vote for this node's own record of
+/// that epoch, with that record's digest, from a member of the record's committee, whose
+/// signature the primary's vote handler verified (or this node's own vote). A round that ends
+/// without a certificate aggregates the signatures kept for its record once they reach the
+/// record's quorum, and the aggregate is saved only when it verifies against the record. The
+/// certificate a round builds from kept signatures is the one a single round with the same votes
+/// builds: the aggregate is a sum and the signer set is a bitmap of committee indices.
 ///
 /// Bounds: signatures of at most [`MAX_RETAINED_RECORDS`] records, at most one per committee
 /// member each. An epoch's signatures are dropped when a round stores or finds its certificate,
@@ -890,6 +959,24 @@ impl RetainedEpochVotes {
         }
         inner.votes.entry(key).or_default().insert(index, signature);
         inner.report();
+    }
+
+    /// Take the signatures kept for the record `(epoch, digest)` out when there are at least
+    /// `quorum` of them, so that one round aggregates them and every other finds them gone.
+    fn take_quorum(
+        &self,
+        epoch: Epoch,
+        digest: EpochDigest,
+        quorum: usize,
+    ) -> Option<BTreeMap<u32, BlsSignature>> {
+        let mut inner = self.inner.lock();
+        let key = (epoch, digest);
+        if inner.votes.get(&key).is_none_or(|kept| kept.len() < quorum) {
+            return None;
+        }
+        let kept = inner.votes.remove(&key);
+        inner.report();
+        kept
     }
 
     /// Drop every signature kept for `epoch`: its certificate is stored.
@@ -1004,6 +1091,17 @@ impl RoundKind {
             Self::Recertify => "recertify",
         }
     }
+}
+
+/// What [`certify_record`] did with a set of signatures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Certify {
+    /// The certificate is stored.
+    Stored,
+    /// The store refused the certificate for a reason other than a local failure (logged).
+    Refused,
+    /// The signatures did not aggregate, or the aggregate did not verify (logged).
+    Invalid,
 }
 
 /// Log rendering of a list of authority ids: `[id1,id2]`, or `[]` when empty.
@@ -4404,5 +4502,129 @@ mod epoch_vote_collector_tests {
                 round.lines
             );
         }
+    }
+
+    /// Run a round for `record` as member 0 against `retained` that counts the votes sent on
+    /// `vote_tx`'s channel. The sender is held until the round ends, so a round short of quorum
+    /// times out into a recovery the quiet network leaves unanswered and ends short.
+    async fn held_round(
+        record: &EpochRecord,
+        me: &KeyConfig,
+        chain: &ConsensusChain,
+        network: &PrimaryNetworkHandle,
+        retained: &RetainedEpochVotes,
+        vote_tx: Sender<EpochVote>,
+        vote_rx: Receiver<EpochVote>,
+    ) {
+        manage_epoch_votes(
+            record.clone(),
+            me.clone(),
+            network.clone(),
+            vote_rx,
+            chain.clone(),
+            ShutdownNotifier::new(),
+            Some(retained.clone()),
+        )
+        .await
+        .expect("no local store failure");
+        drop(vote_tx);
+    }
+
+    /// V11: two rounds for one record run at the same time and each ends short (two votes and
+    /// one, quorum three), while the votes they kept together are a quorum. The first round to
+    /// end aggregates the kept signatures and stores the certificate; the second finds them
+    /// taken.
+    #[tokio::test(start_paused = true)]
+    async fn test_kept_quorum_of_two_short_rounds_is_aggregated() {
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let (committee, keys) = four_keys();
+        let (_dir, chain, record) = record_chain("kept_quorum_two_rounds", &committee).await;
+        let epoch_hash = record.digest();
+        let (network, _published) = spawn_quiet_network();
+        let retained = RetainedEpochVotes::default();
+        let (a_tx, a_rx) = mpsc::channel::<EpochVote>(10);
+        let (b_tx, b_rx) = mpsc::channel::<EpochVote>(10);
+        let (send_a, send_b) = (a_tx.clone(), b_tx.clone());
+
+        // no outer virtual-time timeout: the rounds read the store
+        tokio::join!(
+            held_round(&record, &keys[0], &chain, &network, &retained, a_tx, a_rx),
+            held_round(&record, &keys[0], &chain, &network, &retained, b_tx, b_rx),
+            async {
+                // both rounds have started, each from nothing kept, before a vote arrives
+                tokio::task::yield_now().await;
+                for voter in [0, 1] {
+                    send_a.send(record.sign_vote(&keys[voter])).await.unwrap();
+                }
+                send_b.send(record.sign_vote(&keys[2])).await.unwrap();
+            },
+        );
+
+        let cert = chain.epochs().cert_by_digest(epoch_hash).await.expect("the kept quorum");
+        assert!(record.verify_with_cert(&cert));
+        assert_eq!(cert.signed_authorities.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(retained.signatures(1, epoch_hash).is_empty(), "kept signatures dropped");
+        let certified: Vec<String> = lines
+            .lock()
+            .iter()
+            .filter(|line| line.starts_with("INFO epoch record certified from kept votes"))
+            .cloned()
+            .collect();
+        assert_eq!(certified.len(), 1, "one round aggregates: {certified:?}");
+        assert!(certified[0].contains(" epoch=1") && certified[0].contains(" signers=3"));
+    }
+
+    /// V11's single-round form: the vote that reaches a round during its peer recovery completes
+    /// the quorum with the two the round counted, and the round stores the certificate when it
+    /// ends instead of keeping the three signatures for a later vote.
+    #[tokio::test(start_paused = true)]
+    async fn test_vote_drained_after_recovery_completes_the_quorum() {
+        let (committee, keys) = four_keys();
+        let (_dir, chain, record) = record_chain("kept_quorum_drain", &committee).await;
+        let epoch_hash = record.digest();
+        let late_vote = record.sign_vote(&keys[2]);
+        let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        for voter in [0, 1] {
+            vote_tx.send(record.sign_vote(&keys[voter])).await.unwrap();
+        }
+        // the mock answers no recovery request; its first one sends the late vote
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            let mut late = Some(late_vote);
+            while let Some(cmd) = net_rx.recv().await {
+                match cmd {
+                    NetworkCommand::SendRequestAny { .. } => {
+                        if let Some(vote) = late.take() {
+                            vote_tx.send(vote).await.unwrap();
+                        }
+                    }
+                    NetworkCommand::Publish { reply, .. } => {
+                        let _ = reply.send(Ok(MessageId::new(b"test")));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let retained = RetainedEpochVotes::default();
+
+        manage_epoch_votes(
+            record.clone(),
+            keys[0].clone(),
+            network,
+            vote_rx,
+            chain.clone(),
+            ShutdownNotifier::new(),
+            Some(retained.clone()),
+        )
+        .await
+        .expect("no local store failure");
+
+        let cert = chain.epochs().cert_by_digest(epoch_hash).await.expect("certified");
+        assert!(record.verify_with_cert(&cert));
+        assert_eq!(cert.signed_authorities.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(retained.signatures(1, epoch_hash).is_empty());
     }
 }
