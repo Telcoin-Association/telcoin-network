@@ -1259,10 +1259,12 @@ because the copied execution database replaces the rebuild.
   compare for epochs up to 160). A record the node builds at a close gets the same check before it
   is saved, voted on or published. A block that fails logs `epoch record final_state is not the
   block where the epoch-closing calls ran, stopping the node` with the failed comparison as
-  `check`, and stops the node. Every check counts in
-  `tn_epoch_epoch_record_closing_block_check_total{result}` (`ok`, `beacon_root`, `nonce_epoch`,
-  `extra_data_length` or `extra_data_seed`), and every record the node publishes as its own logs
-  `epoch record published` with its `final_state`, `final_consensus`, `digest` and `branch`.
+  `check`, where it was checked as `path` (`built`, `rederived`, `stored` or `entry`) and what the
+  stop prevents as `reason`, and stops the node. Every check counts in
+  `tn_epoch_epoch_record_closing_block_check_total{result}` (`ok`, `no_block`, `beacon_root`,
+  `nonce_epoch`, `extra_data_length` or `extra_data_seed`), and every record the node publishes as
+  its own logs `epoch record published` with its `final_state`, `final_consensus`, `digest` and
+  `branch`.
   Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
   `restored-state-floor` beside a full consensus database (one copied in with a restored
   observer's execution database by the swap below) moves aside with the execution database, so the

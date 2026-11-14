@@ -58,13 +58,14 @@ impl EpochMetrics {
     }
 
     /// Record one run of the closing-block check on an epoch record's `final_state`, labelled
-    /// `ok` or with the static name of the comparison that failed.
+    /// `ok` or with the static name of what failed: `no_block` (nothing executed), `beacon_root`,
+    /// `nonce_epoch`, `extra_data_length` or `extra_data_seed`.
     ///
-    /// Counted on every path the check runs: the record build at the close, a stored record
-    /// reused at the close, and the previous epoch's record at every epoch entry. A close that
-    /// finds this node's own uncertified record 0 checks it as a stored record and then builds it
-    /// again, so that close counts twice. Anything but `ok` stops the node. An associated
-    /// function for the same reason as
+    /// Counted on every path the check runs: the record build at the close, the re-derive of a
+    /// record a kill left unwritten, a stored record reused at the close, and the previous
+    /// epoch's record at every epoch entry. A close that finds this node's own uncertified record
+    /// 0 checks it as a stored record and then builds it again, so that close counts twice.
+    /// Anything but `ok` stops the node. An associated function for the same reason as
     /// [`Self::record_provider_fault_retry`]: the check is a free function.
     pub(crate) fn record_closing_block_check(result: &'static str) {
         metrics::counter!("tn_epoch.epoch_record_closing_block_check_total", "result" => result)
