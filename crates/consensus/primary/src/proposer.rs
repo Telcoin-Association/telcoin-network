@@ -1668,8 +1668,10 @@ impl ExecBasis {
 /// counting it would make every return to the tip fail at the configured window's rate (about one
 /// probe and two lost headers every `K + 2` headers) while the proposer stays ahead.
 ///
-/// Every input is the proposer's own history (the rounds of the headers it built, and the cancel
-/// and certificate reports for them), never a clock.
+/// Every input comes from the proposer itself, never from a clock: the rounds of the headers it
+/// built, the cancel and certificate reports for them, and its round when a cancel arrives (which
+/// parents of a later round can move up between two headers; only where a new run starts depends
+/// on it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecBlockPolicy {
     /// `quorum_exec_block`.
@@ -1934,13 +1936,13 @@ pub(crate) struct ExecBlockChoice {
 /// - the quorum value is capped at the own tip: a higher block is one this node cannot vouch for,
 ///   and letting f Byzantine parents pick it would bring the starvation back. Below the cap, f
 ///   faulty parents that name high blocks still lift the value past what the honest parents
-///   reached, and if they then withhold their votes, a header under the rule can miss the votes
-///   of honest members that have not executed the lifted block and be cancelled. That costs the
-///   rule's gain, not more: every voter that holds the own tip holds the choice, so a header under
-///   the rule certifies whenever the same header naming the tip would have;
+///   reached, and if they then withhold their votes, a header under the rule can miss the votes of
+///   honest members that have not executed the lifted block and be cancelled. That costs the rule's
+///   gain, not more: every voter that holds the own tip holds the choice, so a header under the
+///   rule certifies whenever the same header naming the tip would have;
 /// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
-///   oldest entry of a shorter ring). Entries count outputs that produced a block, so the floor
-///   has no bound in time (the constant's doc says what that delays);
+///   oldest entry of a shorter ring). Entries count outputs that produced a block, so the floor has
+///   no bound in time (the constant's doc says what that delays);
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
 ///   always this node's own execution, never a parent's hash;
 /// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
@@ -1953,10 +1955,11 @@ pub(crate) struct ExecBlockChoice {
 ///   state export is taken at an epoch's closing block; an export taken inside an epoch would need
 ///   a bound in blocks below the own tip as well;
 /// - a final bound names the opening block itself (`exec_basis=floor`) if the choice still fell
-///   below it. On an honest node it never fires, and a debug assertion says so: the choice is at
-///   or above the opening block as long as the ring's numbers rise in push order and the proposer
-///   starts the epoch only after executing the previous epoch's closing block. The bound keeps the
-///   guarantee when either fails.
+///   below it, so the guarantee no longer rests on the ring's numbers rising in push order. On an
+///   honest node it never fires, and a debug assertion says so. It cannot cover a proposer that
+///   starts the epoch before executing the previous epoch's closing block: that block is not in its
+///   ring yet, its own tip stands in for it, and the rule names that tip, as the switch-off form
+///   does.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.
