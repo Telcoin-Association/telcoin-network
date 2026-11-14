@@ -606,7 +606,8 @@ where
     /// 3. Clear the epoch-scoped DB tables when a boundary was crossed.
     /// 4. Check the consensus DB's stores still make writes durable (`ensure_stores_durable`).
     ///
-    /// Each failure is this node's own storage failing, so it is returned and stops the node.
+    /// Each failure (this node's own storage failing, or a gap in the drain) is returned and stops
+    /// the node.
     #[allow(clippy::too_many_arguments)]
     async fn finish_epoch(
         &mut self,
@@ -705,8 +706,10 @@ where
     ///
     /// Waits for room in `to_engine`, then hands the output over with [`Self::forward_output`].
     /// Used by the restart replay and the leftover drain, which hold their output before they
-    /// call this and are not raced against another future; the live path takes room first and
-    /// the output second ([`Self::wait_for_epoch_boundary`]).
+    /// call this and are cancelled only with the whole epoch loop, when the node exits (the
+    /// restart then replays the output from the consensus DB). The live path, which the epoch's
+    /// other exits can cancel, takes room first and the output second
+    /// ([`Self::wait_for_epoch_boundary`]).
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -725,10 +728,11 @@ where
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
     /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
     /// [`evict_committed_batches`]), then the output is stamped with `forwarded_at`
-    /// (`ConsensusOutput::set_forwarded_at`, observability only: the instant the forwarder began
-    /// to wait for room for it) and sent. `last_forwarded_consensus_number` moves with the send,
-    /// so the restart-replay and leftover-drain paths can rely on it marking what actually reached
-    /// the engine rather than what was merely dequeued.
+    /// (`ConsensusOutput::set_forwarded_at`, observability only: when the forwarder began to wait
+    /// for room for it, see [`Self::wait_for_epoch_boundary`] for the live path) and sent.
+    /// `last_forwarded_consensus_number` moves with the send, so the restart-replay and
+    /// leftover-drain paths can rely on it marking what actually reached the engine rather than
+    /// what was merely dequeued.
     ///
     /// Nothing here awaits: a caller that reserved `permit` before taking `output` off its source
     /// holds the output across no await point, so a cancelled caller never drops one.
@@ -777,8 +781,10 @@ where
         loop {
             let waiting_since = Instant::now();
             let permit = to_engine.reserve().await?;
-            // an output queued before the room came has waited since `waiting_since`, as it did
-            // in the send it used to wait in; one that arrives later is stamped on arrival
+            // the forward-wait stamp: an output found queued once there is room is stamped
+            // `waiting_since`, exact for one that was queued before the wait began (the usual
+            // case under backpressure) and an upper bound for one that arrived during it; an
+            // output that arrives after the room is stamped on arrival
             let (mut output, forwarded_at) = match consensus_output.try_recv() {
                 Ok(output) => (output, waiting_since),
                 Err(_) => match consensus_output.recv().await {
@@ -3264,6 +3270,17 @@ pub(super) mod tests {
     async fn forward_then_exit_then_drain(
         exit: impl Future<Output = ()>,
     ) -> eyre::Result<(Vec<u64>, u64)> {
+        exit_while_the_forward_waits(exit, false).await
+    }
+
+    /// [`forward_then_exit_then_drain`], or with `for_output` the other wait of the forward: the
+    /// engine channel has room for one more output, the queue is empty, and `exit` wins while
+    /// the forward holds its reserved room and waits for an output; outputs 2 and 3 are queued
+    /// after the exit, before the drain.
+    async fn exit_while_the_forward_waits(
+        exit: impl Future<Output = ()>,
+        for_output: bool,
+    ) -> eyre::Result<(Vec<u64>, u64)> {
         let temp = TempDir::with_prefix("forward_preempted")?;
         let (mut manager, _engine, _reth_env, _tasks, committee) =
             manager_with_engine(&temp).await?;
@@ -3273,11 +3290,13 @@ pub(super) mod tests {
         for output in &outputs {
             manager.consensus_chain.save_consensus_output(output.clone()).await?;
         }
-        let (to_engine, mut engine_rx) = mpsc::channel(1);
+        let (to_engine, mut engine_rx) = mpsc::channel(if for_output { 2 } else { 1 });
         manager.process_output(&to_engine, outputs[0].clone()).await?;
         let (queue_tx, mut queue) = mpsc::channel(8);
-        for output in &outputs[1..] {
-            queue_tx.send(output.clone()).await?;
+        if !for_output {
+            for output in &outputs[1..] {
+                queue_tx.send(output.clone()).await?;
+            }
         }
 
         tokio::select! {
@@ -3286,6 +3305,11 @@ pub(super) mod tests {
                 eyre::bail!("the forward ended before the exit: {res:?}");
             }
             _ = exit => {}
+        }
+        if for_output {
+            for output in &outputs[1..] {
+                queue_tx.send(output.clone()).await?;
+            }
         }
 
         // the engine pulls everything forwarded until the drain is over
@@ -3334,6 +3358,25 @@ pub(super) mod tests {
         node_shutdown.notify();
         let (received, last_forwarded) =
             forward_then_exit_then_drain(node_shutdown.subscribe()).await?;
+        assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    /// A mode change landing while the forward holds room in the engine channel and waits for
+    /// the next output: the room is released, and the outputs queued after it reach the engine
+    /// through the drain, in order.
+    #[tokio::test]
+    async fn a_mode_change_while_the_forward_waits_for_output_loses_no_output() -> eyre::Result<()>
+    {
+        let consensus_shutdown = ShutdownNotifier::new();
+        consensus_shutdown.notify();
+        let mut epoch_tasks = TaskManager::new(EPOCH_TASK_MANAGER);
+        let exit = async move {
+            let ended = epoch_tasks.until_task_ends(consensus_shutdown.clone()).await;
+            epoch_tasks_ended(ended, &ShutdownNotifier::new()).expect("a mode change, not a stop");
+        };
+        let (received, last_forwarded) = exit_while_the_forward_waits(exit, true).await?;
         assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
         assert_eq!(last_forwarded, 3);
         Ok(())
