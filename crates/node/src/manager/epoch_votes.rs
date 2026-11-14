@@ -208,6 +208,9 @@ async fn manage_epoch_votes(
     // signers when the round ended; members still in `committee_keys` had not voted by then
     let signers = signed_authorities.len();
     let missing = missing_signers(&epoch_rec.committee, &committee_keys);
+    // the round for an older record this node picked to re-certify leaves the signer gauge to
+    // the rounds of the latest record and the failsafe
+    let recertify_round = retained.as_ref().is_some_and(|r| r.is_recertifying(epoch_rec.epoch));
 
     // Aggregate signatures and save the cert
     if reached_quorum {
@@ -221,7 +224,11 @@ async fn manage_epoch_votes(
             %epoch_hash,
             "epoch record quorum"
         );
-        record_epoch_record_quorum(&epoch_rec.committee, &committee_keys, signers);
+        if recertify_round {
+            record_missing_signers(&epoch_rec.committee, &committee_keys);
+        } else {
+            record_epoch_record_quorum(&epoch_rec.committee, &committee_keys, signers);
+        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -298,7 +305,9 @@ async fn manage_epoch_votes(
                 "epoch vote round ended without a local quorum; the record is already certified",
             );
             // the epoch is certified: report the held certificate's signers, not this round's
-            record_epoch_record_signers(cert.signed_authorities.len());
+            if !recertify_round {
+                record_epoch_record_signers(cert.signed_authorities.len());
+            }
         } else {
             error!(
                 target: "epoch-manager",
@@ -307,7 +316,9 @@ async fn manage_epoch_votes(
                 missing = %SignerList(&missing),
                 "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
             );
-            record_epoch_record_signers(signers);
+            if !recertify_round {
+                record_epoch_record_signers(signers);
+            }
         }
         let db = consensus_chain.epochs().clone();
         let network = primary_network.clone();
@@ -773,8 +784,11 @@ async fn pick_recertify_record(db: &EpochRecordDb, epoch: Epoch) -> Option<Epoch
 /// The record is [`pick_recertify_record`]'s. This node signs only when its key is in that
 /// record's committee; the vote is the same deterministic BLS vote as the record's first round,
 /// sent to the local collector and gossiped, as the failsafe does for the previous record. The
-/// round it joins or starts reports its outcome in `tn_node.epoch_record_recertify_rounds_total`;
-/// a pick this node may not sign counts as `skipped`.
+/// round it joins or starts reports its outcome in `tn_node.epoch_record_recertify_rounds_total`
+/// (`certified` or `short`) and leaves `tn_node.epoch_record_signers` alone; a pick this node may
+/// not sign counts as `skipped`. The outcome is credited to the next round for the picked epoch to
+/// end, which can be a round already open for it or one evicted from the queue (`short`), and a
+/// pick whose round never starts is not counted.
 async fn recertify_older_record(
     db: &EpochRecordDb,
     consensus_bus: &ConsensusBusApp,
@@ -882,6 +896,12 @@ impl RetainedEpochVotes {
         self.inner.lock().recertifying.insert(epoch);
     }
 
+    /// True while `epoch` is marked by [`Self::mark_recertify`]: a round for it ending now is a
+    /// re-certify round.
+    fn is_recertifying(&self, epoch: Epoch) -> bool {
+        self.inner.lock().recertifying.contains(&epoch)
+    }
+
     /// True, once, when a round for `epoch` ends after [`Self::mark_recertify`].
     fn take_recertify(&self, epoch: Epoch) -> bool {
         self.inner.lock().recertifying.remove(&epoch)
@@ -979,7 +999,9 @@ fn missing_signers(
 ///
 /// A round that fails to reach quorum on a record not yet certified sets it to its own count, so
 /// during that failure the gauge shows the failed round's count, not the count of the last round
-/// that reached quorum. A round cut short by eviction or shutdown leaves it alone.
+/// that reached quorum. A round cut short by eviction or shutdown leaves it alone. So does a
+/// re-certify round for an older record (switch `epoch_record_recertify`), whose outcome is in
+/// `tn_node.epoch_record_recertify_rounds_total`.
 fn record_epoch_record_signers(signers: u64) {
     metrics::gauge!("tn_node.epoch_record_signers").set(signers as f64);
 }
@@ -996,6 +1018,13 @@ fn record_epoch_record_quorum(
     signers: u64,
 ) {
     record_epoch_record_signers(signers);
+    record_missing_signers(committee, remaining);
+}
+
+/// Count one missed vote in `tn_node.epoch_record_missing_signers_total` per committee member
+/// that did not sign a round that reached quorum, touching every member's series (see
+/// [`record_epoch_record_quorum`]).
+fn record_missing_signers(committee: &[BlsPublicKey], remaining: &HashSet<BlsPublicKey>) {
     for key in committee {
         let signer = AuthorityIdentifier::from(*key).to_string();
         metrics::counter!("tn_node.epoch_record_missing_signers_total", "signer" => signer)
@@ -3583,5 +3612,96 @@ mod epoch_vote_collector_tests {
         assert_eq!(queue_after_a_new_round(false, true).await, vec![4, 6, 7, 8, 1]);
         assert_eq!(queue_after_a_new_round(true, false).await, vec![10, 6, 7, 8, 1]);
         assert_eq!(queue_after_a_new_round(true, true).await, vec![10, 4, 7, 8, 1]);
+    }
+
+    /// A re-certify round for an older record that ends short, and one that certifies, leave
+    /// `tn_node.epoch_record_signers` at the value the latest record's round set; their outcomes
+    /// are counted in `tn_node.epoch_record_recertify_rounds_total`.
+    #[tokio::test(start_paused = true)]
+    async fn test_recertify_rounds_leave_the_signers_gauge_alone() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let (committee, keys) = four_keys();
+        let (_dir, consensus_chain, latest) =
+            record_chain("recertify_signers_gauge", &committee).await;
+        let older = consensus_chain.epochs().get_epoch_by_number(0).await.expect("record 0").0;
+        let (primary_network, _published) = spawn_quiet_network();
+        let retained = RetainedEpochVotes::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+
+        // the latest record's round: all four members vote, so the gauge reads 4
+        let (latest_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        for key_config in &keys {
+            latest_tx.send(latest.sign_vote(key_config)).await.unwrap();
+        }
+        manage_epoch_votes(
+            latest,
+            keys[0].clone(),
+            primary_network.clone(),
+            vote_rx,
+            consensus_chain.clone(),
+            ShutdownNotifier::new(),
+            Some(retained.clone()),
+        )
+        .await
+        .expect("no local store failure");
+
+        // the re-certify round for record 0 ends short with one vote (it would write 1)
+        retained.mark_recertify(0);
+        let (short_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        short_tx.send(older.sign_vote(&keys[1])).await.unwrap();
+        manage_epoch_votes(
+            older.clone(),
+            keys[0].clone(),
+            primary_network.clone(),
+            vote_rx,
+            consensus_chain.clone(),
+            ShutdownNotifier::new(),
+            Some(retained.clone()),
+        )
+        .await
+        .expect("no local store failure");
+
+        // the next re-certify round for record 0 certifies with three signers (it would write 3)
+        retained.mark_recertify(0);
+        let (certify_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        for key_config in [&keys[2], &keys[3]] {
+            certify_tx.send(older.sign_vote(key_config)).await.unwrap();
+        }
+        manage_epoch_votes(
+            older.clone(),
+            keys[0].clone(),
+            primary_network,
+            vote_rx,
+            consensus_chain.clone(),
+            ShutdownNotifier::new(),
+            Some(retained.clone()),
+        )
+        .await
+        .expect("no local store failure");
+        assert!(consensus_chain.epochs().cert_by_digest(older.digest()).await.is_some());
+
+        // one snapshot: it drains the counters
+        let mut signers_gauge = None;
+        let mut rounds = BTreeMap::new();
+        for (key, .., value) in snapshotter.snapshot().into_vec() {
+            match value {
+                DebugValue::Gauge(gauge) if key.key().name() == "tn_node.epoch_record_signers" => {
+                    signers_gauge = Some(gauge.0);
+                }
+                DebugValue::Counter(n)
+                    if key.key().name() == "tn_node.epoch_record_recertify_rounds_total" =>
+                {
+                    for label in key.key().labels() {
+                        rounds.insert(label.value().to_string(), n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(signers_gauge, Some(4.0), "the latest record's round set the gauge");
+        assert_eq!(rounds, BTreeMap::from([("certified".into(), 1), ("short".into(), 1)]));
     }
 }
