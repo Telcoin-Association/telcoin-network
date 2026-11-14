@@ -781,6 +781,14 @@ where
     /// output, both cancel safe, and an output taken off the queue is handed over before the next
     /// await. Dropped at either await, the loop holds no output, and the leftover drain
     /// (`send_leftover_consensus_output_to_engine`) forwards the next one in order.
+    ///
+    /// Taking the output after the room also moves the eviction of its batches from the batch
+    /// caches and the release of its batch-report quota ([`Self::forward_output`]) behind the wait
+    /// for room. Under backpressure one more output (the next to be taken) keeps its batches
+    /// cached and its quota counted until the engine frees a slot. That is harmless: the outputs
+    /// queued behind the full engine already keep their batches cached and their quota counted,
+    /// and this adds one; and an exit before the boundary leaves the output queued for the
+    /// leftover drain, whose forward evicts and releases it the same way.
     async fn wait_for_epoch_boundary(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
