@@ -1,12 +1,13 @@
-# The aarch64 CRC-32 kernel's tests on an arm64 runner. crates/tn-lmdb/src/crc.rs (a copy of
-# crates/storage/src/archive/crc.rs) takes a PMULL carry-less-multiply folding path on
-# little-endian aarch64 with the `aes` feature, and its unit tests compare that path with
-# crc32fast. The test lanes in pr.yaml run on `ubuntu-latest` (x86_64), where that path is
-# not compiled, so this is the only run of the kernel in CI.
+# The execution engine's tests on an arm64 runner: tn-lmdb and its reth adapter, tn-lmdb-reth.
+# crates/tn-lmdb/src/crc.rs (a copy of crates/storage/src/archive/crc.rs) takes a PMULL
+# carry-less-multiply folding path on little-endian aarch64 with the `aes` feature, and its unit
+# tests compare that path with crc32fast. The test lanes in pr.yaml run on `ubuntu-latest`
+# (x86_64), where that path is not compiled, so this is the only run of the kernel in CI, and the
+# only CI run of the engine's page, mmap and file code on aarch64 Linux.
 #
-# The job tests tn-lmdb's copy only, and first checks that the two files hold the same code, so
-# that run covers the tn-storage copy too (building tn-storage would add reth-libmdbx and the
-# rest of its dependencies to a cold build).
+# The job first checks that the two CRC files hold the same code, so the run covers the
+# tn-storage copy too (building tn-storage would add reth-libmdbx and the rest of its
+# dependencies to a cold build).
 #
 # Not a required check: `CI Success` stays the only one, and this job is not in its needs
 # list (.github/ACTIONS.md, "aarch64 CRC kernel"). A red run here still shows on the pull
@@ -18,6 +19,7 @@ on:
   pull_request:
     paths:
       - "crates/tn-lmdb/**"
+      - "crates/tn-lmdb-reth/**"
       - "crates/storage/src/archive/crc.rs"
       - "rust-toolchain.toml"
       - "Cargo.lock"
@@ -28,6 +30,7 @@ on:
     branches: [main]
     paths:
       - "crates/tn-lmdb/**"
+      - "crates/tn-lmdb-reth/**"
       - "crates/storage/src/archive/crc.rs"
       - "rust-toolchain.toml"
       - "Cargo.lock"
@@ -54,7 +57,7 @@ jobs:
   crc-tests:
     name: arm64 CRC kernel
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       # No submodule: tn-lmdb and its dependencies are all in the workspace tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,7 +102,8 @@ jobs:
           echo "$features"
           grep -qw pmull <<<"$features"
 
-      - name: Run the CRC tests
-        # The `crc::tests` module only: the rest of tn-lmdb's suite runs in pr.yaml's test
-        # lane, and the kernel is the one thing that differs by architecture.
-        run: cargo nextest run --locked -p tn-lmdb -E 'test(/^crc::tests::/)'
+      - name: Run tn-lmdb's and tn-lmdb-reth's tests
+        # Their whole suites, the CRC kernel's tests included: the kernel is the one code path
+        # that differs by architecture, but the engine's page, mmap and file code and the
+        # adapter's cursors also run on aarch64 Linux nowhere else in CI.
+        run: cargo nextest run --locked -p tn-lmdb -p tn-lmdb-reth
