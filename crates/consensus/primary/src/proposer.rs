@@ -1533,8 +1533,10 @@ fn duration_ms(duration: Duration) -> u64 {
 /// picks of the same rule, not tips, so the quorum value can only rise through the floor.
 pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
 
-/// The bound on the adaptive policy's window, in rounds: repeated cancels double the configured
-/// `quorum_exec_block_starved_rounds` up to this value.
+/// The bound on the adaptive policy's window, in headers built under the quorum rule (the switch
+/// keeps its name, `quorum_exec_block_starved_rounds`): repeated cancels double the configured
+/// value up to this one. A proposer in step with its committee builds one header a round, so for
+/// it a header is a round.
 ///
 /// Each failed return to the own tip costs one or two cancelled headers: the probe, and the next
 /// header if it fails too (it is proposed before the probe's cancel report arrives). With p the
@@ -1635,36 +1637,51 @@ impl ExecBasis {
 ///
 /// With the switch off every header is [`ExecPolicy::Off`]; with a window of 0 every header is
 /// [`ExecPolicy::Always`]. Otherwise headers name the own tip until the certifier reports an own
-/// header cancelled uncertified; the next rounds, as many as the current window, use the quorum
-/// rule, and the policy returns to the tip when those rounds have elapsed. The return is by round
-/// number, never by comparing blocks: once several proposers use the rule, the blocks they name
-/// ratchet down, so a test such as "the quorum value reached my tip" would never pass.
+/// header cancelled uncertified; the next headers this proposer builds, as many as the current
+/// window, use the quorum rule, and the policy returns to the tip once it has built them. The
+/// return is by headers built, never by comparing blocks: once several proposers use the rule, the
+/// blocks they name ratchet down, so a test such as "the quorum value reached my tip" would never
+/// pass. The window counts headers, not rounds, because a lagging proposer jumps rounds (its next
+/// round is its parents' round plus one): a window of rounds could pass without one header built
+/// under the rule and still double the next window.
 ///
 /// A cancel that is counted doubles the next window, up to
-/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]. The next window returns to the configured value only
-/// after [`QUORUM_EXEC_BLOCK_RESET_STREAK`] consecutive own headers proposed outside a window
-/// (under the tip policy) certified; every cancel report restarts the count. A single certified
-/// tip header is not enough where the tip certifies part of the time. A header certified inside a
-/// window does not count, even when its quorum value reached the tip: it shows the quorum rule
-/// works, not that the tip would, and counting it would make every return to the tip fail at the
-/// configured window's rate (about one probe and two lost headers every `K + 2` rounds) while the
-/// proposer stays ahead.
+/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`], when the next header under the rule is built: a
+/// window that gets no header built under it gives no evidence that the rule's blocks fail too, so
+/// it does not double, and several counted cancels with no such header between them double once.
+/// The next window returns to the configured value only after [`QUORUM_EXEC_BLOCK_RESET_STREAK`]
+/// consecutive own headers proposed outside a window (under the tip policy) certified; every
+/// cancel report restarts the count. A single certified tip header is not enough where the tip
+/// certifies part of the time. A header certified inside a window does not count, even when its
+/// quorum value reached the tip: it shows the quorum rule works, not that the tip would, and
+/// counting it would make every return to the tip fail at the configured window's rate (about one
+/// probe and two lost headers every `K + 2` headers) while the proposer stays ahead.
+///
+/// Every input is the proposer's own history (the rounds of the headers it built, and the cancel
+/// and certificate reports for them), never a clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecBlockPolicy {
     /// `quorum_exec_block`.
     enabled: bool,
     /// `quorum_exec_block_starved_rounds`: 0 for the quorum rule on every header, otherwise the
-    /// window a first cancel opens.
+    /// window a first cancel opens, in headers.
     base_window: Round,
-    /// The window the next counted cancel opens.
+    /// The window the next counted cancel opens, in headers.
     next_window: Round,
-    /// The proposer's round when the current run of windows opened; rounds above it and at or
-    /// below [`Self::starved_through`] use the quorum rule. A header at or below it was built
-    /// before that run, so its cancel belongs to the episode that opened the run and is not
-    /// counted again.
+    /// The proposer's round when the current run of windows opened. Every own header built after
+    /// it, up to [`Self::rule_through`], was built under the quorum rule. A header at or below it
+    /// was built before that run, so its cancel belongs to the episode that opened the run and is
+    /// not counted again.
     window_start: Round,
-    /// The last round of the current window; 0 before any window.
-    starved_through: Round,
+    /// The round of the newest header built under the quorum rule in the current run; equal to
+    /// [`Self::window_start`] until the run's first such header, 0 before any run.
+    rule_through: Round,
+    /// Headers still to build under the quorum rule in the current window; 0 when no window is
+    /// open.
+    remaining: Round,
+    /// A counted cancel asked to double [`Self::next_window`] and no header has been built under
+    /// the rule since; the next one applies the doubling.
+    doubling_pending: bool,
     /// Own headers proposed outside a window and certified since the last cancel report.
     certified_streak: u32,
 }
@@ -1680,7 +1697,9 @@ impl ExecBlockPolicy {
             base_window: window,
             next_window: window,
             window_start: 0,
-            starved_through: 0,
+            rule_through: 0,
+            remaining: 0,
+            doubling_pending: false,
             certified_streak: 0,
         }
     }
@@ -1710,32 +1729,50 @@ impl ExecBlockPolicy {
         self.enabled && self.base_window > 0
     }
 
-    /// Whether a header at `round` falls in the current window.
-    fn in_window(&self, round: Round) -> bool {
-        round > self.window_start && round <= self.starved_through
+    /// Whether the own header at `round` was built under the quorum rule in the current run.
+    ///
+    /// Every header built after the run opened, up to the newest one under the rule, was built
+    /// under it: the window is spent only by building headers, so none in between named the tip.
+    fn built_under_rule(&self, round: Round) -> bool {
+        round > self.window_start && round <= self.rule_through
     }
 
-    /// The rule for the header proposed at `round`.
-    pub(crate) fn for_round(&self, round: Round) -> ExecPolicy {
+    /// The rule for the new header this proposer is building at `round`.
+    ///
+    /// The proposer calls this once for each header it builds, in round order; a header re-sent
+    /// unchanged is not built again and does not call it. Inside a window the header spends one of
+    /// the window's headers, and a doubling a counted cancel asked for is applied.
+    pub(crate) fn for_round(&mut self, round: Round) -> ExecPolicy {
         if !self.enabled {
             ExecPolicy::Off
         } else if self.base_window == 0 {
             ExecPolicy::Always
-        } else if self.in_window(round) {
-            ExecPolicy::Starved
-        } else {
+        } else if self.remaining == 0 {
             ExecPolicy::Tip
+        } else {
+            self.remaining -= 1;
+            self.rule_through = self.rule_through.max(round);
+            if std::mem::take(&mut self.doubling_pending) {
+                self.next_window = self
+                    .next_window
+                    .saturating_mul(2)
+                    .min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS)
+                    .max(self.base_window);
+            }
+            ExecPolicy::Starved
         }
     }
 
     /// The certifier cancelled the own header at `header_round` uncertified while the proposer is
-    /// at `proposer_round` (the round of its newest header, whose block is already chosen).
+    /// at `proposer_round` (at or above the round of its newest header, whose block is already
+    /// chosen; parents from a later round can move it up without a header).
     ///
     /// A header built before the current run of windows opened is ignored: the cancel of the
     /// header that opened the run lags the next header by a round, and that next header named its
-    /// tip too. Any other cancel, of a tip header after a window or of a header inside one, opens
-    /// a window for the rounds after `proposer_round` (or extends the current one) and doubles the
-    /// next window. Every report, ignored or not, restarts the streak of certified tip headers.
+    /// tip too. Any other cancel, of a tip header after a window or of a header inside one, opens a
+    /// window of the next [`Self::next_window`] headers (or extends the open one to at least that
+    /// many) and asks for the next window to double once a header is built under the rule. Every
+    /// report, ignored or not, restarts the streak of certified tip headers.
     pub(crate) fn on_cancelled(&mut self, header_round: Round, proposer_round: Round) {
         if !self.adaptive() {
             return;
@@ -1744,30 +1781,27 @@ impl ExecBlockPolicy {
         if header_round <= self.window_start {
             return;
         }
-        // a cancel that arrives at the window's last round extends the run instead: that round's
-        // header was built under the rule and must stay inside it, or its certificate would count
-        // toward the streak as a certified tip header
-        if proposer_round > self.starved_through {
+        // a cancel that arrives once the window's last header is built, before the proposer has
+        // moved past it, extends the run instead: that header was built under the rule and must
+        // stay inside it, or its certificate would count toward the streak as a certified tip
+        // header
+        if self.remaining == 0 && proposer_round > self.rule_through {
             // the previous window is spent: a new run starts after the proposer's round
             self.window_start = proposer_round;
+            self.rule_through = proposer_round;
         }
-        self.starved_through =
-            self.starved_through.max(proposer_round.saturating_add(self.next_window));
-        self.next_window = self
-            .next_window
-            .saturating_mul(2)
-            .min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS)
-            .max(self.base_window);
+        self.remaining = self.remaining.max(self.next_window);
+        self.doubling_pending = true;
     }
 
     /// The own header at `header_round` certified: its certificate is a parent of the next header.
     ///
     /// A header proposed outside a window, under the tip policy, extends the streak of certified
     /// tip headers; once the streak reaches [`QUORUM_EXEC_BLOCK_RESET_STREAK`] the next window
-    /// returns to the configured value. A header inside a window, even one whose quorum value
+    /// returns to the configured value. A header built under the rule, even one whose quorum value
     /// reached the own tip (`exec_basis=tip`), neither counts nor breaks the streak.
     pub(crate) fn on_certified(&mut self, header_round: Round) {
-        if !self.adaptive() || self.in_window(header_round) {
+        if !self.adaptive() || self.built_under_rule(header_round) {
             return;
         }
         self.certified_streak = self.certified_streak.saturating_add(1);
