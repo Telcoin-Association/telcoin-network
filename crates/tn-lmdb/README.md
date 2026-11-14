@@ -673,8 +673,14 @@ extra bytes, and two system calls per gap filled.
   write unit is at least one logical block; cloud block storage writes whole blocks). Without gap
   fill no commit writes a page the last durable state names, so a drive that can garble the
   block it was writing at a power cut damages only free pages and a meta (see the page-size
-  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page,
-  which its CRC then reports as `Corrupt`. Leave gap fill off on such a drive.
+  item in [Platform notes](#platform-notes)); with it, such a drive could damage a live page of
+  that state. Reads do not recompute a page's CRC (do-not-flag item 3), and the open after the
+  power cut checks the opened state's roots, not its other pages, so the damage is read as data,
+  or is a `SIGBUS` for a sector the drive cannot read, until a copy-on-write, a free-list load, a
+  multi-page overflow run's read or `Env::check` reports it as `Corrupt`. Gap fill therefore
+  needs a drive that writes each logical block atomically when the power fails (NVMe, cloud
+  block storage); leave it off on any other drive (a SATA SSD without power-loss protection, a
+  hard disk, a USB drive, a RAID controller without a battery-backed cache).
 - **Pages not in memory.** A gap page the page cache does not hold would cost a synchronous random
   read to copy, the cost the fill exists to cut. On Linux the read is one `preadv2` with
   `RWF_NOWAIT` (through `rustix`, so no `unsafe`), which copies only what the cache holds: a gap it

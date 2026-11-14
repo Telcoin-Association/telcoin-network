@@ -574,6 +574,12 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   fills where writes are capped; its choice and fit are the `tn_lmdb_gap_auto_*` database
   counters (`DbCounters`; the width, the fitted cost per write and per page, the fill's cost per
   gap and the capped flag are gauges, `NOT_DIFFERENCES`). The MDBX build refuses any but off.
+  The fill rewrites live pages of the last durable state, which no commit writes without it, so
+  it is safe at a power loss only on a drive that writes each logical block atomically when the
+  power fails (NVMe, cloud block storage): elsewhere a cut during the sync can garble such a
+  page, and reads, which do not recompute page CRCs, return it as data until a copy-on-write or
+  `db check` reports it (tn-lmdb's README, "A torn write"). On any other drive set
+  `--db.gap-fill off`; `auto` fills on every drive while it measures it.
   `--db.sync-mode durable` (the default) is durable commits. `--db.sync-mode safe-no-sync` is the
   engine's `NoSync` with automatic syncs (`SAFE_NO_SYNC_PERIOD`, 1 s, and `SAFE_NO_SYNC_BYTES`, 64
   MiB): a commit returns before it is durable, and the first commit a second after the last durable

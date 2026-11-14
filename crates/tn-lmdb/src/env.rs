@@ -1194,8 +1194,12 @@ impl Writer {
     /// cannot change a page, on a drive that writes each logical block atomically (NVMe, cloud
     /// block storage). A drive that can garble a block it was writing when the power failed
     /// could now damage a page of the last durable state, which without gap fill no commit
-    /// writes (README, "Gap fill"); the page CRCs would report it as `Corrupt`, never read it
-    /// as data.
+    /// writes (README, "Gap fill"). Reads do not recompute a page's CRC (README, do-not-flag
+    /// item 3), and the open after the power cut checks the opened state's roots, not its other
+    /// pages, so such damage is read as data, or is a `SIGBUS` for a sector the drive cannot
+    /// read, until a copy-on-write, a free-list load, a multi-page overflow run's read or
+    /// [`Env::check`] reports it as `Corrupt`. Gap fill therefore needs a drive that writes each
+    /// logical block atomically when the power fails.
     ///
     /// A gap not in memory is skipped and counted ([`IoStats::gap_misses`]); once a commit's
     /// misses exceed its fills by [`GAP_MISS_SLACK`] it stops trying. A kernel or file system that

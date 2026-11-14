@@ -104,17 +104,22 @@ pub struct RethCommand {
     /// the bytes they hold, so the disk takes fewer, larger writes for more bytes written. A width
     /// suits disks that cap I/Os per second (cloud block storage), not local NVMe; `auto` chooses
     /// the width per commit from the disk's measured costs (settling at 0 where filling does not
-    /// pay). Refused on MDBX, whose build defaults to off.
+    /// pay). Refused on MDBX, whose build defaults to off. The rewritten pages include live pages
+    /// of the last durable state, so gap fill is safe at a power loss only on a drive that writes
+    /// each logical block atomically when the power fails (NVMe, cloud block storage); on any
+    /// other drive set `off`, since `auto` also fills while it measures the disk.
     #[arg(long = "db.gap-fill", value_name = "PAGES|auto", help_heading = "Database")]
     pub db_gap_fill: Option<GapFill>,
 }
 
 /// The gap fill a node runs with when `--db.gap-fill` is unset.
 ///
-/// [`GapFill::Auto`] on the tn-lmdb build on Linux: bytes on disk are the same whatever width it
-/// picks, it settles at 0 on local NVMe, and it cuts the write I/Os of a durable commit on cloud
-/// block storage that caps them per second. Off on the MDBX build, which refuses gap fill, and on
-/// other OSes: macOS syncs a commit as ranged msyncs, which mislead the width's cost fit.
+/// [`GapFill::Auto`] on the tn-lmdb build on Linux: a completed commit leaves the same bytes on
+/// disk whatever width it picks, it settles at 0 on local NVMe, and it cuts the write I/Os of a
+/// durable commit on cloud block storage that caps them per second. It needs a drive that writes
+/// each logical block atomically when the power fails, as the drives the hardware requirements
+/// name do (the flag's help). Off on the MDBX build, which refuses gap fill, and on other OSes:
+/// macOS syncs a commit as ranged msyncs, which mislead the width's cost fit.
 pub const DEFAULT_DB_GAP_FILL: GapFill = if cfg!(all(target_os = "linux", not(feature = "mdbx"))) {
     GapFill::Auto
 } else {

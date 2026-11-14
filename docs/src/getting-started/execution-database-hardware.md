@@ -89,7 +89,14 @@ An observer executes the same outputs and makes the same commits, so the same di
 Gap fill trades bytes for I/Os.
 Before a commit's sync, the node rewrites each short gap of unchanged pages between two runs of changed pages with the bytes those pages already hold.
 The disk then gets fewer, larger writes.
-The file's contents and size do not change; only more bytes are written.
+A completed commit leaves the same file contents and size; only more bytes are written.
+
+**Gap fill needs a drive that writes each logical block atomically when the power fails.**
+The rewritten pages include live pages of the last committed state, which no commit writes without gap fill.
+NVMe drives and cloud block storage, the disks [Hardware Requirements](hardware-requirements.md#summary) asks for, meet this.
+On a drive that can garble the block it was writing at a power cut (a SATA SSD without power-loss protection, a hard disk, a USB drive, a RAID controller without a battery-backed cache), a power cut during a commit can damage such a page.
+The node then reads the damaged page as data, which can give a wrong state root (or it crashes on a block the drive cannot read), until `telcoin-network db check` or a later write to that page reports the damage; the database then needs a rebuild (`telcoin-network db reset-execution`).
+On such a drive, set `--db.gap-fill off`: `auto` fills on every drive while it measures it.
 
 | Value | Effect |
 | --- | --- |
