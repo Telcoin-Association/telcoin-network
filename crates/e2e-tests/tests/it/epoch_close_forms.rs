@@ -28,7 +28,8 @@ use super::{
     common::{
         acquire_test_permit, address_from_word, call_rpc, current_epoch, epoch_seconds_remaining,
         get_block, get_block_number, get_node_info, kill_child, log_field, network_advancing,
-        node_log_lines, parse_hex_u64, start_validator_with_overrides, EpochSnapshot, ProcessGuard,
+        node_log_lines, parse_hex_u64, scrape_metrics, start_validator_with_overrides,
+        EpochSnapshot, ProcessGuard,
     },
     exec_block::{
         assert_switches, expected_switches, log_str_field, node_epoch, wait_for_epoch_on_all, Load,
@@ -98,6 +99,20 @@ const OWN_VOTE_LOG: &str = "publishing epoch record vote for epoch";
 
 /// Time limit for a node's [`PUBLISHED_LOG`] line once its registry shows the next epoch.
 const PUBLISHED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The `branch` values of [`PUBLISHED_LOG`]: a record built at the close, a stored record whose
+/// closing block the node executed and checked ([`STORED_MATCHED`]), one whose closing block it
+/// restored from a snapshot.
+const PUBLISHED_BRANCHES: [&str; 3] = ["built", STORED_MATCHED, "stored_restored"];
+
+/// The prometheus counter of the closing-block check runs, by `result` (`ok`, or the comparison
+/// that failed): the record build at the close, the re-derive of a record a kill left unwritten, a
+/// stored record reused at the close and the previous record at every epoch entry.
+const CLOSING_BLOCK_CHECKS: &str = "tn_epoch_epoch_record_closing_block_check_total";
+
+/// The prometheus counter of the close-time base-fee identity check (canonical tip + 1 is the
+/// entered epoch's `blockHeight`), by `result` (`ok` or `mismatch`).
+const IDENTITY_CHECKS: &str = "tn_epoch_epoch_close_identity_check_total";
 
 /// Time limit for one node to serve a certified record once every node is past its epoch.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -372,6 +387,9 @@ fn check_held_member(
          {held_close:?} and logged its own vote {own_vote:?}"
     );
 
+    // the counters live in the held member's process: read them before the release restarts it
+    let held_checks = assert_close_checks(fleet, HELD_MEMBER)?;
+
     // the release: the held member restarts without the delay and catches up inside epoch 1
     fleet.restart(HELD_MEMBER, release)?;
     assert_switches(&test, HELD_MEMBER, 1, &expected)?;
@@ -409,11 +427,14 @@ fn check_held_member(
         );
     }
     fleet.assert_one_chain_logs()?;
+    let checks =
+        (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
 
     Ok(format!(
         "held member {HELD_MEMBER} trailed the closing block {} of epoch 0 by {lag_outputs} outputs \
-         ({lag_blocks} blocks); its close {held_close:?}; record 0: {}; record 1 (after the \
-         release, held index {held_index}): {}",
+         ({lag_blocks} blocks); its close {held_close:?}; its checks before the release: \
+         {held_checks}; record 0: {}; record 1 (after the release, held index {held_index}): {}; \
+         checks at the end {checks:?}",
         closing0.number,
         first.describe(),
         second.describe()
@@ -573,9 +594,11 @@ fn check_missed_round(
         second.record.final_consensus.number
     );
     fleet.assert_one_chain_logs()?;
+    let checks =
+        (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
 
     Ok(format!(
-        "the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
+        "checks at the end {checks:?}; the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
          {missed}; epoch {next} closed {:.0} s after the release with {outputs} outputs and \
          {blocks} blocks; nodes {revoted:?} re-voted record {missed}; records: {:?}",
         gave_up_after.as_secs_f64(),
@@ -714,6 +737,15 @@ impl CloseFleet {
         Ok(lines)
     }
 
+    /// Node `node`'s [`PUBLISHED_LOG`] lines for `epoch` in every run, in run order.
+    fn published(&self, node: usize, epoch: u32) -> eyre::Result<Vec<String>> {
+        let mut lines = Vec::new();
+        for run in 0..=self.runs[node] {
+            lines.extend(published_lines(&self.test, node, run, epoch)?);
+        }
+        Ok(lines)
+    }
+
     /// No run of any node logged a line of [`fork_logs`].
     fn assert_one_chain_logs(&self) -> eyre::Result<()> {
         for node in 0..4 {
@@ -740,25 +772,30 @@ struct ClosedEpoch {
     /// The registry's logs in the closing block that `eth_getLogs` serves on node 0: reported, not
     /// asserted, since system calls build no receipt.
     registry_logs: usize,
+    /// The `branch` of each node's [`PUBLISHED_LOG`] lines for the epoch, in run order.
+    branches: Vec<Vec<String>>,
 }
 
 impl ClosedEpoch {
     /// One line for the test's report.
     fn describe(&self) -> String {
         format!(
-            "epoch {} closing block {} {} ({} registry logs by eth_getLogs), signers per node {:?}",
+            "epoch {} closing block {} {} ({} registry logs by eth_getLogs), signers per node \
+             {:?}, published branches per node {:?}",
             self.record.epoch,
             self.closing.number,
             self.closing.hash,
             self.registry_logs,
-            self.certs.iter().map(signers).collect::<Vec<_>>()
+            self.certs.iter().map(signers).collect::<Vec<_>>(),
+            self.branches
         )
     }
 }
 
 /// Every node holds a certified record for `epoch` whose certificate verifies, the record's digest
-/// is the same on every node, and on every node it matches the chain (see
-/// [`check_record_on_chain`]).
+/// is the same on every node, on every node it matches the chain (see [`check_record_on_chain`]),
+/// and every node's [`PUBLISHED_LOG`] lines for it name the chain's closing block (see
+/// [`check_published_lines`]).
 fn check_closed_epoch(fleet: &CloseFleet, epoch: u32) -> eyre::Result<ClosedEpoch> {
     let mut held = Vec::new();
     for (node, url) in fleet.urls.iter().enumerate() {
@@ -799,12 +836,109 @@ fn check_closed_epoch(fleet: &CloseFleet, epoch: u32) -> eyre::Result<ClosedEpoc
     }
     let closing = closing.swap_remove(0);
     let registry_logs = registry_logs_in_block(&fleet.urls[0], closing.number)?;
+    let branches = check_published_lines(fleet, &record, &closing)?;
     Ok(ClosedEpoch {
         record,
         certs: held.into_iter().map(|(_, cert)| cert).collect(),
         closing,
         registry_logs,
+        branches,
     })
+}
+
+/// Every node logged [`PUBLISHED_LOG`] for `record`'s epoch in some run, and every such line names
+/// what the chain shows for that close: the closing block's number and hash as `final_state`, the
+/// closing block's `parentBeaconBlockRoot` as the `final_consensus` hash, with a `branch` of
+/// [`PUBLISHED_BRANCHES`]. Its `final_consensus_number` and `digest` are the certified record's,
+/// which [`check_record_on_chain`] tied to the chain. The node prints both digests through their
+/// `Display`, a 16-character prefix, and so they are compared as printed. Returns each node's
+/// branches in run order.
+fn check_published_lines(
+    fleet: &CloseFleet,
+    record: &EpochRecord,
+    closing: &ChainBlock,
+) -> eyre::Result<Vec<Vec<String>>> {
+    let epoch = record.epoch;
+    let beacon = closing.consensus_digest.map(ConsensusHeaderDigest::from).ok_or_else(|| {
+        eyre::eyre!(
+            "the closing block {} of epoch {epoch} has no parentBeaconBlockRoot",
+            closing.number
+        )
+    })?;
+    let expected = [
+        ("final_state_number", closing.number.to_string()),
+        ("final_state_hash", closing.hash.clone()),
+        ("final_consensus_number", record.final_consensus.number.to_string()),
+        ("final_consensus_hash", beacon.to_string()),
+        ("digest", record.digest().to_string()),
+    ];
+    let mut branches = Vec::new();
+    for node in 0..4 {
+        wait_until_blocking(
+            PUBLISHED_TIMEOUT,
+            &format!("node {node} logs `{PUBLISHED_LOG}` for epoch {epoch}"),
+            || Ok(!fleet.published(node, epoch)?.is_empty()),
+        )?;
+        let mut node_branches = Vec::new();
+        for line in fleet.published(node, epoch)? {
+            for (name, want) in &expected {
+                let got = log_str_field(&line, name);
+                eyre::ensure!(
+                    got.is_some_and(|got| got.eq_ignore_ascii_case(want)),
+                    "node {node} published record {epoch} with {name}={got:?}, the chain's close \
+                     shows {want}: {line}"
+                );
+            }
+            let branch = log_str_field(&line, "branch").unwrap_or_default();
+            eyre::ensure!(
+                PUBLISHED_BRANCHES.contains(&branch),
+                "node {node} published record {epoch} on branch {branch:?}: {line}"
+            );
+            node_branches.push(branch.to_owned());
+        }
+        branches.push(node_branches);
+    }
+    Ok(branches)
+}
+
+/// The `result` label and the value of every sample of the counter `name` that node `node` serves;
+/// none while the node has counted nothing.
+fn results(fleet: &CloseFleet, node: usize, name: &str) -> eyre::Result<Vec<(String, f64)>> {
+    let prefix = format!("{name}{{");
+    scrape_metrics(&fleet.metrics[node])?
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .map(|line| {
+            let result = line
+                .split_once("result=\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map_or_else(String::new, |(result, _)| result.to_owned());
+            let value = line.rsplit(' ').next().unwrap_or_default();
+            let value =
+                value.parse::<f64>().map_err(|e| eyre::eyre!("{name} sample {line:?}: {e}"))?;
+            Ok((result, value))
+        })
+        .collect()
+}
+
+/// Node `node`'s closing-block checks ([`CLOSING_BLOCK_CHECKS`]) and close-time identity checks
+/// ([`IDENTITY_CHECKS`]) since its latest start all passed: each counter has an `ok` sample of at
+/// least one and no other sample above zero. Returns the two `ok` counts.
+fn assert_close_checks(fleet: &CloseFleet, node: usize) -> eyre::Result<String> {
+    let mut ok = Vec::new();
+    for name in [CLOSING_BLOCK_CHECKS, IDENTITY_CHECKS] {
+        let samples = results(fleet, node, name)?;
+        let passed: f64 = samples.iter().filter(|(result, _)| result == "ok").map(|(_, v)| v).sum();
+        let failed = samples.iter().any(|(result, value)| result != "ok" && *value > 0.0);
+        eyre::ensure!(
+            passed >= 1.0 && !failed,
+            "node {node} run {} counted {name} {samples:?}: every check since its start must pass, \
+             and at least one must have run",
+            fleet.runs[node]
+        );
+        ok.push(passed);
+    }
+    Ok(format!("node {node}: closing-block ok {}, identity ok {}", ok[0], ok[1]))
 }
 
 /// The record matches the chain on `url`: its `final_state` is the block in which the registry's
