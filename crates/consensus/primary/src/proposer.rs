@@ -1551,7 +1551,8 @@ pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
 /// the model, 1.5 % in its worst 4000-round sample. Every climb to the bound also costs one or two
 /// headers per doubling (five doublings from a window of 4), so a measurement that starts as a
 /// regime starts loses 5 to 10 headers before the steady state: the e2e test, about 100 rounds
-/// long, lost 7 or 8 and certified 0.92 to 0.93.
+/// long, lost 7 or 8 and certified 0.92 to 0.93. The policy is built afresh with each epoch's
+/// proposer, so a node that stays starved pays that climb again at every epoch start.
 ///
 /// A configured value above the bound is lowered to it, and the proposer warns at the start of
 /// each epoch (see [`ExecBlockPolicy::starved_rounds_warning`]): a first window that long keeps the
@@ -1877,7 +1878,7 @@ pub(crate) struct ExecBlockChoice {
 /// Under a policy that applies the quorum rule:
 /// - the own tip counts once, for the own authority; each parent from another author counts when it
 ///   is of the header's epoch and not genesis (round 0). An own certificate among the parents is
-///   skipped, and an author is counted at most once (its first certificate);
+///   skipped, and an author is counted at most once (its first usable certificate);
 /// - the values are ranked by number and weighted by voting power: the quorum value is the highest
 ///   number that holders of at least `quorum_threshold` power have reached. With less usable power
 ///   than that the own tip is named;
@@ -1888,11 +1889,14 @@ pub(crate) struct ExecBlockChoice {
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
 ///   always this node's own execution, never a parent's hash;
 /// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
-///   block (see [`RecentBlocks::newest_before_epoch`]): a parent naming an older block is not
-///   counted. Every member executed that block before it entered the epoch, so only a faulty parent
-///   names less, and a voter restored from that epoch's export holds nothing older: one low parent
-///   in a minimal parent set would otherwise drag the choice to a floor entry that such a voter
-///   refuses for good.
+///   block (see [`RecentBlocks::newest_before_epoch`]): while the ring still holds that block, a
+///   parent naming an older one is not counted, and once the ring holds only the epoch's own blocks
+///   every entry is newer. Every member executed that block before it entered the epoch, so only a
+///   faulty parent names less, and a voter restored from that epoch's export holds nothing older:
+///   one low parent in a minimal parent set would otherwise drag the choice to a floor entry that
+///   such a voter refuses for good. The bound matches a restored voter's floor only because every
+///   state export is taken at an epoch's closing block; an export taken inside an epoch would need
+///   a bound in blocks below the own tip as well.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.
