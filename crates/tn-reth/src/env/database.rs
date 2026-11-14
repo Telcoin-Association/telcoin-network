@@ -859,9 +859,9 @@ fn check_db_version_file(path: &Path) -> eyre::Result<()> {
 /// Record [`TN_LMDB_DB_VERSION`] in reth's database version file in `path`, as reth's `create_db`
 /// records its own: an absent or empty directory is created (and made durable in its parent) and
 /// gets the file; a missing file, or one holding reth's own version (a tn-lmdb database written
-/// before the tripwire; the migration records tn-lmdb's itself at its commit point), is rewritten
-/// with it. Runs after [`check_db_version_file`], and refuses what it refuses: any other version,
-/// or a file that does not parse.
+/// before the tripwire; the migration records tn-lmdb's itself before it removes MDBX's files), is
+/// rewritten with it. Runs after [`check_db_version_file`], and refuses what it refuses: any other
+/// version, or a file that does not parse.
 #[cfg(not(feature = "mdbx"))]
 fn record_db_version_file(path: &Path) -> eyre::Result<()> {
     use reth_db::version::{get_db_version, DatabaseVersionError, DB_VERSION};

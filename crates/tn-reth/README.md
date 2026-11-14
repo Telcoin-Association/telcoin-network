@@ -535,10 +535,10 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   incompatible with the latest database version (v2)", where it would otherwise create an empty
   `mdbx.dat` beside `tn-lmdb.dat` and prune the static files down to it. The check runs before the
   backend guard, so a directory another binary wrote (any other version, or a file that does not
-  parse) is refused before a migration touches it. The migration records 1002 at its commit
-  point. A missing file, or one holding reth's 2 (a tn-lmdb `db/` from before the tripwire, or a
-  migration stopped between its commit point and that write), is rewritten atomically after the
-  guard. A new `db/` is made durable in its parent.
+  parse) is refused before a migration touches it. The migration records 1002 before it removes
+  MDBX's files, both in the run that copies and in a later start that finishes a stopped
+  migration. A missing file, or one holding reth's 2 (a tn-lmdb `db/` from before the tripwire),
+  is rewritten atomically after the guard. A new `db/` is made durable in its parent.
 - **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
   `tn-lmdb.dat`, and the tn-lmdb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
   would create an empty database beside the datadir's static files, and reth's
@@ -652,18 +652,18 @@ one of reth's: its rows are not copied (reth does not read them either).
   the copy, and the synced file against the engine's full check. It opens MDBX read-only and
   exclusively (`MDBX_EXCLUSIVE`): while another process has the MDBX database open (an MDBX build
   on a second datadir naming the same `db/`, writing or idle), MDBX refuses the open with
-  `MDBX_BUSY` and the migration does not start, and while the migration copies, MDBX refuses any
-  other process's open. It takes a record of `mdbx.dat` when it opens MDBX (MDBX's last
-  transaction id, and the file's length and modification time), and takes it again once the copy
-  is checked, the id while MDBX is still open: a difference means something wrote MDBX during the
-  migration past the exclusive open (a write to the file itself, or a process MDBX's file locks do
-  not reach), and the copy misses those writes, so the migration fails, leaving MDBX as the write
-  left it. Then it writes the record to `db/tn-lmdb-migrating/mdbx-source`, renames the file to
-  `db/tn-lmdb.dat` (the commit point),
-  records the tn-lmdb version in `db/database.version` (the rollback tripwire, above), checks
-  `mdbx.dat` against the record (see "A stop part way"), removes `mdbx.lck` and then `mdbx.dat`,
-  writes the marker `db/mdbx-migrated` (its text lists the rows copied per table) and removes the
-  temp directory. reth's static files are not touched. While `mdbx.dat` or the temp directory is
+  `MDBX_BUSY` and the migration does not start, and while the migration holds it open, from the
+  copy until MDBX's files are removed, MDBX refuses any other process's open. It takes a record of
+  `mdbx.dat` when it opens MDBX (MDBX's last transaction id, and the file's length and
+  modification time), and takes it again once the copy is checked, with MDBX still open: a
+  difference means something wrote MDBX during the migration past the exclusive open (a write to
+  the file itself, or a process MDBX's file locks do not reach), and the copy misses those
+  writes, so the migration fails, leaving MDBX as the write left it. Then it writes the record to
+  `db/tn-lmdb-migrating/mdbx-source`, renames the file to `db/tn-lmdb.dat` (the commit point),
+  checks that `tn-lmdb.dat` opens and that `mdbx.dat` matches the record (see "A stop part way"),
+  records the tn-lmdb version in `db/database.version` (the rollback tripwire, above), removes
+  `mdbx.lck` and then `mdbx.dat`, closes MDBX, writes the marker `db/mdbx-migrated` (its text
+  lists the rows copied per table) and removes the temp directory. reth's static files are not touched. While `mdbx.dat` or the temp directory is
   there, the open holds an exclusive `flock` on `db/` itself (two datadirs can name one `db/`, and
   the datadir lock is one datadir's), so a second process migrating or finishing the same
   directory is refused with "another process is migrating this database"; the open looks at
@@ -700,17 +700,21 @@ one of reth's: its rows are not copied (reth does not read them either).
   production-sized database has not been timed yet.
 - **A stop part way** (a kill, a power loss) is safe at every step. Before the commit point MDBX is
   as it was, and the next start removes the temp directory and migrates again from the beginning.
-  After it, the next start finishes the remaining steps: it removes what is left of MDBX's files
-  and writes the marker. It knows a stopped migration by the temp directory, emptied by the rename
-  and removed only after the marker. Before it removes `mdbx.dat` it compares the file's length and
-  modification time (a stat; `mdbx.lck` may already be gone) with the record the migration took
-  of it when it opened MDBX: a stop between the rename and the version file leaves a window in
-  which a build running reth on MDBX alone opens and advances `mdbx.dat`, and removing it then
-  would silently roll those writes back, so a differing file is refused and both files are kept
-  (resolve by hand, as for an `mdbx.dat` beside the marker). A temp directory without the record
-  (an older build's migration) is finished as before. A failure after the commit point (the database directory's
-  fsync, or a finishing step) keeps the temp directory too, and its error says the next start
-  finishes the migration. An MDBX build started after a stop before the commit point opens MDBX as
+  After it, the next start finishes the remaining steps as the first run does: it records the
+  tn-lmdb version, removes what is left of MDBX's files and writes the marker. It knows a stopped
+  migration by the temp directory, emptied by the rename and removed only after the marker. Before
+  it changes anything it checks three things, and refuses with both files kept if one fails:
+  `tn-lmdb.dat` opens read-only (a stopped migration of an older build may have left a tn-lmdb
+  format this build does not read); no other process has MDBX open (it opens MDBX exclusively, as
+  the migration does, and holds it until MDBX's files are removed); and `mdbx.dat`'s length and
+  MDBX's last transaction id equal the record the migration took when it opened MDBX. A stop
+  between the rename and the version file leaves a window in which a build running reth on MDBX
+  alone opens and advances `mdbx.dat`, and removing it then would silently roll those writes
+  back. The modification time is not compared: an MDBX commit syncs data, not the file's times, so
+  after a power loss the time on disk can differ with no write. A temp directory without the
+  record (an older build's migration) is not compared. A failure after the commit point (the
+  database directory's fsync, or a finishing step) keeps the temp directory too, and its error
+  says to start this build again, which finishes the migration, and not to start an older release. An MDBX build started after a stop before the commit point opens MDBX as
   it was and warns of the temp directory, naming it and its size, but never removes it: remove it
   by hand to free the space (a tn-lmdb build's next start removes it and migrates again).
 - **Refusals.** The node does not start, and nothing is changed:
@@ -724,9 +728,11 @@ one of reth's: its rows are not copied (reth does not read them either).
   | a row tn-lmdb cannot store: a second value for a dup-sort subkey (`MDBX_KEYEXIST`), or a value over 16 MiB (`MDBX_BAD_VALSIZE`) | tn-lmdb stores one value per subkey and values up to 16 MiB; reth writes neither | MDBX is unchanged: run the MDBX build, and report the error |
   | a copy that fails its checks (a short read, a read-back mismatch, the engine's check) | the copy would lose or change rows | as above |
   | an `mdbx.dat` whose last transaction id, length or modification time after the copy differs from the migration's record of it at the open ("another process wrote the MDBX database during the migration") | something wrote MDBX while it was copied, past the exclusive open (a write to the file itself, or a process MDBX's file locks do not reach), and the copy misses those writes | MDBX is as that write left it: stop the writer, then start again |
-  | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
+  | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may no longer match `tn-lmdb.dat` | rebuild the execution database: `telcoin-network db reset-execution` (it moves `db/` and `static_files/` aside); do not start an older release on the datadir |
   | `mdbx.dat` beside `tn-lmdb.dat`, with neither `db/mdbx-migrated` nor the emptied `db/tn-lmdb-migrating/` | not a stopped migration: say, a tn-lmdb database an MDBX build (an older binary) opened, creating `mdbx.dat` beside it; the static files may match either file | as above |
-  | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or modification time from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | as above; both files are kept |
+  | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or MDBX transaction id from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | both files are kept. When the error says MDBX is at a later transaction than the migration copied, the MDBX build advanced it with the static files: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start this build again, which migrates `mdbx.dat` from the start. Otherwise (`mdbx.dat` may be one an MDBX build created anew, pruning the static files down to it) rebuild as above. Do not start an older release on the datadir |
+  | an unfinished migration (the emptied `db/tn-lmdb-migrating/` beside `tn-lmdb.dat`) whose `tn-lmdb.dat` this build cannot open, say in another tn-lmdb format version | a stopped migration of an older build | nothing is changed. With `mdbx.dat` still there: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start again, which migrates MDBX from the start. Without it: rebuild as above |
+  | an unfinished migration whose `mdbx.dat` another process has open (`MDBX_BUSY`, "another process has the MDBX database open") | two datadirs name one `db/`, and an MDBX build runs on the other | both files are kept: stop that process, then start again |
   | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
   | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
