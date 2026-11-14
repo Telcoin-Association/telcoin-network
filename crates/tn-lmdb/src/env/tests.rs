@@ -1168,10 +1168,13 @@ fn a_writer_open_drops_the_cache_as_the_boot_record_says() {
     assert_eq!(sys::take_dir_sync_log(), [dir.clone(), dir], "the open, then the record's create");
     drop(reopen("recreated", Cache::Clean));
 
-    // A change to the file since the clean close moves its ctime.
-    std::thread::sleep(Duration::from_millis(20));
-    let mode = fs::metadata(&path).expect("metadata").permissions();
-    fs::set_permissions(&path, mode).expect("chmod");
+    // A change to the file since the clean close moves its ctime (made until it does: a file
+    // system with coarse timestamps keeps one ctime for a while).
+    let before = fs::metadata(&path).expect("metadata");
+    boot_record::tests::until_ctime_moves(&before, || {
+        fs::set_permissions(&path, before.permissions()).expect("chmod");
+        fs::metadata(&path).expect("metadata")
+    });
     drop(reopen("the file changed since its clean close", Cache::Changed));
 
     // A read-only open neither reads nor writes the record.
@@ -1235,9 +1238,16 @@ fn a_directory_that_refuses_the_boot_record_opens_without_one() {
     }
     let writable = Writable(&dir);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).expect("chmod");
-    // A process that writes the directory anyway (root) creates the record: nothing to check.
-    if fs::write(dir.join("probe"), b"").is_ok() {
-        return;
+    // A process that writes the directory anyway (root) would create the record: the record's
+    // writes are refused through the test knob instead, as the directory refuses them for others.
+    let root = fs::write(dir.join("probe"), b"").is_ok();
+    if root {
+        eprintln!(
+            "a_directory_that_refuses_the_boot_record_opens_without_one: this process writes a \
+             read-only directory (root): the record's writes are refused by the test knob instead"
+        );
+        fs::remove_file(dir.join("probe")).expect("remove the probe");
+        boot_record::REFUSE_WRITES.set(true);
     }
     for _ in 0..2 {
         let env = Env::open(&path, EnvOptions::default()).expect("an open with no record");
@@ -1246,10 +1256,29 @@ fn a_directory_that_refuses_the_boot_record_opens_without_one() {
         drop(env);
         assert!(boot_file.record().is_none(), "no record");
     }
+    boot_record::REFUSE_WRITES.set(false);
     drop(writable);
     drop(open(&path));
     assert_eq!(take_cache_decision(), Some(boot_record::Cache::NoRecord));
     assert_eq!(boot_file.record().map(|r| r.state), Some(State::Clean), "created");
+}
+
+/// A clean close writes the boot record's "clean" while it still holds the database file's lock:
+/// another open of the file is refused the lock until the record is written, so a writer that
+/// opens the file next (and writes "open" over the record) can never have its "open" overwritten
+/// by the close's "clean".
+#[test]
+fn a_clean_close_marks_the_record_clean_under_the_lock() {
+    let (_dir, path) = temp();
+    let boot_file = BootFile::beside(&path).expect("kept in tests");
+    let env = Env::open(&path, EnvOptions::default()).expect("open");
+    put_all(&env, "a", &[(b"k", b"v")]);
+    assert_eq!(take_clean_under_lock(), None, "no close yet");
+    drop(env);
+    assert_eq!(take_clean_under_lock(), Some(true), "the lock is held across the write");
+    assert_eq!(boot_file.record().map(|r| r.state), Some(State::Clean));
+    let other = File::open(&path).expect("open");
+    assert!(sys::flock_exclusive(&other).expect("lock"), "released once the record is written");
 }
 
 /// A close that stops before its end leaves the record "open", so the next open in this boot
@@ -3267,6 +3296,12 @@ fn a_meta_slot_the_writer_cannot_account_for_skips_the_trim() {
     assert!(trimmed_len(&env) < before, "a trim would shorten the file");
     drop(env);
     assert_eq!(file_len(&path), before, "a slot in doubt trims nothing");
+    let record = BootFile::beside(&path).expect("kept in tests").record();
+    assert_eq!(
+        record.map(|r| r.state),
+        Some(State::Open),
+        "a close that skips its trim stays open"
+    );
 }
 
 /// So is a slot whose record holds the txn the writer holds for it but is not of its kind:

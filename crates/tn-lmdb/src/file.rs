@@ -104,9 +104,33 @@ pub(crate) enum Resident {
     /// Not every byte: some page of the range is not in the page cache.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NotWhole,
-    /// The kernel or the file system refuses a read that does not wait for the disk.
+    /// The kernel or the file system refuses a read that does not wait for the disk, or fails it
+    /// with any error but `EINTR` and `EAGAIN` (a sandbox that answers `preadv2` with `EPERM`,
+    /// say): the read is advisory, and nothing has been written for it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Unsupported(io::Error),
+}
+
+/// What a `preadv2` with `RWF_NOWAIT` of `want` bytes that returned `read` says
+/// ([`PageFile::read_cached`]), or `None` for `EINTR` (reissue the call). `Whole` once it read
+/// every byte; `NotWhole` for a short read (a page past the first is not cached: nothing was read
+/// from the disk) or `EAGAIN` (the first is not: the kernel starts a read of the range, which
+/// nothing waits for, of the range alone under [`PageFile::advise_random_reads`]); `Unsupported`
+/// for any other error, which turns gap fill off: a kernel or file system that refuses the flag
+/// (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`), a sandbox that refuses the call (`EPERM`, `EACCES`), or
+/// anything else. The read is advisory and nothing has been written for it, so no such error
+/// fails the commit.
+#[cfg(any(target_os = "linux", test))]
+fn nowait_read(read: io::Result<usize>, want: usize) -> Option<Resident> {
+    match read {
+        Ok(n) if n == want => Some(Resident::Whole),
+        Ok(_) => Some(Resident::NotWhole),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EINTR) => None,
+            Some(libc::EAGAIN) => Some(Resident::NotWhole),
+            _ => Some(Resident::Unsupported(e)),
+        },
+    }
 }
 
 /// A reader's view of a page file's mapping that needs no lock: the mapping's base address and
@@ -539,8 +563,8 @@ impl PageFile {
 
     /// Read the `buf.len()` bytes at `offset` into `buf` through the file, not the mapping, for
     /// the gap fill (`Writer::fill_gaps`), when the page cache holds them all
-    /// ([`Self::read_cached`]). Any error but those `read_cached` maps is returned (and the caller
-    /// fails the commit). The range must lie inside the file.
+    /// ([`Self::read_cached`]). A poisoned file, and on macOS a failed `pread`, is an error (and
+    /// the caller fails the commit). The range must lie inside the file.
     pub(crate) fn read_resident(&self, offset: u64, buf: &mut [u8]) -> Result<Resident> {
         self.check_poison()?;
         self.check_inside(offset, buf.len())?;
@@ -556,26 +580,17 @@ impl PageFile {
     }
 
     /// Linux: one `preadv2` with `RWF_NOWAIT` (through `rustix`, so no `unsafe` here), which
-    /// copies only what the page cache holds and never waits for the disk. `Whole` once it read
-    /// every byte; `NotWhole` for a short read (a page past the first is not cached: nothing was
-    /// read from the disk) or `EAGAIN` (the first is not: the kernel starts a read of the range,
-    /// which nothing waits for, of the range alone under [`Self::advise_random_reads`]);
-    /// `Unsupported` when the kernel or the file system refuses the flag (`EOPNOTSUPP`, `EINVAL`,
-    /// `ENOSYS`). `EINTR` reissues the call.
+    /// copies only what the page cache holds and never waits for the disk, read as
+    /// [`nowait_read`] says. `EINTR` reissues the call. Never an error.
     #[cfg(target_os = "linux")]
     fn read_cached(&self, offset: u64, buf: &mut [u8]) -> io::Result<Resident> {
-        use rustix::io::{preadv2, Errno, ReadWriteFlags};
+        use rustix::io::{preadv2, ReadWriteFlags};
         let want = buf.len();
         loop {
             let flags = ReadWriteFlags::NOWAIT;
-            match preadv2(&self.file, &mut [io::IoSliceMut::new(&mut *buf)], offset, flags) {
-                Err(Errno::INTR) => {}
-                Ok(n) if n == want => return Ok(Resident::Whole),
-                Ok(_) | Err(Errno::AGAIN) => return Ok(Resident::NotWhole),
-                Err(e @ (Errno::OPNOTSUPP | Errno::INVAL | Errno::NOSYS)) => {
-                    return Ok(Resident::Unsupported(e.into()))
-                }
-                Err(e) => return Err(e.into()),
+            let read = preadv2(&self.file, &mut [io::IoSliceMut::new(&mut *buf)], offset, flags);
+            if let Some(resident) = nowait_read(read.map_err(io::Error::from), want) {
+                return Ok(resident);
             }
         }
     }
@@ -1182,6 +1197,34 @@ mod tests {
         assert!(pf.ensure_len(u64::MAX - 5).is_err(), "no file grows that large");
         assert!(pf.is_poisoned());
         assert!(matches!(pf.ensure_len(4096), Err(Error::Failed(_))));
+    }
+
+    /// A `preadv2` with `RWF_NOWAIT` for the gap fill (`nowait_read`): a whole read is `Whole`, a
+    /// short one or `EAGAIN` is `NotWhole`, `EINTR` reissues the call, and every other error is
+    /// `Unsupported`, which turns gap fill off rather than fail the commit: a kernel or file system
+    /// that refuses the flag, a sandbox that refuses the call (`EPERM`, `EACCES`), or an error the
+    /// advisory read has no use for.
+    #[test]
+    fn a_nowait_read_turns_gap_fill_off_on_any_error_but_eintr_and_eagain() {
+        let err = |code| Err(io::Error::from_raw_os_error(code));
+        assert!(matches!(nowait_read(Ok(4096), 4096), Some(Resident::Whole)));
+        assert!(matches!(nowait_read(Ok(100), 4096), Some(Resident::NotWhole)));
+        assert!(matches!(nowait_read(err(libc::EAGAIN), 4096), Some(Resident::NotWhole)));
+        assert!(nowait_read(err(libc::EINTR), 4096).is_none(), "reissued");
+        for code in [
+            libc::EOPNOTSUPP,
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::EPERM,
+            libc::EACCES,
+            libc::EIO,
+            libc::EBADF,
+        ] {
+            match nowait_read(err(code), 4096) {
+                Some(Resident::Unsupported(e)) => assert_eq!(e.raw_os_error(), Some(code)),
+                other => panic!("errno {code}: {other:?}"),
+            }
+        }
     }
 
     /// A growth that fails after cutting a distrusted tail leaves the file at the pages in use,

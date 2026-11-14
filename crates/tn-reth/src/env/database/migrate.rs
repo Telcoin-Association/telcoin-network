@@ -5,9 +5,9 @@
 //! directory: the backend guard calls [`migrate_from_mdbx`]. The copy is raw: each of reth's
 //! tables is walked on MDBX as its encoded keys and compressed values (`RawTable`) and appended to
 //! tn-lmdb unchanged, so no row is decoded. reth's static files are not touched; its
-//! `database.version` file gets tn-lmdb's version at the commit point (the rollback tripwire,
-//! `TN_LMDB_DB_VERSION`), and the open that follows records the client version as on any open,
-//! after the `VersionHistory` rows the copy brought over.
+//! `database.version` file gets tn-lmdb's version before MDBX's files are removed (the rollback
+//! tripwire, `TN_LMDB_DB_VERSION`), and the open that follows records the client version as on any
+//! open, after the `VersionHistory` rows the copy brought over.
 //!
 //! **States.** The directory's files decide what an open does. Each is looked for with
 //! `symlink_metadata` (a symbolic link counts as present, dangling or not), so a stat error fails
@@ -16,10 +16,10 @@
 //! | `mdbx.dat` | `tn-lmdb.dat` | `mdbx-migrated` | the open |
 //! |---|---|---|---|
 //! | yes | no | no | migrates |
-//! | yes | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after its commit point: finishes it (removes MDBX's files, writes the marker), unless `mdbx.dat` differs from the record the migration took of it when it opened MDBX ([`MDBX_SOURCE_RECORD`] in the temp directory): refused, both files kept |
+//! | yes | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after its commit point: finishes it (writes the version file, removes MDBX's files, writes the marker), unless this build cannot open `tn-lmdb.dat`, another process has MDBX open, or `mdbx.dat` differs from the record the migration took of it when it opened MDBX ([`MDBX_SOURCE_RECORD`] in the temp directory): refused, both files kept |
 //! | yes | yes | no, nor that temp directory | refused, nothing changed: both engines' data files, not a stopped migration (a tn-lmdb database an older binary ran on MDBX?) |
 //! | yes | either | yes | refused: something wrote MDBX after the migration (an older binary), and the static files may no longer match tn-lmdb |
-//! | no | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after removing MDBX's files: finishes it (writes the marker) |
+//! | no | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after removing MDBX's files: finishes it (writes the marker), unless this build cannot open `tn-lmdb.dat`: refused |
 //! | no | yes | either | a normal open |
 //! | no | no | yes | refused: the migrated database is missing |
 //! | no | no | no | a normal open, of a new database |
@@ -36,8 +36,9 @@
 //! (an exclusive `flock` on the directory, [`lock_db_dir`], held until it returns): a second
 //! process migrating or finishing the same files is refused. The open reads the directory's files
 //! under that lock, so a migration another process finishes just before it is seen as finished. A
-//! build running reth on MDBX takes neither lock; the migration's exclusive open of MDBX (step 2)
-//! keeps such a process out.
+//! build running reth on MDBX takes neither lock; the migration's exclusive open of MDBX, held from
+//! step 2 until step 8 has removed MDBX's files, keeps such a process out, and an open that
+//! finishes a stopped migration takes it again before it removes them.
 //!
 //! **Steps.**
 //! 1. Remove a stopped migration's temp directory.
@@ -45,14 +46,15 @@
 //!    transaction timeout as tn-lmdb takes it (`--db.read-transaction-timeout`). While another
 //!    process has the environment open (a build running reth on MDBX on a second datadir naming the
 //!    same directory, writing or idle), MDBX refuses the open with `MDBX_BUSY`, and the error says
-//!    to stop that process; while the migration holds it open, MDBX refuses any other process's
-//!    open. An environment stopped uncleanly under `--db.sync-mode safe-no-sync` is refused by MDBX
-//!    with `MDBX_WANNA_RECOVERY`, and the error says to run the previous binary once and stop it
-//!    cleanly. Take the record of the source ([`MdbxSource`]): MDBX's last transaction id, and
-//!    `mdbx.dat`'s length and modification time, as the open finds them. Sum the live bytes of
-//!    reth's tables in it: their branch, leaf and overflow pages times the page size, as `db stats`
-//!    reports them on the MDBX build ([`mdbx_live_bytes`]). Warn of any named database in it that
-//!    is not one of reth's tables: its rows are not copied (reth does not read them either).
+//!    to stop that process; while the migration holds it open, which it does until step 8 has
+//!    removed MDBX's files, MDBX refuses any other process's open. An environment stopped uncleanly
+//!    under `--db.sync-mode safe-no-sync` is refused by MDBX with `MDBX_WANNA_RECOVERY`, and the
+//!    error says to run the previous binary once and stop it cleanly. Take the record of the source
+//!    ([`MdbxSource`]): MDBX's last transaction id, and `mdbx.dat`'s length and modification time,
+//!    as the open finds them. Sum the live bytes of reth's tables in it: their branch, leaf and
+//!    overflow pages times the page size, as `db stats` reports them on the MDBX build
+//!    ([`mdbx_live_bytes`]). Warn of any named database in it that is not one of reth's tables: its
+//!    rows are not copied (reth does not read them either).
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
@@ -72,25 +74,33 @@
 //!    off, hashes equal to its copy; then `TnLmdbEnv::sync`, the engine's full check of the file
 //!    (`TnLmdbEnv::check`), and its entry count of each table equal to the rows copied.
 //! 7. Close the tn-lmdb file, and check that nothing wrote MDBX while it was copied: MDBX's last
-//!    transaction id, read again from the source while it is still open, then (once it is closed)
-//!    `mdbx.dat`'s length and modification time must equal the record of step 2. A difference means
-//!    something wrote the MDBX database during the migration past the exclusive open (a write to
-//!    the file itself, or a process MDBX's file locks do not reach), and the copy misses those
-//!    writes: the migration fails, before its commit point. Write the record in the temp directory
+//!    transaction id, and `mdbx.dat`'s length and modification time, read again while the source is
+//!    still open, must equal the record of step 2. A difference means something wrote the MDBX
+//!    database during the migration past the exclusive open (a write to the file itself, or a
+//!    process MDBX's file locks do not reach), and the copy misses those writes: the migration
+//!    fails, before its commit point. Write the record in the temp directory
 //!    ([`MDBX_SOURCE_RECORD`], fsynced), fsync the temp directory, and rename its `tn-lmdb.dat`
-//!    into the database directory: the commit point. Then fsync the database directory, and record
-//!    tn-lmdb's version in reth's `database.version` (`TN_LMDB_DB_VERSION`, the rollback tripwire),
-//!    so a build running reth on MDBX alone refuses the directory from here on and never advances
-//!    the `mdbx.dat` that step 8 removes.
-//! 8. Fsync the database directory again (a later open finishing a stopped migration starts here,
-//!    and the rename must be durable before MDBX goes), then remove MDBX's `mdbx.lck`, then
-//!    `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a migration unfinished), and fsync
-//!    the directory. Before removing them, compare `mdbx.dat`'s length and modification time with
-//!    the record (a stat, since `mdbx.lck` may already be gone): a stop between the rename and the
-//!    version file leaves a window in which a build running reth on MDBX alone can open and advance
-//!    `mdbx.dat`, and removing it then would silently roll those writes back, so a differing file
-//!    is refused and both files are kept. A temp directory without the record (an older build's
-//!    migration) is finished as before.
+//!    into the database directory: the commit point. MDBX stays open, so no process MDBX's locks
+//!    reach can open and write it between the check and the rename, nor before step 8 removes it.
+//!    Then fsync the database directory.
+//! 8. Finish ([`finish`]; a later open finishing a stopped migration starts here). First the
+//!    checks, which refuse with both files kept and nothing changed: `tn-lmdb.dat` must open
+//!    read-only with the node's settings (a stopped migration of an older build may have left a
+//!    tn-lmdb format this build does not read, and MDBX's files are then the copy to migrate
+//!    again); while `mdbx.dat` is there, MDBX is held open exclusively (the migration's own open,
+//!    or, finishing a stopped one, a new open as in step 2, refused with `MDBX_BUSY` while another
+//!    process has the environment open), and `mdbx.dat`'s length and MDBX's last transaction id
+//!    must equal the record. A stop between the commit point and the version file leaves a window
+//!    in which a build running reth on MDBX alone can open and advance `mdbx.dat`, and removing it
+//!    then would silently roll those writes back. The modification time is not compared here: an
+//!    MDBX commit syncs data, not the file's times, so after a power loss the time on disk can
+//!    differ from the one the migration read with no write since. A temp directory without the
+//!    record (an older build's migration) is not compared. Then fsync the database directory (the
+//!    rename must be durable before MDBX goes), record tn-lmdb's version in reth's
+//!    `database.version` (`TN_LMDB_DB_VERSION`, the rollback tripwire), so a build running reth on
+//!    MDBX alone refuses the directory before anything of MDBX's is gone, remove MDBX's `mdbx.lck`,
+//!    then `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a migration unfinished), close
+//!    MDBX, and fsync the directory.
 //! 9. Write the marker [`MIGRATED_MARKER`] atomically (a temp file, fsync, rename, fsync of the
 //!    directory). Its text lists the rows copied per table.
 //! 10. Remove the temp directory, the sign of an unfinished migration until the marker is written.
@@ -100,7 +110,9 @@
 //! start; a stop after the rename leaves `tn-lmdb.dat` beside the emptied temp directory (and
 //! MDBX's files until they are removed), and the next open finishes the migration. A failure after
 //! the rename (the database directory's fsync, or a step of finishing) keeps the temp directory as
-//! a stop does, and its error says the next start finishes the migration.
+//! a stop does, and its error says to start this build again, which finishes the migration, and
+//! not to start an older release. Every way to the removal of MDBX's files, the first run's and a
+//! later open's, goes through [`finish`], which writes the version file first.
 //!
 //! **Why a temp directory.** A copy stopped part way cannot resume into the same file: the
 //! adapter's appends are not idempotent (a row appended again is refused, or replaces the last),
@@ -300,12 +312,12 @@ pub(super) fn migrate_from_mdbx(path: &Path, args: TnLmdbArgs) -> eyre::Result<(
         (true, false, false) => migrate(path, args),
         (true, true, false) if stopped_after_commit_point(path)? => {
             info!(target: "tn::reth", path = %path.display(), "finishing an MDBX to tn-lmdb migration stopped after its commit point");
-            finish(path, FINISHED_LATER)
+            finish(path, FINISHED_LATER, args, None)
         }
         (true, true, false) => Err(both_engines(path)),
         (false, true, false) if stopped_after_commit_point(path)? => {
             info!(target: "tn::reth", path = %path.display(), "finishing an MDBX to tn-lmdb migration stopped before its marker");
-            finish(path, FINISHED_LATER)
+            finish(path, FINISHED_LATER, args, None)
         }
         (false, false, true) => eyre::bail!(
             "the reth database at {} was migrated from MDBX to tn-lmdb ({} exists), but {} is \
@@ -364,8 +376,9 @@ pub(super) fn both_engines(path: &Path) -> eyre::Report {
     eyre::eyre!(
         "the reth database at {} holds both {} and {}, with neither a finished MDBX to tn-lmdb \
          migration's marker ({}) nor a stopped one's emptied temp directory ({}): this is not a \
-         stopped migration, so this build changes neither file. Resolve it by hand (start from a \
-         fresh datadir, or `db load-state`)",
+         stopped migration, so this build changes neither file. The static files may match either \
+         file: rebuild the execution database (`telcoin-network db reset-execution`, which moves \
+         `db/` and `static_files/` aside), and do not start an older release on this datadir",
         path.display(),
         path.join(MDBX_DATA_FILE).display(),
         path.join(DATA_FILE).display(),
@@ -379,16 +392,16 @@ pub(super) fn both_engines(path: &Path) -> eyre::Report {
 /// transaction id. At its commit point the migration takes them again ([`changed_during_copy`]),
 /// so a write made while it copied fails it, and writes the record into the temp directory
 /// ([`MDBX_SOURCE_RECORD`]), so that [`finish`] can tell whether the file was written since.
-/// `finish` compares the stat alone: it may run after `mdbx.lck` is gone, when the file is not
-/// opened as MDBX again.
+/// `finish` compares the length and the transaction id ([`MdbxSource::differs_on_disk`]), which an
+/// MDBX commit makes durable, and not the modification time, which it does not: after a power loss
+/// the time on disk can differ from the one the migration read in memory, with no write since.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MdbxSource {
     /// `mdbx.dat`'s length.
     len: u64,
     /// `mdbx.dat`'s modification time, in nanoseconds since the Unix epoch.
     mtime_nanos: u128,
-    /// MDBX's last transaction id (`Info::last_txnid`), compared at the commit point while the
-    /// source is open; for [`finish`], only the refusal's text.
+    /// MDBX's last transaction id (`Info::last_txnid`), read from the open source.
     last_txnid: u64,
 }
 
@@ -426,6 +439,12 @@ impl MdbxSource {
         write().wrap_err_with(|| format!("failed to write {}", record.display()))
     }
 
+    /// Whether `now`, taken by [`finish`], shows a write since this record: a different length or
+    /// MDBX transaction id. The modification time is not compared (the type's docs).
+    fn differs_on_disk(&self, now: &Self) -> bool {
+        (self.len, self.last_txnid) != (now.len, now.last_txnid)
+    }
+
     /// Read the record from the temp directory `temp`: `None` without one (a migration of a build
     /// from before the record). One that does not parse is an error.
     fn read(temp: &Path) -> eyre::Result<Option<Self>> {
@@ -454,26 +473,53 @@ impl MdbxSource {
 }
 
 /// The refusal, when finishing a migration stopped after its commit point in `path`, of an
-/// `mdbx.dat` whose length or modification time (`now`) differs from the record the migration
-/// took of it when it opened MDBX (`recorded`): a build running reth on MDBX alone wrote it in
-/// the window before the version file, and removing it would silently roll those writes back.
-/// Neither file is removed.
-fn written_after_commit_point(path: &Path, recorded: MdbxSource, now: MdbxSource) -> eyre::Report {
+/// `mdbx.dat` whose length (`len`) or MDBX transaction id (`last_txnid`, `None` when MDBX does not
+/// open the file) differs from the record the migration took of it when it opened MDBX
+/// (`recorded`): a build running reth on MDBX alone wrote it in the window before the version
+/// file, and removing it would silently roll those writes back. Neither file is removed. The
+/// remedy follows the transaction id: past the record's, an MDBX build advanced the migrated
+/// database with the static files, so migrating `mdbx.dat` again from the start is right;
+/// otherwise `mdbx.dat` is not known to be that database (one an MDBX build created anew also
+/// prunes the static files down to it), and only a rebuild is.
+fn written_after_commit_point(
+    path: &Path,
+    recorded: MdbxSource,
+    len: u64,
+    last_txnid: Option<u64>,
+) -> eyre::Report {
+    let (mdbx, tn_lmdb, temp) =
+        (path.join(MDBX_DATA_FILE), path.join(DATA_FILE), path.join(MIGRATING_DIR));
+    let remedy = if last_txnid.is_some_and(|id| id > recorded.last_txnid) {
+        format!(
+            "MDBX is at a later transaction than the migration copied: an MDBX build advanced it, \
+             with the static files, so remove {} and {}, then start this build again, which \
+             migrates {} from the start",
+            tn_lmdb.display(),
+            temp.display(),
+            mdbx.display(),
+        )
+    } else {
+        "MDBX is not known to be at a later transaction than the migration copied, so it may not \
+         be the database the migration copied (an MDBX build that creates it anew also prunes the \
+         static files down to it): rebuild the execution database (`telcoin-network db \
+         reset-execution`, which moves `db/` and `static_files/` aside)"
+            .to_string()
+    };
+    let now = match last_txnid {
+        Some(id) => format!("at MDBX transaction {id}"),
+        None => "MDBX does not open it read-only".to_string(),
+    };
     eyre::eyre!(
         "the reth database at {} holds an MDBX to tn-lmdb migration stopped after its commit point \
-         ({} is in place), but {} was written since: the migration recorded it at {} bytes, \
-         modified at {} ns (MDBX transaction {}), and it is now {} bytes, modified at {} ns. A \
-         build running reth on MDBX (an older binary?) ran on it, so the static files may no \
-         longer match the tn-lmdb database: this build does not open it, and removes neither \
-         file. Resolve it by hand (start from a fresh datadir, or `db load-state`)",
+         ({} is in place), but {} was written since: the migration recorded it at {} bytes and \
+         MDBX transaction {}, and it is now {len} bytes, {now}. A build running reth on MDBX (an \
+         older binary?) ran on it: this build does not open the database, and removes neither \
+         file. {remedy}. Do not start an older release on this datadir",
         path.display(),
-        path.join(DATA_FILE).display(),
-        path.join(MDBX_DATA_FILE).display(),
+        tn_lmdb.display(),
+        mdbx.display(),
         recorded.len,
-        recorded.mtime_nanos,
         recorded.last_txnid,
-        now.len,
-        now.mtime_nanos,
     )
 }
 
@@ -503,8 +549,9 @@ pub(super) fn written_after_migration(path: &Path) -> eyre::Report {
     eyre::eyre!(
         "the reth database at {} was migrated from MDBX to tn-lmdb ({} exists), but {} was written \
          since, by a build running reth on MDBX (an older binary?): the static files may no longer \
-         match the tn-lmdb database, so this build does not open it. Resolve it by hand (start from \
-         a fresh datadir, or `db load-state`)",
+         match the tn-lmdb database, so this build does not open it. Rebuild the execution \
+         database (`telcoin-network db reset-execution`, which moves `db/` and `static_files/` \
+         aside), and do not start an older release on this datadir",
         path.display(),
         path.join(MIGRATED_MARKER).display(),
         path.join(MDBX_DATA_FILE).display(),
@@ -563,16 +610,18 @@ fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Open the MDBX database in `path` read-only, for the copy, with a hint on MDBX's `MDBX_BUSY` and
-/// `MDBX_WANNA_RECOVERY` refusals ([`describe_mdbx_open_error`]). Its read transactions take the
-/// node's read transaction timeout as tn-lmdb's do (`read_transaction_timeout`, `None` for none):
-/// the copy's read, which lives as long as the copy, opts out of it.
+/// Open the MDBX database in `path` read-only, for the copy or for [`finish`]'s check, with an
+/// error as reth reports it (the callers add their hints: [`describe_mdbx_open_error`] before the
+/// commit point, [`describe_busy`] after it). Its read transactions take the node's read
+/// transaction timeout as tn-lmdb's do (`read_transaction_timeout`, `None` for none): the copy's
+/// read, which lives as long as the copy, opts out of it.
 ///
 /// The open is exclusive (`MDBX_EXCLUSIVE`): MDBX refuses it with `MDBX_BUSY` while another
 /// process has the environment open, read-write or read-only, committing or idle, and refuses
 /// another process's open while the returned environment is open. A process holding MDBX open
 /// without committing leaves no trace in the record the migration takes ([`MdbxSource`]), and
-/// would keep writing to the `mdbx.dat` that [`finish`] removes.
+/// would keep writing to the `mdbx.dat` that [`finish`] removes, so the environment is held open
+/// until then.
 fn open_mdbx_read_only(
     path: &Path,
     read_transaction_timeout: Option<std::time::Duration>,
@@ -584,12 +633,10 @@ fn open_mdbx_read_only(
     let args = DatabaseArguments::default()
         .with_max_read_transaction_duration(Some(limit))
         .with_exclusive(Some(true));
-    reth_db::mdbx::open_db_read_only(path, args).map_err(describe_mdbx_open_error).wrap_err_with(
-        || {
-            let mdbx = path.join(MDBX_DATA_FILE);
-            format!("failed to open the MDBX database {} read-only", mdbx.display())
-        },
-    )
+    reth_db::mdbx::open_db_read_only(path, args).wrap_err_with(|| {
+        let mdbx = path.join(MDBX_DATA_FILE);
+        format!("failed to open the MDBX database {} read-only", mdbx.display())
+    })
 }
 
 /// The hint [`describe_mdbx_open_error`] adds to MDBX's `MDBX_WANNA_RECOVERY`.
@@ -606,21 +653,35 @@ const BUSY_HINT: &str =
      process writes it during the copy or keeps it open while the migration removes it. Stop that \
      process, then start this build; MDBX is unchanged";
 
-/// The error of an MDBX open, `err`, with [`BUSY_HINT`] when MDBX refused with `MDBX_BUSY` (another
-/// process has the environment open, and the open is exclusive), or [`WANNA_RECOVERY_HINT`] when it
-/// refused with `MDBX_WANNA_RECOVERY` (an environment stopped uncleanly under `safe-no-sync`, whose
-/// recovery needs a read-write open by a build that runs reth on MDBX); any other error as it is.
+/// Whether the MDBX open whose error is `err` was refused with `code`.
+fn mdbx_open_refused_with(err: &eyre::Report, code: MdbxError) -> bool {
+    let code = code.to_err_code();
+    err.chain().any(|e| {
+        matches!(e.downcast_ref::<DatabaseError>(), Some(DatabaseError::Open(info)) if info.code == code)
+    })
+}
+
+/// The error of an MDBX open before the commit point, `err`, with [`BUSY_HINT`] when MDBX refused
+/// with `MDBX_BUSY` (another process has the environment open, and the open is exclusive), or
+/// [`WANNA_RECOVERY_HINT`] when it refused with `MDBX_WANNA_RECOVERY` (an environment stopped
+/// uncleanly under `safe-no-sync`, whose recovery needs a read-write open by a build that runs
+/// reth on MDBX); any other error as it is.
 fn describe_mdbx_open_error(err: eyre::Report) -> eyre::Report {
-    let refused_with = |code: MdbxError| {
-        let code = code.to_err_code();
-        err.chain().any(|e| {
-            matches!(e.downcast_ref::<DatabaseError>(), Some(DatabaseError::Open(info)) if info.code == code)
-        })
-    };
-    if refused_with(MdbxError::Busy) {
+    if mdbx_open_refused_with(&err, MdbxError::Busy) {
         err.wrap_err(BUSY_HINT)
-    } else if refused_with(MdbxError::WannaRecovery) {
+    } else if mdbx_open_refused_with(&err, MdbxError::WannaRecovery) {
         err.wrap_err(WANNA_RECOVERY_HINT)
+    } else {
+        err
+    }
+}
+
+/// The error of [`finish`]'s MDBX open, `err`, with [`BUSY_HINT`] when MDBX refused with
+/// `MDBX_BUSY`; any other error as it is. Never [`WANNA_RECOVERY_HINT`]: after the commit point the
+/// previous binary must not run on `mdbx.dat`.
+fn describe_busy(err: eyre::Report) -> eyre::Report {
+    if mdbx_open_refused_with(&err, MdbxError::Busy) {
+        err.wrap_err(BUSY_HINT)
     } else {
         err
     }
@@ -690,7 +751,9 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
             path.display()
         )
     };
-    let src = open_mdbx_read_only(path, args.read_transaction_timeout).wrap_err_with(unchanged)?;
+    let src = open_mdbx_read_only(path, args.read_transaction_timeout)
+        .map_err(describe_mdbx_open_error)
+        .wrap_err_with(unchanged)?;
     let source = mdbx_last_txnid(&src)
         .and_then(|last_txnid| MdbxSource::stat(&mdbx, last_txnid))
         .wrap_err_with(unchanged)?;
@@ -709,7 +772,7 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
     }
     info!(target: "tn::reth", path = %path.display(), mdbx_bytes = source.len, live_bytes = live, free_bytes = free, "migrating the reth database from MDBX to tn-lmdb");
 
-    let copies = match copy_and_install(path, &temp, src, source, args) {
+    let copies = match copy_and_install(path, &temp, &src, source, args) {
         Ok(copies) => copies,
         Err(e) => {
             #[cfg(test)]
@@ -723,11 +786,13 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
         }
     };
     // Past the commit point a failure keeps the temp directory, emptied by the rename, so the
-    // next open finishes the migration.
+    // next open finishes the migration. Until `finish` writes the version file, a build running
+    // reth on MDBX alone would still open `mdbx.dat`, and advance it past the copy.
     let committed = || {
         format!(
             "the MDBX to tn-lmdb migration of the reth database at {} failed after its commit \
-             point ({} is in place): the next start finishes the migration",
+             point ({} is in place): start this build again, which finishes the migration; do not \
+             start an older release on this datadir",
             path.display(),
             path.join(DATA_FILE).display(),
         )
@@ -738,38 +803,34 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))
     };
     sync_rename().wrap_err_with(committed)?;
-    // The rollback tripwire from the commit point on: a build running reth on MDBX alone refuses
-    // the directory before it can open and advance the `mdbx.dat` that is still beside the new
-    // file, whose removal when the migration is finished later would silently roll it back.
-    super::write_db_version_file(path).wrap_err_with(committed)?;
 
     let total: u64 = copies.iter().map(|copy| copy.rows).sum();
     let mut summary = format!("migrated from MDBX to tn-lmdb: {total} rows\n");
     for copy in &copies {
         summary.push_str(&format!("{} {}\n", copy.name, copy.rows));
     }
-    finish(path, &summary).wrap_err_with(committed)?;
+    // MDBX stays open, exclusively, until `finish` has removed its files.
+    finish(path, &summary, args, Some(src)).wrap_err_with(committed)?;
     info!(target: "tn::reth", path = %path.display(), rows = total, tables = copies.len(), elapsed = ?started.elapsed(), "migrated the reth database from MDBX to tn-lmdb");
     Ok(())
 }
 
 /// Build the tn-lmdb copy of `src`, the MDBX database in `path`, in the directory `temp`, verified
 /// and durable ([`copy_and_verify`]); check MDBX against `source`, the record taken when `src` was
-/// opened (its last transaction id read while `src` is still open, then `mdbx.dat`'s stat once it
-/// is closed), failing on a difference ([`changed_during_copy`]); write the record there, and move
-/// the copy into `path`: the commit point, so a failure here leaves MDBX as it was. Returns the
-/// copy of each table.
+/// opened (its last transaction id and `mdbx.dat`'s stat, both taken again with `src` still open),
+/// failing on a difference ([`changed_during_copy`]); write the record there, and move the copy
+/// into `path`: the commit point, so a failure here leaves MDBX as it was. `src` stays open: its
+/// exclusive open keeps any other process's MDBX open out from the check to the rename, and on
+/// until [`finish`] removes MDBX's files. Returns the copy of each table.
 fn copy_and_install(
     path: &Path,
     temp: &Path,
-    src: DatabaseEnv,
+    src: &DatabaseEnv,
     source: MdbxSource,
     args: TnLmdbArgs,
 ) -> eyre::Result<Vec<TableCopy>> {
-    let copies = copy_and_verify(&src, temp, args)?;
-    let last_txnid = mdbx_last_txnid(&src)?;
-    drop(src);
-    let now = MdbxSource::stat(&path.join(MDBX_DATA_FILE), last_txnid)?;
+    let copies = copy_and_verify(src, temp, args)?;
+    let now = MdbxSource::stat(&path.join(MDBX_DATA_FILE), mdbx_last_txnid(src)?)?;
     if now != source {
         return Err(changed_during_copy(path, source, now));
     }
@@ -987,28 +1048,70 @@ impl<TX: DbTx> TableViewer<()> for VerifyTable<'_, TX> {
     }
 }
 
-/// Finish a migration whose `tn-lmdb.dat` is in place in `path`: refuse an `mdbx.dat` that differs
-/// from the record the migration took of it ([`MdbxSource`], [`written_after_commit_point`]);
-/// fsync the directory, so the rename that put `tn-lmdb.dat` there is durable before MDBX goes (a
-/// later open finishes a migration stopped right after the rename, whose fsync may never have
-/// run); then remove MDBX's files (`mdbx.lck`, then `mdbx.dat` last), fsync the directory, write
-/// the marker with `summary` as its text, and remove the temp directory last: until the marker is
-/// written, the temp directory beside `tn-lmdb.dat` marks the migration unfinished
-/// ([`stopped_after_commit_point`]).
-fn finish(path: &Path, summary: &str) -> eyre::Result<()> {
+/// Finish a migration whose `tn-lmdb.dat` is in place in `path` (module docs, step 8). `src` is the
+/// migration's own exclusive open of MDBX when it runs right after the commit point, `None` when a
+/// later open finishes a stopped migration; `args` are the node's settings.
+///
+/// First the checks, which change nothing: refuse a `tn-lmdb.dat` this build cannot open
+/// ([`unreadable_copy`]); while `mdbx.dat` is there, hold MDBX open exclusively (`src`, or a new
+/// open, refused while another process has the environment open) and refuse an `mdbx.dat` that
+/// differs from the record the migration took of it ([`MdbxSource::differs_on_disk`],
+/// [`written_after_commit_point`]). Then fsync the directory, so the rename that put `tn-lmdb.dat`
+/// there is durable before MDBX goes (a later open finishes a migration stopped right after the
+/// rename, whose fsync may never have run); write the rollback tripwire (reth's version file,
+/// `TN_LMDB_DB_VERSION`), so no build running reth on MDBX alone opens the directory once
+/// anything of MDBX's is gone; remove MDBX's files (`mdbx.lck`, then `mdbx.dat` last); close MDBX;
+/// fsync the directory; write the marker with `summary` as its text; and remove the temp
+/// directory last: until the marker is written, the temp directory beside `tn-lmdb.dat` marks the
+/// migration unfinished ([`stopped_after_commit_point`]).
+fn finish(
+    path: &Path,
+    summary: &str,
+    args: TnLmdbArgs,
+    src: Option<DatabaseEnv>,
+) -> eyre::Result<()> {
     let mdbx = path.join(MDBX_DATA_FILE);
-    if file_exists(&mdbx)? {
-        if let Some(recorded) = MdbxSource::read(&path.join(MIGRATING_DIR))? {
-            let now = MdbxSource::stat(&mdbx, recorded.last_txnid)?;
-            if now != recorded {
-                return Err(written_after_commit_point(path, recorded, now));
+    let held = file_exists(&mdbx)?;
+    if let Err(e) =
+        TnLmdbEnv::open(path, TnLmdbEnvKind::RO, args.with_read_transaction_timeout(None))
+    {
+        return Err(unreadable_copy(path, held, e));
+    }
+    let recorded = if held { MdbxSource::read(&path.join(MIGRATING_DIR))? } else { None };
+    let src = match src {
+        Some(src) => Some(src),
+        None if held => match open_mdbx_read_only(path, None) {
+            Ok(src) => Some(src),
+            Err(e) => {
+                // Unless another process holds it, a length that differs from the record's is a
+                // write since, whatever stops the open (MDBX refuses a file whose length its metas
+                // do not account for).
+                let busy = mdbx_open_refused_with(&e, MdbxError::Busy);
+                if let Some(recorded) = recorded.filter(|_| !busy) {
+                    let len = std::fs::metadata(&mdbx)
+                        .wrap_err_with(|| format!("failed to stat {}", mdbx.display()))?
+                        .len();
+                    if len != recorded.len {
+                        return Err(written_after_commit_point(path, recorded, len, None));
+                    }
+                }
+                return Err(unchecked_mdbx(path, e));
             }
+        },
+        None => None,
+    };
+    if let (Some(src), Some(recorded)) = (&src, recorded) {
+        let now = MdbxSource::stat(&mdbx, mdbx_last_txnid(src)?)?;
+        if recorded.differs_on_disk(&now) {
+            return Err(written_after_commit_point(path, recorded, now.len, Some(now.last_txnid)));
         }
     }
     fsync_directory(path)
         .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))?;
+    super::write_db_version_file(path)?;
     remove_file_if_present(&path.join(MDBX_LOCK_FILE))?;
-    remove_file_if_present(&path.join(MDBX_DATA_FILE))?;
+    remove_file_if_present(&mdbx)?;
+    drop(src);
     fsync_directory(path)
         .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))?;
     step(Step::BeforeMarker)?;
@@ -1025,6 +1128,47 @@ fn finish(path: &Path, summary: &str) -> eyre::Result<()> {
     };
     write().wrap_err_with(|| format!("failed to write {}", marker.display()))?;
     remove_temp_dir(path)
+}
+
+/// The refusal to finish a migration stopped after its commit point in `path` whose `mdbx.dat`
+/// [`finish`] cannot open as MDBX to check it (`err`, as [`open_mdbx_read_only`] reports it): with
+/// [`BUSY_HINT`] when another process has the environment open. Nothing is changed.
+fn unchecked_mdbx(path: &Path, err: eyre::Report) -> eyre::Report {
+    describe_busy(err).wrap_err(format!(
+        "failed to open {} to check it before finishing the MDBX to tn-lmdb migration stopped \
+         after its commit point ({} is in place): this build removes neither file",
+        path.join(MDBX_DATA_FILE).display(),
+        path.join(DATA_FILE).display(),
+    ))
+}
+
+/// The refusal to finish a migration stopped after its commit point in `path` whose `tn-lmdb.dat`
+/// this build cannot open read-only (`err`): a stopped migration of an older build, say, whose
+/// tn-lmdb format this build does not read. Nothing is changed. With `mdbx` (`mdbx.dat` is still
+/// there) MDBX is the copy to migrate again; without it only a rebuild remains.
+fn unreadable_copy(path: &Path, mdbx: bool, err: DatabaseError) -> eyre::Report {
+    let (tn_lmdb, temp) = (path.join(DATA_FILE), path.join(MIGRATING_DIR));
+    let remedy = if mdbx {
+        format!(
+            "{} is still there: remove {} and {}, then start this build again, which migrates it \
+             from the start",
+            path.join(MDBX_DATA_FILE).display(),
+            tn_lmdb.display(),
+            temp.display(),
+        )
+    } else {
+        "MDBX's files are gone: rebuild the execution database (`telcoin-network db \
+         reset-execution`, which moves `db/` and `static_files/` aside)"
+            .to_string()
+    };
+    eyre::Report::new(err).wrap_err(format!(
+        "the reth database at {} holds an MDBX to tn-lmdb migration stopped after its commit point, \
+         and this build cannot open its {} (a migration by an older build, in a tn-lmdb format \
+         this build does not read?): it does not finish the migration, and changes nothing. If \
+         the error says the file is another tn-lmdb format version, {remedy}",
+        path.display(),
+        tn_lmdb.display(),
+    ))
 }
 
 /// Remove a migration's temp directory from `path`, if there is one: a stopped migration's, or

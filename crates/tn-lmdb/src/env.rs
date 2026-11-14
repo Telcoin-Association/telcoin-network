@@ -688,13 +688,22 @@ impl Drop for EnvInner {
 
 /// Write the boot record's "clean" at the end of a clean close ([`EnvInner::drop`], after its
 /// final sync and its trim, with the mappings gone), over `file`, a descriptor of the database
-/// file that still holds its lock: the file's ctime as the close left it, and no sync. A power
-/// loss before its writeback leaves "open" of a boot that is over, and the next boot's open keeps
-/// its cache for that anyway (`boot_record`). A failure is logged and leaves the record as it
-/// was, "open", which the next open in this boot drops the file's cached pages for.
+/// file that still holds its lock: the file's ctime as the close left it, and no sync. `file` is
+/// closed only once the record is written, so its lock keeps a second writer's open, which writes
+/// "open" over the record, out until then. A power loss before its writeback leaves "open" of a
+/// boot that is over, and the next boot's open keeps its cache for that anyway (`boot_record`). A
+/// failure is logged and leaves the record as it was, "open", which the next open in this boot
+/// drops the file's cached pages for.
 fn mark_clean(boot_file: &BootFile, boot_id: BootId, file: io::Result<File>) {
-    let written = file.and_then(|file| file.metadata()).and_then(|meta| {
-        boot_file.write(&BootRecord::new(State::Clean, boot_id, &meta), false, false)
+    let written = file.and_then(|file| {
+        let meta = file.metadata()?;
+        #[cfg(test)]
+        if let Some(locked) = locked_elsewhere(boot_file) {
+            CLEAN_UNDER_LOCK.with(|seen| seen.set(Some(locked)));
+        }
+        let written = boot_file.write(&BootRecord::new(State::Clean, boot_id, &meta), false, false);
+        drop(file);
+        written
     });
     if let Err(e) = written {
         tracing::warn!(
@@ -1203,10 +1212,11 @@ impl Writer {
     ///
     /// A gap not in memory is skipped and counted ([`IoStats::gap_misses`]); once a commit's
     /// misses exceed its fills by [`GAP_MISS_SLACK`] it stops trying. A kernel or file system that
-    /// refuses the residency check turns gap fill off for the environment, with a warning and
-    /// [`IoStats::gap_fill_refusals`], once: no later commit calls this. The gaps filled so far
-    /// keep their bytes. An I/O error reading or writing a gap fails the
-    /// commit and poisons the file (a failed write leaves each byte as it was or rewritten).
+    /// refuses the residency check, or fails it with any error but a miss (`file::Resident`),
+    /// turns gap fill off for the environment, with a warning and [`IoStats::gap_fill_refusals`],
+    /// once: no later commit calls this. The gaps filled so far keep their bytes. An I/O error
+    /// writing a gap (or reading one on macOS, a plain `pread`) fails the commit and poisons the
+    /// file (a failed write leaves each byte as it was or rewritten).
     fn fill_gaps(&mut self, pages: &[u32], width: u32) -> Result<Fill> {
         let size = self.geometry.page_size();
         let (mut filled, mut missed, mut filled_pages) = (0u64, 0u64, 0u64);
@@ -1233,8 +1243,8 @@ impl Writer {
                 Resident::NotWhole => missed += 1,
                 Resident::Unsupported(err) => {
                     tracing::warn!(
-                        "tn-lmdb: gap fill turned off: the file refuses reads with RWF_NOWAIT \
-                         ({err})"
+                        "tn-lmdb: gap fill turned off: the file refuses or fails reads with \
+                         RWF_NOWAIT ({err})"
                     );
                     self.gap_fill = GapWidth::Fixed(0);
                     self.gap_buf = Vec::new();
@@ -2438,6 +2448,30 @@ thread_local! {
     /// Test-only: what this thread's last writer open did with the file's cached pages
     /// ([`Env::open`], step 4). Read and cleared by [`take_cache_decision`].
     static CACHE_DECISION: std::cell::Cell<Option<boot_record::Cache>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: whether this thread's last clean close held the database file's lock when it
+    /// wrote the boot record's "clean" ([`mark_clean`]). Read and cleared by
+    /// [`take_clean_under_lock`].
+    static CLEAN_UNDER_LOCK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: whether a second open of the database file whose boot record is `boot_file`
+/// (`<path>.boot`) is refused its exclusive lock now, as another writer's open would be; `None`
+/// when the file cannot be opened again (a test that removed it).
+#[cfg(test)]
+fn locked_elsewhere(boot_file: &BootFile) -> Option<bool> {
+    let other = File::open(boot_file.path().with_extension("")).ok()?;
+    sys::flock_exclusive(&other).ok().map(|got| !got)
+}
+
+/// Test-only: whether this thread's last clean close held the database file's lock while it wrote
+/// the boot record's "clean", or `None` if no close wrote it since the last call.
+#[cfg(test)]
+pub(crate) fn take_clean_under_lock() -> Option<bool> {
+    CLEAN_UNDER_LOCK.with(std::cell::Cell::take)
 }
 
 /// Test-only: what this thread's last writer open did with the file's cached pages, and why

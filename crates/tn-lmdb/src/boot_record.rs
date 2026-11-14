@@ -253,6 +253,13 @@ pub(crate) enum Found {
     Record(BootRecord),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: every boot record write on this thread fails with `EACCES`, as a directory
+    /// that refuses the record's creation fails it for any process but root's.
+    pub(crate) static REFUSE_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl BootFile {
     /// The record of the database file at `path`: `<path>.boot`, or `None` on a platform that
     /// keeps none ([`KEPT`]).
@@ -304,6 +311,10 @@ impl BootFile {
         let named = |e: io::Error| {
             sys::Context::wrap(format!("the boot record {}", self.path.display()), e)
         };
+        #[cfg(test)]
+        if REFUSE_WRITES.get() {
+            return Err(named(io::Error::from_raw_os_error(libc::EACCES)));
+        }
         let refused = || {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -377,8 +388,26 @@ pub(crate) fn read_and_decide(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Run `change` (a change to a file, returning the file's metadata after it) until the file's
+    /// ctime differs from `before`'s, for up to 5 s, and return the metadata it last returned: on
+    /// a file system with coarse timestamps (1 s) a change may keep the ctime it had.
+    pub(crate) fn until_ctime_moves(
+        before: &Metadata,
+        mut change: impl FnMut() -> Metadata,
+    ) -> Metadata {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let now = change();
+            let moved = (now.ctime(), now.ctime_nsec()) != (before.ctime(), before.ctime_nsec());
+            if moved || std::time::Instant::now() > deadline {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     fn meta_of(dir: &tempfile::TempDir) -> (PathBuf, Metadata) {
         let path = dir.path().join("db");
@@ -442,11 +471,13 @@ mod tests {
         assert_eq!(decide(Some(touched), &meta, this), Cache::Changed, "this boot");
         touched.boot_id = other;
         assert_eq!(decide(Some(touched), &meta, this), Cache::Changed, "another boot");
-        // A write to the file moves its ctime past the clean record's.
+        // A write to the file moves its ctime past the clean record's (written until it does: a
+        // file system with coarse timestamps keeps one ctime for a while).
         let clean = BootRecord::new(State::Clean, [1; 16], &meta);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&path, b"other").expect("write");
-        let now = std::fs::metadata(&path).expect("metadata");
+        let now = until_ctime_moves(&meta, || {
+            std::fs::write(&path, b"other").expect("write");
+            std::fs::metadata(&path).expect("metadata")
+        });
         assert_eq!(decide(Some(clean), &now, this), Cache::Changed, "written since");
         for (cache, drops) in [
             (Cache::NoRecord, true),
@@ -511,25 +542,39 @@ mod tests {
 
     /// A write the OS refuses fails with the OS error under the file's name: the original error
     /// is its source, so a caller that walks the sources for the code (the reth adapter, which
-    /// reports it) finds `EACCES`, not a bare kind.
+    /// reports it) finds `EACCES` (or `ENOENT`), not a bare kind. The `ENOENT` of a directory that
+    /// is gone holds for every user; root writes a read-only file anyway, so a run as root skips
+    /// the `EACCES` case, saying so.
     #[test]
     fn a_refused_write_keeps_the_os_error() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::TempDir::with_prefix("tn_lmdb_boot").expect("temp dir");
         let (path, meta) = meta_of(&dir);
-        let boot_file = BootFile::beside(&path).expect("kept in tests");
+        let os_error = |e: &io::Error| {
+            let source = std::error::Error::source(e).and_then(|s| s.downcast_ref::<io::Error>());
+            source.and_then(io::Error::raw_os_error)
+        };
         let record = BootRecord::new(State::Open, [3; 16], &meta);
+        let gone = BootFile::beside(&dir.path().join("gone").join("db")).expect("kept in tests");
+        let e = gone.write(&record, true, false).expect_err("a directory that is gone");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        assert!(e.to_string().contains("db.boot"), "names the file: {e}");
+        assert_eq!(os_error(&e), Some(libc::ENOENT), "{e:?}");
+
+        let boot_file = BootFile::beside(&path).expect("kept in tests");
         boot_file.write(&record, true, false).expect("create");
         let read_only = std::fs::Permissions::from_mode(0o444);
         std::fs::set_permissions(boot_file.path(), read_only).expect("chmod");
-        // A process that writes a read-only file anyway (root): nothing to check.
         if OpenOptions::new().write(true).open(boot_file.path()).is_ok() {
+            eprintln!(
+                "a_refused_write_keeps_the_os_error: SKIPPED the EACCES case: this process writes \
+                 a read-only file (root)"
+            );
             return;
         }
         let e = boot_file.write(&record, false, true).expect_err("a read-only record");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
         assert!(e.to_string().contains("db.boot"), "names the file: {e}");
-        let source = std::error::Error::source(&e).and_then(|s| s.downcast_ref::<io::Error>());
-        assert_eq!(source.and_then(io::Error::raw_os_error), Some(libc::EACCES), "{e:?}");
+        assert_eq!(os_error(&e), Some(libc::EACCES), "{e:?}");
     }
 }
