@@ -178,6 +178,8 @@ async fn manage_epoch_votes(
     let mut certified = false;
     // set when this round's peer recovery validated a certified record that differs from ours
     let mut conflict = false;
+    // set when the peer recovery failed for real; the alarm waits for the kept quorum below
+    let mut missing_cert_alarm = false;
     // a round of a record older than the previous one leaves the signer gauge to the rounds of
     // the latest record and the failsafe, whoever started it
     let kind = retained.as_ref().map_or(RoundKind::Current, |r| r.round_kind(epoch_rec.epoch));
@@ -438,17 +440,16 @@ async fn manage_epoch_votes(
         // Alarm only on a genuine fetch failure: not while shutting down, not if we were evicted
         // mid-recovery (is_closed() here gates the log only, never the fetch above), and not when
         // the certificate is already held.
-        if !got_epoch_record && !shutting_down && !vote_rx.is_closed() && !already_certified {
-            error!(
-                target: "epoch-manager",
-                "Failed to retrieve an epoch record for epoch {}- We have a missing epoch certificate, if this is not local then sync will be compromised!",
-                epoch_rec.epoch,
-            );
-        }
+        missing_cert_alarm =
+            !got_epoch_record && !shutting_down && !vote_rx.is_closed() && !already_certified;
     }
     if let Some(retained) = &retained {
         if certified {
             retained.forget_epoch(epoch_rec.epoch);
+        } else if conflict {
+            // a record known to differ from the network's certified one is never built from kept
+            // votes, in this round or a later one
+            retained.forget_record(epoch_rec.epoch, epoch_hash);
         } else {
             // votes forwarded after the vote loop ended (during peer recovery) were not counted,
             // and the handler drops their repeats for the rest of its epoch: keep them
@@ -462,8 +463,8 @@ async fn manage_epoch_votes(
             }
             // the drain can complete a quorum, and so can the votes another round for the same
             // record kept: aggregate them now rather than wait for another vote for the epoch,
-            // unless the record conflicts with the network's certified one or the node stops
-            if !conflict && !shutdown.noticed() {
+            // unless the node stops
+            if !shutdown.noticed() {
                 if let Some(kept) = retained.take_quorum(epoch_rec.epoch, epoch_hash, quorum) {
                     let mut kept_signers = roaring::RoaringBitmap::new();
                     let mut kept_sigs = Vec::with_capacity(kept.len());
@@ -505,6 +506,14 @@ async fn manage_epoch_votes(
             metrics::counter!("tn_node.epoch_record_recertify_rounds_total", "result" => result)
                 .increment(1);
         }
+    }
+    // after the kept quorum, so a record certified from kept votes raises no alarm
+    if missing_cert_alarm && !certified {
+        error!(
+            target: "epoch-manager",
+            "Failed to retrieve an epoch record for epoch {}- We have a missing epoch certificate, if this is not local then sync will be compromised!",
+            epoch_rec.epoch,
+        );
     }
     Ok(())
 }
@@ -4582,6 +4591,8 @@ mod epoch_vote_collector_tests {
     /// ends instead of keeping the three signatures for a later vote.
     #[tokio::test(start_paused = true)]
     async fn test_vote_drained_after_recovery_completes_the_quorum() {
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
         let (committee, keys) = four_keys();
         let (_dir, chain, record) = record_chain("kept_quorum_drain", &committee).await;
         let epoch_hash = record.digest();
@@ -4628,6 +4639,17 @@ mod epoch_vote_collector_tests {
         assert!(record.verify_with_cert(&cert));
         assert_eq!(cert.signed_authorities.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(retained.signatures(1, epoch_hash).is_empty());
+        let lines = lines.lock().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("INFO epoch record certified from kept votes")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("We have a missing epoch certificate")),
+            "a record certified from kept votes raises no missing-certificate alarm: {lines:?}"
+        );
     }
 
     /// V3: while the rounds of the latest close collect, members' re-votes for five distinct
