@@ -65,8 +65,11 @@ pub(crate) fn compressed<'b, V: Compress>(value: &'b V, buf: &'b mut Vec<u8>) ->
 /// `f`, a decode of a row of table `T` stored at `key` (its key or its value), with a panic in it
 /// caught and made [`DatabaseError::Decode`]: reth's `Decompress` and `Decode` (its `Compact`
 /// forms) expect their input well formed and panic on a damaged one (a truncated `Bytecode`, say),
-/// where this crate reports it as the read's error (the crate docs' differences from MDBX). Costs
-/// nothing on the path that does not panic.
+/// where this crate reports it as the read's error (the crate docs' differences from MDBX). On the
+/// path that does not panic it adds about 1 to 3 ns a decode: a loop of decodes alone, on an
+/// Apple M1 Max, took 10.4 ns an `Account` bare and 11.7 to 12.1 guarded, 6.2 ns a `StorageEntry`
+/// bare and 8.0 to 8.9 guarded (2026-11-13). Its share of a read through a cursor was not
+/// measured.
 ///
 /// The process's panic hook runs before the catch: the default hook prints the panic's message and
 /// where it panicked (in reth's decoder) to stderr, and a backtrace under `RUST_BACKTRACE`, at
