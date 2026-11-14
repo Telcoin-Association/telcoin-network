@@ -49,12 +49,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Cleared, so a caller's environment cannot weaken the lane the flags below set:
-# CARGO_ENCODED_RUSTFLAGS takes precedence over RUSTFLAGS, a CARGO_PROFILE_DEV_* or
-# CARGO_PROFILE_TEST_* variable overrides the test profile (debug assertions, overflow checks),
-# NEXTEST_RETRIES the profile's retries, and RUSTUP_TOOLCHAIN the pin in rust-toolchain.toml.
+# CARGO_ENCODED_RUSTFLAGS takes precedence over RUSTFLAGS, a CARGO_PROFILE_{DEV,TEST}_DEBUG_ASSERTIONS
+# or _OVERFLOW_CHECKS variable turns off the test profile's checks, NEXTEST_RETRIES overrides the
+# profile's retries, and RUSTUP_TOOLCHAIN the pin in rust-toolchain.toml. Other CARGO_PROFILE_*
+# variables stay: CI sets CARGO_PROFILE_{DEV,TEST}_DEBUG=0 to keep its builds small, which
+# changes no check.
 unset CARGO_ENCODED_RUSTFLAGS NEXTEST_RETRIES RUSTUP_TOOLCHAIN
 for name in $(compgen -e); do
-    case "$name" in CARGO_PROFILE_DEV_* | CARGO_PROFILE_TEST_*) unset "$name" ;; esac
+    case "$name" in
+        CARGO_PROFILE_DEV_DEBUG_ASSERTIONS | CARGO_PROFILE_TEST_DEBUG_ASSERTIONS | \
+            CARGO_PROFILE_DEV_OVERFLOW_CHECKS | CARGO_PROFILE_TEST_OVERFLOW_CHECKS) unset "$name" ;;
+    esac
 done
 # The two nextest profiles the lanes run (see above); any other could change retries or timeouts.
 case "${NEXTEST_PROFILE:-default}" in
