@@ -3081,6 +3081,95 @@ fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
     assert_eq!(bound_to_opening(below, None), below);
 }
 
+/// Review finding V3: f faulty parents (one of four equal members) name a block far above what
+/// the honest members executed and then withhold their votes. The proposer's own tip is 157; its
+/// parents name 10,000 (faulty), 151 and 136 (honest, each holding the blocks up to its own tip).
+/// The rule ranks the faulty value first, so the quorum value is 151 where the honest parents
+/// alone give 136: the member at 136 cannot vote for 151, the faulty member withholds, and the
+/// header gets two of the three votes it needs. Naming 136 it would have certified; naming the
+/// tip, as with the switch off and under the adaptive form outside a window, it fails too. Over a
+/// sweep of honest tips and faulty values, neither form that applies the rule names a block that
+/// fewer honest members hold than hold the tip, so its header certifies whenever the tip header
+/// would have.
+///
+/// Catches: a faulty value that moves the choice past the own tip, a choice that is not an own
+/// ring entry, and a header under the rule that loses an honest vote the tip header would have
+/// had.
+#[test]
+fn test_quorum_exec_block_faulty_high_parents_cost_the_gain_only() {
+    let ring = exec_ring(20);
+    let tip = ring.latest_execution_block_num_hash();
+    assert_eq!(tip.number, 157);
+    // authority 0 proposes, 1 is faulty, 2 and 3 are honest; quorum 3 of 4
+    let inputs = |policy: ExecPolicy, faulty: Option<BlockNumber>, honest: [BlockNumber; 2]| {
+        let parents = faulty
+            .map(|number| table_parent(1, number))
+            .into_iter()
+            .chain([table_parent(2, honest[0]), table_parent(3, honest[1])])
+            .collect();
+        ExecBlockInputs {
+            policy,
+            author: AuthorityIdentifier::dummy_for_test(0),
+            own_power: 1,
+            epoch: EXEC_MODEL_EPOCH,
+            quorum_threshold: 3,
+            parents,
+        }
+    };
+    // the faulty member withholds; the proposer and each honest member that executed the named
+    // block vote
+    let votes = |named: BlockNumHash, honest: [BlockNumber; 2]| -> VotingPower {
+        let holders = honest.iter().map(|executed| VotingPower::from(*executed >= named.number));
+        1 + holders.sum::<VotingPower>()
+    };
+
+    let honest = [151, 136];
+    let choose = |policy, faulty| choose_exec_block(&ring, &inputs(policy, faulty, honest));
+    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    for policy in [ExecPolicy::Off, ExecPolicy::Tip] {
+        assert_eq!(choose(policy, Some(10_000)), own_tip, "{policy:?}: the tip, as on main");
+    }
+    assert_eq!(votes(tip, honest), 1, "the tip header is cancelled");
+    let lifted = ring.newest_at_or_below(151).expect("ring entry");
+    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
+        assert_eq!(
+            choose(policy, Some(10_000)),
+            ExecBlockChoice { block: lifted, tip, basis: ExecBasis::Quorum },
+            "{policy:?}: the faulty value lifts the quorum value to 151"
+        );
+    }
+    assert_eq!(votes(lifted, honest), 2, "the header under the rule is cancelled too");
+    let honest_only = choose(ExecPolicy::Always, None);
+    assert_eq!(honest_only.block.number, 136);
+    assert_eq!(votes(honest_only.block, honest), 3, "without the faulty value it certifies");
+
+    // the sweep: honest tips below, at and above the own tip, faulty values above it
+    let tips: Vec<BlockNumber> = (100..=169).step_by(3).collect();
+    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
+        for faulty in [158, 1_000, 10_000, BlockNumber::MAX] {
+            for &first in &tips {
+                for &second in &tips {
+                    let honest = [first, second];
+                    let choice = choose_exec_block(&ring, &inputs(policy, Some(faulty), honest));
+                    let case = format!("{policy:?}: faulty {faulty}, honest {honest:?}");
+                    assert!(choice.block.number <= tip.number, "{case}: capped at the own tip");
+                    assert_eq!(
+                        ring.newest_at_or_below(choice.block.number),
+                        Some(choice.block),
+                        "{case}: an own ring entry"
+                    );
+                    assert!(votes(choice.block, honest) >= votes(tip, honest), "{case}");
+                    let without = choose_exec_block(&ring, &inputs(policy, None, honest));
+                    assert!(
+                        choice.block.number >= without.block.number,
+                        "{case}: the faulty value only lifts the choice"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The quorum rule in an epoch's first rounds, under both forms that apply it: the ring holds
 /// twenty outputs of the epoch before (blocks 100 to 157; 157 closed that epoch) and three of the
 /// header's epoch (160, 163, 166), so the floor entry eight back (142) lies before the epoch's

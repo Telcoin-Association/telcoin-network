@@ -1918,7 +1918,12 @@ pub(crate) struct ExecBlockChoice {
 ///   number that holders of at least `quorum_threshold` power have reached. With less usable power
 ///   than that the own tip is named;
 /// - the quorum value is capped at the own tip: a higher block is one this node cannot vouch for,
-///   and letting f Byzantine parents pick it would bring the starvation back;
+///   and letting f Byzantine parents pick it would bring the starvation back. Below the cap, f
+///   faulty parents that name high blocks still lift the value past what the honest parents
+///   reached, and if they then withhold their votes, a header under the rule can miss the votes
+///   of honest members that have not executed the lifted block and be cancelled. That costs the
+///   rule's gain, not more: every voter that holds the own tip holds the choice, so a header under
+///   the rule certifies whenever the same header naming the tip would have;
 /// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
 ///   oldest entry of a shorter ring);
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
