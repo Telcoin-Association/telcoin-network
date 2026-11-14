@@ -9,14 +9,17 @@
 //! consensus database, the keys and the config stay where they are.
 //!
 //! The moves are staged in `execution-reset-<UTC time>.partial`, renamed to its final name once
-//! every entry is in it. A node refuses to start while a `.partial` directory is there
-//! ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding half an
-//! execution database. Running the command again finishes an interrupted reset into the same
-//! directory.
+//! every entry is in it. A node refuses to start while a `.partial` directory holding an entry is
+//! there ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding
+//! half an execution database. An empty one (a reset stopped before its first move, or undone by
+//! moving its entries back) holds none of it and blocks nothing. Running the command again finishes
+//! an interrupted reset into the same directory.
 //!
 //! The rebuild replays epoch 0 from the node's own consensus packs first, so the command refuses a
 //! datadir whose consensus database holds a later epoch's pack and none for epoch 0
 //! ([`refuse_consensus_without_epoch_zero`]), as a datadir bootstrapped with `db load-state` does.
+//! The side-observer swap moves the execution database aside to copy in a synced observer's, which
+//! replays nothing below the copy's tip, so it skips that check ([`ResetMode::Swap`]).
 
 use eyre::{bail, eyre, WrapErr as _};
 use std::{
@@ -25,7 +28,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tn_config::{PidLock, TelcoinDirs as _};
-use tn_storage::disk::fsync_directory;
+use tn_storage::disk::{available_bytes, fsync_directory};
 
 /// The prefix of the directories a reset moves the execution database into.
 const RESET_DIR_PREFIX: &str = "execution-reset-";
@@ -74,18 +77,36 @@ fn partial_resets(datadir: &Path) -> eyre::Result<Vec<PathBuf>> {
 
 /// Refuse to start a node, or to run a `db` command on the execution database, on `datadir` while
 /// an execution reset there is unfinished: the datadir may hold part of the old execution database
-/// beside nothing, and the node would open it.
+/// beside nothing, and the node would open it. An empty staging directory holds none of the
+/// execution database (a reset stopped before its first move, or undone by moving its entries
+/// back), so it does not refuse.
 pub(crate) fn refuse_interrupted_reset(datadir: &Path) -> eyre::Result<()> {
-    if let Some(partial) = partial_resets(datadir)?.first() {
+    for partial in partial_resets(datadir)? {
+        if is_empty_dir(&partial)? {
+            continue;
+        }
         bail!(
             "an execution reset of {} did not finish: {} holds part of the execution database. \
              Run `telcoin-network db reset-execution --force` to finish it, or move its entries \
-             back into the datadir to undo it",
+             back into the datadir to undo it (an empty one blocks nothing)",
             datadir.display(),
             partial.display(),
         );
     }
     Ok(())
+}
+
+/// Whether `path` is a directory with no entries. Anything else (a file, a link, a directory
+/// holding an entry) is not.
+fn is_empty_dir(path: &Path) -> eyre::Result<bool> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(false);
+    }
+    let mut entries =
+        fs::read_dir(path).wrap_err_with(|| format!("failed to list {}", path.display()))?;
+    Ok(entries.next().is_none())
 }
 
 /// The epoch of a consensus pack directory named `name` (`epoch-N`), or of one an interrupted
@@ -123,11 +144,24 @@ fn refuse_consensus_without_epoch_zero(datadir: &Path) -> eyre::Result<()> {
              `db load-state` holds consensus only from the restored epoch on), and the rebuild \
              replays epoch 0 from this datadir's packs. To rebuild it, move `consensus-db` aside \
              first, so the node syncs from genesis as a new one does (a validator then stays \
-             stopped until the network has closed the epoch it was in)",
+             stopped until the network has closed the last epoch it took part in). For the \
+             side-observer swap, which copies a synced observer's execution database in instead \
+             of rebuilding, pass `--for-swap`",
             datadir.display(),
         ),
         _ => Ok(()),
     }
+}
+
+/// What the moved-aside execution database is replaced with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResetMode {
+    /// The next start rebuilds it from genesis, replaying the node's own consensus packs from
+    /// epoch 0: refuse a datadir that cannot ([`refuse_consensus_without_epoch_zero`]).
+    Rebuild,
+    /// The side-observer swap copies a synced observer's execution database in before the next
+    /// start, which executes only the consensus output past the copy's tip: no epoch-0 check.
+    Swap,
 }
 
 /// The UTC time `secs` after the Unix epoch, as `YYYYMMDDTHHMMSSZ`.
@@ -157,18 +191,96 @@ pub(crate) struct ResetPlan {
     pub(crate) target: PathBuf,
     /// An interrupted reset's directory this one finishes, if any.
     pub(crate) resumes: Option<PathBuf>,
+    /// The bytes the execution database being moved aside holds (its files' lengths, links not
+    /// followed). It keeps them until the reset directory is deleted, while the rebuild (or the
+    /// swap's copy) writes a new database of about that size on the datadir's filesystem.
+    pub(crate) moved_bytes: u64,
+    /// The bytes free on the datadir's filesystem, when the system reports them.
+    pub(crate) available_bytes: Option<u64>,
+    /// Moved entries that are links: the reset moves the link, not what it points to, and the
+    /// next start creates a new entry in the datadir, on the datadir's filesystem.
+    pub(crate) links: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The bytes the files under `path` hold (their lengths), not following links.
+fn bytes_under(path: &Path) -> eyre::Result<u64> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(if meta.is_file() { meta.len() } else { 0 });
+    }
+    let mut total = 0;
+    for entry in
+        fs::read_dir(path).wrap_err_with(|| format!("failed to list {}", path.display()))?
+    {
+        let entry = entry.wrap_err_with(|| format!("failed to list {}", path.display()))?;
+        total += bytes_under(&entry.path())?;
+    }
+    Ok(total)
+}
+
+/// Refuse a move the reset's rename cannot make: an entry that is a mount point, or on another
+/// filesystem than the datadir (`rename(2)` fails there, `EBUSY` or `EXDEV`). Checked before
+/// anything moves.
+#[cfg(unix)]
+fn refuse_other_filesystem(datadir: &Path, entry: &Path) -> eyre::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = datadir.join(entry);
+    let meta = fs::symlink_metadata(&path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    let datadir_meta =
+        fs::metadata(datadir).wrap_err_with(|| format!("failed to check {}", datadir.display()))?;
+    if meta.dev() != datadir_meta.dev() {
+        bail!(
+            "{} is a mount point, or on another filesystem than the datadir: the reset moves the \
+             execution database aside by renaming it within the datadir and cannot move it. Move \
+             its contents aside by hand, or unmount it and run the reset again",
+            path.display(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse while a process holds the execution database open: tn-lmdb holds an exclusive `flock` on
+/// `db/tn-lmdb.dat` for as long as it is open. This backs up the datadir lock, which a node no
+/// longer holds once its pid file has been deleted under it. A file without the lock, or no file,
+/// passes.
+fn refuse_open_execution_database(datadir: &Path) -> eyre::Result<()> {
+    let path = datadir.join("db").join("tn-lmdb.dat");
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(eyre!("failed to open {}: {e}", path.display())),
+    };
+    match file.try_lock() {
+        // released when `file` closes, on return
+        Ok(()) => Ok(()),
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "a process holds the execution database {} open: stop the node before resetting it",
+            path.display(),
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            Err(eyre!("failed to check whether {} is open: {e}", path.display()))
+        }
+    }
 }
 
 /// Move `datadir`'s execution database aside (with `force`), or report what would move (without
-/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. Refuses, before
-/// anything moves, a datadir whose rebuild could not start
+/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. For
+/// [`ResetMode::Rebuild`], refuses, before anything moves, a datadir whose rebuild could not start
 /// ([`refuse_consensus_without_epoch_zero`]).
-pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<ResetPlan> {
+pub(crate) fn reset_execution(
+    datadir: &Path,
+    force: bool,
+    mode: ResetMode,
+) -> eyre::Result<ResetPlan> {
     if !datadir.is_dir() {
         bail!("datadir {} does not exist", datadir.display());
     }
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
-    refuse_consensus_without_epoch_zero(datadir)?;
+    if mode == ResetMode::Rebuild {
+        refuse_consensus_without_epoch_zero(datadir)?;
+    }
 
     let entries = execution_entries(datadir)?;
     let partials = partial_resets(datadir)?;
@@ -181,7 +293,13 @@ pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<Reset
     }
     let resumes = partials.into_iter().next();
     let mut moves = Vec::new();
+    let mut moved_bytes = 0;
     for entry in &entries {
+        if let Some(partial) = &resumes {
+            if exists(&partial.join(entry))? {
+                moved_bytes += bytes_under(&partial.join(entry))?;
+            }
+        }
         if exists(&datadir.join(entry))? {
             if let Some(partial) = &resumes {
                 if exists(&partial.join(entry))? {
@@ -203,6 +321,23 @@ pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<Reset
             entries.iter().map(|e| e.display().to_string()).collect::<Vec<_>>().join(", "),
         );
     }
+    refuse_open_execution_database(datadir)?;
+    let mut links = Vec::new();
+    for entry in &moves {
+        let path = datadir.join(entry);
+        #[cfg(unix)]
+        refuse_other_filesystem(datadir, entry)?;
+        if fs::symlink_metadata(&path)
+            .wrap_err_with(|| format!("failed to check {}", path.display()))?
+            .is_symlink()
+        {
+            let to = fs::read_link(&path)
+                .wrap_err_with(|| format!("failed to read the link {}", path.display()))?;
+            links.push((entry.clone(), to));
+        }
+        moved_bytes += bytes_under(&path)?;
+    }
+    let available_bytes = available_bytes(datadir).ok();
 
     let staging = match &resumes {
         Some(partial) => partial.clone(),
@@ -227,7 +362,7 @@ pub(crate) fn reset_execution(datadir: &Path, force: bool) -> eyre::Result<Reset
             );
         }
     }
-    let plan = ResetPlan { moves, target, resumes };
+    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links };
     if !force {
         return Ok(plan);
     }
@@ -318,12 +453,15 @@ mod tests {
     fn a_reset_moves_the_execution_entries_aside() {
         let dir = datadir();
         let root = dir.path();
-        let plan = reset_execution(root, false).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Rebuild).unwrap();
         assert_eq!(
             plan.moves,
             ["db", "static_files", "restored-state-floor"].map(PathBuf::from).to_vec()
         );
         assert_eq!(plan.resumes, None);
+        assert_eq!(plan.moved_bytes, (b"database".len() + b"headers".len() + b"42\n".len()) as u64);
+        assert!(plan.available_bytes.is_some());
+        assert!(plan.links.is_empty());
         assert_eq!(
             names(root),
             [
@@ -337,7 +475,7 @@ mod tests {
             "a dry run moves nothing"
         );
 
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         let target_name = plan.target.file_name().unwrap().to_string_lossy().into_owned();
         assert!(target_name.starts_with("execution-reset-"), "{target_name}");
         assert!(!target_name.ends_with(".partial"), "{target_name}");
@@ -347,7 +485,7 @@ mod tests {
         assert_eq!(fs::read(plan.target.join("restored-state-floor")).unwrap(), b"42\n");
         refuse_interrupted_reset(root).unwrap();
 
-        let err = reset_execution(root, true).unwrap_err().to_string();
+        let err = reset_execution(root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("holds no execution database"), "{err}");
     }
 
@@ -362,9 +500,12 @@ mod tests {
         let epochs = root.join("consensus-db/epochs");
         fs::remove_dir(epochs.join("epoch-0")).unwrap();
         for force in [false, true] {
-            let err = format!("{:#}", reset_execution(root, force).unwrap_err());
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
             assert!(err.contains("from epoch 1 on and none for epoch 0"), "{err}");
             assert!(err.contains("move `consensus-db` aside"), "{err}");
+            assert!(err.contains("until the network has closed the last epoch"), "{err}");
+            assert!(err.contains("pass `--for-swap`"), "{err}");
             assert_eq!(
                 names(root),
                 [
@@ -381,9 +522,30 @@ mod tests {
         }
 
         fs::create_dir(epochs.join("epoch-0.replaced")).unwrap();
-        reset_execution(root, false).unwrap();
+        reset_execution(root, false, ResetMode::Rebuild).unwrap();
         fs::remove_dir_all(root.join("consensus-db")).unwrap();
-        reset_execution(root, false).unwrap();
+        reset_execution(root, false, ResetMode::Rebuild).unwrap();
+    }
+
+    /// The side-observer swap (`--for-swap`) moves the execution database of a datadir whose
+    /// consensus database starts at a later epoch, as for a validator bootstrapped with `db
+    /// load-state`: the copied database replaces it, so no replay of epoch 0 follows. The consensus
+    /// database stays.
+    #[test]
+    fn a_swap_reset_moves_a_datadir_without_the_epoch_zero_pack() {
+        let dir = datadir();
+        let root = dir.path();
+        fs::remove_dir(root.join("consensus-db/epochs/epoch-0")).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Swap).unwrap();
+        assert_eq!(
+            plan.moves,
+            ["db", "static_files", "restored-state-floor"].map(PathBuf::from).to_vec()
+        );
+        let plan = reset_execution(root, true, ResetMode::Swap).unwrap();
+        let target_name = plan.target.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(root), ["consensus-db", target_name.as_str(), "node-keys", "telcoin.pid"]);
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        assert_eq!(names(&root.join("consensus-db/epochs")), ["epoch-1"]);
     }
 
     /// A datadir without a floor marker moves what it has.
@@ -393,9 +555,41 @@ mod tests {
         let root = dir.path();
         fs::remove_file(root.join("restored-state-floor")).unwrap();
         fs::remove_dir_all(root.join("static_files")).unwrap();
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.moves, [PathBuf::from("db")]);
         assert_eq!(names(&plan.target), ["db"]);
+    }
+
+    /// The command refuses while a process holds the execution database open (tn-lmdb's `flock` on
+    /// `db/tn-lmdb.dat`), as a node does whose pid file was deleted under it, and moves nothing.
+    #[test]
+    fn a_reset_refuses_while_the_execution_database_is_open() {
+        let dir = datadir();
+        let root = dir.path();
+        let held = fs::File::open(root.join("db/tn-lmdb.dat")).unwrap();
+        held.lock().unwrap();
+        for force in [false, true] {
+            let err = reset_execution(root, force, ResetMode::Rebuild).unwrap_err().to_string();
+            assert!(err.contains("holds the execution database"), "{err}");
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
+        }
+        drop(held);
+        reset_execution(root, true, ResetMode::Rebuild).unwrap();
+    }
+
+    /// A linked `db` is reported: the reset moves the link and leaves what it points to.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_reports_a_linked_entry() {
+        let dir = datadir();
+        let root = dir.path();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::rename(root.join("db"), elsewhere.path().join("db")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("db"), root.join("db")).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.links, [(PathBuf::from("db"), elsewhere.path().join("db"))]);
+        assert!(plan.target.join("db").is_symlink());
+        assert!(elsewhere.path().join("db/tn-lmdb.dat").exists(), "the link's target stays");
     }
 
     /// The command refuses while a node holds the datadir lock, and moves nothing.
@@ -405,7 +599,7 @@ mod tests {
         let dir = datadir();
         let root = dir.path().to_path_buf();
         let held = PidLock::acquire(&root).unwrap();
-        let err = reset_execution(&root, true).unwrap_err().to_string();
+        let err = reset_execution(&root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("another telcoin process"), "{err}");
         assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         drop(held);
@@ -425,10 +619,56 @@ mod tests {
         let err = refuse_interrupted_reset(root).unwrap_err().to_string();
         assert!(err.contains("did not finish"), "{err}");
 
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        refuse_interrupted_reset(root).unwrap();
+    }
+
+    /// An interrupted reset undone as its refusal says (its entries moved back) leaves an empty
+    /// staging directory, which blocks nothing; a later reset fills it.
+    #[test]
+    fn an_interrupted_reset_moved_back_no_longer_blocks_the_node() {
+        let dir = datadir();
+        let root = dir.path();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+        assert!(refuse_interrupted_reset(root).is_err());
+
+        fs::rename(partial.join("db"), root.join("db")).unwrap();
+        refuse_interrupted_reset(root).unwrap();
+        assert_eq!(fs::read(root.join("db/tn-lmdb.dat")).unwrap(), b"database");
+
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+    }
+
+    /// The resume branch where every entry is in the staging directory but the final rename did
+    /// not happen (a stop just before it): the rerun moves nothing and only renames.
+    #[test]
+    fn a_reset_stopped_before_its_final_rename_is_finished_by_a_rerun() {
+        let dir = datadir();
+        let root = dir.path();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        for entry in ["db", "static_files", "restored-state-floor"] {
+            fs::rename(root.join(entry), partial.join(entry)).unwrap();
+        }
+        assert!(refuse_interrupted_reset(root).is_err());
+
+        let plan = reset_execution(root, false, ResetMode::Rebuild).unwrap();
+        assert!(plan.moves.is_empty(), "{:?}", plan.moves);
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        assert_eq!(
+            names(root),
+            ["consensus-db", "execution-reset-20261109T163205Z", "node-keys", "telcoin.pid"]
+        );
         refuse_interrupted_reset(root).unwrap();
     }
 
@@ -444,7 +684,7 @@ mod tests {
         let finished = root.join("execution-reset-20261109T163205Z");
         fs::create_dir(&finished).unwrap();
         for force in [false, true] {
-            let err = reset_execution(root, force).unwrap_err().to_string();
+            let err = reset_execution(root, force, ResetMode::Rebuild).unwrap_err().to_string();
             assert!(err.contains(&finished.display().to_string()), "{err}");
             assert!(err.contains(&partial.display().to_string()), "{err}");
             assert!(err.contains("rename or move"), "{err}");
@@ -454,7 +694,7 @@ mod tests {
         }
 
         fs::remove_dir(&finished).unwrap();
-        let plan = reset_execution(root, true).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.target, finished);
         assert_eq!(names(&finished), ["db", "restored-state-floor", "static_files"]);
     }
@@ -467,7 +707,7 @@ mod tests {
         let root = dir.path();
         let partial = root.join("execution-reset-20261109T163205Z.partial");
         fs::create_dir_all(partial.join("db")).unwrap();
-        let err = reset_execution(root, true).unwrap_err().to_string();
+        let err = reset_execution(root, true, ResetMode::Rebuild).unwrap_err().to_string();
         assert!(err.contains("is both in the datadir and in the unfinished reset"), "{err}");
         assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
     }

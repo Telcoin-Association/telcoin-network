@@ -504,11 +504,13 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 What restore does *not* verify: the authenticity of the header window itself — that is the
 caller's trust decision (the window is validated upstream against consensus data).
 
-A restored node did not execute `B`, so its epoch-record check (see "Rebuilding in the new layout"
-below) skips the one record whose closing block is `B`: when the node enters the epoch after it,
-the restored epoch's record is not compared with `B`. `db load-state` already bound that record's
-`final_state` to the pack's final block. The restored-state floor marker (`restored-state-floor`)
-is what tells the node `B` was imported; every epoch it closes above `B` is compared.
+A restored node did not execute `B`, but its header at `B` is the real one the restore imported, so
+its epoch-record check (see "Rebuilding in the new layout" below) compares the restored epoch's
+record with `B` when the node enters the epoch after it. On the restored datadir that matches:
+`db load-state` bound the record's `final_state` to the pack's final block. Below `B` the node holds
+only the header scaffold, so a record whose closing block is below `B` is not compared. The
+restored-state floor marker (`restored-state-floor`) is what tells the node `B` was imported; every
+epoch closing at `B` or above is compared.
 
 ## Database backend
 
@@ -983,16 +985,25 @@ datadirs get. It moves `db/`, `static_files/` and `restored-state-floor` (the fl
 restored from a snapshot, which would refuse the rebuilt chain's old blocks if it stayed) into
 `<datadir>/execution-reset-<UTC time>/`. It renames and never deletes; the consensus database, keys
 and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
-state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
-moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
-refuses to start while a `.partial` directory is there, and running the command again finishes it.
+state, not chain data. It refuses while a node holds the datadir or a process holds
+`db/tn-lmdb.dat` open, and is a dry run without `--force`. It refuses a `db/` or `static_files/`
+that is a mount point or on another filesystem, which a rename cannot move, before anything moves.
+One that is a link moves as a link: the next start creates a new one in the datadir, on the
+datadir's filesystem, and the command prints a warning naming the link. It prints the size of what
+it moves and the space free on the datadir's filesystem: the moved-aside database keeps its space
+until `execution-reset-*` is deleted, and the rebuild (or the swap's copy) needs about as much
+again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
+refuses to start while a `.partial` directory holding an entry is there, and running the command
+again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
 It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
 for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
 restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
 pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
 new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
-A validator's votes and proposals go aside with `consensus-db/`, so it stays stopped until the
-network has closed the epoch it was last in.
+A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
+in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
+side-observer swap below instead, which keeps its `consensus-db/`: `--for-swap` skips this refusal,
+because the copied execution database replaces the rebuild.
 
 - **In place** (an observer, or a validator that can be out for the rebuild):
 
@@ -1015,7 +1026,7 @@ network has closed the epoch it was last in.
   epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
   `restored-state-floor` beside a full consensus database (one copied in with a restored
   observer's execution database by the swap below) moves aside with the execution database, so the
-  rebuild executes and compares every epoch, the restored one included (the restored-block
+  rebuild executes and compares every epoch, including those below the old floor (the below-floor
   exemption under "Snapshot export / restore" does not apply here). It is out of the
   committee's work for the whole rebuild. On a five-validator committee with a quorum of four, one
   validator out leaves no margin, so validators take the swap below.
@@ -1028,12 +1039,24 @@ network has closed the epoch it was last in.
   proposing a second header for one, as after a restart, so it needs no wait before its start,
   unlike a validator whose `consensus-db/` was moved aside (below).
 
+  At the live edge the order is the other way round. A node whose execution diverges before the
+  epoch's certified record reaches it builds and stores its own record at the close, then meets
+  the certified one. A committee validator stops at the epoch vote, which finds the fork. Every
+  node, an observer or a node outside the epoch's committee included, also stops when its epoch
+  record collector downloads the certified record and the store refuses it beside its own: it
+  logs `a certified epoch record from peers conflicts with this node's own record` with the epoch
+  and both record digests, counts `tn_epoch_final_state_mismatches_total`, and stops. A restart
+  stops again, as the collector asks for the record again. The recovery is the forked-record one
+  below.
+
   A record of the node's own that a bad execution wrote stops every rebuild on this release. A
   node that forked (its execution diverged, and it built and stored its own record for that
   epoch, which no quorum certified) still holds that record after the reset. The rebuild, on a
-  fixed binary, stops at that epoch with an `uncertified` mismatch, and again on every restart.
-  Nothing replaces the record in place: the consensus database keeps one record per epoch, refuses
-  a different one (a peer's certified record too), and no `db` command removes or rewrites one.
+  fixed binary, stops at that epoch with an `uncertified` mismatch, or earlier when its record
+  collector downloads the certified record for that epoch, and again on every restart. Nothing
+  replaces the record in place: the consensus database keeps one record per epoch, refuses a
+  different one (a peer's certified record too, which stops the node), and no `db` command removes
+  or rewrites one.
   The recovery is a fresh datadir, which keeps the keys and config:
 
   ```sh
@@ -1058,7 +1081,9 @@ network has closed the epoch it was last in.
      It gets the layout new datadirs get.
   2. Stop the observer cleanly at the tip, so its files do not change while they are copied.
   3. Stop the validator, then move its execution database aside:
-     `telcoin-network db reset-execution --datadir <validator-datadir> --force`.
+     `telcoin-network db reset-execution --datadir <validator-datadir> --force --for-swap`.
+     `--for-swap` lets a validator bootstrapped with `db load-state` through: the start in step 5
+     executes only the consensus output past the copy's tip, so it needs no epoch-0 pack.
   4. Copy the observer's `db/` and `static_files/` (and its `restored-state-floor`, only if it has
      one) into the validator's datadir. Never copy its `consensus-db/` or its keys.
   5. Start the validator. It opens the copied execution database and executes the consensus output

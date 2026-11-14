@@ -386,13 +386,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 }
 
 /// Open the node's reth execution database in `tn_datadir`, after refusing an unfinished
-/// `db reset-execution` there: one stopped between its moves leaves part of the execution database
-/// in its staging directory, and the open would create a database beside the rest.
+/// `db reset-execution` there (one stopped between its moves leaves part of the execution database
+/// in its staging directory, and the open would create a database beside the rest) and an
+/// unfinished `db load-state` (its execution and consensus databases are incomplete).
 fn open_execution_database(
     node_config: &RethConfig,
     tn_datadir: &Path,
 ) -> eyre::Result<tn_reth::RethDb> {
     crate::db::refuse_interrupted_reset(tn_datadir)?;
+    crate::db::refuse_interrupted_load_state(tn_datadir)?;
     tn_reth::RethEnv::new_database(node_config, tn_datadir.to_path_buf().reth_db_path())
 }
 
@@ -622,6 +624,25 @@ mod tests {
         std::fs::rename(&partial, datadir.join("execution-reset-20261109T000000Z"))?;
         drop(open_execution_database(&config, &datadir)?);
         assert!(datadir.reth_db_path().try_exists()?, "a finished reset: a new database");
+        Ok(())
+    }
+
+    /// The node refuses to open its execution database while a `db load-state` there is
+    /// unfinished (its `load-state-in-progress` marker), and creates nothing.
+    #[test]
+    fn the_node_refuses_an_interrupted_load_state_before_opening_its_database() -> eyre::Result<()>
+    {
+        let tmp = tempfile::TempDir::new()?;
+        let datadir = tmp.path().to_path_buf();
+        std::fs::write(datadir.join("load-state-in-progress"), b"db\n")?;
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config =
+            RethConfig::new(RethCommand::try_parse_from(["tn-reth"])?, None, &datadir, true, chain);
+
+        let err = open_execution_database(&config, &datadir).expect_err("an unfinished restore");
+        let msg = err.to_string();
+        assert!(msg.contains("did not finish") && msg.contains("db load-state"), "{msg}");
+        assert!(!datadir.reth_db_path().try_exists()?, "no database is created");
         Ok(())
     }
 

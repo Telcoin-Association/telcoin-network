@@ -48,7 +48,9 @@ use tn_types::{
     ExecHeader, SealedHeader, TaskManager, B256,
 };
 
+mod load_state_marker;
 mod reset_execution;
+pub(crate) use load_state_marker::refuse_interrupted_load_state;
 pub(crate) use reset_execution::refuse_interrupted_reset;
 
 /// Inspect and diagnose telcoin-network databases.
@@ -119,8 +121,8 @@ enum DbSubcommand {
     /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
     /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
     /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
-    /// rebuild replays epoch 0 from the node's own packs. Dry-run by default; pass `--force` to
-    /// apply.
+    /// rebuild replays epoch 0 from the node's own packs. `--for-swap` skips that refusal for the
+    /// side-observer swap. Dry-run by default; pass `--force` to apply.
     ResetExecution(DbResetExecutionArgs),
 }
 
@@ -130,20 +132,37 @@ pub struct DbResetExecutionArgs {
     /// Move the entries. Without it, print what would move and change nothing.
     #[arg(long)]
     pub force: bool,
+    /// The side-observer swap: a synced observer's `db` and `static_files` are copied in before
+    /// the next start, which then executes only the consensus output past the copy's tip. Skips
+    /// the refusal of a datadir whose consensus database holds no epoch-0 pack (one bootstrapped
+    /// with `db load-state`). Without that copy the next start rebuilds from genesis, which such a
+    /// datadir cannot do.
+    #[arg(long)]
+    pub for_swap: bool,
 }
 
 impl DbResetExecutionArgs {
     /// Run the reset on `datadir` (a dry run without `--force`) and print what it did.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        let plan = reset_execution::reset_execution(&datadir, self.force)?;
+        let mode = if self.for_swap {
+            reset_execution::ResetMode::Swap
+        } else {
+            reset_execution::ResetMode::Rebuild
+        };
+        let plan = reset_execution::reset_execution(&datadir, self.force, mode)?;
         let moves = plan.moves.iter().map(|m| m.display().to_string()).collect::<Vec<_>>();
         if let Some(partial) = &plan.resumes {
             println!("finishing the unfinished execution reset in {}", partial.display());
         }
         if self.force {
+            let next = if self.for_swap {
+                "copy the observer's execution database in before the next start"
+            } else {
+                "the next start rebuilds it from genesis"
+            };
             println!(
-                "moved the execution database ({}) aside to {}; the next start rebuilds it from \
-                 genesis. To undo, stop the node and move the entries back into {}",
+                "moved the execution database ({}) aside to {}; {next}. To undo, stop the node and \
+                 move the entries back into {}",
                 moves.join(", "),
                 plan.target.display(),
                 datadir.display(),
@@ -153,6 +172,30 @@ impl DbResetExecutionArgs {
                 "dry run: would move {} into {}; pass --force to apply",
                 moves.join(", "),
                 plan.target.display(),
+            );
+        }
+        for (link, to) in &plan.links {
+            println!(
+                "warning: {} is a link to {}: the reset moves the link, not what it points to, \
+                 and the next start creates a new {} in the datadir, on the datadir's filesystem",
+                link.display(),
+                to.display(),
+                link.display(),
+            );
+        }
+        let available = plan
+            .available_bytes
+            .map_or_else(|| "an unknown amount".to_owned(), |bytes| human_bytes(bytes as f64));
+        println!(
+            "the moved-aside execution database holds {} until {} is deleted; the new one needs \
+             about as much again, and the datadir's filesystem has {available} free",
+            human_bytes(plan.moved_bytes as f64),
+            plan.target.display(),
+        );
+        if plan.available_bytes.is_some_and(|free| free < plan.moved_bytes) {
+            println!(
+                "warning: less is free than the moved-aside database holds: free space before the \
+                 next start, or the new database may fill the filesystem"
             );
         }
         Ok(())
@@ -949,11 +992,29 @@ impl DbLoadStateArgs {
         // creates is ours to remove if it fails. Snapshot which already exist first, so a failure
         // removes only what we created, never a real node's pre-existing data, and never the
         // operator's keys/config/genesis (which live in sibling subdirectories).
+        //
+        // A run stopped part-way (killed, out of memory) left its marker and the chain data it
+        // created: remove them first, so this run starts on the datadir that one started on.
+        if load_state_marker::clear_interrupted_load_state(&datadir, &chain_data_dirs(&datadir))? {
+            println!(
+                "removed the chain data of an unfinished `db load-state` from {}; restoring again",
+                datadir.display()
+            );
+        }
         let preexisting: HashSet<PathBuf> =
             chain_data_dirs(&datadir).into_iter().filter(|dir| dir.exists()).collect();
+        let created: Vec<PathBuf> = chain_data_dirs(&datadir)
+            .into_iter()
+            .filter(|dir| !preexisting.contains(dir))
+            .collect();
 
         let outcome = (|| -> eyre::Result<(BlockNumHash, B256)> {
-            let (block, root) = restore_pack(&reth_config, datadir.reth_db_path(), &self.pack)?;
+            // the marker goes in once the restore has found the datadir free of chain data, before
+            // it writes any: from there until it is removed below, a node refuses this datadir
+            let (block, root) =
+                restore_pack(&reth_config, datadir.reth_db_path(), &self.pack, || {
+                    load_state_marker::write(&datadir, &created)
+                })?;
 
             // Rebuild the consensus + epoch-records packs from the bundle's data-only files. A
             // plain copy would not work: these files have no index sidecars and the
@@ -979,14 +1040,31 @@ impl DbLoadStateArgs {
                 // Surgically remove only the chain-data dirs this import created; the operator's
                 // keys, node info, and genesis config are left intact so a failed import never
                 // costs them irreplaceable material.
-                clean_created_chain_data(&datadir, &preexisting);
+                if clean_created_chain_data(&datadir, &preexisting) {
+                    return Err(e.wrap_err(format!(
+                        "state import failed; removed the chain data it created under {} (node \
+                         keys and config left intact) — fix the export bundle and re-run `db \
+                         load-state`",
+                        datadir.display()
+                    )));
+                }
                 return Err(e.wrap_err(format!(
-                    "state import failed; removed the chain data it created under {} (node keys \
-                     and config left intact) — fix the export bundle and re-run `db load-state`",
+                    "state import failed; removed what it could of the chain data it created under \
+                     {} (node keys and config left intact), but the datadir still holds an \
+                     unfinished restore, which a node refuses: re-run `db load-state`, which \
+                     removes the rest or names what to remove by hand",
                     datadir.display()
                 )));
             }
         };
+        load_state_marker::remove(&datadir).map_err(|e| {
+            e.wrap_err(format!(
+                "the restore into {} is complete, but its marker {} could not be removed, and a \
+                 node refuses the datadir while it is there: remove it by hand",
+                datadir.display(),
+                load_state_marker::marker_path(&datadir).display(),
+            ))
+        })?;
 
         println!(
             "restored execution state at block {} (state root {root:#x}) into {}",
@@ -1008,15 +1086,22 @@ fn chain_data_dirs(datadir: &Path) -> [PathBuf; 3] {
 }
 
 /// Best-effort removal of the chain data a failed import created — every [`chain_data_dirs`]
-/// entry not already present in `preexisting`, then the restored-state floor marker
-/// (`import_chain_scaffold` writes it before any chain data commits, so a failed import can
-/// leave it orphaned; a stale floor would poison a later normal sync of this datadir by
-/// refusing pinned reads it can actually serve). The marker goes last: removing it before the
-/// dirs could leave restored chain data without its floor if this cleanup itself dies midway.
-/// Skipping pre-existing dirs is a safety guard: even if `db load-state` were pointed at a
-/// populated datadir, this never deletes data the import did not create. Removal errors are
-/// logged, not fatal (the import is already failing).
-fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) {
+/// entry not already present in `preexisting` — then, when the import wrote them, the
+/// restored-state floor marker (`import_chain_scaffold` writes it before any chain data commits,
+/// so a failed import can leave it orphaned; a stale floor would poison a later normal sync of
+/// this datadir by refusing pinned reads it can actually serve) and the restore's own marker
+/// (`load_state_marker`). Skipping pre-existing dirs is a safety guard: even if `db load-state`
+/// were pointed at a populated datadir, this never deletes data the import did not create.
+///
+/// The import writes both markers only once it has found the datadir free of chain data, so
+/// without its own marker a floor marker here is not its own (a restored node's, which the
+/// freshness check refused) and stays. With a pre-existing chain-data dir the import may have
+/// written into, both markers stay: the datadir holds part of a restore, which a node refuses
+/// and a rerun names. The markers go last: removing them before the dirs could leave restored
+/// chain data without them if this cleanup itself dies midway. Removal errors are logged, not
+/// fatal (the import is already failing). Returns whether the datadir is back as it was.
+fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) -> bool {
+    let mut back = true;
     for dir in chain_data_dirs(datadir) {
         if preexisting.contains(&dir) {
             continue;
@@ -1026,15 +1111,33 @@ fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 eprintln!("warning: could not remove {} during import cleanup: {e}", dir.display());
+                back = false;
             }
         }
     }
-    let marker = tn_reth::RethEnv::restored_state_floor_marker(datadir);
-    fs::remove_file(&marker)
+    match load_state_marker::present(datadir) {
+        Ok(true) => {}
+        Ok(false) => return back,
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            return false;
+        }
+    }
+    if !back || !preexisting.is_empty() {
+        return false;
+    }
+    let floor = tn_reth::RethEnv::restored_state_floor_marker(datadir);
+    if let Err(e) = fs::remove_file(&floor)
         .or_else(|e| (e.kind() == std::io::ErrorKind::NotFound).then_some(()).ok_or(e))
-        .unwrap_or_else(|e| {
-            eprintln!("warning: could not remove {} during import cleanup: {e}", marker.display())
-        });
+    {
+        eprintln!("warning: could not remove {} during import cleanup: {e}", floor.display());
+        return false;
+    }
+    if let Err(e) = load_state_marker::remove(datadir) {
+        eprintln!("warning: could not remove the restore's marker during import cleanup: {e:#}");
+        return false;
+    }
+    true
 }
 
 /// Reject an export bundle that cannot produce a resumable node, returning `Err` before any datadir
@@ -1218,7 +1321,9 @@ fn check_state_pack_matches_record(pack: &Path, record: &EpochRecord) -> eyre::R
 }
 
 /// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
-/// returning the snapshot block and its recomputed state root.
+/// returning the snapshot block and its recomputed state root. `before_writes` runs once
+/// `SnapshotRestorer::open` has found the database free of chain data, before the restore writes
+/// anything into it.
 ///
 /// Runs inside a one-shot tokio runtime because `SnapshotRestorer::open` (reth provider setup)
 /// requires a runtime context; the restore steps themselves are synchronous.
@@ -1226,6 +1331,7 @@ fn restore_pack(
     reth_config: &RethConfig,
     db_path: PathBuf,
     pack: &Path,
+    before_writes: impl FnOnce() -> eyre::Result<()>,
 ) -> eyre::Result<(BlockNumHash, B256)> {
     // The reth provider setup (`RethEnv::new` inside `SnapshotRestorer::open`) captures the current
     // tokio handle, so establish a runtime context. The restore steps are otherwise synchronous;
@@ -1243,6 +1349,7 @@ fn restore_pack(
 
     // `open` refuses a datadir that already holds chain data, so this only lands in a fresh one.
     let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
+    before_writes()?;
     restorer.import_chain_scaffold(&window, final_state)?;
     let root = restorer.import_state(&mut reader)?;
     // Reject a bundle the node could not resume from BEFORE declaring the import complete. The
@@ -2378,7 +2485,7 @@ mod tests {
         // `db` was present before the import (simulating a real node's data), so it must survive;
         // the import created `static_files` and `consensus-db`.
         let preexisting: HashSet<PathBuf> = [d.join("db")].into_iter().collect();
-        super::clean_created_chain_data(d, &preexisting);
+        assert!(super::clean_created_chain_data(d, &preexisting), "no restore marker: back");
 
         // Chain-data dirs the import created are removed:
         assert!(!d.join("static_files").exists(), "created static_files must be removed");
@@ -2389,6 +2496,58 @@ mod tests {
         assert!(d.join("node-keys").join("bls.key").exists(), "node keys must be preserved");
         assert!(d.join("node-info.yaml").exists(), "node-info.yaml must be preserved");
         assert!(d.join("genesis").exists(), "genesis dir must be preserved");
+    }
+
+    /// The failed import's cleanup removes the floor marker and the restore's marker only when the
+    /// import wrote them (its marker is there) and created every chain-data dir. Without its
+    /// marker the import stopped at the freshness check, and a floor marker is a restored node's.
+    /// Beside a pre-existing chain-data dir it may have written into, both markers stay, so a node
+    /// refuses the datadir and a rerun names what to remove.
+    #[test]
+    fn clean_created_chain_data_removes_the_markers_only_when_they_are_its_own() {
+        use std::{collections::HashSet, path::PathBuf};
+        let floor = |d: &Path| tn_reth::RethEnv::restored_state_floor_marker(d);
+
+        // refused at the freshness check: a restored node's db, static files and floor
+        let datadir = tempfile::tempdir().unwrap();
+        let d = datadir.path();
+        for dir in super::chain_data_dirs(d) {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(floor(d), b"42\n").unwrap();
+        let preexisting: HashSet<PathBuf> = super::chain_data_dirs(d).into_iter().collect();
+        assert!(super::clean_created_chain_data(d, &preexisting));
+        assert!(floor(d).exists(), "a restored node's floor marker stays");
+
+        // failed after the freshness check, in a datadir it created all chain data in
+        let datadir = tempfile::tempdir().unwrap();
+        let d = datadir.path();
+        let created = super::chain_data_dirs(d);
+        for dir in &created {
+            fs::create_dir_all(dir).unwrap();
+        }
+        super::load_state_marker::write(d, &created).unwrap();
+        fs::write(floor(d), b"42\n").unwrap();
+        assert!(super::clean_created_chain_data(d, &HashSet::new()));
+        assert!(!floor(d).exists(), "its floor marker goes");
+        assert!(!super::load_state_marker::present(d).unwrap(), "its marker goes");
+        super::refuse_interrupted_load_state(d).unwrap();
+
+        // failed after the freshness check, beside a db that was there before it
+        let datadir = tempfile::tempdir().unwrap();
+        let d = datadir.path();
+        for dir in super::chain_data_dirs(d) {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let [db, static_files, consensus] = super::chain_data_dirs(d);
+        super::load_state_marker::write(d, &[static_files.clone(), consensus.clone()]).unwrap();
+        fs::write(floor(d), b"42\n").unwrap();
+        let preexisting: HashSet<PathBuf> = [db.clone()].into_iter().collect();
+        assert!(!super::clean_created_chain_data(d, &preexisting));
+        assert!(db.exists() && !static_files.exists() && !consensus.exists());
+        assert!(floor(d).exists(), "the floor marker stays beside the restored db");
+        let err = super::refuse_interrupted_load_state(d).expect_err("a node refuses the datadir");
+        assert!(err.to_string().contains("did not finish"), "{err}");
     }
 
     // --- import verification (`verify_and_save_epoch_records`) ---
@@ -3005,9 +3164,10 @@ mod tests {
 
     #[test]
     fn parse_db_reset_execution_subcommand() {
-        for (args, force) in [
-            (&["tn", "db", "reset-execution"][..], false),
-            (&["tn", "db", "reset-execution", "--force"][..], true),
+        for (args, force, for_swap) in [
+            (&["tn", "db", "reset-execution"][..], false, false),
+            (&["tn", "db", "reset-execution", "--force"][..], true, false),
+            (&["tn", "db", "reset-execution", "--force", "--for-swap"][..], true, true),
         ] {
             let cli = Cli::<NoArgs>::try_parse_args_from(args.iter().copied()).expect("parsed");
             let Commands::Db(db) = cli.command else {
@@ -3017,6 +3177,7 @@ mod tests {
                 panic!("expected reset-execution");
             };
             assert_eq!(reset.force, force, "{args:?}");
+            assert_eq!(reset.for_swap, for_swap, "{args:?}");
         }
     }
 
