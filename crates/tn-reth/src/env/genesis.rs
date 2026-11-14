@@ -99,8 +99,9 @@ use crate::{
 /// ([`RethEnv::new_for_temp_chain`] and the seams built on it), never by [`RethConfig::new`] or
 /// [`RethConfig::from_node_config`], which the node and `db load-state` open their datadirs with.
 /// `./etc/ci-lanes.sh test-default` sets it to `v1` for a second run of tn-reth's and tn-engine's
-/// suites, so layout v1 on tn-lmdb (every migrated testnet datadir) keeps the coverage it had
-/// before new datadirs moved to v2.
+/// suites, so the tests on temp chains run layout v1 on tn-lmdb (every migrated testnet datadir)
+/// too. Tests that open a datadir as the node does (`test_utils::load::open_production_env`) stay
+/// on v2 under it; those that need v1 name it (`open_production_env_with_layout`).
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) const TEST_NEW_DATADIR_LAYOUT_VAR: &str = "TN_TEST_NEW_DATADIR_LAYOUT";
 
