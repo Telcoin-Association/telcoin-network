@@ -51,7 +51,7 @@ pub(crate) const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
 /// floor of eight ring entries. A delay longer than the commit interval makes the slow nodes' lag
 /// grow without bound; past the floor the fix cannot help by design (measured at the quick cadence:
 /// the adaptive arm then certified 0.59 of the fast node's headers, nearly all named at the floor).
-const SLOW_EXECUTION_DELAY_MS: u64 = 1750;
+pub(crate) const SLOW_EXECUTION_DELAY_MS: u64 = 1750;
 
 /// How long each arm of [`test_fast_executor_is_certified`] measures under load: about 100 rounds.
 const MEASURE_WINDOW: Duration = Duration::from_secs(90);
@@ -206,7 +206,7 @@ pub(crate) fn expected_switches(
 /// more than that to miss its header, yet by less than the commit interval of about 400 ms to keep
 /// up: a margin a loaded host does not keep. At about a second a round, both margins are about half
 /// a second.
-const PRODUCTION_CADENCE: [(&str, &str); 3] =
+pub(crate) const PRODUCTION_CADENCE: [(&str, &str); 3] =
     [("min_header_delay", "1s"), ("max_header_delay", "2500ms"), ("max_batch_delay", "1s")];
 
 /// The most own headers, as a share of those it proposed in the window, the fast validator may
