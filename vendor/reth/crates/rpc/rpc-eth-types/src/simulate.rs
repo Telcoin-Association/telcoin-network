@@ -5,7 +5,9 @@ use crate::{
     CallManyBudget, EthApiError,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction as _};
-use alloy_eips::eip2718::WithEncoded;
+use alloy_eips::{
+    eip2718::WithEncoded, eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS,
+};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_network::TransactionBuilder;
 use alloy_rpc_types_eth::{
@@ -203,6 +205,34 @@ pub fn apply_precompile_overrides(
         precompiles.apply_precompile(&dest, |_| Some(precompile));
     }
 
+    Ok(())
+}
+
+/// TN(TN-0171): the contracts a simulated block's pre-execution system calls run before its
+/// calls: EIP-4788's beacon roots contract and EIP-2935's block hash history contract.
+pub const SYSTEM_CALL_TARGETS: [Address; 2] = [BEACON_ROOTS_ADDRESS, HISTORY_STORAGE_ADDRESS];
+
+/// TN(TN-0171): refuses state overrides that replace the code a pre-execution system call runs:
+/// new `code` for a [`SYSTEM_CALL_TARGETS`] address, or a precompile moved onto one.
+///
+/// A system call runs once per simulated block, outside the request's gas budget, with the
+/// executor's own gas limit. With the chain's own contracts it costs a few storage writes;
+/// overrides of their balance, nonce or storage are still allowed.
+pub fn check_system_call_overrides(state_overrides: &StateOverride) -> Result<(), EthApiError> {
+    for (address, account_override) in state_overrides {
+        let target = if SYSTEM_CALL_TARGETS.contains(address) && account_override.code.is_some() {
+            address
+        } else if let Some(dest) =
+            account_override.move_precompile_to.as_ref().filter(|d| SYSTEM_CALL_TARGETS.contains(d))
+        {
+            dest
+        } else {
+            continue
+        };
+        return Err(EthApiError::InvalidParams(format!(
+            "state override replaces the code of system contract {target}"
+        )))
+    }
     Ok(())
 }
 

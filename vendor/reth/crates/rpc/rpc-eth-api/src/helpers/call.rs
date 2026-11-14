@@ -88,6 +88,14 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             if block_state_calls.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
             }
+            // TN(TN-0171): every block runs the pre-execution system calls outside the gas
+            // budget, so their code stays the chain's own.
+            for block in &block_state_calls {
+                if let Some(state_overrides) = &block.state_overrides {
+                    simulate::check_system_call_overrides(state_overrides)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+            }
 
             let permit = self
                 .acquire_owned_blocking_io()
@@ -114,6 +122,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 let mut prev_timestamp = parent.timestamp();
 
                 for block in block_state_calls {
+                    // TN(TN-0171): a block with no calls still runs the system calls.
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     // Validate block number ordering if overridden
                     if let Some(number) = block.block_overrides.as_ref().and_then(|o| o.number) {
                         let number: u64 = number.try_into().unwrap_or(u64::MAX);

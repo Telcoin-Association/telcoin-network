@@ -2546,8 +2546,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   gas per request on one blocking thread, with cancellation only between calls. Upstream fixed
   it in b8116b42b (#24387, after v1.11.4); the pick does not apply to this base (its Amsterdam
   gas split needs a newer revm and alloy-evm), so this takes its rule: a call runs with at most
-  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request now
-  uses at most `--rpc.gascap` gas in all (50M by default), the budget `eth_callMany` has, and
+  what the earlier calls of the request left, as geth's `sanitizeCall` caps it. A request's
+  calls now use at most `--rpc.gascap` gas in all (50M by default; TN-0171 bounds the
+  pre-execution system calls each block also runs), the budget `eth_callMany` has, and
   fails with the same -32602 error (`request exceeds the gas budget of <cap>`). Requests that
   stay under the budget get the same results, except a call whose gas limit, given or default,
   exceeded what was left, which now runs with less gas. How the default is chosen (the block's
@@ -2591,3 +2592,30 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   history contract answers the genesis hash to `eth_call`, to `eth_callMany` and to
   `debug_traceCallMany` at transaction index 0; `eth_callMany` answered zero without the fix).
   *Upstream*: upstream main replays through `Trace::replay_block_until`, which applies them.
+
+- **TN-0171** — `eth_simulateV1` refuses state overrides that replace the code its
+  pre-execution system calls run, and checks for cancellation before each block.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/simulate.rs` (`SYSTEM_CALL_TARGETS`,
+  `check_system_call_overrides`), `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1`
+  checks every block's overrides before it takes the blocking-IO permit, and `is_cancelled()`
+  at the top of each block), `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulate_blocks`, test
+  `system_call_targets_keep_their_code`).
+  *Why*: every simulated block runs the executor's pre-execution system calls before its calls:
+  on TN the EIP-4788 beacon roots contract (an output's first batch, which a simulated block
+  is) and the EIP-2935 history contract, each with the executor's system-call gas limit
+  (100M on TN) and outside TN-0156's budget. A block's state overrides are applied before them
+  and could give either address any code, so a request of 256 blocks
+  (`--rpc.max-simulate-blocks`) with no calls could run about a thousand times `--rpc.gascap`, with
+  cancellation checked only between calls. Overrides that set `code` on either address, or move
+  a precompile onto one, are now refused with -32602 (`state override replaces the code of
+  system contract <address>`) before any work; balance, nonce and storage overrides of those
+  accounts are still applied. The chain's own contracts make one or two storage writes per
+  call, under 100,000 gas a block, so 256 blocks of them stay under 26M gas. Requests that do
+  not replace those contracts' code get the same results. *Can reach execution or storage*:
+  no. RPC only: the check and the cancellation point run in `simulate_v1`, which block
+  execution does not call.
+  *Tests*: `system_call_targets_keep_their_code` (new code on either address, empty code, and
+  a precompile moved onto the history contract are refused; a balance and storage override of
+  it simulates). Mutation-checked: the check removed (the refusals fail).
+  *Upstream*: no; upstream has the same shape.
