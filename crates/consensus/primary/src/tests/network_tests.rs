@@ -5603,6 +5603,101 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
 
 // ---- bench7 voter-lock ----
 
+// ---- bench7 vote-queue: review follow-ups ----
+
+/// A header from `author` at `round` that names `block` and carries one batch on a worker the
+/// committee does not run: inside the vote window, but refused by `Header::validate` as
+/// `UnkownWorkerId`.
+fn header_on_unknown_worker(
+    committee: &CommitteeFixture<MemDatabase>,
+    author: &AuthorityFixture<MemDatabase>,
+    round: Round,
+    block: BlockNumHash,
+) -> Header {
+    author
+        .header_builder_at_round(&committee.committee(), round)
+        .latest_execution_block(block)
+        .payload([(BlockHash::random(), u16::MAX)].into_iter().collect())
+        .build()
+}
+
+/// A vote request whose header fails the stateless checks is refused at once, without the wait for
+/// execution, whether `vote_queue_fix` is `on` or not, and with the same fatal penalty. It still
+/// goes through the author lock and leaves the same entry there: a well-formed header of the same
+/// round is refused against it. With the switch on it also still sets its author's mark, so a
+/// lower round is refused as superseded; with it off that round is refused against the entry.
+async fn malformed_header_is_refused_without_the_wait(on: bool) -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), on).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+
+    // inside the vote window and naming a block this node has not executed, so a request that
+    // waited for it would wait the whole execution wait
+    let malformed = header_on_unknown_worker(&committee, author, 3, unexecuted);
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, malformed, Vec::new())
+        .await
+        .expect_err("a header on an unknown worker is refused");
+    assert_eq!(
+        start.elapsed(),
+        Duration::ZERO,
+        "a header that fails the stateless checks must not wait for execution (switch on: {on})"
+    );
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::UnkownWorkerId));
+    assert_matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal), "the penalty stays");
+
+    // the refusal was decided under the author lock and recorded in the author's entry
+    let rival = header_at(&committee, author, 3, executed);
+    assert_matches!(
+        handler.vote(peer, rival, Vec::new()).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 3,
+            ours: 3
+        })),
+        "the refused header's entry must hold round 3 (switch on: {on})"
+    );
+
+    let lower = header_at(&committee, author, 2, executed);
+    let res = handler.vote(peer, lower, Vec::new()).await;
+    if on {
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
+            "the refused header still sets its author's mark"
+        );
+    } else {
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+                theirs: 2,
+                ours: 3
+            })),
+            "without the switch a lower round is refused against the entry"
+        );
+    }
+
+    Ok(())
+}
+
+/// [`malformed_header_is_refused_without_the_wait`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_on_refuses_malformed_header_without_the_wait() -> eyre::Result<()> {
+    malformed_header_is_refused_without_the_wait(true).await
+}
+
+/// [`malformed_header_is_refused_without_the_wait`] with `vote_queue_fix` off, as on main.
+#[tokio::test(start_paused = true)]
+async fn vote_queue_fix_off_refuses_malformed_header_without_the_wait() -> eyre::Result<()> {
+    malformed_header_is_refused_without_the_wait(false).await
+}
+
+// ---- bench7 voter-lock (continued) ----
+
 /// A header from `author` at `round` that names `block`, created `round` ms after the UNIX epoch,
 /// far behind the wall clock, so the vote path's drift check never defers it.
 fn header_at(
