@@ -644,8 +644,13 @@ fn persist_output_with_retry(
 /// [`ProviderError::UnexpectedStaticFileBlockNumber`]. That class can never succeed
 /// in-process (the writer stays advanced until reth's startup consistency check
 /// reconciles it on restart), so it is terminal and must not burn further attempts.
+/// So is a database that has failed for good ([`tn_reth::error::database_failed`]):
+/// tn-lmdb's failure latch, tripped by an earlier write, sync or commit failure or by damage
+/// a read found, refuses every write until a restart reopens the database, and damage stays
+/// on disk. The engine fails at once with that cause, and the node stops (fail-stop).
 fn retryable_persist_fault(err: &ProviderError) -> bool {
     !matches!(err, ProviderError::UnexpectedStaticFileBlockNumber(..))
+        && !tn_reth::error::database_failed(err)
 }
 
 /// Roll back the eager per-block in-memory canonical advance for a consensus output whose batch
@@ -704,6 +709,13 @@ mod tests {
     #[test]
     fn test_ordinary_provider_fault_is_retryable() {
         assert!(retryable_persist_fault(&ProviderError::HeaderNotFound(0u64.into())));
+    }
+
+    /// A latched (failed) execution database refuses every write until a restart, so a
+    /// persist that meets it is terminal: no attempt of the budget can succeed.
+    #[test]
+    fn test_latched_database_is_not_retryable() {
+        assert!(!retryable_persist_fault(&tn_reth::error::latched_database_error()));
     }
 
     /// The laps sum across an output's blocks, the maxima keep the slowest block's root and evm

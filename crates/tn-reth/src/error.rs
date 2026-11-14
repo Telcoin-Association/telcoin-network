@@ -170,6 +170,38 @@ impl From<TnRethError> for EthApiError {
     }
 }
 
+/// Whether `err` comes from an execution database that has failed for good in this process:
+/// tn-lmdb's failure latch (`MDBX_PANIC`: a failed write, sync or commit, or damage a read or
+/// write found, stops every later write and commit until the node restarts and reopens the
+/// database) or damage itself (`MDBX_CORRUPTED`, which latches it). No retry of the call in this
+/// process can succeed. The codes mean the same on the MDBX build (a fatal environment error, a
+/// corrupted database).
+pub fn database_failed(err: &ProviderError) -> bool {
+    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
+    let ProviderError::Database(db) = err else { return false };
+    let code = match db {
+        DatabaseError::Open(info)
+        | DatabaseError::CreateTable(info)
+        | DatabaseError::Read(info)
+        | DatabaseError::Delete(info)
+        | DatabaseError::Commit(info)
+        | DatabaseError::InitTx(info)
+        | DatabaseError::InitCursor(info)
+        | DatabaseError::Stats(info) => info.code,
+        DatabaseError::Write(write) => write.info.code,
+        _ => return false,
+    };
+    [MdbxError::Panic, MdbxError::Corrupted].iter().any(|e| e.to_err_code() == code)
+}
+
+/// Test-only: the error a persist meets once tn-lmdb's failure latch has tripped (`MDBX_PANIC` at
+/// the begin of its write transaction), which [`database_failed`] reports.
+#[cfg(any(feature = "test-utils", test))]
+pub fn latched_database_error() -> ProviderError {
+    let info = reth_db::mdbx::Error::Panic.into();
+    ProviderError::Database(reth_db::DatabaseError::InitTx(info))
+}
+
 impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
     fn from(_: std::sync::mpsc::SendError<T>) -> Self {
         Self::TreeChannelClosed
@@ -254,5 +286,44 @@ impl RestoredStateFloorError {
     /// Bundle the refused pin's block number with the floor it fell below.
     pub(crate) fn new(pinned: u64, floor: u64) -> Self {
         Self { pinned, floor }
+    }
+}
+
+#[cfg(test)]
+mod database_failed_tests {
+    use super::*;
+    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
+
+    /// A latched tn-lmdb environment (`MDBX_PANIC`) or damage (`MDBX_CORRUPTED`), whichever
+    /// database call met it, has failed for good; any other database error, or a provider error
+    /// that is not a database error, has not.
+    #[test]
+    fn a_latched_or_damaged_database_has_failed_for_good() {
+        assert!(database_failed(&latched_database_error()));
+        let errors = |code: MdbxError| {
+            let info = || code.into();
+            [
+                DatabaseError::Open(info()),
+                DatabaseError::CreateTable(info()),
+                DatabaseError::Read(info()),
+                DatabaseError::Delete(info()),
+                DatabaseError::Commit(info()),
+                DatabaseError::InitTx(info()),
+                DatabaseError::InitCursor(info()),
+                DatabaseError::Stats(info()),
+            ]
+        };
+        for code in [MdbxError::Panic, MdbxError::Corrupted] {
+            for err in errors(code) {
+                assert!(database_failed(&ProviderError::Database(err.clone())), "{err:?}");
+            }
+        }
+        for code in [MdbxError::Busy, MdbxError::MapFull, MdbxError::KeyExist] {
+            for err in errors(code) {
+                assert!(!database_failed(&ProviderError::Database(err.clone())), "{err:?}");
+            }
+        }
+        assert!(!database_failed(&ProviderError::Database(DatabaseError::Decode)));
+        assert!(!database_failed(&ProviderError::HeaderNotFound(0u64.into())));
     }
 }
