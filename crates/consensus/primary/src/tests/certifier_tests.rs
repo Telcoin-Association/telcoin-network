@@ -109,6 +109,7 @@ impl<DB: Database> CertifierContext<DB> {
             metrics: cx.consensus_bus.app().metrics().clone(),
             consensus_bus: cx.consensus_bus.clone(),
             config,
+            own_cert_delay: None,
         };
         (cx, certifier)
     }
@@ -2636,4 +2637,188 @@ async fn full_report_queue_drops_the_report_without_stalling() {
     if let Ok(report) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
         panic!("the cancel's report should have been dropped, got {report:?}");
     }
+}
+
+// ---- bench7 digest-order-hold ----
+
+/// How long the own-certificate hook holds a certificate in these tests: virtual time on the
+/// paused clock, shorter than [`STEP_TIMEOUT`] and [`QUIET_WINDOW`].
+const HOLD: Duration = Duration::from_secs(5);
+
+/// An own-certificate hold of [`HOLD`] at `stage` on every `every`-th round.
+fn hold_every(stage: OwnCertDelayStage, every: u32) -> Option<OwnCertDelay> {
+    let every = std::num::NonZeroU32::new(every).expect("non-zero every");
+    Some(OwnCertDelay::new(HOLD, stage, every))
+}
+
+/// With the `after_store` hold the own certificate is stored at once, and reaches this node's DAG
+/// (the certificate manager's output, which also feeds the parents of the next own header) and
+/// gossip only once the hold has passed.
+///
+/// Catches: a hold placed before the store, which would leave the header without its guard record,
+/// and a hold that lets the certificate reach the DAG early.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn own_cert_hold_after_store_stores_at_once_and_releases_after_the_hold() {
+    let (mut cx, mut certifier) = CertifierContext::unspawned(4);
+    certifier.own_cert_delay = hold_every(OwnCertDelayStage::AfterStore, 1);
+    let header = cx.proposer_header();
+    let digest = header.digest();
+    let votes = cx.peer_votes(&header);
+    let mut cert_rx = cx.subscribe_new_certificates();
+    let (tx_headers, rx_headers) = mpsc::channel(1);
+    let _run = tokio::spawn(certifier.run(rx_headers));
+
+    tx_headers.send(header).await.expect("queue the header");
+    cx.network
+        .respond(votes.len(), "every peer votes", |peer, _| Reply::Vote(votes[peer].clone()))
+        .await;
+    certified(&cx, digest, "after_store: the certificate is stored before the hold").await;
+
+    let early = HOLD - Duration::from_millis(10);
+    if let Ok(certificate) = tokio::time::timeout(early, cert_rx.recv()).await {
+        panic!("the certificate reached the DAG during the hold: {certificate:?}");
+    }
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the certificate reaches the DAG once the hold has passed")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), digest);
+    let gossip = cx.network.next_publish("gossip of the held certificate").await;
+    assert!(
+        gossip == certificate_gossip(certificate).await,
+        "the gossip must carry the certificate"
+    );
+    drop(tx_headers);
+}
+
+/// With `EVERY=2` only the headers at even rounds are held: the `before_store` hold returns the
+/// certificate of an odd-round header at once, and that of an even-round header only after the
+/// hold, with no newer header to cancel it.
+///
+/// Catches: a rate that holds every header, none, or the wrong half.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn own_cert_hold_every_second_round_holds_alternate_headers() {
+    let (mut cx, mut certifier) = CertifierContext::unspawned(4);
+    certifier.own_cert_delay = hold_every(OwnCertDelayStage::BeforeStore, 2);
+    let committee = cx.fixture.committee();
+    for round in 1..=4 {
+        let header = cx.proposer().header_builder_at_round(&committee, round).build();
+        let votes = cx.peer_votes(&header);
+        let started = Instant::now();
+        let proposal = start_proposal(&certifier, header.clone());
+        let context = format!("round {round}");
+        cx.network.respond(votes.len(), &context, |peer, _| Reply::Vote(votes[peer].clone())).await;
+        let certificate =
+            proposal_result(proposal, &context).await.expect("the header is certified");
+        assert_eq!(certificate.header().digest(), header.digest(), "{context}");
+        let took = started.elapsed();
+        assert_eq!(took >= HOLD, round.is_multiple_of(2), "{context}: the proposal took {took:?}");
+    }
+}
+
+/// With the `before_store` hold a newer own header that reaches the certifier during the hold
+/// cancels the held proposal: the held header is never stored and is reported to the proposer,
+/// the cause of its `canceled` re-queue. The newer header, at an odd round, is not held.
+///
+/// Catches: a hold that the newer header cannot cancel (the older header would be certified late
+/// instead), and a cancelled hold that still stores its certificate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn own_cert_hold_before_store_is_canceled_by_the_next_header() {
+    let (mut cx, mut certifier) = CertifierContext::unspawned(4);
+    certifier.own_cert_delay = hold_every(OwnCertDelayStage::BeforeStore, 2);
+    let committee = cx.fixture.committee();
+    let storage = cx.proposer().consensus_config().node_storage().clone();
+    let held = cx.proposer().header_builder_at_round(&committee, 2).build();
+    let newer = cx.proposer().header_builder_at_round(&committee, 3).build();
+    let held_votes = cx.peer_votes(&held);
+    let newer_votes = cx.peer_votes(&newer);
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+    let (tx_headers, rx_headers) = mpsc::channel(2);
+    let _run = tokio::spawn(certifier.run(rx_headers));
+
+    tx_headers.send(held.clone()).await.expect("queue the held header");
+    cx.network
+        .respond(held_votes.len(), "held header: every peer votes", |peer, _| {
+            Reply::Vote(held_votes[peer].clone())
+        })
+        .await;
+    // on the paused clock a sleep ends only once every task is idle: the votes have reached
+    // quorum and the proposal waits in the hold
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_matches!(
+        storage.get::<ProposedCertificates>(&held.digest()),
+        Ok(None),
+        "the hold keeps the formed certificate from the store"
+    );
+
+    tx_headers.send(newer.clone()).await.expect("queue the newer header");
+    let report = tokio::time::timeout(STEP_TIMEOUT, rx_uncertified.recv())
+        .await
+        .expect("the newer header cancels the held one and reports it")
+        .expect("report channel open");
+    assert_eq!(report, (held.round(), held.digest()), "the report names the held header");
+    cx.network
+        .respond(newer_votes.len(), "newer header: every peer votes", |peer, _| {
+            Reply::Vote(newer_votes[peer].clone())
+        })
+        .await;
+    certified(&cx, newer.digest(), "the newer header is not held").await;
+
+    tokio::time::sleep(HOLD * 2).await;
+    assert_matches!(
+        storage.get::<ProposedCertificates>(&held.digest()),
+        Ok(None),
+        "the cancelled certificate is never stored"
+    );
+    if let Ok(report) = tokio::time::timeout(Duration::ZERO, rx_uncertified.recv()).await {
+        panic!("expected one report, for the held header only, got another: {report:?}");
+    }
+    drop(tx_headers);
+}
+
+/// A newer own header that reaches the certifier during an `after_store` hold is proposed and
+/// certified at once, and the held certificate still reaches the DAG once its hold has passed: the
+/// hold neither blocks the next header nor is cancelled by it.
+///
+/// Catches: a hold that keeps the proposal lock or the in-flight mark, and a hold that a newer
+/// header cuts short or drops.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn own_cert_hold_after_store_lets_the_next_header_through() {
+    let (mut cx, mut certifier) = CertifierContext::unspawned(4);
+    certifier.own_cert_delay = hold_every(OwnCertDelayStage::AfterStore, 1);
+    let committee = cx.fixture.committee();
+    let held = cx.proposer_header();
+    let newer = cx.proposer().header_builder_at_round(&committee, held.round() + 1).build();
+    let held_votes = cx.peer_votes(&held);
+    let newer_votes = cx.peer_votes(&newer);
+    let mut cert_rx = cx.subscribe_new_certificates();
+    let (tx_headers, rx_headers) = mpsc::channel(2);
+    let _run = tokio::spawn(certifier.run(rx_headers));
+    let start = Instant::now();
+
+    tx_headers.send(held.clone()).await.expect("queue the held header");
+    cx.network
+        .respond(held_votes.len(), "held header: every peer votes", |peer, _| {
+            Reply::Vote(held_votes[peer].clone())
+        })
+        .await;
+    certified(&cx, held.digest(), "the held header is stored").await;
+    tx_headers.send(newer.clone()).await.expect("queue the newer header");
+    cx.network
+        .respond(newer_votes.len(), "newer header: every peer votes", |peer, _| {
+            Reply::Vote(newer_votes[peer].clone())
+        })
+        .await;
+    certified(&cx, newer.digest(), "the newer header is certified during the hold").await;
+    let took = start.elapsed();
+    assert!(took < HOLD, "the newer header waited for the hold: {took:?}");
+
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the held certificate is released")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), held.digest(), "the held certificate comes first");
+    let took = start.elapsed();
+    assert!(took >= HOLD, "the held certificate is released only after the hold: {took:?}");
+    drop(tx_headers);
 }
