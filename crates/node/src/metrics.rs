@@ -70,6 +70,17 @@ impl EpochMetrics {
         metrics::counter!("tn_epoch.epoch_record_closing_block_check_total", "result" => result)
             .increment(1);
     }
+
+    /// Record one run of the close-time base-fee identity check (canonical tip + 1 equals the
+    /// entered epoch's `blockHeight`), labelled `ok` when it holds and `mismatch` when it does
+    /// not.
+    ///
+    /// Not counted when the epoch-info read behind it fails: the identity was not compared.
+    pub(crate) fn record_close_identity_check(holds: bool) {
+        let result = if holds { "ok" } else { "mismatch" };
+        metrics::counter!("tn_epoch.epoch_close_identity_check_total", "result" => result)
+            .increment(1);
+    }
 }
 
 /// Export each runtime switch as `tn_node_switch{name="<yaml key>"}`.
@@ -105,6 +116,9 @@ mod tests {
             EpochMetrics::record_closing_block_check("ok");
             EpochMetrics::record_closing_block_check("ok");
             EpochMetrics::record_closing_block_check("beacon_root");
+            EpochMetrics::record_close_identity_check(true);
+            EpochMetrics::record_close_identity_check(false);
+            EpochMetrics::record_close_identity_check(false);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -131,7 +145,7 @@ mod tests {
             .labels()
             .any(|l| l.key() == "read" && l.value() == "epoch-entry state read"));
 
-        // the check counter: one series per `result` label
+        // the two check counters: one series per `result` label
         let count = |name: &str, result: &str| {
             snapshot
                 .iter()
@@ -148,6 +162,9 @@ mod tests {
         let check = "tn_epoch.epoch_record_closing_block_check_total";
         assert_eq!(count(check, "ok"), 2);
         assert_eq!(count(check, "beacon_root"), 1);
+        let identity = "tn_epoch.epoch_close_identity_check_total";
+        assert_eq!(count(identity, "ok"), 1);
+        assert_eq!(count(identity, "mismatch"), 2);
     }
 
     // ---- bench6 bench6-switches ----
