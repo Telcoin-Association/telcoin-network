@@ -407,7 +407,7 @@ fn open(
     let env = RethEnv::new(&config, &tasks, database, None, GasAccumulator::default())?;
     eyre::ensure!(env.datadir_format().tx_bodies == tx_bodies, "the datadir's format");
     if let Some((consensus, epochs_dir)) = packs {
-        env.attach_tx_packs(consensus.clone(), epochs_dir)?;
+        env.attach_tx_packs(consensus, epochs_dir)?;
     }
     let pool = env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
     let methods = env
