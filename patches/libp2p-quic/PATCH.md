@@ -63,6 +63,18 @@ The task ends when the listener closes or is dropped. The node sets the field fr
 Public tracking: telcoin-network issues #1431 (maintenance and advisory coverage of carried
 transport patches) and #1432 (QUIC listener and cross-release interoperability coverage).
 
+The patch also fixes the socket a dial leaves from. A dial reuses a listener's socket, and
+upstream `GenTransport::eligible_listener` accepts any listener of the target's IP family for
+a non-loopback target, including one bound to 127.0.0.1 or `::1`. Such a socket cannot send to
+another host, so a node whose listeners all bind a loopback IP (keytool's default without
+`--external-*-addr`) found no public peers. The patch drops, for a non-loopback target, every
+listener whose bound socket address is loopback. With none left, `dial` does what upstream
+does with no listener: it uses the per-family dialer socket bound to the unspecified address
+(`PortUse::Reuse`) or a fresh one (`PortUse::New`), and a hole punch fails with
+`Error::NoActiveListenerForDialAsListener`. Upstream rust-libp2p master still accepts such a
+listener (checked 2026-11-14). `tests/smoke.rs::non_loopback_dial_skips_loopback_listener`
+covers the fix, and `CHANGELOG.md` records it.
+
 ## Diff against upstream
 
 Issue #1680 extends `IncomingStats` with fixed stage/decision/reason outcomes and shares an
@@ -72,6 +84,21 @@ hook. Accepted upgrades carry a guard until completion, timeout or cancellation.
 counters remain available. See [the observations contract](../../docs/quic-incoming-metrics.md)
 for the exact meanings and queries. Root and candidate manifests select both carried sources;
 independent interoperability peers retain their registry sources.
+
+`tests/smoke.rs` calls its own `Spawn` trait as `<P as Spawn>::spawn`: the carried
+`Provider::spawn` (used by `inbound_accept_task`) makes `P::spawn` ambiguous, so the upstream
+file does not compile with the `tokio` feature. The crate's tests need dev-dependencies that the
+node lockfile does not hold, so run them from a copy, seeded with the node lockfile and with the
+carried `quinn-proto` (from the repository root):
+
+```sh
+TMP=$(mktemp -d)
+cp -R patches/libp2p-quic "$TMP/crate"
+cp Cargo.lock "$TMP/crate/Cargo.lock"
+(cd "$TMP/crate" && cargo test --features tokio \
+  --config "patch.crates-io.quinn-proto.path=\"$PWD/patches/quinn-proto\"")
+rm -rf "$TMP"
+```
 
 `upstream.diff` is the unified diff against the registry copy, with relative paths and no
 file times. The upstream side uses `Cargo.toml.orig` as `Cargo.toml` and leaves out the
@@ -112,4 +139,5 @@ different source form. Passing a scanner alone does not qualify this copy.
 
 Remove this copy and the `[patch.crates-io]` entry when upstream `libp2p-quic` exposes a
 decision hook on incoming attempts (Retry, Refuse or Ignore before accept) and the quinn
-queue bounds. Then set the same values through the upstream API.
+queue bounds, and no longer dials a non-loopback address from a listener bound to a loopback
+IP. Then set the same values through the upstream API.

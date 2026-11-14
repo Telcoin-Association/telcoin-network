@@ -403,7 +403,7 @@ impl TaskManager {
     /// Will resolve once all tasks have shutdown or timeout is reached.
     /// Can be used after until_exit to split up the join.
     pub async fn wait_for_task_shutdown(&mut self) {
-        self.wait_for_task_shutdown_internal().await
+        self.wait_for_task_shutdown_internal().await;
     }
 
     /// Give the tasks up to `grace` to exit on their own (after their shutdown was signalled), so
@@ -420,6 +420,21 @@ impl TaskManager {
     /// stop a blocking task.
     pub fn signal_shutdown(&self) {
         self.local_shutdown.notify();
+    }
+
+    /// Stop and join every task once the shutdown the tasks follow has been notified.
+    ///
+    /// The tasks first get up to `grace` to exit on their own, so their graceful exits run. Then
+    /// the manager signals its own shutdown ([`Self::signal_shutdown`]), which ends the tasks
+    /// that follow only this manager (reth's tasks), and joins them for up to the join wait. Only
+    /// a task still running after both is logged as an error. True when every task exited.
+    pub async fn shutdown_tasks(&mut self, grace: Duration) -> bool {
+        self.update_tasks();
+        if self.join_tasks_within(grace).await {
+            return true;
+        }
+        self.signal_shutdown();
+        self.wait_for_task_shutdown_internal().await
     }
 
     /// Abort all of our direct tasks (not sub task managers though).
@@ -514,13 +529,17 @@ impl TaskManager {
         result
     }
 
-    /// Attempt to wait for all the tasks to complete or timeout waiting on them.
-    async fn wait_for_task_shutdown_internal(&mut self) {
+    /// Attempt to wait for all the tasks to complete or timeout waiting on them. True when all
+    /// of them did; otherwise the ones still running are logged.
+    async fn wait_for_task_shutdown_internal(&mut self) -> bool {
         let task_name = self.name.clone();
         let join_wait = Duration::from_millis(self.join_wait_millis);
-        if !self.join_tasks_within(join_wait).await {
-            tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
+        if self.join_tasks_within(join_wait).await {
+            return true;
         }
+        let running: Vec<&str> = self.tasks.iter().map(|task| task.info.name.as_str()).collect();
+        tracing::error!(target:"tn::tasks", ?running, "{}: All tasks NOT shutdown", task_name);
+        false
     }
 
     /// Join the tasks as they finish, logging each, for up to `wait`. True when all of them did.
@@ -1020,6 +1039,36 @@ mod test {
         task_manager.signal_shutdown();
         assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
         assert_eq!(Arc::strong_count(&held), 1, "the task released what it held");
+    }
+
+    /// After the node's shutdown is notified, `shutdown_tasks` lets the tasks that follow it run
+    /// their graceful exits, then ends the tasks that follow only the manager (reth's, blocking
+    /// or not) and joins every one within the shutdown grace, as the node's clean stop needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_tasks_ends_tasks_that_follow_only_the_manager() {
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        let mut task_manager = TaskManager::default();
+        task_manager.set_join_wait(500);
+        let node_shutdown = ShutdownNotifier::default();
+        let rx_shutdown = node_shutdown.subscribe();
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        task_manager.spawn_critical_task("follows the node shutdown", async move {
+            rx_shutdown.await;
+            // the graceful exit's own work
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(()).await;
+            Ok(())
+        });
+        let spawner = task_manager.get_spawner();
+        RethTaskSpawner::spawn_critical_task(&spawner, "reth", Box::pin(std::future::pending()));
+        RethTaskSpawner::spawn_blocking_task(&spawner, Box::pin(std::future::pending()));
+
+        node_shutdown.notify();
+        assert!(
+            task_manager.shutdown_tasks(Duration::from_millis(300)).await,
+            "every task exits within the grace and the join wait: {task_manager}"
+        );
+        assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
     }
 
     /// Regression: each spawn subscribes to the manager's shutdown notifier (a reth task three
