@@ -1288,7 +1288,7 @@ where
             primary_network_handle.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.clone(),
-            self.builder.tn_config.parameters.epoch_record_recertify,
+            &self.builder.tn_config.parameters,
         );
 
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed
