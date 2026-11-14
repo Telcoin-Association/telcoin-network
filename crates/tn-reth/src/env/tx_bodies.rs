@@ -7,10 +7,12 @@
 //! inline never asks it). For block `number` with `header` and the positions asked it:
 //! 1. takes the batch digest from `header.ommers_hash` (zero is an error: the block names no batch)
 //!    and the epoch from the nonce's high 32 bits, the epoch whose pack holds the batch;
-//! 2. finds the batch in the decoded-batch cache (`cache`); in a test build, in the
-//!    [`MemoryBatches`] that stands in for packs; else in the packs (`packs`): the live epoch's,
-//!    else a closed epoch's, whose read checks the batch digest again. A batch read from a pack
-//!    goes into the cache's cold part;
+//! 2. finds the batch in the thread's read scope (`TxReadScope`, which `eth_getLogs` enters while
+//!    it reads one block's transactions one by one); else in the decoded-batch cache (`cache`); in
+//!    a test build, in the [`MemoryBatches`] that stands in for packs; else in the packs (`packs`):
+//!    the live epoch's, else a closed epoch's, whose read checks the batch digest again. A batch
+//!    read from a pack goes into the cache's cold part, and every batch found goes into the read
+//!    scope, if the thread is in one;
 //! 3. decodes the transaction at each position (EIP-2718), each position checked against the
 //!    batch's length.
 //!
@@ -39,6 +41,7 @@ use std::{
 };
 
 use reth_provider::{providers::TxBodyResolver, ProviderError, ProviderResult};
+use reth_rpc_eth_types::tx_read_scope::TxReadScope;
 use tn_storage::consensus_pack::BatchReadError;
 use tn_types::{
     Batch, BlockNumber, Decodable2718 as _, Epoch, ExecHeader, TransactionSigned, B256,
@@ -156,6 +159,9 @@ impl TxBodyErrorKind {
 /// Where a resolve found its batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BatchSource {
+    /// The thread's read scope ([`TxReadScope`]): an earlier read of the same block in one
+    /// `eth_getLogs` block match.
+    Scoped,
     /// The cache's recent or cold part.
     Cache(CachePart),
     /// The live epoch's pack.
@@ -169,12 +175,13 @@ pub(crate) enum BatchSource {
 
 impl BatchSource {
     /// Every `source` label of `tn_reth.tx_body_resolves_total`.
-    pub(crate) const LABELS: [&'static str; 5] =
-        ["recent", "cold", "live_pack", "closed_pack", "memory"];
+    pub(crate) const LABELS: [&'static str; 6] =
+        ["recent", "cold", "live_pack", "closed_pack", "memory", "scoped"];
 
     /// This source's `source` label.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Scoped => Self::LABELS[5],
             Self::Cache(part) => part.label(),
             Self::LivePack => Self::LABELS[2],
             Self::ClosedPack => Self::LABELS[3],
@@ -329,7 +336,8 @@ impl TxBodySource {
         }
     }
 
-    /// The batch `digest` of `epoch`, and where it was found.
+    /// The batch `digest` of `epoch`, and where it was found: the thread's read scope first, which
+    /// then keeps the batch for the scope's later reads.
     fn batch(
         &self,
         epoch: Epoch,
@@ -338,6 +346,21 @@ impl TxBodySource {
         if digest == B256::ZERO {
             return Err(TxBodyErrorKind::NoBatchDigest);
         }
+        if let Some(batch) = TxReadScope::get::<CachedBatch>(&digest) {
+            return Ok((batch, BatchSource::Scoped));
+        }
+        let (batch, source) = self.find_batch(epoch, digest)?;
+        TxReadScope::keep(digest, batch.clone());
+        Ok((batch, source))
+    }
+
+    /// The batch `digest` of `epoch` from the cache, a test build's [`MemoryBatches`] or the packs,
+    /// and where it was found.
+    fn find_batch(
+        &self,
+        epoch: Epoch,
+        digest: B256,
+    ) -> Result<(Arc<CachedBatch>, BatchSource), TxBodyErrorKind> {
         if let Some((batch, part)) = self.cache.get(&digest) {
             return Ok((batch, BatchSource::Cache(part)));
         }

@@ -25,6 +25,8 @@ pub mod receipt;
 pub mod simulate;
 pub mod transaction;
 pub mod tx_forward;
+// TN(TN-0204): the read scope `append_matching_block_logs` enters for TN's transaction resolver
+pub mod tx_read_scope;
 pub mod utils;
 
 pub use alloy_rpc_types_eth::FillTransaction;

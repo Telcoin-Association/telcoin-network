@@ -30,9 +30,9 @@
 //! [`record_tx_body_inline_rows`]).
 //!
 //! Transaction reads of such a datadir (`env::tx_bodies`): `tn_reth.tx_body_resolves_total`
-//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`) counts the blocks
-//! whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled by
-//! `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
+//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`, `scoped`) counts
+//! the blocks whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled
+//! by `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
 //! packs the resolver opened, the gauge `tn_reth.tx_body_cache_bytes` (labeled by `part`: `recent`,
 //! `cold`) the decoded-batch cache's size, and the histogram `tn_reth.tx_body_resolve_seconds` the
 //! resolves that read a pack. See [`register_tx_body_series`].
