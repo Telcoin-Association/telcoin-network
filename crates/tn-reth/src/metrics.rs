@@ -459,10 +459,18 @@ pub(crate) enum AccountWalkFallback {
     /// Fewer changed accounts than `SPLIT_MIN_ACCOUNTS`: the split's fixed costs are not worth
     /// paying. Expected on most blocks of a quiet chain.
     FewChanges,
-    /// The trie's shape is not one the split composes: a first nibble's node with a leaf or an
-    /// extension child, fewer than two non-empty first nibbles, or a rebuilt node that failed its
-    /// hash check. Expected while the account trie is small (a few thousand accounts or fewer);
-    /// the block paid for the split and then the walk on one thread.
+    /// The stored account trie failed the pre-check (a first nibble's node missing or with a leaf
+    /// or an extension child): a trie of a few thousand accounts or fewer, as a chain has from
+    /// genesis. Not tried, so free: the walk ran on one thread with the storage-root tasks, as
+    /// with `TN_PARALLEL_ACCOUNT_WALK=0`. Expected on every block the split would take while the
+    /// trie is small.
+    SmallTrie,
+    /// The trie passed the pre-check, but the block's own changes left a shape the split does not
+    /// compose: a first nibble's node with a leaf or an extension child (the block removed all
+    /// but one account under a second-level path, or added the first under an empty one), fewer
+    /// than two non-empty first nibbles, or a rebuilt node that failed its hash check. Rare. The
+    /// block paid for the subtries, and then the walk on one thread computed again every storage
+    /// root they had taken from the tasks.
     Shape,
     /// The database holds an account-trie node at the empty path, which reth never writes.
     /// Alert on any nonzero value: the stored trie is not one reth wrote.
@@ -477,12 +485,14 @@ pub(crate) enum AccountWalkFallback {
 impl AccountWalkFallback {
     /// Every variant, for zero-registration in [`register_account_walk_fallback_series`]. Extend
     /// it with [`Self::label`]'s match.
-    const ALL: [Self; 4] = [Self::FewChanges, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+    const ALL: [Self; 5] =
+        [Self::FewChanges, Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
 
     /// The `reason` label value this variant records under.
     const fn label(self) -> &'static str {
         match self {
             Self::FewChanges => "few_changes",
+            Self::SmallTrie => "small_trie",
             Self::Shape => "shape",
             Self::StoredRootNode => "stored_root_node",
             Self::Mismatch => "mismatch",

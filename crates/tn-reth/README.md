@@ -79,8 +79,9 @@ changed accounts also splits the account walk by the first nibble of the hashed 
 (`src/env/output_overlay/account_split.rs`): sixteen subtrie walks, each reth's own `StateRoot`
 over cursors restricted to one nibble, run on the calling thread and pool jobs, and the calling
 thread composes the root branch and the union of their trie updates. No vendored change beyond the
-storage-root hook (TN-0139). A trie the split cannot compose (a small one: a few thousand accounts
-or fewer) runs the walk on one thread as before.
+storage-root hook (TN-0139). A stored trie the split cannot compose (a small one: a few thousand
+accounts or fewer, as a chain has from genesis) is found before any subtrie runs, and the walk runs
+on one thread with the storage-root tasks, as with `TN_PARALLEL_ACCOUNT_WALK=0`.
 
 A hot contract's storage root is split the same way (`src/env/output_overlay/storage_split.rs`): a
 contract with at least 64 changed slots whose stored trie has all sixteen first-nibble nodes over
@@ -114,9 +115,11 @@ those nodes, so the nodes keep agreeing while a block's root may not be the root
 snapshot restore (`src/snapshot.rs`) finds it: it rebuilds the trie from the hashed state and fails
 when that root differs from the snapshot block's header.
 `tn_reth_account_walk_fallbacks_total{reason}` counts the blocks whose split walk
-ran on one thread: `few_changes` and `shape` are expected (most blocks of a quiet chain, and every
-split block while the trie is small), `stored_root_node` and `mismatch` (a sampled check found the
-split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
+ran on one thread: `few_changes` and `small_trie` are expected and free (most blocks of a quiet
+chain, and every block the split would take while the trie is small); `shape` is rare (the trie
+passed the pre-check but the block's own changes left a shape the split does not compose: the
+block paid for the subtries, then the walk on one thread computed again the storage roots they
+took); `stored_root_node` and `mismatch` (a sampled check found the split wrong) are alerts. `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage tries
 the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed serially) are
 expected, `stored_root_node` and `mismatch` are alerts.
 `tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a

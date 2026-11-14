@@ -36,13 +36,16 @@
 //! the first nibble of the hashed address (`account_split.rs`): sixteen subtrie walks, claimed in
 //! order by the calling thread and up to [`WALK_HELPERS`] pool jobs (each on its own read-only
 //! transaction, with the tip check below), take the storage roots from the tasks above, and the
-//! calling thread composes the root branch and the union of their trie updates. A shape the split
-//! does not compose (a small trie, a root that is not a branch) runs the walk on the calling thread
-//! as before, counted in `tn_reth.account_walk_fallbacks_total`. A block with no storage-root
-//! targets but a split walk takes this path too. Measured on the exec bench (storage v2, against
-//! the walk on one thread with the storage-root tasks): the root fell from 311 to 198 ms an output
-//! at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to 322 and from 113 to
-//! 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the split off on its own.
+//! calling thread composes the root branch and the union of their trie updates. A stored trie
+//! whose shape the split does not compose (a small trie, as a chain has from genesis) is found
+//! before any subtrie runs, and its blocks walk on the calling thread with the storage-root tasks;
+//! a block whose own changes leave such a shape (rare once the trie passes) pays for the subtries
+//! and then for that walk. Both are counted in `tn_reth.account_walk_fallbacks_total`. A block with
+//! no storage-root targets but a split walk takes this path too. Measured on the exec bench
+//! (storage v2, against the walk on one thread with the storage-root tasks): the root fell from 311
+//! to 198 ms an output at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to
+//! 322 and from 113 to 70 ms on a 22-thread Linux VM. `TN_PARALLEL_ACCOUNT_WALK=0` turns the
+//! split off on its own.
 //!
 //! # Hot storage tries
 //!
@@ -134,7 +137,9 @@ use super::{
     account_split::{AccountWalk, Subtries},
     layered_factories,
     sorted_runs::SortedTrieRuns,
-    storage_split::{splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk},
+    storage_split::{
+        shape, splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk,
+    },
     OutputTrieOverlay,
 };
 use crate::metrics::{
@@ -147,9 +152,9 @@ use reth_errors::ProviderError;
 use reth_provider::{DBProvider as _, DatabaseProviderFactory, ProviderResult};
 use reth_trie::{
     prefix_set::{PrefixSet, TriePrefixSets},
-    trie_cursor::{TrieCursor as _, TrieCursorFactory},
+    trie_cursor::TrieCursorFactory,
     updates::{StorageTrieUpdates, TrieUpdates},
-    HashedPostState, HashedPostStateSorted, Nibbles, StateRoot, StorageRoot, StorageRootSource,
+    HashedPostState, HashedPostStateSorted, StateRoot, StorageRoot, StorageRootSource,
 };
 use reth_trie_db::DatabaseStorageRoot as _;
 use std::{
@@ -362,11 +367,7 @@ impl OutputTrieOverlay {
         let (whole, hot) = split_storage_targets(&trie, targets, storage)?;
         let tasks = Arc::new(StorageRootTasks::new(whole, StorageSplits::new(hot)));
         let source = Arc::clone(&tasks) as Arc<dyn StorageRootSource>;
-        let stored_root_node = split && has_stored_root_node(&trie)?;
-        if stored_root_node {
-            record_account_walk_fallback(AccountWalkFallback::StoredRootNode);
-        }
-        let subtries = (split && !stored_root_node).then(|| Subtries::new(&prefix_sets));
+        let subtries = (split && account_trie_splits(&trie)?).then(|| Subtries::new(&prefix_sets));
         let root = rayon::in_place_scope(|scope| -> ProviderResult<ParallelRoot> {
             let shared = &*tasks;
             // However the walk below ends, a task not yet started returns at once: the scope's end
@@ -478,11 +479,19 @@ fn split_storage_targets<T: TrieCursorFactory>(
     Ok((whole, hot))
 }
 
-/// Whether the account trie holds a node at the empty path. Reth never writes one (its trie
-/// updates drop the root path); a walk that found one would skip unchanged nibbles by its hashes,
-/// which the split does not reproduce.
-fn has_stored_root_node<T: TrieCursorFactory>(trie: &T) -> Result<bool, DatabaseError> {
-    Ok(trie.account_trie_cursor()?.seek_exact(Nibbles::default())?.is_some())
+/// Whether the account trie (the walk's view, before the block's changes) has the shape the split
+/// composes ([`shape`]), so a trie it would refuse after the work costs no subtrie. A refusal is
+/// counted by reason and the walk runs on one thread. A node at the empty path is refused because
+/// reth never writes one (its trie updates drop the root path): a walk that found one would skip
+/// unchanged nibbles by its hashes, which the split does not reproduce.
+fn account_trie_splits<T: TrieCursorFactory>(trie: &T) -> Result<bool, DatabaseError> {
+    let refused = match shape(&mut trie.account_trie_cursor()?)? {
+        Splittable::Yes => return Ok(true),
+        Splittable::SmallTrie => AccountWalkFallback::SmallTrie,
+        Splittable::StoredRootNode => AccountWalkFallback::StoredRootNode,
+    };
+    record_account_walk_fallback(refused);
+    Ok(false)
 }
 
 /// A pool job working the split storage tries' pieces and then the account walk's subtries (when

@@ -282,7 +282,8 @@ async fn all_nibbles_changed() -> eyre::Result<()> {
 }
 
 /// A trie whose accounts all start with one nibble: its root is an extension over that nibble's
-/// node, not a branch, so the split does not compose it and the walk runs on one thread.
+/// node, not a branch. The pre-check finds the other fifteen first-nibble nodes missing, so no
+/// subtrie runs and the walk runs on one thread.
 #[tokio::test]
 async fn single_nibble_trie_falls_back() -> eyre::Result<()> {
     let base = HashedPostState::default().with_accounts(eoas_under(9, 3_000, 1));
@@ -290,26 +291,73 @@ async fn single_nibble_trie_falls_back() -> eyre::Result<()> {
     let block = HashedPostState::default().with_accounts(eoas_under(9, 200, 2));
     let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block]));
     assert_eq!(composed?, 0, "a single-nibble trie's root was composed");
-    assert_eq!(fallbacks.get("shape"), Some(&2), "fallbacks: {fallbacks:?}");
+    assert_eq!(fallbacks.get("small_trie"), Some(&2), "fallbacks: {fallbacks:?}");
+    assert_eq!(fallbacks.get("shape"), None, "fallbacks: {fallbacks:?}");
     Ok(())
 }
 
-/// A small trie (a few hundred accounts): some first nibbles' nodes have leaf children, which the
-/// split does not rebuild, so it falls back.
+/// A small trie (a few hundred accounts, as a chain has from genesis), with contracts whose storage
+/// the block changes: some first nibbles' nodes have leaf children, which the split does not
+/// rebuild. The pre-check refuses it before any subtrie runs (`small_trie`), so the walk on one
+/// thread takes the storage roots from the tasks; a refusal after the subtries (`shape`) would
+/// have computed every one of them again on the walk's thread.
 #[tokio::test]
 async fn small_trie_falls_back() -> eyre::Result<()> {
-    let base = HashedPostState::default().with_accounts((0..300).map(|i| (eoa(i), account(i))));
-    let fixture = Fixture::new(base)?;
-    let block =
+    let mut base = HashedPostState::default().with_accounts((0..300).map(|i| (eoa(i), account(i))));
+    let mut block =
         HashedPostState::default().with_accounts((0..150).map(|i| (eoa(i * 2), account(i + 9))));
+    for i in 0..20 {
+        base.accounts.insert(small(i), contract(i + 2));
+        base.storages
+            .insert(small(i), HashedStorage::from_iter(false, [(slot(0), U256::from(i + 1))]));
+        block.storages.insert(
+            small(i),
+            HashedStorage::from_iter(false, (0..5).map(|s| (slot(s), U256::from(i + s + 7)))),
+        );
+    }
+    let fixture = Fixture::new(base)?;
     let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block]));
     assert_eq!(composed?, 0, "a small trie's root was composed");
+    assert_eq!(fallbacks.get("small_trie"), Some(&2), "fallbacks: {fallbacks:?}");
+    assert_eq!(fallbacks.get("shape"), None, "the subtries ran: {fallbacks:?}");
+    Ok(())
+}
+
+/// A trie that passes the pre-check, and a block that removes all but one account under one
+/// second-level path: that first nibble's node gets a leaf child, so the block's subtries do not
+/// compose (`shape`) and the walk on one thread gives the serial root.
+#[tokio::test]
+async fn block_that_leaves_a_leaf_child_falls_back() -> eyre::Result<()> {
+    let fixture = Fixture::new(large_base())?;
+    let prefix = 0x53;
+    let under = {
+        let provider = fixture.env.blockchain_provider().database_provider_ro()?;
+        let mut cursor = provider.tx_ref().cursor_read::<tables::HashedAccounts>()?;
+        let mut start = B256::ZERO;
+        start[0] = prefix;
+        cursor
+            .walk(Some(start))?
+            .map_while(|entry| entry.ok().filter(|(address, _)| address[0] == prefix))
+            .map(|(address, _)| address)
+            .collect::<Vec<_>>()
+    };
+    assert!(under.len() > 2, "the path holds {} accounts", under.len());
+    let mut block = HashedPostState::default().with_accounts(
+        (0..EOAS).map(eoa).filter(|a| a[0] != prefix).take(100).map(|a| (a, account(77))),
+    );
+    for address in &under[1..] {
+        block.accounts.insert(*address, None);
+    }
+    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block]));
+    assert_eq!(composed?, 0, "a root over a leaf child was composed");
     assert_eq!(fallbacks.get("shape"), Some(&2), "fallbacks: {fallbacks:?}");
+    assert_eq!(fallbacks.get("small_trie"), None, "fallbacks: {fallbacks:?}");
     Ok(())
 }
 
 /// Destroyed accounts with wiped storage, wiped and re-created contracts, and a whole nibble's
-/// accounts destroyed (its subtrie becomes empty and the root loses that child).
+/// accounts destroyed (its subtrie becomes empty and the root loses that child; the next block's
+/// trie then lacks that first nibble's node, which the pre-check refuses).
 #[tokio::test]
 async fn wiped_storage_and_destroyed_accounts() -> eyre::Result<()> {
     let fixture = Fixture::new(large_base())?;
@@ -354,7 +402,10 @@ async fn wiped_storage_and_destroyed_accounts() -> eyre::Result<()> {
     let next = HashedPostState::default().with_accounts(
         (0..300).map(eoa).filter(|a| nibble_of(a) != emptied).map(|a| (a, account(3))),
     );
-    assert_eq!(fixture.check_output(&[block, next])?, 2 * 2, "both roots are composed");
+    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block, next]));
+    assert_eq!(composed?, 2, "the root that empties the nibble is composed");
+    // the next block's trie has no node at the emptied nibble: the pre-check refuses it
+    assert_eq!(fallbacks.get("small_trie"), Some(&2), "fallbacks: {fallbacks:?}");
     Ok(())
 }
 
