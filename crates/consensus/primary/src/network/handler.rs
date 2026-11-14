@@ -1050,11 +1050,18 @@ where
             // window on arrival neither moves the mark nor waits: `vote_inner` refuses it before
             // its execution check, unless the committed round moved it inside the window while
             // it queued on the lock, when it is checked without a wait (a recoverable
-            // `ExecutionBehind` if its block is not executed yet). the wait runs before the header
-            // checks of `vote_inner`, so a header that fails them is refused after it
+            // `ExecutionBehind` if its block is not executed yet). a header that fails the
+            // stateless checks of `Header::validate` skips the wait too: `vote_inner` refuses it
+            // before its execution check whatever its block, so it goes straight to the author
+            // lock, where it is refused with the same error and penalty and leaves the same entry
+            // as after the wait (only a newer request of its author arriving during the wait it no
+            // longer makes would have turned that into `SupersededRequest`). the window already
+            // keeps a round-0 header and one of another epoch from waiting. every other check of
+            // `vote_inner` (the attached parents, the drift tier, the seed signature) stays under
+            // the lock, so a header that fails only one of those still waits
             let in_window = self.in_vote_window(&header);
             self.refuse_superseded_request(&header, in_window)?;
-            if in_window {
+            if in_window && header.validate(self.consensus_config.committee()).is_ok() {
                 timing.enter(VoteStage::PreLockWait);
                 let waited = timeout(
                     VOTE_EXECUTION_WAIT,
