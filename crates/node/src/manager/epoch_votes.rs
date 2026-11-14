@@ -264,7 +264,7 @@ async fn manage_epoch_votes(
                 }
                 res = network.request_epoch_cert(Some(epoch_rec.epoch), None) => {
                     match res {
-                        Ok((new_epoch_rec, cert)) => {
+                        Ok((new_epoch_rec, cert, peer)) => {
                             // Anchor the downloaded record to the locally-trusted committee using the
                             // same routine the state-sync ingest path uses (see crates/state-sync
                             // epoch.rs). `verify_with_cert` alone only proves the record is
@@ -290,6 +290,8 @@ async fn manage_epoch_votes(
                                 } else {
                                     info!(
                                         target: "epoch-manager",
+                                        %peer,
+                                        signers = cert.signed_authorities.len(),
                                         "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
                                     );
                                     save_and_persist_with_logs(&db, new_epoch_rec, cert).await?;
@@ -2325,5 +2327,177 @@ mod epoch_vote_collector_tests {
             })
             .sum();
         assert_eq!(misses, 1, "only the quorum round counts a missed vote");
+    }
+
+    // ---- bench7 epoch-record-collector-hardening ----
+
+    /// Records every `epoch-manager` event as `LEVEL message key=value ...` on the thread it is
+    /// installed on with [`tracing::subscriber::set_default`].
+    struct EpochManagerLines(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    /// Collects an event's message and its other fields, in the order the event records them.
+    #[derive(Default)]
+    struct LineVisitor {
+        message: String,
+        fields: String,
+    }
+
+    impl tracing::field::Visit for LineVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for EpochManagerLines {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "epoch-manager"
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            let level = event.metadata().level();
+            self.0.lock().push(format!("{level} {}{}", visitor.message, visitor.fields));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// What [`failed_round`] saw.
+    struct FailedRound {
+        /// The round's `epoch-manager` lines.
+        lines: Vec<String>,
+        /// Our record's digest, as the lines print it.
+        digest: String,
+        /// The key the mock network answers from.
+        peer: BlsPublicKey,
+    }
+
+    /// Run a vote round for our epoch-1 record that fails to reach quorum: two of four members
+    /// vote, short of the quorum of three, and the vote windows time out under the paused clock.
+    ///
+    /// With `serve`, the mock network answers the recovery request with our record and a
+    /// three-signer certificate from `peer`; without it, the mock signals shutdown and holds the
+    /// reply, so the round ends right after the failure branch. The round runs on this thread
+    /// (current-thread runtime, awaited, not spawned), so the line subscriber sees it.
+    async fn failed_round(serve: bool) -> FailedRound {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let committee = vec![*kp1.public(), *kp2.public(), *kp3.public(), *kp4.public()];
+        let peer = committee[1];
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("failed_round_held_cert").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        // the epoch-0 record anchors epoch 1 for the recovery download
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_record(rec0.clone()).await.unwrap();
+        let local_rec = EpochRecord {
+            epoch: 1,
+            committee: committee.clone(),
+            next_committee: committee,
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        let cert = make_cert(&local_rec, &[&kc1, &kc2, &kc3]);
+        consensus_chain.epochs().persist().await.unwrap();
+
+        let node_shutdown = ShutdownNotifier::new();
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let node_shutdown = node_shutdown.clone();
+            let record = local_rec.clone();
+            tokio::spawn(async move {
+                // Own the held reply senders so their oneshots stay unresolved.
+                let mut held = Vec::new();
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                        if serve {
+                            let _ = reply.send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: PrimaryResponse::EpochRecord {
+                                    record: record.clone(),
+                                    certificate: cert.clone(),
+                                },
+                            }));
+                        } else {
+                            node_shutdown.notify();
+                            held.push(reply);
+                        }
+                    }
+                }
+            });
+        }
+
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+
+        // neither vote is ours, so the timed-out windows republish nothing
+        let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        for key_config in [&kc2, &kc3] {
+            vote_tx.send(local_rec.sign_vote(key_config)).await.unwrap();
+        }
+        let digest = local_rec.digest().to_string();
+        // No outer virtual-time timeout: the round reads the epoch store, whose actor runs on its
+        // own thread, and the paused clock would jump to that timeout while the reply is on its
+        // way. A hung round is ended by nextest's slow-timeout.
+        manage_epoch_votes(
+            local_rec,
+            kc1,
+            primary_network,
+            vote_rx,
+            consensus_chain,
+            node_shutdown,
+        )
+        .await
+        .expect("no local store failure");
+
+        let lines = lines.lock().clone();
+        FailedRound { lines, digest, peer }
+    }
+
+    /// The recovery download's `retrieved cert` line names the peer that served the certificate
+    /// and how many signers the certificate carries.
+    #[tokio::test(start_paused = true)]
+    async fn test_recovered_cert_line_names_the_peer_and_signers() {
+        let round = failed_round(true).await;
+        let prefix = format!("INFO retrieved cert for epoch 1/{} from a peer", round.digest);
+        let line = round
+            .lines
+            .iter()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no retrieved line in {:?}", round.lines));
+        assert!(line.contains(&format!(" peer={}", round.peer)), "{line}");
+        assert!(line.contains(" signers=3"), "{line}");
     }
 }

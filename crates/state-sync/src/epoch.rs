@@ -291,7 +291,7 @@ async fn collect_epoch_records(
         }
         // Try to recover by downloading the epoch record and cert from a peer.
         match primary_handle.request_epoch_cert(Some(epoch), None).await {
-            Ok((epoch_rec, cert)) => {
+            Ok((epoch_rec, cert, peer)) => {
                 // Validate the downloaded record against the locally-trusted committee using the
                 // same routine the failed-quorum recovery path uses (see crates/node
                 // epoch_votes.rs), so a record cannot be accepted under weaker rules on one path
@@ -305,6 +305,7 @@ async fn collect_epoch_records(
                         let epoch_hash = epoch_rec.digest();
                         // Capture final_consensus before save consumes epoch_rec.
                         let final_consensus = epoch_rec.final_consensus;
+                        let signers = cert.signed_authorities.len();
                         if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
                             stop_on_local_failure(e, epoch)?;
                             return Ok(CollectedPass {
@@ -316,6 +317,8 @@ async fn collect_epoch_records(
                         consensus_bus.set_certified_record_epoch_if_newer(epoch);
                         info!(
                             target: "epoch-manager",
+                            %peer,
+                            signers,
                             "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
                         );
                         // Track the highest final_consensus across downloaded epochs.
@@ -914,6 +917,113 @@ mod tests {
         sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
         assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(0));
         assert!(chain.epochs().contains_dummy_epoch0().await);
+        Ok(())
+    }
+
+    // ---- bench7 epoch-record-collector-hardening ----
+
+    /// Records every `epoch-manager` info line as `message key=value ...` on the thread it is
+    /// installed on with [`tracing::subscriber::set_default`].
+    struct EpochManagerInfoLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    /// Collects an event's message and its other fields, in the order the event records them.
+    #[derive(Default)]
+    struct LineVisitor {
+        message: String,
+        fields: String,
+    }
+
+    impl tracing::field::Visit for LineVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for EpochManagerInfoLines {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "epoch-manager" && *metadata.level() == tracing::Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push(format!("{}{}", visitor.message, visitor.fields));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Records `0..=last`, chained from epoch 0 under one committee (`keys`), each with a
+    /// certificate signed by the first three of `signers`.
+    fn certified_chain(
+        keys: &[BlsPublicKey],
+        signers: &[&BlsKeypair],
+        last: Epoch,
+    ) -> Vec<(EpochRecord, EpochCertificate)> {
+        let mut chain: Vec<(EpochRecord, EpochCertificate)> = Vec::new();
+        for epoch in 0..=last {
+            let parent_hash = chain.last().map(|(record, _)| record.digest()).unwrap_or_default();
+            let record = EpochRecord {
+                epoch,
+                committee: keys.to_vec(),
+                next_committee: keys.to_vec(),
+                parent_hash,
+                ..Default::default()
+            };
+            let cert = make_cert(&record, signers, &[0, 1, 2]);
+            chain.push((record, cert));
+        }
+        chain
+    }
+
+    /// The served record's `retrieved cert` line names the peer that served it and the number of
+    /// signers its certificate carries; the message text is unchanged.
+    #[tokio::test]
+    async fn test_retrieved_cert_line_names_the_peer_and_signers() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let mut records = certified_chain(&keys, &signers, 1).into_iter();
+        let (record0, cert0) = records.next().ok_or_else(|| eyre::eyre!("no record 0"))?;
+        let (record1, cert1) = records.next().ok_or_else(|| eyre::eyre!("no record 1"))?;
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        chain.epochs().save(record0, cert0).await?;
+        let digest = record1.digest();
+        // a peer other than the first, so the line cannot pass by naming a default
+        let peer = keys[1];
+        let handle = mock_epoch_record_network(HashMap::from([(1, (record1, cert1))]), peer, 1);
+        let bus = ConsensusBus::new();
+
+        let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerInfoLines(lines.clone()));
+        collect_epoch_records(0, &chain, &handle, bus.app()).await?;
+
+        let lines = lines.lock().clone();
+        let prefix = format!("retrieved cert for epoch 1: {digest} from a peer");
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with(&prefix))
+            .ok_or_else(|| eyre::eyre!("no retrieved line in {lines:?}"))?;
+        assert!(line.contains(&format!(" peer={peer}")), "{line}");
+        assert!(line.contains(" signers=3"), "{line}");
         Ok(())
     }
 }
