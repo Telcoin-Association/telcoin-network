@@ -22,6 +22,10 @@ genesis validators.
 The node logs the source and the count at startup:
 `bootstrap peers selected servers=5 source=built-in chain list`. The other
 sources are `network-config`, `command line` and `genesis committee file`.
+A `--chain` node whose `genesis/committee.yaml` lists other servers than the
+built-in list says so in the log, and dials the built-in list. A node left with
+no bootstrap peers, committee peers or trusted nodes logs a warning: it dials no
+one, and finds peers only if they dial it.
 
 ## Overriding the default
 

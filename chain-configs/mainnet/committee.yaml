@@ -13,4 +13,5 @@ authorities:
     protocol_key: 21fAHXsP96dUJPXWnACeYS1LNAmCHGt4PW24Nyh9sVXrSCoZNp872yPR7M92gTVYyeqhxU6QRsCPbkavLgJAnmTqBJEgstPvS5TU6X9w6Dh1pBcm99TvEKW4Kzxovs5AGmxL
     execution_address: "0x3333333333333333333333333333333333333333"
 epoch: 0
+bootstrap_servers: {}
 num_workers: 1

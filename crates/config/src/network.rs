@@ -1175,14 +1175,13 @@ mod tests {
         Ok(())
     }
 
-    /// Use the checked-in mainnet bootstrap servers so fixtures exercise real key decoding.
+    /// Real keys and addresses, so fixtures exercise real key decoding.
     fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
-        serde_yaml::from_str(tn_types::MAINNET_BOOTSTRAP_SERVERS).map_err(Into::into)
+        Ok(tn_types::test_utils::bootstrap_servers_fixture())
     }
 
     /// A committee at `epoch` whose members are the [`bootstrap_fixture`] servers, and that
-    /// fixture as its complete launch inventory. The bundled bootstrap list is independent of the
-    /// genesis committee, so the committee is built from the list rather than read from a file.
+    /// fixture as its complete launch inventory.
     fn launch_fixture(
         epoch: tn_types::Epoch,
     ) -> eyre::Result<(Committee, BTreeMap<BlsPublicKey, BootstrapServer>)> {

@@ -785,11 +785,18 @@ where
                 })?;
         // a named chain's servers are built into the binary, so a release can change them; a
         // datadir genesis brings its own in the committee file
-        let bootstrap_servers = builder
-            .tn_config
-            .bootstrap_servers
-            .clone()
-            .unwrap_or_else(|| committee_zero.bootstrap_servers());
+        let bootstrap_servers = builder.tn_config.default_bootstrap_servers(&committee_zero);
+        let listed = committee_zero.bootstrap_servers();
+        if !listed.is_empty() && listed != bootstrap_servers {
+            info!(
+                target: "epoch-manager",
+                listed = listed.len(),
+                built_in = bootstrap_servers.len(),
+                "the genesis committee file lists other bootstrap servers than the list built in for \
+                 this chain; a --chain node dials the built-in list (set bootstrap_peers in \
+                 network-config to choose others)"
+            );
+        }
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
@@ -1085,6 +1092,17 @@ where
             &node_info.p2p_info.workers,
         )?;
         self.trusted_peer_keys = network_config.trusted_nodes().keys().copied().collect();
+        if self.bootstrap_servers.is_empty()
+            && network_config.committee_peers().is_empty()
+            && network_config.trusted_nodes().is_empty()
+        {
+            warn!(
+                target: "epoch-manager",
+                "no bootstrap peers, committee peers or trusted nodes are configured, so this node \
+                 dials no one and finds peers only if they dial it; set bootstrap_peers in \
+                 network-config, pass --bootstrap-peers, or start with --chain"
+            );
+        }
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         let (primary_address, worker_addresses) = self
             .spawn_node_networks(

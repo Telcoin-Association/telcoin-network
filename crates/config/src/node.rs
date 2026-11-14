@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, io::Write, time::Duration};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, BootstrapServer,
-    Genesis, NetworkPublicKey, WorkerId, MAINNET_BOOTSTRAP_SERVERS, MAINNET_COMMITTEE,
+    Committee, Genesis, NetworkPublicKey, WorkerId, MAINNET_BOOTSTRAP_SERVERS, MAINNET_COMMITTEE,
     MAINNET_GENESIS, MAINNET_PARAMETERS, TESTNET_BOOTSTRAP_SERVERS, TESTNET_COMMITTEE,
     TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
@@ -185,6 +185,17 @@ impl Config {
     /// already exists.
     pub fn write_mainnet_committee<P: TelcoinDirs>(tn_datadir: &P) -> eyre::Result<()> {
         write_committee_if_missing(tn_datadir, MAINNET_COMMITTEE)
+    }
+
+    /// The chain's default bootstrap servers: the list built into the binary for a named chain,
+    /// or else `genesis_committee`'s, the genesis committee file of a network started from datadir
+    /// genesis files. `network-config`'s `bootstrap_peers` and the `--bootstrap-peers` flag
+    /// replace this default.
+    pub fn default_bootstrap_servers(
+        &self,
+        genesis_committee: &Committee,
+    ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        self.bootstrap_servers.clone().unwrap_or_else(|| genesis_committee.bootstrap_servers())
     }
 
     /// Update the authority protocol key.
@@ -1177,6 +1188,43 @@ mod test {
         );
         assert_eq!(Config::load_or_default(&datadir, "test")?.bootstrap_servers, None);
         assert_eq!(Config::default_for_test().bootstrap_servers, None);
+        Ok(())
+    }
+
+    /// A named chain's default bootstrap servers are its built-in list, even when the genesis
+    /// committee file (an existing datadir's, written by an older binary) lists others; a network
+    /// from datadir genesis files takes the committee file's.
+    #[test]
+    fn default_bootstrap_servers_prefer_the_built_in_list() -> eyre::Result<()> {
+        use crate::{NodeInfo, TelcoinDirs as _};
+        use tn_types::{test_utils::bootstrap_servers_fixture, CommitteeBuilder};
+
+        let listed = bootstrap_servers_fixture();
+        let mut builder = CommitteeBuilder::new(0);
+        listed.iter().for_each(|(key, server)| {
+            builder.add_authority_and_bootstrap(
+                *key,
+                server.primary.clone(),
+                server.workers.clone(),
+                Address::ZERO,
+            )
+        });
+        let committee = builder.build();
+        assert_eq!(committee.bootstrap_servers(), listed);
+
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_path_buf();
+        Config::write_to_path(datadir.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)?;
+        let adiri = Config::load_adiri(&datadir, "test")?;
+        let built_in = adiri.bootstrap_servers.clone().expect("adiri carries its list");
+        assert_ne!(built_in, listed);
+        assert_eq!(adiri.default_bootstrap_servers(&committee), built_in);
+        let mainnet = Config::load_mainnet(&datadir, "test")?;
+        assert_eq!(Some(mainnet.default_bootstrap_servers(&committee)), mainnet.bootstrap_servers);
+        assert_eq!(
+            Config::load_or_default(&datadir, "test")?.default_bootstrap_servers(&committee),
+            listed
+        );
         Ok(())
     }
 }

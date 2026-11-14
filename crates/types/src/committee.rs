@@ -511,10 +511,10 @@ const COMMITTEE_FIELD_NAMES: [&str; COMMITTEE_FIELDS_V1] =
 ///
 /// The epoch gate is binary-only. Human-readable formats name their fields, so a committee file
 /// written by any build loads on any other: `num_workers` defaults to one when absent,
-/// `bootstrap_servers` to an empty map (the built-in `chain-configs/*/committee.yaml` files carry
-/// none; their servers are in `bootstrap_servers.yaml`), and each [`BootstrapServer`] still
-/// accepts the legacy `worker:` key through its own deserializer. All three are covered by the
-/// tests below.
+/// `bootstrap_servers` to an empty map (the built-in `chain-configs/*/committee.yaml` files write
+/// it as `{}`, since older builds require the key; their servers are in `bootstrap_servers.yaml`),
+/// and each [`BootstrapServer`] still accepts the legacy `worker:` key through its own
+/// deserializer. All three are covered by the tests below.
 #[derive(Deserialize)]
 #[serde(rename = "CommitteeInner")]
 struct CommitteeInnerHr {
@@ -2274,8 +2274,8 @@ mod tests {
         assert_eq!(decoded.with_num_workers(std::num::NonZeroUsize::MIN).number_of_workers(), 1);
     }
 
-    /// A committee file without `bootstrap_servers` (the built-in chain-config files) loads with
-    /// none, keeps its authorities, and still encodes in the binary layout of its epoch.
+    /// A committee file without `bootstrap_servers` loads with none, keeps its authorities, and
+    /// still encodes in the binary layout of its epoch.
     #[test]
     fn committee_yaml_without_bootstrap_servers_loads_empty() {
         let mut rng = rng();
@@ -2305,14 +2305,21 @@ mod tests {
         assert!(round_trip.bootstrap_servers().is_empty());
     }
 
-    /// The bundled committee files carry no bootstrap servers, so a `--chain` committee written
-    /// to a datadir has a single source for them: `bootstrap_servers.yaml`.
+    /// The bundled committee files list no bootstrap servers, so a `--chain` committee written to
+    /// a datadir has a single source for them: `bootstrap_servers.yaml`. They keep the key as an
+    /// empty map: binaries before `bootstrap_servers` became optional refuse a file without it.
     #[test]
     fn bundled_committee_files_carry_no_bootstrap_servers() {
         [crate::TESTNET_COMMITTEE, crate::MAINNET_COMMITTEE].into_iter().for_each(|yaml| {
             let committee: Committee = serde_yaml::from_str(yaml).expect("bundled committee");
             assert!(committee.size() >= 4);
             assert!(committee.bootstrap_servers().is_empty());
+            let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("bundled committee");
+            assert_eq!(
+                value.get("bootstrap_servers"),
+                Some(&serde_yaml::Value::Mapping(serde_yaml::Mapping::new())),
+                "the key stays, as an empty map, for older parsers"
+            );
         });
     }
 

@@ -38,8 +38,8 @@ keys and reachable addresses. Repeat the entry for every validator. A genesis
 ceremony's `committee.yaml` lists the genesis validators as bootstrap servers,
 and that inventory can be copied as a starting point, but verify that it
 contains every launch validator and that its endpoints and worker count are
-current. The built-in bootstrap lists name bootstrap servers, not validators,
-so they are no starting point. An empty or absent `committee_peers` map preserves
+current. The built-in bootstrap lists name bootstrap servers, which need not be
+validators, so they are no starting point. An empty or absent `committee_peers` map preserves
 discovery-based startup for existing deployments. It does not qualify a
 hub-independent Closed launch.
 

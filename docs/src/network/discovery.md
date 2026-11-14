@@ -88,7 +88,7 @@ Rows whose bytes no longer decode — after a schema change or on-disk corruptio
 ## Six ways a node finds the committee
 
 1. **Bootstrap peers.**
-   The first contacts come from the committee's own declared bootstrap servers, read from committee state at startup, not from a CLI flag or a static file the operator maintains.
+   The first contacts come from the bootstrap servers selected at startup: `--bootstrap-peers`, then `bootstrap_peers` in `network-config`, then the chain's default set, which is the list built into the binary for `--chain` or else the genesis committee file's ([Bootstrap peers](../getting-started/bootstrap-peers.md)).
    The primary network takes each server's primary address; a worker network takes that server's entry for its own worker id, and skips servers that run fewer workers.
    Bootstrap peers are registered once per process, before committee membership is applied, and are pinned so committee rotation never evicts them.
 2. **Trusted and explicit peers.**

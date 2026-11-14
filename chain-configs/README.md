@@ -3,7 +3,7 @@
 This directory contains the genesis and general configurations for testnet and mainnet.
 These are built into the telcoin-network binary for use with the `--chain` flag.
 
-Each network has four files:
+Four files of each network are built into the binary:
 
 - `genesis.yaml`: the EVM genesis block.
 - `committee.yaml`: the genesis committee, the validators of epoch 0. `--chain` writes it to the datadir's `genesis/committee.yaml` if that file is missing.
@@ -13,7 +13,7 @@ Each network has four files:
 ## Bootstrap servers
 
 The bootstrap servers are dial hints for a node's first contact with the network. Once a node has peers, kademlia and the peer records it learns take over.
-A server needs no committee seat: any reachable node can serve, and the list need not match the genesis committee, so `committee.yaml` lists none.
+A server needs no committee seat: any reachable node can serve, and the list need not match the genesis committee, so `committee.yaml` lists none (`bootstrap_servers: {}`; the empty key stays because older binaries refuse a committee file without it).
 To change the list, edit `bootstrap_servers.yaml` and build a new binary. A node takes the new list when it restarts on that binary; nothing else changes, and no coordinated upgrade is needed.
 An operator can override the list without a new binary: `bootstrap_peers` in the datadir's `network-config`, or `--bootstrap-peers` for one run (`docs/src/getting-started/bootstrap-peers.md`).
 

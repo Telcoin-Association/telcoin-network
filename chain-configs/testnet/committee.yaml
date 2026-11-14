@@ -16,3 +16,4 @@ authorities:
     protocol_key: 26L3gmkBzxAxEwvVuDrxEmKf2XwYGnYj1EQSiZSX3PBAvRa6Z5tegfmDAGHTsBwdtjFuAd7ayQEemE1AUE5ajSSK8wn3uz1MY5vjbGdeh3RoUv1TKLfbNTTULq9qdtaSTHhL
     execution_address: "0x7489025dfbaad94f2366d88a62989147d9c8b5d3"
 epoch: 0
+bootstrap_servers: {}

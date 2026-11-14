@@ -589,7 +589,7 @@ If not set, addresses default to `127.0.0.1` with a random port (only useful for
 
 ### Peer discovery
 
-Nodes discover each other through Kademlia DHT (libp2p). Bootstrap peers are loaded from the committee configuration at each epoch. Key parameters:
+Nodes discover each other through Kademlia DHT (libp2p). Bootstrap peers are selected once at startup: the list built into the binary for `--chain`, or else the genesis committee file's, unless `bootstrap_peers` in `network-config` or `--bootstrap-peers` replaces it. Key parameters:
 
 - K-bucket size: 20
 - Record TTL: 48 hours
