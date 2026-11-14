@@ -863,8 +863,10 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   storage layout` with `layout` and `new_datadirs` instead.
 - **Static-file checksums (v2).** A v2 datadir's new static files carry a CRC-32 on every value,
   on every `.csoff` record (which block owns which change-set rows) and on each `.conf` (vendor/reth
-  CHANGES.md TN-0120..0124; the v1 tables are covered by tn-lmdb's page CRCs, and v1 static files
-  keep upstream's format byte for byte). Every read verifies before it decodes, and the change-set
+  CHANGES.md TN-0120..0124; v1 keeps those rows in database tables, in tn-lmdb pages, whose CRCs
+  a read does not recompute: a write's copy of a page and `db check` verify them (tn-lmdb's
+  README, do-not-flag item 3); v1 static files keep upstream's format byte for byte). Every read
+  of a v2 static file verifies before it decodes, and the change-set
   lookups behind the pinned committee and epoch reads verify the row they return. A mismatch is an
   error, never a value: `static file <path> is damaged: the value at row <r>, column <c> fails
   its checksum`, `changeset offsets <path> are damaged: record <i> fails its checksum`,
