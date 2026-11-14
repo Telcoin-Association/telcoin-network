@@ -80,15 +80,36 @@
 //! chain. In production one hit of each kind in [`CHECK_ONE_HIT_IN`] is re-read from the parent
 //! state. The sample follows the cache's own hit counters, which start at zero with each cache, so
 //! each node checks other hits than its peers. A differing value is logged with its key and both
-//! values, counted (`tn_reth.exec_cache_stale_hits_total`), and makes `build_recovered_block` (the
-//! build behind `build_block_from_batch_payload` and `build_block_from_recovered_payload`) drop
-//! the whole cache and build the block again without one, so that block is right and the node goes
-//! on. Unchecked stale hits of earlier blocks may already have given the node another state than
-//! its peers': a nonzero count is a bug to report, and the node's recent block hashes are to be
-//! compared with a peer's before it is trusted. A zero count on one node says nothing about
-//! another.
+//! values and counted (`tn_reth.exec_cache_stale_hits_total`). `build_recovered_block` (the build
+//! behind `build_block_from_batch_payload` and `build_block_from_recovered_payload`) then discards
+//! the block, drops the whole cache (bytecode table included) and builds that block again without
+//! one, so that block is the one a node without the cache builds. The node goes on, with a new
+//! cache from the next block.
+//!
+//! The rebuild covers the current block only. Nothing re-checks the blocks built before it: an
+//! unchecked stale hit in one of them may already have given the node another state than its
+//! peers', and that block is persisted. The cache is per node, so such a block forks this node
+//! alone. The cross-node checks find it later, not at the detection: the subscriber's leader check
+//! (a certified leader's execution block missing from the local chain) makes the node inactive
+//! (`CvvInactive`), and an epoch record certified by the network other than the node's own stops
+//! it. Neither repairs the blocks the node persisted; that takes a sync from scratch. A nonzero
+//! count is a bug to report, and the node's recent block hashes are to be compared with a peer's
+//! before it is trusted. A zero count on one node says nothing about another.
+//!
 //! With `TN_EXEC_CACHE_SHADOW=1` (test builds; the default in tn-reth's unit tests) every hit is
 //! checked and a stale one panics.
+//!
+//! # Off switch
+//!
+//! `TN_EXEC_CACHE=0` in the node's environment builds every block without the cache: every read
+//! goes to the parent state, as in the rebuild after a stale hit. Unset or `1` uses the cache; any
+//! other value is logged as an error and also turns it off (the cache-less build is the
+//! reference). It is read when the env is created, so a change takes a restart. A node with the
+//! cache off builds the same blocks as one with it: the invariant above makes every hit equal to
+//! the parent-state read it skips, and the state root never reads the cache. So the switch is safe
+//! on one node: it parts the node from no peer whose cache is right. An environment variable, like
+//! the parallel root's switches (`output_overlay/parallel.rs`, "Off switch"), so an operator can
+//! turn the cache off without a new release.
 //!
 //! # Differences from upstream
 //! - Every miss fills the cache (upstream's prewarm mode); TN runs no prewarming, so the block's
@@ -134,7 +155,7 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::RethEnv;
 use crate::metrics::RETH_METRICS;
@@ -174,6 +195,9 @@ pub(crate) const DEFAULT_WIPED_ACCOUNTS: usize = 4096;
 /// ms without checks (Mac, storage v2, default sizes), 1.3 us a check. At 1 in 256 that is about
 /// 143 checks, 0.19 ms an output, and still under 0.5 ms if a read costs 2.5 times as much.
 pub(crate) const CHECK_ONE_HIT_IN: u64 = 256;
+
+/// The cache's off switch (module docs).
+const EXEC_CACHE_ENV: &str = "TN_EXEC_CACHE";
 
 /// A fixed-cache with [`TopBitHash`] and the default config (no epochs, no stats).
 type FixedCache<K, V> = fixed_cache::Cache<K, V, TopBitHash>;
@@ -438,37 +462,44 @@ pub(crate) struct ExecutionCacheSlot {
     capacity: CacheCapacity,
     /// Blocks built again without the cache after a checked hit was stale.
     rebuilds: u64,
-    /// Build without any cache (the differential tests' baseline).
-    #[cfg(any(test, feature = "test-utils"))]
+    /// Build every block without a cache (`TN_EXEC_CACHE=0`, module docs).
     disabled: bool,
 }
 
 impl ExecutionCacheSlot {
     /// An empty slot (no cache yet) at the default capacity, or the test knobs' (see
-    /// [`CacheCapacity::from_env`]).
+    /// [`CacheCapacity::from_env`]), switched on or off by `TN_EXEC_CACHE`.
     pub(crate) fn new() -> Self {
-        Self {
-            saved: None,
-            code: None,
-            capacity: CacheCapacity::from_env(),
-            rebuilds: 0,
-            #[cfg(any(test, feature = "test-utils"))]
-            disabled: false,
-        }
+        Self::from_env_value(std::env::var(EXEC_CACHE_ENV).ok().as_deref())
+    }
+
+    /// An empty slot switched by a value of `TN_EXEC_CACHE` (`None`: unset).
+    pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        let disabled = match value {
+            None | Some("1") => false,
+            Some("0") => {
+                info!(target: "engine", "{EXEC_CACHE_ENV}=0: blocks are built without the execution cache");
+                true
+            }
+            Some(other) => {
+                error!(target: "engine", "{EXEC_CACHE_ENV}={other}: expected 0 or 1; blocks are built without the execution cache");
+                true
+            }
+        };
+        Self { saved: None, code: None, capacity: CacheCapacity::from_env(), rebuilds: 0, disabled }
     }
 }
 
 impl RethEnv {
     /// Take the saved cache for a block built on `parent`: the saved one when it is anchored at
     /// `parent`, else a new empty one (anchored at `parent` by the caller's use of it) over the
-    /// last dropped cache's bytecode table. `None` only in tests that disabled the cache.
+    /// last dropped cache's bytecode table. `None` when `TN_EXEC_CACHE=0` turned the cache off.
     ///
     /// The env holds no cache while a block builds: only [`Self::check_in_execution_cache`] puts
     /// one back, so a build that fails at any point leaves none.
     pub(crate) fn check_out_execution_cache(&self, parent: B256) -> Option<ExecutionCache> {
         let (saved, code, capacity) = {
             let mut slot = self.inner.execution_cache.lock();
-            #[cfg(any(test, feature = "test-utils"))]
             if slot.disabled {
                 return None;
             }
@@ -557,14 +588,14 @@ impl RethEnv {
         slot.code = None;
     }
 
-    /// TEST-ONLY: build every later block without an execution cache, as a node without one
-    /// would (the baseline of a differential run).
+    /// TEST-ONLY: build every later block without an execution cache, through the slot
+    /// `TN_EXEC_CACHE=0` makes (the baseline of a differential run). Replaces the slot: the saved
+    /// cache, kept bytecode table, test capacity and rebuild count go.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn disable_execution_cache_for_test(&self) {
-        let mut slot = self.inner.execution_cache.lock();
-        slot.disabled = true;
-        slot.saved = None;
-        slot.code = None;
+        let slot = ExecutionCacheSlot::from_env_value(Some("0"));
+        // the old slot's tables drop (unmap) when this returns, after the lock is released
+        let _old = std::mem::replace(&mut *self.inner.execution_cache.lock(), slot);
     }
 }
 

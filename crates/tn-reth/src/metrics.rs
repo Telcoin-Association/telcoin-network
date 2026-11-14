@@ -192,10 +192,16 @@ pub(crate) struct RethEnvMetrics {
     ///
     /// Alert on any nonzero value. One hit of each kind in `CHECK_ONE_HIT_IN` is re-read from
     /// the parent state (`env/exec_cache.rs`); a stale one means an invariant of the cache failed.
-    /// The block is built again without the cache, so this node still builds the right block, but
-    /// unchecked stale hits of earlier blocks may already have forked it from its peers: compare
-    /// its recent block hashes with a peer's before trusting it, and report it. The sample follows
-    /// this node's own cache's hit counts, so a zero on one node says nothing about another.
+    /// That block is discarded and built again without the cache, so it is the block a node
+    /// without the cache builds. Earlier blocks are not checked again: unchecked stale hits in
+    /// them may already have forked this node from its peers, and they are persisted. The node's
+    /// leader check (it goes inactive) or a certified epoch record other than its own (it stops)
+    /// finds such a block later; nothing repairs it short of a sync from scratch. Compare its
+    /// recent block hashes with a peer's before trusting it, and report it. `TN_EXEC_CACHE=0` on
+    /// this node (read when the env is created, so a restart) turns the cache off; that is safe on
+    /// one node, since a node without the cache builds the blocks a correct cache must. The
+    /// sample follows this node's own cache's hit counts, so a zero on one node says nothing
+    /// about another.
     pub(crate) exec_cache_stale_hits_total: Counter,
 
     /// Compared block roots whose parallel storage roots gave another root or other trie updates

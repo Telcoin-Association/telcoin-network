@@ -575,8 +575,9 @@ impl TestChain {
     }
 }
 
-/// Run `plan` on a chain without the cache and on one with it, over the same `genesis`; both
-/// must build the same blocks. Returns the cached chain.
+/// Run `plan` on a chain with the cache off (the slot `TN_EXEC_CACHE=0` makes) and on one with
+/// it, over the same `genesis`; both must build the same blocks (a block hash commits to the
+/// block's state root). Returns the cached chain.
 fn cached_and_uncached(
     genesis: &Genesis,
     plan: impl Fn(&mut TestChain) -> eyre::Result<Vec<B256>>,
@@ -588,6 +589,30 @@ fn cached_and_uncached(
     let mut cached = TestChain::on(genesis.clone(), None)?;
     assert_eq!(plan(&mut cached)?, expected, "the cache changed a block");
     Ok(cached)
+}
+
+/// `TN_EXEC_CACHE`: unset or `1` keeps the cache; `0` turns it off, and so does any other value
+/// (the cache-less build is the reference). An env switched off checks out no cache, so every read
+/// goes to the parent state.
+#[tokio::test]
+async fn exec_cache_switch_turns_the_cache_off() -> eyre::Result<()> {
+    for (value, disabled) in [
+        (None, false),
+        (Some("1"), false),
+        (Some("0"), true),
+        (Some("off"), true),
+        (Some(""), true),
+    ] {
+        assert_eq!(ExecutionCacheSlot::from_env_value(value).disabled, disabled, "{value:?}");
+    }
+    let mut chain = TestChain::new()?;
+    chain.env.disable_execution_cache_for_test();
+    assert!(chain.env.check_out_execution_cache(chain.head.hash()).is_none());
+    let tx = chain.call(COUNTER_ADDRESS);
+    chain.output(vec![vec![tx]])?;
+    assert!(chain.env.execution_cache_stats().is_none(), "no cache was saved");
+    assert_eq!(chain.slot(COUNTER_ADDRESS, 0)?, U256::from(1));
+    Ok(())
 }
 
 /// Block k writes a slot and block k+1 of the same output (not persisted between them) reads
