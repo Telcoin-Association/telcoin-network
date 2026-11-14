@@ -66,7 +66,12 @@ mod persist_bench;
 mod rpc;
 
 pub use exec_cache::ExecutionCacheStats;
-pub use execution::{BlockBuildTimings, OutputBuildScope};
+#[cfg(any(feature = "test-utils", test))]
+pub use execution::SAVED_TX_POSITIONS_KEPT;
+pub use execution::{
+    BlockBuildTimings, BuiltBlock, OutputBuildScope, PersistedBatchSink, PersistedBatches,
+    RecoveredBatch,
+};
 pub use layout::StorageLayout;
 pub use output_overlay::OutputTrieOverlay;
 
@@ -119,6 +124,9 @@ struct RethEnvInner {
     /// by each block build and saved back, anchored at the built block's hash, only when the
     /// build succeeds.
     execution_cache: parking_lot::Mutex<exec_cache::ExecutionCacheSlot>,
+    /// The receiver of the batches each persist stored by position, once installed
+    /// (`RethEnv::set_persisted_batch_sink`, see `env/execution.rs`).
+    persisted_batch_sink: std::sync::OnceLock<Arc<dyn PersistedBatchSink>>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -143,7 +151,15 @@ struct RethEnvInner {
     /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
     #[cfg(any(feature = "test-utils", test))]
     persist_attempts: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: the transaction positions the last persist attempts handed to the block writer,
+    /// oldest first. Read through `RethEnv::saved_tx_positions` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    saved_tx_positions: parking_lot::Mutex<std::collections::VecDeque<SavedTxPositions>>,
 }
+
+/// TEST-ONLY: the transaction positions one persist attempt handed to the block writer.
+#[cfg(any(feature = "test-utils", test))]
+type SavedTxPositions = Vec<Option<Arc<[u32]>>>;
 
 impl std::fmt::Debug for RethEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -232,12 +248,15 @@ impl RethEnv {
                 restored_state_floor,
                 tx_forwarder,
                 execution_cache: parking_lot::Mutex::new(execution_cache),
+                persisted_batch_sink: std::sync::OnceLock::new(),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                saved_tx_positions: Default::default(),
             }),
         })
     }
