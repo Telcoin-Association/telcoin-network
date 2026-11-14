@@ -10,6 +10,9 @@ pub mod consensus;
 mod error;
 mod metrics;
 pub mod network;
+// test-only until the proposer consults it (issue #1807)
+#[cfg(test)]
+mod order_hold;
 mod primary;
 mod proposer;
 mod state_sync;
