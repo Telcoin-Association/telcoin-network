@@ -853,10 +853,21 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   value (`damaged_v2_changeset_fails_pinned_reads_closed`). RPC reads of the damaged rows fail;
   others answer. Startup opens each segment's latest file to heal an interrupted write, and
   refuses that file, rather than cutting it, when its `.csoff` holds a committed record that fails
-  its checksum, or when it or its `.csoff` is shorter than its committed configuration (a prune
-  commits the configuration before it shrinks a file, so only damage leaves that); older files are
+  its checksum, when the last committed value, which ends where an uncommitted tail would be cut,
+  fails its checksum, or when it or its `.csoff` is shorter than its committed configuration (a
+  prune commits the configuration before it shrinks a file, so only damage leaves that); older files are
   verified as they are read. Startup also refuses a segment whose files skip blocks between two of
-  them (a file missing: `<segment> static files skip blocks`). **Operator response:** the file is damaged on this node only (disk or memory fault,
+  them (a file missing: `<segment> static files skip blocks`). A checksum binds a value to its row
+  and column, not to its file, so another file's bytes under a jar's name are caught only in part.
+  A `.conf` that names another segment or block range than its file name is refused at startup and
+  at its load (`static file <path> holds the configuration of another jar`). A full file (every
+  file below a segment's latest) whose data or offsets file has another length than its `.conf`
+  gives is refused at its load (`static file <path> is damaged: its data file does not match its
+  configuration`). Not caught: a data, offsets or `.csoff` file of another file of the segment with
+  the same length (every change-set file starts at row 0), or another file's longer data and
+  offsets under a segment's latest file, which startup cuts to the `.conf`; they read as this
+  file's values with no error. Copy or restore whole datadirs, never single static files.
+  **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
   the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
@@ -897,7 +908,9 @@ holds a v1 and a v2 tn-lmdb datadir built from one fixed chain (`genesis.json` a
 plan: legacy, EIP-2930, EIP-1559 and EIP-7702 transactions, contract creation, an account removal,
 an epoch close, a two-block output), each with its digests (`digests.txt`).
 `format_fixtures_read_back_unchanged` opens a copy of each with the current code and compares every
-table row, static-file row, provider read and the state-pack export.
+table row, static-file row, provider read and the state-pack export; once the copy is closed,
+every checked-in file but `db/tn-lmdb.dat` must still hold its bytes, so an open that rewrites a
+file (each segment's latest `.conf` is rewritten by the open's heal today, unchanged) fails.
 `format_writer_output_unchanged` builds the chain again and compares each tn-lmdb table's raw rows
 and each static file's bytes (the decompressed rows of the LZ4 headers jar), the version markers
 and the block hashes; it is ignored on the adiri build, whose fork schedule builds other blocks.

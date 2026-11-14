@@ -1846,8 +1846,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   returns a value's stored bytes without the check, for a search that only compares a prefix to
   steer itself and then reads the row it settles on verified (TN-0124). A heal never acts on a mismatch: it
   checks lengths only, and a damaged value stays an error on every read. Binding the position
-  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar is
-  written and read exactly as before (byte-identical files); `load` now refuses a version other
+  makes an offset that lands exactly on another value's boundary fail as well. A version-1 jar of
+  the kinds TN writes (uncompressed and LZ4) is written and read as before in steady state
+  (byte-identical files); later entries change version-1 behaviour on other paths: interrupted
+  prunes (TN-0130), leftover files (TN-0131, TN-0132), dictionary zstd (TN-0146), damaged offsets
+  (TN-0152), a configuration naming another jar (TN-0160), a failed writer (TN-0161). `load` now refuses a version other
   than 1 or 2 (upstream only ever wrote 1), and a version-2 configuration naming dictionary zstd
   (`UnsupportedCompression`): the writer compresses without the dictionaries the cursor then
   `expect`s, so that path cannot read back, and no TN segment uses it. A jar's own configuration decides its format, so a
@@ -1872,7 +1875,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   The checksums alone did not close one gap: the open-time heal's prune-direction arms
   (`consistency.rs`) trusted the offsets file's length and final offset, so an offsets file one
   row short, or a flipped high bit in the final offset, cut a committed row and rewrote the
-  configuration without an error. TN-0130 refuses that in checksummed jars.
+  configuration without an error. TN-0130 refuses that in checksummed jars, and TN-0162 a final
+  offset moved down, which the append-direction arm cut the data file to.
 
 - **TN-0121** — Checksummed `.csoff` records, and the changeset read paths fail closed on
   damage. *Kind*: feature (storage integrity) and fix (static-file read paths).
@@ -2015,8 +2019,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   cuts nothing; stopped after the `.conf`, or after the offsets cut, heals to the finished prune
   byte for byte), `changeset_prune_commits_the_header_before_it_cuts` (the same for a changeset
   prune through the provider, of rows and of blocks without changes, so the sidecar alone
-  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (rows cut by an older
-  build's order, a sidecar one record short, a sidecar gone). Mutation-checked: the `.conf`
+  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (an older build's
+  changeset prune stopped after its `prune_rows`, before its header commit: the rows and their
+  count cut, the block range and records not, built with `prune_rows` on the jar alone; a sidecar
+  one record short; a sidecar gone). Mutation-checked: the `.conf`
   written after the cuts, the sidecar cut before the commit, each of the three refusals removed.
   *Upstream*: maybe (the order is an upstream bug; the refusal needs TN-0120's versions).
 
@@ -2138,17 +2144,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 - **TN-0135** — A storage-v2 datadir refuses a jar of a checksummed segment without checksums.
   *Kind*: fix (static-file integrity, policy).
   *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
-  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at every jar
-  load: the cache fill and its reload, `prepare_index_update`, `update_index`,
-  `check_segment_consistency`; tests), `crates/storage/provider/src/providers/mod.rs`.
+  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at the loads
+  that read a jar's values or heal it: the cache fill and its reload, `prepare_index_update`,
+  `update_index`, `check_segment_consistency`, and since TN-0151 and TN-0165 the changeset counts
+  and the writer's open; tests), `crates/storage/provider/src/providers/mod.rs`.
   *Why*: the format is the configuration's version (TN-0120), and two flipped bits turn version 2
   into version 1. A checksummed jar read as version 1 hands out its values with the checksum
   appended (a storage changeset's `U256` reads wrong without an error) and its 20-byte `.csoff`
   records at a 16-byte stride. A byte pattern cannot tell that from a real version-1 jar, but the
   datadir's layout can: under storage v2 (the provider's `jar_checksums`, set from the stored
   settings before any read, TN-0122) every new jar of a checksummed segment is version 2, so a
-  version-1 jar there is refused (`UncheckedJarError`) wherever a jar loads for reading, writing or
-  the startup check. Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
+  version-1 jar there is refused (`UncheckedJarError`) at each of those loads. The loads that use
+  only the header keep `NippyJar::load`, since a version-1 header decodes as the version-2 one:
+  `iter_static_files` (the index, the contiguity check, metrics; TN-0160 checks its names) and
+  the deletions (`delete_jar`, `delete_current_and_open_previous`). Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
   open: accepted, as storage v2 was never released and development datadirs are recreated.
   Version-1 datadirs are unaffected (checksums off). Read-only providers opened without a
   `ProviderFactory` do not know the layout and keep reading a jar in its own format. It cannot
@@ -2214,17 +2223,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`std::thread::scope`, the last on the calling thread, no new dependency) through the same
   `fsync_file` helper (TN-0117), joins all of them, and returns an error if any failed: the first
   in the old serial order (`.csoff`, data, offsets), which is the one the serial code returned.
-  So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
-  sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
+  So no `.conf` is written after a failed sync, as before; a sync whose thread cannot start runs
+  on the calling thread (TN-0166), and a panic is resumed once the others ended. The `.csoff` length goes into the
   header only after its sync succeeded, as before. A failed call has run the other syncs too (the
-  serial code stopped at the first failure), which leaves only bytes past the configuration that
-  the heal or a retried sync already handles. `commit` (prune, unwind, rotation) keeps its serial
+  serial code stopped at the first failure), which leaves only bytes past the configuration. A
+  failed sync is not retried on the same writer: it writes no configuration again (TN-0161), the
+  persist's retry fails at its first `increment_block`, which the engine treats as terminal, and
+  the next start's heal cuts those bytes. `commit` (prune, unwind, rotation) keeps its serial
   syncs. The per-file timings now overlap, so `files_sync` times the span of the three, and TN's
   persist bench reads `sf_sync` from it. It cannot reach execution: the bytes written and the
   `.conf` rule are unchanged; only when the three syncs run changes. *Tests*:
   `a_failed_sync_leaves_the_configuration_unwritten` (each of the three syncs failed, both
-  formats: the call returns that error after every file was written, the `.conf` is the last
-  commit's, a reopen heals back to it and the blocks append again, a retried sync commits them)
+  formats: the call returns that error, after every file was written when the sync failed after
+  its write, and the `.conf` is the last commit's; TN-0161 adds a sync that fails without running,
+  and a retried sync and a finalize on the same writer refused; a reopen heals back to the `.conf`
+  and the blocks append again)
   and `failed_syncs_return_the_first_in_the_serial_order` (a changeset and a block segment), both
   through the fault hook; `sync_stats_record_each_phase_per_segment` (the span holds each sync);
   the TN-0130 to TN-0137 crash and checksum tests unchanged. Mutation-checked: the error dropped
@@ -2424,21 +2437,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   changesets, both versions: a rotation whose configuration write fails leaves no file of the
   next jar, and one stopped after the configuration, or after the data file too, opens; the next
   persist writes the jar and every block reads; it fails with the old order, on the stray data
-  file). *Upstream*: yes (upstream's order).
+  file); TN-0167 adds `creation_at_genesis_stopped_before_the_jar_has_its_files` (the first jar of
+  a segment). A leftover configuration of a stopped deletion that the new jar replaces is
+  TN-0132's `deletion_stopped_at_any_file`. A data file without a configuration that an older
+  build's creation left (files first) still fails every start in `iter_static_files`, as before:
+  remove that jar's files by hand. *Upstream*: yes (upstream's order).
 
 - **TN-0151** — The changeset counts load each jar through TN-0135's format check and count a
   segment's last file. *Kind*: fix. *Files*:
   `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
   (`account_changeset_count`, `storage_changeset_count`; test).
   *Why*: the two counts loaded a jar's configuration with `NippyJar::load`, outside `load_jar`,
-  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at every other load,
-  was counted with its own record size instead of refused. They also named each file by the
+  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at the loads that read
+  values, was counted with its own record size instead of refused. They also named each file by the
   blocks its configuration holds (the range `iter_static_files` lists), not by its fixed range,
   so a segment's last file, which holds fewer blocks than its range until it fills, was never
   found and its changes were left out of the count (upstream's line). *Can reach execution or
-  storage*: no. They only read and count, and no TN crate calls them (they back reth's
-  `StatsReader::count_entries` and the `*_changeset_count` provider methods); no byte written or
-  read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
+  storage*: no. They only read and count, and no TN crate calls them (they back the
+  `*_changeset_count` methods of reth's database and consistent providers;
+  `StatsReader::count_entries` does not reach them); no byte written or read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
   refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
   off and for the segment still checked; it fails without either change). *Upstream*: the file
   name, yes; the format check, no (TN-0135 is TN's).
@@ -2572,3 +2589,176 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
   storage*: no; a doc comment and a test assertion.
   *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
+
+- **TN-0160** — A jar's configuration must name its own file, and a full checksummed jar's files
+  must have its configuration's lengths. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/db/src/static_file/mod.rs` (`check_static_file_identity`,
+  `StaticFileIdentityError`, called by `iter_static_files`), `crates/storage/nippy-jar/src/{lib.rs,
+  error.rs}` (`NippyJar::check_file_lengths`, `NippyJarError::FileLengthMismatch`),
+  `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderInner::load_jar`, `LoadedJar::new`; tests).
+  *Why*: TN-0120's checksums seed a value with its row and column and TN-0121's a `.csoff` record
+  with its index, never with the file, and every change-set jar starts at row 0. So another jar's
+  files copied or restored under a jar's name (an operator or tool mistake) verified and served
+  the other range's history with no error. Two cheap checks, no format change: (a) every jar
+  `iter_static_files` lists (each start, `check_contiguity`) and every load through `load_jar`
+  refuses a configuration whose segment differs from its file name's, or whose expected block
+  range does not end where the name's range ends or starts before it (a non-zero genesis moves a
+  first jar's expected start past its name's, `SegmentHeader::set_expected_block_start`); this
+  applies to both jar versions, since no writer names a file other than by its configuration's
+  range. (b) `LoadedJar::new` holds a full checksummed jar (its last block in: every jar below a
+  segment's latest, which TN-0133's contiguity check requires, and the latest once its last block
+  is committed) to its configuration: offsets file `1 + 8 * (rows * columns + 1)` bytes and final
+  offset at the data file's end. A full jar takes no more rows (the next block rotates to a new
+  file) and a prune commits its configuration first (TN-0130), so only damage or another jar's
+  file fails it; a jar still being written is not checked, since it holds bytes past its
+  configuration until the next commit. Not caught: same-length data, offsets or `.csoff` files of
+  another jar of the segment, and another jar's longer files under a segment's latest name, which
+  the open-time heal cuts (`crates/tn-reth/README.md`, "Static-file checksums"). Binding the file
+  into the seeds would catch every swap but changes the format. *Can reach execution or storage*:
+  storage, by refusing: a datadir whose files a writer made passes both checks, and no byte
+  written or value read changes. *Tests*: `a_configuration_must_name_its_own_jar` (the name's
+  range, a moved genesis start, another range, another segment, a name that is no data file),
+  `jar_files_under_another_jars_name_are_refused` (a swapped `.conf` and the other segment's
+  `.conf`, at startup and at a load after it; another jar's data file and offsets file under a
+  full jar: refused, other jars still read). *Upstream*: maybe (the name check; the length check
+  needs TN-0120's version).
+
+- **TN-0161** — A static-file writer whose sync, offsets write or prune failed writes no
+  configuration again. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, error.rs, lib.rs}`
+  (`NippyJarWriter::{mark_failed, has_failed}`, `NippyJarError::WriterFailed`; test),
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_crash_tests.rs}`
+  (`StaticFileProviderRW::{sync_all, commit, increment_block, flush_current_changeset_offset,
+  truncate_changesets}`; the test-only `fail_syncs_unrun` hook; test).
+  *Why*: after a failure the writer's memory and its files can disagree, and its next commit
+  wrote a configuration over them. A failed offsets write drained the offsets it had not written,
+  so a later sync wrote none and the `.conf` counted rows without offsets; a `prune_rows` whose
+  configuration write or cut failed had already cut its rows and offsets in memory, so the next
+  append took its offset from the uncut data end and its seed from the cut row count, and the
+  pruned rows' values verified as the new rows; a failed `.csoff` append dropped the block's
+  record; and on Linux a retried `fsync` can report success for pages the failed one lost. The
+  writer now keeps a `failed` flag, set by its own failed data or offsets sync or offsets write
+  and by a failed `prune_rows`, and by the provider (`mark_failed`) when one of `sync_all`'s
+  concurrent syncs (TN-0138), a `.csoff` append, sync or truncation fails. A failed writer's
+  `finalize` and `prune_rows`, the only writes of its configuration, return `WriterFailed`, so a
+  retried persist or commit on it writes nothing; the next start opens a new writer, whose heal
+  cuts the files back to the last configuration. Not reachable in TN today: a failed persist's
+  retry already fails at its first `increment_block` (`UnexpectedStaticFileBlockNumber`, terminal),
+  and the only prunes are the startup heal's, on writers it just opened, which abort the start on
+  any error. *Can reach execution or storage*: storage, on the failure path only: a writer that
+  never failed writes what it wrote before. *Tests*: `test_interrupted_prune_heals_at_every_point`
+  (after a failed prune the same writer's commit and prune are refused; the files are unchanged),
+  `a_failed_sync_leaves_the_configuration_unwritten` (TN-0138's, now with a retried sync and a
+  finalize refused, and each sync also failed without running). Mutation-checked: no refusal in
+  `finalize` (both tests fail). *Upstream*: maybe (the drain and the prune order are upstream's).
+
+- **TN-0162** — The open-time heal verifies a checksummed jar's last committed value before it
+  cuts the data file to the final offset. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/nippy-jar/src/{consistency.rs, lib.rs}` (`NippyJarChecker`'s
+  append-direction data arm, `verify_last_value`; test).
+  *Why*: a data file longer than the final offset is what an interrupted append leaves, and the
+  heal (run at every start on each segment's latest jar) cut it to that offset. The offset itself
+  was not checked: a bit cleared in a checksummed jar's final offset made the heal cut committed
+  bytes of the last value, after which every read of it failed and the next appends started
+  inside it. TN-0130's refusals cover only files shorter than the configuration. Now, in a
+  checksummed jar, the value that ends at the final offset (the last committed row's last
+  column, starting at the offset before it) must verify before the cut; otherwise the open fails
+  with `ChecksumMismatch` naming that row and column and cuts nothing. A version-1 jar keeps
+  upstream's heal. *Can reach execution or storage*: storage, on damage only: an intact jar's last
+  value verifies and the heal cuts what it cut before. *Tests*:
+  `test_heal_refuses_a_final_offset_moved_down` (the final offset lowered by 1, 4 and 8: refused,
+  files unchanged; an intact jar with an uncommitted row still healed to its committed files).
+  Mutation-checked: no verification (the test fails). *Upstream*: no (TN-0120's checksums).
+
+- **TN-0163** — The changeset sidecar heal refuses committed `.csoff` records that are not one
+  contiguous run from row 0. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::heal_changeset_sidecar`; test).
+  *Why*: the heal checked only that each committed record's rows fit the jar's rows and that none
+  fit again after one that did not (TN-0121). Records that verify but overlap, skip rows or start
+  past row 0 (another jar's sidecar, TN-0160's trigger, or a writer bug; bit rot fails the record
+  checksums first) passed, and blocks then read other blocks' rows. The writer gives each block
+  the rows after the previous block's, starting at row 0 (`increment_block` takes the jar's row
+  count), so the heal, which reads the committed records in one bulk read already, now requires
+  each record to start where the previous one's rows end and the first at row 0, and otherwise
+  returns `CorruptedChangeSetStaticFile` and cuts nothing. Both jar versions: an interrupted prune
+  of an older build leaves a contiguous run past the rows, which the heal still cuts. Only the
+  latest jar of each changeset segment is healed at a start; older jars' records are read as
+  lookups need them. *Can reach execution or storage*: storage, by refusing: records a writer
+  made pass, and nothing written or read changes. *Tests*:
+  `sidecar_heal_refuses_records_out_of_order` (a record pointing back into earlier rows, one
+  skipping rows, a first record past row 0; both formats: refused, the sidecar unchanged);
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` and the TN-0130 crash tests unchanged.
+  Mutation-checked: no check (the test fails). *Upstream*: maybe (the run check; the checksums
+  are TN-0121's).
+
+- **TN-0164** — `truncate_changesets` syncs the `.csoff` record it flushed before it writes the
+  configuration. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/provider/src/providers/static_file/writer.rs`
+  (`StaticFileProviderRW::truncate_changesets`).
+  *Why*: the prune flushed the pending block's `.csoff` record and then wrote the configuration
+  (through `prune_rows` or `commit`, whose own sidecar sync comes after `prune_rows`), which can
+  count that record, without syncing the sidecar. A crash then left a sidecar shorter than its
+  header, which a checksummed jar refuses at the next start (TN-0130). `sync_all` and `commit`
+  already sync the sidecar before the configuration; the prune now does too, and a failed sync
+  leaves the writer failed (TN-0161). Not reachable in TN: the only prunes are the startup heal's,
+  on writers just opened, which hold no pending record. *Can reach execution or storage*:
+  storage: one `fsync` more per changeset prune, no byte changes. *Tests*: none new (a sync's
+  ordering against a crash is not observable in a test); the TN-0130 crash tests unchanged.
+  *Upstream*: maybe.
+
+- **TN-0165** — The static-file writer's open loads the jar through TN-0135's and TN-0160's
+  checks. *Kind*: fix (static-file integrity). *Files*:
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::open`; test).
+  *Why*: the open loaded the configuration of a jar the cache already held with `NippyJar::load`.
+  A checksummed jar's configuration turned into version 1 on disk while the node ran (two flipped
+  bits) then ran the version-1 heal, which can cut committed rows, and its commit rewrote the
+  configuration, before the index update's `load_jar` refused the jar. A jar the cache does not
+  hold was already loaded through `load_jar` on the cache fill. Now the open loads through
+  `load_jar` in both cases, so the refusal comes before the heal. *Can reach execution or
+  storage*: storage, by refusing: a jar that passes the checks opens as before. *Tests*:
+  `storage_v2_refuses_jars_without_checksums` (a cached jar's configuration turned into version 1
+  with its offsets file one offset short: the writer's open is refused and both files are left as
+  they are; it fails without the change). *Upstream*: no (TN-0135 is TN's).
+
+- **TN-0166** — A static-file sync whose thread cannot start runs on the calling thread, and a
+  wait for a file's readers is logged once it passes a second. *Kind*: fix (operability).
+  *Files*: `crates/storage/provider/src/providers/static_file/{writer.rs, mod.rs,
+  tn_crash_tests.rs}` (`sync_at_once`, the test-only `FAIL_SYNC_THREADS`,
+  `LoadedJar::release`; test).
+  *Why*: TN-0138 runs each segment commit's `.csoff`, data and offsets syncs on scoped threads
+  (under storage v2 up to eight a persist), and a thread that could not start (`EAGAIN` under a
+  cgroup pids limit or systemd `TasksMax`) was its sync's error: the persist failed and the node
+  stopped. The job now waits in a slot its thread takes it from; when the thread does not start,
+  the calling thread takes it and runs it after starting the others, as every sync ran before
+  TN-0138, with a warning naming the phase. A sync's own failure is unchanged. TN-0148's
+  `LoadedJar::release` waits, with no bound, for readers of a file's earlier snapshots before the
+  file shrinks or is replaced (an RPC reader holding a changeset tip file across a rotation); a
+  wait now logs a warning naming the segment and range after a second, and again with its length
+  when it ends. *Can reach execution or storage*: storage, in timing only: the same syncs run, on
+  another thread, before the configuration as before; no byte changes. *Tests*:
+  `syncs_run_here_when_their_threads_cannot_start` (no sync thread starts: the changeset commit
+  succeeds and its blocks read back, also after a reopen, both formats; it failed before). The
+  release warning has no test (a log line after a one-second wait). *Upstream*: no (TN-0138 and
+  TN-0148 are TN's).
+
+- **TN-0167** — Tests: crash states of block-segment prunes and of a creation at genesis, the
+  offsets-only cut of a changeset prune, and two tests' descriptions. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/static_file/{tn_crash_tests.rs,
+  tn_checksum_tests.rs}`.
+  *Why*: TN-0130's provider crash tests covered changeset prunes only, and the state a prune
+  stopped between its offsets cut and its data cut only at the jar level; TN-0150's covered
+  rotation only. `block_segment_prune_stopped_after_the_configuration_heals` (headers and
+  transactions, both formats: `prune_rows`'s configuration with nothing cut, or the offsets alone
+  cut, heals at the next open to the finished `prune_rows`'s files, and the kept rows read; for
+  transactions the block range is left to `check_consistency`, not run there),
+  `changeset_prune_commits_the_header_before_it_cuts` (now also the offsets cut without the data),
+  `creation_at_genesis_stopped_before_the_jar_has_its_files` (a segment's first jar stopped after
+  its configuration, or after its data file too: the next start opens and the next persist writes
+  the jar, headers and account changesets, both formats). The descriptions of
+  `checksummed_changesets_shorter_than_the_header_are_refused` and of a case of
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` now say which state they build: an
+  older build's prune stopped between `prune_rows` and its header commit. *Can reach execution or
+  storage*: no; tests only. *Upstream*: n/a.
