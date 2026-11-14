@@ -160,9 +160,10 @@ pub struct PrimaryMetrics {
     /// (`gc_activity_window(gc_depth)`, 40 rounds at a `gc_depth` of 50) demotes the node once a
     /// certificate of that epoch passes it, so a value near the window means the node entered the
     /// epoch with little margin left. Only an active CVV records it: a node that enters the epoch
-    /// already demoted reads zero, and recording stops at the first certificate round past the
-    /// window, where the demotion fires. A request handler built for a later epoch than the
-    /// recorded one starts it at zero; one rebuilt by a mode change inside the epoch keeps it.
+    /// already demoted reads zero, and recording stops once the demotion fires, at the first
+    /// certificate round past the window; certificates already being checked then can still raise
+    /// it a few rounds further. A request handler built for a later epoch than the recorded one
+    /// starts it at zero; one rebuilt by a mode change inside the epoch keeps it.
     pub(crate) epoch_entry_rounds_behind: Gauge,
 }
 
