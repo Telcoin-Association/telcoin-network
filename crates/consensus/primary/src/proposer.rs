@@ -246,6 +246,27 @@ struct ProposalTrigger {
     pending_before: usize,
     /// `tn_primary_headers_proposed_total{reason}` for [`Self::reason`].
     proposed: Counter,
+    /// The new header's place in the own chain and what the order hold of issue #1807 kept back.
+    hold: HoldReport,
+}
+
+/// The order-hold fields of a new header's `header proposed` line (issue #1807).
+///
+/// Observability only. The proposer has no order hold yet, so the counts of what it held are zero;
+/// `own_parent` is measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HoldReport {
+    /// The header's parents carry this node's certificate of the own header tracked at the
+    /// previous round (see [`Proposer::cites_own_parent`]).
+    own_parent: bool,
+    /// Digests a hold left in the queue. Zero: nothing is held.
+    held: usize,
+    /// Workers whose lanes a hold kept back. Zero: nothing is held.
+    held_lanes: usize,
+    /// Tracked older own headers with digests that the parents do not prove to be ancestors of
+    /// the header. Zero for now: counting them exactly needs a per-header record of which tracked
+    /// headers each own header proves, which the hold brings.
+    blockers: usize,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -506,6 +527,10 @@ impl<DB: Database> Proposer<DB> {
             exec_tip = exec.tip.number,
             exec_basis = exec.basis.as_str(),
             exec_policy = exec_inputs.policy.as_str(),
+            own_parent = trigger.hold.own_parent,
+            held = trigger.hold.held,
+            held_lanes = trigger.hold.held_lanes,
+            blockers = trigger.hold.blockers,
             "header proposed"
         );
         trigger.proposed.increment(1);
@@ -1179,6 +1204,23 @@ impl<DB: Database> Proposer<DB> {
         drained
     }
 
+    /// Whether `parents` carry this node's certificate of the own header tracked at the round
+    /// below `round`: the `own_parent` field of the `header proposed` line (issue #1807).
+    ///
+    /// Only a tracked previous header counts, so round 1 (its genesis parents have no tracked own
+    /// header below them) and a header whose previous own header already left the tracked set
+    /// report `false`. Observability only: the header's contents never depend on it.
+    fn cites_own_parent(&self, round: Round, parents: &[Certificate]) -> bool {
+        let Some(previous) = round.checked_sub(1).and_then(|r| self.proposed_headers.get(&r))
+        else {
+            return false;
+        };
+        let previous = previous.digest();
+        parents.iter().any(|parent| {
+            parent.origin() == &self.authority_id && parent.header().digest() == previous
+        })
+    }
+
     /// Conditions are met to propose the next header.
     ///
     /// This method ensures proposer is protected against equivocation and sends the next header to
@@ -1256,6 +1298,10 @@ impl<DB: Database> Proposer<DB> {
                     reason,
                     pending_before: self.pending_digests_len(),
                     proposed: self.headers_proposed.counter(reason),
+                    hold: HoldReport {
+                        own_parent: self.cites_own_parent(current_round, &self.last_parents),
+                        ..HoldReport::default()
+                    },
                 };
                 let digests = self.drain_digests_for_header();
                 let parents = std::mem::take(&mut self.last_parents);
