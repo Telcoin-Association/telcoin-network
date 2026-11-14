@@ -2566,3 +2566,26 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
   storage*: no; a doc comment and a test assertion.
   *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
+
+- **TN-0192** — The thread-local zstd decompressors keep at most 128 KiB of buffer between calls.
+  *Kind*: fix (security). *Files*: `crates/storage/zstd-compressors/src/lib.rs`
+  (`MAX_RETAINED_BUFFER_CAPACITY`, `ReusableDecompressor::release_oversized_buffer`, called by
+  `with_tx_decompressor` and `with_receipt_decompressor` after their closure returns; test
+  `thread_local_decompressors_release_oversized_buffers`).
+  *Why*: a `ReusableDecompressor`'s buffer grows to the largest item decompressed into it and never
+  shrank, and the thread-local ones live as long as their thread. Every receipt and transaction read
+  from static files is decoded through them, on whichever thread reads it: for RPC, the blocking
+  pool's threads (up to 512 in TN's RPC pool). A receipt can be a few MB, so a pool that had
+  decoded such receipts kept that much per thread for as long as the thread lived. A buffer that grew past 128 KiB is now shrunk back to 128 KiB once the closure that used it
+  returns (its result cannot borrow the buffer), so a thread keeps at most 128 KiB per
+  decompressor. 128 KiB is the pool's default limit on a transaction's encoded size
+  (`DEFAULT_MAX_TX_INPUT_BYTES`); every transaction the default pool admits and the receipt of any
+  ordinary transaction (a few KiB) decodes without a reallocation, and a larger item pays one
+  allocation, small beside decoding it. *Can reach execution or storage*: no change to what is
+  computed or stored. The decompressed bytes and every decoded value are unchanged; only the
+  capacity of a scratch buffer between calls moves. Compression, the stored bytes and the
+  dictionaries are untouched, and no dependency or feature changes.
+  *Tests*: `thread_local_decompressors_release_oversized_buffers` (a 512 KiB receipt and a 512 KiB
+  transaction decode correctly and leave each buffer at or under 128 KiB; a 64 KiB item's buffer is
+  kept; a shrunk buffer decodes a large item again). Mutation-checked: never shrinking (fails,
+  the receipt buffer keeps about 1 MB). *Upstream*: yes.
