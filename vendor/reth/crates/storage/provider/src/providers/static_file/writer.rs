@@ -3,6 +3,8 @@ use super::{
     SyncPhase,
 };
 use crate::providers::static_file::metrics::StaticFileProviderOperation;
+// TN(TN-0201): the values of a `Transactions` jar with tagged values.
+use super::{manager::JarFormat, tx_row::TaggedTx, TxPositionsError};
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber, TxNumber, U256};
 use parking_lot::{lock_api::RwLockWriteGuard, Mutex, RawRwLock, RwLock};
@@ -413,8 +415,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             ),
             Err(ProviderError::MissingStaticFileBlock(_, _)) => {
                 let path = static_file_provider.directory().join(segment.filename(&block_range));
-                let checksums = static_file_provider.jar_checksums(segment);
-                (create_jar(segment, &path, block_range, checksums), path)
+                let format = static_file_provider.new_jar_format(segment);
+                (create_jar(segment, &path, block_range, format), path)
             }
             Err(err) => return Err(err),
         };
@@ -1532,7 +1534,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.ensure_no_queued_prune()?;
 
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Transactions);
-        self.append_with_tx_number(tx_num, tx)?;
+        // TN(TN-0201): a jar with tagged values stores the transaction after the inline tag.
+        if self.writer.has_tagged_values() {
+            self.append_with_tx_number(tx_num, TaggedTx::Inline(tx))?;
+        } else {
+            self.append_with_tx_number(tx_num, tx)?;
+        }
 
         if let Some(metrics) = &self.metrics {
             metrics.record_segment_operation(
@@ -1543,6 +1550,45 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         Ok(())
+    }
+
+    /// TN(TN-0201): appends the row of transaction `tx_num` that stores its position in the
+    /// consensus batch its block executed, instead of the transaction ([`super::TxRow::Ref`]).
+    /// Only a `Transactions` jar with tagged values stores one ([`Self::tagged_tx_rows`]); in any
+    /// other jar this is an error and nothing is written.
+    ///
+    /// Like [`Self::append_transaction`], it does not call `increment_block()`.
+    pub fn append_transaction_ref(
+        &mut self,
+        tx_num: TxNumber,
+        position: u32,
+    ) -> ProviderResult<()> {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        if !self.tagged_tx_rows() {
+            return Err(ProviderError::other(TxPositionsError::UntaggedJar {
+                path: self.data_path.clone(),
+            }))
+        }
+        self.append_with_tx_number::<TaggedTx<'_, N::SignedTx>>(tx_num, TaggedTx::Ref(position))?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::Transactions,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// TN(TN-0201): whether the current jar is a `Transactions` jar with tagged values, whose
+    /// rows [`Self::append_transaction_ref`] can write.
+    pub fn tagged_tx_rows(&self) -> bool {
+        self.writer.user_header().segment() == StaticFileSegment::Transactions &&
+            self.writer.has_tagged_values()
     }
 
     /// Appends receipt to static file.
@@ -1989,7 +2035,7 @@ fn create_jar(
     segment: StaticFileSegment,
     path: &Path,
     expected_block_range: SegmentRangeInclusive,
-    checksums: bool,
+    format: JarFormat,
 ) -> NippyJar<SegmentHeader> {
     let mut jar = NippyJar::new(
         segment.columns(),
@@ -1997,9 +2043,11 @@ fn create_jar(
         SegmentHeader::new(expected_block_range, None, None, segment),
     );
 
-    // TN(TN-0122): the provider's policy (`StaticFileProviderInner::jar_checksums`).
-    if checksums {
-        jar = jar.with_checksums();
+    // TN(TN-0122, TN-0201): the provider's policy (`StaticFileProviderInner::new_jar_format`).
+    match format {
+        JarFormat::Plain => {}
+        JarFormat::Checksummed => jar = jar.with_checksums(),
+        JarFormat::TaggedTx => jar = jar.with_checksums().with_tagged_values(),
     }
 
     // Transaction and Receipt already have the compression scheme used natively in its encoding.

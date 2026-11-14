@@ -1,14 +1,16 @@
 //! TN(TN-0123): static files with checksums (TN-0120, TN-0121) through `StaticFileProvider`: the
 //! policy that picks a new jar's format, damage reaching every reader as an error, the sidecar
-//! heal, rotation and prune, and datadirs that hold both formats.
+//! heal, rotation and prune, and datadirs that hold both formats. TN(TN-0201): the policy's
+//! `Transactions` jars with tagged values, and their refusal in any other segment.
 
-use super::manager::{StaticFileProviderBuilder, StaticFileWriter};
+use super::manager::{JarFormat, StaticFileProviderBuilder, StaticFileWriter};
 use crate::{
     providers::StaticFileProvider, test_utils::create_test_provider_factory, HeaderProvider,
     ReceiptProvider, StaticFileProviderFactory, TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::{Header, SignableTransaction, Transaction, TxLegacy};
 use alloy_primitives::{Address, Signature, B256, U160, U256};
+use reth_codecs::Compact;
 use reth_db::{
     models::{AccountBeforeTx, StorageBeforeTx},
     test_utils::create_test_static_files_dir,
@@ -41,6 +43,26 @@ pub(super) fn provider(
         .with_jar_checksums(checksums)
         .build()
         .unwrap()
+}
+
+/// TN(TN-0201): [`provider`] whose `Transactions` jars have tagged values if `pointers` (and
+/// `checksums`).
+fn pointer_provider(
+    dir: &Path,
+    checksums: bool,
+    pointers: bool,
+) -> StaticFileProvider<EthPrimitives> {
+    StaticFileProviderBuilder::read_write(dir)
+        .with_blocks_per_file(1_000)
+        .with_jar_checksums(checksums)
+        .with_tx_pointer_jars(pointers)
+        .build()
+        .unwrap()
+}
+
+/// The transaction [`write_block_segments`] writes for block `number`.
+fn block_tx(number: u64) -> TransactionSigned {
+    TxLegacy { nonce: number, ..Default::default() }.into_signed(Signature::test_signature()).into()
 }
 
 pub(super) fn address(block: u64, change: u64) -> Address {
@@ -107,9 +129,7 @@ pub(super) fn write_block_segments(provider: &StaticFileProvider<EthPrimitives>,
             writer.increment_block(number).unwrap();
             match segment {
                 StaticFileSegment::Transactions => {
-                    let tx = TxLegacy { nonce: number, ..Default::default() };
-                    let tx: TransactionSigned = tx.into_signed(Signature::test_signature()).into();
-                    writer.append_transaction(number, &tx).unwrap();
+                    writer.append_transaction(number, &block_tx(number)).unwrap();
                 }
                 StaticFileSegment::Receipts => {
                     let receipt = Receipt { cumulative_gas_used: number + 1, ..Default::default() };
@@ -163,20 +183,40 @@ fn is_checksum_error(err: &ProviderError) -> bool {
 
 /// The policy: a provider with checksums on creates checksummed jars for every segment, with
 /// 20-byte `.csoff` records; one with checksums off creates upstream's format. A
-/// `ProviderFactory` turns them on for storage v2 and off for v1.
+/// `ProviderFactory` turns them on for storage v2 and off for v1. TN(TN-0201): with tx pointer
+/// jars on as well, the `Transactions` jars have tagged values (version 3), whose inline rows are
+/// one byte longer; without checksums the flag gives upstream's format. No other segment's jar
+/// ever has tagged values, and `jar_formats` reads back what was created.
 #[test]
 fn policy_picks_the_jar_format() {
-    for checksums in [false, true] {
+    for (checksums, pointers) in [(false, false), (true, false), (false, true), (true, true)] {
         let (dir, _) = create_test_static_files_dir();
-        let provider = provider(dir.path(), checksums, 1_000);
+        let provider = pointer_provider(dir.path(), checksums, pointers);
         write_changesets(&provider, 0..3);
         write_block_segments(&provider, 3);
         for segment in StaticFileSegment::iter() {
             assert!(super::checksummed_segment(segment), "{segment}");
             assert_eq!(provider.jar_checksums(segment), checksums, "{segment}");
+            let tagged = checksums && pointers && segment == StaticFileSegment::Transactions;
+            assert_eq!(provider.tx_pointer_jars(segment), tagged, "{segment}");
             let jar = load(&jar_path(&provider, segment, 0));
             assert_eq!(jar.has_checksums(), checksums, "{segment}");
+            assert_eq!(jar.has_tagged_values(), tagged, "{segment}");
+            let format = match (tagged, checksums) {
+                (true, _) => JarFormat::TaggedTx,
+                (false, true) => JarFormat::Checksummed,
+                (false, false) => JarFormat::Plain,
+            };
+            assert_eq!(provider.new_jar_format(segment), format, "{segment}");
+            assert_eq!(JarFormat::of(&jar), format, "{segment}");
+            let range = provider.find_fixed_range(segment, 0);
+            assert_eq!(provider.jar_formats(segment).unwrap(), [(range, format)], "{segment}");
         }
+        // Transactions: the value, a tag in a jar with tagged values, and a checksum.
+        let txs = jar_path(&provider, StaticFileSegment::Transactions, 0);
+        let values: usize = (0..3).map(|number| block_tx(number).to_compact(&mut Vec::new())).sum();
+        let per_value = 4 * usize::from(checksums) + usize::from(checksums && pointers);
+        assert_eq!(std::fs::metadata(txs).unwrap().len() as usize, values + 3 * per_value);
         for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
         {
             let csoff = jar_path(&provider, segment, 0).with_extension("csoff");
@@ -200,6 +240,23 @@ fn policy_picks_the_jar_format() {
     assert!(!StaticFileSegment::iter().any(|segment| static_files.jar_checksums(segment)));
     factory.provider().unwrap().set_storage_settings_cache(StorageSettings::v2());
     assert!(StaticFileSegment::iter().all(|segment| static_files.jar_checksums(segment)));
+
+    // TN(TN-0201): the settings never turn tx pointer jars on; only the setter does, and only
+    // for `Transactions` jars with checksums.
+    let tx_pointer_segments = || {
+        StaticFileSegment::iter()
+            .filter(|segment| static_files.tx_pointer_jars(*segment))
+            .collect::<Vec<_>>()
+    };
+    assert!(tx_pointer_segments().is_empty());
+    static_files.set_tx_pointer_jars(true);
+    assert_eq!(tx_pointer_segments(), [StaticFileSegment::Transactions]);
+    factory.set_storage_settings_cache(StorageSettings::v1());
+    assert!(tx_pointer_segments().is_empty());
+    factory.set_storage_settings_cache(StorageSettings::v2());
+    assert_eq!(tx_pointer_segments(), [StaticFileSegment::Transactions]);
+    static_files.set_tx_pointer_jars(false);
+    assert!(tx_pointer_segments().is_empty());
 }
 
 /// A changed byte in a changeset value is an error from the point lookups, the block reads and the
@@ -458,6 +515,51 @@ fn rotation_prune_and_appends() {
 /// Whether `err` is TN-0135's refusal of a jar without checksums.
 fn is_unchecked_jar(err: &ProviderError) -> bool {
     err.downcast_other_ref::<super::UncheckedJarError>().is_some()
+}
+
+/// TN(TN-0201): a jar with tagged values (version 3) of any segment but `Transactions` is
+/// refused at every load that reads or opens it, with checksums on or off: here a header and a
+/// changeset jar whose configurations say version 3, with a valid checksum. The `Transactions`
+/// jar, version 3 by the policy, loads, and the other segments still answer.
+#[test]
+fn tagged_values_are_refused_outside_transactions() {
+    let (dir, _) = create_test_static_files_dir();
+    let written = pointer_provider(dir.path(), true, true);
+    write_changesets(&written, 0..3);
+    write_block_segments(&written, 3);
+    let headers = jar_path(&written, StaticFileSegment::Headers, 0);
+    let accounts = jar_path(&written, StaticFileSegment::AccountChangeSets, 0);
+    drop(written);
+    for path in [&headers, &accounts] {
+        let config = path.with_extension("conf");
+        let mut bytes = std::fs::read(&config).unwrap();
+        assert_eq!(bytes[..8], 2u64.to_le_bytes());
+        bytes[..8].copy_from_slice(&3u64.to_le_bytes());
+        let body = bytes.len() - 4;
+        let crc = reth_nippy_jar::checksum(0, &bytes[..body]);
+        bytes[body..].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&config, bytes).unwrap();
+        assert!(load(path).has_tagged_values());
+    }
+    let is_tagged_jar =
+        |err: &ProviderError| err.downcast_other_ref::<super::TaggedJarError>().is_some();
+
+    for checksums in [true, false] {
+        let reopened = provider(dir.path(), checksums, 1_000);
+        let err = reopened.header_by_number(0).unwrap_err();
+        assert!(is_tagged_jar(&err), "{err}");
+        assert!(is_tagged_jar(&reopened.account_block_changeset(0).unwrap_err()));
+        assert!(is_tagged_jar(&reopened.account_changeset_count().unwrap_err()));
+        let err = reopened.latest_writer(StaticFileSegment::Headers).map(drop).unwrap_err();
+        assert!(is_tagged_jar(&err), "{err}");
+
+        assert!(load(&jar_path(&reopened, StaticFileSegment::Transactions, 0)).has_tagged_values());
+        reopened.get_segment_provider_for_block(StaticFileSegment::Transactions, 0, None).unwrap();
+        assert_eq!(reopened.storage_changeset(1).unwrap().len(), CHANGES as usize);
+        assert_eq!(reopened.receipt(2).unwrap().unwrap().cumulative_gas_used, 3);
+    }
+    let err = provider_ro(dir.path()).header_by_number(1).unwrap_err();
+    assert!(is_tagged_jar(&err), "{err}");
 }
 
 /// TN(TN-0135): a provider with checksums on (storage v2) refuses a jar of a checksummed segment

@@ -65,6 +65,8 @@ use reth_storage_api::{
     StorageSettingsCache, TryIntoHistoricalStateProvider, WriteStateInput,
 };
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
+// TN(TN-0201): the check on the positions `save_blocks_with_tx_positions` is given.
+use crate::providers::static_file::check_tx_positions_len;
 use reth_trie::{
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
     HashedPostStateSorted, StoredNibbles,
@@ -491,12 +493,34 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     ///
     /// Use [`SaveBlocksMode::Full`] for production (includes receipts, state, trie).
     /// Use [`SaveBlocksMode::BlocksOnly`] for block structure only (used by `insert_block`).
-    #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
     pub fn save_blocks(
         &self,
         blocks: Vec<ExecutedBlock<N::Primitives>>,
         save_mode: SaveBlocksMode,
     ) -> ProviderResult<()> {
+        // TN(TN-0201): without positions every transaction is stored inline.
+        self.save_blocks_with_tx_positions(blocks, save_mode, &[])
+    }
+
+    /// TN(TN-0201): [`Self::save_blocks`], with the positions of each block's transactions in the
+    /// consensus batch it executed: `tx_positions[i]` belongs to `blocks[i]`, `None` gives none
+    /// for that block, and an empty slice none for any; any other length is an error before
+    /// anything is written. In a `Transactions` jar with tagged values a block with positions
+    /// stores one position row per transaction, which must match its transactions one to one and
+    /// increase strictly, or the call fails; a block without them stores its transactions inline.
+    /// A jar without tagged values ignores the positions and is written exactly as
+    /// [`Self::save_blocks`] writes it (`StaticFileProvider::write_blocks_data`).
+    ///
+    /// The positions are an argument, not state, so a caller that retries a failed save with the
+    /// same blocks and positions writes the same rows.
+    #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
+    pub fn save_blocks_with_tx_positions(
+        &self,
+        blocks: Vec<ExecutedBlock<N::Primitives>>,
+        save_mode: SaveBlocksMode,
+        tx_positions: &[Option<Arc<[u32]>>],
+    ) -> ProviderResult<()> {
+        check_tx_positions_len(blocks.len(), tx_positions).map_err(ProviderError::other)?;
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to write empty block range");
             return Ok(())
@@ -543,7 +567,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let start = Instant::now();
                 sf_result = Some(
                     sf_provider
-                        .write_blocks_data(&blocks, &tx_nums, sf_ctx, runtime)
+                        .write_blocks_data(&blocks, &tx_nums, tx_positions, sf_ctx, runtime)
                         .map(|()| start.elapsed()),
                 );
             });

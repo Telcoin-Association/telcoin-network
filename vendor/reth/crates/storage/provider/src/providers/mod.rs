@@ -22,6 +22,11 @@ pub use static_file::StaticFileGapError;
 pub use static_file::UncheckedJarError;
 // TN(TN-0137): a compressed changeset jar met by a point lookup.
 pub use static_file::CompressedChangesetJarError;
+// TN(TN-0201): jar formats, and the rows of a `Transactions` jar with tagged values.
+pub use static_file::{
+    decode_tx_row, encode_tx_ref, JarFormat, TaggedJarError, TxPositionsError, TxRow, TxRowError,
+    TX_ROW_INLINE, TX_ROW_REF,
+};
 
 mod state;
 pub use state::{

@@ -3,6 +3,8 @@ use super::{
     StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileSyncStats,
     SyncPhase,
 };
+// TN(TN-0201): the checks on the positions `write_blocks_data` is given.
+use super::tx_row::{check_tx_positions, check_tx_positions_len};
 use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
     to_range, BlockHashReader, BlockNumReader, BlockReader, BlockSource, EitherWriter,
@@ -136,6 +138,8 @@ pub struct StaticFileProviderBuilder<P> {
     genesis_block_number: u64,
     /// TN(TN-0122): whether the jars the provider creates carry checksums.
     jar_checksums: bool,
+    /// TN(TN-0201): whether the `Transactions` jars the provider creates have tagged values.
+    tx_pointer_jars: bool,
 }
 
 impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
@@ -148,6 +152,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             use_metrics: false,
             genesis_block_number: 0,
             jar_checksums: false,
+            tx_pointer_jars: false,
         }
     }
 
@@ -160,6 +165,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             use_metrics: false,
             genesis_block_number: 0,
             jar_checksums: false,
+            tx_pointer_jars: false,
         }
     }
 
@@ -232,6 +238,14 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
         self
     }
 
+    /// TN(TN-0201): makes the `Transactions` jars the provider creates have tagged values
+    /// ([`StaticFileProviderInner::set_tx_pointer_jars`]), for tests; TN sets it through the
+    /// setter.
+    pub const fn with_tx_pointer_jars(mut self, enabled: bool) -> Self {
+        self.tx_pointer_jars = enabled;
+        self
+    }
+
     /// Builds the final [`StaticFileProvider`] and initializes the index.
     pub fn build<N: NodePrimitives>(self) -> ProviderResult<StaticFileProvider<N>> {
         let mut provider = StaticFileProviderInner::new(self.path, self.access)?;
@@ -244,6 +258,7 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
         }
         provider.genesis_block_number = self.genesis_block_number;
         provider.jar_checksums = AtomicBool::new(self.jar_checksums);
+        provider.tx_pointer_jars = AtomicBool::new(self.tx_pointer_jars);
 
         let provider = StaticFileProvider(Arc::new(provider));
         provider.initialize_index()?;
@@ -460,6 +475,10 @@ pub struct StaticFileProviderInner<N> {
     sync_stats: parking_lot::Mutex<StaticFileSyncStats>,
     /// TN(TN-0122): whether the jars this provider creates carry checksums.
     jar_checksums: AtomicBool,
+    /// TN(TN-0201): whether the `Transactions` jars this provider creates have tagged values.
+    tx_pointer_jars: AtomicBool,
+    /// TN(TN-0201): the transactions written inline into jars with tagged values.
+    tagged_jar_inline_tx_rows: AtomicU64,
     #[cfg(test)]
     before_cache_insert: BeforeCacheInsertHook,
     #[cfg(test)]
@@ -499,12 +518,74 @@ impl<N> StaticFileProviderInner<N> {
         self.jar_checksums.load(Ordering::Relaxed) && checksummed_segment(segment)
     }
 
+    /// TN(TN-0201): sets whether the `Transactions` jars this provider creates from now on have
+    /// tagged values (`NippyJar` version 3, `reth_nippy_jar::NippyJar::with_tagged_values`), whose
+    /// rows can store a transaction's position in its consensus batch instead of the transaction
+    /// ([`super::TxRow`]). It takes effect only with checksums on ([`Self::set_jar_checksums`]),
+    /// since version 3 is built on version 2. TN sets it from the datadir's format before genesis
+    /// writes the first jar and at every open; a datadir that stores its transactions inline never
+    /// turns it on. A jar that exists is read and appended in its own format.
+    pub fn set_tx_pointer_jars(&self, enabled: bool) {
+        self.tx_pointer_jars.store(enabled, Ordering::Relaxed);
+    }
+
+    /// TN(TN-0201): whether a jar of `segment` this provider creates now has tagged values: only
+    /// a `Transactions` jar, and only with checksums on.
+    pub fn tx_pointer_jars(&self, segment: StaticFileSegment) -> bool {
+        self.tx_pointer_jars.load(Ordering::Relaxed) &&
+            segment == StaticFileSegment::Transactions &&
+            self.jar_checksums(segment)
+    }
+
+    /// TN(TN-0201): the format of a jar of `segment` this provider creates now.
+    pub fn new_jar_format(&self, segment: StaticFileSegment) -> JarFormat {
+        if self.tx_pointer_jars(segment) {
+            JarFormat::TaggedTx
+        } else if self.jar_checksums(segment) {
+            JarFormat::Checksummed
+        } else {
+            JarFormat::Plain
+        }
+    }
+
+    /// TN(TN-0201): the transactions this provider has written inline (tag 0) into `Transactions`
+    /// jars with tagged values since it was built: those of the blocks
+    /// [`StaticFileProvider::write_blocks_data`] was given no positions for.
+    pub fn tagged_jar_inline_tx_rows(&self) -> u64 {
+        self.tagged_jar_inline_tx_rows.load(Ordering::Relaxed)
+    }
+
+    /// TN(TN-0201): the format of each of `segment`'s jars, by expected block range, lowest first,
+    /// from its configuration on disk. Read only: no policy check applies, and nothing is cached.
+    pub fn jar_formats(
+        &self,
+        segment: StaticFileSegment,
+    ) -> ProviderResult<Vec<(SegmentRangeInclusive, JarFormat)>> {
+        let ranges: Vec<_> = self
+            .indexes
+            .read()
+            .get(segment)
+            .map(|index| index.expected_block_ranges_by_max_block.values().copied().collect())
+            .unwrap_or_default();
+        ranges
+            .into_iter()
+            .map(|range| {
+                let path = self.path.join(segment.filename(&range));
+                let jar = NippyJar::<SegmentHeader>::load(&path).map_err(ProviderError::other)?;
+                check_static_file_identity(&path, jar.user_header())
+                    .map_err(ProviderError::other)?;
+                Ok((range, JarFormat::of(&jar)))
+            })
+            .collect()
+    }
+
     /// TN(TN-0135): loads the configuration of `segment`'s jar at `path`. Under storage v2 (the
     /// provider's checksums on) every jar of a checksummed segment must carry checksums: a
     /// version-1 jar there is refused, since two flipped bits turn a version-2 configuration into
     /// a version-1 one, whose values would then read with their checksums appended and whose
     /// 20-byte `.csoff` records at a 16-byte stride. A storage-v2 datadir from before checksums
-    /// is refused the same way (storage v2 was never released).
+    /// is refused the same way (storage v2 was never released). TN(TN-0201): in any datadir, a
+    /// jar with tagged values (version 3) is refused unless it is a `Transactions` jar.
     pub(crate) fn load_jar(
         &self,
         segment: StaticFileSegment,
@@ -522,9 +603,64 @@ impl<N> StaticFileProviderInner<N> {
             );
             return Err(ProviderError::other(UncheckedJarError { path: path.to_path_buf() }))
         }
+        // TN(TN-0201): only `Transactions` rows interpret a tag, in any datadir.
+        if jar.has_tagged_values() && segment != StaticFileSegment::Transactions {
+            tracing::error!(
+                target: "reth::static_file",
+                %segment,
+                path = %path.display(),
+                "Static file with tagged values in a segment that never writes them"
+            );
+            return Err(ProviderError::other(TaggedJarError { path: path.to_path_buf() }))
+        }
         Ok(jar)
     }
 }
+
+/// TN(TN-0201): a jar's format, from its configuration's version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JarFormat {
+    /// Upstream's format (`NippyJar` version 1).
+    Plain,
+    /// Checksummed values, configuration and changeset offsets (version 2, TN-0120).
+    Checksummed,
+    /// Version 2 with a tag byte at the start of every value (version 3, TN-0200), which only
+    /// the `Transactions` segment writes ([`super::TxRow`]).
+    TaggedTx,
+}
+
+impl JarFormat {
+    /// The format of `jar`.
+    pub const fn of(jar: &NippyJar<SegmentHeader>) -> Self {
+        if jar.has_tagged_values() {
+            Self::TaggedTx
+        } else if jar.has_checksums() {
+            Self::Checksummed
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+/// TN(TN-0201): a jar with tagged values (`NippyJar` version 3) of a segment other than
+/// `Transactions` ([`StaticFileProviderInner::load_jar`]).
+#[derive(Debug)]
+pub struct TaggedJarError {
+    /// The jar's data file.
+    pub path: PathBuf,
+}
+
+impl core::fmt::Display for TaggedJarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "static file {} holds tagged values, which only the Transactions segment writes",
+            self.path.display()
+        )
+    }
+}
+
+impl core::error::Error for TaggedJarError {}
 
 /// TN(TN-0135): a jar of a checksummed segment without checksums, in a storage-v2 datadir
 /// ([`StaticFileProviderInner::load_jar`]).
@@ -656,6 +792,8 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             genesis_block_number: 0,
             sync_stats: Default::default(),
             jar_checksums: Default::default(),
+            tx_pointer_jars: Default::default(),
+            tagged_jar_inline_tx_rows: Default::default(),
             #[cfg(test)]
             before_cache_insert: Default::default(),
             #[cfg(test)]
@@ -783,20 +921,43 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     }
 
     /// Writes transactions for all blocks to the static file segment.
+    ///
+    /// TN(TN-0201): `tx_positions` holds each block's transactions' positions in its batch, or
+    /// nothing ([`StaticFileProvider::write_blocks_data`]). Returns the transactions written
+    /// inline into jars with tagged values.
     #[instrument(level = "debug", target = "providers::static_file", skip_all)]
     fn write_transactions(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
-    ) -> ProviderResult<()> {
+        tx_positions: &[Option<Arc<[u32]>>],
+    ) -> ProviderResult<u64> {
+        let mut tx_positions = tx_positions.iter();
+        let mut tagged_inline = 0;
         for (block, &first_tx) in blocks.iter().zip(tx_nums) {
             let b = block.recovered_block();
             w.increment_block(b.number())?;
+            // TN(TN-0201): the jar this block's rows go to, after any rotation above, decides how
+            // they are stored. A jar without tagged values ignores the positions.
+            match tx_positions.next().and_then(Option::as_deref) {
+                Some(positions) if w.tagged_tx_rows() => {
+                    let txs = b.body().transaction_count();
+                    check_tx_positions(b.number(), txs, positions).map_err(ProviderError::other)?;
+                    for (i, &position) in positions.iter().enumerate() {
+                        w.append_transaction_ref(first_tx + i as u64, position)?;
+                    }
+                    continue
+                }
+                None if w.tagged_tx_rows() => {
+                    tagged_inline += b.body().transaction_count() as u64;
+                }
+                _ => {}
+            }
             for (i, tx) in b.body().transactions().iter().enumerate() {
                 w.append_transaction(first_tx + i as u64, tx)?;
             }
         }
-        Ok(())
+        Ok(tagged_inline)
     }
 
     /// Writes transaction senders for all blocks to the static file segment.
@@ -919,14 +1080,23 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// This spawns tasks on the storage thread pool for each segment type and each task calls
     /// `sync_and_freeze()` on its writer when done.
+    ///
+    /// TN(TN-0201): `tx_positions` is empty, or holds one entry per block: the positions of its
+    /// transactions in the consensus batch it executed. A block whose `Transactions` jar has
+    /// tagged values stores a position row per transaction when its positions are given (one per
+    /// transaction, strictly increasing, or the write fails), and its transactions inline (tag 0)
+    /// otherwise, counted by [`StaticFileProviderInner::tagged_jar_inline_tx_rows`]. A jar
+    /// without tagged values stores them as before, whatever the positions.
     #[instrument(level = "debug", target = "providers::static_file", skip_all)]
     pub fn write_blocks_data(
         &self,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
+        tx_positions: &[Option<Arc<[u32]>>],
         ctx: StaticFileWriteCtx,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
+        check_tx_positions_len(blocks.len(), tx_positions).map_err(ProviderError::other)?;
         if blocks.is_empty() {
             return Ok(());
         }
@@ -952,7 +1122,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 r_txs = Some(self.write_segment(
                     StaticFileSegment::Transactions,
                     first_block_number,
-                    |w| Self::write_transactions(w, blocks, tx_nums),
+                    |w| {
+                        let inline = Self::write_transactions(w, blocks, tx_nums, tx_positions)?;
+                        self.tagged_jar_inline_tx_rows.fetch_add(inline, Ordering::Relaxed);
+                        Ok(())
+                    },
                 ));
             });
 
