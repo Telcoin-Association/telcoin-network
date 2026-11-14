@@ -84,12 +84,10 @@ pub(crate) const HALT_LOG: &str = "stored epoch record final_state does not matc
                                    closing block: this node's execution diverged from the \
                                    recorded chain, stopping the node";
 
-/// The error the epoch-record collector logs before it stops the node under
+/// The stable start of the error the epoch-record collector logs before it stops the node under
 /// `epoch_record_conflict_halt`: a certified record of the network differs from this node's own.
-pub(crate) const CONFLICT_HALT_LOG: &str = "this node's epoch record differs from a certified \
-                                            record of the network: this node has forked and \
-                                            stops; do not delete its chain data before the \
-                                            cause is known";
+/// The line that does not stop the node starts `epoch record conflict:` instead.
+pub(crate) const CONFLICT_HALT_LOG: &str = "epoch record conflict halt:";
 
 /// The error the leftover-output drain at an epoch close logs before it stops the node: an output
 /// that does not follow the last one forwarded to the engine.
