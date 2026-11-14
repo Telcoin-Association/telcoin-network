@@ -1,6 +1,6 @@
 //! `eth_` `PubSub` RPC handler implementation
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::eth::filter::check_filter_size;
 use alloy_primitives::TxHash;
@@ -281,10 +281,32 @@ fn too_many_listeners_err() -> ErrorObject<'static> {
     )
 }
 
+/// TN(TN-0173): how long a subscription waits for room in its connection's send buffer before
+/// it ends.
+const SUBSCRIPTION_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Pipes all stream items to the subscription sink.
 async fn pipe_from_stream<T, St>(
     sink: SubscriptionSink,
+    stream: St,
+) -> Result<(), ErrorObject<'static>>
+where
+    St: Stream<Item = T> + Unpin,
+    T: Serialize,
+{
+    pipe_from_stream_within(sink, stream, SUBSCRIPTION_SEND_TIMEOUT).await
+}
+
+/// [`pipe_from_stream`], ending the subscription once an item waits `send_timeout` for room.
+///
+/// TN(TN-0173): while a send waits, the stream is not polled and its source keeps what it
+/// buffers for this subscriber: a full-transaction listener holds up to 1,024 pool transactions,
+/// evicted ones included. A subscriber that stops reading would hold them until its connection
+/// closed; it now loses the subscription instead, and the stream with its buffer is dropped.
+async fn pipe_from_stream_within<T, St>(
+    sink: SubscriptionSink,
     mut stream: St,
+    send_timeout: Duration,
 ) -> Result<(), ErrorObject<'static>>
 where
     St: Stream<Item = T> + Unpin,
@@ -310,7 +332,7 @@ where
                     &item
                 ).map_err(SubscriptionSerializeError::new)?;
 
-                if sink.send(msg).await.is_err() {
+                if sink.send_timeout(msg, send_timeout).await.is_err() {
                     break Ok(());
                 }
             }
@@ -431,5 +453,64 @@ where
                 );
                 futures::stream::iter(all_logs)
             })
+    }
+}
+
+/// TN(TN-0173): a subscriber that stops reading loses the subscription.
+#[cfg(test)]
+mod send_timeout_tests {
+    use super::*;
+    use jsonrpsee::RpcModule;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll},
+    };
+
+    /// A stream of zeros that never ends and records when it is dropped.
+    struct Endless(Arc<AtomicBool>);
+
+    impl Stream for Endless {
+        type Item = u64;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<u64>> {
+            Poll::Ready(Some(0))
+        }
+    }
+
+    impl Drop for Endless {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The subscriber's buffer of four messages is never read: once it is full, the next send
+    /// waits the timeout, the subscription ends and its stream is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscriber_that_stops_reading_loses_the_subscription() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut module = RpcModule::new(dropped.clone());
+        module
+            .register_subscription(
+                "test_subscribe",
+                "test_item",
+                "test_unsubscribe",
+                |_, pending, dropped, _| async move {
+                    let sink = pending.accept().await?;
+                    let stream = Endless(Arc::clone(&dropped));
+                    let _ = pipe_from_stream_within(sink, stream, Duration::from_millis(50)).await;
+                    jsonrpsee::core::SubscriptionResult::Ok(())
+                },
+            )
+            .unwrap();
+
+        let _subscription = module.subscribe("test_subscribe", Vec::<u8>::new(), 4).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dropped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stream is dropped once the buffer stays full");
     }
 }

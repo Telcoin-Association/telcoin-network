@@ -2660,3 +2660,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `-32603`). Mutation-checked: no charge in `try_geth_traces`, and the mux rebuilt in `fuse`
   (all three patched-crate tests fail).
   *Upstream*: as TN-0079 (revm-inspectors 0.44.3 caps nothing); re-port with it.
+
+- **TN-0173** — A subscription whose connection's send buffer stays full for 10 seconds ends.
+  *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`SUBSCRIPTION_SEND_TIMEOUT`,
+  `pipe_from_stream_within`, which `pipe_from_stream` calls; test
+  `a_subscriber_that_stops_reading_loses_the_subscription`).
+  *Why*: `pipe_from_stream`, which feeds `newHeads`, `logs` and `newPendingTransactions`
+  subscriptions, awaited each send without a limit. jsonrpsee buffers 1,024 messages per
+  connection; once a WS or IPC client stopped reading, the send waited until the connection
+  closed and the stream was not polled meanwhile. For `newPendingTransactions` with full
+  transactions the stream's pool listener then kept up to `--txpool.max-new-txns` (1,024)
+  transactions, evicted and replaced ones included, outside the pool's limits, for each of up
+  to 1,024 listeners. Each send now waits at most 10 seconds; then the subscription ends and its stream, with the listener and what
+  it held, is dropped. A client reading normally is unaffected; one more than 1,024 messages
+  behind for 10 seconds loses the subscription and must subscribe again. *Can reach execution or
+  storage*: no. RPC only: subscriptions run in their own tasks, and the pool removes a dropped
+  listener at its next send.
+  *Tests*: `a_subscriber_that_stops_reading_loses_the_subscription` (a never-read buffer of four
+  messages over an endless stream: the stream is dropped once a send waits the timeout).
+  Mutation-checked: a plain `send` (the stream is never dropped).
+  *Upstream*: no; upstream has the same shape.
