@@ -96,6 +96,9 @@
 #   has an EXEC_PAGE_SIZE_* set, TN_EXEC_BENCH_LAYOUT when the run's side has a layout (layout
 #   mode's v1 and v2, EXEC_LAYOUT_*), and in layout mode TN_EXEC_BENCH_DIFF and
 #   TN_EXEC_BENCH_DIFF_AGAINST (a round's first run without any).
+#   The variables the node's own code reads (TN_PARALLEL_*, TN_EXEC_CACHE_*, RUST_LOG) pass through
+#   to both sides too, as they are: CONFIG's "node variables" lists them. A before commit may read
+#   none of them.
 #
 # Each test binary is run directly (not through cargo), its md5 and test count recorded, and the run
 # refused if the two binaries match (layout mode's one binary runs both sides) or either lacks the
@@ -1281,6 +1284,9 @@ owned="CACHE_DIR|REPORT" # the knobs the script sets on every run
 caller_knobs="$(env | grep -E '^TN_EXEC_BENCH_' | grep -vE "^TN_EXEC_BENCH_($owned)=" \
     | sort | tr '\n' ' ' | sed 's/ $//' || true)"
 kv "caller knobs" "${caller_knobs:-(none)}"
+node_vars="$(env | grep -E '^(TN_PARALLEL_|TN_EXEC_CACHE_|RUST_LOG=)' | sort | tr '\n' ' ' \
+    | sed 's/ $//' || true)"
+kv "node variables" "${node_vars:-(none of TN_PARALLEL_*, TN_EXEC_CACHE_*, RUST_LOG set)}"
 for profile in "${profiles[@]}"; do
     kv "profile $profile" "$(profile_settings "$profile" | sed 's/^$/(the bench defaults)/')"
 done
