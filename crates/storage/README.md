@@ -287,7 +287,12 @@ holding nothing but its header. An install replaces an epoch's files only with t
 certified chain (`stream_import`, over a pack lacking that chain's final output) or with the same
 log re-indexed or migrated (a read-side heal). The checked batch reads above serve readers that
 record where a batch is (its leader epoch and digest) and treat a missing pack as damage, so
-pruning, if it is ever added, must first move such references off the packs it removes.
+pruning, if it is ever added, must first move such references off the packs it removes. tn-reth's
+execution datadirs that store transactions by position (layout marker version 2; tn-reth's
+README, "Transactions stored by position") are such readers: each transaction is kept only as its
+position in a batch its block's header names, and a node holding one refuses to start without the
+pack of an epoch its rows point into. `db repair` and `db migrate` keep every batch's bytes and
+digest, which is all those rows name; a record's place in the pack is never named.
 
 `epoch_records` (`EpochRecordDb`) is the singleton chain of `EpochRecord`s (`epochs.pack`) and their
 `EpochCertificate`s (`epoch_certs.pack`), auto-healed on open under the same rules: `persist()` stamps

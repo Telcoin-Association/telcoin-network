@@ -1,25 +1,37 @@
 //! Format-freeze tests: TN's on-disk execution formats, pinned by checked-in fixtures.
 //!
-//! A seeded generator ([`Plan`]) builds one small chain in a storage v1 and a storage v2 datadir
-//! on tn-lmdb. Both datadirs are checked in under `tests/fixtures/format-freeze/` with their
-//! digests (`digests.txt`), and two tests hold them:
+//! A seeded generator ([`Plan`]) builds one small chain in three tn-lmdb datadirs ([`FIXTURES`]):
+//! storage v1 and storage v2 storing their transactions inline (`v1`, `v2`: layout marker version
+//! 1, the format of every datadir before transactions were stored once), and storage v2 storing
+//! each transaction as its position in its consensus batch (`v2-ptr`: marker version 2, version-3
+//! `Transactions` jars). The pointer chain is built from real batches under their digests, as
+//! consensus commits them; they are checked in beside its datadir (`batches.bcs`) and stand in for
+//! the consensus packs a node reads them from. Each datadir is checked in under
+//! `tests/fixtures/format-freeze/` with its digests (`digests.txt`), and two tests hold them:
 //!
 //! - [`format_fixtures_read_back_unchanged`] (reader compatibility): opens a copy of each
 //!   checked-in datadir with the current code, through `RethEnv::new`, and reads back every row of
 //!   every reth table, every row of every static-file jar, the chain through the provider's readers
 //!   (headers, bodies, transactions, receipts, senders, both changesets), the plan's accounts at
 //!   every block through the historical state provider (account, code, slots 0 to 9), the
-//!   registry's epoch state at every header, and the state-pack export. Each read is digested and
-//!   compared with the `read` lines. A binary that can no longer read today's bytes, or reads them
-//!   as other values, fails here.
+//!   registry's epoch state at every header, and the state-pack export. A pointer datadir's
+//!   transactions resolve from its `batches.bcs`, decoded into a [`MemoryBatches`] of their own
+//!   under each batch's recomputed digest (the `read batches` line). Each read is digested and
+//!   compared with the `read` lines; the pointer fixture's transactions, senders, receipts, change
+//!   sets and account history must also read as its inline twin's (`v2`, [`SAME_AS_INLINE`]). A
+//!   binary that can no longer read today's bytes, or reads them as other values, fails here.
 //! - [`format_writer_output_unchanged`] (writer stability): builds the chain again in a temp dir
 //!   and compares the `write` lines: each tn-lmdb table's ordered raw (key, value) pairs, and each
 //!   static file's bytes (data, `.off`, `.csoff`, `.conf`; the decompressed rows instead of the
-//!   data and `.off` of a jar with a compressor). The tn-lmdb file's own bytes are not pinned:
-//!   transaction ids and free pages differ between runs. A writer change fails here.
+//!   data and `.off` of a jar with a compressor), and a pointer fixture's batch encoding (`write
+//!   batches.bcs`). The tn-lmdb file's own bytes are not pinned: transaction ids and free pages
+//!   differ between runs. A writer change fails here.
+//! - [`format_inline_fixtures_stay_inline`]: the current binary, asked for pointer rows as a new
+//!   datadir is, opens `v1` and `v2` as inline datadirs, keeps their marker, and stores the
+//!   transactions of a block it executes on them inline.
 //!
-//! Both also check the format version markers each fixture records (`version` lines) and the block
-//! hashes (`block` lines): a different block hash means execution changed, not storage.
+//! The first two also check the format version markers each fixture records (`version` lines) and
+//! the block hashes (`block` lines): a different block hash means execution changed, not storage.
 //!
 //! **The chain** ([`Plan`]), blocks 0 to [`TIP`], from a fixed genesis (`genesis.json`, checked in
 //! so a later contract artifact cannot change the chain): legacy, EIP-2930, EIP-1559 and EIP-7702
@@ -31,21 +43,24 @@
 //! held at the tip, and calls that run a delegated account's code; an epoch close, which rewrites
 //! `ConsensusRegistry` slots; and an output that executes two blocks. Storage wipes of existing
 //! slots cannot happen from Cancun on (EIP-6780), so none is covered. [`Plan::execute`] fails if
-//! the plan stops producing the logs or the delegations.
+//! the plan stops producing the logs or the delegations. In the pointer chain, block 5's batch
+//! also holds a copy of block 4's last transaction first (a transaction two producers packed),
+//! which execution skips, so its block's transactions sit at batch positions 1 and 2.
 //!
 //! **Not pinned**: `VersionHistory` (each open's wall clock and client version), the tn-lmdb file
 //! bytes, the compressed bytes of the headers jar, and anything outside the reth datadir (the
-//! consensus DB and packs). The chain is short, so it also holds no history shard split past
-//! `NUM_OF_INDICES_IN_SHARD` (2,000 indices), no jar past block 499,999, no prune checkpoint or
-//! snapshot-restore scaffold (`crate::snapshot`), and no datadir migrated from MDBX.
+//! consensus DB and packs: `batches.bcs` pins the batches, not a pack's encoding of them). The
+//! chain is short, so it also holds no history shard split past `NUM_OF_INDICES_IN_SHARD` (2,000
+//! indices), no jar past block 499,999, no prune checkpoint or snapshot-restore scaffold
+//! (`crate::snapshot`), and no datadir migrated from MDBX.
 //!
-//! **Regenerating** is explicit, never part of a test run: see [`regenerate_format_fixtures`] and
-//! the crate README, "On-disk format versions". It refuses to rewrite a fixture whose `version`
-//! lines differ from the build's.
+//! **Regenerating** is explicit, never part of a test run, and names the fixtures it writes: see
+//! [`regenerate_format_fixtures`] and the crate README, "On-disk format versions". It refuses to
+//! rewrite a fixture whose `version` lines differ from the build's.
 
 use super::{
     database::TN_LMDB_DB_VERSION,
-    layout::{stored_marker, TN_LAYOUT_KEY},
+    layout::{stored_marker, LAYOUT_VERSION_INLINE_TXS, TN_LAYOUT_KEY},
 };
 use crate::{
     init_reth_defaults,
@@ -54,8 +69,8 @@ use crate::{
         consensus_output_for_tests_at, test_genesis_with_consensus_registry_and_workers,
         TransactionFactory,
     },
-    MaybePlatformPath, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethConfig, RethDb,
-    RethEnv, StorageLayout,
+    DatadirFormat, MaybePlatformPath, MemoryBatches, NewCanonicalChain, OutputBuildScope,
+    OutputTrieOverlay, RethChainSpec, RethConfig, RethDb, RethEnv, StorageLayout, TxBodies,
 };
 use alloy::{
     consensus::{TxEip2930, TxEip7702},
@@ -74,6 +89,7 @@ use reth_db::{
 };
 use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
 use reth_provider::{
+    providers::{JarFormat, TxRow},
     AccountReader as _, BlockBodyIndicesProvider as _, ChangeSetReader as _,
     DatabaseProviderFactory as _, HeaderProvider as _, MetadataProvider as _, ReceiptProvider as _,
     StateProviderFactory as _, StaticFileProviderFactory as _, StaticFileSegment,
@@ -90,8 +106,9 @@ use std::{
 use tempfile::TempDir;
 use tn_storage::exec_state_pack::EXEC_STATE_PACK_VERSION;
 use tn_types::{
-    gas_accumulator::GasAccumulator, Address, Bytes, ConsensusOutput, Encodable2718 as _, Genesis,
-    GenesisAccount, SealedHeader, TaskManager, B256, U256,
+    gas_accumulator::GasAccumulator, Address, Batch, Bytes, CertifiedBatch, ConsensusHeader,
+    ConsensusOutput, Decodable2718 as _, Encodable2718 as _, Genesis, GenesisAccount, Hash as _,
+    SealedHeader, TaskManager, TransactionSigned, B256, U256,
 };
 
 /// The fixtures' directory.
@@ -99,10 +116,40 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/format-freeze")
 }
 
-/// The fixtures: each one's directory under [`fixtures_dir`] and the layout it holds.
-const FIXTURES: [(&str, StorageLayout); 2] = [("v1", StorageLayout::V1), ("v2", StorageLayout::V2)];
+/// The fixtures: each one's directory under [`fixtures_dir`] and the datadir format it holds.
+/// `v1` and `v2` store their transactions inline, as every datadir written before pointer rows
+/// does; `v2-ptr` stores them by position in the batches beside it ([`BATCHES_FILE`]).
+const FIXTURES: [(&str, DatadirFormat); 3] = [
+    ("v1", DatadirFormat { layout: StorageLayout::V1, tx_bodies: TxBodies::Inline }),
+    ("v2", DatadirFormat { layout: StorageLayout::V2, tx_bodies: TxBodies::Inline }),
+    ("v2-ptr", DatadirFormat { layout: StorageLayout::V2, tx_bodies: TxBodies::Pointers }),
+];
 
-/// The env var that lets [`regenerate_format_fixtures`] write.
+/// The fixture a pointer fixture must read back as, line for line, for the lines that do not
+/// depend on where the transactions are stored ([`SAME_AS_INLINE`]).
+const INLINE_TWIN: &str = "v2";
+
+/// The `read` lines a pointer fixture shares with its [`INLINE_TWIN`]: every transaction (by id,
+/// with its hash), sender and receipt, the change sets, and the plan's accounts and the registry's
+/// epoch state at every block. Its headers name real batch digests, so its block hashes differ,
+/// and with them the parent hashes the block-hash history contract (EIP-2935) stores: its headers,
+/// hashed storage, account trie and state export differ.
+const SAME_AS_INLINE: [&str; 8] = [
+    "read chain/account_changesets",
+    "read chain/body_indices",
+    "read chain/receipts",
+    "read chain/senders",
+    "read chain/storage_changesets",
+    "read chain/transactions",
+    "read history/accounts",
+    "read history/epochs",
+];
+
+/// The batches of a fixture that stores transactions by position, beside its datadir: the BCS
+/// encoding of the `Vec<Batch>` its outputs carried, in output order.
+const BATCHES_FILE: &str = "batches.bcs";
+
+/// The env var that names the fixtures [`regenerate_format_fixtures`] writes.
 const REGENERATE_VAR: &str = "TN_REGENERATE_FORMAT_FIXTURES";
 
 /// What a failing test tells its reader to do.
@@ -209,6 +256,42 @@ fn load_genesis() -> eyre::Result<Genesis> {
 struct PlannedOutput {
     output: ConsensusOutput,
     batches: Vec<Vec<Vec<u8>>>,
+}
+
+/// The output whose second batch, in the pointer chain, starts with a copy of its first batch's
+/// last transaction (blocks 4 and 5), as when two producers pack one transaction: execution skips
+/// the copy (its nonce is used), so the block keeps batch positions 1 and 2.
+const REPACKED_OUTPUT: usize = 3;
+
+impl PlannedOutput {
+    /// This output as consensus commits it, for a datadir that stores transactions by position:
+    /// each block's transactions in a real [`Batch`] of the output's epoch, carried under its
+    /// digest, with the copy of [`REPACKED_OUTPUT`] when `repack`. Also the batches, in order.
+    fn with_batches(&self, repack: bool) -> eyre::Result<(ConsensusOutput, Vec<Batch>)> {
+        let epoch = self.output.sub_dag().leader_epoch();
+        let mut batches: Vec<Batch> = self
+            .batches
+            .iter()
+            .map(|txs| Batch { transactions: txs.clone(), epoch, ..Default::default() })
+            .collect();
+        if repack {
+            let copy = batches[0].transactions.last().cloned();
+            let copy = copy.ok_or_else(|| eyre::eyre!("no transaction to repack"))?;
+            batches[1].transactions.insert(0, copy);
+        }
+        let output = ConsensusOutput::new(
+            self.output.sub_dag().clone(),
+            ConsensusHeader::default().digest(),
+            self.output.number(),
+            self.output.close_epoch(),
+            batches.iter().map(Batch::digest).collect(),
+            vec![CertifiedBatch { address: Address::ZERO, batches: batches.clone() }],
+        );
+        // the consensus digest covers the sub-DAG, not the batches: the blocks keep the
+        // inline chain's consensus fields
+        eyre::ensure!(output.digest() == self.output.digest(), "the output's digest moved");
+        Ok((output, batches))
+    }
 }
 
 /// The chain the fixtures hold: its spec, its outputs in order, and the accounts it touches.
@@ -386,24 +469,69 @@ impl Plan {
     /// Execute every output on `env`, from its genesis, as the engine does: one trie overlay an
     /// output, each block made canonical in memory before the next builds, the output's blocks
     /// persisted together.
-    fn execute(&self, env: &RethEnv) -> eyre::Result<()> {
+    ///
+    /// With [`TxBodies::Inline`] each block names a placeholder batch digest (its number) and the
+    /// persist gets no positions, as the inline fixtures were built. With [`TxBodies::Pointers`]
+    /// each output carries its blocks' transactions as real batches
+    /// ([`PlannedOutput::with_batches`]), signers are recovered with the batch digests checked,
+    /// and the persist gets each block's batch positions; the batches are returned, in order.
+    fn execute(&self, env: &RethEnv, tx_bodies: TxBodies) -> eyre::Result<Vec<Batch>> {
         let canonical = env.blockchain_provider().canonical_in_memory_state();
         let mut parent = header(env, 0)?;
         let mut logs = 0;
-        for planned in &self.outputs {
+        let mut all_batches = Vec::new();
+        for (index, planned) in self.outputs.iter().enumerate() {
+            let (output, recovered) = match tx_bodies {
+                TxBodies::Inline => (planned.output.clone(), Vec::new()),
+                TxBodies::Pointers => {
+                    let (output, batches) = planned.with_batches(index == REPACKED_OUTPUT)?;
+                    all_batches.extend(batches);
+                    let recovered = RethEnv::recover_output_signers(&output);
+                    (output, recovered)
+                }
+            };
+            let mut recovered = recovered.into_iter();
             let mut overlay = OutputTrieOverlay::new();
-            let mut blocks = Vec::new();
+            let mut scope = OutputBuildScope::new();
+            let (mut blocks, mut positions) = (Vec::new(), Vec::new());
             for (batch_index, txs) in planned.batches.iter().enumerate() {
                 let number = parent.number + 1;
-                let mut payload = TNPayload::new_for_test_with(
-                    parent,
-                    &planned.output,
-                    Address::ZERO,
-                    B256::with_last_byte(number as u8),
-                    B256::with_last_byte(number as u8),
-                );
-                payload.batch_index = batch_index;
-                let block = env.build_block_from_batch_payload(payload, txs, &mut overlay)?;
+                let block = if tx_bodies == TxBodies::Inline {
+                    let mut payload = TNPayload::new_for_test_with(
+                        parent,
+                        &output,
+                        Address::ZERO,
+                        B256::with_last_byte(number as u8),
+                        B256::with_last_byte(number as u8),
+                    );
+                    payload.batch_index = batch_index;
+                    env.build_block_from_batch_payload(payload, txs, &mut overlay)?
+                } else {
+                    let digest = output
+                        .get_batch_digest(batch_index)
+                        .ok_or_else(|| eyre::eyre!("block {number}: no batch digest"))?;
+                    let mut payload = TNPayload::new_for_test_with(
+                        parent,
+                        &output,
+                        Address::ZERO,
+                        digest,
+                        B256::with_last_byte(number as u8),
+                    );
+                    payload.batch_index = batch_index;
+                    let recovered = recovered.next().ok_or_else(|| eyre::eyre!("no signers"))?;
+                    let built =
+                        env.build_block_from_recovered_payload(payload, recovered, &mut scope)?;
+                    // each kept transaction's index in its batch, past the repacked copy
+                    let first = u32::from(index == REPACKED_OUTPUT && batch_index == 1);
+                    let expected: Vec<u32> = (first..first + txs.len() as u32).collect();
+                    eyre::ensure!(
+                        built.tx_positions.as_deref() == Some(expected.as_slice()),
+                        "block {number}: positions {:?}, not {expected:?}",
+                        built.tx_positions
+                    );
+                    positions.push(built.tx_positions);
+                    built.block
+                };
                 let included = block.recovered_block.body().transactions.len();
                 eyre::ensure!(
                     included == txs.len(),
@@ -421,7 +549,11 @@ impl Plan {
                 canonical.set_canonical_head(parent.clone());
                 blocks.push(block);
             }
-            env.finish_executing_output(blocks, None)?;
+            // `finish_executing_output`'s two halves, the engine's way: an inline persist gets
+            // no positions, and the cache fill then has nothing to take
+            env.persist_executed_output(&blocks, &positions)?;
+            env.cache_persisted_batches(&output, &positions);
+            env.announce_executed_output(blocks, None)?;
             env.finalize_block(parent.clone())?;
         }
         eyre::ensure!(parent.number == TIP, "the plan ends at block {}, not {TIP}", parent.number);
@@ -438,7 +570,7 @@ impl Plan {
             state.account_code(&self.delegated[1])?.is_some_and(|code| code.is_eip7702()),
             "the second account holds no delegation at the tip"
         );
-        Ok(())
+        Ok(all_batches)
     }
 }
 
@@ -455,9 +587,29 @@ struct Opened {
 }
 
 impl Opened {
-    /// Open the datadir at `dir` with `chain`; a new datadir takes `layout` and stores its
-    /// transactions inline, as every fixture does.
-    fn open(dir: &Path, chain: Arc<RethChainSpec>, layout: StorageLayout) -> eyre::Result<Self> {
+    /// Open the datadir at `dir` with `chain`, which must be in `format` (a new datadir is
+    /// created in it). The env reads the batches of a datadir storing transactions by position
+    /// from `batches`; without them, a read of such a transaction fails.
+    fn open(
+        dir: &Path,
+        chain: Arc<RethChainSpec>,
+        format: DatadirFormat,
+        batches: Option<Arc<MemoryBatches>>,
+    ) -> eyre::Result<Self> {
+        let opened = Self::open_asking(dir, chain, format, batches)?;
+        let found = opened.env.datadir_format();
+        eyre::ensure!(found == format, "the datadir at {} is {found}, not {format}", dir.display());
+        Ok(opened)
+    }
+
+    /// Open the datadir at `dir` with `chain`, asking a new datadir for `asked`: an existing one
+    /// keeps its own format. `batches` as for [`Self::open`].
+    fn open_asking(
+        dir: &Path,
+        chain: Arc<RethChainSpec>,
+        asked: DatadirFormat,
+        batches: Option<Arc<MemoryBatches>>,
+    ) -> eyre::Result<Self> {
         init_reth_defaults();
         let node_config = NodeConfig {
             datadir: DatadirArgs {
@@ -470,13 +622,18 @@ impl Opened {
             ..NodeConfig::default()
         };
         let config = RethConfig::from_node_config(node_config)
-            .with_new_datadir_layout(layout)
-            .with_new_datadir_tx_bodies(crate::TxBodies::Inline);
+            .with_new_datadir_layout(asked.layout)
+            .with_new_datadir_tx_bodies(asked.tx_bodies);
+        let config = match batches {
+            Some(batches) => config.with_memory_batches_from(batches),
+            None => config,
+        };
         let tasks = TaskManager::new("format freeze");
         // where the node keeps it (`TelcoinDirs::reth_db_path`)
         let db = RethEnv::new_database(&config, dir.join("db"))?;
         let env = RethEnv::new(&config, &tasks, db.clone(), None, GasAccumulator::default())?;
         let running = env.blockchain_provider().database_provider_ro()?.cached_storage_settings();
+        let layout = env.datadir_format().layout;
         eyre::ensure!(
             running.is_v2() == (layout == StorageLayout::V2),
             "the datadir at {} runs {running:?}, not {layout:?}",
@@ -527,7 +684,12 @@ impl Digest {
     /// The line value of a whole file's bytes.
     fn file(path: &Path) -> eyre::Result<String> {
         let bytes = std::fs::read(path).map_err(|e| eyre::eyre!("read {}: {e}", path.display()))?;
-        Ok(format!("{} {:x}", bytes.len(), Sha256::digest(&bytes)))
+        Ok(Self::bytes(&bytes))
+    }
+
+    /// The line value of `bytes`, as of a file holding them.
+    fn bytes(bytes: &[u8]) -> String {
+        format!("{} {:x}", bytes.len(), Sha256::digest(bytes))
     }
 }
 
@@ -816,12 +978,9 @@ fn fixture_datadir(name: &str) -> PathBuf {
     fixtures_dir().join(name).join("datadir")
 }
 
-/// Open a temp copy of fixture `name`'s datadir, never the checked-in files: an open writes.
-fn open_fixture(
-    name: &str,
-    chain: Arc<RethChainSpec>,
-    layout: StorageLayout,
-) -> eyre::Result<(Opened, TempDir)> {
+/// A temp copy of fixture `name`'s datadir, at `datadir` in the returned directory: an open
+/// writes, so no test opens the checked-in files.
+fn copy_fixture(name: &str) -> eyre::Result<TempDir> {
     let source = fixture_datadir(name);
     eyre::ensure!(
         source.is_dir(),
@@ -830,22 +989,103 @@ fn open_fixture(
     );
     let dir = TempDir::new()?;
     copy_tree(&source, &dir.path().join("datadir"))?;
-    let opened = Opened::open(&dir.path().join("datadir"), chain, layout)?;
+    Ok(dir)
+}
+
+/// Open a temp copy of fixture `name`'s datadir, which holds `format`, reading its batches from
+/// `batches` ([`fixture_batches`]).
+fn open_fixture(
+    name: &str,
+    chain: Arc<RethChainSpec>,
+    format: DatadirFormat,
+    batches: Option<Arc<MemoryBatches>>,
+) -> eyre::Result<(Opened, TempDir)> {
+    let dir = copy_fixture(name)?;
+    let opened = Opened::open(&dir.path().join("datadir"), chain, format, batches)?;
     Ok((opened, dir))
 }
 
-/// The chain built fresh in a temp datadir in `layout`, open, with its `block`, `version` and
-/// `write` lines.
-fn build(plan: &Plan, layout: StorageLayout) -> eyre::Result<(Opened, TempDir, Lines)> {
+/// The bytes of [`BATCHES_FILE`] holding `batches`.
+fn encode_batches(batches: &[Batch]) -> Vec<u8> {
+    tn_types::encode(&batches)
+}
+
+/// The batches of fixture `name` in `format`, decoded from its [`BATCHES_FILE`] into a
+/// [`MemoryBatches`] of their own, each under the digest recomputed from its decoded fields (the
+/// digest a pointer row's block names), and the `read batches` line in `lines`: their count and a
+/// digest of those digests, in order. `None` for a fixture storing transactions inline.
+fn fixture_batches(
+    name: &str,
+    format: DatadirFormat,
+    lines: &mut Lines,
+) -> eyre::Result<Option<Arc<MemoryBatches>>> {
+    if format.tx_bodies == TxBodies::Inline {
+        return Ok(None);
+    }
+    let path = fixtures_dir().join(name).join(BATCHES_FILE);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        eyre::eyre!("read {}: {e} (see regenerate_format_fixtures)", path.display())
+    })?;
+    let batches: Vec<Batch> =
+        tn_types::try_decode(&bytes).map_err(|e| eyre::eyre!("decode {}: {e}", path.display()))?;
+    let memory = Arc::new(MemoryBatches::default());
+    let mut digests = Digest::default();
+    for batch in &batches {
+        let digest = batch.digest();
+        memory.insert(digest, batch);
+        digests.row(&[digest.as_slice()]);
+    }
+    lines.insert("read batches".into(), digests.finish());
+    Ok(Some(memory))
+}
+
+/// Check that `env` stores each of transactions `0..count` as `tx_bodies` says: as its position in
+/// its batch in a datadir storing them by position, as the transaction otherwise.
+fn check_tx_rows(env: &RethEnv, tx_bodies: TxBodies, count: u64) -> eyre::Result<()> {
+    let static_files = env.blockchain_provider().static_file_provider();
+    let rows = static_files.tx_rows_by_tx_range(0..count)?;
+    eyre::ensure!(rows.len() as u64 == count, "{} transaction rows, not {count}", rows.len());
+    let positions = rows.iter().filter(|row| matches!(row, TxRow::Ref(_))).count();
+    let expected = if tx_bodies == TxBodies::Pointers { rows.len() } else { 0 };
+    eyre::ensure!(
+        positions == expected,
+        "{positions} of the {count} transaction rows are positions, not {expected}"
+    );
+    Ok(())
+}
+
+/// The number of transactions of blocks 0 to `tip`.
+fn tx_count(env: &RethEnv, tip: u64) -> eyre::Result<u64> {
+    let provider = env.blockchain_provider().database_provider_ro()?;
+    let indices = provider.block_body_indices(tip)?;
+    Ok(indices.ok_or_else(|| eyre::eyre!("no body indices {tip}"))?.next_tx_num())
+}
+
+/// The chain built fresh in a temp datadir in `format`, open, with its `block`, `version` and
+/// `write` lines, and the batches it was built from (none for `format` storing transactions
+/// inline): their encoding is the `write batches.bcs` line.
+fn build(plan: &Plan, format: DatadirFormat) -> eyre::Result<(Opened, TempDir, Lines, Vec<Batch>)> {
     let dir = TempDir::new()?;
     let root = dir.path().join("datadir");
-    let opened = Opened::open(&root, plan.chain.clone(), layout)?;
-    plan.execute(&opened.env)?;
+    let opened = Opened::open(&root, plan.chain.clone(), format, None)?;
+    let batches = plan.execute(&opened.env, format.tx_bodies)?;
     let mut lines = Lines::new();
     blocks(&opened.env, &mut lines)?;
     versions(&opened.env, &root.join("db"), &mut lines)?;
     write_lines(&opened, &root, &mut lines)?;
-    Ok((opened, dir, lines))
+    if format.tx_bodies == TxBodies::Pointers {
+        lines.insert(format!("write {BATCHES_FILE}"), Digest::bytes(&encode_batches(&batches)));
+    }
+    Ok((opened, dir, lines, batches))
+}
+
+/// The lines of `lines` whose key is one of `keys`.
+fn only(lines: &Lines, keys: &[&str]) -> Lines {
+    lines
+        .iter()
+        .filter(|(key, _)| keys.contains(&key.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Parse a `digests.txt`.
@@ -917,16 +1157,22 @@ fn ensure_same(
 
 /// Reader compatibility: the current code opens each checked-in fixture and reads back exactly what
 /// it held when it was written: every table row, every jar row, the chain through the provider's
-/// readers and the state-pack export. See the module docs.
+/// readers and the state-pack export. A pointer fixture's transactions resolve from its checked-in
+/// batches, and it reads as its inline twin wherever the storage of transactions makes no
+/// difference ([`SAME_AS_INLINE`]). See the module docs.
 #[tokio::test]
 async fn format_fixtures_read_back_unchanged() -> eyre::Result<()> {
     let plan = Plan::new(load_genesis()?);
-    for (name, layout) in FIXTURES {
+    for (name, format) in FIXTURES {
         let expected = load_lines(name)?;
-        let (opened, dir) = open_fixture(name, plan.chain.clone(), layout)
-            .map_err(|e| failed(name, "the current code cannot open the checked-in datadir", e))?;
         let mut found = Lines::new();
+        let batches = fixture_batches(name, format, &mut found)
+            .map_err(|e| failed(name, "the current code cannot load the checked-in batches", e))?;
+        let (opened, dir) = open_fixture(name, plan.chain.clone(), format, batches)
+            .map_err(|e| failed(name, "the current code cannot open the checked-in datadir", e))?;
         blocks(&opened.env, &mut found)?;
+        check_tx_rows(&opened.env, format.tx_bodies, tx_count(&opened.env, TIP)?)
+            .map_err(|e| failed(name, "the checked-in datadir stores other rows", e))?;
         read_lines(&opened, &dir.path().join("datadir"), &plan.accounts, &mut found)
             .map_err(|e| failed(name, "the current code cannot read the checked-in datadir", e))?;
         ensure_same(
@@ -941,6 +1187,15 @@ async fn format_fixtures_read_back_unchanged() -> eyre::Result<()> {
             differences(&expected, &found, &["read"]),
             WHAT_TO_DO,
         )?;
+        if format.tx_bodies == TxBodies::Pointers {
+            let twin = only(&load_lines(INLINE_TWIN)?, &SAME_AS_INLINE);
+            ensure_same(
+                name,
+                &format!("the current code reads it otherwise than its inline twin {INLINE_TWIN}"),
+                differences(&twin, &only(&found, &SAME_AS_INLINE), &["read"]),
+                WHAT_TO_DO,
+            )?;
+        }
         opened.close()?;
         ensure_same(
             name,
@@ -950,6 +1205,158 @@ async fn format_fixtures_read_back_unchanged() -> eyre::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// The current binary, asked for transactions by position as a new datadir is, opens each inline
+/// fixture (`v1`, `v2`: every datadir written before pointer rows) storing them inline, and keeps
+/// it so: the open rewrites no file, its marker stays version 1, no `Transactions` jar is made for
+/// tagged values, and a block executed from a real batch, its positions handed to the persist,
+/// stores its transaction inline, read back by hash after a reopen.
+#[tokio::test]
+async fn format_inline_fixtures_stay_inline() -> eyre::Result<()> {
+    assert_eq!(
+        TxBodies::for_new_datadirs(),
+        TxBodies::Pointers,
+        "a new datadir on this build stores transactions by position: the test asks what a node \
+         asks"
+    );
+    let plan = Plan::new(load_genesis()?);
+    let owner = plan.accounts[0];
+    for (name, format) in FIXTURES.into_iter().filter(|(_, f)| f.tx_bodies == TxBodies::Inline) {
+        let asked = DatadirFormat { layout: format.layout, tx_bodies: TxBodies::Pointers };
+        let dir = copy_fixture(name)?;
+        let root = dir.path().join("datadir");
+        let open = || Opened::open_asking(&root, plan.chain.clone(), asked, None);
+
+        let opened = open()?;
+        check_stays_inline(name, &opened.env, format, TIP)?;
+        opened.close()?;
+        ensure_same(
+            name,
+            "an open asking for transactions by position rewrote its files",
+            rewritten_files(&fixture_datadir(name), &root)?,
+            WHAT_TO_DO,
+        )?;
+
+        let opened = open()?;
+        let (output, batch) = next_output(&opened.env, &plan, owner)?;
+        let positions = execute_batched(&opened.env, header(&opened.env, TIP)?, &output)?;
+        eyre::ensure!(positions == [Some(Arc::from([0u32]))], "{name}: positions {positions:?}");
+        check_stays_inline(name, &opened.env, format, TIP + 1)?;
+        opened.close()?;
+
+        let opened = open()?;
+        check_stays_inline(name, &opened.env, format, TIP + 1)?;
+        let tx_hash = *TransactionSigned::decode_2718_exact(&batch.transactions[0])?.tx_hash();
+        let provider = opened.env.blockchain_provider().database_provider_ro()?;
+        let read = provider.transaction_by_hash(tx_hash)?;
+        eyre::ensure!(
+            read.is_some_and(|tx| *tx.tx_hash() == tx_hash),
+            "{name}: the new block's transaction does not read back by hash"
+        );
+        drop(provider);
+        opened.close()?;
+    }
+    Ok(())
+}
+
+/// Check that `env`, opened over inline fixture `name` in `format`, stores the transactions of
+/// blocks 0 to `tip` inline and makes no jar for anything else: its format, its marker version,
+/// the jar policy, each `Transactions` jar's format and each row.
+fn check_stays_inline(
+    name: &str,
+    env: &RethEnv,
+    format: DatadirFormat,
+    tip: u64,
+) -> eyre::Result<()> {
+    eyre::ensure!(env.datadir_format() == format, "{name}: opened as {}", env.datadir_format());
+    let provider = env.blockchain_provider().database_provider_ro()?;
+    let marker = stored_marker(provider.get_metadata(TN_LAYOUT_KEY)?)?;
+    drop(provider);
+    eyre::ensure!(
+        marker.is_some_and(|marker| marker.version == LAYOUT_VERSION_INLINE_TXS),
+        "{name}: the layout marker is {marker:?}"
+    );
+    let static_files = env.blockchain_provider().static_file_provider();
+    eyre::ensure!(
+        !static_files.tx_pointer_jars(StaticFileSegment::Transactions),
+        "{name}: a new Transactions jar would take tagged values"
+    );
+    let jars = static_files.jar_formats(StaticFileSegment::Transactions)?;
+    let untagged = match format.layout {
+        StorageLayout::V1 => JarFormat::Plain,
+        StorageLayout::V2 => JarFormat::Checksummed,
+    };
+    eyre::ensure!(
+        !jars.is_empty() && jars.iter().all(|(_, jar)| *jar == untagged),
+        "{name}: Transactions jars {jars:?}, not {untagged:?}"
+    );
+    check_tx_rows(env, TxBodies::Inline, tx_count(env, tip)?)
+}
+
+/// The output after the plan's last one, carrying one real batch of one transaction of `owner`
+/// (a value transfer at its next nonce), and that batch.
+fn next_output(
+    env: &RethEnv,
+    plan: &Plan,
+    owner: Address,
+) -> eyre::Result<(ConsensusOutput, Batch)> {
+    let nonce =
+        env.blockchain_provider().latest()?.basic_account(&owner)?.unwrap_or_default().nonce;
+    let mut factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    eyre::ensure!(factory.address() == owner, "the plan's owner is seed 33");
+    factory.set_nonce(nonce);
+    let tx = factory.create_eip1559_encoded(
+        plan.chain.clone(),
+        None,
+        100,
+        Some(FRESH[1]),
+        U256::from(1),
+        Bytes::new(),
+    );
+    let batch = Batch { transactions: vec![tx], epoch: 1, ..Default::default() };
+    let base = consensus_output_for_tests_at(12, 1, TIP, false, GENESIS_TIME + 10 * TIP);
+    let output = ConsensusOutput::new(
+        base.sub_dag().clone(),
+        ConsensusHeader::default().digest(),
+        TIP,
+        false,
+        [batch.digest()].into(),
+        vec![CertifiedBatch { address: Address::ZERO, batches: vec![batch.clone()] }],
+    );
+    Ok((output, batch))
+}
+
+/// Execute `output` on `parent`, as the engine does: signers recovered with the batch digests
+/// checked, one block a batch under its digest, the persist given each block's batch positions.
+/// Returns those positions.
+fn execute_batched(
+    env: &RethEnv,
+    mut parent: SealedHeader,
+    output: &ConsensusOutput,
+) -> eyre::Result<Vec<Option<Arc<[u32]>>>> {
+    let canonical = env.blockchain_provider().canonical_in_memory_state();
+    let mut scope = OutputBuildScope::new();
+    let (mut blocks, mut positions) = (Vec::new(), Vec::new());
+    for (batch_index, recovered) in RethEnv::recover_output_signers(output).into_iter().enumerate()
+    {
+        let digest =
+            output.get_batch_digest(batch_index).ok_or_else(|| eyre::eyre!("no batch digest"))?;
+        let mut payload =
+            TNPayload::new_for_test_with(parent, output, Address::ZERO, digest, digest);
+        payload.batch_index = batch_index;
+        let built = env.build_block_from_recovered_payload(payload, recovered, &mut scope)?;
+        parent = built.block.recovered_block.clone_sealed_header();
+        canonical.update_chain(NewCanonicalChain::Commit { new: vec![built.block.clone()] });
+        canonical.set_canonical_head(parent.clone());
+        blocks.push(built.block);
+        positions.push(built.tx_positions);
+    }
+    env.persist_executed_output(&blocks, &positions)?;
+    env.cache_persisted_batches(output, &positions);
+    env.announce_executed_output(blocks, None)?;
+    env.finalize_block(parent)?;
+    Ok(positions)
 }
 
 /// The files of the checked-in datadir `fixture` that the open and close of its copy at `copy`
@@ -988,9 +1395,9 @@ fn rewritten_files(fixture: &Path, copy: &Path) -> eyre::Result<Vec<String>> {
 #[cfg_attr(feature = "adiri", ignore = "adiri's fork schedule builds other blocks")]
 async fn format_writer_output_unchanged() -> eyre::Result<()> {
     let plan = Plan::new(load_genesis()?);
-    for (name, layout) in FIXTURES {
+    for (name, format) in FIXTURES {
         let expected = load_lines(name)?;
-        let (opened, _dir, found) = build(&plan, layout)
+        let (opened, _dir, found, _batches) = build(&plan, format)
             .map_err(|e| failed(name, "the current code cannot build the fixture's chain", e))?;
         eyre::ensure!(
             differences(&expected, &found, &["block"]).is_empty(),
@@ -1017,22 +1424,37 @@ async fn format_writer_output_unchanged() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Write the fixtures: `genesis.json` (kept when present; delete it to rebuild it from the current
-/// contracts) and, for each layout, `<name>/datadir` and `<name>/digests.txt`. A fixture whose
-/// `version` lines differ from the build's is refused, before anything is written: move it to its
-/// own directory first (or delete it, for a format no release has written). Ignored, and a no-op
-/// unless `TN_REGENERATE_FORMAT_FIXTURES=1`, so no test run rewrites them:
+/// Write the fixtures `TN_REGENERATE_FORMAT_FIXTURES` names (comma-separated, from
+/// [`FIXTURES`]): `genesis.json` (kept when present; delete it to rebuild it from the current
+/// contracts) and, for each named fixture, `<name>/datadir`, `<name>/digests.txt` and, for one
+/// storing transactions by position, `<name>/batches.bcs`. A fixture whose `version` lines differ
+/// from the build's is refused, before anything is written: move it to its own directory first
+/// (or delete it, for a format no release has written). Ignored, and a no-op unless the variable
+/// is set, so no test run rewrites them; an unknown name is an error:
 ///
 /// ```text
-/// TN_REGENERATE_FORMAT_FIXTURES=1 cargo test -p tn-reth --features test-utils --lib \
+/// TN_REGENERATE_FORMAT_FIXTURES=v2-ptr cargo test -p tn-reth --features test-utils --lib \
 ///     env::format_freeze_tests::regenerate_format_fixtures -- --ignored --exact
 /// ```
 #[tokio::test]
 #[ignore = "writes the checked-in fixtures; see the crate README"]
 async fn regenerate_format_fixtures() -> eyre::Result<()> {
-    if std::env::var(REGENERATE_VAR).as_deref() != Ok("1") {
-        eprintln!("{REGENERATE_VAR}=1 not set: nothing written");
-        return Ok(());
+    let names = match std::env::var(REGENERATE_VAR) {
+        Ok(names) => names,
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("{REGENERATE_VAR} not set: nothing written");
+            return Ok(());
+        }
+        Err(e) => eyre::bail!("{REGENERATE_VAR}: {e}"),
+    };
+    let names: Vec<&str> = names.split(',').map(str::trim).collect();
+    for name in &names {
+        eyre::ensure!(
+            FIXTURES.iter().any(|(fixture, _)| fixture == name),
+            "{REGENERATE_VAR} names {name:?}, which is no fixture: name those to write, \
+             comma-separated, from {:?}",
+            FIXTURES.map(|(fixture, _)| fixture)
+        );
     }
     eyre::ensure!(
         !cfg!(feature = "adiri"),
@@ -1045,8 +1467,8 @@ async fn regenerate_format_fixtures() -> eyre::Result<()> {
         std::fs::write(&genesis_path, serde_json::to_string_pretty(&new_genesis())? + "\n")?;
     }
     let plan = Plan::new(load_genesis()?);
-    for (name, layout) in FIXTURES {
-        let (opened, built, mut lines) = build(&plan, layout)?;
+    for (name, format) in FIXTURES.into_iter().filter(|(name, _)| names.contains(name)) {
+        let (opened, built, mut lines, batches) = build(&plan, format)?;
         opened.close()?;
 
         // a fixture of another format version is kept, never rewritten in place
@@ -1072,8 +1494,15 @@ async fn regenerate_format_fixtures() -> eyre::Result<()> {
             let path = target.join(&key["write file/".len()..]);
             eyre::ensure!(&Digest::file(&path)? == value, "{} changed at close", path.display());
         }
+        let batches_path = root.join(name).join(BATCHES_FILE);
+        if format.tx_bodies == TxBodies::Pointers {
+            std::fs::write(&batches_path, encode_batches(&batches))?;
+        } else if batches_path.exists() {
+            std::fs::remove_file(&batches_path)?;
+        }
 
-        let (opened, dir) = open_fixture(name, plan.chain.clone(), layout)?;
+        let read_batches = fixture_batches(name, format, &mut lines)?;
+        let (opened, dir) = open_fixture(name, plan.chain.clone(), format, read_batches)?;
         read_lines(&opened, &dir.path().join("datadir"), &plan.accounts, &mut lines)?;
         opened.close()?;
 

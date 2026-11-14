@@ -3120,8 +3120,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   is always inline and decodes as upstream does) and `encode_tx_ref`, with `TxRowError` for an
   empty value, an unknown tag, and a position that is truncated, longer than five bytes,
   non-canonical, above `u32::MAX` or followed by bytes; the value's checksum is verified before,
-  so these mean a writer bug or a newer format. Nothing reads these rows yet: the readers that
-  resolve them are a later change, and until then nothing creates such a jar. Policy:
+  so these mean a writer bug or a newer format. TN-0202 reads these rows; no jar holds them
+  unless TN turns the policy on. Policy:
   `StaticFileProviderInner::set_tx_pointer_jars` (and the builder's `with_tx_pointer_jars`, for
   tests) makes new `Transactions` jars version 3, only with checksums on (`tx_pointer_jars`,
   `new_jar_format`, `JarFormat`); no settings push it, TN sets it from the datadir's format, and
