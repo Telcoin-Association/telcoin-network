@@ -601,7 +601,8 @@ where
     ///    forwards every output up to that number, read back from the pack (reads ignore a failed
     ///    sync), so without it an output whose persist failed could be executed.
     /// 2. On an exit without the boundary, drain leftover output to the engine; if the drain
-    ///    reaches the boundary, close the epoch and write its [`EpochRecord`] here too.
+    ///    reaches the boundary, close the epoch and write its [`EpochRecord`] here too. A gap in
+    ///    the drained numbers is returned and stops the node before the engine gets past it.
     /// 3. Clear the epoch-scoped DB tables when a boundary was crossed.
     /// 4. Check the consensus DB's stores still make writes durable (`ensure_stores_durable`).
     ///
@@ -635,7 +636,7 @@ where
             while let Ok(_output) = consensus_output.try_recv() {}
             RunEpochMode::NewEpoch
         } else if let Some(target_hash) =
-            self.send_leftover_consensus_output_to_engine(consensus_output, to_engine).await
+            self.send_leftover_consensus_output_to_engine(consensus_output, to_engine).await?
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
@@ -1118,7 +1119,7 @@ where
 
 /// How the next consensus output's number relates to the last one forwarded to the engine.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum OutputContinuity {
+pub(super) enum OutputContinuity {
     /// Already forwarded (`number <= last_forwarded`): skip as a duplicate.
     Stale,
     /// The expected next output (`last_forwarded + 1`): forward it.
@@ -1130,10 +1131,12 @@ enum OutputContinuity {
 
 /// Classify `number` against the last consensus number actually forwarded to the engine.
 ///
-/// Used only on the live-forwarding path ([`EpochManager::wait_for_epoch_boundary`]); the
-/// replay and leftover-drain paths legitimately re-forward numbers at or below
-/// `last_forwarded` and must not be checked.
-fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity {
+/// Used on the paths that take outputs off the consensus-output queue: the live forward
+/// ([`EpochManager::wait_for_epoch_boundary`]) and the queue phase of the leftover drain, which
+/// takes what the live forward would have taken next. The restart replay legitimately
+/// re-forwards numbers at or below `last_forwarded` (primed from the pack's latest) and must not
+/// be checked; the drain's pack phase loads from `last_forwarded + 1` on, in order.
+pub(super) fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity {
     if number <= last_forwarded {
         OutputContinuity::Stale
     } else if number == last_forwarded + 1 {
@@ -3216,7 +3219,10 @@ pub(super) mod tests {
 
     /// Output `number` led by a member of `committee` and carrying one batch of its own, so a
     /// pack over `committee` saves it and reads it back.
-    fn member_output_at(committee: &Committee, number: u64) -> ConsensusOutput {
+    pub(in crate::manager::node) fn member_output_at(
+        committee: &Committee,
+        number: u64,
+    ) -> ConsensusOutput {
         let author = committee.authorities().first().expect("a committee member").id();
         let batch = Batch { transactions: vec![vec![number as u8; 32]], ..Default::default() };
         let mut leader = Certificate::default();
@@ -3297,7 +3303,8 @@ pub(super) mod tests {
             boundary
         };
         let (boundary, received) = tokio::join!(drain, engine);
-        assert!(boundary.is_none(), "no test output reaches the boundary");
+        // the drain's continuity check does not fire: the forward lost nothing
+        assert!(boundary?.is_none(), "no test output reaches the boundary");
         Ok((received, manager.last_forwarded_consensus_number))
     }
 

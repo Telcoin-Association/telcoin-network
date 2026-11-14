@@ -14,7 +14,10 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
+use super::{
+    export_retention::PublishOutcome,
+    run_epoch::{check_output_continuity, retry_provider_faults, OutputContinuity},
+};
 use crate::{
     engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics, primary::PrimaryNode,
 };
@@ -313,13 +316,53 @@ where
     /// caller must not wait on execution of output the engine never received, and
     /// the dead channel resurfaces as a hard error at the next forwarding attempt
     /// after re-entry.
+    ///
+    /// Phase 1 applies the live forward's continuity rule
+    /// ([`check_output_continuity`]) to what it takes off the queue: an output
+    /// already forwarded is skipped, and one that does not directly follow the
+    /// last output forwarded to the engine is refused with an error that stops the
+    /// node, before the engine gets past the gap (on restart the replay forwards
+    /// the missing output from the consensus DB). No honest path reaches the
+    /// refusal: the subscriber queues outputs in order, and the live forward hands
+    /// over every output it takes (`wait_for_epoch_boundary` is cancel safe). It
+    /// is there so a regression stops a node cleanly instead of forking its
+    /// execution.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-    ) -> Option<ConsensusHeaderDigest> {
+    ) -> eyre::Result<Option<ConsensusHeaderDigest>> {
         // Phase 1: drain the consensus_output queue
         while let Ok(output) = consensus_output.try_recv() {
+            let last_forwarded = self.last_forwarded_consensus_number;
+            match check_output_continuity(last_forwarded, output.number()) {
+                OutputContinuity::Stale => {
+                    warn!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        "skipping already-forwarded consensus output",
+                    );
+                    continue;
+                }
+                OutputContinuity::Gap => {
+                    metrics::counter!("tn_node.leftover_output_gaps_total").increment(1);
+                    error!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        "leftover consensus output does not follow the last output forwarded to \
+                         the engine: stopping the node before the engine executes past the gap",
+                    );
+                    return Err(eyre!(
+                        "leftover consensus output gap: expected {} but received {} - stopping \
+                         the node; a restart replays the missing output from the consensus DB",
+                        last_forwarded + 1,
+                        output.number(),
+                    ));
+                }
+                OutputContinuity::Next => {}
+            }
             let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                 // stash the boundary header for the caller's close-and-write sequence
                 self.last_consensus_header = Some(output.clone().into());
@@ -332,10 +375,10 @@ where
             // block on forever in wait_for_consensus_execution
             if let Err(e) = self.process_output(to_engine, output).await {
                 error!(target: "epoch-manager", "error sending leftover consensus output to engine: {}", e);
-                return None;
+                return Ok(None);
             }
             if result.is_some() {
-                return result;
+                return Ok(result);
             }
         }
 
@@ -362,10 +405,10 @@ where
                         // the caller would block on forever in wait_for_consensus_execution
                         if let Err(e) = self.process_output(to_engine, output).await {
                             error!(target: "epoch-manager", number, "error sending leftover consensus output to engine: {}", e);
-                            return None;
+                            return Ok(None);
                         }
                         if result.is_some() {
-                            return result;
+                            return Ok(result);
                         }
                     }
                     Err(e) => {
@@ -376,7 +419,7 @@ where
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
@@ -3513,6 +3556,81 @@ mod tests {
             (RecordCheckPath::Rederived, ClosingBlockCheck::NonceEpoch)
         );
         assert!(manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop ----
+
+    /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
+    /// got, an engine channel with room for all of them and no boundary in reach. Returns the
+    /// drain's result, the numbers the engine received and the last forwarded number after it.
+    async fn drain_after(
+        last_forwarded: u64,
+        queued: &[u64],
+    ) -> eyre::Result<(eyre::Result<Option<ConsensusHeaderDigest>>, Vec<u64>, u64)> {
+        let temp = tempfile::TempDir::with_prefix("leftover_continuity")?;
+        let (mut manager, _engine, _reth_env, _tasks, committee) =
+            super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+        manager.epoch_boundary = u64::MAX;
+        manager.last_forwarded_consensus_number = last_forwarded;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        for &number in queued {
+            queue_tx
+                .send(super::super::run_epoch::tests::member_output_at(&committee, number))
+                .await?;
+        }
+        let (to_engine, mut engine_rx) = mpsc::channel(8);
+        let drained =
+            manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await;
+        drop(to_engine);
+        let mut received = Vec::new();
+        while let Some(output) = engine_rx.recv().await {
+            received.push(output.number());
+        }
+        Ok((drained, received, manager.last_forwarded_consensus_number))
+    }
+
+    /// The queue phase refuses an output that does not follow the last one the engine got: the
+    /// node stops with both numbers named and the gap counted, and the engine gets nothing, so
+    /// it never executes past the gap. The output after the gap is not forwarded either.
+    #[test]
+    fn the_leftover_drain_stops_on_a_gap_before_the_engine_gets_past_it() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (drained, received, last_forwarded) =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain_after(1, &[3, 4])))
+                .expect("the drain runs");
+
+        let err = drained.expect_err("a gap stops the node");
+        assert!(format!("{err:#}").contains("expected 2 but received 3"), "{err:#}");
+        assert!(received.is_empty(), "the engine gets nothing past the gap: {received:?}");
+        assert_eq!(last_forwarded, 1);
+        let gaps = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_output_gaps_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(gaps, Some(1));
+    }
+
+    /// The queue phase skips an output the engine already got, as the live forward does, and
+    /// forwards the one after it.
+    #[tokio::test]
+    async fn the_leftover_drain_skips_an_output_already_forwarded() -> eyre::Result<()> {
+        let (drained, received, last_forwarded) = drain_after(2, &[2, 3]).await?;
+        assert!(drained?.is_none(), "no boundary in reach");
+        assert_eq!(received, [3], "forwarded once, in order");
+        assert_eq!(last_forwarded, 3);
         Ok(())
     }
 }
