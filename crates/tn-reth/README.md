@@ -996,6 +996,13 @@ CHANGES.md TN-0200..0203.
 
   At most 4 pack reads run at once. Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
+
+  `eth_getLogs`, on a block the RPC cache does not hold, reads the transaction of each matching
+  receipt by id, one call each (`append_matching_block_logs`), inside a read scope
+  (`TxReadScope`, vendor/reth CHANGES.md TN-0204). The resolver looks there before the cache and
+  keeps each batch it finds there, so one call reads a block's batch at most once even when the
+  cache cannot keep it (many concurrent scans of old blocks evicting the cold part); the scope
+  drops the batch when the block is done.
 - **Failures.** A row that cannot be resolved fails the read with an error naming the block, the
   epoch and the batch digest: an RPC call reading it answers an error, never `null` and never
   another transaction. Each failed block counts in `tn_reth_tx_body_resolve_failures_total` by
@@ -1003,10 +1010,10 @@ CHANGES.md TN-0200..0203.
   pack read failed, its digest check included), `position_out_of_range`, `decode`,
   `batch_too_large`, `handoff_timeout`. A read by hash that resolves another transaction fails as
   well (TN-0202's `TxBodyMismatch`), outside that counter. The other series:
-  `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`;
-  `memory` in test builds), `tn_reth_tx_body_pack_opens_total`, the gauge
-  `tn_reth_tx_body_cache_bytes` by `part`, and the histogram `tn_reth_tx_body_resolve_seconds` of
-  resolves that read a pack.
+  `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`,
+  `scoped` for a read answered from the read scope; `memory` in test builds),
+  `tn_reth_tx_body_pack_opens_total`, the gauge `tn_reth_tx_body_cache_bytes` by `part`, and the
+  histogram `tn_reth_tx_body_resolve_seconds` of resolves that read a pack.
 - **Who reads what.** Each jar's own version decides how its rows read (3: tagged; 1 and 2: as
   upstream). The marker decides the startup checks and whether the node attaches its consensus
   packs to the resolver (`RethEnv::attach_tx_packs`, at startup before the engine and RPC; an

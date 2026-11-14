@@ -34,8 +34,8 @@
 //! - `full block`: `sealed_block_with_senders`, the shape of `eth_getBlockByNumber(.., true)` and
 //!   `eth_getBlockReceipts`;
 //! - `logs k=1`, `logs k=10`, `logs k=all`: `transaction_by_id` of the block's first k
-//!   transactions, one call each, as `eth_getLogs` fetches the transaction of each matching
-//!   receipt;
+//!   transactions, one call each inside one `TxReadScope`, as `eth_getLogs` fetches the transaction
+//!   of each matching receipt of a block (`append_matching_block_logs`);
 //! - `tx range`: `RethEnv::transactions_by_tx_range_with_meta` of `RANGE` transactions from a
 //!   block's first, across blocks (the ExEx feed);
 //! - `rpc tx by hash` and `rpc receipt`: `eth_getTransactionByHash` and `eth_getTransactionReceipt`
@@ -95,6 +95,7 @@ use reth_provider::{
     DatabaseProviderFactory as _, HeaderProvider as _, ReceiptProvider as _, TransactionVariant,
     TransactionsProvider as _,
 };
+use reth_rpc_eth_types::tx_read_scope::TxReadScope;
 use tempfile::TempDir;
 use tn_storage::{archive::data_file::drop_cached_pages, consensus::ConsensusChain};
 use tn_types::{
@@ -612,6 +613,7 @@ fn run(chain: &Chain, opened: &Opened, read: Read, sample: &Sample) -> eyre::Res
         }
         Read::Logs(k) => {
             let k = k.unwrap_or(block.txs()).min(block.txs());
+            let _scope = TxReadScope::enter();
             for id in block.first_tx..block.first_tx + k {
                 provider.transaction_by_id(id)?.ok_or_else(missing)?;
             }

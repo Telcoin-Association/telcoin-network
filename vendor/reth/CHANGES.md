@@ -3259,3 +3259,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `transactions_by_block_range`, a block's rows split wrongly or resolved one call per row, the
   tag ignored, a second resolver accepted silently, no check that the indexed block holds the
   transaction, and an undecodable row read as no row. *Upstream*: no.
+
+- **TN-0204** — `eth_getLogs` reads a block's batch once: a per-thread read scope that the log
+  path enters and TN's transaction resolver answers from. *Kind*: perf (RPC reads).
+  *Files*: `crates/rpc/rpc-eth-types/src/{tx_read_scope.rs, logs_utils.rs, lib.rs}`
+  (`tx_read_scope.rs` new).
+  *Why*: `append_matching_block_logs`, on a block the RPC cache does not hold, reads the
+  transaction of each matching receipt by id, one `transaction_by_id` call each. On a datadir
+  that stores transactions by batch position (TN-0201, TN-0202) every such call resolves the
+  block's batch: from TN's decoded-batch cache when it holds the batch, else from a consensus pack
+  (a read, a decode and a digest check of the whole batch), so a block with k matching
+  transactions could read its batch k times (about 80 ms for a block of 587 matches against
+  1.7 ms from the cache) whenever the cache cannot keep it, as under many concurrent scans of
+  old blocks. `TxReadScope` is a guard (`enter`, ended by its drop; nested scopes share the
+  outermost one) over a thread-local slot holding one value under a `B256` key (`keep`, `get`;
+  nothing outside a scope). `append_matching_block_logs` enters it for the provider path; TN's
+  resolver keeps each batch it resolves there and answers from it first, so a block's batch is
+  read at most once per call. The slot holds one batch while one block's logs are matched, then
+  drops it.
+  *Can reach execution or storage*: no. Nothing is written; RPC reads only. The resolver keys the
+  slot by batch digest and keeps only batches it already digest-checked or took from its cache,
+  so a read answers the same transaction from it. Inline rows and providers without a resolver
+  never touch it.
+  *Tests*: the module's own (`nothing_is_kept_outside_a_scope`,
+  `a_scope_keeps_one_value_until_it_ends`, `an_inner_scope_shares_the_outer_one`,
+  `a_scope_is_its_threads_own`); TN's `a_blocks_logs_read_its_batch_once`
+  (`crates/tn-reth/src/env/tx_bodies/pack_tests.rs`) matches a block's logs through
+  `append_matching_block_logs` on real packs with no decoded-batch cache and requires one pack
+  read for the block, the other reads answered from the scope, and one pack read per transaction
+  for the same reads outside a scope. Mutation-checked: without the scope in
+  `append_matching_block_logs`, or with the resolver keeping nothing in it, the block's batch is
+  read once per transaction and the test fails. *Upstream*: no (TN's format).
