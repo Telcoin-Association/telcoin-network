@@ -20,8 +20,9 @@
 //! thread while the work they wait for queues, and RPC would stall on every worker.
 //!
 //! With `--rpc.pending-block` set (the default is `none`), a state read at `pending` holds a
-//! thread without a permit while it waits for the pending-block build on the same pool, so enough
-//! of those reads held open can still take every thread of their own server's pool.
+//! thread without a permit while it waits for the pending-block build. The build runs on the eth
+//! API's own CPU pool (vendored TN-0182), not on this one, so those reads cannot keep it from a
+//! thread.
 //!
 //! tokio starts a pool's blocking threads on demand and ends each after 10 seconds idle, so an
 //! idle pool keeps one thread: its runtime's worker, which drives the timers and I/O of the

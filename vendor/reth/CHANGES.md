@@ -2997,3 +2997,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   runs once it is free). Mutation-checked: no permit taken in `simulate_v1` (the request runs
   while the permit is held).
   *Upstream*: no; upstream has the same shape (its handler in `rpc-eth-api/src/core.rs`).
+
+- **TN-0182** — The pending block is built on the eth API's CPU pool, not on a blocking-IO
+  thread. *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/pending_block.rs`
+  (`pool_pending_block` builds with `spawn_tracing`), `crates/rpc/rpc/src/eth/helpers/state.rs`
+  (test `a_pending_read_holding_every_blocking_thread_still_gets_its_block`).
+  *Why*: with `--rpc.pending-block` set (TN's default is `none`), a state read at `pending`
+  (`eth_getBalance`, `eth_call` and the other state methods) runs on a blocking-IO thread and
+  waits there for the pending block, which `pool_pending_block` built on another blocking-IO
+  thread. Plain state reads take no blocking-IO permit, so enough of them sent at once held every
+  thread of the server's blocking pool while the build waited for one: every read at `pending`
+  waited forever, and the server's other blocking work queued behind them. The build now runs on
+  the rayon pool each eth API owns (`tracing_task_pool`, one thread per core), which no RPC path
+  used and nothing on it waits for other work, so it always gets a thread. The build is unchanged
+  and still one at a time behind the pending-block lock. *Can reach execution or storage*: no.
+  RPC only; the node's blocks are built and executed elsewhere.
+  *Tests*: `a_pending_read_holding_every_blocking_thread_still_gets_its_block` (a runtime with
+  one blocking thread; the read at `pending` waited forever before the change).
+  *Upstream*: no; upstream has the same shape.
