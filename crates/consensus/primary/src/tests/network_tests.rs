@@ -5513,7 +5513,11 @@ async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<(
 /// `tn_primary_epoch_entry_rounds_behind` holds the highest round of a certificate from the epoch
 /// after the one this node last executed, without changing the decision: the node stays active up
 /// to the activity window and is demoted past it, as before. A certificate of the executed epoch
-/// does not move it, and the next epoch's handler, built on the same bus, starts it at zero.
+/// does not move it. Handlers built on the same bus keep it while they serve the epoch it was
+/// recorded for or an earlier one (a mode change, or the first handler of the lagging epoch), and
+/// a handler of a later epoch starts it at zero.
+///
+/// The value lives in a process-wide static, so this test must run in its own process (nextest).
 #[tokio::test]
 async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -5557,8 +5561,32 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
     assert_eq!(gauge(), Some(f64::from(window + 1)));
     assert!(cb.app().is_cvv_inactive(), "the demotion is unchanged");
 
-    let _next = RequestHandler::new(config, cb.app().clone(), synchronizer, consensus_chain);
-    assert_eq!(gauge(), Some(0.0), "the next epoch's handler starts the gauge at zero");
+    // the demotion's mode change rebuilds the handler for the same epoch
+    let _rebuilt = RequestHandler::new(
+        config,
+        cb.app().clone(),
+        synchronizer.clone(),
+        consensus_chain.clone(),
+    );
+    assert_eq!(gauge(), Some(f64::from(window + 1)), "a mode change keeps the epoch's value");
+
+    // a handler of the epoch the rounds belong to keeps them; one of a later epoch starts at zero
+    for (epoch, expected) in [(1, f64::from(window + 1)), (2, 0.0)] {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .epoch(epoch)
+            .build();
+        let epoch_config = fixture.first_authority().consensus_config();
+        let epoch_sync =
+            StateSynchronizer::new(epoch_config.clone(), cb.clone(), task_manager.get_spawner());
+        let _handler = RequestHandler::new(
+            epoch_config,
+            cb.app().clone(),
+            epoch_sync,
+            consensus_chain.clone(),
+        );
+        assert_eq!(gauge(), Some(expected), "a handler of epoch {epoch}");
+    }
 
     Ok(())
 }

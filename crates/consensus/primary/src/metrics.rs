@@ -1,6 +1,7 @@
 //! Prometheus metrics for the primary (consensus layer).
 
 use crate::{ConsensusBusApp, NodeMode, RecentBlocks};
+use parking_lot::Mutex;
 use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
@@ -9,7 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tn_types::{Noticer, Round, TaskSpawner};
+use tn_types::{Epoch, Noticer, Round, TaskSpawner};
 use tokio::sync::watch;
 use tracing::debug;
 
@@ -22,6 +23,15 @@ pub(crate) mod test_recorder;
 /// The `metrics` `Gauge` handle has no getter, so the "max since startup" gauge needs an
 /// external running max. There is one `PrimaryMetrics` per process, so a static is fine.
 static MAX_CONSENSUS_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide epoch and running max behind `tn_primary_epoch_entry_rounds_behind`.
+///
+/// The gauge has no getter, and the request handler that records it is rebuilt on every mode
+/// change inside an epoch, so the max is kept here, keyed by the certificates' epoch. `None`
+/// until the first request handler starts. There is one `PrimaryMetrics` per process, so a
+/// static is fine. The gauge is written under this lock, so certificates checked side by side
+/// cannot leave it below the max.
+static EPOCH_ENTRY_ROUNDS_BEHIND: Mutex<Option<(Epoch, Round)>> = parking_lot::const_mutex(None);
 
 /// Metrics for the primary's consensus pipeline.
 ///
@@ -142,15 +152,16 @@ pub struct PrimaryMetrics {
     pub(crate) execution_check_retries_total: Counter,
     // bench6 tracker-drain
     /// The highest round of a certificate from the epoch after the one this node last executed,
-    /// seen since this epoch's request handler was built (zero then): how many rounds the
-    /// committee had run in an epoch this node had not executed any of yet.
+    /// seen in the newest such epoch: how many rounds the committee had run in an epoch this
+    /// node had not executed any of yet.
     ///
     /// Set where a certificate is checked for falling behind. The activity window
     /// (`gc_activity_window(gc_depth)`, 40 rounds at a `gc_depth` of 50) demotes the node once a
     /// certificate of that epoch passes it, so a value near the window means the node entered the
     /// epoch with little margin left. Only an active CVV records it: a node that enters the epoch
-    /// already demoted reads zero, and a demotion stops it one round past the window. The next
-    /// epoch's handler starts it at zero again, so read it as a maximum over time.
+    /// already demoted reads zero, and recording stops at the first certificate round past the
+    /// window, where the demotion fires. A request handler built for a later epoch than the
+    /// recorded one starts it at zero; one rebuilt by a mode change inside the epoch keeps it.
     pub(crate) epoch_entry_rounds_behind: Gauge,
 }
 
@@ -162,6 +173,34 @@ impl PrimaryMetrics {
         self.consensus_output_bytes.set(bytes as f64);
         let prev = MAX_CONSENSUS_OUTPUT_BYTES.fetch_max(bytes, Ordering::Relaxed);
         self.max_consensus_output_bytes.set(prev.max(bytes) as f64);
+    }
+
+    /// Start `tn_primary_epoch_entry_rounds_behind` for a request handler of `epoch`: zero,
+    /// unless rounds of `epoch` or a later epoch are already recorded.
+    ///
+    /// A handler rebuilt by a mode change keeps the value its predecessor recorded, and so does
+    /// the first handler of an epoch whose certificates the previous epoch's handler saw while
+    /// execution was still behind.
+    pub(crate) fn start_epoch_entry_rounds_behind(&self, epoch: Epoch) {
+        let mut entry = EPOCH_ENTRY_ROUNDS_BEHIND.lock();
+        if entry.is_none_or(|(recorded, _)| recorded < epoch) {
+            *entry = Some((epoch, 0));
+            self.epoch_entry_rounds_behind.set(0.0);
+        }
+    }
+
+    /// Raise `tn_primary_epoch_entry_rounds_behind` to `round`, the round of a certificate of
+    /// `epoch`, the epoch after the one this node last executed, when it is the highest round
+    /// seen in the newest such epoch. A later epoch replaces the recorded one whatever its round.
+    ///
+    /// This node has executed nothing of that epoch, so the round is how far it trails the
+    /// committee there. Observation only: the caller decides as before.
+    pub(crate) fn record_epoch_entry_rounds_behind(&self, epoch: Epoch, round: Round) {
+        let mut entry = EPOCH_ENTRY_ROUNDS_BEHIND.lock();
+        if entry.is_none_or(|recorded| recorded < (epoch, round)) {
+            *entry = Some((epoch, round));
+            self.epoch_entry_rounds_behind.set(f64::from(round));
+        }
     }
 
     /// Count a catching-up CVV's promotion back to an active CVV in
