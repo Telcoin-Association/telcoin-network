@@ -1208,10 +1208,11 @@ impl Writer {
     ///
     /// A gap not in memory is skipped and counted ([`IoStats::gap_misses`]); once a commit's
     /// misses exceed its fills by [`GAP_MISS_SLACK`] it stops trying. A kernel or file system that
-    /// refuses the residency check turns gap fill off for the environment, with a warning and
-    /// [`IoStats::gap_fill_refusals`], once: no later commit calls this. The gaps filled so far
-    /// keep their bytes. An I/O error reading or writing a gap fails the
-    /// commit and poisons the file (a failed write leaves each byte as it was or rewritten).
+    /// refuses the residency check, or fails it with any error but a miss (`file::Resident`),
+    /// turns gap fill off for the environment, with a warning and [`IoStats::gap_fill_refusals`],
+    /// once: no later commit calls this. The gaps filled so far keep their bytes. An I/O error
+    /// writing a gap (or reading one on macOS, a plain `pread`) fails the commit and poisons the
+    /// file (a failed write leaves each byte as it was or rewritten).
     fn fill_gaps(&mut self, pages: &[u32], width: u32) -> Result<Fill> {
         let size = self.geometry.page_size();
         let (mut filled, mut missed, mut filled_pages) = (0u64, 0u64, 0u64);
@@ -1238,8 +1239,8 @@ impl Writer {
                 Resident::NotWhole => missed += 1,
                 Resident::Unsupported(err) => {
                     tracing::warn!(
-                        "tn-lmdb: gap fill turned off: the file refuses reads with RWF_NOWAIT \
-                         ({err})"
+                        "tn-lmdb: gap fill turned off: the file refuses or fails reads with \
+                         RWF_NOWAIT ({err})"
                     );
                     self.gap_fill = GapWidth::Fixed(0);
                     self.gap_buf = Vec::new();

@@ -686,9 +686,13 @@ extra bytes, and two system calls per gap filled.
   dropped the file's cached pages (Linux, open step 4: after an unclean end, or with no usable boot
   record) the cache holds none of the file, so the first commits' gaps miss until the tree's reads and the commits' writes bring pages back; that bound caps what it
   costs, and no byte changes either way. A kernel or file system that refuses `RWF_NOWAIT`
-  (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one) turns gap fill off for the environment at the
-  first gap read, a fixed width and auto alike, with one warning and `IoStats::gap_fill_refusals` at
-  1: no later commit tries (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`). The gap
+  (`EOPNOTSUPP`, `EINVAL`, `ENOSYS`; tmpfs is one), and any other error of that read but `EINTR`
+  (reissued) and `EAGAIN` (a miss), such as a sandbox's `EPERM`, turns gap fill off for the
+  environment at the first gap read, a fixed width and auto alike, with one warning naming the
+  error and `IoStats::gap_fill_refusals` at 1: no later commit tries
+  (`a_file_that_refuses_nowait_reads_turns_gap_fill_off_once`,
+  `a_nowait_read_turns_gap_fill_off_on_any_error_but_eintr_and_eagain`). The read is advisory and
+  nothing has been written for it, so no error of it fails the commit. The gap
   fill tests assert that fallback on such a file system (`file::refuses_nowait_reads`, a probe of
   their own), so they fill gaps only where the temp dir is on a disk. No safe call reports residency
   without reading (`mincore` would be a raw call: new `unsafe`).
