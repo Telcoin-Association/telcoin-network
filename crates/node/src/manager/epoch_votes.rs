@@ -529,9 +529,14 @@ async fn manage_epoch_votes(
 /// Direct a newly received vote to its task.
 ///
 /// `retained` is handed to a round this starts (see [`manage_epoch_votes`]); it is `Some` only
-/// with the switch `epoch_record_recertify` on. With it, a full `vote_queues` first drops the
-/// senders of rounds that ended and then evicts the round of the oldest epoch, instead of the
-/// front entry, so the up to three rounds a close starts do not evict the newest record's round.
+/// with the switch `epoch_record_recertify` on.
+///
+/// `vote_queues` holds at most five rounds. Before a new round is queued, the senders of rounds
+/// that ended are dropped and, when five rounds are still running, the round of the lowest epoch
+/// is evicted (its channel closes and it ends without peer recovery). Each queued round is for a
+/// distinct epoch this node holds a record of, so of five running rounds at most two are for the
+/// newest record and the one before it, and the lowest epoch is below both: re-votes for older
+/// records, from this node or from peers, never evict the rounds of the latest close.
 #[allow(clippy::too_many_arguments)]
 async fn handle_new_vote(
     vote: EpochVote,
@@ -588,7 +593,6 @@ async fn handle_new_vote(
         // A round is not critical (it ends once its epoch is certified or given up), so its one
         // error, our own store failing, goes to the critical collector, which stops the node.
         let store_failed = store_failed.clone();
-        let recertify = retained.is_some();
         task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
             if let Err(e) = manage_epoch_votes(
                 epoch_rec,
@@ -608,23 +612,19 @@ async fn handle_new_vote(
         if epoch_vote_tx.send(vote).await.is_ok() {
             // In a properly working system only one collector at a time should run.
             // Allow some extras though in case we have to handle epoch certification exceptions in
-            // the future.
-            if recertify {
-                // a close starts up to three rounds of its own: drop the entries of rounds that
-                // already ended, then evict the oldest epoch's round, never the newest record's
-                vote_queues.retain(|(_, tx)| !tx.is_closed());
-                if vote_queues.len() >= 5 {
-                    let oldest = vote_queues
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (epoch, _))| *epoch)
-                        .map(|(position, _)| position);
-                    if let Some(oldest) = oldest {
-                        vote_queues.remove(oldest);
-                    }
+            // the future. A close starts up to three rounds of its own and peers' re-votes for
+            // older records start more: drop the entries of rounds that already ended, then evict
+            // the lowest epoch's round, never the newest record's or the previous one's.
+            vote_queues.retain(|(_, tx)| !tx.is_closed());
+            if vote_queues.len() >= 5 {
+                let lowest = vote_queues
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (epoch, _))| *epoch)
+                    .map(|(position, _)| position);
+                if let Some(lowest) = lowest {
+                    vote_queues.remove(lowest);
                 }
-            } else if vote_queues.len() >= 5 {
-                vote_queues.pop_front();
             }
             vote_queues.push_back((vote.epoch, epoch_vote_tx));
         }
@@ -3880,13 +3880,14 @@ mod epoch_vote_collector_tests {
         vote_queues.iter().map(|(epoch, _)| *epoch).collect()
     }
 
-    /// With the switch on, a full vote queue first drops the senders of rounds that ended, then
-    /// evicts the round of the oldest epoch, so the newest record's round is not evicted first.
-    /// Off, the front entry is evicted as before.
+    /// With either setting of the switch, a full vote queue first drops the senders of rounds
+    /// that ended, then evicts the round of the lowest epoch, so the newest record's round is not
+    /// evicted first. With the switch off main evicted the front entry, ended or not (`[4, 6, 7,
+    /// 8, 1]` in both cases); the review's V3 made the switch-on rule the only one.
     #[tokio::test]
     async fn test_vote_queue_eviction_spares_the_newest_round() {
-        assert_eq!(queue_after_a_new_round(false, false).await, vec![4, 6, 7, 8, 1]);
-        assert_eq!(queue_after_a_new_round(false, true).await, vec![4, 6, 7, 8, 1]);
+        assert_eq!(queue_after_a_new_round(false, false).await, vec![10, 6, 7, 8, 1]);
+        assert_eq!(queue_after_a_new_round(false, true).await, vec![10, 4, 7, 8, 1]);
         assert_eq!(queue_after_a_new_round(true, false).await, vec![10, 6, 7, 8, 1]);
         assert_eq!(queue_after_a_new_round(true, true).await, vec![10, 4, 7, 8, 1]);
     }
@@ -4773,5 +4774,73 @@ mod epoch_vote_collector_tests {
         assert!(record.verify_with_cert(&cert));
         assert_eq!(cert.signed_authorities.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(retained.signatures(1, epoch_hash).is_empty());
+    }
+
+    /// V3: while the rounds of the latest close collect, members' re-votes for five distinct
+    /// older records start five more rounds; with either setting of `epoch_record_recertify` the
+    /// newest record's round and the previous one's are not evicted, and both certify when the
+    /// members' votes for them arrive. Main evicted the oldest-started rounds, which were these.
+    #[tokio::test]
+    async fn test_older_rounds_do_not_evict_the_latest_close() {
+        for recertify in [false, true] {
+            let (committee, keys) = four_keys();
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::with_prefix("older_rounds_evict").unwrap();
+            let chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let records: Vec<EpochRecord> = (0..=7)
+                .map(|epoch| EpochRecord {
+                    epoch,
+                    committee: committee.clone(),
+                    next_committee: committee.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            for record in &records {
+                chain.epochs().save_record(record.clone()).await.unwrap();
+            }
+            chain.epochs().persist().await.unwrap();
+            let (network, published) = spawn_quiet_network();
+            let consensus_bus = ConsensusBus::new();
+            let task_manager = TaskManager::default();
+            let node_shutdown = ShutdownNotifier::new();
+            spawn_epoch_vote_collector(
+                chain.clone(),
+                consensus_bus.app().clone(),
+                keys[0].clone(),
+                network,
+                task_manager.get_spawner(),
+                node_shutdown.clone(),
+                &Parameters { epoch_record_recertify: recertify, ..Parameters::default() },
+            );
+
+            // the close of epoch 7: our votes for records 6 (the failsafe) and 7 start their rounds
+            consensus_bus.app().epoch_record_watch().send_replace(Some(records[7].clone()));
+            wait_until(Duration::from_secs(5), "our vote for epoch 7 gossiped", || async {
+                Ok(published.lock().iter().any(|vote| vote.epoch == 7))
+            })
+            .await
+            .unwrap();
+            for record in &records[0..=4] {
+                new_epoch_vote(consensus_bus.app(), record.sign_vote(&keys[1]));
+            }
+            for record in &records[6..=7] {
+                for key_config in &keys[1..=2] {
+                    new_epoch_vote(consensus_bus.app(), record.sign_vote(key_config));
+                }
+            }
+            for record in &records[6..=7] {
+                let digest = record.digest();
+                wait_until(Duration::from_secs(10), "the latest close's records certified", || {
+                    let chain = chain.clone();
+                    async move { Ok(chain.epochs().cert_by_digest(digest).await.is_some()) }
+                })
+                .await
+                .unwrap_or_else(|e| panic!("recertify={recertify} epoch {}: {e}", record.epoch));
+            }
+            node_shutdown.notify();
+        }
     }
 }
